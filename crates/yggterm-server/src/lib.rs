@@ -2114,9 +2114,78 @@ fn external_agent_resume_processes_for_session(
             })
         })
         .collect::<Vec<_>>();
+    // ⛔ FD-BASED ARM (2026-09-05). The argv scan above is blind to the most
+    // common holder class: an interactive TUI runs as `codex -s
+    // danger-full-access` — its argv NEVER names the session — and it holds
+    // the rollout and its writer lock purely by fd. Exactly that class
+    // (orphaned by a daemon rotation) held a transcript on the GUI host while
+    // a resume composed into it, and codex refused with its own raw -32600
+    // ("thread already has an active writer") instead of this guard's named,
+    // actionable banner. A session id is unique enough that any open path
+    // carrying it IS this session's transcript or its writer lock, so a
+    // process holding such an fd is a holder whatever its argv says.
+    for pid in linux_proc_pids_holding_session_path(session_id) {
+        if pid == current_pid
+            || linux_proc_state(pid) == Some('Z')
+            || processes.iter().any(|process| process.pid == pid)
+        {
+            continue;
+        }
+        let marker = session_tenancy::session_marker_from_proc_environ(pid);
+        let holder = if marker.is_some_and(|marker| {
+            session_tenancy::session_marker_names_session(&marker, session_id)
+        }) {
+            AgentResumeHolderKind::StrandedYggtermOwned
+        } else if linux_proc_ancestor_cmdline_args(pid)
+            .iter()
+            .any(|ancestor| yggterm_process_args(ancestor))
+        {
+            AgentResumeHolderKind::StrandedYggtermOwned
+        } else {
+            AgentResumeHolderKind::External
+        };
+        let argv0 = linux_proc_cmdline_args(pid)
+            .and_then(|args| args.first().cloned())
+            .unwrap_or_default();
+        processes.push(ExternalCodexResumeProcess {
+            pid,
+            argv0,
+            holder,
+            ppid: linux_proc_ppid(pid),
+        });
+    }
     processes.sort_by_key(|process| process.pid);
     processes.dedup_by_key(|process| process.pid);
     processes
+}
+
+/// Every live pid holding an open fd whose path names `session_id` — the
+/// transcript jsonl, its writer lock, or any sibling artefact. Cheap enough
+/// for the resume wait loop: one readdir per pid, readlink per fd.
+#[cfg(target_os = "linux")]
+fn linux_proc_pids_holding_session_path(session_id: &str) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut holders = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(target) = fs::read_link(fd.path())
+                && target.to_string_lossy().contains(session_id)
+            {
+                holders.push(pid);
+                break;
+            }
+        }
+    }
+    holders
 }
 
 #[cfg(target_os = "linux")]
@@ -7665,10 +7734,61 @@ impl YggtermServer {
     /// poll while its `claimed` set only lives for one tick, so without the
     /// full bound set it re-claimed the same transcript for a new row every
     /// tick (the 2026-09-04 collapse: all codex rows on one shared id).
+    /// The live row of `kind` ALREADY carrying `session_id` as its identity —
+    /// the agent-CLI twin of the codex stamp's duplicate refusal. Muse,
+    /// Antigravity and friends bind by setting `session.id` directly, so the
+    /// id scan is the whole truth here.
+    pub(crate) fn live_agent_session_holding_session_id(
+        &self,
+        kind: SessionKind,
+        session_id: &str,
+        exclude_key: &str,
+    ) -> Option<String> {
+        for key in &self.live_session_order {
+            if key == exclude_key {
+                continue;
+            }
+            let Some(session) = self.sessions.get(key) else {
+                continue;
+            };
+            if session.kind == kind && session.id == session_id {
+                return Some(key.clone());
+            }
+        }
+        None
+    }
+
     /// The live codex row ALREADY carrying `session_id` as its real
     /// transcript id, if any — storage key of that row. The stamp chore
     /// refuses to write a duplicate: one transcript, one row. `exclude_key`
     /// is the row asking to be stamped.
+    /// Revert a drifted self-minting row to the birth id its PATH carries and
+    /// clear the transcript metadata no one vouches for. The last resort of
+    /// the identity plane: a row whose id drifted (wrong rebind, ensure-funnel
+    /// re-mint) and whose attempts exhausted without an owner alias must stop
+    /// advertising a transcript it does not hold — resume on the birth id
+    /// degrades to a fresh launch (safe) instead of racing a foreign writer.
+    /// Returns TRUE when the row moved.
+    pub(crate) fn reset_agent_session_to_birth_id(&mut self, key: &str, birth_id: &str) -> bool {
+        let Some(storage_key) = self
+            .resolve_session_storage_key(key)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Some(session) = self.sessions.get_mut(&storage_key) else {
+            return false;
+        };
+        let before = session.clone();
+        if session.id != birth_id {
+            session.id = birth_id.to_string();
+        }
+        session
+            .metadata
+            .retain(|entry| entry.label != "Codex Session");
+        *session != before
+    }
+
     pub(crate) fn live_codex_session_holding_session_id(
         &self,
         session_id: &str,
@@ -48491,6 +48611,126 @@ terminal_window_id: None,
     /// The other half of the divergence made loud: an order entry naming a
     /// key the sessions map does not hold is NAMED, never silent.
     #[test]
+    /// The fd-based holder arm, live against a real child process: an
+    /// interactive TUI holds its transcript purely by fd (its argv never
+    /// names the session), and that holder class is exactly what the argv
+    /// scan missed on 2026-09-04 — the resume composed into a held thread
+    /// and codex refused with its own raw -32600.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_guard_sees_holders_by_open_fd_not_only_by_argv() -> Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let session_id = "019f5a3c-9b21-7e44-8c11-2f6d8a90e3b7";
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-fd-holder-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        fs::create_dir_all(&dir)?;
+        let transcript = dir.join(format!("rollout-{session_id}.jsonl"));
+        let mut opened = fs::File::create(&transcript)?;
+        writeln!(opened, "transcript bytes")?;
+
+        // The child holds the transcript open but its argv ("sleep 60")
+        // never names the session — the argv scan must miss it and the fd
+        // arm must find it.
+        let child_argv0 = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::from(opened))
+            .stdout(Stdio::null())
+            .spawn()?;
+        let _ = opened;
+
+        // The child needs a moment to exec before its fd table is visible;
+        // retry briefly instead of racing it.
+        let mut holders = Vec::new();
+        let mut child_fd_links = Vec::new();
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            holders = crate::external_agent_resume_processes_for_session(
+                SessionKind::Codex,
+                session_id,
+            );
+            if holders.iter().any(|holder| holder.pid == child_argv0.id()) {
+                break;
+            }
+            if let Ok(fds) = fs::read_dir(format!("/proc/{}/fd", child_argv0.id())) {
+                for fd in fds.flatten() {
+                    if let Ok(target) = fs::read_link(fd.path()) {
+                        child_fd_links.push(target.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        let result = holders.iter().find(|holder| holder.pid == child_argv0.id());
+        assert!(
+            result.is_some(),
+            "an fd holder with no session id in its argv must still be found; holders={holders:?}; child_fds={child_fd_links:?}"
+        );
+        assert_eq!(
+            result.unwrap().holder,
+            crate::AgentResumeHolderKind::External
+        );
+
+        // And a session nobody holds stays unheld.
+        assert!(crate::external_agent_resume_processes_for_session(
+            SessionKind::Codex,
+            "019ffffff-ffff-7fff-8fff-ffffffffffff",
+        )
+        .is_empty());
+
+        let _ = Command::new("kill")
+            .arg(child_argv0.id().to_string())
+            .status();
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// [identity-stale-metadata]: a drifted row with no vouched alias must
+    /// go back to its path-carried birth id, and the stale transcript
+    /// metadata must go with it.
+    #[test]
+    fn reset_to_birth_clears_drifted_identity_and_stale_metadata() {
+        let birth = "31d35e27-d6a3-4bd4-986e-3f798a7a9d7a";
+        let wrong = "01a0349d-8451-7312-aa5d-e131120ed8c7";
+        let runtime_key = remote_scanned_session_path("dev", birth);
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.clone(),
+            id: wrong.to_string(),
+            title: "stale".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/gh/yggterm".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let live = server.sessions.get_mut(&runtime_key).expect("mounted");
+        upsert_session_metadata(&mut live.metadata, "Codex Session", wrong.to_string());
+
+        assert!(server.reset_agent_session_to_birth_id(&runtime_key, birth));
+        let healed = server.sessions.get(&runtime_key).expect("present");
+        assert_eq!(healed.id, birth);
+        assert_eq!(session_metadata_value(healed, "Codex Session"), None);
+        // Resetting an already-birth row moves nothing.
+        assert!(!server.reset_agent_session_to_birth_id(&runtime_key, birth));
+    }
+
     fn poll_view_names_order_keys_missing_from_sessions() {
         let mut server = YggtermServer::new(
             false,

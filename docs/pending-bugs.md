@@ -26931,7 +26931,7 @@ divergence signature (order vs map), no debugger needed.
 
 ## ⛔ [resume-external-holder-scan] RESUME COMPOSES AGAINST A TRANSCRIPT AN ORPHANED CODEX PROCESS STILL WRITES — CODEX REFUSES -32600
 
-**Status:** OPEN (filed 2026-09-04 ~23:58, lane `lane/trace/agent-identity-reach`).
+**Status:** GUARD FIXED 2026-09-05 on `lane/trace/resume-holder-guard` — the scan was argv-only, and an interactive TUI holds its transcript purely by fd (its argv never names the session), so exactly that holder class was invisible. The scan now also walks /proc fds for any open path carrying the session id (transcript or writer lock), classifies the holder as before (environ marker / ancestry), and the existing wait + named banner (`orphaned process … kill <pid>`) covers it. Generic across CLIs — the scan is kind-parameterised and the fd arm is id-based. What stays open: making the WAIT reflexive for a live working holder (today it still waits out the 120 s deadline before naming the kill command).
 
 Measured twice live (screenshots, GUI host): a row whose bound id named a
 transcript held by ANOTHER, still-alive codex process composed

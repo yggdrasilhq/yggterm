@@ -6878,12 +6878,49 @@ impl DaemonRuntime {
         let mut bound = 0usize;
         for (key, kind) in targets {
             let runtime_path = self.terminal_runtime_key_for_path(&key);
-            let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
-                continue;
+            // Same handover blindness the codex chore had: a successor daemon
+            // holds addresses, not runtimes, so the terminal-map pid is absent
+            // for every row whose PTY a preserved owner serves. Silent-skip
+            // here is how Muse and Antigravity rows lost their identities at
+            // every takeover — "a new session opens in the spot after
+            // restart". Resolve through the preserved owner before giving up,
+            // and NAME the rows that stay unresolvable.
+            let pid = match self.terminals.session_process_id(&runtime_path) {
+                Some(pid) => pid,
+                None => match self.preserved_owner_terminal_pid(&runtime_path) {
+                    Some(pid) => pid,
+                    None => {
+                        Self::note_identity_probe_unresolved(&key, "terminal_pid_unknown");
+                        continue;
+                    }
+                },
             };
             let Some(session_id) = agent_runtime_session_id_from_root_pid(kind, pid) else {
+                Self::note_identity_probe_unresolved(&key, "no_transcript_marker");
                 continue;
             };
+            // One transcript, one row — the same duplicate refusal the codex
+            // stamp chore carries; the marker walk can land on a shared or
+            // recycled process just the same.
+            if let Some(holder) = self
+                .server
+                .live_agent_session_holding_session_id(kind, &session_id, &key)
+            {
+                Self::note_identity_probe_unresolved(&key, "duplicate_transcript_refused");
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "persistence",
+                    "agent_identity_stamp_duplicate",
+                    serde_json::json!({
+                        "session_path": key,
+                        "kind": format!("{kind:?}"),
+                        "session_id": session_id,
+                        "holder": holder,
+                    }),
+                );
+                continue;
+            }
             if self
                 .server
                 .apply_agent_runtime_session_id_to_live_session(&key, &session_id)
@@ -15045,6 +15082,11 @@ fn run_remote_agent_identity_poll_chore(
         cwd_candidates: usize,
     }
     let mut decisions: HashMap<String, RowDecision> = HashMap::new();
+    let mut resets: Vec<(String, String, String, &'static str)> = Vec::new();
+    // Transcript ids the owners report as FD-LIVE this tick, and the
+    // birth alias each carries — the reset-to-birth pass reads both.
+    let mut live_identity_ids: HashSet<String> = HashSet::new();
+    let mut alias_by_real_id: HashMap<String, String> = HashMap::new();
     let (targets, excluded, yggterm_home) = {
         let runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_read");
         let (targets, excluded) = runtime.server.live_remote_agent_identity_poll_view();
@@ -15144,6 +15186,12 @@ fn run_remote_agent_identity_poll_chore(
             .iter()
             .map(|identity| (identity.session_id.as_str(), identity))
             .collect();
+        for identity in &identities {
+            live_identity_ids.insert(identity.session_id.clone());
+            if let Some(birth) = identity.birth_session_id.as_deref() {
+                alias_by_real_id.insert(identity.session_id.clone(), birth.to_string());
+            }
+        }
         let mut polled: Vec<crate::RemoteAgentIdentityPollTarget> = Vec::new();
         for target in group {
             let effective_birth = target
@@ -15267,6 +15315,23 @@ fn run_remote_agent_identity_poll_chore(
         if let Some(decision) = decisions.get_mut(&target.key) {
             decision.verdict = "exhausted";
         }
+        // Last resort for a drifted row (the path still carries its birth):
+        // the budget is spent, nothing vouched an alias, and the id it
+        // carries is either not live anywhere or belongs to another row's
+        // birth. Advertising that id keeps resume racing a foreign writer —
+        // revert to the birth id, where resume degrades to a fresh launch,
+        // and clear the stale transcript metadata. Applied after the pass,
+        // under one lock.
+        if let Some(birth) = target.birth_id.as_deref() {
+            let foreign_alias = alias_by_real_id
+                .get(&target.current_id)
+                .is_some_and(|alias_birth| alias_birth != birth);
+            let dead_id = !live_identity_ids.contains(&target.current_id);
+            if dead_id || foreign_alias {
+                resets.push((target.key.clone(), birth.to_string(), target.current_id.clone(),
+                    if dead_id { "dead_id" } else { "foreign_alias" }));
+            }
+        }
     }
     for (_, kind, ..) in &rebinds {
         if let Some(kind_stats) = stats.get_mut(kind) {
@@ -15325,6 +15390,34 @@ fn run_remote_agent_identity_poll_chore(
                     )
                 })
                 .collect();
+        }
+    }
+
+    if !resets.is_empty() {
+        let mut runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_reset");
+        let mut applied_resets = 0usize;
+        for (key, birth, from_id, because) in &resets {
+            if runtime
+                .server
+                .reset_agent_session_to_birth_id(key, birth)
+            {
+                applied_resets += 1;
+                append_trace_event(
+                    runtime.store.home_dir(),
+                    "daemon",
+                    "persistence",
+                    "agent_identity_reset_to_birth",
+                    serde_json::json!({
+                        "session_path": key,
+                        "from_id": from_id,
+                        "to_id": birth,
+                        "because": because,
+                    }),
+                );
+            }
+        }
+        if applied_resets > 0 {
+            runtime.persist()?;
         }
     }
 

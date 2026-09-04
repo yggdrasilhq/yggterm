@@ -1,20 +1,31 @@
-fix(identity): a pid is not a process - revalidate the codex identity cache; one transcript, one row
+fix(resume): the resume guard sees holders by open fd, not only by argv; drifted rows reset to birth
 
-Second collapse of the night, measured at 00:21: dev's stamp chore serves
-identities from a blind pid-to-identity cache ("a codex process owns one
-session for its whole life" - true of the PROCESS, not of the pid KEY).
-After the takeover cascade the kernel recycled pids, the cache served a
-dead codex's transcript to a DIFFERENT row, several rows got stamped with
-ONE session id (01a06d75), the owner-alias export flip-flopped per tick on
-first-write-wins, and the GUI host's alias arm - the exact arm the cwd
-retirement just made primary - bound three different rows to that one
-transcript on three consecutive ticks. Convergence again, wearing the
-authoritative arm.
+Two units from the 2026-09-04/05 collapse nights, both generalized across
+every self-minting CLI (Codex, Claude Code, Muse, Antigravity, ...):
 
-- the cache is revalidated before serving: the pid must STILL hold the
-  cached rollout open (one /proc fd readdir), else it is re-resolved
-- the stamp chore refuses to write a duplicate: one transcript, one row;
-  a would-be duplicate is refused and named
-  (cli/agent_identity_stamp_duplicate, edge-triggered) with the holder row
-- test: the holder scan sees another live row's claim and never the
-  requester's own
+- The external-holder scan was argv-only: it matched processes whose command
+  line names the session id. An interactive TUI runs as `codex -s
+  danger-full-access` and holds its rollout and writer lock purely by fd -
+  exactly the holder class orphaned by daemon rotations was invisible, the
+  resume composed into a held thread, and codex refused with its own raw
+  -32600 ("already has an active writer"). The scan now also walks /proc fds
+  for any open path carrying the session id and classifies holders as
+  before (environ marker / ancestry), so the existing wait + named banner
+  ("orphaned process ... kill <pid>") covers them.
+
+- A drifted row whose attempts exhausted with no vouched alias kept
+  advertising a transcript it does not hold, and resume kept racing a
+  foreign writer. When the id is dead (fd-live nowhere) or the owner alias
+  hands it to a DIFFERENT row's birth, the poll now resets the row to the
+  birth id its path still carries and clears the stale Codex Session
+  metadata (cli/agent_identity_reset_to_birth, named because).
+
+- The Muse/Antigravity stamp chore gets the codex chore's handover
+  treatment: the terminal pid resolves through the preserved owner before
+  giving up, unresolvable rows are named, and a duplicate transcript bind
+  is refused - "a new session opens in the spot after restart" was this
+  chore silently skipping every row across a takeover.
+
+Tests: fd-holder found while a real child process holds the transcript with
+no session id in its argv; reset-to-birth clears drifted id + stale
+metadata and never moves a birth row.
