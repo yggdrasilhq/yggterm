@@ -10936,6 +10936,23 @@ impl YggtermServer {
             .filter(|value| value.starts_with("ses_"))
     }
 
+    /// The cold-restore candidate (Issue Heading 35, the vouch ladder's
+    /// third tier): a stampless anchor row's birth uuid is a phantom, and
+    /// today's answer — a fresh empty window — abandons the conversation.
+    /// opencode's OWN on-disk store knows which sessions exist for the row's
+    /// cwd; the newest is the closest guess to what the human had open. The
+    /// focus stamp outranks it, the ses_ guard still refuses anything
+    /// non-ses_, and the emission names it a heuristic so nobody mistakes it
+    /// for focus truth.
+    fn opencode_store_candidate_vouch(&self, cwd: Option<&str>) -> Option<String> {
+        let cwd = cwd?.trim_end_matches('/');
+        if cwd.is_empty() {
+            return None;
+        }
+        let home = resolve_yggterm_home().ok()?;
+        yggterm_core::agent_cli::opencode_store_newest_session_for_directory(&home, cwd)
+    }
+
     fn ensure_remote_runtime_agent_session(
         &mut self,
         kind: SessionKind,
@@ -10963,35 +10980,61 @@ impl YggtermServer {
         // never adopts uuid keys), and the compose below re-points id, launch
         // command and Restore line in the same step it already ran.
         let mut session_id = session_id.to_string();
-        if kind == SessionKind::OpenCode
-            && !session_id.starts_with("ses_")
-            && let Some(viewed) = self.opencode_viewing_session_vouch(&key)
-        {
-            use crate::codex_cli::{composed_cli_extra_args_with, split_extra_args};
-            let descriptor_extra = composed_cli_extra_args_with(
-                kind,
-                &AgentLaunchOptions::default(),
-                configured_extra_args,
-            )
-            .unwrap_or_default();
-            let selector = agent_cli_descriptor(kind)
-                .map(|descriptor| descriptor.resume_selector_token())
-                .unwrap_or_default();
-            yggterm_core::cli_plane::emit_launch_contract(
-                "daemon",
-                kind,
-                selector,
-                yggterm_core::cli_plane::CliInvocationShape {
-                    action: "resume",
-                    selector,
-                    carries_id: true,
-                    re_roots_with_cwd: false,
-                    extra_arg_tokens: split_extra_args(&descriptor_extra).len(),
-                    persistent: true,
-                },
-                yggterm_core::cli_plane::CliLaunchContractBreach::ServiceVouchedResume,
-            );
-            session_id = viewed;
+        if kind == SessionKind::OpenCode && !session_id.starts_with("ses_") {
+            // THE VOUCH LADDER: the focus stamp (the service's per-tick
+            // word — truth) first; the store candidate (the newest session
+            // for this row's cwd — a bounded heuristic, Issue Heading 35)
+            // second; today's fresh-launch degrade stays the last resort for
+            // a row the store cannot answer for either.
+            let mut vouched = self
+                .opencode_viewing_session_vouch(&key)
+                .map(|viewed| {
+                    (
+                        viewed,
+                        yggterm_core::cli_plane::CliLaunchContractBreach::ServiceVouchedResume,
+                    )
+                });
+            if vouched.is_none() {
+                vouched = self.opencode_store_candidate_vouch(cwd).map(|candidate| {
+                    (
+                        candidate,
+                        yggterm_core::cli_plane::CliLaunchContractBreach::StoreCandidateResume,
+                    )
+                });
+            }
+            if let Some((vouched_id, breach)) = vouched {
+                // BUS LAW (1cb614bcf): the restore tests run this arm for the
+                // composed launch; the fleet bus must not receive fixture
+                // vouches. The rebind's 04:04 incident was this exact hole.
+                #[cfg(not(test))]
+                {
+                    use crate::codex_cli::{composed_cli_extra_args_with, split_extra_args};
+                    let descriptor_extra = composed_cli_extra_args_with(
+                        kind,
+                        &AgentLaunchOptions::default(),
+                        configured_extra_args,
+                    )
+                    .unwrap_or_default();
+                    let selector = agent_cli_descriptor(kind)
+                        .map(|descriptor| descriptor.resume_selector_token())
+                        .unwrap_or_default();
+                    yggterm_core::cli_plane::emit_launch_contract(
+                        "daemon",
+                        kind,
+                        selector,
+                        yggterm_core::cli_plane::CliInvocationShape {
+                            action: "resume",
+                            selector,
+                            carries_id: true,
+                            re_roots_with_cwd: false,
+                            extra_arg_tokens: split_extra_args(&descriptor_extra).len(),
+                            persistent: true,
+                        },
+                        breach,
+                    );
+                }
+                session_id = vouched_id;
+            }
         }
         let session_id: &str = &session_id;
         // ⛔ LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE — the same rule the
@@ -37839,6 +37882,182 @@ mod tests {
         assert!(
             restore.contains(&format!("resume-opencode {viewed}")),
             "the Restore line must name the vouched session: {restore}"
+        );
+    }
+
+    /// ⛔ THE STORE-CANDIDATE TIER (Issue Heading 35): a stampless anchor's
+    /// birth uuid is a phantom; instead of degrading into a fresh empty
+    /// window, the newest store session for the row's cwd is the closest
+    /// guess to what the human had open. Measured live (2026-09-04 22:56,
+    /// build 3.2.59): `ses_guard_degrade, selector: ""` — one more
+    /// conversation abandoned by the empty-window answer.
+    #[test]
+    fn a_stampless_anchor_resumes_the_newest_store_session_for_its_cwd() {
+        let _env = env_yggterm_home_test_lock();
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-cand-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(home.join(".local/share/opencode")).expect("temp home store dir");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+        let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
+            .expect("fixture store");
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);",
+        )
+        .expect("fixture table");
+        for (id, directory, viewed) in [
+            ("ses_old000000000000000000000001", "/home/user/proj", "100"),
+            ("ses_new000000000000000000000002", "/home/user/proj", "200"),
+            // The decoy: a NEWER session for a DIFFERENT cwd must not win.
+            ("ses_decoy00000000000000000000003", "/home/user/other", "900"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_v2 (id, directory, time_updated, time_viewed, time_archived) VALUES (?1, ?2, ?3, ?4, NULL)",
+                rusqlite::params![id, directory, viewed, viewed],
+            )
+            .expect("fixture row");
+        }
+        drop(conn);
+
+        let anchor_id = "d4090efe-4e12-42d9-938d-66f61801d2e7";
+        let anchor_key = format!("opencode-runtime://{anchor_id}");
+        let mut server = test_server();
+        server.insert_live_session_with_launch(
+            &anchor_key,
+            anchor_id,
+            SessionKind::OpenCode,
+            &crate::local_session_target(SessionKind::OpenCode, Some("/home/user/proj")),
+            Some("New dev OpenCode".to_string()),
+            false,
+            false,
+        );
+
+        let ensured = server
+            .ensure_remote_runtime_agent_session_public(
+                SessionKind::OpenCode,
+                anchor_id,
+                Some("/home/user/proj"),
+                false,
+                None,
+                None,
+            )
+            .expect("ensure the stampless anchor");
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        let newest = "ses_new000000000000000000000002";
+        let session = server.sessions.get(&ensured).expect("anchor row");
+        assert_eq!(
+            session.id, newest,
+            "the resume lands in the newest store session for the row's cwd"
+        );
+        assert!(
+            session.launch_command.contains(newest),
+            "the composed resume must name the store candidate: {}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains("ses_old000000000000000000000001"),
+            "an older sibling must not win: {}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains("ses_decoy00000000000000000000003"),
+            "another cwd's newer session must not win: {}",
+            session.launch_command
+        );
+    }
+
+    /// The focus stamp outranks the store candidate: when the mirror saw the
+    /// row viewing session A while the store's newest for the cwd is B, the
+    /// resume names A. The store tier is for stampless rows only.
+    #[test]
+    fn the_store_candidate_loses_to_the_focus_vouch() {
+        let _env = env_yggterm_home_test_lock();
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-oc-vcr-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(home.join(".local/share/opencode")).expect("temp home store dir");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+        let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
+            .expect("fixture store");
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);",
+        )
+        .expect("fixture table");
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_updated, time_viewed, time_archived) VALUES (?1, ?2, ?3, ?4, NULL)",
+            rusqlite::params!["ses_store0000000000000000000001", "/home/user/proj", "900", "900"],
+        )
+        .expect("fixture row");
+        drop(conn);
+
+        let anchor_id = "d4090efe-4e12-42d9-938d-66f61801d2e7";
+        let anchor_key = format!("opencode-runtime://{anchor_id}");
+        let viewed = "ses_f9dd04cfaffeYv8F8dLF6r74FX";
+        let mut server = test_server();
+        server.insert_live_session_with_launch(
+            &anchor_key,
+            anchor_id,
+            SessionKind::OpenCode,
+            &crate::local_session_target(SessionKind::OpenCode, Some("/home/user/proj")),
+            Some("New dev OpenCode".to_string()),
+            false,
+            false,
+        );
+        if let Some(session) = server.sessions.get_mut(&anchor_key) {
+            upsert_session_metadata(
+                &mut session.metadata,
+                crate::opencode_mirror::VIEWING_SESSION_METADATA,
+                viewed.to_string(),
+            );
+        }
+
+        let ensured = server
+            .ensure_remote_runtime_agent_session_public(
+                SessionKind::OpenCode,
+                anchor_id,
+                Some("/home/user/proj"),
+                false,
+                None,
+                None,
+            )
+            .expect("ensure the anchor");
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        let session = server.sessions.get(&ensured).expect("anchor row");
+        assert_eq!(
+            session.id, viewed,
+            "the focus stamp outranks the store candidate"
         );
     }
 

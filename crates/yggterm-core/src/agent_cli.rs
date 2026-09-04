@@ -5376,6 +5376,86 @@ pub fn opencode_store_index_holds_session(home: &Path, session_id: &str) -> Opti
     Some(false)
 }
 
+/// The newest resumable OpenCode session for `directory` in opencode's own
+/// SQLite store — the COLD-RESTORE CANDIDATE (Issue Heading 35). Reads the
+/// same db `opencode_store_index_holds_session` does: `session_v2` first,
+/// v1 `session` as the fallback; the first table that ANSWERS wins (v1 is
+/// the stale stragglers' table by measurement 2026-08-29). `None` = this
+/// host cannot answer or nothing matches — a caller must never read
+/// unanswerable as a verdict.
+///
+/// Recency is the later of `time_viewed` and `time_updated` (epoch-ms text;
+/// equal digit counts sort correctly as strings, parsed here anyway): the
+/// conversation with the most recent human contact of ANY kind is what a
+/// stampless cold restore means. Archived rows are excluded — an archived
+/// conversation is not what was on screen. The heuristic is bounded by the
+/// caller to the row's own cwd (N-windows-one-cwd picks the newest, which
+/// is strictly closer to the owner's intent than the fresh empty window
+/// this arm replaces).
+pub fn opencode_store_newest_session_for_directory(home: &Path, directory: &str) -> Option<String> {
+    let trimmed = directory.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let conn = open_cli_index_readonly(&home.join(".local/share/opencode/opencode.db"))?;
+    // (table, selects time_viewed?) — v1 predates the column by measurement.
+    for (table, selects_viewed) in [("session_v2", true), ("session", false)] {
+        let present = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()?;
+        if present == 0 {
+            continue;
+        }
+        let viewed_col = if selects_viewed { ", time_viewed" } else { "" };
+        let sql = format!(
+            "SELECT id, time_updated{viewed_col} FROM {table} WHERE directory = ?1 AND (time_archived IS NULL OR time_archived = '')"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params![trimmed], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                if selects_viewed {
+                    row.get::<_, Option<String>>(2)?
+                } else {
+                    None
+                },
+            ))
+        }) else {
+            continue;
+        };
+        let mut best: Option<(i128, String)> = None;
+        for row in rows.flatten() {
+            let (id, updated, viewed) = row;
+            if !id.starts_with("ses_") {
+                continue;
+            }
+            let epoch_ms = |v: &Option<String>| -> i128 {
+                v.as_deref()
+                    .and_then(|s| s.trim().parse::<i128>().ok())
+                    .unwrap_or(0)
+            };
+            let recency = epoch_ms(&viewed).max(epoch_ms(&updated));
+            if recency <= 0 {
+                continue;
+            }
+            if best.as_ref().map(|(r, _)| recency > *r).unwrap_or(true) {
+                best = Some((recency, id));
+            }
+        }
+        if let Some((_, id)) = best {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Does Antigravity hold `session_id`?
 ///
 /// ⛔ NOT via `conversation_summaries.db`, which is the obvious answer and the
@@ -8740,5 +8820,105 @@ mod tests {
             other => panic!("OpenCode must install from npm, got {other:?}"),
         }
         assert_eq!(npm_dist_tag(SessionKind::OpenCode), Some("beta"));
+    }
+}
+
+
+#[cfg(test)]
+mod newest_session_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn seed(home: &Path, sql: &str) {
+        let dir = home.join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).expect("store dir");
+        let conn = Connection::open(dir.join("opencode.db")).expect("fixture store");
+        conn.execute_batch(sql).expect("fixture schema+rows");
+    }
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-ocnewest-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("temp home");
+        home
+    }
+
+    #[test]
+    fn newest_prefers_the_later_of_viewed_and_updated_and_skips_archived() {
+        let home = temp_home("pref");
+        seed(
+            &home,
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
+             INSERT INTO session_v2 VALUES ('ses_viewed', '/p', '200', '500', NULL);
+             INSERT INTO session_v2 VALUES ('ses_updated', '/p', '900', '100', NULL);
+             INSERT INTO session_v2 VALUES ('ses_archived', '/p', '9999', '9999', 'now');",
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
+            Some("ses_updated"),
+            "recency is the later of viewed and updated; archived never wins"
+        );
+    }
+
+    #[test]
+    fn newest_falls_back_to_the_v1_table_and_prefers_v2_when_it_answers() {
+        let home = temp_home("v1");
+        seed(
+            &home,
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_archived TEXT);
+             INSERT INTO session VALUES ('ses_v1', '/p', '700', NULL);",
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
+            Some("ses_v1"),
+            "no v2 table: the v1 table answers"
+        );
+        seed(
+            &home,
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
+             INSERT INTO session_v2 VALUES ('ses_v2', '/p', '10', '10', NULL);",
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
+            Some("ses_v2"),
+            "v2 answered: the stale v1 table must not override it"
+        );
+    }
+
+    #[test]
+    fn newest_refuses_other_directories_and_non_ses_ids_and_missing_dbs() {
+        let home = temp_home("refuse");
+        seed(
+            &home,
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated TEXT, time_viewed TEXT, time_archived TEXT);
+             INSERT INTO session_v2 VALUES ('ses_here', '/p', '100', '100', NULL);
+             INSERT INTO session_v2 VALUES ('not_ses', '/p', '900', '900', NULL);",
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
+            Some("ses_here"),
+            "a non-ses_ id is never a candidate"
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/elsewhere"),
+            None,
+            "another directory's sessions are not this row's candidate"
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(&home, "/p/").as_deref(),
+            Some("ses_here"),
+            "a trailing slash on the cwd is the same directory"
+        );
+        assert_eq!(
+            opencode_store_newest_session_for_directory(
+                &std::env::temp_dir().join("yggterm-ocnewest-missing-db"),
+                "/p"
+            ),
+            None,
+            "no db: this host cannot answer"
+        );
     }
 }

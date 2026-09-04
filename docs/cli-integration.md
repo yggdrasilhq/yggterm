@@ -1774,3 +1774,65 @@ Spawn two codex rows in one cwd on the GUI host against the owner host:
 distinct `chosen_id`s (or honest `no_candidate`), and ZERO two rows sharing
 one id; `identities_with_birth_alias` in `cli/identity_poll` must be > 0
 once the owner daemon has rotated.
+
+## Issue Heading 36: the store-candidate tier — a stampless cold restore lands in the newest store session for its cwd (2026-09-04)
+
+Issue 32's residual ("does NOT cover"): a cold restore where the anchor row
+carries NO `Viewing Tab Session Id` stamp — the mirror never saw the TUI
+(mounted before the mirror ran, or mounted and never interacted) — vouches
+nothing, and the ses_ guard degraded the compose into a FRESH EMPTY WINDOW.
+Measured live: 2026-09-04 22:56 (build 3.2.59, dev),
+`launch_contract {breach: ses_guard_degrade, action: launch, selector: "",
+declared_selector: "--session"}` — one more conversation abandoned by the
+empty-window answer.
+
+### The measured store
+
+`active_sessions` is the LIVE SERVICE API (`/api/session/active` +
+`/api/session` over HTTP) — dead exactly when a cold restore needs it (no
+TUI, no service). The durable truth is opencode2's own SQLite store at
+`~/.local/share/opencode/opencode.db`, which the title reader already
+probes. Schema measured on dev: `session_v2 (id, directory, title,
+time_created, time_updated, time_viewed, time_archived, …)` — everything
+the candidate needs; the v1 `session` table lacks `time_viewed` and holds
+stale stragglers (measured 2026-08-29).
+
+### The contract, as landed
+
+* **The vouch ladder** in `ensure_remote_runtime_agent_session` (an
+  OpenCode compose whose id is not `ses_`-shaped):
+  1. the focus stamp (`Viewing Tab Session Id`) — the service's per-tick
+     word, truth; landed as Issue 32;
+  2. the STORE CANDIDATE — the newest resumable session for the ROW'S OWN
+     CWD from the store db (`opencode_store_newest_session_for_directory`):
+     v2 first, v1 fallback (the first table that ANSWERS wins), recency =
+     the later of `time_viewed` and `time_updated`, archived rows excluded,
+     non-`ses_` ids never candidates;
+  3. today's fresh-launch degrade — the last resort for a row the store
+     cannot answer for either.
+* **The heuristic is honest about itself**: the candidate emits
+  `launch_contract` with its own breach kind, `store_candidate_resume`
+  (the probe's fourth rail), so the pane and the probe name the guess
+  instead of passing it off as focus truth. The focus stamp outranks it —
+  when the mirror SAW the row, the store's newest loses.
+* **Rails**: the candidate is bounded to the row's own cwd (N-windows-
+  one-cwd picks the newest, which is strictly closer to the owner's intent
+  than the empty window it replaces); a trailing slash on the cwd is the
+  same directory; unanswerable hosts (no db, unreadable) are `None` and
+  never read as absence; downstream, the composed id is `ses_`-shaped, so
+  the ses_ guard passes and the saved-session probe runs against an id the
+  store really holds.
+* **BUS LAW**: both vouch-tier emissions are `#[cfg(not(test))]` — the
+  existing focus-vouch emission (merged after the 1cb614bcf sweep) was
+  firing in CI test runs; gated in this lane.
+
+### What this issue does NOT cover
+
+* The row that was never persisted at all (nothing calls ensure): its
+  conversation re-materializes only through the startpage/folder-truth
+  surface (Issue 28's plane) or the mirror's active-tab spawn when the TUI
+  itself survived — a startpage candidate is a UI decision, not a restore
+  compose.
+* Other CLIs' cold-restore candidates — muse/agy hold per-conversation
+  artifacts the proc-marker walk already covers; a store scan for them
+  would need its own measured unit.
