@@ -35,6 +35,12 @@ mod resume_gate;
 mod scroll_mode;
 mod session_copy_policy;
 mod shell;
+// Overlay scroll-thumb geometry (XTERM-BUG: terminal-edge-unpaintable): the
+// testable statement of the thumb decision the JS mirrors in
+// shell/terminal_scripts.rs syncXtermScrollThumb. Marked allow(dead_code) the
+// same way scroll_mode is — the JS wiring consults it by mirror, not by call.
+#[allow(dead_code)]
+mod terminal_scrollbar_overlay;
 mod terminal_observe;
 mod terminal_protocol;
 mod terminal_retained_replay_policy;

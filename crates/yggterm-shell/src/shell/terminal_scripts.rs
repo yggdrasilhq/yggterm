@@ -1160,25 +1160,20 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }}
         }} catch (_reapError) {{}}
-        // XTERM-BUG: right-edge-glyph-clipped — ONE owner for the right gutter.
+        // XTERM-BUG: terminal-edge-unpaintable — the gutter var's remaining job.
         //
-        // `.xterm-screen` is deliberately narrower than the host by the
-        // scrollbar width (XTERM-BUG: scrollbar-not-draggable, below) and it
-        // clips: `overflow: hidden`. The grid proposal used to divide the FULL
-        // host width by the cell width, so it handed the terminal one more
-        // column than the paint box can show and the last column was clipped to
-        // a sliver — measured live on guihost at 3.0.45: cols 170 x 8px = 1360px of
-        // canvas inside a 1353px screen, i.e. 1 of the final column's 8 pixels
-        // visible. The user's symptom was exactly that: "sometimes a letter is
-        // missing on the rightmost edge, and widening the window brings it back"
-        // (widening changes the remainder, so whether the loss is visible on a
-        // given line depends on where the text ends).
-        //
-        // ⛔ Do NOT widen the screen back to 100% — that re-breaks the
-        // scrollbar hitbox. The gutter is a real reservation, so the honest fix
-        // is to compute the grid against the box that actually paints it. Every
-        // consumer of that 8px reads it from here, so the paint box and the grid
-        // can never drift apart again.
+        // This var used to be a LAYOUT reservation: `.xterm-screen` narrowed
+        // itself by it (XTERM-BUG: scrollbar-not-draggable) and the grid was
+        // proposed against the narrowed box (XTERM-BUG: right-edge-glyph-clipped)
+        // so paint box and grid could not drift. That reservation was exactly
+        // the right-edge strip no TUI cell could paint — measured live on guihost
+        // at 3.2.60: a 921x904 card painting a 912x900 canvas, a 9px right +
+        // 4px bottom edge every CLI showed (see docs/xterm-bugs.md). The
+        // scrollbar is now shell-drawn and overlays the grid, the screen and
+        // the grid are FULL host width, and the canvas stretches to the screen
+        // box — so the var sizes the OVERLAY THUMB only. It survives as a var
+        // (not a constant) because the thumb hides on the alternate screen and
+        // the number stays owner-tunable via __yggtermXtermScrollbarGutterPx.
         let lastAppliedScrollbarGutterPx = null;
         const syncScrollbarGutterVar = () => {{
             try {{
@@ -1190,18 +1185,15 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (host && host.style) {{
                     host.style.setProperty('--yggterm-scrollbar-gutter', gutterPx + 'px');
                 }}
-                // The grid proposal subtracts the SAME number — a transition
-                // between screens must re-fit or the columns lie.
-                fitTerminalToHost('scrollbar_gutter_changed');
             }} catch (_error) {{}}
         }};
         const terminalScrollbarGutterPx = () => {{
             // XTERM-BUG: gutter-steals-tui-width — on the ALTERNATE screen a
-            // full-screen TUI (opencode, grok, claude, any editor) repaints
-            // its own right edge every frame; scrollback does not exist, so
-            // the scrollbar reservation is pure theft: the TUI's last column
-            // lands under the clip or a dead 8px strip rides its right
-            // flank. Alternate screen → no gutter, full width, no D-pad.
+            // full-screen TUI owns its right edge every frame and scrollback
+            // does not exist, so the overlay thumb would be pure noise there.
+            // The thumb is the only consumer left (the grid is full width
+            // regardless — XTERM-BUG: terminal-edge-unpaintable), so on the
+            // alternate screen this returns 0 and the thumb hides.
             try {{
                 const active = term && term.buffer ? term.buffer.active : null;
                 if (active && active.type === 'alternate') {{
@@ -2623,11 +2615,14 @@ fn terminal_eval_script_with_canvas_renderer(
             const cellWidth = Math.max(1, terminalCssCellWidth());
             const cellHeight = Math.max(1, terminalCssCellHeight());
             const bottomGuardPx = Math.max(0, Number(window.__yggtermXtermFitBottomGuardPx || 2));
-            // XTERM-BUG: right-edge-glyph-clipped — the grid must be proposed
-            // against the width `.xterm-screen` actually paints into, which is
-            // the host MINUS the reserved scrollbar gutter. Dividing the full
-            // host width here handed out a column that lands under the clip.
-            const rightGutterPx = terminalScrollbarGutterPx();
+            // XTERM-BUG: terminal-edge-unpaintable — the grid is proposed
+            // against the FULL host width. The scrollbar no longer reserves a
+            // layout gutter (the shell draws its own overlay thumb above the
+            // grid), so subtracting a column here would strand a strip no TUI
+            // cell can ever paint. The canvas is CSS-stretched to the screen
+            // box, so the raster's integer-cell floor cannot strand one
+            // either — every host pixel belongs to a grid cell again.
+            const rightGutterPx = 0;
             const availableWidth = Math.max(0, Number(content.width || 0) - rightGutterPx);
             const availableHeight = Math.max(0, Number(content.height || 0) - bottomGuardPx);
             const pinned = shadowPinnedGrid();
@@ -3662,17 +3657,30 @@ fn terminal_eval_script_with_canvas_renderer(
                 #${{hostId}} .xterm-screen {{
                     overflow: hidden !important;
                     height: 100% !important;
-                    /* XTERM-BUG: scrollbar-not-draggable
-                       The screen layer stacks above .xterm-viewport in
-                       the xterm.js DOM. If it's full-width it covers
-                       the right-edge scrollbar slot and intercepts
-                       mouse clicks before they reach the native
-                       scrollbar. Reserve the scrollbar width on the
-                       right so the scrollbar is hit-testable. Matches
-                       the ::-webkit-scrollbar width rule below, and the
-                       SAME number the grid proposal subtracts — see
-                       XTERM-BUG: right-edge-glyph-clipped. */
-                    width: calc(100% - var(--yggterm-scrollbar-gutter, 8px)) !important;
+                    /* XTERM-BUG: terminal-edge-unpaintable
+                       The screen is FULL host width. It used to reserve the
+                       scrollbar gutter (XTERM-BUG: scrollbar-not-draggable)
+                       because the native scrollbar needed a hit-testable slot;
+                       the shell now draws its own overlay thumb above the
+                       grid, so no reservation survives — a TUI owns every
+                       column the PTY hands it, and the grid is proposed from
+                       this same full box (see proposedTerminalFitDimensions). */
+                    width: 100% !important;
+                }}
+                /* XTERM-BUG: terminal-edge-unpaintable — the canvas renderer
+                   rasters at INTEGER cell sizes (floor of the font's fractional
+                   metrics: 8.01x18.08 cells paint 8x18 raster), so the canvas
+                   natural box is up to one cell short of the screen box per
+                   axis. Stretch every render canvas to the screen box: the
+                   sub-1% scale is invisible, mouse mapping stays faithful
+                   (xterm converts via its own css cell dims, and the stretched
+                   cell equals them to within a pixel), and a TUI's background
+                   reaches the card's right and bottom edges. Scoped to
+                   .xterm-screen so the cursor helper canvas (a .xterm child)
+                   keeps its natural size. */
+                #${{hostId}} .xterm-screen canvas {{
+                    width: 100% !important;
+                    height: 100% !important;
                 }}
                 /* XTERM-BUG: scrollable-element-zero-height (xterm.js 6)
                    xterm.js 6 moved .xterm-screen INSIDE a new VS Code-derived
@@ -3696,18 +3704,17 @@ fn terminal_eval_script_with_canvas_renderer(
                 #${{hostId}} .xterm-viewport {{
                     height: 100% !important;
                     overflow-x: hidden !important;
-                    /* Sleek thin scrollbar — fixed width at rest and
-                       on drag, so clicking the thumb does NOT cause
-                       the browser to widen and shift it 2-3px left
-                       (a UX wart of WebKit's default :active scrollbar
-                       behavior). Thumb is the only thing that changes
-                       on hover (color), not width. The screen layer
-                       reserves an 8px right gutter to match. */
-                    scrollbar-width: thin !important;
-                    scrollbar-color: rgba(120, 142, 166, 0.36) transparent !important;
-                }}
-                #${{hostId}} .xterm-viewport:hover {{
-                    scrollbar-color: rgba(140, 162, 186, 0.78) transparent !important;
+                    /* XTERM-BUG: terminal-edge-unpaintable — the native
+                       scrollbar is fully hidden (both the standard-property
+                       and the WebKit pseudos below): a visible scrollbar
+                       needs a reserved layout strip, and that strip is
+                       exactly the right edge no TUI could paint. Scrolling
+                       itself is untouched — wheel and programmatic scrollTop
+                       work with a zero-width scrollbar — and the shell draws
+                       its own draggable thumb overlay (see
+                       ensureXtermScrollThumb) when scrollback exists. */
+                    scrollbar-width: none !important;
+                    scrollbar-color: transparent transparent !important;
                 }}
                 /* line-height is intentionally NOT !important: xterm.js 6's DOM
                    renderer sets each row div's inline line-height to the exact cell
@@ -3805,56 +3812,41 @@ fn terminal_eval_script_with_canvas_renderer(
                     color: inherit !important;
                     -webkit-text-fill-color: currentColor !important;
                 }}
-                /* WebKit / Chromium thin sleek scrollbar to match Firefox.
-                   Width is fixed at 8px across rest/hover/active so that
-                   clicking the thumb doesn't trigger WebKit's default
-                   "fatter scrollbar while dragging" behavior — which
-                   produced a 2-3px leftward shift and a chunky drag
-                   highlight on rest-to-active transition. Color is the
-                   only thing that changes; transition keeps it smooth. */
+                /* XTERM-BUG: terminal-edge-unpaintable — the native scrollbar
+                   is display:none (a visible one needs a reserved layout
+                   strip). The shell's overlay thumb below carries the same
+                   look the native thumb had: 36px min target, fixed 8px slot,
+                   color-only state changes, slimming transparent borders. */
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
-                    width: ${{terminalScrollbarGutterPx()}}px !important;
+                    width: 0 !important;
                     height: 0 !important;
-                    background: transparent !important;
+                    display: none !important;
                 }}
-                #${{hostId}} .xterm-viewport::-webkit-scrollbar-track {{
-                    background: transparent !important;
-                }}
-                #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb {{
-                    background: rgba(120, 142, 166, 0.36) !important;
-                    border-radius: 4px !important;
-                    background-clip: padding-box !important;
-                    /* 36px min-height for a comfortable click target.
-                       8px scrollbar slot stays fixed across states; the
-                       transparent border below trims the VISIBLE thumb
-                       width on hover/active per user preference: full
-                       8px at rest, slimmer when actively engaged. */
+                #${{hostId}} .yggterm-xterm-scroll-thumb {{
+                    position: absolute !important;
+                    top: 0 !important;
+                    right: 0 !important;
+                    width: var(--yggterm-scrollbar-gutter, 8px) !important;
                     min-height: 36px !important;
+                    border-radius: 4px !important;
+                    background: rgba(120, 142, 166, 0.36) !important;
+                    background-clip: padding-box !important;
                     border: 0 solid transparent !important;
+                    z-index: 30 !important;
+                    cursor: default !important;
                     transition: background-color 120ms ease,
                                 border-width 120ms ease !important;
                 }}
-                #${{hostId}} .xterm-viewport:hover::-webkit-scrollbar-thumb {{
-                    background: rgba(140, 162, 186, 0.78) !important;
-                    background-clip: padding-box !important;
-                    /* 1px transparent border on each side → 6px visible
-                       width when the viewport is hovered. */
-                    border: 1px solid transparent !important;
-                }}
-                #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:hover {{
+                #${{hostId}} .yggterm-xterm-scroll-thumb:hover {{
                     background: rgba(150, 172, 196, 0.78) !important;
-                    background-clip: padding-box !important;
                     border: 1px solid transparent !important;
                 }}
-                #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:active {{
+                #${{hostId}} .yggterm-xterm-scroll-thumb[data-dragging="1"] {{
                     background: rgba(170, 188, 210, 0.85) !important;
-                    background-clip: padding-box !important;
-                    /* 2px transparent border each side → 4px visible
-                       width while actively dragging — slimmest state. */
                     border: 2px solid transparent !important;
                 }}
-                #${{hostId}} .xterm-viewport::-webkit-scrollbar-corner {{
-                    background: transparent !important;
+                #${{hostId}} .yggterm-xterm-scroll-thumb[data-hidden="1"] {{
+                    display: none !important;
                 }}
             `;
             document.head.appendChild(runtimeStyle);
@@ -5705,11 +5697,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}, true);
             }}
             syncFocusClass();
-            // XTERM-BUG: scrollbar-not-draggable — leave the screen narrower
-            // than the host by the scrollbar width so the right-edge
-            // scrollbar slot is hit-testable by the native browser drag.
+            // XTERM-BUG: terminal-edge-unpaintable — the screen is FULL host
+            // width and height: the scrollbar is an overlay the shell draws
+            // (ensureXtermScrollThumb), so no strip is reserved and a TUI can
+            // paint every host pixel. The canvases stretch via the scoped CSS
+            // rule, covering the raster's integer-cell shortfall.
             if (screen) {{
-                screen.style.width = `calc(100% - ${{terminalScrollbarGutterPx()}}px)`;
+                screen.style.width = '100%';
                 screen.style.height = '100%';
                 screen.style.position = 'relative';
                 screen.style.overflow = 'hidden';
@@ -5836,6 +5830,126 @@ fn terminal_eval_script_with_canvas_renderer(
         const visiblePaintMinIntervalMs = 120;
         const visiblePaintFullRefreshMinIntervalMs = 750;
         let rebuildAttempts = 0;
+        // XTERM-BUG: terminal-edge-unpaintable — the native scrollbar is
+        // hidden (a visible one needs a reserved layout strip, and that strip
+        // was exactly the right edge no TUI could paint). This shell-drawn
+        // thumb carries the drag affordance instead: a host child ABOVE the
+        // grid, visible only when scrollback exists, dragged with pointer
+        // capture. Geometry mirrors the Rust decision module
+        // terminal_scrollbar_overlay::scroll_thumb_geometry (keep in sync —
+        // the guard test names both).
+        const ensureXtermScrollThumb = () => {{
+            let thumb = host.querySelector('.yggterm-xterm-scroll-thumb');
+            if (thumb) {{
+                return thumb;
+            }}
+            try {{
+                if (window.getComputedStyle(host).position === 'static') {{
+                    host.style.position = 'relative';
+                }}
+                thumb = document.createElement('div');
+                thumb.className = 'yggterm-xterm-scroll-thumb';
+                thumb.setAttribute('data-hidden', '1');
+                let dragState = null;
+                thumb.addEventListener('mousedown', (event) => {{
+                    try {{
+                        const viewportElement = host.querySelector('.xterm-viewport');
+                        if (!viewportElement) {{
+                            return;
+                        }}
+                        event.preventDefault();
+                        event.stopPropagation();
+                        thumb.setAttribute('data-dragging', '1');
+                        dragState = {{
+                            start_client_y: Number(event.clientY || 0),
+                            start_scroll_top: Number(viewportElement.scrollTop || 0),
+                        }};
+                        try {{ thumb.setPointerCapture(event.pointerId); }} catch (_e) {{}}
+                    }} catch (_error) {{}}
+                }}, true);
+                thumb.addEventListener('mousemove', (event) => {{
+                    try {{
+                        if (!dragState) {{
+                            return;
+                        }}
+                        const viewportElement = host.querySelector('.xterm-viewport');
+                        if (!viewportElement) {{
+                            return;
+                        }}
+                        const scrollable = Number(viewportElement.scrollHeight || 0)
+                            - Number(viewportElement.clientHeight || 0);
+                        if (scrollable <= 0) {{
+                            return;
+                        }}
+                        const maxThumbOffset = Math.max(
+                            1,
+                            Number(viewportElement.clientHeight || 0)
+                                - Number(thumb.offsetHeight || 0)
+                        );
+                        const dy = Number(event.clientY || 0) - dragState.start_client_y;
+                        viewportElement.scrollTop = dragState.start_scroll_top
+                            + dy * (scrollable / maxThumbOffset);
+                        event.stopPropagation();
+                    }} catch (_error) {{}}
+                }}, true);
+                const endDrag = (event) => {{
+                    if (!dragState) {{
+                        return;
+                    }}
+                    dragState = null;
+                    thumb.removeAttribute('data-dragging');
+                    try {{
+                        if (event) {{ thumb.releasePointerCapture(event.pointerId); }}
+                    }} catch (_e) {{}}
+                }};
+                thumb.addEventListener('mouseup', endDrag, true);
+                thumb.addEventListener('pointercancel', endDrag, true);
+                host.appendChild(thumb);
+                return thumb;
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
+        const syncXtermScrollThumb = () => {{
+            try {{
+                const thumb = ensureXtermScrollThumb();
+                const viewportElement = host.querySelector('.xterm-viewport');
+                if (!thumb || !viewportElement) {{
+                    return;
+                }}
+                const scrollHeight = Number(viewportElement.scrollHeight || 0);
+                const clientHeight = Number(viewportElement.clientHeight || 0);
+                const scrollTop = Number(viewportElement.scrollTop || 0);
+                const visible = scrollHeight > clientHeight + 1 && clientHeight > 0;
+                const gutterPx = Math.max(0, Number(terminalScrollbarGutterPx() || 0));
+                if (!visible || gutterPx <= 0) {{
+                    if (thumb.getAttribute('data-hidden') !== '1') {{
+                        thumb.setAttribute('data-hidden', '1');
+                    }}
+                    return;
+                }}
+                const thumbHeight = Math.max(36, trackPxRatio(clientHeight, scrollHeight));
+                const maxThumbOffset = Math.max(0, clientHeight - thumbHeight);
+                const scrollable = Math.max(1, scrollHeight - clientHeight);
+                const thumbOffset = Math.max(0, Math.min(
+                    maxThumbOffset,
+                    (scrollTop / scrollable) * maxThumbOffset
+                ));
+                const nextHeight = Math.round(thumbHeight) + 'px';
+                const nextTop = Math.round(thumbOffset) + 'px';
+                if (thumb.style.height !== nextHeight) {{ thumb.style.height = nextHeight; }}
+                if (thumb.style.top !== nextTop) {{ thumb.style.top = nextTop; }}
+                if (thumb.style.width !== gutterPx + 'px') {{ thumb.style.width = gutterPx + 'px'; }}
+                if (thumb.getAttribute('data-hidden') !== '0') {{
+                    thumb.setAttribute('data-hidden', '0');
+                }}
+            }} catch (_error) {{}}
+        }};
+        const trackPxRatio = (clientHeight, scrollHeight) => {{
+            return clientHeight > 0 && scrollHeight > 0
+                ? (clientHeight * clientHeight) / scrollHeight
+                : 0;
+        }};
         const emitPaint = () => {{
             rebindCurrentHost('emit_paint', true);
             const xtermRoot = host.querySelector('.xterm');
@@ -5850,6 +5964,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 || Boolean(rowsLayer);
             normalizeLowContrastGlyphs();
             applySoftwareCanvasLayerOptimization('paint');
+            syncXtermScrollThumb();
             // `visible` above is satisfied by ANY child in the host — including an
             // empty `.xterm` husk left behind by a detached term. It reported
             // `true` 43 times over a viewport that never painted a glyph. Record
