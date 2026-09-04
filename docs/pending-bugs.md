@@ -18,6 +18,45 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.56] A FORCED hot-restart HANDOFF LEFT THE NEW DAEMON OWNED:0 AND THE GUI AT ZERO ROWS FOR ~15 MINUTES — THE PRESERVED OWNER WAS NEVER ADOPTED
+
+**Status:** OPEN
+
+Witnessed 2026-09-05 00:52–01:07 on the gui host (dev), during the wry
+0.56.1 substrate deploy (lane/dev/vendor-wry-056, main c1b1d6cf5):
+
+- `server monitor --scenario hot-restart` (no --force, then with --force)
+  answered `hot_update_handoff_used: true` — "hot update handoff started:
+  preserving 24 live terminal runtime(s)" — and then
+  `ready: {deferred: true, reason: "hot_update_handoff_preserved_owner"}`.
+  The successor bound the canonical `server-3-2-60.sock` (owning ZERO
+  runtimes) while the predecessor kept all 24 PTYs on the renamed
+  `.retired-<pid>` socket, indefinitely.
+- The GUI's own paint gate reported the truth the whole time:
+  `client_sessions_awaiting_adoption: true`, `last_transition:
+  "resumed_timed_out"`, and `server app state` showed rows: 0 for ~15
+  minutes (clean succession per the handover contract is ~8 s).
+- Trace shows the reconcile loop spinning without taking the PTYs:
+  `preserved_owner_deep_reconcile_deferred_on_load` → `…_ran` →
+  `preserved_owner_removed` ×3 — yet `preserved_owner_present: true`.
+- Recovery that WORKED (documented orphan path): SIGTERM the owned:0
+  successor (safe — it owns nothing), `rm` its now-dangling canonical
+  socket, restart the GUI with the full env copy → the GUI fell back to
+  the preserved owner, all rows returned (1025 listed, the original 24
+  spot-checked live), and the substrate upgrade reached the paint path
+  through the relaunched GUI binary.
+- Follow-on wound, same family: one churn-spawned codex row
+  (`01a06d75`) bootstrap-loops on codex's own writer lock
+  ("thread already has an active writer", code -32600) — the twin-writer
+  seat-conflict class of [[daemon-handover-contract]] family 3, this
+  time ACROSS the preserved-owner boundary.
+
+The successor-election/adoption step owes an answer: when the preserved
+owner stays healthy, WHO adopts the PTYs and WHEN? If the design is
+"owner keeps serving until quiet", then the successor must not bind the
+canonical socket until adoption is possible — binding it first is what
+stranded the GUI at zero rows.
+
 ## ⛔ [11.55] TWO ENTRIES CLAIM VERIFIED-FIXED AND STILL OCCUPY THE QUEUE — THE GATE STAYS RED UNTIL THEIR LANES DELETE THEM
 
 **Status:** OPEN
