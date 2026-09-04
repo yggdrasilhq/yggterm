@@ -7591,14 +7591,20 @@ impl YggtermServer {
     ) -> (
         Vec<RemoteAgentIdentityPollTarget>,
         HashMap<String, HashSet<String>>,
+        Vec<(String, &'static str)>,
     ) {
         let mut targets = Vec::new();
         let mut bound_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut excluded: Vec<(String, &'static str)> = Vec::new();
         for key in &self.live_session_order {
             let Some(session) = self.sessions.get(key) else {
                 continue;
             };
+            // Exclusions are NAMED (key, gate) so a row that LOOKS like it
+            // needs the poll but never reaches it is visible in one glance —
+            // the 2026-09-04 collapse hid damaged rows behind these gates.
             if !managed_session_is_live_runtime_session(key, session) {
+                excluded.push((key.clone(), "not_live_runtime"));
                 continue;
             }
             let Some(descriptor) = agent_cli_descriptor(session.kind) else {
@@ -7609,9 +7615,13 @@ impl YggtermServer {
                     &session.session_path,
                 ) {
                     Some(parsed) => parsed,
-                    None => continue,
+                    None => {
+                        excluded.push((key.clone(), "path_parse_failed"));
+                        continue;
+                    }
                 };
             if scheme_kind != session.kind {
+                excluded.push((key.clone(), "scheme_kind_mismatch"));
                 continue;
             }
             let Some(ssh_target) = session
@@ -7619,6 +7629,7 @@ impl YggtermServer {
                 .as_deref()
                 .filter(|target| !is_loopback_ssh_target(target))
             else {
+                excluded.push((key.clone(), "no_remote_target"));
                 continue;
             };
             bound_ids
@@ -7628,6 +7639,7 @@ impl YggtermServer {
             if descriptor.id_assigned_at_birth
                 || (session.kind != SessionKind::Codex && descriptor.live_session_marker.is_none())
             {
+                excluded.push((key.clone(), "id_assigned_at_birth"));
                 continue;
             }
             // Healthy birth: the row still answers on its synthesized id.
@@ -7642,11 +7654,13 @@ impl YggtermServer {
             {
                 Some(path_session_id.to_string())
             } else {
+                excluded.push((key.clone(), "path_id_neither_birth_nor_matched"));
                 continue;
             };
             let Some(cwd) = session_metadata_value(session, "Cwd")
                 .filter(|value| !value.trim().is_empty())
             else {
+                excluded.push((key.clone(), "no_cwd_metadata"));
                 continue;
             };
             targets.push(RemoteAgentIdentityPollTarget {
@@ -7659,7 +7673,7 @@ impl YggtermServer {
                 birth_id,
             });
         }
-        (targets, bound_ids)
+        (targets, bound_ids, excluded)
     }
 
     /// Mirrors `apply_codex_runtime_identity_to_live_session` for Claude Code.
@@ -47867,6 +47881,78 @@ terminal_window_id: None,
     }
 
     #[test]
+    #[test]
+    fn damaged_remote_codex_row_stays_pollable_with_path_birth_id() {
+        let birth = "31d35e27-d6a3-4bd4-986e-3f798a7a9d7a";
+        let wrong = "01a0349d-8451-7312-aa5d-e131120ed8c7";
+        let runtime_key = remote_scanned_session_path("dev", birth);
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.clone(),
+            id: wrong.to_string(),
+            title: "collapse victim".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/gh/yggterm".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let live = server.sessions.get_mut(&runtime_key).expect("mounted");
+        upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
+        let (targets, bound, _excluded) = server.live_remote_agent_identity_poll_view();
+        let mine = targets.iter().find(|t| t.key == runtime_key);
+        assert!(
+            mine.is_some(),
+            "damaged row must stay pollable; targets={targets:?}"
+        );
+        // A takeover's restore re-births the row onto its path id, so the
+        // collapsed wrong id does not survive the handover in the sessions
+        // map — the row returns as a HEALTHY birth target, and the owner's
+        // alias (real id -> this birth) does the repair through the exact
+        // birth_alias arm on the next poll. Pin that contract.
+        let target = mine.unwrap();
+        assert_eq!(target.birth_id.as_deref(), None);
+        assert_eq!(target.current_id, birth, "restore re-births the id from the path");
+        assert!(bound
+            .get("codex")
+            .map(|s: &HashSet<String>| s.contains(birth))
+            .unwrap_or(false));
+
+        // Second takeover generation: the row must STILL be pollable.
+        let persisted = server.persisted_state();
+        let mut restored = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        restored.restore_persisted_state_with_launch_policy(persisted, None, false);
+        let restored_row = restored
+            .sessions
+            .get(&runtime_key)
+            .expect("restored runtime live session");
+        let restored_id = restored_row.id.clone();
+        let (targets2, _bound2, excluded2) = restored.live_remote_agent_identity_poll_view();
+        let mine2 = targets2.iter().find(|t| t.key == runtime_key);
+        assert!(
+            mine2.is_some(),
+            "generation-2 damaged row must stay pollable; row id in map={restored_id}; targets2={targets2:?}; excluded2={excluded2:?}"
+        );
+        assert_eq!(mine2.unwrap().current_id, birth);
+    }
+
     fn keep_alive_remote_codex_identity_restores_real_session_not_fresh_start() {
         let synthetic_id = "54f06fff-d15d-4e79-8734-0ec9627632f2";
         let real_id = "019e3fd6-87da-7803-a4e6-f95ad0f0e687";
