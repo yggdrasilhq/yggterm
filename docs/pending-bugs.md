@@ -26956,3 +26956,53 @@ for as long as it owns the foreground.
 
 **Code location:** the tenants walker behind `server terminal tenants`
 (foreground pgrp resolution).
+
+
+---
+
+## ⛔ [11.59] MOUSE-CODE TUIS ARE DEAF: THE XTERM.JS 6 SCROLLABLE ELEMENT EATS CANVAS WHEELS, AND REAL CLICKS ARRIVE LATE AND DUPLICATED
+
+**Status:** OPEN — root-caused 2026-09-05, fix owed
+
+Owner report ("with mouse codes like opencode, the cursor goes I-beam and
+scrolling does not occur"). Instrumented on the GUI host with a mock-tui
+row (`cat -v` inside alt-screen with DECSET 1000+1002+1006 armed) and REAL
+OS input (`server app pointer click` — not synthetic DOM events):
+
+**Measured (build 3.2.60+, GUI rotated onto the fullbleed main):**
+- xterm's parser applied the modes (`term.modes.mouseTrackingMode = "drag"`);
+  `coreMouseService` latched `protocol=DRAG, encoding=SGR`;
+  `areMouseEventsActive=true`; gates open; the data-out path alive
+  (direct `coreService.triggerDataEvent` reached the app).
+- A REAL OS click inside the grid produced SGR press/release/press
+  (`^[[<0;87;33M ^[[<32;87;33m ^[[<0;87;33M`) — arriving LATE (after a
+  later daemon-side byte) and with a STUCK second press (no matching
+  release): one physical click, three encoded events, button state left
+  pressed.
+- Wheels dispatched on `.xterm-screen` NEVER reached the app; the same
+  wheel dispatched directly on `.xterm` produced `^[[<65;13;3M`
+  immediately. The DOM chain is
+  `.xterm-screen → .xterm-scrollable-element → .xterm`: the xterm.js 6
+  ScrollableElement consumes canvas-originated wheel events before
+  `bindMouse()`'s wheel handler (bound on `.xterm`, bubble phase) can see
+  them. The second `onProtocolChange` subscriber sets the scrollable
+  element's `handleMouseWheel:false` when tracking arms — measured
+  insufficient: the event still dies between the layers.
+- `mouse_mode_probe` (the observability that should have caught this)
+  emitted ZERO events across the whole window despite the parser applying
+  the DECSETs — the witness itself is dark.
+
+**Fix shape:** when the mouse protocol arms, the ScrollableElement must
+PASS wheel events through (no consume/preventDefault) — either the vendored
+xterm 6 patch flips its wheel handler to pass-through under
+`handleMouseWheel:false`, or `bindMouse()` binds its wheel handler
+capture-phase on `.xterm` so it outranks the scrollable layer. The click
+delay/duplication needs its own probe (WebKitGTK auxclick synthesis is the
+first suspect for the third event). `mouse_mode_probe` must fire on every
+DECSET the parser applies — fix its attach point and it would have caught
+this class a campaign ago.
+
+**Falsifier:** run `tools/mock-tui-opentui` `mouse-probe` scenario in a
+row; `server app pointer click` + (once shipped) `pointer scroll` — the
+app's echo must show exactly press/release per click and one SGR wheel per
+notch, instantly; `mouse_mode_probe` events present per DECSET.
