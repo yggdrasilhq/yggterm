@@ -6604,12 +6604,32 @@ impl DaemonRuntime {
         let mut refreshed = 0usize;
         for key in keys {
             let runtime_path = self.terminal_runtime_key_for_path(&key);
-            let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
-                continue;
+            // The terminal-map pid dies with every daemon handover: a
+            // successor holds addresses, not runtimes, and the row's PTY
+            // belongs to a preserved owner. This used to be a bare
+            // `else { continue }` — the silent skip that starved the
+            // "Codex Session" stamp for every fresh-spawn codex row across
+            // every takeover (0 stamps on the dev fleet host since 3.2.33),
+            // which starved the birth-alias export and drove the GUI host's
+            // identity poll to its cwd guess (the 2026-09-04 collapse).
+            let pid = match self.terminals.session_process_id(&runtime_path) {
+                Some(pid) => pid,
+                None => match self.preserved_owner_terminal_pid(&runtime_path) {
+                    Some(pid) => pid,
+                    None => {
+                        Self::note_identity_probe_unresolved(&key, "terminal_pid_unknown");
+                        continue;
+                    }
+                },
             };
             let Some(identity) = self.codex_runtime_identity_for_pid(pid) else {
+                // Expected while a codex TUI sits on its picker (no rollout
+                // fd yet) — named so the expected wait and the starvation are
+                // distinguishable in the trace.
+                Self::note_identity_probe_unresolved(&key, "no_transcript_fd");
                 continue;
             };
+            Self::note_identity_probe_resolved(&key);
             if self.server.apply_codex_runtime_identity_to_live_session(
                 &key,
                 &identity,
@@ -6632,6 +6652,79 @@ impl DaemonRuntime {
             }
         }
         refreshed
+    }
+
+    /// The root pid of a row whose PTY this daemon no longer holds directly —
+    /// a preserved owner (a predecessor daemon) serves it. The owner's
+    /// snapshot already carries `terminal_process_id`, so ask for it instead
+    /// of silently skipping the row. Memoized per key for 60 s, refusals
+    /// included, so persist() never queues behind a sick peer.
+    fn preserved_owner_terminal_pid(&mut self, runtime_key: &str) -> Option<u32> {
+        const PID_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        static OWNER_PID_MEMO: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<String, (std::time::Instant, Option<u32>)>>,
+        > = std::sync::OnceLock::new();
+        let memo = OWNER_PID_MEMO.get_or_init(std::sync::Mutex::default);
+        if let Ok(guard) = memo.lock() {
+            if let Some((at, pid)) = guard.get(runtime_key) {
+                if at.elapsed() < PID_TTL {
+                    return *pid;
+                }
+            }
+        }
+        let resolved = (|| {
+            let endpoint = self.preserved_owner_endpoint_for_request(runtime_key)?;
+            let Ok((snapshot, _message)) = snapshot(&endpoint) else {
+                return None;
+            };
+            snapshot
+                .live_sessions
+                .iter()
+                .chain(snapshot.active_session.iter())
+                .find(|session| session.session_path == runtime_key)
+                .and_then(|session| session.terminal_process_id)
+        })();
+        if let Ok(mut guard) = memo.lock() {
+            guard.insert(runtime_key.to_string(), (std::time::Instant::now(), resolved));
+        }
+        resolved
+    }
+
+    /// Edge-triggered naming of a live self-minting row whose identity could
+    /// not be measured: emits only when the (row, reason) pair is new or
+    /// changed, so a picker-stage wait costs one event, not one per persist.
+    fn note_identity_probe_unresolved(session_path: &str, reason: &str) {
+        static LAST_REASON: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+            std::sync::OnceLock::new();
+        let last = LAST_REASON.get_or_init(std::sync::Mutex::default);
+        let emit = match last.lock() {
+            Ok(mut guard) => {
+                if guard.len() > 1024 {
+                    guard.clear();
+                }
+                guard.insert(session_path.to_string(), reason.to_string()).as_deref() != Some(reason)
+            }
+            Err(_) => true,
+        };
+        if emit {
+            #[cfg(not(test))]
+            yggterm_core::cli_plane::emit_agent_identity_probe_unresolved(
+                "daemon",
+                session_path,
+                reason,
+            );
+        }
+    }
+
+    /// Clears the unresolved marker so a row that starves again later
+    /// re-announces instead of being suppressed by its old silence.
+    fn note_identity_probe_resolved(session_path: &str) {
+        static LAST_REASON: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+            std::sync::OnceLock::new();
+        let last = LAST_REASON.get_or_init(std::sync::Mutex::default);
+        if let Ok(mut guard) = last.lock() {
+            guard.remove(session_path);
+        }
     }
 
     /// The Claude Code twin of `codex_runtime_identity_for_pid` — memoized for
@@ -14752,10 +14845,23 @@ fn normalize_cwd_for_identity_match(cwd: &str) -> String {
 /// paired only when its real session id differs from the row's synthesized id
 /// and has not already been claimed, so two rows never collapse onto one
 /// transcript.
+///
+/// ⛔ Hardened after the 2026-09-04 collapse (every codex row on one shared
+/// transcript, resume refused with "owned by another process"):
+/// - the alias arm also accepts the row's PATH-carried birth id
+///   (`target.birth_id`), so a row a previous poll froze on a wrong id can
+///   repair instead of being wrong forever;
+/// - the cwd guess refuses identities the owner daemon already aliased to one
+///   of its own rows (`birth_session_id.is_some()`) and identities bound to
+///   any other live remote row (`remote_bound_ids`). The guess runs on every
+///   poll but `claimed` only lives for one tick, so without a cross-tick
+///   ownership guard each new row re-claimed the same lexicographically-first
+///   transcript the previous row had already taken.
 fn match_agent_identities_to_targets(
     group: &[crate::RemoteAgentIdentityPollTarget],
     identities: &[crate::LocalAgentCliIdentity],
-) -> Vec<(String, SessionKind, crate::LocalAgentCliIdentity)> {
+    remote_bound_ids: &HashSet<(String, String)>,
+) -> Vec<(String, SessionKind, crate::LocalAgentCliIdentity, &'static str)> {
     let by_birth_id: HashMap<(&str, &str), &crate::LocalAgentCliIdentity> = identities
         .iter()
         .filter_map(|identity| {
@@ -14779,17 +14885,30 @@ fn match_agent_identities_to_targets(
     let mut rebinds = Vec::new();
     for target in group {
         let kind_slug = yggterm_core::agent_cli::session_kind_label(target.kind);
-        // Exact owner-reported alias first. The previous cwd-only join fails
-        // for worktrees: Codex's transcript retains the checkout cwd it was
-        // born in while the yggterm wrapper correctly re-roots the resumed TUI
-        // into another worktree. The remote daemon already owns the precise
-        // synthetic UUID -> real transcript relation; use it before heuristics.
-        let identity = by_birth_id
-            .get(&(kind_slug, target.current_id.as_str()))
-            .copied()
-            .filter(|identity| {
-                identity.session_id != target.current_id
-                    && !claimed.contains(&(identity.kind.clone(), identity.session_id.clone()))
+        // Exact owner-reported alias first — from the row's current id when it
+        // is still the synthesized birth, else from the path-carried birth id
+        // (the repair arm). The previous cwd-only join fails for worktrees:
+        // Codex's transcript retains the checkout cwd it was born in while the
+        // yggterm wrapper correctly re-roots the resumed TUI into another
+        // worktree. The remote daemon already owns the precise synthetic UUID
+        // -> real transcript relation; use it before heuristics.
+        let alias_hit = |lookup_id: &str| {
+            by_birth_id
+                .get(&(kind_slug, lookup_id))
+                .copied()
+                .filter(|identity| {
+                    identity.session_id != target.current_id
+                        && !claimed.contains(&(identity.kind.clone(), identity.session_id.clone()))
+                })
+        };
+        let identity = alias_hit(target.current_id.as_str())
+            .map(|identity| (identity, "birth_alias"))
+            .or_else(|| {
+                target
+                    .birth_id
+                    .as_deref()
+                    .and_then(alias_hit)
+                    .map(|identity| (identity, "birth_key_alias"))
             })
             .or_else(|| {
                 // Only Codex publishes a trustworthy cwd in this wire. Muse
@@ -14806,17 +14925,28 @@ fn match_agent_identities_to_targets(
                     ))?
                     .iter()
                     .copied()
+                    // An identity the owner aliased to one of its own rows is
+                    // somebody's child; a cwd guess must never take it.
+                    .filter(|identity| identity.birth_session_id.is_none())
                     .find(|identity| {
                         identity.session_id != target.current_id
                             && !claimed
                                 .contains(&(identity.kind.clone(), identity.session_id.clone()))
+                            && !remote_bound_ids
+                                .contains(&(kind_slug.to_string(), identity.session_id.clone()))
+                            && !group.iter().any(|other| {
+                                other.key != target.key
+                                    && (other.current_id == identity.session_id
+                                        || other.birth_id.as_deref() == Some(identity.session_id.as_str()))
+                            })
                     })
+                    .map(|identity| (identity, "cwd_unique"))
             });
-        let Some(identity) = identity else {
+        let Some((identity, arm)) = identity else {
             continue;
         };
         claimed.insert((identity.kind.clone(), identity.session_id.clone()));
-        rebinds.push((target.key.clone(), target.kind, identity.clone()));
+        rebinds.push((target.key.clone(), target.kind, identity.clone(), arm));
     }
     rebinds
 }
@@ -14826,19 +14956,31 @@ fn match_agent_identities_to_targets(
 /// and emits one `cli/identity_poll` aggregate per kind. Codex retains cwd as a
 /// compatibility fallback; CLIs whose identity wire cannot report cwd never
 /// guess with it.
+///
+/// Since the 2026-09-04 collapse the poll also (a) repairs rows a previous
+/// tick froze on a wrong id, via the path-carried birth alias, (b) skips rows
+/// whose current id the owner has aliased back to this row's birth without
+/// burning an attempt, and (c) emits one edge-triggered
+/// `cli/agent_identity_decision` per row so a silent cross-wire can never
+/// happen again unnoticed.
+///
 /// Returns the number of rows rebound this tick.
 fn run_remote_agent_identity_poll_chore(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     attempts: &mut HashMap<String, u32>,
 ) -> Result<usize> {
-    let (targets, yggterm_home) = {
+    let (targets, remote_bound_ids, yggterm_home) = {
         let runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_read");
-        (
-            runtime
-                .server
-                .live_remote_agent_sessions_needing_identity_poll(),
-            resolve_yggterm_home().ok(),
-        )
+        let (targets, bound_ids_by_slug) = runtime.server.live_remote_agent_identity_poll_view();
+        // Flatten slug -> ids into (slug, id) pairs for the matcher's
+        // cross-tick ownership guard.
+        let bound_ids: HashSet<(String, String)> = bound_ids_by_slug
+            .into_iter()
+            .flat_map(|(slug, ids)| {
+                ids.into_iter().map(move |id| (slug.clone(), id))
+            })
+            .collect();
+        (targets, bound_ids, resolve_yggterm_home().ok())
     };
 
     // Forget attempt counters for rows that no longer need polling.
@@ -14866,7 +15008,17 @@ fn run_remote_agent_identity_poll_chore(
             .push(target);
     }
 
-    let mut rebinds: Vec<(String, SessionKind, crate::LocalAgentCliIdentity)> = Vec::new();
+    // Per-row decision capture for the edge-triggered probes below.
+    struct RowDecision {
+        slug: String,
+        verdict: &'static str,
+        arm: &'static str,
+        chosen: Option<String>,
+        cwd_candidates: usize,
+    }
+    let mut decisions: HashMap<String, RowDecision> = HashMap::new();
+    let mut rebinds: Vec<(String, SessionKind, crate::LocalAgentCliIdentity, &'static str)> =
+        Vec::new();
     let mut stats: HashMap<SessionKind, yggterm_core::cli_plane::CliIdentityPollStats> =
         HashMap::new();
     for target in machines.values().flatten() {
@@ -14892,10 +15044,6 @@ fn run_remote_agent_identity_poll_chore(
                 kind_stats.machines_queried += 1;
             }
         }
-        // Count the attempt for every row we are about to poll, regardless of outcome.
-        for target in group {
-            *attempts.entry(target.key.clone()).or_insert(0) += 1;
-        }
         let identities = match poll_remote_local_codex_identities(ssh_target, ssh_prefix.as_deref())
         {
             Ok(identities) => identities,
@@ -14905,10 +15053,51 @@ fn run_remote_agent_identity_poll_chore(
                         kind_stats.query_failures += 1;
                     }
                 }
+                // The row was polled and the wire failed it: count the attempt.
+                for target in group {
+                    *attempts.entry(target.key.clone()).or_insert(0) += 1;
+                }
                 warn!(ssh_target = %ssh_target, error = %error, "remote agent identity poll failed");
                 continue;
             }
         };
+        // A row whose current id names a live transcript the owner has aliased
+        // back to this row's birth is healthy. Drop it BEFORE the attempt
+        // budget — it costs nothing and proves nothing is wrong — and reset
+        // its budget, so a later genuine move gets the full allowance.
+        let identities_by_id: HashMap<&str, &crate::LocalAgentCliIdentity> = identities
+            .iter()
+            .map(|identity| (identity.session_id.as_str(), identity))
+            .collect();
+        let mut polled: Vec<crate::RemoteAgentIdentityPollTarget> = Vec::new();
+        for target in group {
+            let effective_birth = target
+                .birth_id
+                .as_deref()
+                .unwrap_or(target.current_id.as_str());
+            let satisfied = identities_by_id
+                .get(target.current_id.as_str())
+                .is_some_and(|identity| {
+                    identity.birth_session_id.as_deref() == Some(effective_birth)
+                });
+            let slug = yggterm_core::agent_cli::session_kind_label(target.kind).to_string();
+            if satisfied {
+                attempts.remove(&target.key);
+                decisions.insert(
+                    target.key.clone(),
+                    RowDecision {
+                        slug,
+                        verdict: "satisfied",
+                        arm: "none",
+                        chosen: Some(target.current_id.clone()),
+                        cwd_candidates: 0,
+                    },
+                );
+            } else {
+                *attempts.entry(target.key.clone()).or_insert(0) += 1;
+                polled.push(target.clone());
+            }
+        }
         for kind in kinds {
             let kind_slug = yggterm_core::agent_cli::session_kind_label(kind);
             let kind_identities = identities
@@ -14923,7 +15112,7 @@ fn run_remote_agent_identity_poll_chore(
                 .iter()
                 .filter(|identity| identity.birth_session_id.is_some())
                 .count();
-            kind_stats.exact_alias_candidates += group
+            kind_stats.exact_alias_candidates += polled
                 .iter()
                 .filter(|target| target.kind == kind)
                 .filter(|target| {
@@ -14934,7 +15123,7 @@ fn run_remote_agent_identity_poll_chore(
                 })
                 .count();
             if kind == SessionKind::Codex {
-                kind_stats.cwd_candidates += group
+                kind_stats.cwd_candidates += polled
                     .iter()
                     .filter(|target| target.kind == kind)
                     .filter(|target| {
@@ -14946,13 +15135,49 @@ fn run_remote_agent_identity_poll_chore(
                     .count();
             }
         }
-        rebinds.extend(match_agent_identities_to_targets(group, &identities));
+        rebinds.extend(match_agent_identities_to_targets(
+            &polled,
+            &identities,
+            &remote_bound_ids,
+        ));
+        // Unbound polled rows record WHY they got nothing, per target.
+        for target in &polled {
+            if decisions.contains_key(&target.key) {
+                continue;
+            }
+            let slug = yggterm_core::agent_cli::session_kind_label(target.kind).to_string();
+            let cwd_candidates = identities
+                .iter()
+                .filter(|identity| {
+                    identity.kind == slug
+                        && normalize_cwd_for_identity_match(&identity.cwd)
+                            == normalize_cwd_for_identity_match(&target.cwd)
+                })
+                .count();
+            decisions.insert(
+                target.key.clone(),
+                RowDecision {
+                    slug,
+                    verdict: "no_candidate",
+                    arm: "none",
+                    chosen: None,
+                    cwd_candidates,
+                },
+            );
+        }
     }
 
     let rebound_keys = rebinds
         .iter()
-        .map(|(key, _, _)| key.as_str())
+        .map(|(key, ..)| key.as_str())
         .collect::<HashSet<_>>();
+    for (key, _, identity, arm) in &rebinds {
+        if let Some(decision) = decisions.get_mut(key) {
+            decision.verdict = "bound";
+            decision.arm = *arm;
+            decision.chosen = Some(identity.session_id.clone());
+        }
+    }
     for target in machines
         .values()
         .flatten()
@@ -14965,12 +15190,70 @@ fn run_remote_agent_identity_poll_chore(
         if let Some(kind_stats) = stats.get_mut(&target.kind) {
             kind_stats.newly_exhausted += 1;
         }
+        if let Some(decision) = decisions.get_mut(&target.key) {
+            decision.verdict = "exhausted";
+        }
     }
-    for (_, kind, _) in &rebinds {
+    for (_, kind, ..) in &rebinds {
         if let Some(kind_stats) = stats.get_mut(kind) {
             kind_stats.rebinds += 1;
         }
     }
+
+    // Edge-triggered per-row decision probe: the join plane's camera. A
+    // collapse like 2026-09-04 is now a stream of `bound`/`cwd_unique`
+    // events naming the shared id within one tick, instead of silence.
+    {
+        static LAST_DECISION: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<String, (String, String, Option<String>)>>,
+        > = std::sync::OnceLock::new();
+        let last = LAST_DECISION
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for (key, decision) in &decisions {
+            let current = (
+                decision.verdict.to_string(),
+                decision.arm.to_string(),
+                decision.chosen.clone(),
+            );
+            if last.get(key) == Some(&current) {
+                continue;
+            }
+            #[cfg(not(test))]
+            yggterm_core::cli_plane::emit_agent_identity_decision(
+                "daemon",
+                yggterm_core::cli_plane::CliAgentIdentityDecision {
+                    slug: &decision.slug,
+                    session_path: key,
+                    verdict: decision.verdict,
+                    arm: decision.arm,
+                    chosen_id: decision.chosen.as_deref(),
+                    cwd_candidates: decision.cwd_candidates,
+                },
+            );
+        }
+        if let Ok(mut guard) = LAST_DECISION
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+        {
+            *guard = decisions
+                .iter()
+                .map(|(key, decision)| {
+                    (
+                        key.clone(),
+                        (
+                            decision.verdict.to_string(),
+                            decision.arm.to_string(),
+                            decision.chosen.clone(),
+                        ),
+                    )
+                })
+                .collect();
+        }
+    }
+
     let mut stats = stats.into_iter().collect::<Vec<_>>();
     stats.sort_by_key(|(kind, _)| yggterm_core::agent_cli::session_kind_label(*kind));
     for (kind, kind_stats) in stats {
@@ -14983,7 +15266,7 @@ fn run_remote_agent_identity_poll_chore(
 
     let mut applied = 0usize;
     let mut runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_apply");
-    for (key, kind, identity) in &rebinds {
+    for (key, kind, identity, _arm) in &rebinds {
         let changed = if *kind == SessionKind::Codex {
             runtime.server.apply_codex_runtime_identity_to_live_session(
                 key,
@@ -30223,6 +30506,7 @@ mod tests {
             ssh_prefix: None,
             cwd: cwd.to_string(),
             current_id: current_id.to_string(),
+            birth_id: None,
         }
     }
 
@@ -30251,7 +30535,7 @@ mod tests {
         let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
         let targets = vec![poll_target("codex-runtime://abc", "/home/user", synth)];
         let identities = vec![codex_identity(real, "/home/user")];
-        let rebinds = match_agent_identities_to_targets(&targets, &identities);
+        let rebinds = match_agent_identities_to_targets(&targets, &identities, &HashSet::new());
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].0, "codex-runtime://abc");
         assert_eq!(rebinds[0].2.session_id, real);
@@ -30269,7 +30553,7 @@ mod tests {
             "/home/user/proj",
         )];
         assert_eq!(
-            match_agent_identities_to_targets(&targets, &identities).len(),
+            match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).len(),
             1
         );
     }
@@ -30290,7 +30574,7 @@ mod tests {
         let mut identity = codex_identity(real, "/home/user/proj");
         identity.birth_session_id = Some(synth.to_string());
 
-        let rebinds = match_agent_identities_to_targets(&targets, &[identity]);
+        let rebinds = match_agent_identities_to_targets(&targets, &[identity], &HashSet::new());
 
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].2.session_id, real);
@@ -30302,7 +30586,7 @@ mod tests {
         // Row already carries the real id — nothing to rebind.
         let targets = vec![poll_target("k", "/home/user", id)];
         let identities = vec![codex_identity(id, "/home/user")];
-        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -30317,17 +30601,90 @@ mod tests {
             codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user"),
             codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/user"),
         ];
-        let rebinds = match_agent_identities_to_targets(&targets, &identities);
+        let rebinds = match_agent_identities_to_targets(&targets, &identities, &HashSet::new());
         assert_eq!(rebinds.len(), 2);
         let bound: HashSet<String> = rebinds
             .iter()
-            .map(|(_, _, id)| id.session_id.clone())
+            .map(|(_, _, id, _)| id.session_id.clone())
             .collect();
         assert_eq!(
             bound.len(),
             2,
             "two rows must bind to two distinct transcripts"
         );
+    }
+
+    /// The 2026-09-04 collapse, reduced: a row frozen on a WRONG real id by a
+    /// previous poll must be repairable through the birth id its PATH still
+    /// carries — the old matcher could only look the alias up by the current
+    /// id, which the collapse had already overwritten.
+    #[test]
+    fn damaged_row_repairs_through_the_path_carried_birth_alias() {
+        let birth = "11111111-2222-4333-8444-555555555555";
+        let wrong = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        let real = "019f5a3c-9b21-7e44-8c11-2f6d8a90e3b7";
+        let mut target = poll_target("remote-session://dev/example", "/home/user", wrong);
+        target.birth_id = Some(birth.to_string());
+        let mut identity = codex_identity(real, "/home/user/proj");
+        identity.birth_session_id = Some(birth.to_string());
+
+        let rebinds = match_agent_identities_to_targets(&[target], &[identity], &HashSet::new());
+
+        assert_eq!(rebinds.len(), 1);
+        assert_eq!(rebinds[0].2.session_id, real);
+        assert_eq!(rebinds[0].3, "birth_key_alias");
+    }
+
+    /// The other collapse arm: a transcript the owner daemon aliased to one
+    /// of its OWN rows is somebody's child. The cwd guess ran per tick with a
+    /// per-tick claimed set, so it re-claimed exactly such a transcript for a
+    /// new row and cross-wired every same-directory row onto one session.
+    #[test]
+    fn cwd_guess_never_takes_an_identity_the_owner_aliased_to_its_own_row() {
+        let synth = "11111111-2222-4333-8444-555555555555";
+        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        let targets = vec![poll_target("k", "/home/user", synth)];
+        let mut identity = codex_identity(real, "/home/user");
+        identity.birth_session_id = Some("owner-row-birth".to_string());
+        assert!(
+            match_agent_identities_to_targets(&targets, &[identity], &HashSet::new()).is_empty(),
+            "an owner-aliased transcript must never be cwd-claimed"
+        );
+    }
+
+    #[test]
+    fn cwd_guess_never_takes_an_identity_bound_to_another_live_remote_row() {
+        let synth = "11111111-2222-4333-8444-555555555555";
+        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        let targets = vec![poll_target("k", "/home/user", synth)];
+        let identity = codex_identity(real, "/home/user");
+        let mut bound = HashSet::new();
+        bound.insert(("codex".to_string(), real.to_string()));
+        assert!(
+            match_agent_identities_to_targets(&targets, &[identity], &bound).is_empty(),
+            "a transcript bound to another live remote row must never be re-claimed"
+        );
+    }
+
+    #[test]
+    fn match_codex_identities_still_spreads_two_rows_across_two_transcripts() {
+        // The per-tick spread the original design intended, kept green next
+        // to the collapse guards: N needing rows, N transcripts, one tick.
+        let targets = vec![
+            poll_target("s1", "/home/user", "11111111-1111-4111-8111-111111111111"),
+            poll_target("s2", "/home/user", "22222222-2222-4222-8222-222222222222"),
+        ];
+        let identities = vec![
+            codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user"),
+            codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/user"),
+        ];
+        let rebinds = match_agent_identities_to_targets(&targets, &identities, &HashSet::new());
+        assert_eq!(rebinds.len(), 2);
+        let bound: HashSet<String> = rebinds
+            .iter()
+            .map(|(_, _, id, _)| id.session_id.clone())
+            .collect();
+        assert_eq!(bound.len(), 2);
     }
 
     #[test]
@@ -30341,7 +30698,7 @@ mod tests {
             "019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "/home/user",
         )];
-        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -30358,7 +30715,7 @@ mod tests {
             storage_path: "/home/user/.claude/projects/x/y.jsonl".to_string(),
             birth_session_id: None,
         }];
-        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -30376,12 +30733,13 @@ mod tests {
         };
 
         assert!(
-            match_agent_identities_to_targets(&[target.clone()], &[identity.clone()]).is_empty(),
+            match_agent_identities_to_targets(&[target.clone()], &[identity.clone()], &HashSet::new())
+                .is_empty(),
             "Muse's placeholder cwd must never cross-wire two rows"
         );
 
         identity.birth_session_id = Some(birth.to_string());
-        let rebinds = match_agent_identities_to_targets(&[target], &[identity]);
+        let rebinds = match_agent_identities_to_targets(&[target], &[identity], &HashSet::new());
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].1, SessionKind::Muse);
         assert_eq!(rebinds[0].2.session_id, real);

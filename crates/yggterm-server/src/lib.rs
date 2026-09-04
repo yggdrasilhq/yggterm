@@ -7576,43 +7576,89 @@ impl YggtermServer {
     pub(crate) fn live_remote_agent_sessions_needing_identity_poll(
         &self,
     ) -> Vec<RemoteAgentIdentityPollTarget> {
-        self.live_session_order
-            .iter()
-            .filter_map(|key| {
-                let session = self.sessions.get(key)?;
-                if !managed_session_is_live_runtime_session(key, session) {
-                    return None;
-                }
-                let descriptor = agent_cli_descriptor(session.kind)?;
-                if descriptor.id_assigned_at_birth
-                    || (session.kind != SessionKind::Codex
-                        && descriptor.live_session_marker.is_none())
-                {
-                    return None;
-                }
-                let (scheme_kind, _machine_key, path_session_id) =
-                    yggterm_core::agent_scheme::parse_remote_agent_session_path(
-                        &session.session_path,
-                    )?;
-                if scheme_kind != session.kind || path_session_id != session.id {
-                    return None;
-                }
-                let ssh_target = session
-                    .ssh_target
-                    .as_deref()
-                    .filter(|target| !is_loopback_ssh_target(target))?;
-                let cwd = session_metadata_value(session, "Cwd")
-                    .filter(|value| !value.trim().is_empty())?;
-                Some(RemoteAgentIdentityPollTarget {
-                    key: key.clone(),
-                    kind: session.kind,
-                    ssh_target: ssh_target.to_string(),
-                    ssh_prefix: session.ssh_prefix.clone(),
-                    cwd,
-                    current_id: session.id.clone(),
-                })
-            })
-            .collect()
+        self.live_remote_agent_identity_poll_view().0
+    }
+
+    /// The identity-poll view: the rows needing a (re)bind, plus the ids of
+    /// EVERY live remote agent row by kind slug. The second element is the
+    /// cross-tick ownership guard — the cwd compatibility guess runs on every
+    /// poll while its `claimed` set only lives for one tick, so without the
+    /// full bound set it re-claimed the same transcript for a new row every
+    /// tick (the 2026-09-04 collapse: all codex rows on one shared id).
+    pub(crate) fn live_remote_agent_identity_poll_view(
+        &self,
+    ) -> (
+        Vec<RemoteAgentIdentityPollTarget>,
+        HashMap<String, HashSet<String>>,
+    ) {
+        let mut targets = Vec::new();
+        let mut bound_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        for key in &self.live_session_order {
+            let Some(session) = self.sessions.get(key) else {
+                continue;
+            };
+            if !managed_session_is_live_runtime_session(key, session) {
+                continue;
+            }
+            let Some(descriptor) = agent_cli_descriptor(session.kind) else {
+                continue;
+            };
+            let (scheme_kind, _machine_key, path_session_id) =
+                match yggterm_core::agent_scheme::parse_remote_agent_session_path(
+                    &session.session_path,
+                ) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+            if scheme_kind != session.kind {
+                continue;
+            }
+            let Some(ssh_target) = session
+                .ssh_target
+                .as_deref()
+                .filter(|target| !is_loopback_ssh_target(target))
+            else {
+                continue;
+            };
+            bound_ids
+                .entry(yggterm_core::agent_cli::session_kind_label(session.kind).to_string())
+                .or_default()
+                .insert(session.id.clone());
+            if descriptor.id_assigned_at_birth
+                || (session.kind != SessionKind::Codex && descriptor.live_session_marker.is_none())
+            {
+                continue;
+            }
+            // Healthy birth: the row still answers on its synthesized id.
+            // Repair: a previous poll already moved the id to a real CLI id —
+            // possibly a WRONG one (see the collapse note on `birth_id`).
+            // Such a row must stay pollable or the wrong id is permanent; the
+            // path still carries the birth id, so expose it for the alias join.
+            let birth_id = if path_session_id == session.id {
+                None
+            } else if looks_like_synthesized_uuidv4_session_id(&path_session_id)
+                && !looks_like_synthesized_uuidv4_session_id(&session.id)
+            {
+                Some(path_session_id.to_string())
+            } else {
+                continue;
+            };
+            let Some(cwd) = session_metadata_value(session, "Cwd")
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            targets.push(RemoteAgentIdentityPollTarget {
+                key: key.clone(),
+                kind: session.kind,
+                ssh_target: ssh_target.to_string(),
+                ssh_prefix: session.ssh_prefix.clone(),
+                cwd,
+                current_id: session.id.clone(),
+                birth_id,
+            });
+        }
+        (targets, bound_ids)
     }
 
     /// Mirrors `apply_codex_runtime_identity_to_live_session` for Claude Code.
@@ -14072,8 +14118,18 @@ pub(crate) struct RemoteAgentIdentityPollTarget {
     pub ssh_target: String,
     pub ssh_prefix: Option<String>,
     pub cwd: String,
-    /// The synthesized UUIDv4 id currently bound to the row.
+    /// The id currently bound to the row — a synthesized UUIDv4 on a healthy
+    /// unborn row, or whatever a previous poll moved it to.
     pub current_id: String,
+    /// The birth id carried by the row's PATH, when the current id is a real
+    /// CLI id that may be WRONG. The 2026-09-04 collapse froze one shared
+    /// wrong transcript id onto every same-directory codex row, and the old
+    /// `path id == session id` gate then hid each damaged row from every
+    /// later poll — the wrong id became permanent and every resume composed
+    /// against a transcript another process owned. The path still carries the
+    /// birth id, so the repair join has an exact key. `Some` exactly when the
+    /// path id is synthesized-v4 and the current id is not.
+    pub birth_id: Option<String>,
 }
 
 /// True when `session_id` is a random UUIDv4 (8-4-4-4-12 hex) rather than a real
