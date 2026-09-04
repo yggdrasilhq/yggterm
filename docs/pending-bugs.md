@@ -26918,7 +26918,7 @@ id, holder_pid, lock_path}` at refusal, `cfg(not(test))`-gated.
 >.lock, composing a resume for <id> must refuse within one second with the
 holder pid named — never surface codex's raw -32600.
 
-## ⛔ [11.57] A DAEMON SWAP LEFT THE ACTIVE ROW'S WEB SURFACE DEAD ~6.5 MINUTES — THE RESTORE POLL TRUSTED A CORPSE RECORD'S EXISTENCE AS "ALREADY UP"
+## ⛔ [11.58] A DAEMON SWAP LEFT THE ACTIVE ROW'S WEB SURFACE DEAD ~6.5 MINUTES — THE RESTORE POLL TRUSTED A CORPSE RECORD'S EXISTENCE AS "ALREADY UP"
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
