@@ -15019,9 +15019,19 @@ fn run_remote_agent_identity_poll_chore(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     attempts: &mut HashMap<String, u32>,
 ) -> Result<usize> {
-    let (targets, remote_bound_ids, yggterm_home) = {
+    // Per-row decision capture for the edge-triggered probes below.
+    struct RowDecision {
+        slug: String,
+        verdict: &'static str,
+        arm: &'static str,
+        chosen: Option<String>,
+        cwd_candidates: usize,
+    }
+    let mut decisions: HashMap<String, RowDecision> = HashMap::new();
+    let (targets, remote_bound_ids, excluded, yggterm_home) = {
         let runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_read");
-        let (targets, bound_ids_by_slug) = runtime.server.live_remote_agent_identity_poll_view();
+        let (targets, bound_ids_by_slug, excluded) =
+            runtime.server.live_remote_agent_identity_poll_view();
         // Flatten slug -> ids into (slug, id) pairs for the matcher's
         // cross-tick ownership guard.
         let bound_ids: HashSet<(String, String)> = bound_ids_by_slug
@@ -15030,8 +15040,24 @@ fn run_remote_agent_identity_poll_chore(
                 ids.into_iter().map(move |id| (slug.clone(), id))
             })
             .collect();
-        (targets, bound_ids, resolve_yggterm_home().ok())
+        (targets, bound_ids, excluded, resolve_yggterm_home().ok())
     };
+    // A row that never reached the poll is exactly how the 2026-09-04
+    // collapse stayed invisible: surface every named exclusion as an
+    // edge-triggered decision so the gate that bites is readable in the
+    // trace, not in a debugger.
+    for (key, gate) in &excluded {
+        decisions.insert(
+            key.clone(),
+            RowDecision {
+                slug: "agent".to_string(),
+                verdict: "excluded",
+                arm: gate,
+                chosen: None,
+                cwd_candidates: 0,
+            },
+        );
+    }
 
     // Forget attempt counters for rows that no longer need polling.
     let live_keys: HashSet<String> = targets.iter().map(|target| target.key.clone()).collect();
@@ -15058,15 +15084,6 @@ fn run_remote_agent_identity_poll_chore(
             .push(target);
     }
 
-    // Per-row decision capture for the edge-triggered probes below.
-    struct RowDecision {
-        slug: String,
-        verdict: &'static str,
-        arm: &'static str,
-        chosen: Option<String>,
-        cwd_candidates: usize,
-    }
-    let mut decisions: HashMap<String, RowDecision> = HashMap::new();
     let mut rebinds: Vec<(String, SessionKind, crate::LocalAgentCliIdentity, &'static str)> =
         Vec::new();
     let mut stats: HashMap<SessionKind, yggterm_core::cli_plane::CliIdentityPollStats> =
