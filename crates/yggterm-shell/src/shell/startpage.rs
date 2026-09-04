@@ -862,7 +862,15 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     // transcript context store), so it is safe to run on every keystroke — an
     // unbounded re-scan of the session stores is exactly what this must not be.
     let mut start_page_query = use_signal(String::new);
+    // THE INTELLITYPE LAW on the start page's own field (scope-named, so the
+    // history is THIS field's): accepted searches prefill as you type with
+    // the tail selected — typed over, or accepted with Enter. The query
+    // signal holds the COMPLETED text (the omnibox draft's semantics); the
+    // typed boundary rides beside it, because insertion vs deletion is what
+    // stops the first backspace from re-offering the prefill.
+    let mut start_page_query_typed_len = use_signal(|| 0usize);
     let query = start_page_query();
+    let query_typed_len = start_page_query_typed_len();
     let terms = search_terms(&query);
     let recent_rows = if terms.is_empty() {
         ordered_rows
@@ -1052,7 +1060,45 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                 value: "{query}",
                                 placeholder: "Search title, summary, path",
                                 style: "{search_field_style}",
-                                oninput: move |evt| start_page_query.set(evt.value()),
+                                oninput: move |evt| {
+                                    let value = evt.value();
+                                    let prev_typed = Some(query_typed_len);
+                                    if let Some((completed, typed, completed_len)) =
+                                        yggui::intellitype::intelli_on_input(
+                                            "yggterm/startpage-search",
+                                            query.len(),
+                                            prev_typed,
+                                            &value,
+                                        )
+                                    {
+                                        let prefix =
+                                            completed.get(..typed).unwrap_or_default().to_string();
+                                        if let Some(script) = yggui::intellitype::intellitype_js(
+                                            "[data-yggterm-start-page-search]",
+                                            &completed,
+                                            &prefix,
+                                            typed,
+                                            completed_len,
+                                        ) {
+                                            let _ = document::eval(&script);
+                                        }
+                                        start_page_query.set(completed);
+                                        start_page_query_typed_len.set(typed);
+                                    } else {
+                                        let len = value.len();
+                                        start_page_query.set(value);
+                                        start_page_query_typed_len.set(len); //nop
+                                    }
+                                },
+                                onkeydown: move |evt: KeyboardEvent| {
+                                    if evt.key() == Key::Enter {
+                                        yggui::intellitype::intelli_record(
+                                            "yggterm/startpage-search",
+                                            &start_page_query(),
+                                        );
+                                        start_page_query_typed_len.set(0);
+                                    }
+                                },
                             }
                             div {
                                 "data-yggterm-start-page-recent-count": "{recent_count}",
