@@ -17809,6 +17809,15 @@ async fn terminal_app_declares_async(
     })
     .await
 }
+async fn terminal_app_declares_all_async(
+    endpoint: ServerEndpoint,
+    trace_home: &Path,
+) -> Result<Vec<yggterm_server::TerminalAppDeclareSession>> {
+    run_dedicated_terminal_io("terminal_app_declares_all", trace_home, move || {
+        yggterm_server::terminal_app_declares_all(&endpoint)
+    })
+    .await
+}
 async fn terminal_retained_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,

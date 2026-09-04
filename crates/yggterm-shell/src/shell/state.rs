@@ -1463,6 +1463,65 @@ fn media_presentation_witness(category: &str, name: &str, presented: Option<u64>
 }
 
 #[cfg(test)]
+mod app_surface_batch_tests {
+    use super::*;
+
+    fn session(path: &str, owner_remote: bool, records: Vec<AppDeclareRecordShape>) -> yggterm_server::TerminalAppDeclareSession {
+        yggterm_server::TerminalAppDeclareSession {
+            session_path: path.to_string(),
+            records,
+            running: true,
+            owner_remote,
+        }
+    }
+    type AppDeclareRecordShape = yggterm_server::app_declare::AppDeclareRecord;
+    fn record(verb: &str, action: &str) -> AppDeclareRecordShape {
+        yggterm_server::app_declare::AppDeclareRecord {
+            verb: verb.to_string(),
+            action: action.to_string(),
+            payload: serde_json::Value::Null,
+            at_ms: 0,
+            seq: 1,
+        }
+    }
+    fn target(path: &str, want_rail: bool, want_web: bool) -> AppSurfaceRestoreTarget {
+        AppSurfaceRestoreTarget {
+            session_path: path.to_string(),
+            ssh_target: None,
+            runtime_token: None,
+            want_rail,
+            want_web,
+        }
+    }
+
+    #[test]
+    fn the_batch_decides_absence_locally_and_spends_asks_only_where_it_must() {
+        let batch = AppSurfaceRestoreBatch::from_sessions(vec![
+            session("local://plain", false, vec![]),
+            session("local://ychrome", false, vec![record("web-surface", "open")]),
+            session("remote-cc://dev/x", true, vec![]),
+        ]);
+        // A plain shell: both halves decided locally — no round trip at all.
+        let (rail, web) = batch.verdicts_for(&target("local://plain", true, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::AbsentLocally);
+        assert_eq!(web, AppSurfaceBatchVerdict::AbsentLocally);
+        // ychrome: the web half rebuilds (a declare exists), the rail half is
+        // decided absent LOCALLY (no sidebar record) — not a round trip.
+        let (rail, web) = batch.verdicts_for(&target("local://ychrome", true, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::AbsentLocally);
+        assert_eq!(web, AppSurfaceBatchVerdict::Rebuild);
+        // A preserved owner elsewhere: the single owner-proxying ask.
+        let (rail, web) = batch.verdicts_for(&target("remote-cc://dev/x", true, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::AskSingle);
+        assert_eq!(web, AppSurfaceBatchVerdict::AskSingle);
+        // Unwanted halves never ask, whatever the records say.
+        let (rail, web) = batch.verdicts_for(&target("local://ychrome", false, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::AbsentLocally);
+        assert_eq!(web, AppSurfaceBatchVerdict::Rebuild);
+    }
+}
+
+#[cfg(test)]
 mod media_playback_gate_tests {
     use super::*;
 
@@ -37759,6 +37818,104 @@ fn mark_app_surface_restore_attempted(
     entry.last_at_ms = now_ms;
 }
 
+/// The restore tick's one batched ask, decided locally. The daemon answers
+/// for every live row in a single round trip; the tick spends single-probe
+/// round trips ONLY on rows that can actually rebuild (or whose PTY a
+/// preserved owner elsewhere holds), and decides the overwhelmingly-common
+/// absent case with no round trip and no UI dispatch at all. Measured
+/// 2026-09-04 on the 359-row desktop during the UI-thrash storm: the
+/// per-target asks were ~35 daemon round trips/min with
+/// `terminal_app_declares` dispatches at ui_wait up to 526 ms each.
+#[derive(Debug, Default)]
+struct AppSurfaceRestoreBatch {
+    by_session: HashMap<String, Vec<yggterm_server::app_declare::AppDeclareRecord>>,
+    owner_remote: HashSet<String>,
+}
+impl AppSurfaceRestoreBatch {
+    fn from_sessions(
+        sessions: Vec<yggterm_server::TerminalAppDeclareSession>,
+    ) -> Self {
+        let mut batch = Self::default();
+        for session in sessions {
+            if session.owner_remote {
+                batch.owner_remote.insert(session.session_path);
+            } else {
+                batch
+                    .by_session
+                    .insert(session.session_path, session.records);
+            }
+        }
+        batch
+    }
+
+    /// (rail verdict, web verdict) for one target.
+    fn verdicts_for(
+        &self,
+        target: &AppSurfaceRestoreTarget,
+    ) -> (AppSurfaceBatchVerdict, AppSurfaceBatchVerdict) {
+        if self.owner_remote.contains(&target.session_path) {
+            return (
+                Self::ask_single(target.want_rail),
+                Self::ask_single(target.want_web),
+            );
+        }
+        match self.by_session.get(&target.session_path) {
+            None => (Self::absent(target.want_rail), Self::absent(target.want_web)),
+            Some(records) => (
+                Self::verdict(
+                    target.want_rail,
+                    records
+                        .iter()
+                        .any(|r| r.verb == "sidebar" && r.action == "declare"),
+                ),
+                Self::verdict(
+                    target.want_web,
+                    records.iter().any(|r| r.verb == "web-surface"),
+                ),
+            ),
+        }
+    }
+
+    fn ask_single(want: bool) -> AppSurfaceBatchVerdict {
+        if want {
+            AppSurfaceBatchVerdict::AskSingle
+        } else {
+            AppSurfaceBatchVerdict::AbsentLocally
+        }
+    }
+    fn absent(want: bool) -> AppSurfaceBatchVerdict {
+        Self::verdict(want, false)
+    }
+    fn verdict(want: bool, present: bool) -> AppSurfaceBatchVerdict {
+        if !want {
+            AppSurfaceBatchVerdict::AbsentLocally
+        } else if present {
+            AppSurfaceBatchVerdict::Rebuild
+        } else {
+            AppSurfaceBatchVerdict::AbsentLocally
+        }
+    }
+}
+
+/// What the batch answer decided for one target half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppSurfaceBatchVerdict {
+    /// The batch holds the verb's declare — run the (single-ask) rebuild,
+    /// whose staleness ceilings stay authoritative.
+    Rebuild,
+    /// The batch ANSWERED and holds no such declare — decided locally: no
+    /// round trip, no UI dispatch, one locally-emitted absent trace.
+    AbsentLocally,
+    /// The batch deferred this row (a preserved owner elsewhere holds the
+    /// PTY) — use the single, owner-proxying ask.
+    AskSingle,
+}
+
+/// Set the first time a daemon answers the batch ask with `Error` (a daemon
+/// too old to know the variant). The tick then falls back to the per-target
+/// asks permanently for this process — one lost tick, not a per-tick tax.
+static APP_SURFACE_BATCH_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
 /// Re-establish app surfaces this client never witnessed being declared.
 ///
 /// The user's words (docs/pending-bugs.md, settled call #5): *"yedit AND
@@ -37812,42 +37969,110 @@ async fn restore_app_surfaces_tick(
             );
         }
     }
+    // ⭐ ONE batched ask replaces one ask per target. The batch DECIDES the
+    // absent case locally — the round trip and the UI dispatch it saves are
+    // the storm engine's other half (see AppSurfaceRestoreBatch). A daemon
+    // too old for the batch answers once, is remembered, and this tick falls
+    // back to the per-target asks it always did.
+    let batch = if APP_SURFACE_BATCH_UNAVAILABLE.load(Ordering::Relaxed) {
+        None
+    } else {
+        let endpoint = state.read().bootstrap.server_endpoint.clone();
+        match terminal_app_declares_all_async(endpoint, &trace_home).await {
+            Ok(sessions) => Some(AppSurfaceRestoreBatch::from_sessions(sessions)),
+            Err(_) => {
+                APP_SURFACE_BATCH_UNAVAILABLE.store(true, Ordering::Relaxed);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "app_surface_restore",
+                    "batch_unavailable",
+                    json!({"fallback": "per_target_asks"}),
+                );
+                None
+            }
+        }
+    };
     for target in targets {
-        // The rail/document half. Endpoint-probed liveness lives inside it: a
-        // declare whose control endpoint does not answer traces
+        let (rail_verdict, web_verdict) = match &batch {
+            Some(batch) => batch.verdicts_for(&target),
+            None => (
+                AppSurfaceRestoreBatch::ask_single(target.want_rail),
+                AppSurfaceRestoreBatch::ask_single(target.want_web),
+            ),
+        };
+        // The locally-decided absence keeps its trace name — `via: "batch"`
+        // says the ask never left the client, so an operator counting these
+        // still sees the poll working, at a fraction of the cost.
+        if rail_verdict == AppSurfaceBatchVerdict::AbsentLocally
+            || web_verdict == AppSurfaceBatchVerdict::AbsentLocally
+        {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_declare",
+                "daemon_declare_absent",
+                json!({
+                    "session_path": target.session_path,
+                    "via": "batch",
+                }),
+            );
+        }
+        // The rail/document half. Endpoint-probed liveness lives inside the
+        // rebuild: a declare whose control endpoint does not answer traces
         // `daemon_declare_endpoint_dead` and restores nothing, which leaves the
         // session on the terminal surface — today's behaviour, with a reason.
         //
         // Only when this client has no contribution: a rebuild tears the stored
         // one down and re-resolves its `ssh -L`, so running it against a rail
         // that is already up would spawn one ssh per window.
-        let rail = if target.want_rail {
-            rebuild_sidebar_contribution_from_daemon_declare(
-                state,
-                trace_home.clone(),
-                &target.session_path,
-                target.ssh_target.clone(),
-            )
-            .await
-        } else {
-            false
+        let rail = match rail_verdict {
+            // The verdict already encodes "this half is MISSING" (unwanted
+            // halves decide AbsentLocally in the batch) - the literal guard
+            // below keeps that invariant at the callsite, one gate away from
+            // the ssh -L it protects
+            // (the_restore_tick_drives_each_missing_half).
+            AppSurfaceBatchVerdict::Rebuild | AppSurfaceBatchVerdict::AskSingle => {
+                if target.want_rail {
+                    rebuild_sidebar_contribution_from_daemon_declare(
+                        state,
+                        trace_home.clone(),
+                        &target.session_path,
+                        target.ssh_target.clone(),
+                    )
+                    .await
+                } else {
+                    false
+                }
+            }
+            AppSurfaceBatchVerdict::AbsentLocally => false,
         };
         // The web half. Independent of the rail: ychrome declares a
         // `web-surface` and no sidebar pane, yedit the reverse. Its own
         // staleness ceiling is the right liveness test HERE (unlike the rail's,
         // where it was wrong) because a browser surface heartbeats every ~4s —
         // an old web-surface record means the app really did exit.
-        let web = if target.want_web {
-            Some(
-                rebuild_web_surface_from_daemon_declare(
-                    state,
-                    trace_home.clone(),
-                    &target.session_path,
-                )
-                .await,
-            )
-        } else {
-            None
+        let web = match web_verdict {
+            AppSurfaceBatchVerdict::Rebuild | AppSurfaceBatchVerdict::AskSingle => {
+                if target.want_web {
+                    Some(
+                        rebuild_web_surface_from_daemon_declare(
+                            state,
+                            trace_home.clone(),
+                            &target.session_path,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            }
+            // Decided locally; carried as the honest `no_declare` reason
+            // so the restored-trace below cannot read it as `already_up`.
+            AppSurfaceBatchVerdict::AbsentLocally if target.want_web => {
+                Some(DeclareRebuild::NoDeclare)
+            }
+            AppSurfaceBatchVerdict::AbsentLocally => None,
         };
         if rail || web.as_ref().is_some_and(DeclareRebuild::rebuilt) {
             append_trace_event(
