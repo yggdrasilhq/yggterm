@@ -130,14 +130,21 @@ if [ "$WITH_TIMERS" = true ] || [ "$created" -gt 0 ]; then
       fi
     done
   fi
-  # Ensure ygg-memory and ygg-memory-sync are on PATH for hooks
-  if [ -f "$SCRIPT_DIR/ygg-memory" ] && [ ! -x "$HOME/.local/bin/ygg-memory" ]; then
+  # Ensure ygg-memory and ygg-memory-sync are on PATH for hooks — and keep the
+  # installed copies fresh. The checkout is the SSOT for the verb's code the same
+  # way the hub is the SSOT for memory content: every other CLI's memory is a
+  # cache the sync refreshes unconditionally, and this install once guarded the
+  # installed base so hard that the zcode adapter drifted for days existing only
+  # in ~/.local/bin (a reinstall would have silently regressed fleet-memory
+  # sync). Refresh unconditionally; hot-patching an installed copy is now
+  # correctly impossible — land it in the checkout and re-run bootstrap.
+  if [ -f "$SCRIPT_DIR/ygg-memory" ]; then
     mkdir -p "$HOME/.local/bin"
     cp "$SCRIPT_DIR/ygg-memory" "$HOME/.local/bin/ygg-memory" 2>/dev/null || true
     cp "$SCRIPT_DIR/ygg-memory.py" "$HOME/.local/bin/ygg-memory.py" 2>/dev/null || true
     cp "$SCRIPT_DIR/ygg-memory-sync" "$HOME/.local/bin/ygg-memory-sync" 2>/dev/null || true
     chmod +x "$HOME/.local/bin/ygg-memory"* 2>/dev/null || true
-    note "installed ygg-memory to ~/.local/bin"
+    note "installed/refreshed ygg-memory to ~/.local/bin"
   fi
   # Backfill Muse/Gemini/Codex from unified if they are empty (new user with only Claude)
   if command -v ygg-memory >/dev/null 2>&1 || [ -x "$HOME/.local/bin/ygg-memory" ]; then
