@@ -1491,6 +1491,7 @@ mod app_surface_batch_tests {
             runtime_token: None,
             want_rail,
             want_web,
+            web_surface_dead: false,
         }
     }
 
@@ -1518,6 +1519,57 @@ mod app_surface_batch_tests {
         let (rail, web) = batch.verdicts_for(&target("local://ychrome", false, true));
         assert_eq!(rail, AppSurfaceBatchVerdict::AbsentLocally);
         assert_eq!(web, AppSurfaceBatchVerdict::Rebuild);
+    }
+
+    #[test]
+    fn the_restore_tick_asks_for_a_dead_web_surface_record() {
+        // Measured 2026-09-05 (GUI host): after a daemon swap the client's
+        // web-surface record survived with tabs but a frozen last_seen, and
+        // `!has_web_surface` read it as "already up" — the row kept its
+        // corpse and `stale_detected` fired with no arm behind it. A record
+        // that is not LIVE is not up: the row stays a candidate, want_web
+        // is set, and the corpse flag routes the tick to the reload arm.
+        let row = |path: &str, has_web: bool, live: bool, active: bool| {
+            AppSurfaceRestoreRow {
+                session_path: path.to_string(),
+                ssh_target: None,
+                runtime_token: None,
+                has_contribution: true,
+                has_web_surface: has_web,
+                web_surface_live: live,
+                active,
+            }
+        };
+        let rows = vec![
+            row("local://live", true, true, false),
+            row("local://corpse", true, false, true),
+            AppSurfaceRestoreRow {
+                session_path: "local://bare".to_string(),
+                ssh_target: None,
+                runtime_token: None,
+                has_contribution: false,
+                has_web_surface: false,
+                web_surface_live: false,
+                active: false,
+            },
+        ];
+        let targets = app_surface_restore_targets(&rows, &HashMap::new(), 1_000, 8);
+        // A live surface is "already up" — never re-asked.
+        assert!(!targets.iter().any(|t| t.session_path == "local://live"));
+        // A corpse record is NOT up: candidate, want_web, corpse flag.
+        let corpse = targets
+            .iter()
+            .find(|t| t.session_path == "local://corpse")
+            .expect("corpse row must stay a restore candidate");
+        assert!(corpse.want_web);
+        assert!(corpse.web_surface_dead);
+        // The bare row still candidates; no corpse flag.
+        let bare = targets
+            .iter()
+            .find(|t| t.session_path == "local://bare")
+            .expect("bare row must stay a candidate");
+        assert!(bare.want_web);
+        assert!(!bare.web_surface_dead);
     }
 }
 
@@ -23319,6 +23371,19 @@ impl ShellState {
             _ => now_ms,
         }
     }
+    /// `has_live_web_surface` without the `stale_detected` side effect —
+    /// for decisions that only need the boolean. The surface-restore tick
+    /// reads every row each pass; the stale trace must stay owned by the
+    /// probes that judge one row (input policy, viewport render).
+    fn web_surface_record_live(&self, session_path: &str, now_ms: u64) -> bool {
+        let reads_since = self.session_reads_since(session_path, now_ms);
+        self.web_surfaces
+            .get(session_path)
+            .is_some_and(|surface| {
+                now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
+                    <= WEB_SURFACE_STALE_AFTER_MS
+            })
+    }
     /// Cheap liveness probe (no view construction) for the input policy.
     fn has_live_web_surface(&self, session_path: &str, now_ms: u64) -> bool {
         let reads_since = self.session_reads_since(session_path, now_ms);
@@ -37590,6 +37655,11 @@ struct AppSurfaceRestoreRow {
     has_contribution: bool,
     /// This client already holds a web surface with at least one tab.
     has_web_surface: bool,
+    /// ...and that surface is LIVE (a heartbeat within the stale window). A
+    /// record whose liveness died — a daemon swap is the common killer — must
+    /// not masquerade as "already up": the corpse is exactly what this tick
+    /// exists to restore.
+    web_surface_live: bool,
     /// The row the user is looking at.
     active: bool,
 }
@@ -37661,8 +37731,12 @@ struct AppSurfaceRestoreTarget {
     /// FALSE means "already up", and the rail rebuild must NOT run — it tears
     /// down and re-resolves the contribution's `ssh -L` forward.
     want_rail: bool,
-    /// This client holds no web surface with tabs: ask for the web half.
+    /// This client holds no LIVE web surface with tabs: ask for the web
+    /// half (a record with tabs whose liveness died counts as not-up).
     want_web: bool,
+    /// The record exists WITH tabs but its liveness is already gone: reload
+    /// the corpse from local state instead of asking the daemon.
+    web_surface_dead: bool,
 }
 
 /// PURE. Which rows this tick should ask the daemon for a retained declare, in
@@ -37698,7 +37772,9 @@ fn app_surface_restore_targets(
 ) -> Vec<AppSurfaceRestoreTarget> {
     let mut candidates: Vec<&AppSurfaceRestoreRow> = rows
         .iter()
-        .filter(|row| !row.has_contribution || !row.has_web_surface)
+        .filter(|row| {
+            !row.has_contribution || !row.has_web_surface || !row.web_surface_live
+        })
         .filter(|row| match attempted.get(&row.session_path) {
             None => true,
             Some(attempt) => {
@@ -37720,7 +37796,8 @@ fn app_surface_restore_targets(
             ssh_target: row.ssh_target.clone(),
             runtime_token: row.runtime_token.clone(),
             want_rail: !row.has_contribution,
-            want_web: !row.has_web_surface,
+            want_web: !row.has_web_surface || !row.web_surface_live,
+            web_surface_dead: row.has_web_surface && !row.web_surface_live,
         })
         .collect()
 }
@@ -37731,6 +37808,7 @@ impl ShellState {
     /// viewport is actually showing.
     fn app_surface_restore_rows(&self) -> Vec<AppSurfaceRestoreRow> {
         let active = self.server.active_session_path().map(str::to_string);
+        let now_ms = current_millis() as u64;
         self.server
             .live_session_views()
             .iter()
@@ -37745,6 +37823,8 @@ impl ShellState {
                     .web_surfaces
                     .get(&session.session_path)
                     .is_some_and(|surface| !surface.tabs.is_empty()),
+                web_surface_live: self
+                    .web_surface_record_live(&session.session_path, now_ms),
                 active: active.as_deref() == Some(session.session_path.as_str()),
             })
             .collect()
@@ -37936,7 +38016,7 @@ static APP_SURFACE_BATCH_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 /// `document_surface_visible_for` and the web reconciler then render when the
 /// user visits that session.
 async fn restore_app_surfaces_tick(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     trace_home: std::path::PathBuf,
     attempts: Rc<RefCell<HashMap<String, AppSurfaceRestoreAttempt>>>,
 ) {
@@ -38052,27 +38132,59 @@ async fn restore_app_surfaces_tick(
         // staleness ceiling is the right liveness test HERE (unlike the rail's,
         // where it was wrong) because a browser surface heartbeats every ~4s —
         // an old web-surface record means the app really did exit.
-        let web = match web_verdict {
-            AppSurfaceBatchVerdict::Rebuild | AppSurfaceBatchVerdict::AskSingle => {
-                if target.want_web {
-                    Some(
-                        rebuild_web_surface_from_daemon_declare(
-                            state,
-                            trace_home.clone(),
-                            &target.session_path,
-                        )
-                        .await,
-                    )
-                } else {
-                    None
+        let web = if target.web_surface_dead {
+            // THE CORPSE ARM. A record with tabs whose liveness is gone —
+            // measured 2026-09-05 (GUI host, swap window 01:49): a daemon
+            // swap killed the app behind the active row's web surface; the
+            // client's record survived as a corpse, so `want_web` read
+            // "already up", this tick never asked, and the row stayed dead
+            // ~6.5 minutes until the user's own click drove the ensure
+            // path's liveness probe. The batch cannot vouch for a corpse
+            // (the successor's declare registry is pruned empty after a
+            // swap) and the rebuild would decline the duplicate — the
+            // reload nonce is the existing destroy-and-recreate trigger,
+            // the same arm the ensure path drives; the reconciler owns the
+            // teardown. Quiet by doctrine: no activation, no focus move.
+            state.with_mut_counted(|shell| {
+                if shell
+                    .web_surfaces
+                    .get(&target.session_path)
+                    .is_some_and(|surface| !surface.tabs.is_empty())
+                {
+                    shell.web_surface_reload_active_tab(&target.session_path);
                 }
+            });
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "restore_tick_corpse_reload",
+                json!({ "session_path": target.session_path }),
+            );
+            None
+        } else {
+            match web_verdict {
+                AppSurfaceBatchVerdict::Rebuild | AppSurfaceBatchVerdict::AskSingle => {
+                    if target.want_web {
+                        Some(
+                            rebuild_web_surface_from_daemon_declare(
+                                state,
+                                trace_home.clone(),
+                                &target.session_path,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    }
+                }
+                // Decided locally; carried as the honest `no_declare` reason
+                // so the restored-trace below cannot read it as `already_up`.
+                AppSurfaceBatchVerdict::AbsentLocally if target.want_web => {
+                    Some(DeclareRebuild::NoDeclare)
+                }
+                AppSurfaceBatchVerdict::AbsentLocally => None,
             }
-            // Decided locally; carried as the honest `no_declare` reason
-            // so the restored-trace below cannot read it as `already_up`.
-            AppSurfaceBatchVerdict::AbsentLocally if target.want_web => {
-                Some(DeclareRebuild::NoDeclare)
-            }
-            AppSurfaceBatchVerdict::AbsentLocally => None,
         };
         if rail || web.as_ref().is_some_and(DeclareRebuild::rebuilt) {
             append_trace_event(
