@@ -26702,3 +26702,39 @@ system install — yggterm only removes binaries under its own managed dir"
 before the no-op assertion can run. The test's isolation is incomplete — the
 resolution seam must be injectable (paths for the lookup too), or the test
 must neuter PATH. Same class as [[finding-a-test-that-reads-ambient-host-state-is-not-flaky]].
+
+## ⛔ [identity-order-divergence] COLLAPSE-DAMAGED REMOTE CODEX ROWS ARE ABSENT FROM live_session_order — THE IDENTITY POLL CANNOT REACH THEM
+
+**Status:** OPEN (filed 2026-09-04 late, lane `lane/trace/agent-identity-collapse`).
+Follow-up to Issue Heading 35 (docs/cli-integration.md) — the collapse
+MECHANISM is fixed and live-verified (owner host stamps fire — first
+birth-key `codex_runtime_identity_refreshed` events ever at 21:43 incl.
+`31d35e27 -> 01a06bc8`; aliases export with `birth_session_id`; GUI-host
+`cli/identity_poll` shows `identities_with_birth_alias: 1`; the cwd guess is
+fenced). What stays broken is the THREE already-damaged rows on the GUI host
+(`remote-session://dev/31d35e27…`, `715ed3fa…`, `8a5749e0…`, all still bound
+to the shared wrong `01a0349d…`): the repaired poll never SEES them, because
+they are absent from the daemon's `live_session_order` — while `server
+snapshot` and `server app rows` (live_rail) both still list them, and the
+view's named exclusions (`agent_identity_decision verdict=excluded`) fire
+for NOTHING (zero events), proving the rows never reach the loop rather
+than being gated inside it. The poll view iterates `live_session_order`;
+these rows are in `sessions` but not in the order.
+
+**Named next unit:** reconcile `live_session_order` for takeover-restored
+remote rows (the order ledger lost them across the 2026-09-04 cascade —
+the same ledger family as the [row-jump] `record_row_order_ledger` fix), OR
+make the identity view iterate the sessions map with the order as a
+presentation preference. Then the already-shipped repair path finishes the
+job automatically: dev's alias (`01a06bc8 -> 31d35e27`) meets the row in
+the poll, the `birth_alias`/`birth_key_alias` arm rebinds it to the
+transcript its own codex process actually holds, and resume stops hitting
+the wrong thread's writer lock.
+
+**Falsifier:** after the fix, `ytrace query --name agent_identity_decision
+--since 15m` on the GUI host must show a non-excluded decision (or a
+satisfied/bound verdict) for each of the three damaged rows, and `server
+app rows` must stop listing the same `session_id` on three different rows.
+**Probe:** the view now names every in-order exclusion — absence of BOTH
+decision-and-exclusion for a codex row visible in `server snapshot` IS the
+divergence signature (order vs map), no debugger needed.
