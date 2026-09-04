@@ -241,6 +241,12 @@ name their target.
 now speaks 5 times, then once per 30 rescues, each line carrying the
 gate snapshot.)
 
+**Quiet night, 2026-09-05 ~04:30 (falsifier sweep):** 0 rescues across ~2 h on
+the post-fix GUI (was 1,622 / 57 min pre-fix), no strands,
+`visible_paint_demand_hidden_defer` still unobserved (needs a hidden period on
+a post-fix GUI). The open half stands: a strand on a VISIBLE row with all
+gates clear is the genuinely-new-defect trigger.
+
 **ROOT CAUSE, code-verified 2026-09-04 ~01:00 (`lane/trace/paint-demand-hidden-defer`): rAF starvation on a hidden window.** The paint funnel consults
 `document.hidden` nowhere: while the window is hidden its rAF never fires, so
 the frame a rescue registers stays pending forever, `visiblePaintFramePending`
@@ -754,7 +760,7 @@ cluster of >=2 s `app_control`-adjacent blocks. Read by pid, not by version:
 pre/post share the same build number.
 
 
-**AUDIT 2026-09-04 ~21:30 (part 2 — the mount-loop call sites; the falsifier held, the first audit had missed six sites).** The swept-arms falsifier measured IN on the gui host: 18 h of `input/loop_block` across the deploy-churn night and a quiet day, ZERO events from the five swept branches. But `read_poll_apply` itself held **25.1 s** (04:46:02→04:46:27, one invocation, v3.2.53 pid on the gui host) behind `read_error_after_attach`: the recovery arm for a failed read still awaited `terminal_attempt_resume_recovery_async` INLINE, and its `terminal_ensure_with_retry_async` cascade (three 5 s-timeout ensure attempts + process-guard waits — the daemon was mid-swap on `server-3-2-52.sock`, `startup_hot_swap_direct_status_unreachable`, `daemon_declare_unavailable` ×4 in the window) starved the keystroke branch for the whole 25 s. Six call sites total — `retained_empty_surface`, `terminal_write_error`, `transport_error_after_attach`, the `no_output_stall`/`eof`/`dead` family, `protected_runtime_careful_restore`, `read_error_after_attach` — all in the mount/select-loop body the first audit treated as one "flagged only" blob. Part 2 converts all six to the first sweep's own shape (spawn + `ResumeRecoverySettled` on `off_loop_rpc_tx`, attempt counters read at event time, error traces unchanged — `resume_recovery_error` keeps its `reason` field via a new enum field), and the source-contract test `every_resume_recovery_call_runs_off_the_terminal_loop` now refuses any future inline call. **Part-2 falsifier:** the next read-error-during-a-daemon-swap window must show `resume_recovery_begin`/`resume_recovery_end` WITHOUT a ≥200 ms `input/loop_block` on `read_poll_apply`; failures still trace their `*_recovery_error`.
+**AUDIT 2026-09-04 ~21:30 (part 2 — the mount-loop call sites; the falsifier held, the first audit had missed six sites).** The swept-arms falsifier measured IN on the gui host: 18 h of `input/loop_block` across the deploy-churn night and a quiet day, ZERO events from the five swept branches. But `read_poll_apply` itself held **25.1 s** (04:46:02→04:46:27, one invocation, v3.2.53 pid on the gui host) behind `read_error_after_attach`: the recovery arm for a failed read still awaited `terminal_attempt_resume_recovery_async` INLINE, and its `terminal_ensure_with_retry_async` cascade (three 5 s-timeout ensure attempts + process-guard waits — the daemon was mid-swap on `server-3-2-52.sock`, `startup_hot_swap_direct_status_unreachable`, `daemon_declare_unavailable` ×4 in the window) starved the keystroke branch for the whole 25 s. Six call sites total — `retained_empty_surface`, `terminal_write_error`, `transport_error_after_attach`, the `no_output_stall`/`eof`/`dead` family, `protected_runtime_careful_restore`, `read_error_after_attach` — all in the mount/select-loop body the first audit treated as one "flagged only" blob. Part 2 converts all six to the first sweep's own shape (spawn + `ResumeRecoverySettled` on `off_loop_rpc_tx`, attempt counters read at event time, error traces unchanged — `resume_recovery_error` keeps its `reason` field via a new enum field), and the source-contract test `every_resume_recovery_call_runs_off_the_terminal_loop` now refuses any future inline call. **Part-2 falsifier:** the next read-error-during-a-daemon-swap window must show `resume_recovery_begin`/`resume_recovery_end` WITHOUT a ≥200 ms `input/loop_block` on `read_poll_apply`; failures still trace their `*_recovery_error`. **PROVEN 2026-09-05 ~04:30 (falsifier sweep, gui host):** through the four-deploy churn night (02:42–03:23, daemons rotating repeatedly), 42 `resume_recovery_begin`/`end` events fired (all `read_error_after_attach`, each pair sub-300 ms) with **ZERO** `input/loop_block` ≥200 ms on `read_poll_apply` in the whole window — the only ≥200 ms hold was a single 295 ms `js_event` on an unrelated row, once. (A second, independent corroboration was already recorded at the 01:49:01 swap window: 5 recovery pairs, all off-loop.)
 
 ## ⛔ [11.39] A GUI RESTART LEAVES AN IDLE FULLSCREEN TUI'S VIEWPORT BLANK FOR ~40s — THE "SLOW TERMINAL REVEAL"
 
@@ -26935,7 +26941,7 @@ Measured on the GUI host, 2026-09-05 01:41–02:02, from the ytrace generations 
 
 ---
 
-## ⛔ [11.58] `terminal tenants` MISREPORTS A FOREGROUND BASH SCRIPT AS THE SHELL
+## ⛔ [11.59] `terminal tenants` MISREPORTS A FOREGROUND BASH SCRIPT AS THE SHELL
 
 **Status:** OPEN
 

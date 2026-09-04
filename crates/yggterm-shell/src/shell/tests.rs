@@ -67305,4 +67305,34 @@ mod web_surface_immersion_locks {
             "terminal_scrollbar_overlay::scroll_thumb_geometry is the named decision mirror of syncXtermScrollThumb"
         );
     }
+
+    /// XTERM-BUG: mouse-wheel-eaten-by-scrollable-element (pending-bugs [11.59]).
+    /// `bindMouse()` binds the mouse-protocol wheel handler on `.xterm` in the
+    /// BUBBLE phase; xterm.js 6's ScrollableElement (a DESCENDANT of `.xterm`,
+    /// wrapping `.xterm-screen`) consumes canvas-originated wheel events first,
+    /// so mouse-code TUIs (DECSET 1000/1002/1006 — opencode et al.) never
+    /// receive a wheel report. Measured live 2026-09-05 with REAL OS input:
+    /// wheel on .xterm-screen produced nothing, the identical wheel fed
+    /// directly to .xterm produced `^[[<65;13;3M` instantly. The fix binds the
+    /// SAME handler CAPTURE-phase (and removes it with the matching capture
+    /// flag) — capture on the ancestor outranks every descendant consumer in
+    /// every state, which is the requirement: the dead state was not
+    /// reproducible on demand. jsdom cannot test this (the renderer init fails
+    /// before bindMouse runs), so this is a string lock on the vendored bundle;
+    /// the live falsifier is `server app pointer click`/wheel against a
+    /// mouse-probe mock-tui row after deploy.
+    #[test]
+    fn the_mouse_protocol_wheel_handler_binds_capture_phase() {
+        const BUNDLE: &str = include_str!("../../../../assets/xterm/xterm.js");
+        let bind = "t.addEventListener(\"wheel\",r.wheel,{passive:!1,capture:!0})";
+        let unbind = "t.removeEventListener(\"wheel\",s.wheel,{capture:!0})";
+        assert!(
+            BUNDLE.contains(bind),
+            "bindMouse must bind the protocol wheel handler CAPTURE-phase on .xterm — bubble loses to the ScrollableElement descendant ([11.59])"
+        );
+        assert!(
+            BUNDLE.contains(unbind),
+            "the disarm path must remove the wheel handler with the MATCHING capture flag — a capture/bubble mismatch leaks the listener forever"
+        );
+    }
 }
