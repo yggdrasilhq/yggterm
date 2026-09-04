@@ -26734,7 +26734,7 @@ must neuter PATH. Same class as [[finding-a-test-that-reads-ambient-host-state-i
 
 ## ⛔ [identity-order-divergence] COLLAPSE-DAMAGED REMOTE CODEX ROWS ARE ABSENT FROM live_session_order — THE IDENTITY POLL CANNOT REACH THEM
 
-**Status:** OPEN (filed 2026-09-04 late, lane `lane/trace/agent-identity-collapse`).
+**Status:** REACHABILITY CLOSED 2026-09-04 late on `lane/trace/agent-identity-reach` — the poll view now sweeps the sessions map for live self-minting rows the order does not name (sorted, deterministic) and names a dead order key `order_key_missing_from_sessions` instead of skipping it silently. The rows are REACHED; what stays open below is the order-ledger reconciliation itself (presentation plane) and the second measured wound: the rows can answer on a THIRD synthesized id (ensure-funnel re-mint), which the widened repair signature (path-v4 birth, any drifted id) now covers. The cwd guess itself was RETIRED the same night after re-cross-wiring rows (01a06bc8) while the alias export silently zeroed — binding is owner-alias-only now.
 Follow-up to Issue Heading 35 (docs/cli-integration.md) — the collapse
 MECHANISM is fixed and live-verified (owner host stamps fire — first
 birth-key `codex_runtime_identity_refreshed` events ever at 21:43 incl.
@@ -26767,3 +26767,31 @@ app rows` must stop listing the same `session_id` on three different rows.
 **Probe:** the view now names every in-order exclusion — absence of BOTH
 decision-and-exclusion for a codex row visible in `server snapshot` IS the
 divergence signature (order vs map), no debugger needed.
+
+## ⛔ [resume-external-holder-scan] RESUME COMPOSES AGAINST A TRANSCRIPT AN ORPHANED CODEX PROCESS STILL WRITES — CODEX REFUSES -32600
+
+**Status:** OPEN (filed 2026-09-04 ~23:58, lane `lane/trace/agent-identity-reach`).
+
+Measured twice live (screenshots, GUI host): a row whose bound id named a
+transcript held by ANOTHER, still-alive codex process composed
+`codex resume <id>` anyway, and codex itself refused during TUI bootstrap:
+"thread <id> already has an active writer (code -32600)"
+(`~/.codex/thread-writer-locks/<id>.lock`, write-locked fd held by the old
+codex pid). The guards exist — `wait_for_external_codex_resume_to_clear`
+plus `external_agent_resume_processes_for_session` — but the holder they
+needed to see was a codex process ORPHANED by a daemon rotation (its PTY's
+runtime died in the handover cascade; the process kept running with the
+lock). The scan missed it, the compose went out, the user saw codex's raw
+error. A later retry succeeded once the orphan exited on its own, so the
+wound self-heals slowly instead of being named fast.
+
+**Named next unit:** make the external-holder detection walk the
+thread-writer-locks DIRECTORY (lock name == session id — no fd scan
+ambiguity) and treat a held lock as the refusal reason WITH the holder pid
+in the error/trace; only compose the resume when the lock is free or the
+live-runtime bridge answered. Probe: `cli/resume_external_holder {session_
+id, holder_pid, lock_path}` at refusal, `cfg(not(test))`-gated.
+
+**Falsifier:** with a second codex process holding thread-writer-locks/<id
+>.lock, composing a resume for <id> must refuse within one second with the
+holder pid named — never surface codex's raw -32600.

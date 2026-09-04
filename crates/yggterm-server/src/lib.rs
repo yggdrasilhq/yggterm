@@ -3500,7 +3500,6 @@ fn identity_poll_process_row(
     key: &str,
     session: &ManagedSessionView,
     targets: &mut Vec<RemoteAgentIdentityPollTarget>,
-    bound_ids: &mut HashMap<String, HashSet<String>>,
     excluded: &mut Vec<(String, &'static str)>,
 ) {
     if !managed_session_is_live_runtime_session(key, session) {
@@ -3531,10 +3530,6 @@ fn identity_poll_process_row(
         excluded.push((key.to_string(), "no_remote_target"));
         return;
     };
-    bound_ids
-        .entry(yggterm_core::agent_cli::session_kind_label(session.kind).to_string())
-        .or_default()
-        .insert(session.id.clone());
     if descriptor.id_assigned_at_birth
         || (session.kind != SessionKind::Codex && descriptor.live_session_marker.is_none())
     {
@@ -7672,13 +7667,8 @@ impl YggtermServer {
     /// tick (the 2026-09-04 collapse: all codex rows on one shared id).
     pub(crate) fn live_remote_agent_identity_poll_view(
         &self,
-    ) -> (
-        Vec<RemoteAgentIdentityPollTarget>,
-        HashMap<String, HashSet<String>>,
-        Vec<(String, &'static str)>,
-    ) {
+    ) -> (Vec<RemoteAgentIdentityPollTarget>, Vec<(String, &'static str)>) {
         let mut targets = Vec::new();
-        let mut bound_ids: HashMap<String, HashSet<String>> = HashMap::new();
         let mut excluded: Vec<(String, &'static str)> = Vec::new();
         // Pass 1 walks the presented order; pass 2 sweeps the sessions map
         // for live self-minting rows the order does not name. Reachability
@@ -7696,7 +7686,6 @@ impl YggtermServer {
                     key,
                     session,
                     &mut targets,
-                    &mut bound_ids,
                     &mut excluded,
                 ),
                 None => excluded.push((key.clone(), "order_key_missing_from_sessions")),
@@ -7710,16 +7699,10 @@ impl YggtermServer {
         sweep.sort();
         for key in sweep {
             if let Some(session) = self.sessions.get(key) {
-                identity_poll_process_row(
-                    key,
-                    session,
-                    &mut targets,
-                    &mut bound_ids,
-                    &mut excluded,
-                );
+                identity_poll_process_row(key, session, &mut targets, &mut excluded);
             }
         }
-        (targets, bound_ids, excluded)
+        (targets, excluded)
     }
 
     /// Mirrors `apply_codex_runtime_identity_to_live_session` for Claude Code.
@@ -48254,7 +48237,7 @@ terminal_window_id: None,
         });
         let live = server.sessions.get_mut(&runtime_key).expect("mounted");
         upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
-        let (targets, bound, _excluded) = server.live_remote_agent_identity_poll_view();
+        let (targets, _excluded) = server.live_remote_agent_identity_poll_view();
         let mine = targets.iter().find(|t| t.key == runtime_key);
         assert!(
             mine.is_some(),
@@ -48268,10 +48251,6 @@ terminal_window_id: None,
         let target = mine.unwrap();
         assert_eq!(target.birth_id.as_deref(), None);
         assert_eq!(target.current_id, birth, "restore re-births the id from the path");
-        assert!(bound
-            .get("codex")
-            .map(|s: &HashSet<String>| s.contains(birth))
-            .unwrap_or(false));
 
         // Second takeover generation: the row must STILL be pollable.
         let persisted = server.persisted_state();
@@ -48286,7 +48265,7 @@ terminal_window_id: None,
             .get(&runtime_key)
             .expect("restored runtime live session");
         let restored_id = restored_row.id.clone();
-        let (targets2, _bound2, excluded2) = restored.live_remote_agent_identity_poll_view();
+        let (targets2, excluded2) = restored.live_remote_agent_identity_poll_view();
         let mine2 = targets2.iter().find(|t| t.key == runtime_key);
         assert!(
             mine2.is_some(),
@@ -48338,7 +48317,7 @@ terminal_window_id: None,
             .retain(|key| key != &runtime_key);
         assert_eq!(server.live_session_order.len(), before - 1);
 
-        let (targets, _bound, _excluded) = server.live_remote_agent_identity_poll_view();
+        let (targets, _excluded) = server.live_remote_agent_identity_poll_view();
         let mine = targets.iter().find(|t| t.key == runtime_key);
         assert!(
             mine.is_some(),
@@ -48388,7 +48367,7 @@ terminal_window_id: None,
         // it the way the live daemon ended up: a fresh synthesized id that
         // is neither the path birth nor a real transcript id.
         live.id = rebirth.to_string();
-        let (targets, _bound, _excluded) = server.live_remote_agent_identity_poll_view();
+        let (targets, _excluded) = server.live_remote_agent_identity_poll_view();
         let mine = targets.iter().find(|t| t.key == runtime_key);
         assert!(mine.is_some(), "re-birthed row must stay pollable");
         assert_eq!(mine.unwrap().birth_id.as_deref(), Some(birth));
@@ -48409,7 +48388,7 @@ terminal_window_id: None,
         );
         let ghost = "remote-session://dev/00000000-0000-4000-8000-000000000000";
         server.live_session_order.push(ghost.to_string());
-        let (_targets, _bound, excluded) = server.live_remote_agent_identity_poll_view();
+        let (_targets, excluded) = server.live_remote_agent_identity_poll_view();
         assert!(
             excluded
                 .iter()

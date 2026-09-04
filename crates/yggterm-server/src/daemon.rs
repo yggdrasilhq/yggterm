@@ -14889,28 +14889,23 @@ fn normalize_cwd_for_identity_match(cwd: &str) -> String {
 }
 
 /// Matches self-minting agent processes on one machine to their live remote
-/// rows. An owner-reported birth alias is authoritative; normalized cwd remains
-/// a Codex-only compatibility fallback for older remote binaries.
+/// rows. OWNER-REPORTED ALIAS ONLY for every self-minting CLI: the cwd
+/// compatibility guess was retired on 2026-09-04 after it cross-wired every
+/// same-directory codex row onto one live transcript TWICE in one night —
+/// its fences could not hold while the owner's alias export silently zeroed
+/// on a daemon skew. A row with no alias stays on its birth id (resume
+/// degrades to a fresh launch) until the owner stamps and vouches one.
 /// Pure (no IO) so the matching policy is unit-testable. A running identity is
-/// paired only when its real session id differs from the row's synthesized id
+/// paired only when its real session id differs from the row's current id
 /// and has not already been claimed, so two rows never collapse onto one
 /// transcript.
 ///
-/// ⛔ Hardened after the 2026-09-04 collapse (every codex row on one shared
-/// transcript, resume refused with "owned by another process"):
-/// - the alias arm also accepts the row's PATH-carried birth id
-///   (`target.birth_id`), so a row a previous poll froze on a wrong id can
-///   repair instead of being wrong forever;
-/// - the cwd guess refuses identities the owner daemon already aliased to one
-///   of its own rows (`birth_session_id.is_some()`) and identities bound to
-///   any other live remote row (`remote_bound_ids`). The guess runs on every
-///   poll but `claimed` only lives for one tick, so without a cross-tick
-///   ownership guard each new row re-claimed the same lexicographically-first
-///   transcript the previous row had already taken.
+/// The alias arm accepts BOTH the row's current id and its PATH-carried
+/// birth id (`target.birth_id`), so a row a previous poll froze on a wrong
+/// or re-birthed id can repair instead of being wrong forever.
 fn match_agent_identities_to_targets(
     group: &[crate::RemoteAgentIdentityPollTarget],
     identities: &[crate::LocalAgentCliIdentity],
-    remote_bound_ids: &HashSet<(String, String)>,
 ) -> Vec<(String, SessionKind, crate::LocalAgentCliIdentity, &'static str)> {
     let by_birth_id: HashMap<(&str, &str), &crate::LocalAgentCliIdentity> = identities
         .iter()
@@ -14921,16 +14916,6 @@ fn match_agent_identities_to_targets(
                 .map(|birth_id| ((identity.kind.as_str(), birth_id), identity))
         })
         .collect();
-    let mut by_cwd: HashMap<(String, String), Vec<&crate::LocalAgentCliIdentity>> = HashMap::new();
-    for identity in identities {
-        by_cwd
-            .entry((
-                identity.kind.clone(),
-                normalize_cwd_for_identity_match(&identity.cwd),
-            ))
-            .or_default()
-            .push(identity);
-    }
     let mut claimed: HashSet<(String, String)> = HashSet::new();
     let mut rebinds = Vec::new();
     for target in group {
@@ -14951,6 +14936,14 @@ fn match_agent_identities_to_targets(
                         && !claimed.contains(&(identity.kind.clone(), identity.session_id.clone()))
                 })
         };
+        // Alias-only, every self-minting CLI. The cwd compatibility guess is
+        // RETIRED: it cross-wired every same-directory codex row onto one
+        // live transcript twice on 2026-09-04 (01a0349d, then 01a06bc8),
+        // because its owner-alias fence only holds while the owner's alias
+        // export is flowing — and that export silently zeroes on any daemon
+        // or protocol skew. A row with no alias stays on its birth id and
+        // its resume degrades to a fresh launch: safe, and the stamp->alias
+        // pipeline binds it exactly within a minute of the CLI minting.
         let identity = alias_hit(target.current_id.as_str())
             .map(|identity| (identity, "birth_alias"))
             .or_else(|| {
@@ -14959,38 +14952,6 @@ fn match_agent_identities_to_targets(
                     .as_deref()
                     .and_then(alias_hit)
                     .map(|identity| (identity, "birth_key_alias"))
-            })
-            .or_else(|| {
-                // Only Codex publishes a trustworthy cwd in this wire. Muse
-                // and Antigravity are intentionally alias-only: their process
-                // marker enumerator cannot derive cwd, and pairing two rows by
-                // the host's default directory would cross-wire sessions.
-                if target.kind != SessionKind::Codex {
-                    return None;
-                }
-                by_cwd
-                    .get(&(
-                        kind_slug.to_string(),
-                        normalize_cwd_for_identity_match(&target.cwd),
-                    ))?
-                    .iter()
-                    .copied()
-                    // An identity the owner aliased to one of its own rows is
-                    // somebody's child; a cwd guess must never take it.
-                    .filter(|identity| identity.birth_session_id.is_none())
-                    .find(|identity| {
-                        identity.session_id != target.current_id
-                            && !claimed
-                                .contains(&(identity.kind.clone(), identity.session_id.clone()))
-                            && !remote_bound_ids
-                                .contains(&(kind_slug.to_string(), identity.session_id.clone()))
-                            && !group.iter().any(|other| {
-                                other.key != target.key
-                                    && (other.current_id == identity.session_id
-                                        || other.birth_id.as_deref() == Some(identity.session_id.as_str()))
-                            })
-                    })
-                    .map(|identity| (identity, "cwd_unique"))
             });
         let Some((identity, arm)) = identity else {
             continue;
@@ -15028,19 +14989,10 @@ fn run_remote_agent_identity_poll_chore(
         cwd_candidates: usize,
     }
     let mut decisions: HashMap<String, RowDecision> = HashMap::new();
-    let (targets, remote_bound_ids, excluded, yggterm_home) = {
+    let (targets, excluded, yggterm_home) = {
         let runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_read");
-        let (targets, bound_ids_by_slug, excluded) =
-            runtime.server.live_remote_agent_identity_poll_view();
-        // Flatten slug -> ids into (slug, id) pairs for the matcher's
-        // cross-tick ownership guard.
-        let bound_ids: HashSet<(String, String)> = bound_ids_by_slug
-            .into_iter()
-            .flat_map(|(slug, ids)| {
-                ids.into_iter().map(move |id| (slug.clone(), id))
-            })
-            .collect();
-        (targets, bound_ids, excluded, resolve_yggterm_home().ok())
+        let (targets, excluded) = runtime.server.live_remote_agent_identity_poll_view();
+        (targets, excluded, resolve_yggterm_home().ok())
     };
     // A row that never reached the poll is exactly how the 2026-09-04
     // collapse stayed invisible: surface every named exclusion as an
@@ -15205,7 +15157,6 @@ fn run_remote_agent_identity_poll_chore(
         rebinds.extend(match_agent_identities_to_targets(
             &polled,
             &identities,
-            &remote_bound_ids,
         ));
         // Unbound polled rows record WHY they got nothing, per target.
         for target in &polled {
@@ -15268,7 +15219,7 @@ fn run_remote_agent_identity_poll_chore(
     }
 
     // Edge-triggered per-row decision probe: the join plane's camera. A
-    // collapse like 2026-09-04 is now a stream of `bound`/`cwd_unique`
+    // collapse like 2026-09-04 is now a stream of `bound`/`birth_alias`
     // events naming the shared id within one tick, instead of silence.
     {
         static LAST_DECISION: std::sync::OnceLock<
@@ -30627,31 +30578,30 @@ mod tests {
     }
 
     #[test]
-    fn match_codex_identities_rebinds_uuidv4_row_to_running_transcript() {
+    fn match_codex_identities_rebinds_through_the_owner_alias() {
         let synth = "11111111-2222-4333-8444-555555555555";
         let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
         let targets = vec![poll_target("codex-runtime://abc", "/home/user", synth)];
-        let identities = vec![codex_identity(real, "/home/user")];
-        let rebinds = match_agent_identities_to_targets(&targets, &identities, &HashSet::new());
+        let mut identity = codex_identity(real, "/home/user");
+        identity.birth_session_id = Some(synth.to_string());
+        let rebinds = match_agent_identities_to_targets(&targets, &[identity]);
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].0, "codex-runtime://abc");
         assert_eq!(rebinds[0].2.session_id, real);
     }
 
+    /// The cwd guess is RETIRED (2026-09-04, twice in one night): an
+    /// unaliased identity is never claimed, no matter how well the
+    /// directory matches. A row with no alias stays on its birth id.
     #[test]
-    fn match_codex_identities_ignores_trailing_slash_cwd_difference() {
-        let targets = vec![poll_target(
-            "k",
-            "/home/user/proj/",
-            "11111111-2222-4333-8444-555555555555",
-        )];
-        let identities = vec![codex_identity(
-            "019aaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "/home/user/proj",
-        )];
-        assert_eq!(
-            match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).len(),
-            1
+    fn match_codex_identities_never_binds_without_an_owner_alias() {
+        let synth = "11111111-2222-4333-8444-555555555555";
+        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        let targets = vec![poll_target("codex-runtime://abc", "/home/user", synth)];
+        let identity = codex_identity(real, "/home/user");
+        assert!(
+            match_agent_identities_to_targets(&targets, &[identity]).is_empty(),
+            "a cwd match alone must never bind a transcript"
         );
     }
 
@@ -30671,7 +30621,7 @@ mod tests {
         let mut identity = codex_identity(real, "/home/user/proj");
         identity.birth_session_id = Some(synth.to_string());
 
-        let rebinds = match_agent_identities_to_targets(&targets, &[identity], &HashSet::new());
+        let rebinds = match_agent_identities_to_targets(&targets, &[identity]);
 
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].2.session_id, real);
@@ -30683,22 +30633,21 @@ mod tests {
         // Row already carries the real id — nothing to rebind.
         let targets = vec![poll_target("k", "/home/user", id)];
         let identities = vec![codex_identity(id, "/home/user")];
-        assert!(match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
     }
 
     #[test]
-    fn match_codex_identities_does_not_collapse_two_rows_onto_one_transcript() {
-        // Two synthesized rows at the same cwd, two running transcripts: each
-        // row must claim a distinct transcript, never the same one twice.
-        let targets = vec![
-            poll_target("k1", "/home/user", "11111111-1111-4111-8111-111111111111"),
-            poll_target("k2", "/home/user", "22222222-2222-4222-8222-222222222222"),
-        ];
-        let identities = vec![
-            codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user"),
-            codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/user"),
-        ];
-        let rebinds = match_agent_identities_to_targets(&targets, &identities, &HashSet::new());
+    fn match_codex_identities_binds_each_row_its_own_aliased_transcript() {
+        // Two rows, two owner-vouched transcripts: each row binds exactly the
+        // transcript aliased to its own birth, never a neighbour's.
+        let b1 = "11111111-1111-4111-8111-111111111111";
+        let b2 = "22222222-2222-4222-8222-222222222222";
+        let targets = vec![poll_target("k1", "/home/user", b1), poll_target("k2", "/home/user", b2)];
+        let mut i1 = codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user");
+        i1.birth_session_id = Some(b1.to_string());
+        let mut i2 = codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/user");
+        i2.birth_session_id = Some(b2.to_string());
+        let rebinds = match_agent_identities_to_targets(&targets, &[i1, i2]);
         assert_eq!(rebinds.len(), 2);
         let bound: HashSet<String> = rebinds
             .iter()
@@ -30725,67 +30674,15 @@ mod tests {
         let mut identity = codex_identity(real, "/home/user/proj");
         identity.birth_session_id = Some(birth.to_string());
 
-        let rebinds = match_agent_identities_to_targets(&[target], &[identity], &HashSet::new());
+        let rebinds = match_agent_identities_to_targets(&[target], &[identity]);
 
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].2.session_id, real);
         assert_eq!(rebinds[0].3, "birth_key_alias");
     }
 
-    /// The other collapse arm: a transcript the owner daemon aliased to one
-    /// of its OWN rows is somebody's child. The cwd guess ran per tick with a
-    /// per-tick claimed set, so it re-claimed exactly such a transcript for a
-    /// new row and cross-wired every same-directory row onto one session.
     #[test]
-    fn cwd_guess_never_takes_an_identity_the_owner_aliased_to_its_own_row() {
-        let synth = "11111111-2222-4333-8444-555555555555";
-        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
-        let targets = vec![poll_target("k", "/home/user", synth)];
-        let mut identity = codex_identity(real, "/home/user");
-        identity.birth_session_id = Some("owner-row-birth".to_string());
-        assert!(
-            match_agent_identities_to_targets(&targets, &[identity], &HashSet::new()).is_empty(),
-            "an owner-aliased transcript must never be cwd-claimed"
-        );
-    }
-
-    #[test]
-    fn cwd_guess_never_takes_an_identity_bound_to_another_live_remote_row() {
-        let synth = "11111111-2222-4333-8444-555555555555";
-        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
-        let targets = vec![poll_target("k", "/home/user", synth)];
-        let identity = codex_identity(real, "/home/user");
-        let mut bound = HashSet::new();
-        bound.insert(("codex".to_string(), real.to_string()));
-        assert!(
-            match_agent_identities_to_targets(&targets, &[identity], &bound).is_empty(),
-            "a transcript bound to another live remote row must never be re-claimed"
-        );
-    }
-
-    #[test]
-    fn match_codex_identities_still_spreads_two_rows_across_two_transcripts() {
-        // The per-tick spread the original design intended, kept green next
-        // to the collapse guards: N needing rows, N transcripts, one tick.
-        let targets = vec![
-            poll_target("s1", "/home/user", "11111111-1111-4111-8111-111111111111"),
-            poll_target("s2", "/home/user", "22222222-2222-4222-8222-222222222222"),
-        ];
-        let identities = vec![
-            codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/user"),
-            codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/user"),
-        ];
-        let rebinds = match_agent_identities_to_targets(&targets, &identities, &HashSet::new());
-        assert_eq!(rebinds.len(), 2);
-        let bound: HashSet<String> = rebinds
-            .iter()
-            .map(|(_, _, id, _)| id.session_id.clone())
-            .collect();
-        assert_eq!(bound.len(), 2);
-    }
-
-    #[test]
-    fn match_codex_identities_skips_when_cwd_has_no_running_codex() {
+    fn match_codex_identities_skips_when_no_identity_exists() {
         let targets = vec![poll_target(
             "k",
             "/home/user/other",
@@ -30795,7 +30692,7 @@ mod tests {
             "019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "/home/user",
         )];
-        assert!(match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
     }
 
     #[test]
@@ -30812,7 +30709,7 @@ mod tests {
             storage_path: "/home/user/.claude/projects/x/y.jsonl".to_string(),
             birth_session_id: None,
         }];
-        assert!(match_agent_identities_to_targets(&targets, &identities, &HashSet::new()).is_empty());
+        assert!(match_agent_identities_to_targets(&targets, &identities).is_empty());
     }
 
     #[test]
@@ -30830,13 +30727,13 @@ mod tests {
         };
 
         assert!(
-            match_agent_identities_to_targets(&[target.clone()], &[identity.clone()], &HashSet::new())
+            match_agent_identities_to_targets(&[target.clone()], &[identity.clone()])
                 .is_empty(),
             "Muse's placeholder cwd must never cross-wire two rows"
         );
 
         identity.birth_session_id = Some(birth.to_string());
-        let rebinds = match_agent_identities_to_targets(&[target], &[identity], &HashSet::new());
+        let rebinds = match_agent_identities_to_targets(&[target], &[identity]);
         assert_eq!(rebinds.len(), 1);
         assert_eq!(rebinds[0].1, SessionKind::Muse);
         assert_eq!(rebinds[0].2.session_id, real);
