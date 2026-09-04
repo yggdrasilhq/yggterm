@@ -795,6 +795,20 @@ viewport must paint the TUI's current frame within the normal reveal budget
 (no multi-second blank), and the daemon trace shows one
 `resize_repaint_nudge` per mount where `resize_noop` used to be.
 
+**Falsifier instrumentation note (2026-09-05, zcode seat):** two traps for
+whoever runs this falsifier. (1) A SHADOW-CLIENT mount can never fire the
+nudge — D8 means shadows never resize the PTY (they adopt the daemon grid
+via `shadowPinnedGrid`), so the nudge arm is structurally unreachable there;
+the falsifier needs the ACTIVE client as written. Measured: a shadow mount
+of an idle winch-witness row painted the retained screen instantly (the
+retained-live arm is healthy) with frame count unchanged. (2) The
+`winch-repaint` witness had a hardcoded 30s deadline and retired before the
+mount happened (three dead-witness mounts measured) — `--winch-secs 0`
+(`lane/dev/winch-falsifier-knob`) makes it sleep until SIGWINCH or stdin
+closes; use that for the live run. The idle row must ALSO be verified alive
+at mount time: `server terminal tenants` misclassifies a running bash
+SCRIPT as the shell ([11.58]) — use the frame counter on screen instead.
+
 ## ⛔ [11.41] THE SSOT SESSION-TITLE LAW — A ROW, ITS RAIL AND ITS SNAPSHOT ANSWERED WITH THREE DIFFERENT NAMES
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -26934,3 +26948,28 @@ Measured on the GUI host, 2026-09-05 01:41–02:02, from the ytrace generations 
 **Fix (`lane/trace/web-corpse-restore`):** the restore decision reads LIVENESS, not existence — `AppSurfaceRestoreRow` carries `web_surface_live` (silent read, no `stale_detected` side effect; the tick judges every row and the trace must stay owned by the single-row probes), a record with tabs whose liveness died keeps the row a candidate with `want_web` set and a `web_surface_dead` flag, and the tick's new CORPSE ARM reloads the surface from local state (the reload nonce — the existing destroy-and-recreate trigger the ensure path already drives; the reconciler owns teardown). It is verdict-independent on purpose: after a swap the successor's registry is empty, so no daemon round trip can vouch for the corpse. Backoff ledger unchanged — a corpse that stays dead retries on the normal schedule instead of spinning. Source contract `the_restore_tick_asks_for_a_dead_web_surface_record`.
 
 **Falsifier:** on the next daemon swap with a web-surface row alive, the row's surface comes back WITHOUT user input — trace `web_surface/restore_tick_corpse_reload` fires within one backoff window of the swap, `liveness stale_detected` for that row does not recur after the reload, and the terminal-side recovery traces stay as clean as this window's (no `input/loop_block`).
+
+
+---
+
+## ⛔ [11.58] `terminal tenants` MISREPORTS A FOREGROUND BASH SCRIPT AS THE SHELL
+
+**Status:** OPEN
+
+Measured 2026-09-05 ~02:55 on the GUI host, 3.2.60+: a row whose foreground process
+was a running bash SCRIPT (`winch-witness.sh`, a PTY child of the root
+`bash -i`) reported `"foreground_command": "/bin/bash -i"` — the root
+shell — while the script owned the tty foreground pgrp. The tenants law
+says the probe exists to name "what is RUNNING inside a row" (the
+immortal-tenant probe's whole point); a foreground script hiding behind the
+shell's name is exactly the squatting shape the probe must surface. The
+walker's foreground detection resolves the tty foreground pgrp correctly
+for a BINARY child (mock-tui reported fine) but falls back to the root
+process when the foreground child is itself a shell descendant.
+
+**Falsifier:** run any long-lived bash script in a row; `server terminal
+tenants` must name the SCRIPT (its path/args), never the root `bash -i`,
+for as long as it owns the foreground.
+
+**Code location:** the tenants walker behind `server terminal tenants`
+(foreground pgrp resolution).
