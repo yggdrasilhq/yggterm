@@ -372,18 +372,13 @@ fn WebOmniboxBar(
     } else {
         0
     };
-    // On glass the buttons breathe: the D-pad key's padding and radius, a
-    // touch larger than the shared icon chip, so the bar's four verbs read as
-    // keys on a panel rather than glyphs in a row.
+    // On glass the buttons breathe: the frosted key recipe from the yggui
+    // component (`frosted_bar`), tinted with the theme's foreground — the
+    // panel and the keys wear ONE recipe owned by the component, not this
+    // file's copy of it.
     let nav_button_style = |enabled: bool| {
         if compact {
-            format!(
-                "border:none; background:rgba(255,255,255,0.16); color:{foreground}; font-size:15px; line-height:1; \
-                 padding:5px 9px; border-radius:7px; cursor:{}; opacity:{}; \
-                 box-shadow:inset 0 0 0 1px rgba(255,255,255,0.20);",
-                if enabled { "pointer" } else { "default" },
-                if enabled { "0.9" } else { "0.35" },
-            )
+            format!("color:{foreground}; {}", frosted_key_style(enabled))
         } else {
             web_chrome_icon_button_style(&foreground, enabled)
         }
@@ -401,11 +396,9 @@ fn WebOmniboxBar(
     // mounted in the glass, not pasted on top; over the page this is the
     // classic single-row nav bar, unchanged.
     let bar_style = if compact {
-        "display:flex; flex-wrap:wrap; align-items:center; column-gap:2px; row-gap:1px; \
-         margin:2px 2px 0; padding:5px 8px 6px; border-radius:12px; user-select:none; \
-         background:rgba(22,27,34,0.10); backdrop-filter:blur(14px) saturate(130%); \
-         box-shadow:inset 0 0 0 1px rgba(255,255,255,0.10), 0 12px 28px rgba(0,0,0,0.14);"
-            .to_string()
+        // The FLOATING GLASS BAR recipe lives in the yggui frosted-bar
+        // component now; the rail only adds where the panel sits.
+        frosted_panel_style("margin:2px 2px 0;")
     } else {
         format!(
             "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{background}; user-select:none; \
@@ -1567,6 +1560,8 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
         // vocabulary even when the left sidebar (its other declaration site) is
         // not mounted.
         style { "{STATUS_DOT_BLINK_CSS}" }
+        // The glass keys' hover and focus answers, from the same component that owns the recipe.
+        style { {YGGUI_FROSTED_BAR_CSS} }
         // The scrollbar contract: a scrollbar that LAYS OUT beside the rows
         // instead of overlaying them — the fix that gives the right-edge verbs
         // their clicks back. Declared with the rail so it can never be
@@ -1746,6 +1741,7 @@ use emd_renderer::components::{
 // render as their alt text + a link (asset transport is a follow-up; the GUI
 // cannot assume a note's relative path is fetchable from its own host).
 use emd_renderer::{MdBlock, MdInline, parse_markdown_blocks, top_level_block_ranges};
+use yggui::frosted_bar::{frosted_key_style, frosted_panel_style, YGGUI_FROSTED_BAR_CSS};
 use yggui::prose::AnalyticalTextRole;
 
 // The typed markdown model + parser live in `emd-renderer`, which is no longer
