@@ -79,7 +79,7 @@ def resolve_fleet_mesh(explicit=None):
 
 STEERING_HEADER = """# Memory Index
 
-> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, Gemini, or Muse. Ingest full or partial diffs as needed.
+> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, Gemini, Zcode, or Muse. Ingest full or partial diffs as needed.
 > ⛔ **Doors, not rooms.** Rules (`feedback-/spec-/reference-/user-`) · ledgers (`campaign-/project-`) · findings (`finding-/bug-class-`) · steers (`steer-<harness>-`).
 > One line, one door. Detail belongs in the target file, never here.
 """
@@ -123,7 +123,11 @@ def write_managed_block(
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     base = strip_managed_block(existing) if user_content is None else user_content.strip()
     block = managed_block if managed_block is not None else memory_bridge(harness)
-    rendered = ((base + "\n\n") if base else "") + block + "\n"
+    # The blank-line boundary matches yggsteer's assemble(): a guarded part
+    # ends with "\n" and parts join on "\n\n", so a stamped file carries three
+    # newlines before a trailing foreign block. Rendering anything else made
+    # steer check and this sync fight over one line, each rewriting the other.
+    rendered = ((base + "\n\n\n") if base else "") + block + "\n"
     if rendered == existing:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -806,6 +810,136 @@ class QwenMemoryAdapter(HarnessMemoryAdapter):
         return len(pairs) + 1, ingested + i0 + i2 + i3, delivered + o0 + o2 + o3, deleted + d0 + d2 + d3
 
 
+class ZcodeMemoryAdapter(HarnessMemoryAdapter):
+    """Zcode auto-memory under ``~/.zcode/cli/memories/projects`` plus an AGENTS.md bridge.
+
+    The zcode project slug (``default-<hash>``) is opaque — never derivable
+    from a cwd — so every discovered ``projects/*/memory`` dir carries the
+    global namespace. Hub doors are delivered into ``pinned/yggterm/``; native
+    memories live flat at the top level and ingest through the native tree.
+    MEMORY.md is zcode's always-loaded one-line-per-door index: rebuilt from
+    the files themselves, never synced.
+    """
+
+    name = "zcode"
+
+    def __init__(self, home: Path):
+        self.home = home
+        self.projects_root = home / ".zcode" / "cli" / "memories" / "projects"
+        self.instruction_path = home / ".zcode" / "AGENTS.md"
+
+    def memory_dirs(self) -> list:
+        if not self.projects_root.is_dir():
+            return []
+        return sorted(
+            directory / "memory"
+            for directory in self.projects_root.iterdir()
+            if directory.is_dir() and (directory / "memory").is_dir()
+        )
+
+    @staticmethod
+    def _frontmatter_block(content: str) -> str:
+        match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
+        return match.group(1) if match else ""
+
+    @classmethod
+    def _meta(cls, content: str, key: str) -> str:
+        # zcode-native files nest type under `metadata:`; hub doors keep it
+        # flat — the indented-or-not match covers both. YAML folds long
+        # scalars across indented continuation lines; a continuation is
+        # indented text that is not itself a `key:` line.
+        block = cls._frontmatter_block(content)
+        match = re.search(rf"^[ \t]*{re.escape(key)}:[ \t]*(.*)$", block, re.MULTILINE)
+        if not match:
+            return ""
+        parts = [match.group(1).strip()]
+        rest = block[match.end():]
+        if rest.startswith("\n"):
+            rest = rest[1:]
+        for line in rest.splitlines():
+            if not re.match(r"^[ \t]+\S", line) or re.match(r"^[ \t]+[A-Za-z_][A-Za-z0-9_]*:(\s|$)", line):
+                break
+            parts.append(line.strip())
+        value = " ".join(part for part in parts if part)
+        return value.strip("\"'").replace('\\"', '"')
+
+    def _rebuild_index(self, memory_dir: Path) -> None:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        lines = ["# Memory index", ""]
+        for doc in sorted(memory_dir.rglob("*.md")):
+            if doc.name == "MEMORY.md":
+                continue
+            content = doc.read_text(encoding="utf-8", errors="replace")
+            if not content.startswith("---\n"):
+                continue
+            title = self._meta(content, "name") or doc.stem
+            description = self._meta(content, "description") or title
+            rel = urllib.parse.quote(doc.relative_to(memory_dir).as_posix(), safe="/._~-")
+            line = f"- [{title}]({rel}) — {description}".replace("\n", " ")
+            lines.append(line[:199] + "…" if len(line) > 200 else line)
+        rendered = "\n".join(lines) + "\n"
+        index = memory_dir / "MEMORY.md"
+        if not index.is_file() or index.read_text(encoding="utf-8") != rendered:
+            index.write_text(rendered, encoding="utf-8")
+
+    def _project(self, root: Path, harness: str, memory_dir: Path) -> tuple:
+        ns_dir = get_namespace_dir(root, GLOBAL_NAMESPACE)
+        target = memory_dir / "pinned" / "yggterm"
+        target.mkdir(parents=True, exist_ok=True)
+        expected = set()
+        delivered = deleted = 0
+        for door in sorted(ns_dir.glob("*.md")):
+            if door.name == "MEMORY.md":
+                continue
+            kind, summary, door_target = extract_metadata_and_summary(door.read_text(encoding="utf-8"), door.name)
+            if not matches_target_harness(door_target, harness):
+                continue
+            expected.add(door.name)
+            dest = target / door.name
+            content = door.read_text(encoding="utf-8")
+            if not dest.is_file() or dest.read_text(encoding="utf-8") != content:
+                dest.write_text(content, encoding="utf-8")
+                delivered += 1
+        for old in target.glob("*.md"):
+            if old.name not in expected:
+                old.unlink()
+                deleted += 1
+        ingested, outc, delc = _sync_native_tree(
+            root,
+            harness,
+            GLOBAL_NAMESPACE,
+            memory_dir,
+            "memory",
+            target_harness="all",
+            exclude=lambda relative: relative.name == "MEMORY.md"
+            or relative.parts[:2] == ("pinned", "yggterm"),
+        )
+        self._rebuild_index(memory_dir)
+        return ingested, delivered + outc, deleted + delc
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple:
+        # The zcode store is global; a per-cwd namespace has no native home here.
+        ingested = delivered = deleted = 0
+        for memory_dir in self.memory_dirs():
+            i, o, d = self._project(root, harness, memory_dir)
+            ingested += i
+            delivered += o
+            deleted += d
+        i2, o2, d2 = sync_instruction_document(root, harness, self.instruction_path)
+        return ingested + i2, delivered + o2, deleted + d2
+
+    def sync_all(self, root: Path, harness: str) -> tuple:
+        memory_dirs = self.memory_dirs()
+        ingested = delivered = deleted = 0
+        for memory_dir in memory_dirs:
+            i, o, d = self._project(root, harness, memory_dir)
+            ingested += i
+            delivered += o
+            deleted += d
+        i2, o2, d2 = sync_instruction_document(root, harness, self.instruction_path)
+        return max(1, len(memory_dirs)), ingested + i2, delivered + o2, deleted + d2
+
+
 class GrokMemoryAdapter(HarnessMemoryAdapter):
     """Grok 1.0.5 native MEMORY.md; SQLite/session state remains CLI-owned."""
 
@@ -1107,6 +1241,8 @@ def get_harness_adapter(harness: str, home: Path | None = None, cwd: Path | None
         return GrokMemoryAdapter(home, cwd)
     if normalized == "gemini":
         return GeminiMemoryAdapter(home, cwd)
+    if normalized == "zcode":
+        return ZcodeMemoryAdapter(home)
     raise ValueError(f"Unsupported harness memory backend: {normalized}")
 
 
@@ -1164,6 +1300,8 @@ def normalize_harness_name(name: str) -> str:
         return "kimi"
     if n in ("pi-coding-agent", "pi_coding_agent", "pi"):
         return "pi"
+    if n in ("zcode-cli", "zcode_cli", "zcode"):
+        return "zcode"
     return n
 
 
@@ -1182,6 +1320,8 @@ def detect_harness(override: str = None) -> str:
         return "grok"
     if os.environ.get("MUSE_SESSION"):
         return "muse"
+    if os.environ.get("ZCODE_APP_VERSION") or os.environ.get("ZCODE_RUNTIME_ENV"):
+        return "zcode"
     return "unknown"
 
 
