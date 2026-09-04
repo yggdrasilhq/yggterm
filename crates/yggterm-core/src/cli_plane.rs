@@ -856,6 +856,56 @@ fn identity_poll_payload(kind: SessionKind, stats: CliIdentityPollStats) -> Valu
     })
 }
 
+/// One self-minting row's identity-bind outcome, emitted on VERDICT CHANGE
+/// only. This is the probe point for the whole join plane: which arm bound
+/// the row (owner-reported birth alias vs the Codex cwd compatibility guess),
+/// which id won, and — the refusal classes behind the 2026-09-04
+/// all-codex-rows-one-session collapse — why a row that needed an identity
+/// got none. `session_path` names the row; ids ride as ids, never titles.
+pub struct CliAgentIdentityDecision<'a> {
+    pub slug: &'a str,
+    pub session_path: &'a str,
+    /// `bound` | `satisfied` | `no_candidate` | `ambiguous_cwd` |
+    /// `exhausted` | `unchanged`
+    pub verdict: &'static str,
+    /// `birth_alias` | `birth_key_alias` | `cwd_unique` | `none`
+    pub arm: &'static str,
+    pub chosen_id: Option<&'a str>,
+    pub cwd_candidates: usize,
+}
+
+pub fn emit_agent_identity_decision(component: &str, decision: CliAgentIdentityDecision<'_>) {
+    crate::perf::ytrace_emit_event(
+        component,
+        CLI_PLANE_CATEGORY,
+        "agent_identity_decision",
+        json!({
+            "slug": decision.slug,
+            "session_path": decision.session_path,
+            "verdict": decision.verdict,
+            "arm": decision.arm,
+            "chosen_id": decision.chosen_id,
+            "cwd_candidates": decision.cwd_candidates,
+        }),
+    );
+}
+
+/// A live self-minting row whose real transcript id could NOT be measured
+/// this tick, with the named reason. The stamp starvation behind the
+/// 2026-09-04 collapse lived here as a bare `continue`: a row whose terminal
+/// pid the daemon could not see was never stamped and never counted, so the
+/// precise owner-alias join starved and the cwd guess cross-wired every
+/// same-directory row onto one transcript. Edge-triggered per
+/// (session_path, reason).
+pub fn emit_agent_identity_probe_unresolved(component: &str, session_path: &str, reason: &str) {
+    crate::perf::ytrace_emit_event(
+        component,
+        CLI_PLANE_CATEGORY,
+        "agent_identity_probe_unresolved",
+        json!({ "session_path": session_path, "reason": reason }),
+    );
+}
+
 /// One mirror tick's identity decision, for a CLI whose TUI renders sessions
 /// the row was not born with.
 ///
