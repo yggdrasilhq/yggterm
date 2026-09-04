@@ -18781,6 +18781,37 @@ fn run_remote_yggterm_command(
     )
 }
 
+/// The hot-path variant: resolve (a warm cache needs no ssh), run ONCE, and
+/// return the error as-is. No cache reset, no re-resolve, no binary upload,
+/// no retry.
+///
+/// Measured 2026-09-04 on the gui host: a remote codex row's switch-in fired
+/// five PTY resizes in four seconds and every one died inside the fallback
+/// machinery — the first (transient) error matched the over-broad fallback
+/// list, so the runner threw the answer away, reset the binary cache,
+/// re-resolved, tried to UPLOAD the binary to the remote host, and the
+/// upload failed — a grid correction that never touched the grid, leaving
+/// the row painting for the wrong screen through its reveal. A resize is a
+/// hot, latency-sensitive, grid-correctness operation: provisioning is the
+/// background refresh's job (see pending-bugs [11.49]), not something to
+/// heal inside a keystroke-sized verb.
+fn run_remote_yggterm_command_no_fallback(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> anyhow::Result<String> {
+    let resolved = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
+    run_remote_binary_command_with_timeout(
+        ssh_target,
+        exec_prefix,
+        &resolved.0,
+        args,
+        stdin_bytes,
+        REMOTE_YGGTERM_COMMAND_TIMEOUT_MS,
+    )
+}
+
 fn run_remote_yggterm_command_with_timeout(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -31357,7 +31388,14 @@ pub fn resize_remote_agent_session_pty(
         .with_context(|| format!("session kind {kind:?} has no daemon runtime lane to resize"))?;
     let cols = cols.to_string();
     let rows = rows.to_string();
-    run_remote_yggterm_command(
+    // ⛔ A RESIZE NEVER PROVISIONS. The fallback runner answers a transient
+    // first error by resetting the remote binary cache and potentially
+    // uploading the whole binary to the remote host mid-resize (measured
+    // 2026-09-04: five resizes for one row switch died exactly this way,
+    // "failed to upload yggterm binary", the row painting for the wrong
+    // screen through its reveal). Resolve-and-run-once keeps the grid
+    // correction honest; see run_remote_yggterm_command_no_fallback.
+    run_remote_yggterm_command_no_fallback(
         &machine.ssh_target,
         machine.prefix.as_deref(),
         &[
@@ -34155,6 +34193,44 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// ⛔ THE RESIZE NEVER PROVISIONS. The remote PTY resize is a hot,
+    /// grid-correctness verb; measured 2026-09-04 it lost five resizes in one
+    /// switch-in window to the binary-upload fallback (the grid never moved;
+    /// the row painted for the wrong screen through its reveal). It must run
+    /// through the no-fallback runner.
+    #[test]
+    fn the_remote_pty_resize_never_runs_the_fallback_machinery() {
+        let source = include_str!("lib.rs");
+        let fn_start = source
+            .find("fn resize_remote_agent_session_pty(")
+            .expect("resize_remote_agent_session_pty must exist");
+        let body_len = source[fn_start..]
+            .find("\npub fn ")
+            .unwrap_or_else(|| source[fn_start..].find("\nfn ").expect("next fn follows"));
+        let body = &source[fn_start..fn_start + body_len];
+        assert!(
+            body.contains("run_remote_yggterm_command_no_fallback("),
+            "the remote PTY resize must call the no-fallback runner — a resize \
+             that can reset the binary cache and upload a binary is a \
+             provisioning operation wearing a resize's clothes"
+        );
+        assert!(
+            !body.contains("run_remote_yggterm_command("),
+            "the remote PTY resize still calls the fallback runner"
+        );
+        let runner_start = source
+            .find("fn run_remote_yggterm_command_no_fallback(")
+            .expect("the no-fallback runner must exist");
+        let runner_len = source[runner_start..]
+            .find("\nfn ")
+            .expect("the runner is followed by another fn");
+        let runner = &source[runner_start..runner_start + runner_len];
+        assert!(
+            !runner.contains("should_fallback_to_python") && !runner.contains("cache.remove"),
+            "the no-fallback runner grew fallback machinery back"
+        );
+    }
+
 
     /// Fleet projection must preserve the core scanner's verdict rather than
     /// re-derive a title or row scheme at the transport seam.
