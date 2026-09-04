@@ -35,6 +35,36 @@ mod tests {
         include_str!("overlays.rs")
     );
 
+    /// ⛔ THE RECOVERY-RPC OFF-LOOP LOCK, part 2. The first [11.46] sweep moved
+    /// the HostHealth cascade's five arms off the terminal loop; the next live
+    /// window (a daemon swap, 2026-09-04 04:46) then measured the six remaining
+    /// `terminal_attempt_resume_recovery_async` call sites holding the
+    /// `read_poll_apply` branch for 25.1 s behind awaited daemon-ensure
+    /// retries — the keystroke path queued behind a full recovery cascade
+    /// precisely while the daemon was least able to answer. Every call must
+    /// run inside a spawned task whose result rides `off_loop_rpc_tx`.
+    #[test]
+    fn every_resume_recovery_call_runs_off_the_terminal_loop() {
+        let source = SHELL_SOURCE;
+        let mut calls = 0;
+        for (idx, _) in source.match_indices("terminal_attempt_resume_recovery_async(") {
+            let head = &source[idx.saturating_sub(60)..idx];
+            if head.contains("async fn") {
+                continue; // the definition, not a call site
+            }
+            calls += 1;
+            let prefix = &source[idx.saturating_sub(400)..idx];
+            assert!(
+                prefix.contains("task::spawn(async move {"),
+                "a `terminal_attempt_resume_recovery_async` call at byte {idx} is                  not inside a spawned task — an inline `.await` here holds the                  terminal loop (and the owner's typing) behind daemon-ensure                  retries; spawn it and let the result land on `off_loop_rpc_tx`                  (the [11.46] sweep pattern)."
+            );
+        }
+        assert!(
+            calls >= 9,
+            "the recovery call sites moved — re-anchor this scan"
+        );
+    }
+
     /// ⚠⚠ THE INSTRUMENT-LIE LOCK, client half. The record a GUI publishes must carry
     /// the GL decision THIS process made.
     ///

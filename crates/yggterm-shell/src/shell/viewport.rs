@@ -8146,28 +8146,35 @@ fn TerminalCanvas(
                                                 session_host_label
                                             ),
                                         );
-                                        if let Err(recovery_error) =
-                                            terminal_attempt_resume_recovery_async(
-                                                endpoint.clone(),
-                                                runtime_session_path.clone(),
-                                                &trace_home,
-                                                "retained_empty_surface",
-                                                retained_empty_surface_recovery_attempts,
-                                            )
-                                            .await
                                         {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "retained_empty_surface_recovery_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "error": recovery_error.to_string(),
-                                                    "attempt": retained_empty_surface_recovery_attempts,
-                                                }),
-                                            );
-                                        }
+    // The recovery RPC leaves the loop (the [11.46] sweep, part 2 —
+    // the mount-loop call sites the first pass left behind; one of
+    // these measured a 25.1 s loop_block behind a daemon swap).
+    // Only its error trace waits for the result.
+    let sweep_tx = off_loop_rpc_tx.clone();
+    let sweep_endpoint = endpoint.clone();
+    let sweep_session = runtime_session_path.clone();
+    let sweep_trace = trace_home.clone();
+    let sweep_attempt = retained_empty_surface_recovery_attempts;
+    task::spawn(async move {
+        let result = terminal_attempt_resume_recovery_async(
+            sweep_endpoint,
+            sweep_session,
+            &sweep_trace,
+            "retained_empty_surface",
+            sweep_attempt,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ =
+            sweep_tx.send(OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                error_trace: "retained_empty_surface_recovery_error",
+                reason: None,
+                attempt: sweep_attempt,
+                result,
+            });
+    });
+}
                                         cursor = 0;
                                         append_trace_event(
                                             &trace_home,
@@ -8831,6 +8838,7 @@ fn TerminalCanvas(
                                                 let _ = sweep_tx.send(
                                                     OffLoopTerminalRpcResult::ResumeRecoverySettled {
                                                         error_trace: "blank_retry_poison_recovery_error",
+                        reason: None,
                                                         attempt: sweep_attempt,
                                                         result,
                                                     },
@@ -8911,6 +8919,7 @@ fn TerminalCanvas(
                                                 let _ = sweep_tx.send(
                                                     OffLoopTerminalRpcResult::ResumeRecoverySettled {
                                                         error_trace: "transport_error_visible_in_host_recovery_error",
+                        reason: None,
                                                         attempt: sweep_attempt,
                                                         result,
                                                     },
@@ -9988,27 +9997,35 @@ fn TerminalCanvas(
                             deferred_resume_output.clear();
                             visual_reveal_output_sample.clear();
                             first_resume_connected_output_ms = None;
-                            if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
-                                endpoint.clone(),
-                                runtime_session_path.clone(),
-                                &trace_home,
-                                "terminal_write_error",
-                                post_attach_read_recovery_attempts,
-                            )
-                            .await
                             {
-                                append_trace_event(
-                                    &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "terminal_write_recovery_error",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "error": recovery_error.to_string(),
-                                        "attempt": post_attach_read_recovery_attempts,
-                                    }),
-                                );
-                            }
+    // The recovery RPC leaves the loop (the [11.46] sweep, part 2 —
+    // the mount-loop call sites the first pass left behind; one of
+    // these measured a 25.1 s loop_block behind a daemon swap).
+    // Only its error trace waits for the result.
+    let sweep_tx = off_loop_rpc_tx.clone();
+    let sweep_endpoint = endpoint.clone();
+    let sweep_session = runtime_session_path.clone();
+    let sweep_trace = trace_home.clone();
+    let sweep_attempt = post_attach_read_recovery_attempts;
+    task::spawn(async move {
+        let result = terminal_attempt_resume_recovery_async(
+            sweep_endpoint,
+            sweep_session,
+            &sweep_trace,
+            "terminal_write_error",
+            sweep_attempt,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ =
+            sweep_tx.send(OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                error_trace: "terminal_write_recovery_error",
+                reason: None,
+                attempt: sweep_attempt,
+                result,
+            });
+    });
+}
                             cursor = 0;
                             read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
                         } else {
@@ -10470,6 +10487,7 @@ fn TerminalCanvas(
                                                 let _ = sweep_tx.send(
                                                     OffLoopTerminalRpcResult::ResumeRecoverySettled {
                                                         error_trace: "retained_non_prompt_surface_recovery_error",
+                        reason: None,
                                                         attempt: sweep_attempt,
                                                         result,
                                                     },
@@ -10633,6 +10651,7 @@ fn TerminalCanvas(
                             }
                             OffLoopTerminalRpcResult::ResumeRecoverySettled {
                                 error_trace,
+                                reason,
                                 attempt,
                                 result,
                             } => {
@@ -10641,16 +10660,20 @@ fn TerminalCanvas(
                                     &session_path,
                                 );
                                 if let Err(recovery_error) = result {
+                                    let mut payload = json!({
+                                        "session_path": session_path.clone(),
+                                        "error": recovery_error,
+                                        "attempt": attempt,
+                                    });
+                                    if let Some(reason) = reason {
+                                        payload["reason"] = json!(reason);
+                                    }
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
                                         "terminal_mount",
                                         error_trace,
-                                        json!({
-                                            "session_path": session_path.clone(),
-                                            "error": recovery_error,
-                                            "attempt": attempt,
-                                        }),
+                                        payload,
                                     );
                                 }
                             }
@@ -11700,27 +11723,35 @@ fn TerminalCanvas(
                                     deferred_resume_output.clear();
                                     visual_reveal_output_sample.clear();
                                     first_resume_connected_output_ms = None;
-                                    if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        &trace_home,
-                                        "transport_error_after_attach",
-                                        post_attach_read_recovery_attempts,
-                                    )
-                                    .await
                                     {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "transport_error_after_attach_recovery_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": recovery_error.to_string(),
-                                                "attempt": post_attach_read_recovery_attempts,
-                                            }),
-                                        );
-                                    }
+    // The recovery RPC leaves the loop (the [11.46] sweep, part 2 —
+    // the mount-loop call sites the first pass left behind; one of
+    // these measured a 25.1 s loop_block behind a daemon swap).
+    // Only its error trace waits for the result.
+    let sweep_tx = off_loop_rpc_tx.clone();
+    let sweep_endpoint = endpoint.clone();
+    let sweep_session = runtime_session_path.clone();
+    let sweep_trace = trace_home.clone();
+    let sweep_attempt = post_attach_read_recovery_attempts;
+    task::spawn(async move {
+        let result = terminal_attempt_resume_recovery_async(
+            sweep_endpoint,
+            sweep_session,
+            &sweep_trace,
+            "transport_error_after_attach",
+            sweep_attempt,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ =
+            sweep_tx.send(OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                error_trace: "transport_error_after_attach_recovery_error",
+                reason: None,
+                attempt: sweep_attempt,
+                result,
+            });
+    });
+}
                                     cursor = 0;
                                     read_poll_ms = 60;
                                     next_read_deadline = tokio::time::Instant::now()
@@ -13246,7 +13277,7 @@ fn TerminalCanvas(
                                         enabled: false,
                                         focus: false,
                                     });
-                                    let reason = if invalid_remote_resume_surface {
+                                    let reason: &'static str = if invalid_remote_resume_surface {
                                         if dead_codex_resume_instruction_surface {
                                             "dead_codex_resume_instruction"
                                         } else if saw_transcript_browser_output {
@@ -13271,28 +13302,36 @@ fn TerminalCanvas(
                                     } else {
                                         "no_output_stall"
                                     };
-                                    if let Err(error) = terminal_attempt_resume_recovery_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        &trace_home,
-                                        reason,
-                                        resume_recovery_attempts,
-                                    )
-                                    .await
                                     {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "resume_recovery_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "reason": reason,
-                                                "attempt": resume_recovery_attempts,
-                                                "error": error.to_string(),
-                                            }),
-                                        );
-                                    }
+    // The recovery RPC leaves the loop (the [11.46] sweep, part 2 —
+    // the mount-loop call sites the first pass left behind; one of
+    // these measured a 25.1 s loop_block behind a daemon swap).
+    // Only its error trace waits for the result.
+    let sweep_tx = off_loop_rpc_tx.clone();
+    let sweep_endpoint = endpoint.clone();
+    let sweep_session = runtime_session_path.clone();
+    let sweep_trace = trace_home.clone();
+    let sweep_attempt = resume_recovery_attempts;
+    let sweep_reason = reason;
+    task::spawn(async move {
+        let result = terminal_attempt_resume_recovery_async(
+            sweep_endpoint,
+            sweep_session,
+            &sweep_trace,
+            &sweep_reason,
+            sweep_attempt,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ =
+            sweep_tx.send(OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                error_trace: "resume_recovery_error",
+                reason: Some(sweep_reason.to_string()),
+                attempt: sweep_attempt,
+                result,
+            });
+    });
+}
                                     cursor = 0;
                                     read_poll_ms = 60;
                                     terminal_has_visible_output = false;
@@ -13358,26 +13397,36 @@ fn TerminalCanvas(
                                                     remote_resume_codex_rejected_surface_observed,
                                             }),
                                         );
-                                        if let Err(error) = terminal_attempt_resume_recovery_async(
-                                            endpoint.clone(),
-                                            runtime_session_path.clone(),
-                                            &trace_home,
-                                            restore_reason,
-                                            resume_recovery_attempts.saturating_add(1),
-                                        )
-                                        .await
                                         {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "protected_runtime_careful_restore_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "error": error.to_string(),
-                                                }),
-                                            );
-                                        }
+    // The recovery RPC leaves the loop (the [11.46] sweep, part 2 —
+    // the mount-loop call sites the first pass left behind; one of
+    // these measured a 25.1 s loop_block behind a daemon swap).
+    // Only its error trace waits for the result.
+    let sweep_tx = off_loop_rpc_tx.clone();
+    let sweep_endpoint = endpoint.clone();
+    let sweep_session = runtime_session_path.clone();
+    let sweep_trace = trace_home.clone();
+    let sweep_attempt = resume_recovery_attempts.saturating_add(1);
+    let sweep_reason = restore_reason;
+    task::spawn(async move {
+        let result = terminal_attempt_resume_recovery_async(
+            sweep_endpoint,
+            sweep_session,
+            &sweep_trace,
+            &sweep_reason,
+            sweep_attempt,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ =
+            sweep_tx.send(OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                error_trace: "protected_runtime_careful_restore_error",
+                reason: Some(sweep_reason.to_string()),
+                attempt: sweep_attempt,
+                result,
+            });
+    });
+}
                                         remote_resume_hard_fail_deadline_ms =
                                             current_millis().saturating_add(
                                                 REMOTE_TERMINAL_RESUME_HARD_FAIL_MS,
@@ -13783,27 +13832,35 @@ fn TerminalCanvas(
                                         deferred_resume_output.clear();
                                         visual_reveal_output_sample.clear();
                                         first_resume_connected_output_ms = None;
-                                        if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
-                                            endpoint.clone(),
-                                            runtime_session_path.clone(),
-                                            &trace_home,
-                                            "read_error_after_attach",
-                                            post_attach_read_recovery_attempts,
-                                        )
-                                        .await
                                         {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "read_error_after_attach_recovery_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "error": recovery_error.to_string(),
-                                                    "attempt": post_attach_read_recovery_attempts,
-                                                }),
-                                            );
-                                        }
+    // The recovery RPC leaves the loop (the [11.46] sweep, part 2 —
+    // the mount-loop call sites the first pass left behind; one of
+    // these measured a 25.1 s loop_block behind a daemon swap).
+    // Only its error trace waits for the result.
+    let sweep_tx = off_loop_rpc_tx.clone();
+    let sweep_endpoint = endpoint.clone();
+    let sweep_session = runtime_session_path.clone();
+    let sweep_trace = trace_home.clone();
+    let sweep_attempt = post_attach_read_recovery_attempts;
+    task::spawn(async move {
+        let result = terminal_attempt_resume_recovery_async(
+            sweep_endpoint,
+            sweep_session,
+            &sweep_trace,
+            "read_error_after_attach",
+            sweep_attempt,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ =
+            sweep_tx.send(OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                error_trace: "read_error_after_attach_recovery_error",
+                reason: None,
+                attempt: sweep_attempt,
+                result,
+            });
+    });
+}
                                         cursor = 0;
                                         read_poll_ms = 60;
                                         next_read_deadline = tokio::time::Instant::now()
@@ -16744,6 +16801,9 @@ enum OffLoopTerminalRpcResult {
     },
     ResumeRecoverySettled {
         error_trace: &'static str,
+        /// The per-cause reason string, for the one family whose error
+        /// trace carries it (the no_output_stall / eof / dead family).
+        reason: Option<String>,
         attempt: u64,
         result: Result<(), String>,
     },
