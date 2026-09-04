@@ -22,6 +22,8 @@ Closed narratives from before 2026-08-02 are in
 
 **Status:** OPEN
 
+Filed 2026-09-05 ~01:05 on `lane/trace/agent-identity-reach`.
+
 Multi-session law: the owner runs SEVERAL integration sessions in parallel;
 each claims one member id, works `lane/integration/<cli>`, and keeps per-CLI
 state in its own door. Seeded members: [11.92] (11.6.0, FIXED IN CODE — LIVE
@@ -29086,3 +29088,28 @@ SHIPPED IN THE SAME LANE (the owner's dynamic-metadata requirement):
 name, never an invention; a zcode-tui session switch (or a muse/agy one)
 re-titles the row within ticks via the cure; `rows show` answers
 title_sources for every agent row; the privacy gate passes.
+
+## ⛔ [identity-stale-metadata] EXHAUSTED ROWS FREEZE POISONED IDENTITY METADATA — NO PATH BACK TO THE BIRTH ID
+
+**Status:** OPEN
+
+The 00:21 flip-flop (pid-recycling collapse, fixed in the same lane) left
+three GUI-host rows bound to a transcript id (01a06d75) that belongs to
+none of them; their attempt budgets then exhausted, which stops the churn
+but also freezes the poisoned `Codex Session` metadata — the rail keeps
+advertising the wrong transcript and resume keeps hitting the live writer
+lock (-32600) even though the identity plane is now clean. The safe end
+state for a row with a drifted id and NO owner-vouched alias is the birth
+id: resume degrades to a fresh launch, the display stops lying, and the
+first truthful stamp rebinds it exactly.
+
+**Named next unit:** in the identity poll, when a repair-signature row
+(path carries the birth) finds no alias and its attempts exhaust, revert
+the row to its path-carried birth id and clear the stale `Codex Session`
+metadata (one named trace: `cli/agent_identity_reset_to_birth`). Owner
+workaround until then: close the affected rows — their real conversations
+live in other rows and a fresh spawn binds exactly.
+
+**Falsifier:** a row frozen on a wrong id with no alias must, within one
+poll of exhausting, show its birth id in `server app rows` and resume as a
+fresh launch; the stale id appears nowhere.
