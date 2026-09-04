@@ -3490,6 +3490,88 @@ impl LiveSessionOrderUpdate {
     }
 }
 
+/// The gate chain for one candidate row of the identity-poll view, shared by
+/// the order pass and the sessions-map sweep. Exclusions are NAMED (key, gate)
+/// so a row that LOOKS like it needs the poll but never reaches it is visible
+/// in one glance — the 2026-09-04 collapse hid damaged rows behind these
+/// gates, and one of them (the order naming a key the map does not hold) was
+/// silent until this fn existed.
+fn identity_poll_process_row(
+    key: &str,
+    session: &ManagedSessionView,
+    targets: &mut Vec<RemoteAgentIdentityPollTarget>,
+    bound_ids: &mut HashMap<String, HashSet<String>>,
+    excluded: &mut Vec<(String, &'static str)>,
+) {
+    if !managed_session_is_live_runtime_session(key, session) {
+        excluded.push((key.to_string(), "not_live_runtime"));
+        return;
+    }
+    let Some(descriptor) = agent_cli_descriptor(session.kind) else {
+        return;
+    };
+    let (scheme_kind, _machine_key, path_session_id) = match
+        yggterm_core::agent_scheme::parse_remote_agent_session_path(&session.session_path)
+    {
+        Some(parsed) => parsed,
+        None => {
+            excluded.push((key.to_string(), "path_parse_failed"));
+            return;
+        }
+    };
+    if scheme_kind != session.kind {
+        excluded.push((key.to_string(), "scheme_kind_mismatch"));
+        return;
+    }
+    let Some(ssh_target) = session
+        .ssh_target
+        .as_deref()
+        .filter(|target| !is_loopback_ssh_target(target))
+    else {
+        excluded.push((key.to_string(), "no_remote_target"));
+        return;
+    };
+    bound_ids
+        .entry(yggterm_core::agent_cli::session_kind_label(session.kind).to_string())
+        .or_default()
+        .insert(session.id.clone());
+    if descriptor.id_assigned_at_birth
+        || (session.kind != SessionKind::Codex && descriptor.live_session_marker.is_none())
+    {
+        excluded.push((key.to_string(), "id_assigned_at_birth"));
+        return;
+    }
+    // Healthy birth: the row still answers on its synthesized id.
+    // Repair: a previous poll already moved the id to a real CLI id —
+    // possibly a WRONG one (see the collapse note on `birth_id`).
+    // Such a row must stay pollable or the wrong id is permanent; the
+    // path still carries the birth id, so expose it for the alias join.
+    let birth_id = if path_session_id == session.id {
+        None
+    } else if looks_like_synthesized_uuidv4_session_id(&path_session_id)
+        && !looks_like_synthesized_uuidv4_session_id(&session.id)
+    {
+        Some(path_session_id.to_string())
+    } else {
+        excluded.push((key.to_string(), "path_id_neither_birth_nor_matched"));
+        return;
+    };
+    let Some(cwd) = session_metadata_value(session, "Cwd").filter(|value| !value.trim().is_empty())
+    else {
+        excluded.push((key.to_string(), "no_cwd_metadata"));
+        return;
+    };
+    targets.push(RemoteAgentIdentityPollTarget {
+        key: key.to_string(),
+        kind: session.kind,
+        ssh_target: ssh_target.to_string(),
+        ssh_prefix: session.ssh_prefix.clone(),
+        cwd,
+        current_id: session.id.clone(),
+        birth_id,
+    });
+}
+
 fn managed_session_is_live_runtime_session(key: &str, session: &ManagedSessionView) -> bool {
     managed_session_is_promoted_live_session(key, session)
         // ⚖ NARROWED ON PURPOSE, and it is not the Class-B hand-list: the
@@ -7596,82 +7678,44 @@ impl YggtermServer {
         let mut targets = Vec::new();
         let mut bound_ids: HashMap<String, HashSet<String>> = HashMap::new();
         let mut excluded: Vec<(String, &'static str)> = Vec::new();
-        for key in &self.live_session_order {
-            let Some(session) = self.sessions.get(key) else {
-                continue;
-            };
-            // Exclusions are NAMED (key, gate) so a row that LOOKS like it
-            // needs the poll but never reaches it is visible in one glance —
-            // the 2026-09-04 collapse hid damaged rows behind these gates.
-            if !managed_session_is_live_runtime_session(key, session) {
-                excluded.push((key.clone(), "not_live_runtime"));
-                continue;
+        // Pass 1 walks the presented order; pass 2 sweeps the sessions map
+        // for live self-minting rows the order does not name. Reachability
+        // must not depend on the order staying in sync: the 2026-09-04
+        // collapse left three damaged remote rows in the map but out of the
+        // order, and a poll that iterates only the order can never repair
+        // them (filed as [identity-order-divergence]). Both passes are
+        // sorted, so the matcher's claimed-set spread is deterministic.
+        let mut ordered: Vec<String> = self.live_session_order.clone();
+        ordered.sort();
+        let in_order: HashSet<String> = ordered.iter().cloned().collect();
+        for key in &ordered {
+            match self.sessions.get(key) {
+                Some(session) => identity_poll_process_row(
+                    key,
+                    session,
+                    &mut targets,
+                    &mut bound_ids,
+                    &mut excluded,
+                ),
+                None => excluded.push((key.clone(), "order_key_missing_from_sessions")),
             }
-            let Some(descriptor) = agent_cli_descriptor(session.kind) else {
-                continue;
-            };
-            let (scheme_kind, _machine_key, path_session_id) =
-                match yggterm_core::agent_scheme::parse_remote_agent_session_path(
-                    &session.session_path,
-                ) {
-                    Some(parsed) => parsed,
-                    None => {
-                        excluded.push((key.clone(), "path_parse_failed"));
-                        continue;
-                    }
-                };
-            if scheme_kind != session.kind {
-                excluded.push((key.clone(), "scheme_kind_mismatch"));
-                continue;
+        }
+        let mut sweep: Vec<&String> = self
+            .sessions
+            .keys()
+            .filter(|key| !in_order.contains(*key))
+            .collect();
+        sweep.sort();
+        for key in sweep {
+            if let Some(session) = self.sessions.get(key) {
+                identity_poll_process_row(
+                    key,
+                    session,
+                    &mut targets,
+                    &mut bound_ids,
+                    &mut excluded,
+                );
             }
-            let Some(ssh_target) = session
-                .ssh_target
-                .as_deref()
-                .filter(|target| !is_loopback_ssh_target(target))
-            else {
-                excluded.push((key.clone(), "no_remote_target"));
-                continue;
-            };
-            bound_ids
-                .entry(yggterm_core::agent_cli::session_kind_label(session.kind).to_string())
-                .or_default()
-                .insert(session.id.clone());
-            if descriptor.id_assigned_at_birth
-                || (session.kind != SessionKind::Codex && descriptor.live_session_marker.is_none())
-            {
-                excluded.push((key.clone(), "id_assigned_at_birth"));
-                continue;
-            }
-            // Healthy birth: the row still answers on its synthesized id.
-            // Repair: a previous poll already moved the id to a real CLI id —
-            // possibly a WRONG one (see the collapse note on `birth_id`).
-            // Such a row must stay pollable or the wrong id is permanent; the
-            // path still carries the birth id, so expose it for the alias join.
-            let birth_id = if path_session_id == session.id {
-                None
-            } else if looks_like_synthesized_uuidv4_session_id(&path_session_id)
-                && !looks_like_synthesized_uuidv4_session_id(&session.id)
-            {
-                Some(path_session_id.to_string())
-            } else {
-                excluded.push((key.clone(), "path_id_neither_birth_nor_matched"));
-                continue;
-            };
-            let Some(cwd) = session_metadata_value(session, "Cwd")
-                .filter(|value| !value.trim().is_empty())
-            else {
-                excluded.push((key.clone(), "no_cwd_metadata"));
-                continue;
-            };
-            targets.push(RemoteAgentIdentityPollTarget {
-                key: key.clone(),
-                kind: session.kind,
-                ssh_target: ssh_target.to_string(),
-                ssh_prefix: session.ssh_prefix.clone(),
-                cwd,
-                current_id: session.id.clone(),
-                birth_id,
-            });
         }
         (targets, bound_ids, excluded)
     }
@@ -48027,6 +48071,78 @@ terminal_window_id: None,
             "generation-2 damaged row must stay pollable; row id in map={restored_id}; targets2={targets2:?}; excluded2={excluded2:?}"
         );
         assert_eq!(mine2.unwrap().current_id, birth);
+    }
+
+    /// The [identity-order-divergence] guarantee: a live self-minting row
+    /// the order ledger lost must STILL be reachable by the identity poll
+    /// through the sessions-map sweep, or a collapse can freeze damaged
+    /// rows out of repair forever.
+    #[test]
+    fn poll_view_reaches_sessions_map_rows_the_order_lost() {
+        let birth = "31d35e27-d6a3-4bd4-986e-3f798a7a9d7a";
+        let runtime_key = remote_scanned_session_path("dev", birth);
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.clone(),
+            id: birth.to_string(),
+            title: "order-lost row".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/gh/yggterm".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let live = server.sessions.get_mut(&runtime_key).expect("mounted");
+        upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
+        // Simulate the order-ledger divergence measured on the GUI host
+        // after the 2026-09-04 cascade: the row lives in the map, not in
+        // the order.
+        let before = server.live_session_order.len();
+        server
+            .live_session_order
+            .retain(|key| key != &runtime_key);
+        assert_eq!(server.live_session_order.len(), before - 1);
+
+        let (targets, _bound, _excluded) = server.live_remote_agent_identity_poll_view();
+        let mine = targets.iter().find(|t| t.key == runtime_key);
+        assert!(
+            mine.is_some(),
+            "an order-lost row must stay reachable; targets={targets:?}"
+        );
+        assert_eq!(mine.unwrap().current_id, birth);
+    }
+
+    /// The other half of the divergence made loud: an order entry naming a
+    /// key the sessions map does not hold is NAMED, never silent.
+    #[test]
+    fn poll_view_names_order_keys_missing_from_sessions() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let ghost = "remote-session://dev/00000000-0000-4000-8000-000000000000";
+        server.live_session_order.push(ghost.to_string());
+        let (_targets, _bound, excluded) = server.live_remote_agent_identity_poll_view();
+        assert!(
+            excluded
+                .iter()
+                .any(|(key, gate)| key == ghost && *gate == "order_key_missing_from_sessions"),
+            "a dead order key must be named; excluded={excluded:?}"
+        );
     }
 
     fn keep_alive_remote_codex_identity_restores_real_session_not_fresh_start() {
