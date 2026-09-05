@@ -20867,7 +20867,32 @@ fn spawn_disk_binary_version_poll(
                 );
                 let last = SAME_VERSION_HANDOFF_LAST_MS.load(Ordering::Relaxed);
                 let in_cooldown = now_ms.saturating_sub(last) < SAME_VERSION_HANDOFF_COOLDOWN_MS;
-                let same_version = disk_replacement_version(&exe_link)
+                let probed_version = disk_replacement_version(&exe_link);
+                if binary_replaced && probed_version.is_none() {
+                    // The probe did not answer within its bound — the audit
+                    // trail must say so: this is the signature of the 2026-
+                    // 09-05 stall (one hung child, rotation blind for hours).
+                    // Suppressed to once per window; the hysteresis treats
+                    // unanswered as not-ours and rotates anyway.
+                    let now = current_millis_u64();
+                    let announced = DISK_VERSION_PROBE_UNANSWERED_MS.load(Ordering::Relaxed);
+                    if announced == 0 || now.saturating_sub(announced) >= 300_000 {
+                        DISK_VERSION_PROBE_UNANSWERED_MS.store(now, Ordering::Relaxed);
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "disk_version_probe_unanswered",
+                            serde_json::json!({
+                                "exe_link": exe_link,
+                                "current_version": SERVER_PROTOCOL_VERSION,
+                                "current_pid": std::process::id(),
+                                "hysteresis": "bypassed; rotating unversioned",
+                            }),
+                        );
+                    }
+                }
+                let same_version = probed_version
                     .map(|version| version == SERVER_PROTOCOL_VERSION)
                     .unwrap_or(false);
                 if in_cooldown && same_version {
@@ -21840,6 +21865,11 @@ static DISK_REPLACEMENT_COMPARE_LATCH: Mutex<Option<((u64, u64), bool)>> = Mutex
 /// spawn per 20 s poll.
 #[cfg(target_os = "linux")]
 static DISK_REPLACEMENT_VERSION_LATCH: Mutex<Option<((u64, u64), String)>> = Mutex::new(None);
+
+/// Last time an unanswered disk-version probe was traced — one line per
+/// window, not one per 20 s poll.
+#[cfg(target_os = "linux")]
+static DISK_VERSION_PROBE_UNANSWERED_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 fn disk_replacement_version(exe_link: &str) -> Option<String> {

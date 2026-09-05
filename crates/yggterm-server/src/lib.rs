@@ -19278,12 +19278,55 @@ fn local_bootstrap_payload_version() -> String {
 ///
 /// `None` when the binary cannot be interrogated at all; callers decide whether
 /// an unknown version is a reason to proceed or to hold back.
+/// The version-probe bound. Generous against a cold page-in of a 60 MB
+/// binary; far below the 20 s poll it must never outlive.
+pub const VERSION_PROBE_TIMEOUT_MS: u64 = 5_000;
+
+/// How long a spawned binary may take to report `--version` before it is
+/// killed and the probe answers "unanswered". The disk-binary poll runs this
+/// ON ITS 20 s THREAD: `.output()` waits without bound, and one hung child —
+/// measured on the GUI host 2026-09-05, a binary that reaches for the daemon
+/// bind lock another daemon holds — blocked the poll thread FOREVER, so every
+/// later deploy became invisible to rotation and stale daemons served for
+/// hours. Bound it; a killed probe answers `None`, and the same-version
+/// hysteresis treats unanswered as NOT-ours — failing toward rotation.
 pub fn yggterm_executable_reported_version(path: &Path) -> Option<String> {
-    let out = std::process::Command::new(path)
+    yggterm_executable_reported_version_bounded(path, VERSION_PROBE_TIMEOUT_MS)
+}
+
+pub fn yggterm_executable_reported_version_bounded(
+    path: &Path,
+    timeout_ms: u64,
+) -> Option<String> {
+    let mut child = std::process::Command::new(path)
         .arg("--version")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    // Read after exit: a `--version` line cannot fill the pipe, and a chatty
+    // child that could is killed by the bound above instead of blocking us.
+    let _ = status;
+    let mut text = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = stdout.read_to_string(&mut text);
+    }
     let token = text.split_whitespace().find(|t| looks_like_version(t))?;
     Some(token.to_string())
 }
@@ -34485,6 +34528,46 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn a_version_probe_answers_with_the_first_version_looking_token() {
+        let dir = std::env::temp_dir().join(format!("ygg-probe-ok-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("probe-ok.sh");
+        std::fs::write(&bin, "#!/bin/sh\necho 'yggterm 3.2.69 build-x'\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let v = yggterm_executable_reported_version_bounded(&bin, 5_000);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(v.as_deref(), Some("3.2.69"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_hanging_version_probe_is_killed_at_the_bound_and_answers_none() {
+        let dir = std::env::temp_dir().join(format!("ygg-probe-hang-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("probe-hang.sh");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 60\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let v = yggterm_executable_reported_version_bounded(&bin, 1_000);
+        let elapsed = started.elapsed();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(v.is_none(), "a child past its bound must answer unanswered");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the bound must actually bound: took {elapsed:?}"
+        );
+    }
+
     /// ⛔ THE RESIZE NEVER PROVISIONS. The remote PTY resize is a hot,
     /// grid-correctness verb; measured 2026-09-04 it lost five resizes in one
     /// switch-in window to the binary-upload fallback (the grid never moved;
