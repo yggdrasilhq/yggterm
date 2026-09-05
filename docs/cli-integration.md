@@ -2154,7 +2154,11 @@ pts devices is unrecoverable by anyone (a pts exists only while its master
 lives) and reads as the corpse it is. Refusals carry per-holder
 `why_not_reaped` notes — the banner arrives with its own diagnosis.
 
-**Falsifier:** the dev orphan at filing time is the live falsifier — after
-the deploy rotates a daemon onto the fix, that row's reopen must reap
-(`external_stranded_orphan_reaped_by_ensure`, `reason` field), respawn the
-TUI, and paint the session with no hand kill.
+**Falsifier PROVEN live 2026-09-05 22:16 (build 3.2.70):** the 12-hour-old
+orphan was reaped automatically at the resume wait's 122 s deadline
+(`external_active_wait_recovered_stranded_orphan`, `reason: stranded_orphan`),
+the wait ended released, and the fresh TUI spawned with the NEW DAEMON as its
+parent — the session daemon-owned again, no hand kill. Also live-proofed:
+the corrected banner wording ("already running under yggterm … Nothing to
+close") replaced the eternal "end it with kill" refusal from the first
+resume attempt on the fixed bytes.
