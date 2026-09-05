@@ -27197,3 +27197,27 @@ decide for agent rows with a readable record (`Idle`), keeping the
 foreground veto at full force for shell rows and unreadable transcripts
 (`a_stale_agent_transcript_overrides_the_uninformative_foreground_gate`).
 
+## ⛔ [11.66] THE COMPOSER DRAFT DETECTOR FALSE-POSITIVES ON RESUMED CODEX SCREENS — HISTORY USER-MESSAGES WEAR THE COMPOSER'S OWN MARKER
+
+**Status:** OPEN
+
+Found 2026-09-06 ~03:1x by the migration drain's own blocked announcements:
+a resumed codex row (idle 800+ s, never typed into) held
+`pending_draft` forever, and pending_draft is an absolute migration block —
+the row could never follow its daemon. The composer detector
+(`composer_row_holds_text`) walks up from the screen bottom, skips chrome,
+accumulates non-chrome rows into "wrapped composer text", and returns
+draft-present when it finds the descriptor's `composer_marker` with content.
+Codex's marker is `›` (U+203A) — and codex's TUI renders HISTORICAL USER
+MESSAGES with the same `›`, so on any RESUMED thread the walk runs past the
+(empty) composer into history and reads a `› user message…` row as typed
+composer text. The 14-row window plus a bottom-heavy resumed transcript
+makes the false positive permanent.
+
+**Fix shape (needs one measured fact):** capture the live idle-composer
+glyph codex v0.153+ actually draws (the marker may have drifted from `›`),
+and require the marker row to be the BOTTOM-MOST content row — a marker
+found above accumulated non-chrome rows is transcript wearing the marker,
+which must answer `None` ("no composer here"), never "draft". The same
+ambiguity probably affects every CLI whose history rendering reuses its
+composer marker.

@@ -6391,11 +6391,17 @@ impl DaemonRuntime {
             return TranscriptActivity::Unknown;
         };
         let session_id = runtime_key.rsplit('/').next().unwrap_or("");
-        match yggterm_core::agent_cli::agent_session_recency_ms(
-            self.store.home_dir(),
-            kind,
-            session_id,
-        ) {
+        // ⛔ THE USER HOME, NOT THE YGGTERM HOME (the F3 lesson, again —
+        // caught live by the drain's own blocked announcements 2026-09-06:
+        // a codex/opencode pair answered transcript_unknown forever because
+        // `store.home_dir()` is `~/.yggterm`, and the CLIs' stores live under
+        // the USER home — `~/.codex`, `~/.claude`,
+        // `~/.local/share/opencode`). The CLIs' own stores are anchored on
+        // the user home and nothing else.
+        let recency = dirs::home_dir().and_then(|user_home| {
+            yggterm_core::agent_cli::agent_session_recency_ms(user_home, kind, session_id)
+        });
+        match recency {
             Some(recency_ms) => {
                 let now = current_millis_u64() as i64;
                 let age = (now - recency_ms).max(0) as u64;
