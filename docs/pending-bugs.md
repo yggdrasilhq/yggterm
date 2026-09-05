@@ -27061,6 +27061,15 @@ Both rotation-critical callers are covered (the poll's version read AND the
 handoff's `target_version`). Source tests: the bound actually bounds (a 60 s
 sleeper is killed, answer within 10 s) and a healthy binary still parses.
 
+**SECOND HALF, found in the same drill (2026-09-05 21:27-21:58):** the
+hysteresis clock was documented as SEEDED AT BOOT but was seeded at the FIRST
+TRIGGER — the fresh 3.2.69 daemon (born 13:33) deferred its first same-version
+deploy for a brand-new 30-minute window (21:27:39→~21:58) instead of rotating
+on the next poll, because eight hours of age had not spent a window that had
+never started. Fixed in the same hour: the clock is stored at boot
+(), the doc is true, and an aged daemon now
+rotates on the first eligible poll.
+
 **Falsifier:** on the next deploy, the incumbent daemon retires onto the new
 bytes within one poll of the cooldown policy (≤20 s if versions differ or the
 30-min hysteresis has expired — the normal case for an aged daemon); if a
