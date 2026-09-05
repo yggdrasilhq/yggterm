@@ -3110,6 +3110,7 @@ impl PtySessionRuntime {
                                 &reader_app_declares,
                                 &key_label,
                                 &data,
+                                &launch_command_label,
                             );
                             osc_witness.observe(&key_label, &data);
                             if let Some(new_title) = osc_title_tracker.observe(&data)
@@ -4618,6 +4619,53 @@ fn find_uuid_in_text(text: &str) -> Option<String> {
     None
 }
 
+/// Whose launch commands may mint retained web-surface state.
+///
+/// [11.60], measured 2026-09-05 on the GUI host: a plain shell row's `printf`
+/// of a forged base64 web-surface `open` was retained by this log and the
+/// GUI's restore tick then PASSIVELY materialized a webview at the attacker's
+/// URL — no user action, no explicit ask, and the row was `--no-activate` so
+/// the accepted-risk mitigation in docs/web-surfaces.md ("visibly labeled,
+/// one keypress removes it") never applied. The declare plane reads a shared
+/// PTY, so byte provenance is unattributable; the LAUNCH COMMAND is the one
+/// durable fact the daemon owns about who a row is. A row launched as a
+/// surface app may declare surfaces; arbitrary row content may not. (A forger
+/// who execs the real app has crossed from "output" to "running the binary" —
+/// a different, accepted threat.)
+fn launch_command_declares_web_surfaces(launch_command: &str) -> bool {
+    launch_command.contains("ychrome")
+}
+
+/// Refusals are traced at most once per (path, verb, action) per window: a
+/// forger can emit the OSC every chunk, and the refusal must not become the
+/// drumbeat it prevents.
+static PROVENANCE_REFUSED_LAST_MS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn trace_provenance_refused(path: &str, verb: &str, action: &str, launch_command: &str) {
+    let key = format!("{path}|{verb}|{action}");
+    let now = now_millis();
+    let Ok(mut guard) = PROVENANCE_REFUSED_LAST_MS.lock() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(&last) = map.get(&key) {
+        if now.saturating_sub(last) < 30_000 {
+            return;
+        }
+    }
+    map.insert(key, now);
+    trace_terminal_event(
+        "provenance_refused",
+        serde_json::json!({
+            "path": path,
+            "verb": verb,
+            "action": action,
+            "launch_command": launch_command,
+        }),
+    );
+}
+
 /// Lift libyggterm declares out of a chunk and retain the latest per verb.
 ///
 /// Runs on every PTY chunk, so the scanner's no-escape fast path matters: the
@@ -4629,11 +4677,13 @@ fn ingest_app_declares(
     log: &Arc<Mutex<AppDeclareLog>>,
     path: &str,
     data: &str,
+    launch_command: &str,
 ) {
     let messages = scanner.scan(data);
     if messages.is_empty() {
         return;
     }
+    let surface_capable = launch_command_declares_web_surfaces(launch_command);
     let now_ms = now_millis();
     // Identity of the retained STATE, ignoring the timestamp and seq a
     // heartbeat refreshes — otherwise every heartbeat looks like a change.
@@ -4650,12 +4700,16 @@ fn ingest_app_declares(
             .collect::<Vec<_>>()
     };
     for message in messages {
+        let verb = message.verb.clone();
+        let action = message.action.clone();
+        if verb == "web-surface" && !surface_capable {
+            trace_provenance_refused(path, &verb, &action, launch_command);
+            continue;
+        }
         let Ok(mut log) = log.lock() else {
             return;
         };
         let before = state_of(&log.records());
-        let verb = message.verb.clone();
-        let action = message.action.clone();
         log.ingest(message, now_ms);
         let after = log.records();
         if before != state_of(&after) {
@@ -5587,6 +5641,65 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn a_forged_web_surface_declare_from_a_plain_shell_is_refused() {
+        // [11.60]: a plain shell row's printf must not mint retained
+        // web-surface state — the restore tick materializes whatever this log
+        // retains, passively.
+        let mut scanner = AppDeclareScanner::new();
+        let log = Arc::new(Mutex::new(AppDeclareLog::new()));
+        let payload = "eyJ1cmwiOiJodHRwOi8vMTI3LjAuMC4xOjkveCJ9";
+        let forged = format!("\x1b]7717;web-surface;open;{payload}\x07");
+        ingest_app_declares(&mut scanner, &log, "local://x", &forged, "exec '/bin/bash' -i");
+        assert!(
+            log.lock().unwrap().records().is_empty(),
+            "a plain shell's output must not retain web-surface state"
+        );
+    }
+
+    #[test]
+    fn a_web_surface_declare_from_a_surface_launcher_is_retained() {
+        let mut scanner = AppDeclareScanner::new();
+        let log = Arc::new(Mutex::new(AppDeclareLog::new()));
+        let payload = "eyJ1cmwiOiJodHRwOi8vMTI3LjAuMC4xOjkveCJ9";
+        let real = format!("\x1b]7717;web-surface;open;{payload}\x07");
+        ingest_app_declares(
+            &mut scanner,
+            &log,
+            "local://x",
+            &real,
+            "/home/u/.local/bin/ychrome https://example.test",
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|r| r.verb == "web-surface"),
+            "a row launched as the surface app may declare surfaces"
+        );
+    }
+
+    #[test]
+    fn a_sidebar_declare_from_a_plain_shell_is_still_retained() {
+        // The gate is about SURFACE state specifically; the rail/document
+        // plane keeps its semantics for every row ([11.48] picker retention
+        // rides this log too).
+        let mut scanner = AppDeclareScanner::new();
+        let log = Arc::new(Mutex::new(AppDeclareLog::new()));
+        let payload = "eyJhIjoxfQ==";
+        let declare = format!("\x1b]7717;sidebar;declare;{payload}\x07");
+        ingest_app_declares(&mut scanner, &log, "local://x", &declare, "exec '/bin/bash' -i");
+        assert!(
+            log.lock()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|r| r.verb == "sidebar"),
+            "non-surface verbs keep their retention for every row"
+        );
+    }
 
     /// The load-bearing fact behind the mount buffer-kind seed: feeding the
     /// daemon's vt100 the alternate-screen enter MUST flip
@@ -6747,9 +6860,13 @@ line-two on the real screen\r\n\
                 .to_string()
                 .as_bytes(),
         );
+        // [11.60]: the provenance gate retains web-surface declares only for
+        // surface-capable launch commands, so this fixture must be launched
+        // as one. `command -v ychrome` states the capability and is harmless
+        // when the binary is absent.
         let runtime = PtySessionRuntime::spawn(
             "local://declare-ingest",
-            &format!("printf '\\033]7717;web-surface;open;{payload}\\007'; sleep 5"),
+            &format!("command -v ychrome; printf '\\033]7717;web-surface;open;{payload}\\007'; sleep 5"),
             None,
             None,
         )
