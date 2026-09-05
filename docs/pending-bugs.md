@@ -27147,3 +27147,52 @@ daemon, force a same-version handover; with the signal wired, the
 predecessor releases the row (`progressive_migration_session_released`), the
 successor re-resumes it, and the predecessor reaches
 `progressive_migration_owner_empty_retire` and exits.
+
+## ⛔ [11.65] THE SELF-ALIAS PURGE EATS A TRUE PRESERVED-OWNER CLAIM AFTER A SAME-VERSION HANDOFF — THE SUCCESSOR RE-RESUMES A LIVE WRITER AND CODEX REFUSES -32600
+
+**Status:** OPEN
+
+Measured 2026-09-05 ~22:14–23:14 on dev (owner screenshot: a codex row
+answering `Failed to resume session … thread <id> already has an active
+writer (code -32600)`). The chain, every link probed live:
+
+1. A same-version preserving handoff spawns a successor; the predecessor
+   renames its socket to `.retired-<pid>` and lingers holding the agent
+   PTYs (constitution-legal; with the drain fixed it even names its
+   adopter now — but agent rows never release, [11.64]).
+2. The successor's preserved-owner registry entries name the predecessor
+   by its ENDPOINT STRING — the canonical socket name, which the successor
+   itself now answers. Every resolve-to-self check therefore reads the
+   claim as an adoption alias of SELF, and the purge arm deletes it as
+   "factually wrong: these rows are ours now" (`owner_is_self_alias`) —
+   but the rows were NOT ours: the PTYs and their live CLI processes were
+   on the predecessor's renamed socket. The 2026-08-21 purge law was
+   written for single-daemon adoption artifacts, where self-resolution
+   really does mean false; after a same-version handoff it is TRUE claims
+   that self-resolve, and the purge eats them.
+3. Registry gone, the next daemon generation reported
+   `preserved_terminal_owner_count: 0`, believed the row's runtime gone,
+   and re-resumed it — spawning a SECOND codex against a thread whose
+   first writer was still alive under the unregistered predecessor.
+   Codex's own writer lock refused: -32600, painted raw into the row.
+
+**Cure applied (the [11.57] doctrine, worked first try):** the stale pair
+was `zombie daemon -> wrapper -> codex writer` with the zombie holding
+exactly the stale rows; SIGTERM of the zombie released writer + wrapper +
+the sibling opencode TUI (SIGHUP via master close, no orphans left), and
+the row's reattach resumed clean under the current daemon, which now owns
+the runtime. A live-parent writer is NOT reapable by the [11.63] arms —
+and must not be; the registry truth is what was broken.
+
+**Fix shape:** before purging a self-resolving preserved-owner claim,
+read the registry entry's `owner_server_pid`: if that pid is alive and is
+not this process, the claim names a same-version predecessor behind a
+renamed socket — repoint the entry (the `.retired-<pid>` name or a
+/proc lookup by pid) instead of purging. Purge only when the pid is dead
+or our own. Same law for every other resolve-to-self consumer of
+preserved-owner endpoints (the negative-cache arm shares the blindness).
+
+**Falsifier:** force a same-version handover on a daemon holding an agent
+row (the predecessor keeps it, [11.64]); the successor's registry must
+still name the predecessor (count 1, resolve-by-pid), no re-resume may
+fire, and the row must keep painting from the preserved owner.
