@@ -1388,16 +1388,29 @@ fn process_tree_runs_agent_cli(_pid: u32) -> bool {
 /// is harmless, but losing a user's unsent work is the cardinal sin — so ANY
 /// unavailable/ambiguous signal (`None`) means NOT migratable.
 fn session_is_migratable(signals: &MigratableSignals, idle_threshold_ms: u64) -> bool {
+    first_blocking_migration_gate(signals, idle_threshold_ms).is_none()
+}
+
+/// ⛔ THE ONE OWNER OF "what stands between this session and a migration
+/// release" — [`session_is_migratable`] reads it as a bool, the migration
+/// drain's blocked announcement carries it per row BY NAME (the §9
+/// observability contract: a row that is not moving must say which gate
+/// holds it, or every stalled drain reads as healthy). Gate order matters
+/// only for the diagnosis; every arm is a hard block.
+fn first_blocking_migration_gate(
+    signals: &MigratableSignals,
+    idle_threshold_ms: u64,
+) -> Option<&'static str> {
     // (a) output/input-idle past the generous threshold.
     let Some(idle_ms) = signals.activity_idle_ms else {
-        return false;
+        return Some("pty_idle_unknown");
     };
     if idle_ms < idle_threshold_ms {
-        return false;
+        return Some("pty_recently_active");
     }
     // (b) no protected draft on the current line.
     if signals.has_pending_draft != Some(false) {
-        return false;
+        return Some("pending_draft");
     }
     // (c) no foreground command running in the tty — EXCEPT when the
     // transcript decides. ⛔ [11.64]: for an agent row this signal is
@@ -1413,11 +1426,11 @@ fn session_is_migratable(signals: &MigratableSignals, idle_threshold_ms: u64) ->
     // cannot read, still blocks exactly as before.
     let transcript_decides = matches!(signals.transcript, TranscriptActivity::Idle(_));
     if signals.foreground_command_running != Some(false) && !transcript_decides {
-        return false;
+        return Some("foreground_command");
     }
     // (d) optional working-footer guard.
     if signals.screen_shows_working {
-        return false;
+        return Some("working_screen");
     }
     // (e) the transcript is not still being written. THE SUBAGENT CLAUSE: (a),
     // (c) and (d) all clear on an agent session whose main loop is stalled while
@@ -1426,14 +1439,14 @@ fn session_is_migratable(signals: &MigratableSignals, idle_threshold_ms: u64) ->
     // has no transcript and is unaffected.
     match signals.transcript {
         TranscriptActivity::NotAnAgentSession => {}
-        TranscriptActivity::Unknown => return false,
+        TranscriptActivity::Unknown => return Some("transcript_unknown"),
         TranscriptActivity::Idle(idle_ms) => {
             if idle_ms < idle_threshold_ms {
-                return false;
+                return Some("transcript_fresh");
             }
         }
     }
-    true
+    None
 }
 
 #[cfg(unix)]
@@ -15818,6 +15831,38 @@ fn live_same_version_successor(home_dir: &Path) -> Option<u32> {
     (status.server_pid != std::process::id()).then_some(status.server_pid)
 }
 
+/// Throttled blocked-drain announcement: rows exist, an adopter may even be
+/// live, but nothing is migratable THIS tick — carry each row's blocking gate
+/// by name, once a minute (the §9 observability contract).
+fn announce_migration_candidates_blocked(home_dir: &Path, rows: &[MigrationCandidateRow]) {
+    static LAST_ANNOUNCED_MS: AtomicU64 = AtomicU64::new(0);
+    let now = current_millis_u64();
+    let last = LAST_ANNOUNCED_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 30_000 {
+        return;
+    }
+    LAST_ANNOUNCED_MS.store(now, Ordering::Relaxed);
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "lifecycle",
+        "progressive_migration_candidates_blocked",
+        serde_json::json!({
+            "rows": rows
+                .iter()
+                .map(|row| serde_json::json!({
+                    "runtime_key": row.runtime_key,
+                    "idle_ms": row.idle_ms,
+                    "re_resumable": row.re_resumable,
+                    "migratable": row.migratable,
+                    "blocking_gate": row.blocking_gate,
+                }))
+                .collect::<Vec<_>>(),
+            "current_pid": std::process::id(),
+        }),
+    );
+}
+
 /// Throttled no-adopter announcement for the migration drain — once a minute,
 /// so a stalled drain is a NAMED state (`progressive_migration_no_adopter`)
 /// instead of a silent `continue` that reads as healthy. The §9 observability
@@ -21627,6 +21672,10 @@ struct MigrationCandidateRow {
     re_resumable: bool,
     migratable: bool,
     idle_ms: u64,
+    /// Which gate holds a non-migratable row, named — the blocked-drain
+    /// announcement carries this verbatim (§9: a row that is not moving says
+    /// which gate holds it).
+    blocking_gate: Option<&'static str>,
 }
 
 /// Pick the SINGLE session to migrate this tick — oldest-idle-first (largest
@@ -21772,7 +21821,7 @@ fn spawn_progressive_session_migration(
             // runtime lock: two locks held in one order here and the other order
             // anywhere else is a deadlock, and this one is cheap to copy.
             let release_attempts = migration_release_attempts_snapshot();
-            let candidate = {
+            let (candidate, rows) = {
                 let rt = lock_daemon_runtime(&runtime, "progressive_migration_select");
                 let rows = owned
                     .iter()
@@ -21780,21 +21829,29 @@ fn spawn_progressive_session_migration(
                         release_attempts.get(key.as_str()).copied().unwrap_or(0)
                             < MAX_MIGRATION_RELEASES_PER_KEY
                     })
-                    .map(|key| MigrationCandidateRow {
-                        runtime_key: key.clone(),
-                        re_resumable: rt
-                            .server
-                            .live_session_kind(key)
-                            .map(session_kind_is_migratable_agent)
-                            .unwrap_or(false),
-                        migratable: rt.session_is_migratable_now(key),
-                        idle_ms: rt.terminals.session_idle_for_ms(key).unwrap_or(0),
+                    .map(|key| {
+                        let signals = rt.session_migratable_signals(key);
+                        let blocking_gate =
+                            first_blocking_migration_gate(&signals, migration_idle_threshold_ms());
+                        MigrationCandidateRow {
+                            runtime_key: key.clone(),
+                            re_resumable: rt
+                                .server
+                                .live_session_kind(key)
+                                .map(session_kind_is_migratable_agent)
+                                .unwrap_or(false),
+                            migratable: blocking_gate.is_none(),
+                            idle_ms: rt.terminals.session_idle_for_ms(key).unwrap_or(0),
+                            blocking_gate,
+                        }
                     })
                     .collect::<Vec<_>>();
-                select_next_migration_candidate(&rows)
+                (select_next_migration_candidate(&rows), rows)
             };
             let Some(runtime_key) = candidate else {
-                // Nothing safe to migrate this tick; keep lingering and re-check.
+                // Nothing safe to migrate this tick — SAY what holds each row,
+                // throttled (§9: silence reads as healthy).
+                announce_migration_candidates_blocked(&home_dir, &rows);
                 continue;
             };
             let attempts = record_migration_release_attempt(&runtime_key);
@@ -29644,6 +29701,7 @@ mod tests {
                     re_resumable: true,
                     migratable: true,
                     idle_ms: 60_000,
+                    blocking_gate: None,
                 })
                 .collect::<Vec<_>>();
             super::select_next_migration_candidate(&rows).is_some()
@@ -30370,6 +30428,7 @@ mod tests {
             re_resumable: re,
             migratable: mig,
             idle_ms,
+            blocking_gate: None,
         }
     }
 
