@@ -5683,6 +5683,140 @@ pub fn opencode_store_newest_session_for_directory(home: &Path, directory: &str)
     None
 }
 
+/// The last-write recency of one agent session's OWN transcript or store row —
+/// the positive migration-liveness signal ([11.64]).
+///
+/// `Some(epoch_ms)` = this CLI's records for `session_id` were read, and this
+/// is when they last grew. `None` = this CLI has no reader here, or the id is
+/// empty, or the row exists with no readable timestamps — the caller must
+/// treat that as "cannot say", never as "stale": an unreadable liveness signal
+/// on a session that might have live subagents is exactly the ambiguity that
+/// must resolve to "leave it alone".
+///
+/// Per kind: codex reads the newest rollout file's mtime under
+/// `~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`; Claude Code the
+/// session jsonl under `~/.claude/projects/*/<id>.jsonl`; OpenCode the later
+/// of `time_updated`/`time_viewed` in its own sqlite store (`session_v2`
+/// first, v1 `session` as the fallback — the same store, table precedence and
+/// type-agnostic column reading [`opencode_store_newest_session_for_directory`]
+/// uses; archived rows answer None: an archived conversation is not a live
+/// one). Every other kind has no reader yet and answers `None`.
+pub fn agent_session_recency_ms(home: &Path, kind: SessionKind, session_id: &str) -> Option<i64> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    match kind {
+        SessionKind::Codex => newest_jsonl_mtime_under(
+            &home.join(".codex").join("sessions"),
+            session_id,
+            4,
+        ),
+        SessionKind::ClaudeCode => newest_jsonl_mtime_under(
+            &home.join(".claude").join("projects"),
+            session_id,
+            2,
+        ),
+        SessionKind::OpenCode => opencode_store_row_recency_ms(home, session_id),
+        _ => None,
+    }
+}
+
+/// Newest modification time (epoch ms) among `.jsonl` files under `root`
+/// (walked to `depth` directory levels) whose NAME contains `needle`.
+/// `None` when the root is missing or nothing matches — the caller turns
+/// that into "cannot say".
+fn newest_jsonl_mtime_under(root: &Path, needle: &str, depth: u8) -> Option<i64> {
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut newest: Option<i64> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Some(found) = newest_jsonl_mtime_under(&path, needle, depth - 1) {
+                if newest.is_none_or(|known| found > known) {
+                    newest = Some(found);
+                }
+            }
+            continue;
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if name.ends_with(".jsonl") && name.contains(needle) {
+            if let Some(ms) = path_mtime_epoch_ms(&path) {
+                if newest.is_none_or(|known| ms > known) {
+                    newest = Some(ms);
+                }
+            }
+        }
+    }
+    newest
+}
+
+fn path_mtime_epoch_ms(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
+}
+
+/// OpenCode's own recency for one session id: the later of `time_updated` and
+/// `time_viewed`, read TYPE-AGNOSTICALLY (the store held INTEGER epochs and a
+/// `String` read silently dropped every row — the F3 lesson), `session_v2`
+/// first, v1 `session` as the fallback. An archived row answers `None`.
+fn opencode_store_row_recency_ms(home: &Path, session_id: &str) -> Option<i64> {
+    let conn = open_cli_index_readonly(&home.join(".local/share/opencode/opencode.db"))?;
+    for (table, selects_viewed) in [("session_v2", true), ("session", false)] {
+        let present = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()?;
+        if present == 0 {
+            continue;
+        }
+        let viewed_col = if selects_viewed { ", time_viewed, time_archived" } else { ", time_archived" };
+        let sql = format!("SELECT time_updated{viewed_col} FROM {table} WHERE id = ?1");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let row = stmt.query_row(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, rusqlite::types::Value>(0)?,
+                if selects_viewed {
+                    row.get::<_, rusqlite::types::Value>(1)?
+                } else {
+                    rusqlite::types::Value::Null
+                },
+                row.get::<_, rusqlite::types::Value>(if selects_viewed { 2 } else { 1 })?,
+            ))
+        });
+        let Ok((updated, viewed, archived)) = row else {
+            // No row in THIS table — the v1 fallback may still hold it.
+            continue;
+        };
+        let epoch_ms = |v: &rusqlite::types::Value| -> i128 {
+            match v {
+                rusqlite::types::Value::Integer(i) => *i as i128,
+                rusqlite::types::Value::Real(f) => *f as i128,
+                rusqlite::types::Value::Text(t) => t.trim().parse::<i128>().unwrap_or(0),
+                _ => 0,
+            }
+        };
+        if epoch_ms(&archived) > 0 {
+            return None;
+        }
+        let recency = epoch_ms(&viewed).max(epoch_ms(&updated));
+        return (recency > 0).then(|| i64::try_from(recency).unwrap_or(i64::MAX));
+    }
+    None
+}
+
 /// PUSH the harmonized title INTO muse's own index (Issue Heading 37): muse
 /// code does NOT self-title — a zero-prompt session sits at "New session"
 /// forever (28 such rows measured on dev 2026-09-05) — so yggterm's
@@ -9405,6 +9539,86 @@ mod newest_session_tests {
             opencode_store_newest_session_for_directory(&home, "/p").as_deref(),
             Some("ses_int"),
             "an INTEGER-epoch row must be readable as a candidate"
+        );
+    }
+
+    /// ⛔ [11.64] THE POSITIVE MIGRATION-LIVENESS SIGNAL, per kind. Recency is
+    /// the session's own record's last write: codex's rollout file mtime,
+    /// Claude Code's session jsonl mtime, OpenCode's store row (later of
+    /// `time_updated`/`time_viewed`, archived = None). No reader for a kind,
+    /// an empty id, or unreadable timestamps is `None` — "cannot say", which
+    /// the caller must treat as blocking, never as stale.
+    #[test]
+    fn agent_session_recency_reads_each_kinds_own_records() {
+        // codex: the rollout file under its dated session tree.
+        let home = temp_home("recency-codex");
+        let dir = home.join(".codex/sessions/2026/09/06");
+        std::fs::create_dir_all(&dir).expect("codex session tree");
+        let rollout = dir.join("rollout-2026-09-06T00-00-00-01a0709f-0345-7281-9967-9bef550cbaf1.jsonl");
+        std::fs::write(&rollout, b"{}").expect("rollout");
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as i64;
+        let recency = agent_session_recency_ms(
+            &home,
+            SessionKind::Codex,
+            "01a0709f-0345-7281-9967-9bef550cbaf1",
+        )
+        .expect("rollout recency");
+        assert!(
+            recency <= before && recency > before - 60_000,
+            "the rollout mtime is the recency ({recency} vs now {before})"
+        );
+        // A different session's rollout is not this session's recency.
+        assert_eq!(
+            agent_session_recency_ms(&home, SessionKind::Codex, "ses_absent"),
+            None,
+            "no matching rollout is None, never a fake zero"
+        );
+
+        // Claude Code: the session jsonl under the projects tree.
+        let home = temp_home("recency-cc");
+        let dir = home.join(".claude/projects/-home-x-proj");
+        std::fs::create_dir_all(&dir).expect("cc projects tree");
+        std::fs::write(dir.join("ses_cc000000000000000000001.jsonl"), b"{}").expect("cc jsonl");
+        assert!(
+            agent_session_recency_ms(&home, SessionKind::ClaudeCode, "ses_cc000000000000000000001")
+                .is_some(),
+            "the CC session jsonl answers"
+        );
+        assert_eq!(
+            agent_session_recency_ms(&home, SessionKind::ClaudeCode, "ses_absent"),
+            None
+        );
+
+        // OpenCode: the store row, later of updated/viewed, INTEGER or TEXT.
+        let home = temp_home("recency-oc");
+        seed(
+            &home,
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);
+             INSERT INTO session_v2 VALUES ('ses_live', 100, 900, NULL);
+             INSERT INTO session_v2 VALUES ('ses_gone', 100, 100, 500);",
+        );
+        assert_eq!(
+            agent_session_recency_ms(&home, SessionKind::OpenCode, "ses_live"),
+            Some(900),
+            "the later of updated/viewed is the recency"
+        );
+        assert_eq!(
+            agent_session_recency_ms(&home, SessionKind::OpenCode, "ses_gone"),
+            None,
+            "an archived row is not a live one"
+        );
+
+        // A kind with no reader, and an empty id: cannot say.
+        assert_eq!(
+            agent_session_recency_ms(&temp_home("recency-none"), SessionKind::Muse, "ses_x"),
+            None
+        );
+        assert_eq!(
+            agent_session_recency_ms(&temp_home("recency-empty"), SessionKind::Codex, "   "),
+            None
         );
     }
 

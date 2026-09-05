@@ -6346,10 +6346,37 @@ impl DaemonRuntime {
             // `None` here and blocks. Say "unknown" rather than inventing a shell.
             return TranscriptActivity::Unknown;
         };
-        if process_tree_runs_agent_cli(pid) {
-            TranscriptActivity::Unknown
-        } else {
-            TranscriptActivity::NotAnAgentSession
+        if !process_tree_runs_agent_cli(pid) {
+            return TranscriptActivity::NotAnAgentSession;
+        }
+        // ⭐ [11.64] THE POSITIVE SIGNAL. This arm answered a blanket
+        // `Unknown`, and Unknown BLOCKS — so no agent runtime was ever
+        // releasable, every predecessor with an agent row lingered until
+        // process death, and the fleet's dominant rows pinned their daemons
+        // forever (three generations measured on dev). The CLI's own
+        // transcript is the positive "still working" instrument the clause
+        // was written to wait for: a session whose main loop is stalled
+        // while its subagents keep working still has its transcript GROWING
+        // (Fresh → blocks), and one genuinely parked for past the idle
+        // threshold reads Stale → releasable with the other four signals.
+        // A kind without a reader, an unreadable store, or an empty id
+        // still answers `Unknown` → blocks — "cannot say" never widens the
+        // release.
+        let Some(kind) = self.server.live_session_kind(runtime_key) else {
+            return TranscriptActivity::Unknown;
+        };
+        let session_id = runtime_key.rsplit('/').next().unwrap_or("");
+        match yggterm_core::agent_cli::agent_session_recency_ms(
+            self.store.home_dir(),
+            kind,
+            session_id,
+        ) {
+            Some(recency_ms) => {
+                let now = current_millis_u64() as i64;
+                let age = (now - recency_ms).max(0) as u64;
+                TranscriptActivity::Idle(age)
+            }
+            None => TranscriptActivity::Unknown,
         }
     }
 
@@ -30105,6 +30132,61 @@ mod tests {
         let mut sig = migratable_idle_session();
         sig.activity_idle_ms = Some(1_000);
         assert!(!session_is_migratable(&sig, MIGRATE_IDLE_MS));
+    }
+
+    /// ⛔ [11.64] THE TRANSCRIPT ARM DECIDES AGENT-ROW MIGRABILITY, PER STATE.
+    /// Fresh (recently grown) blocks even with every other signal green — the
+    /// subagent clause: a stalled main loop still grows the transcript while
+    /// its delegates work. Stale past the threshold releases. Unknown blocks —
+    /// "cannot say" never widens the release.
+    #[test]
+    fn the_transcript_signal_gates_migration_fresh_blocks_stale_releases_unknown_blocks() {
+        let fresh = || {
+            let mut sig = migratable_idle_session();
+            sig.transcript = TranscriptActivity::Idle(MIGRATE_IDLE_MS / 2);
+            sig
+        };
+        let stale = || {
+            let mut sig = migratable_idle_session();
+            sig.transcript = TranscriptActivity::Idle(MIGRATE_IDLE_MS + 1);
+            sig
+        };
+        let unknown = || {
+            let mut sig = migratable_idle_session();
+            sig.transcript = TranscriptActivity::Unknown;
+            sig
+        };
+        assert!(
+            !session_is_migratable(&fresh(), MIGRATE_IDLE_MS),
+            "a transcript growing within the threshold is a working session"
+        );
+        assert!(
+            session_is_migratable(&stale(), MIGRATE_IDLE_MS),
+            "a transcript stale past the threshold is a parked session"
+        );
+        assert!(
+            !session_is_migratable(&unknown(), MIGRATE_IDLE_MS),
+            "an unreadable transcript must keep the session protected"
+        );
+    }
+
+    /// ⛔ [11.64] THE AGENT ARM ANSWERS THE POSITIVE SIGNAL, NOT A BLANKET
+    /// UNKNOWN. `session_transcript_activity` must resolve the CLI's own
+    /// transcript recency (`agent_session_recency_ms`) for agent rows — the
+    /// blanket `Unknown` it answered blocked every agent runtime from ever
+    /// migrating and pinned every predecessor until process death.
+    #[test]
+    fn the_agent_transcript_arm_resolves_the_positive_recency_signal() {
+        let source = include_str!("daemon.rs");
+        let body = daemon_fn_body(source, "fn session_transcript_activity(");
+        assert!(
+            body.contains("agent_session_recency_ms"),
+            "the agent arm must consult the per-kind recency reader"
+        );
+        assert!(
+            body.contains("TranscriptActivity::Idle("),
+            "a readable recency must become Idle(age), the releasable-when-stale state"
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ Guards belong on the second, never the first.
 | Mechanism | Destructive? | Guarded by |
 | --- | --- | --- |
 | Hot-restart handoff | No — preserves PTYs | nothing; it is always safe |
-| Progressive migration release | Per-session | `session_is_migratable_now` (idle, no draft, no foreground command, not "working") |
+| Progressive migration release | Per-session | `session_is_migratable_now` (idle, no draft, no foreground command, not "working", and — for agent rows — the CLI's own transcript stale past the same threshold, [11.64]) |
 | Cold shutdown / self-retire | **Yes** — kills PTYs | `hot_update_idle_gate_block_reason` |
 
 ### The two bugs
