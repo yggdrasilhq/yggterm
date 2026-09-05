@@ -65879,6 +65879,62 @@ mod live_md_edit_tests {
 }
 
 #[cfg(test)]
+mod browser_tree_refresh_skip_tests {
+    use super::*;
+    use yggterm_core::SessionNode;
+
+    fn leaf(name: &str, title: &str) -> SessionNode {
+        SessionNode {
+            kind: yggterm_core::SessionNodeKind::CodexSession,
+            name: name.to_string(),
+            title: Some(title.to_string()),
+            document_kind: None,
+            group_kind: None,
+            path: std::path::PathBuf::from(format!("/tmp/{name}")),
+            children: Vec::new(),
+            session_id: Some(name.to_string()),
+            cwd: None,
+            session_kind: None,
+            detail: None,
+        }
+    }
+
+    /// Source contract: the skip fires ONLY for a previously-applied (non-zero)
+    /// fingerprint seen again. Never-applied (0 = never), failed walks (None)
+    /// and unserializable trees (0) all apply — failure modes stay visible
+    /// downstream, never swallowed by the skip.
+    #[test]
+    fn an_unchanged_tree_refresh_skips_only_after_a_real_apply() {
+        let fp = 12345u64;
+        assert!(!browser_tree_refresh_skip_verdict(0, Some(fp)));
+        assert!(browser_tree_refresh_skip_verdict(fp, Some(fp)));
+        assert!(!browser_tree_refresh_skip_verdict(fp, Some(fp + 1)));
+        assert!(!browser_tree_refresh_skip_verdict(fp, None));
+        assert!(!browser_tree_refresh_skip_verdict(fp, Some(0)));
+    }
+
+    /// The fingerprint is a pure function of the tree shape the sidebar
+    /// renders: a deep-equal re-walk must not re-apply; a title change must.
+    #[test]
+    fn fingerprint_tracks_tree_content_not_walk_identity() {
+        let mut tree_a = leaf("s1", "one");
+        tree_a.children.push(leaf("s2", "two"));
+        let mut tree_b = leaf("s1", "one");
+        tree_b.children.push(leaf("s2", "two"));
+        let mut tree_c = leaf("s1", "one");
+        tree_c.children.push(leaf("s2", "two RENAMED"));
+
+        let fp_a = browser_tree_fingerprint(&tree_a);
+        let fp_b = browser_tree_fingerprint(&tree_b);
+        let fp_c = browser_tree_fingerprint(&tree_c);
+
+        assert_ne!(fp_a, 0);
+        assert_eq!(fp_a, fp_b);
+        assert_ne!(fp_a, fp_c);
+    }
+}
+
+#[cfg(test)]
 mod web_surface_immersion_locks {
     use super::*;
 
