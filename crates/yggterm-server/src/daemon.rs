@@ -14537,11 +14537,14 @@ fn build_background_copy_updates(
             } else {
                 None
             };
-            // PUSH (Issue Heading 37): muse code does NOT self-title — the
-            // generated title is pushed into muse's own session index so the
-            // CLI's picker and yggterm's row agree. USER home (the
-            // store-candidate lesson: not resolve_yggterm_home). Codex has no
-            // title store — yggterm's metadata layer stays its only carrier.
+            // PUSH (Issue Heading 37) — ⚠ DORMANT since the owner's second
+            // titling word (2026-09-05): muse self-titles now
+            // (`sessions.session_name`), so `session_accepts_generated_copy`
+            // refuses its rows upstream and no generated title ever reaches
+            // this arm. Kept deliberately: the push path is the contract for
+            // any future generated-copy kind with a writable title store.
+            // USER home (the store-candidate lesson: not
+            // resolve_yggterm_home).
             if let Some(generated) = title.as_deref()
                 && candidate.session_path.starts_with("muse-runtime://")
                 && let Some(user_home) = dirs::home_dir()
@@ -34747,9 +34750,17 @@ mod tests {
 
     #[test]
     fn live_title_candidates_gate_on_working_indicator() {
-        // spec-title-summary-working-indicator: a live agent session becomes
-        // a title candidate ONLY while working; idle sessions are never
+        // spec-title-summary-working-indicator: a live row becomes a title
+        // GENERATION candidate ONLY while working; idle sessions are never
         // scanned or sent to the LLM.
+        //
+        // ⚠ POPULATION NARROWED 2026-09-05 (owner titling law, closed): every
+        // agent CLI self-titles now, so `session_accepts_generated_copy`
+        // refuses them all. A working CODEX row below must therefore produce
+        // NO candidate — the live-store title chore reads the CLI's own
+        // Thread name instead. The working gate's remaining live population
+        // is the durable transcript-path row whose kind did not survive the
+        // trip, which the second half of this test locks.
         let mut server = crate::YggtermServer::new(
             false,
             crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
@@ -34760,8 +34771,8 @@ mod tests {
             Some("/home/user"),
             Some("home/pi codex"),
         );
-        // Give the live session a Storage JSONL so it would qualify as a
-        // live-local-agent candidate (write a real temp file).
+        // Give the live session a Storage JSONL so it WOULD qualify as a
+        // live-local-agent candidate were codex still a generated-copy kind.
         let dir = std::env::temp_dir().join("yggterm-test-title-gate");
         let _ = std::fs::create_dir_all(&dir);
         let jsonl = dir.join("rollout-test-title-gate.jsonl");
@@ -34774,22 +34785,40 @@ mod tests {
             );
         }
         let store = yggterm_core::SessionStore::open_or_init().expect("store");
-        let mut out = Vec::new();
-        // Idle → no candidate.
-        let idle = std::collections::HashSet::new();
-        super::collect_live_copy_candidates(&store, &server.live_sessions(), &idle, &mut out);
-        assert!(
-            out.iter().all(|c| c.session_path != key),
-            "idle live session must not become a title candidate"
-        );
-        // Working → candidate appears.
+        // ⛔ THE OWNER TITLING LAW (closed): even WORKING, a codex row is
+        // never a generation candidate — codex stores its own Thread name
+        // (`local_thread_catalog.display_title`) and yggterm reads it.
         let mut out = Vec::new();
         let working: std::collections::HashSet<String> = [key.clone()].into_iter().collect();
         super::collect_live_copy_candidates(&store, &server.live_sessions(), &working, &mut out);
         assert!(
+            out.iter().all(|c| c.session_path != key),
+            "a self-titling CLI's working row must never become a generation \
+             candidate — the title chore reads the CLI's own title instead"
+        );
+        // The gate still gates the rows it still serves: a durable
+        // transcript-path row (kind lost in the trip, absolute .jsonl path)
+        // is a candidate while WORKING and never while idle.
+        let mut carried = server.live_sessions()[0].clone();
+        carried.session_path = jsonl.to_string_lossy().to_string();
+        carried.kind = crate::SessionKind::Shell;
+        let idle = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        super::collect_live_copy_candidates(&store, &[carried.clone()], &idle, &mut out);
+        assert!(
             out.iter()
-                .any(|c| c.session_path == key && c.live_local_agent),
-            "working live agent session must become a title candidate"
+                .all(|c| c.session_path != carried.session_path),
+            "idle durable row must not become a title candidate"
+        );
+        let mut out = Vec::new();
+        let working: std::collections::HashSet<String> = [carried.session_path.clone()]
+            .into_iter()
+            .collect();
+        super::collect_live_copy_candidates(&store, &[carried.clone()], &working, &mut out);
+        assert!(
+            out.iter()
+                .any(|c| c.session_path == carried.session_path),
+            "working durable row must become a title candidate"
         );
         let _ = std::fs::remove_file(&jsonl);
     }

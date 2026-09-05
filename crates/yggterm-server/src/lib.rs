@@ -39297,15 +39297,21 @@ mod tests {
         );
         let shell_row =
             server.start_command_session(Some("/home/user"), Some("shell"), "/bin/bash -i", None);
-        let agent_row =
-            server.start_command_session(Some("/home/user"), Some("codex"), "codex", None);
+        // ⚠ Was a CODEX row before the owner titling law closed (2026-09-05):
+        // every agent CLI self-titles now, so NO agent kind accepts generated
+        // copy any more and the gate's positive local-live population is the
+        // DOCUMENT — titled from its own body. The lock's shape is unchanged:
+        // three rows differing only in what they ARE, and a path-shaped arm
+        // would still admit all three.
+        let document_row =
+            server.start_command_session(Some("/home/user"), Some("notes"), "yedit notes.md", None);
         server
             .sessions
-            .get_mut(&agent_row)
-            .expect("the agent row exists")
-            .kind = SessionKind::Codex;
+            .get_mut(&document_row)
+            .expect("the document row exists")
+            .kind = SessionKind::Document;
 
-        let verdicts = [&app_row, &shell_row, &agent_row].map(|path| {
+        let verdicts = [&app_row, &shell_row, &document_row].map(|path| {
             let session = server.sessions.get(path).expect("the row exists");
             (
                 session.session_path.starts_with("local://"),
@@ -39315,8 +39321,8 @@ mod tests {
         assert_eq!(
             verdicts,
             [(true, false), (true, false), (true, true)],
-            "all three carry a local runtime key; only the agent session may be \
-             titled from its transcript"
+            "all three carry a local runtime key; only the document may be \
+             titled from its own body"
         );
     }
 
