@@ -1399,8 +1399,20 @@ fn session_is_migratable(signals: &MigratableSignals, idle_threshold_ms: u64) ->
     if signals.has_pending_draft != Some(false) {
         return false;
     }
-    // (c) no foreground command running in the tty.
-    if signals.foreground_command_running != Some(false) {
+    // (c) no foreground command running in the tty — EXCEPT when the
+    // transcript decides. ⛔ [11.64]: for an agent row this signal is
+    // uninformative BY CONSTRUCTION: the wrapper `bash -c` runs the TUI in
+    // its own process group, so the tty's foreground pgid differs from the
+    // PTY child for as long as the TUI lives — idle at its prompt and
+    // mid-turn alike — and a signal that can never clear would block every
+    // agent row forever no matter what the transcript says. For an agent row
+    // with a readable transcript, (e) IS the working/parked verdict: growing
+    // blocks, stale past the threshold releases. The foreground gate keeps
+    // its full force for shell rows (NotAnAgentSession) and whenever the
+    // transcript cannot say (Unknown) — a vi in a shell row, or any row we
+    // cannot read, still blocks exactly as before.
+    let transcript_decides = matches!(signals.transcript, TranscriptActivity::Idle(_));
+    if signals.foreground_command_running != Some(false) && !transcript_decides {
         return false;
     }
     // (d) optional working-footer guard.
@@ -30186,6 +30198,39 @@ mod tests {
         assert!(
             body.contains("TranscriptActivity::Idle("),
             "a readable recency must become Idle(age), the releasable-when-stale state"
+        );
+    }
+
+    /// ⛔ [11.64] THE FOREGROUND GATE IS UNINFORMATIVE FOR AGENT ROWS: the
+    /// `bash -c` wrapper runs the TUI in its own process group, so the tty
+    /// foreground differs from the PTY child for as long as the TUI lives —
+    /// parked at its prompt included. With the transcript decidably stale the
+    /// transcript decides; for a shell row the foreground veto keeps its full
+    /// force.
+    #[test]
+    fn a_stale_agent_transcript_overrides_the_uninformative_foreground_gate() {
+        let agent = || {
+            let mut sig = migratable_idle_session();
+            sig.transcript = TranscriptActivity::Idle(MIGRATE_IDLE_MS + 1);
+            sig.foreground_command_running = Some(true);
+            sig
+        };
+        assert!(
+            session_is_migratable(&agent(), MIGRATE_IDLE_MS),
+            "a parked agent row must release even though the TUI owns the tty foreground"
+        );
+        let mut shell = migratable_idle_session();
+        shell.transcript = TranscriptActivity::NotAnAgentSession;
+        shell.foreground_command_running = Some(true);
+        assert!(
+            !session_is_migratable(&shell, MIGRATE_IDLE_MS),
+            "a shell row's foreground command keeps its full veto"
+        );
+        let mut unknown = agent();
+        unknown.transcript = TranscriptActivity::Unknown;
+        assert!(
+            !session_is_migratable(&unknown, MIGRATE_IDLE_MS),
+            "an unreadable transcript keeps every gate closed"
         );
     }
 
