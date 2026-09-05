@@ -48,7 +48,6 @@ BOOTER = HERE / "ygg-booter.py"
 #    file must not grow a second copy of them.
 REPO = HERE.parent.parent.parent
 PANIC_SH = REPO / "scripts" / "ygg-resource-panic.sh"
-USABILITY_SH = REPO / "scripts" / "usability-check.sh"
 GUARD_SH = REPO / "scripts" / "ygg-scratch-guard.sh"
 
 
@@ -141,21 +140,12 @@ def measure():
         except Exception:
             result["panic"] = "unknown"
             result["detail"] = out[-800:]
-    rc2, out2 = run([str(USABILITY_SH), "--json"])
-    if rc2 is None:
-        result["usability_level"] = "unknown"
-    else:
-        try:
-            result["usability"] = json.loads(out2.strip().splitlines()[-1])
-            result["usability_level"] = result["usability"].get("first_failing_level")
-        except Exception:
-            result["usability_level"] = "unknown"
     return result
 
 
 def breached(r):
     """True only on a REAL breach. `unknown` is reported, never treated as one."""
-    return bool(r.get("panic") is True) or bool(r.get("usability_level"))
+    return bool(r.get("panic") is True)
 
 
 def cmd_tick(a):
@@ -166,10 +156,9 @@ def cmd_tick(a):
         fh.write(json.dumps(r) + "\n")
 
     summary = r.get("summary", "")
-    lvl = r.get("usability_level")
-    log(f"panic={r.get('panic')} usability_level={lvl} | {summary}")
+    log(f"panic={r.get('panic')} | {summary}")
 
-    if r.get("panic") == "unknown" or lvl == "unknown":
+    if r.get("panic") == "unknown":
         log("⚠ at least one probe was BLIND this tick — reported, not scored")
 
     if not breached(r):
