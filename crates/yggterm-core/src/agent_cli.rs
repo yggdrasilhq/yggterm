@@ -5521,13 +5521,21 @@ fn open_cli_index_readonly(db_path: &Path) -> Option<rusqlite::Connection> {
     if !db_path.exists() {
         return None;
     }
-    rusqlite::Connection::open_with_flags(
+    let conn = rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_URI
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .ok()
+    .ok()?;
+    // ⛔ [11.64] A liveness probe must WAIT, not blink: with no busy timeout a
+    // readonly read against a WAL store mid-write answers SQLITE_BUSY
+    // instantly, the probe read that as "cannot say", and the row stayed
+    // pinned behind a transcript_unknown gate exactly when it was safe to
+    // move. Two seconds covers a store append; a probe is allowed to be slow,
+    // a wrong verdict is not.
+    conn.busy_timeout(std::time::Duration::from_secs(2)).ok()?;
+    Some(conn)
 }
 
 /// Does Muse's session index hold `session_id`?
