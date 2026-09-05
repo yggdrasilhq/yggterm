@@ -13873,7 +13873,25 @@ fn collect_live_store_title_syncs_in(
             // and the current title is machine copy, the birth title IS the
             // answer: insert it, report it, and let the next tick's
             // store-agrees path keep it quiet.
-            let wearing_fallback = looks_like_generated_fallback_title(&session.title);
+            //
+            // ⚠ STRIP CLASSES (2026-09-06): codex/codex-litellm wore RAW
+            // ROLLOUT PROMPTS as "titles" for a day (the deleted rollout arm
+            // pumped them), and agy wears the prompt-class titles its
+            // preview/history arms fed it before those arms were deleted.
+            // For those three kinds, ANY non-owner-set title is machine copy
+            // when the store answers nothing — the reader's cache arm has
+            // already been consulted (a generated title WOULD have answered),
+            // so stripping to the birth title is safe and the generation
+            // fallback re-names the row. An EMPTY title is replaceable for
+            // every kind (a blank row name is no name at all — measured on
+            // id-drifted opencode rows after the restart storm).
+            let strip_machine_copy = matches!(
+                session.kind,
+                SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::Antigravity
+            );
+            let wearing_fallback = looks_like_generated_fallback_title(&session.title)
+                || session.title.trim().is_empty()
+                || (strip_machine_copy && !session.title_is_owner_set());
             if wearing_fallback {
                 let birth = yggterm_core::agent_cli::new_row_birth_title(
                     yggterm_core::local_machine_name_opt().as_deref(),
@@ -14258,9 +14276,10 @@ fn collect_remote_store_title_syncs(
             }
         }
         for row in rows {
-            let current = live_sessions
+            let session_view = live_sessions
                 .iter()
-                .find(|session| session.session_path == row.session_path)
+                .find(|session| session.session_path == row.session_path);
+            let current = session_view
                 .map(|session| session.title.as_str())
                 .unwrap_or("");
             let Some(title) = titles.get(&row.session_id) else {
@@ -14274,6 +14293,89 @@ fn collect_remote_store_title_syncs(
                     &row.session_id,
                     false,
                 );
+                // ⛔ THE STORE IS SILENT — WHAT IS THE ROW WEARING, AND WHO
+                // WROTE IT? Three measured classes rode this arm as permanent
+                // titles (2026-09-06): raw rollout prompts on codex rows (the
+                // deleted rollout arm's output), prompt-class previews on agy
+                // rows ("Today is Aug 30."), and EMPTY titles on
+                // id-drifted opencode rows. In order:
+                // 1. THIS daemon's generated-title cache answers — a title
+                //    the generation chore produced lives HERE even though the
+                //    CLI's store across the ssh hop cannot speak. Apply it.
+                //    This is also what stops the strip below from fighting
+                //    the generation that named the row: after generation the
+                //    cache always answers, and a cache hit is never strip.
+                // 2. Otherwise: an EMPTY title is replaceable for every kind;
+                //    and for codex/codex-litellm/agy ANY non-owner-set title
+                //    is machine copy when both the store and the cache are
+                //    silent — strip it to the birth title, which the copy
+                //    chore's generation fallback then replaces.
+                let cached = yggterm_core::agent_cli::cached_generated_title(&row.session_id)
+                    .map(|title| title.trim().to_string())
+                    .filter(|title| !title.is_empty());
+                if let Some(cached) = cached {
+                    if &cached != current {
+                        let owner_set = session_view
+                            .is_some_and(|session| session.title_is_owner_set());
+                        if !owner_set {
+                            sweep.record(
+                                &row.session_path,
+                                row.kind,
+                                &row.session_id,
+                                CliTitleOutcome::PickedUp,
+                                Some(&cached),
+                                serde_json::json!({
+                                    "machine": machine_key,
+                                    "source": "generated_title_cache",
+                                }),
+                            );
+                            updates.push(BackgroundCopyUpdate {
+                                session_path: row.session_path.clone(),
+                                title: Some(cached),
+                                summary: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                let owner_set =
+                    session_view.is_some_and(|session| session.title_is_owner_set());
+                let strip_machine_copy = matches!(
+                    row.kind,
+                    SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::Antigravity
+                );
+                let replaceable = current.trim().is_empty()
+                    || looks_like_generated_fallback_title(current)
+                    || (strip_machine_copy && !owner_set && !current.trim().is_empty());
+                if replaceable && !owner_set {
+                    let descriptor =
+                        yggterm_core::agent_cli::agent_cli_descriptor(row.kind);
+                    if let Some(descriptor) = descriptor {
+                        let birth = yggterm_core::agent_cli::new_row_birth_title(
+                            Some(machine_key.as_str()),
+                            descriptor.display_name,
+                        );
+                        if birth != current {
+                            sweep.record(
+                                &row.session_path,
+                                row.kind,
+                                &row.session_id,
+                                CliTitleOutcome::InsertedBirthTitle,
+                                Some(&birth),
+                                serde_json::json!({
+                                    "machine": machine_key,
+                                    "replaced_len": current.len(),
+                                    "id_origin": CliIdOrigin::declared_for(row.kind).label(),
+                                }),
+                            );
+                            updates.push(BackgroundCopyUpdate {
+                                session_path: row.session_path.clone(),
+                                title: Some(birth),
+                                summary: None,
+                            });
+                        }
+                    }
+                }
                 sweep.record(
                     &row.session_path,
                     row.kind,
@@ -34498,8 +34600,13 @@ mod tests {
             crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
             yggui_contract::UiTheme::ZedLight,
         );
+        // A STATIC CLI (Claude Code writes its title once): an idle row with a
+        // well-formed title is settled — the cheap skip fires before any store
+        // read, and the sweep emits nothing. (This used to be a CODEX row,
+        // back when codex was Static; the catalog made codex a Dynamic
+        // retiler, and the codex half of this law moved to the test below.)
         server.start_local_session(
-            crate::SessionKind::Codex,
+            crate::SessionKind::ClaudeCode,
             Some("/home/user/proj"),
             Some("Refactor the parser pipeline"),
         );
@@ -34513,6 +34620,49 @@ mod tests {
             updates.is_empty(),
             "a Static-CLI idle row must settle: {updates:?}",
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ⚠ THE OTHER HALF OF THE SETTLE LAW (2026-09-06): a codex row is
+    /// Dynamic — polled forever — and when both the Thread-name catalog AND
+    /// the generated-title cache are silent, ANY non-owner-set title on the
+    /// row is machine copy (the deleted rollout arm's prompts, or a stale
+    /// artifact): it is stripped to the birth title, which the generation
+    /// fallback then replaces.
+    #[test]
+    fn a_silent_store_codex_row_strips_machine_copy_to_birth() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-codex-strip-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        server.start_local_session(
+            crate::SessionKind::Codex,
+            Some("/home/user/proj"),
+            Some("continue the practice campaign. It will mostly be a tweaking"),
+        );
+        let working: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let updates = super::collect_live_store_title_syncs_in(
+            &home,
+            &server.live_sessions(),
+            &working,
+        );
+        assert!(
+            !updates.is_empty(),
+            "a store-silent codex row wearing machine copy must be stripped: no update at all"
+        );
+        for update in &updates {
+            if let Some(title) = &update.title {
+                assert!(
+                    yggterm_core::looks_like_generated_fallback_title(title),
+                    "the strip lands on the birth title, never on another guess: {title:?}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 

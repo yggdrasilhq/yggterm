@@ -2013,6 +2013,53 @@ probe reads the Thread-name catalog first (the store home derived from
 each passed glob's first segment) and the muse remote probe offers
 `session_name` before `title` with a legacy-schema fallback.
 
+### Addendum 6 — the store-silent fallback, the strip law, and the end of prompt-as-title (2026-09-06)
+
+The live falsifier came back FAILING at fleet scale the morning after the
+map closed (owner: "none of the rows are being titled properly"), and the
+failure split three ways:
+
+* **codex — the deleted rollout arm had pumped raw prompts onto rows.**
+  "You are being consulted as a depth advisor (gpt-5.6-sol) by ..." wore a
+  row for a day: on every codex install too old for the Thread-name
+  catalog (dev, oc — the db is ABSENT there) the reader's rollout arm and
+  the remote probe's rollout arm answered the first real prompt, and the
+  chore wrote it as a title. **A prompt is INPUT, not a title.** Both arms
+  are DELETED (local reader: catalog -> generated-title cache -> None;
+  remote probe: catalog -> silence).
+* **agy — the remote probe (and the local reader) still carried the
+  prompt-class arms** Issue 37 only half-killed: summaries PREVIEW,
+  history display, transcript USER_INPUT. "Today is Aug 30.", "Use the
+  data-fabric skill" — prompt text, on rows. Both readers now answer the
+  AUTHORED summaries title and nothing else; a conversation agy has not
+  authored yet is untitled (the late-write contract, unchanged).
+* **opencode — EMPTY titles on id-drifted rows.** The restart storm minted
+  row ids that exist in no store; the chore's no-title arm treated an empty
+  title as "not a fallback" and inserted nothing. An empty title now counts
+  as replaceable (birth title) — the ids themselves are Issue 34's F2
+  repair lane, still open.
+
+**The store-silent generation fallback.** Rule 2 ("a store-authoritative
+CLI's title is never generated over") read as "never generate" — which on
+a SILENT store means never named. Now `session_accepts_generated_copy`
+admits codex/codex-litellm/muse rows whose store answers nothing
+(`store_title_silent` — the descriptor's own reader returning None), and
+the Dynamic title poll still overwrites with the CLI's word the moment the
+store speaks. The generated-title cache is what makes this converge: a
+generated title BECOMES the store answer (reader arm 2), so generation
+never fights itself.
+
+**The strip law.** When the store AND the cache are both silent, any
+non-owner-set title on a codex/codex-litellm/agy row is machine copy —
+stripped to the birth title, which the generation fallback replaces (agy
+is stripped but never generated for: it authors late). The remote arm
+consults the daemon's cache BEFORE stripping, which is the treadmill-killer:
+after generation the cache always answers, and a cache hit is never strip.
+
+Known-red on clean main (live-daemon interference, pre-existing):
+a_symlink_to_our_own_socket, a_reparented_agent, a_stampless_anchor,
+install::promote_direct_install.
+
 
 ### The contract, as landed
 

@@ -1280,12 +1280,14 @@ mod scan_truth_tests {
     }
 
     // The chore's live-title reader and the scan must be able to see the same
-    // conversation. The reader's third fallback asked every store root for the
-    // OLD `transcript.jsonl` spelling — dead since the 2026-08-20 glob fix —
-    // so a row with an empty summaries title AND no history line fell through
-    // to the LLM rescue as if the store had nothing.
+    // conversation. ⛔ REWRITTEN 2026-09-06: this test once locked the reader's
+    // transcript arm (the 2026-08-20 `transcript_full.jsonl` glob fix) — but a
+    // transcript's first USER_INPUT is PROMPT text, and prompt text wore rows
+    // as titles ("Refactor the CSV import" is a request, not a name). The arm
+    // is deleted: an un-authored conversation is UNTITLED, whatever its
+    // transcript holds.
     #[test]
-    fn the_live_title_reader_finds_the_transcript_the_glob_spelling_named() {
+    fn the_live_title_reader_answers_silence_for_an_unauthored_transcript() {
         let tmp = std::env::temp_dir().join(format!("ygg_scan_title_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1304,9 +1306,11 @@ mod scan_truth_tests {
         .unwrap();
 
         let title = crate::read_antigravity_session_title(&tmp, id)
-            .expect("read succeeds")
-            .expect("the transcript holds a title");
-        assert_eq!(title, "Refactor the CSV import");
+            .expect("read succeeds");
+        assert_eq!(
+            title, None,
+            "a transcript is input, not a title — silence until agy authors one"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
