@@ -947,7 +947,10 @@ Security properties:
 Known accepted risk (v0): any program that can write to the PTY can emit the
 OSC (same class as OSC 777 fake notifications) — e.g. `cat`ing a crafted file
 opens a surface pointing at an attacker URL. The surface is visibly labeled
-with its URL and one keypress (Ctrl+C) removes it.
+with its URL and one keypress (Ctrl+C) removes it. Since 2026-09-05 ([11.60]) the DAEMON additionally retains web-surface
+declares only for rows whose launch command is surface-capable — arbitrary
+output in a plain shell row is refused (`provenance_refused`) and can no
+longer mint a surface through the passive restore tick.
 
 ### The app control token: a page must not be able to drive an app's pane (2026-07-27)
 

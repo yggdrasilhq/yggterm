@@ -26967,7 +26967,9 @@ for as long as it owns the foreground.
 
 ## ⛔ [11.60] A ROW'S OWN OUTPUT MINTS A GUI WEBVIEW — THE APP-DECLARE PLANE AUTHENTICATES SHAPE, NOT PROVENANCE (live adversarial audit, 2026-09-05)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Fix (2026-09-05, `lane/trace/declare-provenance-gate`):** the daemon now retains web-surface declares only when the session's launch command is surface-capable (`launch_command_declares_web_surfaces`); a plain shell emitting the OSC is refused by name — trace `app_declare/provenance_refused`, once per (session, verb, action) per 30 s so the refusal cannot become the drumbeat it prevents. Non-surface verbs (sidebar, the [11.48] picker family) keep their retention for every row. The end-to-end fixture (`pty_runtime_retains_an_app_declare_with_no_client_attached`) is now launched as a capable row. The residual accepted-risk class is unchanged and honest: a forger who execs the real app binary has crossed from output to running the app.
 
 Found during a scheduled adversarial pass against the live 3.2.61 fleet
 (2026-09-05 ~04:50-05:00, full log in journal-papers/ytrace notes). Every step
