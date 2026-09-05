@@ -27150,7 +27150,7 @@ successor re-resumes it, and the predecessor reaches
 
 ## ⛔ [11.65] THE SELF-ALIAS PURGE EATS A TRUE PRESERVED-OWNER CLAIM AFTER A SAME-VERSION HANDOFF — THE SUCCESSOR RE-RESUMES A LIVE WRITER AND CODEX REFUSES -32600
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Measured 2026-09-05 ~22:14–23:14 on dev (owner screenshot: a codex row
 answering `Failed to resume session … thread <id> already has an active
@@ -27196,3 +27196,16 @@ preserved-owner endpoints (the negative-cache arm shares the blindness).
 row (the predecessor keeps it, [11.64]); the successor's registry must
 still name the predecessor (count 1, resolve-by-pid), no re-resume may
 fire, and the row must keep painting from the preserved owner.
+
+**Fix (`lane/cli/owner-repoint-by-pid`):** the proxy read
+(`preserved_owner_for_runtime_key`) resolves a self-resolving entry
+through the predecessor's renamed socket before refusing
+(`retired_socket_for_live_owner`: same-target + `owner_server_pid` alive
+and not ours + the retired name exists — reusing the bequest's own pure
+name derivation), and the purge site attempts the same repoint before
+`owner_is_self_alias`, persisting
+`preserved_owner_entry_repointed_to_retired_socket`. Dead-or-ours pids
+still purge exactly as the 2026-08-21 law requires (the adoption-artifact
+case). Locked by
+`a_self_resolving_owner_claim_resolves_through_the_retired_socket_before_being_dropped`
+and `repoint_entry_corrects_only_the_named_runtime`.

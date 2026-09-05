@@ -2592,6 +2592,21 @@ impl PreservedTerminalOwnerRegistry {
             .retain(|entry| entry.runtime_key != runtime_key);
         before != self.entries.len()
     }
+
+    /// Point one entry at a corrected endpoint and report whether anything
+    /// changed. The [11.65] repoint: a same-version predecessor's entry names
+    /// the canonical socket the successor took over, so it is repointed at the
+    /// predecessor's real `.retired-<pid>` name instead of being purged.
+    fn repoint_entry(&mut self, runtime_key: &str, endpoint: PreservedOwnerEndpoint) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if entry.runtime_key == runtime_key {
+                entry.endpoint = endpoint.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 fn snapshot_session_metadata_value(session: &SnapshotSessionView, label: &str) -> Option<String> {
@@ -5726,7 +5741,37 @@ impl DaemonRuntime {
             // (`server_endpoints_same_target` resolves symlinks). A claim that
             // resolves to self is not merely skipped — it is PURGED, because
             // post-adoption it is factually wrong: these rows are ours now.
+            // ⛔ [11.65] ONE EXCEPTION, learned 2026-09-05/06 the hard way: a
+            // claim that self-resolves because its same-version PREDECESSOR
+            // yielded this very canonical name is TRUE — the predecessor's
+            // real socket is the renamed `.retired-<pid>`, its PTYs and their
+            // live CLI writers are on it, and purging the claim is what left
+            // the predecessor unregistered (`preserved_terminal_owner_count:
+            // 0`) until a later generation re-resumed a live writer and codex
+            // refused -32600. Resolve by the entry's owner pid first: alive
+            // and not ours → repoint the entry at the retired name; only a
+            // dead-or-ours pid earns the purge.
             if server_endpoints_same_target(&owner, &own_endpoint) {
+                if let Some(retired) = self.retired_socket_for_live_owner(&runtime_key) {
+                    self.preserved_terminal_owners.repoint_entry(
+                        &runtime_key,
+                        PreservedOwnerEndpoint::Unix {
+                            path: retired.display().to_string(),
+                        },
+                    );
+                    let _ = self.preserved_terminal_owners.save(self.store.home_dir());
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "hot_update",
+                        "preserved_owner_entry_repointed_to_retired_socket",
+                        serde_json::json!({
+                            "runtime_key": runtime_key,
+                            "retired_socket": retired.display().to_string(),
+                        }),
+                    );
+                    continue;
+                }
                 append_trace_event(
                     self.store.home_dir(),
                     "daemon",
@@ -7169,7 +7214,18 @@ impl DaemonRuntime {
             return None;
         }
         let entry = self.preserved_terminal_owners.owner_for_key(runtime_key)?;
-        let endpoint = entry.endpoint.to_endpoint();
+        let mut endpoint = entry.endpoint.to_endpoint();
+        // ⛔ [11.65]: a same-target endpoint may still name a LIVE same-version
+        // predecessor behind its renamed `.retired-<pid>` socket — after a
+        // same-version preserving handoff the successor answers the canonical
+        // name the predecessor yielded, so the entry the handoff wrote
+        // self-resolves BY NAME. Dropping the claim here (the old behaviour)
+        // blinded every proxy read, left the predecessor unregistered, and the
+        // next re-resume twin-wrote a live codex (-32600). Resolve through the
+        // retired name when the owner pid is alive and is not ours.
+        if let Some(retired) = self.retired_socket_for_live_owner(runtime_key) {
+            endpoint = ServerEndpoint::UnixSocket(retired);
+        }
         if server_endpoints_same_target(&endpoint, &default_endpoint(self.store.home_dir())) {
             return None;
         }
@@ -7182,6 +7238,31 @@ impl DaemonRuntime {
             return None;
         }
         Some(endpoint)
+    }
+
+    /// The renamed `.retired-<pid>` socket of the live same-version predecessor
+    /// behind a SELF-RESOLVING preserved-owner entry, when there is one.
+    ///
+    /// Pure read — the registry entry converges to the repointed name when a
+    /// mutable pass (`preserved_owner_endpoint_for_request`'s purge site)
+    /// observes the same fact. `None` for entries that do not self-resolve,
+    /// name our own pid, name a dead pid, or whose retired socket is gone —
+    /// every "cannot say" keeps the caller's existing verdict.
+    fn retired_socket_for_live_owner(&self, runtime_key: &str) -> Option<PathBuf> {
+        let entry = self.preserved_terminal_owners.owner_for_key(runtime_key)?;
+        let endpoint = entry.endpoint.to_endpoint();
+        let ServerEndpoint::UnixSocket(path) = &endpoint else {
+            return None;
+        };
+        if !server_endpoints_same_target(&endpoint, &default_endpoint(self.store.home_dir())) {
+            return None;
+        }
+        let owner_pid = entry.owner_server_pid;
+        if owner_pid == std::process::id() || !hot_update_owner_pid_is_alive(owner_pid) {
+            return None;
+        }
+        let (retired, _lock) = retired_daemon_socket_names(path, owner_pid);
+        retired.exists().then_some(retired)
     }
 
     /// A sibling that answered for this row last time discovery ran, unless it
@@ -35657,6 +35738,108 @@ mod tests {
         assert_eq!(entry.owner_server_version, "2.7.9");
         assert_eq!(entry.owner_server_pid, 279);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ⛔ [11.65]: a self-resolving preserved-owner claim naming a LIVE
+    /// same-version predecessor must be resolved through the predecessor's
+    /// renamed `.retired-<pid>` socket — by the proxy read AND at the purge
+    /// site — never dropped as an adoption alias. The purge law of 2026-08-21
+    /// stays intact for dead-or-ours pids (the adoption-artifact case it was
+    /// written for).
+    #[test]
+    fn a_self_resolving_owner_claim_resolves_through_the_retired_socket_before_being_dropped() {
+        let source = include_str!("daemon.rs");
+        let read_body = daemon_fn_body(source, "fn preserved_owner_for_runtime_key(");
+        assert!(
+            read_body.contains("retired_socket_for_live_owner"),
+            "the proxy read must try the retired-socket resolution before refusing"
+        );
+        let retired_arm = read_body
+            .find("retired_socket_for_live_owner")
+            .expect("retired arm present");
+        let refusal = read_body
+            .find("server_endpoints_same_target(&endpoint, &default_endpoint")
+            .expect("the same-target refusal must remain as the fallback");
+        assert!(
+            retired_arm < refusal,
+            "the retired-socket resolution must precede the same-target refusal"
+        );
+        // The purge site: the repoint attempt must sit between the
+        // self-resolving check and the purge it guards.
+        let purge_start = source
+            .find("if server_endpoints_same_target(&owner, &own_endpoint) {")
+            .expect("the purge site must exist");
+        let purge_body = &source[purge_start..purge_start + 3_000];
+        let repoint = purge_body
+            .find("retired_socket_for_live_owner(&runtime_key)")
+            .expect("the purge site must attempt the repoint first");
+        let purge = purge_body
+            .find("owner_is_self_alias")
+            .expect("the purge must remain for dead-or-ours claims");
+        assert!(repoint < purge, "the repoint must be attempted before the purge");
+    }
+
+    #[test]
+    fn repoint_entry_corrects_only_the_named_runtime() {
+        let mut registry = super::PreservedTerminalOwnerRegistry {
+            schema_version: super::preserved_terminal_owner_schema_version(),
+            expected_server_version: None,
+            entries: vec![
+                super::PreservedTerminalOwnerEntry {
+                    runtime_key: "remote-a://one".to_string(),
+                    endpoint: super::PreservedOwnerEndpoint::Unix {
+                        path: "/home/x/.yggterm/server-3-2-70.sock".to_string(),
+                    },
+                    owner_server_version: "3.2.70".to_string(),
+                    owner_server_build_id: 70,
+                    owner_server_pid: 4242,
+                    created_at_ms: 1,
+                },
+                super::PreservedTerminalOwnerEntry {
+                    runtime_key: "remote-b://two".to_string(),
+                    endpoint: super::PreservedOwnerEndpoint::Unix {
+                        path: "/home/x/.yggterm/server-3-2-69.sock".to_string(),
+                    },
+                    owner_server_version: "3.2.69".to_string(),
+                    owner_server_build_id: 69,
+                    owner_server_pid: 4243,
+                    created_at_ms: 1,
+                },
+            ],
+        };
+        let changed = registry.repoint_entry(
+            "remote-a://one",
+            super::PreservedOwnerEndpoint::Unix {
+                path: "/home/x/.yggterm/server-3-2-70.sock.retired-4242".to_string(),
+            },
+        );
+        assert!(changed);
+        assert_eq!(
+            registry
+                .owner_for_key("remote-a://one")
+                .expect("entry kept")
+                .endpoint
+                .to_endpoint(),
+            super::ServerEndpoint::UnixSocket(std::path::PathBuf::from(
+                "/home/x/.yggterm/server-3-2-70.sock.retired-4242"
+            ))
+        );
+        // The sibling entry is untouched.
+        assert_eq!(
+            registry
+                .owner_for_key("remote-b://two")
+                .expect("sibling kept")
+                .endpoint
+                .label(),
+            "/home/x/.yggterm/server-3-2-69.sock"
+        );
+        // An unknown key reports no change.
+        assert!(!registry.repoint_entry(
+            "remote-c://three",
+            super::PreservedOwnerEndpoint::Unix {
+                path: "/nowhere".to_string()
+            }
+        ));
     }
 
     #[cfg(unix)]
