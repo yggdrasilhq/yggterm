@@ -27165,3 +27165,13 @@ without a reader / an unreadable store / an empty id still answers
 `the_transcript_signal_gates_migration_fresh_blocks_stale_releases_unknown_blocks`
 + `the_agent_transcript_arm_resolves_the_positive_recency_signal` (daemon).
 
+**Second gate found while falsifying (same lane): the foreground signal is
+UNINFORMATIVE for agent rows by construction.** The wrapper `bash -c` runs
+the TUI in its own process group, so the tty's foreground pgid differs from
+the PTY child for as long as the TUI lives — idle at its prompt and
+mid-turn alike — and a signal that can never clear blocked every agent row
+even with the transcript wired. The predicate now lets the transcript
+decide for agent rows with a readable record (`Idle`), keeping the
+foreground veto at full force for shell rows and unreadable transcripts
+(`a_stale_agent_transcript_overrides_the_uninformative_foreground_gate`).
+
