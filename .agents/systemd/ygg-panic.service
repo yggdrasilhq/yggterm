@@ -1,6 +1,5 @@
 [Unit]
 Description=yggterm resource panic watch (seat 6.7)
-Documentation=file:%h/gh/yggterm--resource/docs/usability-contract.md
 
 [Service]
 Type=oneshot

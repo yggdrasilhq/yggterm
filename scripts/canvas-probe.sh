@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Draw a terminal canvas and photograph it, WITHOUT going near the owner's view.
 #
-# ⛔ THIS EXISTS BECAUSE THE HOURLY EYE CHECK CANNOT SEE THE CANVAS.
-# `usability-check.sh` levels 2 and 3 capture whatever is on screen. With no
-# session open that is the start page, and `capture_faithful` still reports
-# `true` — it means "an honest picture of the screen", never "the terminal was
-# captured". So the check could go green on a frame where the canvas was never
-# drawn, blind to the only surface the three open render faults live in.
+# ⛔ THE REASON THIS EXISTS (the hourly eye check it was built for was retired
+# 2026-09-05, but the lesson — and the render faults — are not): a screenshot
+# of whatever is on screen is NOT a canvas test. With no session open the GUI
+# shows the start page and `capture_faithful` still reports `true` — it means
+# "an honest picture of the screen", never "the terminal was captured". Only a
+# deliberate draw-and-photograph of a row we own exercises the xterm surface
+# the render faults live in. See the [6.7] history in docs/pending-bugs.md.
 #
 # The two things that make this safe are the whole design, and both were learned
 # by getting them wrong first:

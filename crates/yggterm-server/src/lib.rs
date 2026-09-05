@@ -43788,7 +43788,7 @@ terminal_window_id: None,
         let probe = server.start_local_session_with_launch_options_and_activation(
             SessionKind::Shell,
             Some("/home/user"),
-            Some("Agent unnamed shell: usability level-4 input probe"),
+            Some("Agent unnamed shell: probe row (fixture)"),
             &AgentLaunchOptions::default(),
             false,
         );

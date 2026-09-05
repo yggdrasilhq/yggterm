@@ -7744,7 +7744,7 @@ ticks out of the second reading — a rate that can never trip its own threshold
 tmpfs is RAM wearing a filesystem's clothes. Never stage a large download, a
 screenshot loop, or any recurring artefact there. `scripts/usability-check.sh`
 was doing it too — writing a screenshot into `/tmp` on that host every hour —
-and now writes under `~/.yggterm/usability`.
+then under `~/.yggterm/usability` — the whole hourly check was retired 2026-09-05 and both write paths are gone.
 
 ### ⭐ A THIRD INSTANCE, 2026-08-14 — AND THIS ONE IS OURS TO FIX
 
@@ -8922,9 +8922,11 @@ branch. Equal on every host, or this is open.
 
 ## ⛔⛔ [6.7] THE HOURLY VISUAL CHECK CANNOT SEE THE CANVAS, WHICH IS THE ONLY THING IT IS FOR
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 ⚠ The blindness is now REPORTED (shipped); it is not REMOVED.
+
+**Resolved 2026-09-05 by REMOVAL, not cure.** The hourly check itself is gone — owner directive: dynamic tracing on ytrace replaces screenshot log-keeping, and an instrument that cannot see the thing it exists to see has no place in an hourly timer. `scripts/usability-check.sh` and `docs/usability-contract.md` are deleted, and the panic watcher no longer invokes any of it. What survives: `scripts/canvas-probe.sh` (the on-demand canvas instrument this entry shipped) and this text as the record of the capture_faithful lesson. Live proof owed: post-deploy ticks spawn no probe row, write no `~/.yggterm/usability` artefact, and the panic log carries no usability field.
 
 *measured 2026-08-14 17:30*
 
@@ -9025,7 +9027,7 @@ wrong discriminator.
 **Status:** OPEN
 
 *found 2026-08-14 from the system coredump log; definition and ordering in
-[`usability-contract.md`](usability-contract.md)*
+the retired usability contract (doc removed 2026-09-05 with the hourly check)*
 
 Five yggterm GUI coredumps in 24 hours on the desktop host. Four are one bug
 class — the GL/EGL compositing readback:
