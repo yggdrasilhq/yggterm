@@ -354,6 +354,15 @@ static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
 /// `ShellState` field because the loop is a property of the PROCESS (it samples the
 /// process tree), not of any shell instance, and a second loop would double-count.
 static RENDER_PROBE_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+/// Last fingerprint of the walked store tree the shell actually applied. 0 =
+/// never applied. The background tree refresh walks the stores regardless (the
+/// walk is cheap and memoized), but re-applying an identical tree re-swaps the
+/// browser, re-merges the sidebar, and re-logs multi-KB restore telemetry on
+/// every poll: measured live, an unchanged 677-session tree was re-applied
+/// every ~8s, the render plane burned ~25% of a core standing still, and the
+/// UI thread stalled ~29x/min. Equal fingerprint ⇒ skip the whole re-apply.
+static LAST_APPLIED_BROWSER_TREE_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+static BROWSER_TREE_REFRESH_UNCHANGED_STREAK: AtomicU64 = AtomicU64::new(0);
 // `js_debug` events are pure diagnostics forwarded from the webview. During a
 // reveal/replay the xterm `onData` handler emits hundreds per second
 // (`on_data_burst` / `input_snap_skipped`), and `append_trace_event` does a
@@ -38698,6 +38707,29 @@ fn spawn_initial_server_sync(
         maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
+/// Stable within-process fingerprint of a walked store tree: the serialized
+/// shape is exactly what the sidebar renders, so equal fingerprints mean a
+/// re-apply would have been invisible. `DefaultHasher` is deliberate — the
+/// comparison never crosses a process boundary.
+fn browser_tree_fingerprint(tree: &SessionNode) -> u64 {
+    use std::hash::{Hash, Hasher};
+    match serde_json::to_vec(tree) {
+        Ok(bytes) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        }
+        // Unserializable tree: never equal to a real fingerprint, so the tree
+        // always applies and the failure stays visible downstream.
+        Err(_) => 0,
+    }
+}
+/// The skip verdict, pure so the contract is testable: skip only when a tree
+/// was actually applied before (0 = never) and the walk produced the same one.
+/// A `None` (failed walk) or a 0 fingerprint always applies.
+fn browser_tree_refresh_skip_verdict(last_applied: u64, loaded: Option<u64>) -> bool {
+    matches!(loaded, Some(fp) if fp != 0 && last_applied != 0 && last_applied == fp)
+}
 fn spawn_initial_browser_tree_load(
     state: Signal<ShellState>,
     schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -38722,6 +38754,8 @@ fn spawn_initial_browser_tree_load(
                     let selected_hint = shell
                         .active_browser_selection_path_for_session()
                         .or_else(|| shell.browser.selected_path().map(str::to_string));
+                    LAST_APPLIED_BROWSER_TREE_FINGERPRINT
+                        .store(browser_tree_fingerprint(&browser_tree), Ordering::Relaxed);
                     restore_browser_tree(shell, browser_tree, selected_hint.as_deref());
                     shell.refresh_search_state("initial_browser_tree_load_complete");
                     shell.last_action = "loaded session tree".to_string();
@@ -38773,18 +38807,55 @@ fn spawn_browser_tree_refresh(
             store.load_codex_tree(&settings)
         })
         .await;
+        let fingerprint = outcome
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.as_ref().ok())
+            .map(browser_tree_fingerprint);
+        let unchanged = browser_tree_refresh_skip_verdict(
+            LAST_APPLIED_BROWSER_TREE_FINGERPRINT.load(Ordering::Relaxed),
+            fingerprint,
+        );
         let _ = safe_shell_mut(state, reason, |shell| {
             shell.browser_tree_refresh_in_flight = false;
             shell.next_browser_tree_refresh_after_ms =
                 current_millis() + shell_browser_tree_refresh_poll_ms(shell);
             match outcome {
                 Ok(Ok(browser_tree)) => {
+                    if unchanged {
+                        // The walk returned the tree already on screen: skip
+                        // the re-swap, the sidebar merge, the search-state
+                        // rebuild, and the restore telemetry entirely — that
+                        // churn was the render plane's standing load. Speak
+                        // once per streak, then every 30th, so the skip stays
+                        // visible without becoming a drumbeat.
+                        let streak = BROWSER_TREE_REFRESH_UNCHANGED_STREAK
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
+                        if streak == 1 || streak % 30 == 0 {
+                            shell.record_ui_telemetry(
+                                "browser_tree_refresh_skipped_unchanged",
+                                json!({
+                                    "source": reason,
+                                    "streak": streak,
+                                    "fingerprint": fingerprint,
+                                }),
+                            );
+                        }
+                        return;
+                    }
+                    if let Some(fp) = fingerprint {
+                        LAST_APPLIED_BROWSER_TREE_FINGERPRINT
+                            .store(fp, Ordering::Relaxed);
+                    }
+                    BROWSER_TREE_REFRESH_UNCHANGED_STREAK.store(0, Ordering::Relaxed);
                     restore_browser_tree_preserving_sidebar_view(
                         shell,
                         browser_tree,
                         selected_hint.as_deref(),
                     );
                     shell.refresh_search_state(reason);
+                    shell.refresh_tree_debug(reason);
                     shell.last_action = "refreshed session tree".to_string();
                 }
                 Ok(Err(error)) => {
