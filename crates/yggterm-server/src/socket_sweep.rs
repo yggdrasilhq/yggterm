@@ -87,6 +87,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::daemon::{parse_retired_server_socket_artifact, parse_versioned_server_socket_name};
+use yggterm_core::append_trace_event;
 
 /// How long a socket must have been continuously observed dead before it is
 /// unlinked. A daemon mid-restart is dark for milliseconds; this is a day, and
@@ -598,6 +599,22 @@ pub(crate) fn run_socket_sweep(
             SocketVerdict::Remove => {
                 if fs::remove_file(&path).is_ok() {
                     outcome.removed += 1;
+                    // A removed retired artifact whose pid was our liveness
+                    // witness IS a preserved-owner death — the 2026-09-05
+                    // audit SIGKILLed a lingerer and NOTHING traced it; the
+                    // death gets a name here or the plane stays self-blind.
+                    if let Some((_, pid)) = parse_retired_server_socket_artifact(&path) {
+                        append_trace_event(
+                            home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "retired_owner_gone",
+                            serde_json::json!({
+                                "pid": pid,
+                                "name": name,
+                            }),
+                        );
+                    }
                 } else {
                     // Could not unlink — keep the sighting so the next round
                     // retries rather than restarting the clock.
