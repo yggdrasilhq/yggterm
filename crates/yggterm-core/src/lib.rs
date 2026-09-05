@@ -2567,6 +2567,17 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
 /// Antigravity stores an auto-generated title in `preview` after the first turn,
 /// and a user-edited rename in `title`. If `title` is set (non-empty), it takes
 /// precedence over `preview`.
+/// [`AgentCliDescriptor::read_live_store_title`] for Antigravity: agy's own
+/// AUTHORED title, from `conversation_summaries.title` — and NOTHING else.
+///
+/// ⛔ Every other arm this reader once carried — the summaries preview, the
+/// `history.jsonl` display line, the brain transcript's first prompt — is
+/// PROMPT text, and prompt text wore rows as titles until 2026-09-06 ("Today
+/// is Aug 30.", "Use the data-fabric skill", the owner's original screenshot
+/// complaint). The write is LATE by design (Issue Heading 37): a conversation
+/// with no summaries row yet is UNTITLED here, the row keeps its birth name,
+/// and the store-silent generation fallback (codex/muse-only — agy authors
+/// late, so generation would fight the authored title) does not apply to it.
 pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<Option<String>> {
     let descriptor = agent_cli_descriptor(SessionKind::Antigravity);
     let conv_dir = descriptor.and_then(|d| d.store_roots_absolute(home).into_iter().next());
@@ -2582,71 +2593,13 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?1;",
+                "SELECT title FROM conversation_summaries WHERE conversation_id = ?1;",
             ) {
                 if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
                     if let Ok(Some(row)) = rows.next() {
                         let title: String = row.get(0).unwrap_or_default();
-                        let preview: String = row.get(1).unwrap_or_default();
                         if let Some(t) = clean_agy_prompt_first_line(&title) {
                             return Ok(Some(t));
-                        }
-                        if let Some(p) = clean_agy_prompt_first_line(&preview) {
-                            return Ok(Some(p));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Check history.jsonl
-    let history_path = conv_dir
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("history.jsonl")));
-    if let Some(history_path) = history_path.filter(|p| p.exists()) {
-        if let Ok(file) = std::fs::File::open(&history_path) {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(file);
-            for line in reader.lines().flatten() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if value.get("conversationId").and_then(|v| v.as_str()) == Some(session_id) {
-                        if let Some(display) = value.get("display").and_then(|v| v.as_str()) {
-                            if let Some(t) = clean_agy_prompt_first_line(display) {
-                                return Ok(Some(t));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(desc) = descriptor {
-        // ⛔ TWO DEAD PATHS USED TO MEET HERE. The glob corrected to
-        // `transcript_full.jsonl` on 2026-08-20 (the old spelling matched 0 of
-        // 497 brain dirs) and the per-root layout puts the transcript under the
-        // `brain/` root — yet this fallback kept asking every root for the OLD
-        // spelling, so every row with an empty summaries title AND no history
-        // line fell through to the LLM rescue as if the store had nothing.
-        // Try the measured spelling first, keep the old one as a legacy tail.
-        for root in desc.store_roots_absolute(home) {
-            for file_name in ["transcript_full.jsonl", "transcript.jsonl"] {
-                let candidate = root
-                    .join(session_id)
-                    .join(".system_generated/logs")
-                    .join(file_name);
-                if candidate.exists() {
-                    if let Some(entry) = desc.store_entry(&candidate) {
-                        if let Some(t) = entry.title.filter(|t| !t.trim().is_empty()) {
-                            return Ok(Some(t));
-                        }
-                        if let Some(d) = entry.detail.filter(|d| !d.trim().is_empty()) {
-                            if let Some(t) = clean_agy_prompt_first_line(&d)
-                                .or_else(|| crate::best_effort_title_from_context(&d))
-                            {
-                                return Ok(Some(t));
-                            }
                         }
                     }
                 }
@@ -3765,11 +3718,17 @@ mod tests {
             rusqlite::params![session_id],
         ).unwrap();
 
-        // 1. Initial read should return preview as fallback title
+        // 1. An EMPTY authored title reads as UNTITLED — the preview is
+        //    prompt text and was deleted as a title source (2026-09-06): it
+        //    wore rows with "Today is Aug 30."-class strings.
         let initial_title = read_antigravity_session_title(&dir, session_id).unwrap();
-        assert_eq!(initial_title, Some("Generated Title Preview".to_string()));
+        assert_eq!(
+            initial_title, None,
+            "a preview is a prompt, never a title — silence until agy authors one"
+        );
 
-        // 2. Updating title should set title column and win over preview
+        // 2. The authored title, once agy writes it, is THE title — the
+        //    rename door writes the same column.
         update_antigravity_session_title(&dir, session_id, "3. Custom Renamed Title").unwrap();
         let updated_title = read_antigravity_session_title(&dir, session_id).unwrap();
         assert_eq!(updated_title, Some("3. Custom Renamed Title".to_string()));

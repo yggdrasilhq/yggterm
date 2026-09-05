@@ -3921,93 +3921,6 @@ fn cached_session_title(session_id: &str) -> Option<String> {
         .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
 }
 
-/// The FIRST REAL USER PROMPT in a codex rollout — the title codex sessions
-/// deserve (owner spec 2026-06-06: yggterm owns codex titles; the transcript's
-/// own opening prompt is the honest one).
-///
-/// ⛔ The rollout's first `role:"user"` item is NOT the prompt: codex writes
-/// the AGENTS.md/instructions block and environment context as user messages
-/// first (measured 2026-08-30 — a rollout whose first user item is the whole
-/// fleet steer file). Skip those wrappers; take the first user text that is
-/// neither, clean it to one line, and refuse fallback/low-signal shapes.
-fn codex_first_real_user_prompt(path: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    for (index, line) in reader.lines().enumerate() {
-        // The real prompt is near the top; a bound keeps this cheap no matter
-        // how long the rollout grows.
-        if index > 400 {
-            return None;
-        }
-        let Ok(line) = line else { continue };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if value.get("type").and_then(|v| v.as_str()) != Some("response_item") {
-            continue;
-        }
-        let payload = value.get("payload")?;
-        if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
-            continue;
-        }
-        let text = payload
-            .get("content")
-            .and_then(|content| content.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("text"))
-                    .filter_map(|text| text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            });
-        let Some(text) = text else { continue };
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        let is_wrapper = lower.starts_with("# agents.md")
-            || lower.contains("<user_instructions>")
-            || lower.contains("<environment_context>")
-            || lower.contains("<permissions")
-            || lower.contains("<turn_context>")
-            || lower.starts_with("<instructions>");
-        if is_wrapper {
-            continue;
-        }
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty()
-                || line.starts_with('#')
-                || line.starts_with('<')
-                || line.starts_with("```")
-            {
-                continue;
-            }
-            let candidate: String = {
-                let mut end = line
-                    .char_indices()
-                    .nth(120)
-                    .map(|(offset, _)| offset)
-                    .unwrap_or(line.len());
-                while !line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                line[..end].trim_end().to_string()
-            };
-            if candidate.is_empty()
-                || crate::looks_like_generated_fallback_title(&candidate)
-                || crate::looks_like_low_signal_generated_copy(&candidate)
-            {
-                continue;
-            }
-            return Some(candidate);
-        }
-    }
-    None
-}
 
 /// Find one file under `root` (bounded depth) whose FILE NAME ends with
 /// `suffix`. Read-dir only — no file is opened to match.
@@ -4053,9 +3966,7 @@ fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> 
     // The codex family's candidate homes, descriptor-derived so the CODEX_HOME
     // env override keeps working: codex's own sessions root and the litellm
     // fork's. A litellm session id never exists under `.codex`, so walking
-    // both is collision-free — and it is what lets the fork's rollout
-    // fallback find its transcripts at all (the previous single-root search
-    // looked only at codex's).
+    // both is collision-free.
     let homes: Vec<(PathBuf, PathBuf)> = [SessionKind::Codex, SessionKind::CodexLiteLlm]
         .iter()
         .filter_map(|kind| agent_cli_descriptor(*kind))
@@ -4067,8 +3978,8 @@ fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> 
         .collect();
     // 1. The CLI's own word — the Thread-name catalog
     // (`<codex home>/sqlite/codex-dev.db`, `local_thread_catalog`), newest
-    // host row first. Measured 2026-09-05 on the GUI host; older codex installs
-    // (dev/oc) carry no sqlite dir, and every miss falls open to the next arm.
+    // host row first. Measured 2026-09-05 on the GUI host; older codex
+    // installs carry no sqlite dir, and every miss falls open to the next arm.
     for (_sessions_root, codex_home) in &homes {
         if let Some(title) =
             title_without_fallbacks(codex_thread_catalog_title(codex_home, session_id))
@@ -4076,22 +3987,20 @@ fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> 
             return Some(title);
         }
     }
-    // 2. yggterm's own cache: generated titles that predate the flip keep the
-    // name their row already wears until the CLI's own word exists.
+    // 2. yggterm's own cache — the generation chore's output. This is ALSO
+    // the store-silent fallback's landing place: a generated title becomes
+    // the store answer, which is what keeps the title chore's strip rule
+    // (store silent + no cache ⇒ machine copy) from ever fighting the
+    // generation that named the row.
     if let Some(title) = cached_session_title(session_id) {
         return Some(title);
     }
-    // 3. The rollout's first real user prompt — the same value codex derives
-    // its cli display titles from.
-    for (sessions_root, _codex_home) in &homes {
-        let Some(rollout) = find_file_by_suffix(sessions_root, 4, &format!("-{session_id}.jsonl"))
-        else {
-            continue;
-        };
-        if let Some(title) = title_without_fallbacks(codex_first_real_user_prompt(&rollout)) {
-            return Some(title);
-        }
-    }
+    // ⛔ There is NO rollout-prompt arm. The rollout's first user prompt was
+    // this reader's third answer for one day (2026-09-05 → 2026-09-06) and it
+    // pumped raw prompts onto rows as "titles" on every codex install too old
+    // to carry the Thread-name catalog — "You are being consulted as a depth
+    // advisor (gpt-5.6-sol) by …" wore a row for days. A prompt is INPUT, not
+    // a title; on a silent store the row is the generation chore's to name.
     None
 }
 
@@ -4122,6 +4031,50 @@ fn codex_thread_catalog_title(codex_home: &Path, thread_id: &str) -> Option<Stri
     let row = rows.next().ok()??;
     let title: Option<String> = row.get(0).ok();
     title
+}
+
+/// Whether a store-authoritative CLI's store can answer NOTHING for this
+/// session — the gate question behind the store-silent generation fallback
+/// (2026-09-06): codex/codex-litellm/muse keep `TitleAuthority::Store` (the
+/// CLI's word wins the moment its store speaks, via the Dynamic title poll),
+/// but a store that cannot yet answer — codex before the Thread-name catalog
+/// ships on an install, muse before it names a session — must not leave the
+/// row permanently unnamed or prompt-named. Only these three participate:
+/// every other Store CLI's store is guaranteed to answer (and agy authors
+/// LATE, so generating for it would fight the authored title).
+pub fn store_title_silent(kind: SessionKind, session_id: &str) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    store_title_silent_in(&home, kind, session_id)
+}
+
+/// [`store_title_silent`] against an explicit home — the test seam, so a test
+/// never reads the machine's real CLI stores.
+pub fn store_title_silent_in(home: &Path, kind: SessionKind, session_id: &str) -> bool {
+    if !matches!(
+        kind,
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::Muse
+    ) {
+        return false;
+    }
+    let Some(descriptor) = agent_cli_descriptor(kind) else {
+        return false;
+    };
+    let Some(read) = descriptor.read_live_store_title else {
+        return false;
+    };
+    read(home, session_id).is_none()
+}
+
+/// The yggterm-side generated title for a session id — the LLM chore's own
+/// output, cache-filtered like every reader's. The REMOTE title arm consults
+/// this before declaring a row's title machine copy: a generated title lives
+/// in THIS daemon's cache even when the CLI's store on the far side of an
+/// ssh hop cannot answer, and it is exactly what stops the strip rule from
+/// fighting the generation that named the row.
+pub fn cached_generated_title(session_id: &str) -> Option<String> {
+    cached_session_title(session_id)
 }
 
 /// [`AgentCliDescriptor::read_live_store_title`] for OpenCode: the v2 store's
@@ -4495,12 +4448,13 @@ for session_id in ids:
 /// the transcript could name reports `no_title_in_store`, which is true and
 /// cheap; guessing it would have cost a store walk per tick.
 /// The codex/codex-litellm remote title script: the CLI's own Thread-name
-/// catalog first (`<store home>/sqlite/codex-dev.db`,
+/// catalog ONLY (`<store home>/sqlite/codex-dev.db`,
 /// `local_thread_catalog.display_title` — the home dir name derived from each
 /// passed glob's first segment, so the per-CLI globs decide which homes are
-/// probed), then the rollout's FIRST REAL USER PROMPT — the same skip the
-/// local reader does (`codex_first_real_user_prompt`): the rollout's first
-/// user item is the AGENTS.md/instructions wrapper, never the prompt.
+/// probed). ⛔ NO rollout arm: for one day the rollout's first real prompt
+/// answered here and pumped raw prompts onto rows as titles on every codex
+/// install too old for the catalog. A silent store means the remote row is
+/// the generation chore's to name — not the transcript's.
 const CODEX_REMOTE_TITLE_SCRIPT: &str = r#"
 import json, os, sqlite3, sys
 from pathlib import Path
@@ -4510,12 +4464,11 @@ if '--' not in argv:
 split = argv.index('--')
 globs = [v for v in argv[:split] if v.strip()]
 ids = [v for v in argv[split + 1:] if v.strip()]
-if not ids:
+if not ids or not globs:
     sys.exit(0)
 home = Path(os.path.expanduser('~'))
 wanted = set(ids)
 answered = {}
-WRAPPER_MARKS = ('<user_instructions>', '<environment_context>', '<permissions', '<turn_context>')
 
 def read_catalog(path):
     if not path.exists():
@@ -4548,62 +4501,6 @@ for g in globs:
     first = g.split('/')[0] if g else ''
     if first:
         read_catalog(home / first / 'sqlite' / 'codex-dev.db')
-
-def first_real_prompt(path):
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
-            for i, line in enumerate(fh):
-                if i > 400:
-                    return None
-                try:
-                    v = json.loads(line)
-                except Exception:
-                    continue
-                if v.get('type') != 'response_item':
-                    continue
-                p = v.get('payload') or {}
-                if p.get('role') != 'user':
-                    continue
-                c = p.get('content')
-                if not isinstance(c, list):
-                    continue
-                text = '\n'.join(x.get('text', '') for x in c if isinstance(x, dict))
-                t = text.strip()
-                if not t:
-                    continue
-                low = t.lower()
-                if low.startswith('# agents.md') or low.startswith('<instructions>'):
-                    continue
-                if any(m in low for m in WRAPPER_MARKS):
-                    continue
-                for ln in text.splitlines():
-                    ln = ln.strip()
-                    if not ln or ln.startswith(('#', '<', '`')):
-                        continue
-                    return ln[:120]
-    except Exception:
-        return None
-    return None
-
-for sid in ids:
-    if sid in answered:
-        continue
-    found = None
-    for g in globs:
-        try:
-            matches = home.glob(g)
-        except Exception:
-            continue
-        for p in matches:
-            if p.is_file() and p.name.endswith('-' + sid + '.jsonl'):
-                t = first_real_prompt(p)
-                if t:
-                    found = t
-                    break
-        if found:
-            break
-    if found:
-        answered[sid] = found
 
 for sid in ids:
     if sid in answered:
@@ -4930,9 +4827,13 @@ import json, os, sqlite3, sys
 from pathlib import Path
 
 # argv: <home-relative locator>... -- <session id>...
-# A locator is either a literal file (the shared index) or a glob naming the
-# per-conversation stores. Both are needed: see the registry's note on why the
-# index alone answers for nothing on a fresh conversation.
+# ⛔ SUMMARIES TITLES ONLY (owner titling law, closed 2026-09-05; enforced
+# here 2026-09-06 after rows wore "Today is Aug 30." and "Use the
+# data-fabric skill" — prompt text, not titles). Agy's own authored title is
+# `conversation_summaries.title`; the preview, the history log and the
+# transcript's first USER_INPUT are all PROMPT text and are never offered.
+# The write is LATE (Issue 37): a conversation with no summaries row yet is
+# untitled here, and the row keeps its birth name until agy authors one.
 argv = sys.argv[1:]
 if '--' not in argv:
     sys.exit(0)
@@ -4942,16 +4843,7 @@ ids = [value for value in argv[split + 1:] if value.strip()]
 if not locators or not ids:
     sys.exit(0)
 home = Path(os.path.expanduser('~'))
-wanted = set(ids)
-# rank -> the local reader's own precedence: index title, index preview,
-# history display, transcript prompt. Ranking here rather than relying on
-# locator order keeps the remote answer identical to the local one.
-RANK_TITLE, RANK_PREVIEW, RANK_HISTORY, RANK_TRANSCRIPT = 0, 1, 2, 3
 candidates = {session_id: [] for session_id in ids}
-
-def offer(session_id, rank, value):
-    if session_id in candidates and value and str(value).strip():
-        candidates[session_id].append((rank, str(value)))
 
 def open_read_only(path):
     # Never take a write lock on a store yggterm does not own. `mode=ro` still
@@ -4965,18 +4857,21 @@ def open_read_only(path):
             continue
     return None
 
-def read_summaries(path):
+for locator in locators:
+    path = home / locator
+    if not path.exists() or path.suffix != '.db':
+        continue
     conn = open_read_only(path)
     if conn is None:
-        return
+        continue
     try:
         placeholders = ','.join('?' * len(ids))
         rows = conn.execute(
-            'SELECT conversation_id, title, preview FROM conversation_summaries '
+            'SELECT conversation_id, title FROM conversation_summaries '
             'WHERE conversation_id IN (%s);' % placeholders, ids).fetchall()
-        for conversation_id, title, preview in rows:
-            offer(conversation_id, RANK_TITLE, title)
-            offer(conversation_id, RANK_PREVIEW, preview)
+        for conversation_id, title in rows:
+            if conversation_id in candidates and title and str(title).strip():
+                candidates[conversation_id].append(str(title))
     except Exception:
         pass
     finally:
@@ -4985,85 +4880,8 @@ def read_summaries(path):
         except Exception:
             pass
 
-def read_history(path):
-    try:
-        with open(path, encoding='utf-8', errors='ignore') as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except Exception:
-                    continue
-                offer(record.get('conversationId'), RANK_HISTORY, record.get('display'))
-    except Exception:
-        return
-
-def transcript_id(path):
-    # The conversation id is a DIRECTORY segment of the transcript path, not
-    # its stem — the stem is the same word for every conversation. Matching on
-    # the parts is exact and needs no knowledge of the store's depth.
-    for part in path.parts:
-        if part in wanted:
-            return part
-    return None
-
-def read_transcript(path):
-    session_id = transcript_id(path)
-    if session_id is None:
-        return
-    try:
-        with open(path, encoding='utf-8', errors='ignore') as handle:
-            for index, line in enumerate(handle):
-                if index > 20:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except Exception:
-                    continue
-                if record.get('type') != 'USER_INPUT':
-                    continue
-                content = record.get('content')
-                if content and str(content).strip():
-                    offer(session_id, RANK_TRANSCRIPT, content)
-                    return
-    except Exception:
-        return
-
-for locator in locators:
-    if any(character in locator for character in '*?['):
-        try:
-            matches = sorted(home.glob(locator))
-        except Exception:
-            continue
-        for match in matches:
-            # ⛔ A DELIBERATE, NAMED SKIP, not an oversight. A glob may also name
-            # this CLI's per-conversation `.db` and its legacy `.json` layout.
-            # Their schemas have not been measured, and a decoder written
-            # against a guessed schema returns EMPTY rather than an error — it
-            # would read as "this conversation has no title" forever. The
-            # transcript is the source that has been measured, so it is the one
-            # decoded; the others are listed so a future measurement has a
-            # place to land.
-            if match.suffix != '.jsonl':
-                continue
-            read_transcript(match)
-        continue
-    path = home / locator
-    if not path.exists():
-        continue
-    if path.suffix == '.db':
-        read_summaries(path)
-    else:
-        read_history(path)
-
 for session_id in ids:
-    found = [value for _, value in sorted(candidates.get(session_id) or [],
-                                          key=lambda pair: pair[0])]
+    found = sorted(set(candidates.get(session_id) or []))
     if found:
         print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
 "#;
@@ -7489,11 +7307,13 @@ mod tests {
     /// wired when something has run it against a store shaped like the real
     /// one.
     #[test]
-    fn a_codex_live_title_skips_the_instructions_wrapper() {
+    fn a_codex_rollout_prompt_is_never_a_title() {
         // Measured 2026-08-30: a codex rollout's FIRST role:"user" item is the
-        // AGENTS.md/instructions block, not the prompt. The live-title reader
-        // must skip the wrapper or every codex row gets titled with the fleet
-        // steer file.
+        // AGENTS.md/instructions block, not the prompt — and for one day
+        // (2026-09-05 → 09-06) the reader's third arm answered with the first
+        // REAL prompt anyway, pumping raw prompts onto rows as titles on
+        // every codex install too old for the Thread-name catalog. The arm
+        // is deleted: a rollout can never answer, whatever it contains.
         let home =
             std::env::temp_dir().join(format!("yggterm-codex-title-{}", uuid::Uuid::new_v4()));
         let dir = home.join(".codex/sessions/2026/08/30");
@@ -7509,10 +7329,11 @@ mod tests {
         .unwrap();
 
         // The cache lookup consults the machine's real session-titles.db; a
-        // fresh random id cannot be cached there, so the rollout arm answers.
+        // fresh random id cannot be cached there, so nothing answers.
         assert_eq!(
-            read_codex_live_store_title(&home, id).as_deref(),
-            Some("Fix the agy restart bug please"),
+            read_codex_live_store_title(&home, id),
+            None,
+            "a rollout is input, not a title — silence is the answer"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -7703,7 +7524,7 @@ mod tests {
     /// is indistinguishable from the defect it was written to repair. This is
     /// that row, and it must come back titled.
     #[test]
-    fn a_fresh_remote_agy_conversation_is_titled_from_its_own_transcript() {
+    fn a_fresh_remote_agy_conversation_is_silence_until_agy_authors() {
         let home = std::env::temp_dir().join(format!("yggterm-agy-probe-{}", uuid::Uuid::new_v4()));
         let conversation_id = "4f0d5a2b-1c73-4c8e-9f21-6b0a7d3e5c14";
         write_agy_fixture(
@@ -7716,37 +7537,20 @@ mod tests {
         let lines = run_agy_probe(&home, &[conversation_id]);
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            lines.len(),
-            1,
-            "the conversation exists only as a transcript and was answered for by nothing: \
-             {lines:?}"
-        );
-        let value: serde_json::Value =
-            serde_json::from_str(&lines[0]).expect("the probe answers in JSON lines");
-        assert_eq!(value["session_id"], conversation_id);
-        let candidates: Vec<String> = value["candidates"]
-            .as_array()
-            .expect("candidates")
-            .iter()
-            .map(|candidate| candidate.as_str().unwrap_or_default().to_string())
-            .collect();
-        let probe = agent_cli_descriptor(SessionKind::Antigravity)
-            .and_then(|descriptor| descriptor.remote_live_store_title)
-            .expect("Antigravity declares a remote probe");
-        assert_eq!(
-            (probe.choose)(&candidates),
-            Some("Rewrite the invoice exporter".to_string()),
-            "the transcript prompt did not survive the same cleaner the local reader uses"
+        assert!(
+            lines.is_empty(),
+            "the conversation exists only as a transcript — and a transcript prompt is \
+             INPUT, never a title: the probe answers silence and the row keeps its \
+             birth name until agy authors a summary title: {lines:?}"
         );
     }
 
-    /// The precedence half: where the shared index HAS answered, it still wins.
-    /// The transcript is the fallback that was missing, not a new authority —
-    /// promoting it would make a remote row's title differ from the same row's
-    /// title read locally, which is the drift the two halves exist to avoid.
+    /// The precedence half: where the shared index HAS answered, its TITLE is
+    /// the only thing the probe offers. The preview/history/transcript arms
+    /// that once ranked behind it were all PROMPT text, and prompt text wore
+    /// rows as titles until 2026-09-06 ("Today is Aug 30.").
     #[test]
-    fn an_indexed_agy_conversation_still_prefers_the_index_title() {
+    fn the_indexed_agy_title_is_the_only_thing_the_probe_answers() {
         let home = std::env::temp_dir().join(format!("yggterm-agy-probe-{}", uuid::Uuid::new_v4()));
         let conversation_id = "8c1e7f40-92ab-4d55-bb03-1e6f2a9c4d77";
         write_agy_fixture(
@@ -7768,14 +7572,10 @@ mod tests {
             .map(|candidate| candidate.as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(
-            candidates.first().map(String::as_str),
-            Some("Renamed by the owner"),
-            "the local reader's precedence is index title, index preview, history, \
-             transcript — the remote answer must be ordered the same way: {candidates:?}"
-        );
-        assert!(
-            candidates.iter().any(|candidate| candidate.contains("the transcript prompt")),
-            "the transcript must still be offered as the last fallback: {candidates:?}"
+            candidates,
+            vec!["Renamed by the owner".to_string()],
+            "the authored summaries title is the whole answer — no preview, history \
+             or transcript prompt may ride beside it: {candidates:?}"
         );
     }
 
@@ -9165,12 +8965,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
-    /// The litellm fork's transcripts live under `.codex-litellm`, and the
-    /// shared reader walks both descriptor homes — the wrapper item is
-    /// skipped, the first real prompt answers. (Previously the rollout
-    /// fallback searched only codex's root and could never find these.)
+    /// ⛔ The rollout prompt is NOT a title (2026-09-06): the litellm fork's
+    /// transcripts live under `.codex-litellm`, both homes are walked for the
+    /// CATALOG — and when no catalog answers, the reader answers None. It
+    /// must never fall back to the rollout's first prompt: for one day that
+    /// arm pumped raw prompts onto rows as titles on every codex install too
+    /// old for the Thread-name catalog.
     #[test]
-    fn codex_litellm_rollouts_are_found_in_their_own_home() {
+    fn codex_reader_never_serves_a_rollout_prompt() {
         let home = std::env::temp_dir().join(format!("ygg-codex-lit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let day = home.join(".codex-litellm/sessions/2026/09/05");
@@ -9185,18 +8987,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_codex_live_store_title(&home, "test-codex-lit-3").as_deref(),
-            Some("Fix the login redirect loop for expired sessions"),
+            read_codex_live_store_title(&home, "test-codex-lit-3"),
+            None,
+            "a silent store answers None — the rollout prompt is input, not a title"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Exercise the actual codex Python probe, not a Rust paraphrase: the
-    /// Thread-name catalog answers FIRST (a session with no rollout at all
-    /// still gets its catalog title), a thread the catalog does not know
-    /// falls to its rollout's first real prompt, and an absent id is silence.
+    /// The store-silence probe behind the generation fallback: codex with a
+    /// Thread-name catalog row is NOT silent (the CLI's word exists — rule 2
+    /// holds); codex with no catalog anywhere IS silent (generation may name
+    /// the row). Only codex/codex-litellm/muse ever answer true.
     #[test]
-    fn remote_codex_title_probe_answers_catalog_first_then_rollout() {
+    fn store_title_silent_tracks_the_catalog() {
+        let home = std::env::temp_dir().join(format!("ygg-codex-silent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let sqlite_dir = home.join(".codex/sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let conn = rusqlite::Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE local_thread_catalog (host_id TEXT NOT NULL, thread_id TEXT NOT NULL, \
+             display_title TEXT NOT NULL, source_recency_at REAL NOT NULL DEFAULT 0, \
+             PRIMARY KEY (host_id, thread_id));",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_thread_catalog VALUES ('host', 'thread-named', 'Catalogued', 1.0);",
+            [],
+        )
+        .unwrap();
+        assert!(!store_title_silent_in(
+            &home,
+            SessionKind::Codex,
+            "thread-named"
+        ));
+        assert!(store_title_silent_in(
+            &home,
+            SessionKind::Codex,
+            "thread-unnamed"
+        ));
+        // A non-participating Store CLI is never "silent" for generation —
+        // agy authors LATE, and generating for it would fight the authored
+        // title (Issue Heading 37's late-write contract).
+        assert!(!store_title_silent_in(
+            &home,
+            SessionKind::Antigravity,
+            "thread-unnamed"
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Exercise the actual codex Python probe, not a Rust paraphrase: the
+    /// Thread-name catalog answers, and an install without the catalog (or a
+    /// thread it does not know) is SILENCE — the rollout prompt is never a
+    /// candidate (2026-09-06).
+    #[test]
+    fn remote_codex_title_probe_answers_catalog_only() {
         let root = dirs::home_dir()
             .unwrap()
             .join(".yggterm/scratchpad")
@@ -9216,6 +9063,8 @@ mod tests {
             rusqlite::params!["Catalogued thread name"],
         )
         .unwrap();
+        // A rollout whose first real prompt WOULD have answered under the
+        // deleted arm — its presence must change nothing now.
         std::fs::create_dir_all(root.join(".codex/sessions/2026/09/05")).unwrap();
         std::fs::write(
             root.join(".codex/sessions/2026/09/05/rollout-2026-09-05T10-00-00-thread-raw.jsonl"),
@@ -9236,7 +9085,6 @@ mod tests {
         args.push("--".to_string());
         args.push("thread-catalogued".to_string());
         args.push("thread-raw".to_string());
-        args.push("thread-absent".to_string());
         let output = std::process::Command::new("python3")
             .arg("-c")
             .arg(probe.script)
@@ -9250,34 +9098,18 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let answered: std::collections::HashMap<String, Vec<String>> = stdout
+        let answered: Vec<String> = stdout
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).expect("JSON lines");
-                let id = value["session_id"].as_str().expect("session_id").to_string();
-                let candidates = value["candidates"]
-                    .as_array()
-                    .expect("candidates")
-                    .iter()
-                    .filter_map(|candidate| candidate.as_str().map(ToOwned::to_owned))
-                    .collect();
-                (id, candidates)
+                value["session_id"].as_str().expect("session_id").to_string()
             })
             .collect();
         assert_eq!(
-            answered.get("thread-catalogued").map(Vec::as_slice),
-            Some(&["Catalogued thread name".to_string()][..]),
-            "the catalog answers first — no rollout needed"
-        );
-        assert_eq!(
-            answered.get("thread-raw").map(Vec::as_slice),
-            Some(&["the raw first prompt for thread b".to_string()][..]),
-            "a thread the catalog does not know falls to its rollout's first real prompt"
-        );
-        assert!(
-            !answered.contains_key("thread-absent"),
-            "an absent id is silence, not an invented title"
+            answered,
+            vec!["thread-catalogued".to_string()],
+            "the catalog answers; the rollout-bearing thread stays silent"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -9470,10 +9302,16 @@ mod tests {
 /// (`session-index.db` `sessions.session_name` + `session_name_revision`,
 /// measured on dev — random adjective-noun slugs until muse ships real
 /// names). So yggterm READS every agent CLI's title and generates for none
-/// of them; the generation machinery stays for documents and other
-/// non-agent rows, and the muse push is dormant. A descriptor that drifts
-/// from this map fails here, and the map itself changes only with the
-/// owner's word (docs/cli-integration.md Issue Heading 37).
+/// of them — with ONE measured exception (2026-09-06): codex/codex-litellm/
+/// muse stores can be SILENT (old codex has no catalog; muse names late),
+/// and a silent store admits the row to generation
+/// (`store_title_silent`, asked by `session_accepts_generated_copy`) — the
+/// Dynamic title poll still overwrites with the CLI's word the moment the
+/// store speaks. The generation machinery stays for documents and other
+/// non-agent rows, and the muse push fires whenever generation names a muse
+/// row. A descriptor that drifts from this map fails here, and the map
+/// itself changes only with the owner's word (docs/cli-integration.md
+/// Issue Heading 37).
 #[test]
 fn title_authority_matches_the_owner_titling_law() {
     for descriptor in AGENT_CLIS.iter() {

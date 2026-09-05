@@ -1397,11 +1397,27 @@ pub fn session_is_app_row(session: &ManagedSessionView) -> bool {
 ///    agent session can hold. A plain shell — local or ssh — is not one, and
 ///    generating a title from its scrollback is how three ssh rows came to be
 ///    called after an unrelated line of `apt` output.
+///
+/// ⚠ **THE STORE-SILENT EXCEPTION to rule 2 (2026-09-06).** Codex,
+/// codex-litellm and muse keep `TitleAuthority::Store` — the CLI's word wins
+/// the moment its store speaks — but their stores can be SILENT: codex
+/// installs older than the Thread-name catalog will never answer, and muse
+/// leaves a session unnamed until it names it. Rule 2 read as "never
+/// generate" left those rows wearing the birth name (or, for one day, a raw
+/// rollout prompt) forever. So a silent store ADMITS the row to generation,
+/// and the Dynamic title poll overwrites with the CLI's own word the moment
+/// the store has one. Measured live 2026-09-06: every codex row on an
+/// old-codex host sat prompt-named under rule 2 as written.
 pub fn session_accepts_generated_copy(session: &ManagedSessionView) -> bool {
     if session_is_app_row(session) {
         return false;
     }
     if session.kind.self_generates_copy() {
+        // Rule 2 — with the store-silent exception: a CLI whose store cannot
+        // answer for THIS session is not authoritative over it.
+        if yggterm_core::agent_cli::store_title_silent(session.kind, &session.id) {
+            return true;
+        }
         return false;
     }
     if session.kind == SessionKind::Document {
@@ -39342,13 +39358,22 @@ mod tests {
             let session = server.sessions.get(&row).expect("the row exists");
             let expected = match kind {
                 SessionKind::Document => true,
+                // The store-silent exception (2026-09-06): codex/codex-litellm/
+                // muse are admitted ONLY when their store cannot answer this
+                // row's id — asserted through the SAME predicate the gate
+                // asks, against the same home, so the test tracks the law and
+                // not this machine's store contents.
+                kind @ (SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::Muse) => {
+                    yggterm_core::agent_cli::store_title_silent(kind, &session.id)
+                }
                 kind => kind.is_agent() && !kind.self_generates_copy(),
             };
             assert_eq!(
                 super::session_accepts_generated_copy(session),
                 expected,
                 "{kind:?} must answer the gate from what it IS — an agent CLI \
-                 that writes no title of its own, or a document with a body"
+                 whose store speaks, or a silent store admitting generation, \
+                 or a document with a body"
             );
         }
     }
