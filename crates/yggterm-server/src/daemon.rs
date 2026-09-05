@@ -6399,7 +6399,7 @@ impl DaemonRuntime {
         // `~/.local/share/opencode`). The CLIs' own stores are anchored on
         // the user home and nothing else.
         let recency = dirs::home_dir().and_then(|user_home| {
-            yggterm_core::agent_cli::agent_session_recency_ms(user_home, kind, session_id)
+            yggterm_core::agent_cli::agent_session_recency_ms(&user_home, kind, session_id)
         });
         match recency {
             Some(recency_ms) => {
