@@ -50,7 +50,30 @@ Falsifier for the landed half: the next unownable remote resize emits `remote_pt
 
 ## ⛔ [11.56] A FORCED hot-restart HANDOFF LEFT THE NEW DAEMON OWNED:0 AND THE GUI AT ZERO ROWS FOR ~15 MINUTES — THE PRESERVED OWNER WAS NEVER ADOPTED
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+⭐ **ROOT CAUSE (2026-09-05 ~23:5x, `lane/cli/same-version-adoption`): the
+progressive-migration drain's adopter gate accepted ONLY a strictly-newer
+VERSION peer** — `live_newer_daemon_socket` skips every socket whose version
+is `<= my_version`, and a same-version successor answers from the
+predecessor's own canonical socket name (the preserving arm made it take
+that name). In the fleet's dominant handoff shape — a same-version
+newer-BUILD swap, every ygg-ci lane merge that is not a release roll — the
+drain therefore `continue`d forever: the predecessor never released a single
+session (this entry's "kept all 24 PTYs on the `.retired-<pid>` socket,
+indefinitely"), never reached `progressive_migration_owner_empty_retire`,
+and stayed a zombie holding PTYs (three generations measured coexisting on
+dev the same evening, `preserved_terminal_owner_count: 0` on the canonical
+daemon while two predecessors still lived). The deep reconcile adopted ROW
+metadata; the RUNTIME convergence could never start. The fix: the drain
+probes its own canonical endpoint FIRST — a live answer from a pid that is
+not ours IS the adopter (`live_same_version_successor`; a bequest alias
+pointing at a newer daemon answers the same way) — and keeps the
+newer-version probe as the cross-version arm. A drain that finds no adopter
+now announces `progressive_migration_no_adopter` once a minute instead of
+`continue`ing silently, and the first adopter seen is traced with WHICH arm
+found it (`progressive_migration_adopter_seen`). Source-locked by
+`the_migration_drain_accepts_a_same_version_successor_not_only_a_newer_one`.
 
 Witnessed 2026-09-05 00:52–01:07 on the gui host (dev), during the wry
 0.56.1 substrate deploy (lane/dev/vendor-wry-056, main c1b1d6cf5):

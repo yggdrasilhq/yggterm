@@ -136,7 +136,18 @@ telling a human to do its janitorial work. The contract:
    (`stranded_orphan` | `orphaned_dead_output`) and a surviving refusal
    carries per-holder `why_not_reaped` notes, so the next banner arrives
    with its own diagnosis instead of costing a hand investigation.
-5. **Adoption precedes binding** (from [11.56], still owed): a successor
-   daemon must not bind the canonical socket until it can adopt the
-   preserved owner's runtimes. Binding first is what stranded a GUI at zero
-   rows for ~15 minutes while a healthy preserved owner held every PTY.
+5. **Adoption must be POSSIBLE at binding, and must CONVERGE after it**
+   (from [11.56]; the convergence half implemented in
+   `lane/cli/same-version-adoption`). Binding first is still correct — the
+   canonical name must answer or old clients find no daemon at all — but the
+   handover is only honest when the preserved owner's sessions actually
+   drain. The migration drain's adopter gate now probes the canonical
+   endpoint FIRST: a live answer from a foreign pid there IS the adopter
+   (the same-version successor that took our name, or a bequest alias to a
+   newer one); the strictly-newer-version probe remains the cross-version
+   arm. A stalled drain announces `progressive_migration_no_adopter` once a
+   minute, and the first adopter seen is traced with the arm that answered
+   (`progressive_migration_adopter_seen`). Before this, the gate accepted
+   only a strictly-newer VERSION peer — invisible in the fleet's dominant
+   same-version newer-build swaps — so predecessors kept every PTY until
+   process death and successors stayed owned:0.
