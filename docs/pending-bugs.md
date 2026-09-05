@@ -27078,3 +27078,49 @@ bytes within one poll of the cooldown policy (≤20 s if versions differ or the
 probe hangs, `disk_version_probe_unanswered` fires and the rotation happens
 ANYWAY. A stale daemon coexisting with newer disk bytes across two polls is
 the regression alarm.
+## ⛔ [11.63] AN ORPHANED OPENCODE HOLDER CLASSIFIED EXTERNAL FOREVER — THE MARKER TEST DEMANDED THE ROW'S NAME BE THE SESSION'S NAME
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The all-CLI attach-refusal plague (2026-09-05, owner eureka): under the fleet's
+update velocity — dev yggterm re-deployed many times a day — every daemon
+restart that ends a daemon generation WITHOUT a preserving handover orphans its
+CLI children (reparented to init, terminal gone). The resume guard knew this
+shape and had a bounded reap for it (B2, the [11.57] cure), but only for
+holders it could call PROVABLY OURS — and its test for that was the environ
+marker's LAST SEGMENT equal to the agent session id. That held only for CLIs
+whose runtime row is named after the session. The newer integrations name the
+row after the CLI's own runtime uuid, so their orphans classified External:
+
+- Measured live on dev: `opencode2 --auto --session ses_f998…`, ppid 1,
+  environ stamped `LC_YGGTERM_SESSION_ID=opencode-runtime://8a59fba6…` — a
+  yggterm stamp naming the ROW, not the session. Every resume retried, scanned,
+  found the orphan, refused with the orphan banner ("end it with `kill …`"),
+  and waited for a hand that never came. The row read "held by an orphaned
+  OpenCode process … this wait cannot end on its own" — accurate prose around
+  a state yggterm itself could have ended. The same daemon generation had
+  reaped a codex orphan hours earlier (codex rows ARE named after their
+  session) — the plague was per-CLI by row-naming scheme, invisible until a
+  newer-CLI row met an old daemon.
+
+**Fix (`lane/cli/orphan-holder-reap`):** the marker is the yggterm-BIRTH proof;
+it does not have to name the session — argv already names the session. A
+holder whose environ carries ANY yggterm marker is `StrandedYggtermOwned`
+(both the argv arm and the fd-based arm; the strict strictness stays: no
+marker and no yggterm ancestor is still External, and an unreadable environ
+never widens anything). Plus the owner-ruled widen
+(`orphaned_dead_output_holders_recoverable`): a holder of ANY tenancy that is
+orphaned to init AND whose stdout AND stderr both point into `/dev/pts/N`
+entries that no longer exist is unrecoverable by anyone — a pts exists only
+while its master lives — so it reads as the corpse it is at the same bounded
+reap arms (wait deadline, ensure pre-refusal). Anything observable (a live
+parent, a live pts, a file, a pipe, an unreadable fd) keeps wait-and-banner:
+"cannot say dead" never widens the kill. Reap events carry `reason`
+(`stranded_orphan` | `orphaned_dead_output`), and the refusal event now
+carries per-holder `why_not_reaped` notes (parent live/orphaned, output
+reachable/dead/unreadable) — the next banner arrives with its own diagnosis.
+
+**Falsifier:** the dev orphan above is still alive on the GUI host's dev
+daemon at filing time. After the deploy rotates a daemon onto the fix,
+re-running that row's resume must reap it (`external_stranded_orphan_reaped_by_ensure`
+with `reason`), spawn the fresh TUI, and paint the session — no hand kill.

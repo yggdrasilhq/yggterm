@@ -102,3 +102,41 @@ ps -eo pid,lstart,cmd | grep "[s]erver daemon"
 More than one daemon should no longer happen on its own. If it does, that is a
 bug — read `docs/daemon-handoff.md` and the incident notes before "fixing" the
 handoff, which is working as designed.
+
+## The orphan-zero contract (2026-09-05, tightened after the all-CLI attach plague)
+
+At fleet update velocity — a dev host redeploys many times a day — daemon
+generations turn over constantly, and **every generation boundary is a chance
+to orphan the CLI children of the dying daemon.** An orphan (reparented to
+init, its terminal and owning daemon both gone) is a HANDOVER FAULT, never a
+user problem: the user cannot close a terminal that does not exist, and a
+resume that refuses forever behind "end it with `kill …`" is the mechanism
+telling a human to do its janitorial work. The contract:
+
+1. **A clean handover leaves zero orphaned holders.** The preserved owner
+   keeps its children alive by design; only a death WITHOUT handover (crash,
+   SIGKILL, cold-shutdown race) creates orphans, so the recovery arms exist
+   for them and must converge without a human.
+2. **The environ marker proves yggterm BIRTH, not the session's name.** It is
+   fixed at exec and only yggterm writes it, so a marker naming ANY row —
+   including a row uuid that is not the agent session id (the
+   `opencode-runtime://<uuid>` vs `ses_…` split, [11.63]) — is the full
+   "ours" proof; argv names which session the process holds. Demanding the
+   marker repeat the session id silently narrowed the recovery to the one
+   CLI family whose rows are session-named.
+3. **Dead output makes any orphan a corpse, whatever its stamp.** A
+   `/dev/pts/N` entry exists only while some process holds that PTY's master;
+   both output fds pointing into vanished pts devices means nobody can ever
+   read the holder again, and no live parent can adopt it (owner-ruled
+   2026-09-05). Everything still observable — a live parent, a live pts, a
+   file, a pipe, an unreadable fd — keeps wait-and-banner: "cannot say dead"
+   never widens the kill.
+4. **The reap is bounded and named.** One SIGTERM round to the process tree,
+   one short yield, one rescan; the reap events carry `reason`
+   (`stranded_orphan` | `orphaned_dead_output`) and a surviving refusal
+   carries per-holder `why_not_reaped` notes, so the next banner arrives
+   with its own diagnosis instead of costing a hand investigation.
+5. **Adoption precedes binding** (from [11.56], still owed): a successor
+   daemon must not bind the canonical socket until it can adopt the
+   preserved owner's runtimes. Binding first is what stranded a GUI at zero
+   rows for ~15 minutes while a healthy preserved owner held every PTY.

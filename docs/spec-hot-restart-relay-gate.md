@@ -175,3 +175,46 @@ swap at an announced boundary with nothing in flight at all.
   `hot_restart_pending: true` is the state this document exists to abolish: if a
   swap is waiting, something must be nameable as the thing it waits for, and if
   nothing is, it must fire.
+
+## 9. The observability contract — a handover you cannot see is a handover you cannot trust (2026-09-05)
+
+The hot-restart mechanism spent weeks being blamed for defects it did not
+cause and silently causing others; both costs came from the same hole — the
+handover was not OBSERVABLE end to end, so every attach failure looked like
+the swap and every swap fault looked like an attach failure. The owner's
+ruling after the all-CLI attach plague: **the tracing must be wired so the
+smooth handover is observable and any fault is caught by name.** The contract
+every handover-path change must satisfy:
+
+1. **Every swap emits a joinable event family.** Arm (the gate decision with
+   its reason), handoff (predecessor pid + build, runtime count preserved),
+   bind (successor pid + build, socket taken), adopt (per-runtime adoption
+   or its deferral reason), drain (progressive migration releases). One
+   identifier must join predecessor and successor sides so a single swap can
+   be replayed from the trace alone.
+2. **Faults are named events with self-explaining payloads.** No silent
+   branch on the handover path: a refusal carries WHY per holder
+   (`why_not_reaped`), a deferral carries the gate that held it, a timeout
+   names the phase that expired. The test is the 2026-09-05 standard: the
+   next screenshot of a stuck row must be diagnosable from its own trace
+   payload, without a hand `/proc` investigation.
+3. **Absence is not evidence.** Lossy writers and abrupt exits mean a missing
+   `daemon_self_retire` proves nothing (measured: a daemon vanishing with
+   zero lifecycle events). Observability of a COMPLETED handover is
+   positive: successor birth + adoption events on the new build's pid.
+4. **The state machine of §3 and the queue of §4 report through it.**
+   `hot_restart_blockers` must never be empty while a swap waits (§8's law),
+   and each blocker names the session holding it.
+
+## 10. The convergence unit is the BUILD, not the version (2026-09-05)
+
+The relay gate fires on version skew, but the fleet's update cadence makes
+**same-version newer builds a normal state**: a host can run yesterday's
+build of the same version for hours beside today's. The different-bytes law
+(`disk_binary_replaced` means different bytes, size+mtime latched,
+`/proc/<pid>/exe` compared) already governs daemon self-retirement; the gate
+and the convergence detection must compare BUILD identity the same way, so a
+same-version newer build arms a handover exactly as a version bump does.
+Under this spec a "stale daemon" is: older version, OR same version with
+different (newer) build bytes on disk. The bidirectional convergence spec
+carries the same rule for the client side.
