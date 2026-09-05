@@ -1763,8 +1763,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // OpenAI's teal, darkened to clear AA against white (5.47:1).
         brand_color: "#0f766e",
         menu_hint: 'c',
-        // Codex records no title of its own; yggterm's LLM chore writes one.
-        title_authority: TitleAuthority::Generated,
+        // OWNER TITLING LAW, second half (2026-09-05): codex now names its own
+        // threads — "Thread name" in `~/.codex/sqlite/codex-dev.db`
+        // `local_thread_catalog.display_title` (measured on the GUI host: 233 rows,
+        // `thread_id` == the rollout uuid, cli rows titled from the first
+        // prompt; the db is ABSENT on dev/oc, so the reader fails open to the
+        // cached/rollout chain). yggterm READS the thread name and never
+        // generates over it.
+        title_authority: TitleAuthority::Store,
         // Codex launches bare and discovers its ULID later, so the synthesized
         // `local://<uuid4>` has to be rebound once the transcript appears.
         id_assigned_at_birth: false,
@@ -1931,9 +1937,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        // Owner spec 2026-06-06: codex titles are YGGTERM-owned. The 12s
-        // title chore serves live codex rows from the cached title or the
-        // rollout's first real user prompt (the wrappers skipped).
+        // ⚠ SUPERSEDED (2026-09-05): the 2026-06-06 "codex titles are
+        // YGGTERM-owned" spec is dead — codex stores its own Thread name now.
+        // The 12s title chore serves live codex rows from the thread catalog
+        // first (the CLI's own word), then the cached title, then the rollout's
+        // first real user prompt (the wrappers skipped).
         read_live_store_title: Some(read_codex_live_store_title),
         remote_live_store_title: Some(CODEX_REMOTE_TITLE_PROBE),
     },
@@ -1957,7 +1965,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // behind a proxy, but separable at a glance (5.93:1).
         brand_color: "#0369a1",
         menu_hint: 'z',
-        title_authority: TitleAuthority::Generated,
+        // OWNER TITLING LAW, second half (2026-09-05): same as codex — it IS
+        // codex behind a proxy, so it self-titles the same way. No
+        // `~/.codex-litellm/sqlite/codex-dev.db` has been measured on any fleet
+        // host yet (the GUI host's litellm home has no sessions dir at all; dev's has
+        // no sqlite), so the shared reader's catalog arm simply misses here and
+        // the cached/rollout chain answers.
+        title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
         // ⛔ LOCAL-ONLY, and this is the declaration that says so. It replaces
         // the `matches!(kind, CodexLiteLlm)` that the scheme lock, both arm
@@ -2048,9 +2062,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
         live_session_marker: None,
-        // Owner spec 2026-06-06: codex titles are YGGTERM-owned. The 12s
-        // title chore serves live codex rows from the cached title or the
-        // rollout's first real user prompt (the wrappers skipped).
+        // ⚠ SUPERSEDED (2026-09-05): the 2026-06-06 "codex titles are
+        // YGGTERM-owned" spec is dead — codex stores its own Thread name
+        // now. The shared reader walks both descriptor homes; no catalog
+        // exists here yet (measured), so cached/rollout answers.
         read_live_store_title: Some(read_codex_live_store_title),
         // ⛔ Codex-LiteLLM has no remote arm — its remote-*:// rows never
         // exist, so a probe here would be dead weight the coverage lock
@@ -2837,8 +2852,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Nearest available (8.24:1).
         brand_color: "#86198f",
         menu_hint: 'm',
-        // Muse records no title of its own (like Codex); yggterm's LLM chore writes one.
-        title_authority: TitleAuthority::Generated,
+        // OWNER TITLING LAW, second half (2026-09-05): muse now names its own
+        // sessions — `session-index.db` `sessions.session_name` (+ its
+        // `session_name_revision` projection-guard columns, measured on dev:
+        // `arctic-exosphere`, `glass-asteroid`, … random adjective-noun slugs
+        // for now, the owner expects real names soon). yggterm READS the
+        // session name and never generates over it.
+        title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
         wrapper_slug: Some("muse"),
         remote_row_scheme: Some("remote-muse://"),
@@ -4030,16 +4050,78 @@ fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> 
     if session_id.trim().is_empty() {
         return None;
     }
+    // The codex family's candidate homes, descriptor-derived so the CODEX_HOME
+    // env override keeps working: codex's own sessions root and the litellm
+    // fork's. A litellm session id never exists under `.codex`, so walking
+    // both is collision-free — and it is what lets the fork's rollout
+    // fallback find its transcripts at all (the previous single-root search
+    // looked only at codex's).
+    let homes: Vec<(PathBuf, PathBuf)> = [SessionKind::Codex, SessionKind::CodexLiteLlm]
+        .iter()
+        .filter_map(|kind| agent_cli_descriptor(*kind))
+        .filter_map(|descriptor| {
+            let sessions_root = descriptor.store_roots_absolute(home).into_iter().next()?;
+            let codex_home = sessions_root.parent()?.to_path_buf();
+            Some((sessions_root, codex_home))
+        })
+        .collect();
+    // 1. The CLI's own word — the Thread-name catalog
+    // (`<codex home>/sqlite/codex-dev.db`, `local_thread_catalog`), newest
+    // host row first. Measured 2026-09-05 on the GUI host; older codex installs
+    // (dev/oc) carry no sqlite dir, and every miss falls open to the next arm.
+    for (_sessions_root, codex_home) in &homes {
+        if let Some(title) =
+            title_without_fallbacks(codex_thread_catalog_title(codex_home, session_id))
+        {
+            return Some(title);
+        }
+    }
+    // 2. yggterm's own cache: generated titles that predate the flip keep the
+    // name their row already wears until the CLI's own word exists.
     if let Some(title) = cached_session_title(session_id) {
         return Some(title);
     }
-    let descriptor = agent_cli_descriptor(SessionKind::Codex)?;
-    let sessions_root = descriptor
-        .store_roots_absolute(home)
-        .into_iter()
-        .next()?;
-    let rollout = find_file_by_suffix(&sessions_root, 4, &format!("-{session_id}.jsonl"))?;
-    title_without_fallbacks(codex_first_real_user_prompt(&rollout))
+    // 3. The rollout's first real user prompt — the same value codex derives
+    // its cli display titles from.
+    for (sessions_root, _codex_home) in &homes {
+        let Some(rollout) = find_file_by_suffix(sessions_root, 4, &format!("-{session_id}.jsonl"))
+        else {
+            continue;
+        };
+        if let Some(title) = title_without_fallbacks(codex_first_real_user_prompt(&rollout)) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+/// One codex Thread name, read from the catalog projection codex itself
+/// maintains. Read-only with the fleet's WAL hardening (busy timeout, fail
+/// open to `None` — never a partial answer).
+fn codex_thread_catalog_title(codex_home: &Path, thread_id: &str) -> Option<String> {
+    let db_path = codex_home.join("sqlite").join("codex-dev.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(400))
+        .ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT display_title FROM local_thread_catalog \
+             WHERE thread_id = ?1 ORDER BY source_recency_at DESC LIMIT 1",
+        )
+        .ok()?;
+    let mut rows = stmt.query(rusqlite::params![thread_id]).ok()?;
+    let row = rows.next().ok()??;
+    let title: Option<String> = row.get(0).ok();
+    title
 }
 
 /// [`AgentCliDescriptor::read_live_store_title`] for OpenCode: the v2 store's
@@ -4214,27 +4296,31 @@ fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT title, workspace_root FROM sessions WHERE session_id=?1",
-            ) {
-                if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
-                    if let Ok(Some(row)) = rows.next() {
-                        let title: Option<String> = row.get(0).ok();
-                        let ws: Option<String> = row.get(1).ok();
-                        let ws = ws.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-                        let title = title
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty() && s != session_id)
-                            .filter(|s| !crate::looks_like_generated_fallback_title(s))
-                            .filter(|s| !crate::looks_like_low_signal_generated_copy(s));
-                        let title = match (&ws, &title) {
-                            (Some(ws), Some(t)) if t == ws => None,
-                            _ => title,
-                        };
-                        if let Some(t) = title {
-                            return Some(t);
-                        }
-                    }
+            if let Some((name, title, ws)) = muse_index_row(&conn, session_id) {
+                let ws = ws.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                // The CLI's own name for the session (owner titling law,
+                // 2026-09-05 — muse names its sessions, random adjective-noun
+                // slugs until it ships real ones). Read VERBATIM: the
+                // generated-copy filters below exist to catch yggterm's own
+                // guesses, and they must not editorialize muse's word away.
+                if let Some(name) = name
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != session_id)
+                    .filter(|s| Some(s.as_str()) != ws.as_deref())
+                {
+                    return Some(name);
+                }
+                let title = title
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != session_id)
+                    .filter(|s| !crate::looks_like_generated_fallback_title(s))
+                    .filter(|s| !crate::looks_like_low_signal_generated_copy(s));
+                let title = match (&ws, &title) {
+                    (Some(ws), Some(t)) if t == ws => None,
+                    _ => title,
+                };
+                if let Some(t) = title {
+                    return Some(t);
                 }
             }
         }
@@ -4253,6 +4339,41 @@ fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// One muse index row: `(session_name, title, workspace_root)`. The
+/// `session_name` projection only exists on muse builds new enough to name
+/// sessions — probed for before it is selected, so an older store keeps
+/// answering with the two columns it has (a guessed SELECT against a schema
+/// that lacks the column would error the whole db arm into "no title").
+fn muse_index_row(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let has_name = conn
+        .prepare("SELECT session_name FROM sessions LIMIT 0")
+        .is_ok();
+    let sql = if has_name {
+        "SELECT title, session_name, workspace_root FROM sessions WHERE session_id=?1"
+    } else {
+        "SELECT title, workspace_root FROM sessions WHERE session_id=?1"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
+    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+    let row = rows.next().ok()??;
+    let title: Option<String> = row.get(0).ok();
+    let name = if has_name {
+        let name: Option<String> = row.get(1).ok();
+        name
+    } else {
+        None
+    };
+    let ws: Option<String> = if has_name {
+        row.get(2).ok()
+    } else {
+        row.get(1).ok()
+    };
+    Some((name, title, ws))
 }
 
 fn find_muse_session_jsonl_in(dir: &Path, session_id: &str, depth: usize) -> Option<PathBuf> {
@@ -4373,12 +4494,15 @@ for session_id in ids:
 /// answer for every conversation that has had a turn. A remote row that only
 /// the transcript could name reports `no_title_in_store`, which is true and
 /// cheap; guessing it would have cost a store walk per tick.
-/// The codex/codex-litellm remote title script: find the session's rollout by
-/// file-name suffix and answer the FIRST REAL USER PROMPT — the same skip the
+/// The codex/codex-litellm remote title script: the CLI's own Thread-name
+/// catalog first (`<store home>/sqlite/codex-dev.db`,
+/// `local_thread_catalog.display_title` — the home dir name derived from each
+/// passed glob's first segment, so the per-CLI globs decide which homes are
+/// probed), then the rollout's FIRST REAL USER PROMPT — the same skip the
 /// local reader does (`codex_first_real_user_prompt`): the rollout's first
 /// user item is the AGENTS.md/instructions wrapper, never the prompt.
 const CODEX_REMOTE_TITLE_SCRIPT: &str = r#"
-import json, os, sys
+import json, os, sqlite3, sys
 from pathlib import Path
 argv = sys.argv[1:]
 if '--' not in argv:
@@ -4389,7 +4513,41 @@ ids = [v for v in argv[split + 1:] if v.strip()]
 if not ids:
     sys.exit(0)
 home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+answered = {}
 WRAPPER_MARKS = ('<user_instructions>', '<environment_context>', '<permissions', '<turn_context>')
+
+def read_catalog(path):
+    if not path.exists():
+        return
+    for uri in (f'file:{path}?mode=ro', f'file:{path}?immutable=1'):
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+            break
+        except Exception:
+            conn = None
+    if conn is None:
+        return
+    try:
+        placeholders = ','.join('?' * len(ids))
+        rows = conn.execute(
+            'SELECT thread_id, display_title FROM local_thread_catalog '
+            'WHERE thread_id IN (%s);' % placeholders, ids).fetchall()
+        for thread_id, title in rows:
+            if thread_id in wanted and title and str(title).strip():
+                answered[thread_id] = str(title).strip()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+for g in globs:
+    first = g.split('/')[0] if g else ''
+    if first:
+        read_catalog(home / first / 'sqlite' / 'codex-dev.db')
 
 def first_real_prompt(path):
     try:
@@ -4428,6 +4586,8 @@ def first_real_prompt(path):
     return None
 
 for sid in ids:
+    if sid in answered:
+        continue
     found = None
     for g in globs:
         try:
@@ -4443,7 +4603,11 @@ for sid in ids:
         if found:
             break
     if found:
-        print(json.dumps({'session_id': sid, 'candidates': [found]}, ensure_ascii=False))
+        answered[sid] = found
+
+for sid in ids:
+    if sid in answered:
+        print(json.dumps({'session_id': sid, 'candidates': [answered[sid]]}, ensure_ascii=False))
 "#;
 
 const CODEX_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
@@ -4935,19 +5099,36 @@ fn first_muse_title_candidate(candidates: &[String]) -> Option<String> {
         if trimmed.is_empty() || trimmed.starts_with('/') {
             return None;
         }
-        // Muse's store candidates are raw prompts as often as finished DB
-        // titles. A raw prompt beginning `please ...` is intentionally
-        // low-signal AS A TITLE, but it is excellent title input. The local
-        // durable reader condenses first; rejecting first made the ssh reader
-        // answer `no_title_in_store` for the same conversation.
-        let condensed = crate::best_effort_title_from_context(trimmed).or_else(|| {
-            let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-            if !first_line.is_empty() && first_line.len() <= 120 {
-                Some(first_line.to_string())
-            } else {
-                Some(trimmed.chars().take(80).collect())
-            }
-        })?;
+        // The CLI's own session name (owner titling law, second half
+        // 2026-09-05) is read VERBATIM — the condenser below is for raw
+        // prompt text, and it title-cases, which would mangle a name like
+        // `arctic-exosphere`. Muse names randomly-shaped slugs today
+        // (measured on dev), so the verbatim arm is the measured slug shape
+        // and nothing more; when muse ships its promised real-name system
+        // this predicate is the seam to revisit. Everything else — often a
+        // RAW PROMPT — keeps the condense-first path.
+        let is_session_name_slug = {
+            let body = trimmed;
+            !body.is_empty()
+                && body.len() <= 64
+                && body.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                && !body.starts_with('-')
+                && !body.ends_with('-')
+                && body.contains('-')
+                && !body.contains("--")
+        };
+        let condensed = if is_session_name_slug {
+            Some(trimmed.to_string())
+        } else {
+            crate::best_effort_title_from_context(trimmed).or_else(|| {
+                let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
+                if !first_line.is_empty() && first_line.len() <= 120 {
+                    Some(first_line.to_string())
+                } else {
+                    Some(trimmed.chars().take(80).collect())
+                }
+            })
+        }?;
         (!crate::looks_like_generated_fallback_title(&condensed)
             && !crate::looks_like_low_signal_generated_copy(&condensed))
             .then_some(condensed)
@@ -4987,12 +5168,27 @@ def read_db(path):
         return
     try:
         placeholders = ','.join('?' * len(ids))
-        rows = conn.execute(
-            'SELECT session_id, title, workspace_root FROM sessions '
-            'WHERE session_id IN (%s);' % placeholders, ids).fetchall()
-        for session_id, title, ws in rows:
-            if title and title.strip() and title.strip() != session_id and title.strip() != (ws or '').strip():
-                offer(session_id, title)
+        # The CLI's own session name (owner titling law, 2026-09-05) is
+        # offered BEFORE the first-prompt title — the candidates order is the
+        # precedence. The name projection only exists on newer muse builds:
+        # an OperationalError falls back to the two-column legacy SELECT
+        # rather than erroring the whole db arm into "no title".
+        try:
+            rows = conn.execute(
+                'SELECT session_id, title, session_name, workspace_root FROM sessions '
+                'WHERE session_id IN (%s);' % placeholders, ids).fetchall()
+            for session_id, title, name, ws in rows:
+                if name and str(name).strip() and str(name).strip() != session_id and str(name).strip() != (ws or '').strip():
+                    offer(session_id, name)
+                if title and title.strip() and title.strip() != session_id and title.strip() != (ws or '').strip():
+                    offer(session_id, title)
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                'SELECT session_id, title, workspace_root FROM sessions '
+                'WHERE session_id IN (%s);' % placeholders, ids).fetchall()
+            for session_id, title, ws in rows:
+                if title and title.strip() and title.strip() != session_id and title.strip() != (ws or '').strip():
+                    offer(session_id, title)
     except Exception:
         pass
     finally:
@@ -5937,7 +6133,8 @@ pub fn new_row_birth_title(machine: Option<&str>, what: &str) -> String {
 ///   MEASURED retitling — with the measurement in the comment, not a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleMutability {
-    /// The store can retitle the session at any time (OpenCode today).
+    /// The store can retitle the session at any time (OpenCode, the codex
+    /// family's Thread-name catalog, muse's session name).
     Dynamic,
     /// The store writes a title once and never revises it (the default).
     Static,
@@ -5945,7 +6142,17 @@ pub enum TitleMutability {
 
 pub fn title_mutability(kind: SessionKind) -> TitleMutability {
     match kind {
-        SessionKind::OpenCode => TitleMutability::Dynamic,
+        // OpenCode retitles for life (auto-title, human rename, fork names —
+        // measured 2026-09-02). Codex maintains its Thread-name catalog as a
+        // projection (recency columns, `pending_observed_title`), and muse
+        // carries `session_name_revision` with real names expected to replace
+        // the random slugs — the owner said so the same day the stores were
+        // measured (2026-09-05). Same reason, one arm: a settled row can be
+        // wearing last week's name.
+        SessionKind::OpenCode
+        | SessionKind::Codex
+        | SessionKind::CodexLiteLlm
+        | SessionKind::Muse => TitleMutability::Dynamic,
         _ => TitleMutability::Static,
     }
 }
@@ -6295,19 +6502,42 @@ mod tests {
     /// MEMBER (owner directive 2026-09-02: "our metadata system should
     /// understand their dynamicity language"). A CLI the registry has not
     /// MEASURED as retitling must answer Static — the cheap settle-skip is
-    /// correct for it — and OpenCode must answer Dynamic: its store rewrites
-    /// titles for a session's whole life (auto-title after the first prompt,
-    /// human rename in the TUI, fork names), which is the measured reason a
-    /// settled row wore last week's name (2026-09-02).
+    /// correct for it — and the measured retilers must answer Dynamic:
+    /// OpenCode rewrites titles for a session's whole life (auto-title after
+    /// the first prompt, human rename in the TUI, fork names — the measured
+    /// reason a settled row wore last week's name, 2026-09-02); the codex
+    /// family maintains its Thread-name catalog as a projection, and muse
+    /// carries `session_name_revision` with real names expected to replace
+    /// the random slugs (both measured 2026-09-05).
     #[test]
     fn title_mutability_is_dynamic_only_for_measured_retitlers() {
-        assert_eq!(
-            title_mutability(SessionKind::OpenCode),
-            TitleMutability::Dynamic,
-            "OpenCode retitles dynamically — the one measured member"
-        );
+        let dynamic = [
+            (
+                SessionKind::OpenCode,
+                "auto-title, human rename, fork names (2026-09-02)",
+            ),
+            (
+                SessionKind::Codex,
+                "Thread-name catalog projection (2026-09-05)",
+            ),
+            (
+                SessionKind::CodexLiteLlm,
+                "codex behind a proxy — same catalog (2026-09-05)",
+            ),
+            (
+                SessionKind::Muse,
+                "session_name_revision; real names expected (2026-09-05)",
+            ),
+        ];
+        for (kind, why) in dynamic {
+            assert_eq!(
+                title_mutability(kind),
+                TitleMutability::Dynamic,
+                "{kind:?} is a measured retiler ({why})"
+            );
+        }
         for kind in SessionKind::ALL {
-            if *kind == SessionKind::OpenCode {
+            if dynamic.iter().any(|(member, _)| member == kind) {
                 continue;
             }
             assert_eq!(
@@ -8710,6 +8940,216 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// OWNER TITLING LAW, second half (2026-09-05): muse names its own
+    /// sessions — `sessions.session_name` (random adjective-noun slugs until
+    /// it ships real names, measured on dev: `anise-hyperion`,
+    /// `arctic-exosphere`, …). The name is the CLI's word and wins over the
+    /// first-prompt title, read VERBATIM: the generated-copy filters exist to
+    /// catch yggterm's guesses, not to editorialize the CLI's naming.
+    #[test]
+    fn muse_session_name_is_the_clis_own_title_and_wins() {
+        let home = std::env::temp_dir().join(format!("ygg-muse-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let muse_dir = home.join(".local/share/muse");
+        std::fs::create_dir_all(&muse_dir).unwrap();
+        let conn = rusqlite::Connection::open(muse_dir.join("session-index.db")).unwrap();
+        conn.execute(
+            // The MEASURED store shape: the name projection (with its
+            // revision) beside the first-prompt title.
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, workspace_root TEXT, title TEXT, \
+             session_name TEXT, session_name_revision INTEGER, updated_at_us INTEGER);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, 1, ?5);",
+            rusqlite::params![
+                "test-muse-named-1",
+                "/home/user/proj",
+                "What is the architecture of your memory system in this harness",
+                "anise-hyperion",
+                1700000000000000i64,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read_muse_live_store_title(&home, "test-muse-named-1").as_deref(),
+            Some("anise-hyperion"),
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The codex Thread-name catalog (owner titling law, second half
+    /// 2026-09-05): `local_thread_catalog.display_title` is codex's own word
+    /// and the reader's FIRST arm, newest host row first. An install without
+    /// the sqlite projection (dev/oc, measured) fails open — None, never an
+    /// invented title.
+    #[test]
+    fn codex_thread_catalog_names_the_session_and_bare_installs_fail_open() {
+        let home = std::env::temp_dir().join(format!("ygg-codex-cat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let sqlite_dir = home.join(".codex/sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let conn = rusqlite::Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
+        conn.execute(
+            // The MEASURED catalog shape (GUI host): keyed (host_id, thread_id),
+            // recency-ordered reads.
+            "CREATE TABLE local_thread_catalog (host_id TEXT NOT NULL, thread_id TEXT NOT NULL, \
+             display_title TEXT NOT NULL, source_recency_at REAL NOT NULL DEFAULT 0, \
+             PRIMARY KEY (host_id, thread_id));",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_thread_catalog VALUES \
+             ('host-a', ?1, ?2, 100.0), ('host-b', ?1, ?3, 200.0);",
+            rusqlite::params![
+                "test-codex-thread-1",
+                "first prompt title (stale host)",
+                "newer title (fresh host)",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_live_store_title(&home, "test-codex-thread-1").as_deref(),
+            Some("newer title (fresh host)"),
+        );
+
+        let bare = std::env::temp_dir().join(format!("ygg-codex-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(read_codex_live_store_title(&bare, "test-codex-thread-2"), None);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The litellm fork's transcripts live under `.codex-litellm`, and the
+    /// shared reader walks both descriptor homes — the wrapper item is
+    /// skipped, the first real prompt answers. (Previously the rollout
+    /// fallback searched only codex's root and could never find these.)
+    #[test]
+    fn codex_litellm_rollouts_are_found_in_their_own_home() {
+        let home = std::env::temp_dir().join(format!("ygg-codex-lit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let day = home.join(".codex-litellm/sessions/2026/09/05");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-09-05T10-00-00-test-codex-lit-3.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"text\":\"<user_instructions>wrapper\"}]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"text\":\"Fix the login redirect loop for expired sessions\\nsecond line\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_live_store_title(&home, "test-codex-lit-3").as_deref(),
+            Some("Fix the login redirect loop for expired sessions"),
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Exercise the actual codex Python probe, not a Rust paraphrase: the
+    /// Thread-name catalog answers FIRST (a session with no rollout at all
+    /// still gets its catalog title), a thread the catalog does not know
+    /// falls to its rollout's first real prompt, and an absent id is silence.
+    #[test]
+    fn remote_codex_title_probe_answers_catalog_first_then_rollout() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join(".yggterm/scratchpad")
+            .join(format!("codex-remote-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".codex/sqlite")).unwrap();
+        let conn = rusqlite::Connection::open(root.join(".codex/sqlite/codex-dev.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE local_thread_catalog (host_id TEXT NOT NULL, thread_id TEXT NOT NULL, \
+             display_title TEXT NOT NULL, source_recency_at REAL NOT NULL DEFAULT 0, \
+             PRIMARY KEY (host_id, thread_id));",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_thread_catalog VALUES ('host', 'thread-catalogued', ?1, 100.0);",
+            rusqlite::params!["Catalogued thread name"],
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".codex/sessions/2026/09/05")).unwrap();
+        std::fs::write(
+            root.join(".codex/sessions/2026/09/05/rollout-2026-09-05T10-00-00-thread-raw.jsonl"),
+            concat!(
+                r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"<user_instructions>agents md"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"the raw first prompt for thread b"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let descriptor = agent_cli_descriptor(SessionKind::Codex).expect("Codex is registered");
+        let probe = descriptor
+            .remote_live_store_title
+            .expect("Codex declares a remote probe");
+        let mut args = descriptor.remote_store_title_locators();
+        args.push("--".to_string());
+        args.push("thread-catalogued".to_string());
+        args.push("thread-raw".to_string());
+        args.push("thread-absent".to_string());
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(probe.script)
+            .args(args)
+            .env("HOME", &root)
+            .output()
+            .expect("python3 is needed to exercise the remote Codex probe");
+        assert!(
+            output.status.success(),
+            "the probe script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answered: std::collections::HashMap<String, Vec<String>> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).expect("JSON lines");
+                let id = value["session_id"].as_str().expect("session_id").to_string();
+                let candidates = value["candidates"]
+                    .as_array()
+                    .expect("candidates")
+                    .iter()
+                    .filter_map(|candidate| candidate.as_str().map(ToOwned::to_owned))
+                    .collect();
+                (id, candidates)
+            })
+            .collect();
+        assert_eq!(
+            answered.get("thread-catalogued").map(Vec::as_slice),
+            Some(&["Catalogued thread name".to_string()][..]),
+            "the catalog answers first — no rollout needed"
+        );
+        assert_eq!(
+            answered.get("thread-raw").map(Vec::as_slice),
+            Some(&["the raw first prompt for thread b".to_string()][..]),
+            "a thread the catalog does not know falls to its rollout's first real prompt"
+        );
+        assert!(
+            !answered.contains_key("thread-absent"),
+            "an absent id is silence, not an invented title"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The remote muse chooser must let a session-name slug through intact —
+    /// it is the CLI's finished title, not prompt input to condense.
+    #[test]
+    fn muse_remote_chooser_keeps_a_session_name_slug() {
+        assert_eq!(
+            first_muse_title_candidate(&["arctic-exosphere".to_string()]).as_deref(),
+            Some("arctic-exosphere"),
+        );
+    }
+
     /// Muse can emit hundreds of lifecycle records before the first accepted
     /// user intent.  The index has been observed to keep `prompt_count = 0`
     /// and `title = "New session"` even after that intent exists, so the
@@ -8879,24 +9319,27 @@ mod tests {
 
 
 #[cfg(test)]
-/// ⛔ THE OWNER TITLING LAW (2026-09-05), as a registry lock: ONLY codex and
-/// muse code lack a self-titling mechanism — every other CLI sets its own
-/// title first and yggterm READS it (retrieval); yggterm generates and PUSHES
-/// only for the two. A descriptor that drifts from this map fails here, and
-/// the map itself changes only with the owner's word (noted in
-/// docs/cli-integration.md Issue Heading 37).
+/// ⛔ THE OWNER TITLING LAW (2026-09-05, CLOSED the same day by the owner's
+/// second word): every CLI in the registry self-titles now. The morning map —
+/// "only codex and muse lack a self-titling mechanism" — lasted hours: codex
+/// stores its own "Thread name" (`~/.codex/sqlite/codex-dev.db`
+/// `local_thread_catalog.display_title`, measured on the GUI host; `thread_id` IS the
+/// rollout uuid), and muse code names its sessions
+/// (`session-index.db` `sessions.session_name` + `session_name_revision`,
+/// measured on dev — random adjective-noun slugs until muse ships real
+/// names). So yggterm READS every agent CLI's title and generates for none
+/// of them; the generation machinery stays for documents and other
+/// non-agent rows, and the muse push is dormant. A descriptor that drifts
+/// from this map fails here, and the map itself changes only with the
+/// owner's word (docs/cli-integration.md Issue Heading 37).
 #[test]
 fn title_authority_matches_the_owner_titling_law() {
-    let yggterm_titles = ["codex", "codex-litellm", "muse"];
     for descriptor in AGENT_CLIS.iter() {
-        let want = if yggterm_titles.contains(&descriptor.slug) {
-            TitleAuthority::Generated
-        } else {
-            TitleAuthority::Store
-        };
         assert_eq!(
-            descriptor.title_authority, want,
-            "{} drifts from the owner titling law",
+            descriptor.title_authority,
+            TitleAuthority::Store,
+            "{} drifts from the owner titling law — a CLI whose own title \
+             yggterm must read, never generate over",
             descriptor.slug,
         );
     }

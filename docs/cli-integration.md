@@ -1099,7 +1099,11 @@ and Muse also fail.*
 | Grok Build | yes (`summary.json` `generated_title`, often empty) | scan only |
 | Codex / Codex-LiteLLM | **no** — owner spec 2026-06-06: yggterm OWNS these | scan only (first prompt / LLM) |
 
-⛔ (2026-09-05, OWNER TITLING LAW — corrects this whole map: ONLY codex and muse code do not self-title; every other CLI sets its own title first and yggterm READS it. The registry flip + the harmonization contract are Issue Heading 37.)
+⛔ (2026-09-05, OWNER TITLING LAW — corrects this whole map: every CLI sets
+its own title first and yggterm READS it — CLOSED the same day by the
+owner's second word: codex stores Thread names, muse names its sessions,
+so ZERO CLIs are Generated. The registry flip + the harmonization contract
+are Issue Heading 37.)
 | Muse | first prompt only (`session-index.db.title`; `New session` when empty) | local reader + remote probe |
 | Pi | no (transcript jsonl only) | scan only |
 | Kimi | none found (`~/.kimi/kimi.json` is a work_dirs map) | dedicated scanner only |
@@ -1929,7 +1933,11 @@ showed the CLI's OWN authored title, "Swarm Memory Schema Review".
 ### The titling map, as the owner states it
 
 **ONLY codex and muse code do not self-title. Every other CLI sets its own
-title first; yggterm READS it.** This CORRECTS the Issue 29 measured map
+title first; yggterm READS it.** ⚠ SUPERSEDED HOURS LATER — the owner's
+second word the same day CLOSED the map: codex stores Thread names and muse
+names its sessions, so **every** CLI self-titles now (see "The map,
+closed" below). The morning map is kept as history. This CORRECTS the
+Issue 29 measured map
 (where OpenCode was labelled `Generated` — the descriptor drift already
 acknowledged there — and where pi/kimi/grok sat on the Generated side of
 the fence). The store measurements behind the flip:
@@ -1952,12 +1960,59 @@ the fence). The store measurements behind the flip:
   is no late authored rewrite, so reading it is stable.
 * **grok-build** — Store: `summary.json` `generated_title` when the CLI
   writes it.
-* **codex, codex-litellm** — Generated (yggterm owns the title; the rollout
-  store has no title column to push into — yggterm's metadata layer is the
-  only carrier, noted as the push limit for the codex family).
-* **muse** — Generated (muse code does not self-title: a zero-prompt
-  session sits at "New session" forever — 28 such rows measured in
-  `session-index.db` on dev).
+* **codex, codex-litellm** — ⚠ SUPERSEDED HOURS LATER (see "The map,
+  closed" below): was Generated because the rollout store had no title
+  column to push into — codex now stores one.
+* **muse** — ⚠ SUPERSEDED HOURS LATER (see "The map, closed" below): was
+  Generated because a zero-prompt session sat at "New session" forever —
+  muse now writes its own `session_name`.
+
+### The map, closed — every CLI self-titles (2026-09-05, hours after the morning law)
+
+The owner's second word the same day: codex now stores session titles —
+it calls them **Thread names** — and muse code has the title concept too,
+naming sessions randomly for now ("corpus-baboon"-shaped slugs) with real
+names expected soon. **That makes ALL CLIs self-titling: yggterm READS
+every agent CLI's title and generates for none of them.** Measured before
+writing the reader (the Issue 36 method law), both stores:
+
+* **codex** — `~/.codex/sqlite/codex-dev.db`, table `local_thread_catalog`:
+  `display_title` (the Thread name), keyed `(host_id, thread_id)`, with
+  `cwd`, `source_created_at`/`source_updated_at`/`source_recency_at`,
+  `source_kind` (`cli` 208 / `chatgpt` 25 on the GUI host), `pending_observed_title`,
+  `git_branch`, `project_id`, `conversation_origin`. 233 rows measured on
+  the GUI host; `thread_id` IS the rollout filename uuid, so the join to yggterm's
+  session id is direct. `cli` rows are titled from the first real prompt
+  today (the chatgpt rows carry real curated titles — the shape codex is
+  clearly growing into); the projection is codex-maintained, so the reader
+  orders by `source_recency_at` and codex+codex-litellm flip to Dynamic
+  mutability. ⛔ The db is ABSENT on dev/oc (older codex) — reader and
+  remote probe fail open to the cached/rollout chain. Codex-litellm's
+  `~/.codex-litellm` home carries NO catalog on any fleet host (measured);
+  its lookups miss and the fallback answers — and the shared reader now
+  walks BOTH descriptor homes, which fixes the fork's rollout fallback
+  (it previously searched only codex's root and could never have found a
+  litellm transcript).
+* **muse** — `~/.local/share/muse/session-index.db`, `sessions` table:
+  `session_name` + `session_name_revision` (with projection-guard
+  triggers) beside the first-prompt `title`. Dev, 39 rows: names are
+  random adjective-noun slugs (`arctic-exosphere`, `anise-hyperion`,
+  `glass-asteroid`, …). The reader takes `session_name` VERBATIM when
+  present (the CLI's own word — the generated-copy filters must not
+  editorialize it), then `title`, then the transcript fallback; muse flips
+  to Dynamic (the revision column exists because names revise). The name
+  probe is schema-guarded so an older muse build without the column keeps
+  answering from `title`.
+
+What landed with the closure: the registry lock now asserts **zero
+`Generated` CLIs**; `title_mutability` adds the codex family and muse to
+Dynamic; the muse push is DORMANT (`session_accepts_generated_copy`
+refuses muse upstream; the push arm is kept as the contract for any
+future generated-copy kind with a writable title store); the codex remote
+probe reads the Thread-name catalog first (the store home derived from
+each passed glob's first segment) and the muse remote probe offers
+`session_name` before `title` with a legacy-schema fallback.
+
 
 ### The contract, as landed
 
@@ -1976,13 +2031,19 @@ the fence). The store measurements behind the flip:
   `session_name` rename field is never touched) — muse's picker and
   yggterm's row then agree, and the trace records `title/pushed_to_cli_store`.
   Codex has no title store: yggterm's metadata layer stays its only carrier.
+  ⚠ Both halves DORMANT since "The map, closed" (same day): muse
+  self-titles now, so generation is refused for its rows upstream and the
+  push never fires; codex's Thread-name catalog made yggterm's carrier role
+  obsolete there too. The arm is kept for any future generated-copy kind.
 * **USER home law** (from the Issue 36 falsifier round): every CLI-store
   path resolves `dirs::home_dir()` — never `resolve_yggterm_home()`.
 
 ### What this issue does NOT cover
 
-* The muse `session_name` push (the user's rename field) — deliberately
-  untouched; a generated title must never overwrite an explicit rename.
+* The muse `session_name` WRITE path — still deliberately untouched, and
+  doubly so now that `session_name` is the read source: yggterm never
+  writes the CLI's name field (its own generated-title push is dormant;
+  see "The map, closed").
 * The agy session-id vs summaries-conversation-id mapping (the screenshot
   row's id had no summaries row while the picker showed the title — the
   summaries write for that conversation was still pending; when it lands,
