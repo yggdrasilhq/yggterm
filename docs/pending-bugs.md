@@ -27011,3 +27011,14 @@ wire plane mutes all malformed input and actively disconnects floods; the
 ytrace socket is a request plane that refuses injection (0 spoofed events
 landed); resource floods (row churn, 100 KB keystrokes, 30 parallel CLIs,
 resize storms) left the user's GUI with zero ui/block events.
+
+
+## ⛔ [11.61] THE SOCKET GRAVEYARD: 845 ALIAS SYMLINKS + 785 LOCK FILES FROM EVERY VERSION EVER DEPLOYED WERE KEPT FOREVER (live adversarial audit, 2026-09-05)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured on the GUI host 2026-09-05 ~04:50: `dead_server_sockets_removed` reported `kept_live: 846` against `live_sockets: 2`; the on-disk census was 844 `server-*.sock` files + 789 locks. Classification of the actual files against the sweep's own rules: 845 are ALIAS SYMLINKS to the live socket (the bequest machinery links every old version name at the current daemon so old clients can connect), kept by the resolve-and-keep arm — correct for a rollback alias, a litter engine across every version ever deployed. 785 are `server-X-Y-Z.sock.lock` files with no retiree pid, which the sweep classified NotOurs — invisible entirely. Only ~8 files (the renamed `.retired-<pid>` bequests) were on the confirm ledger the campaign has been tracking; the 84-artifact first-sighting was the small renamed tip of a ~1600-file mountain.
+
+**Fix (`lane/trace/socket-alias-reap`):** the census now carries the INSTALLED-versions set (read from `versions/`, dot-parsed) with an explicit known flag; an alias to a live socket is load-bearing only while its own version is still installed (a rollback can return to it) — otherwise it dies on the ordinary re-proved-sighting rule; an unreadable install history keeps every alias (fail-safe). Versioned lock files are classified instead of ignored: alive while their version is listening, live, or installed; litter otherwise. Source tests pin all four arms plus the live lock.
+
+**Falsifier:** on a host carrying the graveyard, the first two sweep ticks past deploy record the aliases and ancient locks as first-seen-dead; the ticks past `SOCKET_DEAD_CONFIRM_MS` remove them (`removed` counts in the hundreds), while the installed version's alias + the live lock stay (`kept_live` collapses to single digits). The user-visible scrollbar of `~/.yggterm` empties.

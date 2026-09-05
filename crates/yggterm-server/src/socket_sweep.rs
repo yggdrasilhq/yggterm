@@ -124,6 +124,10 @@ pub(crate) enum KeepReason {
     /// lingerer drains, so the file is load-bearing however dead its name
     /// looks to the census.
     RetiredOwnerAlive,
+    /// The alias/lock resolves to something live, but the install history
+    /// could not be read, so whether the version is still rollback-able is
+    /// unknown — kept, because absence of proof is never a deletion.
+    RollbackSetUnknown,
 }
 
 /// One entry's verdict. `Remove` is the only branch that unlinks anything.
@@ -152,6 +156,13 @@ pub(crate) struct LiveDaemonCensus {
     live_versions: HashSet<(u64, u64, u64)>,
     /// False ⇒ some input could not be gathered ⇒ the sweep removes nothing.
     complete: bool,
+    /// Versions still installed under `versions/` — the only versions a
+    /// rollback can return to, so the only versions whose socket-name ALIAS
+    /// is load-bearing. Empty-but-known means "nothing can roll back".
+    rollback_versions: HashSet<(u64, u64, u64)>,
+    /// False ⇒ the versions directory could not be read ⇒ alias retention is
+    /// unrestricted (fail-safe: an unreadable install history keeps aliases).
+    rollback_known: bool,
 }
 
 impl LiveDaemonCensus {
@@ -167,7 +178,21 @@ impl LiveDaemonCensus {
             listening,
             live_versions,
             complete,
+            rollback_versions: HashSet::new(),
+            rollback_known: false,
         }
+    }
+
+    /// State the installed-versions set explicitly (builder; tests and
+    /// `gather` are the callers).
+    pub(crate) fn with_rollback_versions(
+        mut self,
+        versions: HashSet<(u64, u64, u64)>,
+        known: bool,
+    ) -> Self {
+        self.rollback_versions = versions;
+        self.rollback_known = known;
+        self
     }
 
     /// Read the kernel's unix-socket table and keep the listening paths that
@@ -181,11 +206,47 @@ impl LiveDaemonCensus {
             .into_iter()
             .filter(|path| path.parent() == Some(home_dir))
             .collect();
-        Self::from_parts(listening, true)
+        Self::from_parts(listening, true).with_rollback_versions(
+            Self::installed_rollback_versions(home_dir),
+            home_dir.join("versions").is_dir(),
+        )
     }
 
     pub(crate) fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Versions a rollback can still return to: the names under `versions/`.
+    /// Directory names are dot-separated (`3.2.61`); socket names are
+    /// dash-separated. A failed read yields an empty set AND `false` — the
+    /// caller distinguishes "nothing installed" from "could not look".
+    fn installed_rollback_versions(home_dir: &Path) -> HashSet<(u64, u64, u64)> {
+        let mut versions = HashSet::new();
+        let Ok(entries) = fs::read_dir(home_dir.join("versions")) else {
+            return versions;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let mut parts = name.split('.');
+            let (Some(major), Some(minor), Some(patch)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if parts.next().is_some() {
+                continue;
+            }
+            if let (Ok(major), Ok(minor), Ok(patch)) = (
+                major.parse::<u64>(),
+                minor.parse::<u64>(),
+                patch.parse::<u64>(),
+            ) {
+                versions.insert((major, minor, patch));
+            }
+        }
+        versions
     }
 
     pub(crate) fn live_socket_count(&self) -> usize {
@@ -337,6 +398,43 @@ pub(crate) fn classify_socket_entry(
                 None => SocketVerdict::Keep(KeepReason::Unreadable),
             };
         }
+        // 1c. A versioned LOCK file (`server-X-Y-Z.sock.lock`, no retiree
+        //     pid) was invisible to this sweep as NotOurs — the 2026-09-05
+        //     audit counted 785 of them beside the aliases. Its fate follows
+        //     its socket: alive while that version is listening, live
+        //     somewhere, or still installed; litter on the usual terms
+        //     otherwise; kept while the install history is unreadable.
+        if !census.complete {
+            return SocketVerdict::Keep(KeepReason::CensusIncomplete);
+        }
+        if let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".lock"))
+            .and_then(|stem| parse_versioned_server_socket_name(Path::new(stem)).map(|_| stem))
+        {
+            let version = parse_versioned_server_socket_name(Path::new(stem))
+                .expect("stem re-parsed after lock strip");
+            let sibling = path.with_file_name(format!(
+                "server-{}-{}-{}.sock",
+                version.0, version.1, version.2
+            ));
+            if census.listening.contains(&sibling)
+                || census.live_versions.contains(&version)
+                || (census.rollback_known && census.rollback_versions.contains(&version))
+            {
+                return SocketVerdict::Keep(KeepReason::LiveDaemonVersion);
+            }
+            if !census.rollback_known {
+                return SocketVerdict::Keep(KeepReason::RollbackSetUnknown);
+            }
+            return match first_seen_dead_ms {
+                Some(first) if now_ms.saturating_sub(first) >= SOCKET_DEAD_CONFIRM_MS => {
+                    SocketVerdict::Remove
+                }
+                _ => SocketVerdict::ConfirmLater,
+            };
+        }
         return SocketVerdict::NotOurs;
     };
     // 2. No proof of what is alive ⇒ no deletions at all.
@@ -349,13 +447,38 @@ pub(crate) fn classify_socket_entry(
     {
         return SocketVerdict::Keep(KeepReason::OwnSocket);
     }
-    // 4. Positive liveness: something is listening here, or on what this
-    //    resolves to (the alias case).
-    if census.listening.contains(path)
-        || canonical.is_some_and(|target| census.listening.contains(target))
-    {
+    // 4. Positive liveness: something is listening HERE.
+    if census.listening.contains(path) {
         return SocketVerdict::Keep(KeepReason::Listening);
     }
+    // 4b. An ALIAS to a listening socket is load-bearing only while a client
+    //     of the alias's own version can still exist — i.e. that version is
+    //     still installed under `versions/` and a rollback could return to
+    //     it. The 2026-09-05 audit measured 845 alias files kept forever on
+    //     the GUI host (every version ever deployed, all resolving to the
+    //     live daemon), because this arm kept anything that resolved. An
+    //     alias for an uninstalled version is litter on the ordinary
+    //     re-proved-sighting terms. An unreadable install history keeps
+    //     every alias: fail-safe.
+    if let Some(target) = canonical
+        && census.listening.contains(target)
+    {
+        match parse_versioned_server_socket_name(path) {
+            Some(version) if census.rollback_versions.contains(&version) => {
+                return SocketVerdict::Keep(KeepReason::Listening);
+            }
+            Some(_) if !census.rollback_known => {
+                return SocketVerdict::Keep(KeepReason::RollbackSetUnknown);
+            }
+            _ => match first_seen_dead_ms {
+                Some(first) if now_ms.saturating_sub(first) >= SOCKET_DEAD_CONFIRM_MS => {
+                    return SocketVerdict::Remove;
+                }
+                _ => return SocketVerdict::ConfirmLater,
+            },
+        }
+    }
+
     // 5. A daemon of this exact version is alive somewhere else.
     if census.live_versions.contains(&version) {
         return SocketVerdict::Keep(KeepReason::LiveDaemonVersion);
@@ -580,7 +703,11 @@ mod tests {
         let alias = tmp.path().join("server-2-1-2.sock");
         touch(&live);
         std::os::unix::fs::symlink(&live, &alias).unwrap();
-        let census = census_with(&[live.as_path()]);
+        // The alias version is INSTALLED (a rollback can return to it), so
+        // the alias is serving, not litter — see the ancient-alias test for
+        // the uninstalled counterpart ([2026-09-05 audit]).
+        let census = census_with(&[live.as_path()])
+            .with_rollback_versions([(2, 1, 2), (3, 0, 32)].into_iter().collect(), true);
         assert_eq!(
             classify_socket_entry(
                 &alias,
@@ -775,6 +902,86 @@ mod tests {
             SocketVerdict::Keep(KeepReason::RetiredOwnerAlive),
             "a draining lingerer's retired path is load-bearing — the registry \
              hands adopters this exact name — whatever the census says"
+        );
+    }
+
+    #[test]
+    fn an_ancient_alias_to_a_live_socket_dies_after_the_confirm_window() {
+        // [2026-09-05 audit] 845 alias symlinks — every version ever deployed,
+        // all resolving to the live daemon — were kept forever by the old
+        // resolve-and-keep rule. An alias is load-bearing only for a version
+        // still installed; the rest are litter on the usual terms.
+        let tmp = Scratch::new("ancient-alias");
+        let live = tmp.path().join("server-3-2-61.sock");
+        let alias = tmp.path().join("server-2-8-96.sock");
+        let census = LiveDaemonCensus::from_parts([live.clone()].into_iter().collect(), true)
+            .with_rollback_versions([(3, 2, 61)].into_iter().collect(), true);
+        assert_eq!(
+            classify_socket_entry(
+                &alias,
+                Some(&live),
+                true,
+                &census,
+                None,
+                Some(0),
+                100 * DAY_MS
+            ),
+            SocketVerdict::Remove,
+            "an alias for an uninstalled version cannot serve any rollback"
+        );
+    }
+
+    #[test]
+    fn an_alias_for_an_installed_version_is_kept() {
+        let tmp = Scratch::new("rollback-alias");
+        let live = tmp.path().join("server-3-2-61.sock");
+        let alias = tmp.path().join("server-3-2-60.sock");
+        let census = LiveDaemonCensus::from_parts([live.clone()].into_iter().collect(), true)
+            .with_rollback_versions([(3, 2, 60), (3, 2, 61)].into_iter().collect(), true);
+        assert_eq!(
+            classify_socket_entry(&alias, Some(&live), true, &census, None, Some(0), 100 * DAY_MS),
+            SocketVerdict::Keep(KeepReason::Listening),
+            "a rollback can still return to this version; its alias is load-bearing"
+        );
+    }
+
+    #[test]
+    fn an_alias_is_kept_while_the_install_history_is_unreadable() {
+        let tmp = Scratch::new("unknown-rollback");
+        let live = tmp.path().join("server-3-2-61.sock");
+        let alias = tmp.path().join("server-2-8-96.sock");
+        let census = LiveDaemonCensus::from_parts([live.clone()].into_iter().collect(), true);
+        assert_eq!(
+            classify_socket_entry(&alias, Some(&live), true, &census, None, Some(0), 100 * DAY_MS),
+            SocketVerdict::Keep(KeepReason::RollbackSetUnknown),
+            "could not look at versions/ ⇒ absence of proof is never a deletion"
+        );
+    }
+
+    #[test]
+    fn an_ancient_version_lock_file_dies_after_the_confirm_window() {
+        let tmp = Scratch::new("ancient-lock");
+        let lock = tmp.path().join("server-2-4-31.sock.lock");
+        let census = LiveDaemonCensus::from_parts(HashSet::new(), true)
+            .with_rollback_versions([(3, 2, 61)].into_iter().collect(), true);
+        assert_eq!(
+            classify_socket_entry(&lock, Some(&lock), true, &census, None, Some(0), 100 * DAY_MS),
+            SocketVerdict::Remove,
+            "a lock for a version that is neither live nor installed is litter"
+        );
+    }
+
+    #[test]
+    fn the_live_daemons_lock_is_kept() {
+        let tmp = Scratch::new("live-lock");
+        let sock = tmp.path().join("server-3-2-61.sock");
+        let lock = tmp.path().join("server-3-2-61.sock.lock");
+        let census = LiveDaemonCensus::from_parts([sock.clone()].into_iter().collect(), true)
+            .with_rollback_versions([(3, 2, 61)].into_iter().collect(), true);
+        assert_eq!(
+            classify_socket_entry(&lock, Some(&lock), true, &census, None, None, 100 * DAY_MS),
+            SocketVerdict::Keep(KeepReason::LiveDaemonVersion),
+            "the lock rides its socket's liveness"
         );
     }
 
