@@ -75,6 +75,16 @@ now announces `progressive_migration_no_adopter` once a minute instead of
 found it (`progressive_migration_adopter_seen`). Source-locked by
 `the_migration_drain_accepts_a_same_version_successor_not_only_a_newer_one`.
 
+**LIVE PROOF (2026-09-05 ~00:14, dev, build 1788631756):** a forced
+same-version handover of a daemon holding an agent row emitted
+`progressive_migration_adopter_seen {adopter:
+"same-version-successor-pid:3639004"}` — the drain SAW its same-version
+successor, which the old gate could never do; the event did not exist before
+this lane. The release+retire completion stays owed on a SEPARATE,
+deliberate guard: agent runtimes answer `TranscriptActivity::Unknown` and
+are never released by design (see [11.64]) — so the full "predecessor
+retires" falsifier needs [11.64]'s positive liveness signal first.
+
 Witnessed 2026-09-05 00:52–01:07 on the gui host (dev), during the wry
 0.56.1 substrate deploy (lane/dev/vendor-wry-056, main c1b1d6cf5):
 
@@ -27101,3 +27111,39 @@ bytes within one poll of the cooldown policy (≤20 s if versions differ or the
 probe hangs, `disk_version_probe_unanswered` fires and the rotation happens
 ANYWAY. A stale daemon coexisting with newer disk bytes across two polls is
 the regression alarm.
+
+## ⛔ [11.64] AN AGENT RUNTIME CAN NEVER MIGRATE — TRANSCRIPT ACTIVITY ANSWERS UNKNOWN, SO EVERY PRESERVED OWNER WITH AN AGENT ROW LINGERS FOREVER
+
+**Status:** OPEN
+
+Found 2026-09-05 ~00:2x while falsifying [11.56]'s fix on dev: with the
+drain's adopter blindness fixed, the release path still refused the one
+owned row — because `session_transcript_activity` deliberately answers
+`TranscriptActivity::Unknown` for every AGENT runtime, and Unknown BLOCKS
+release ("an agent runtime is never released... a lingering old daemon is
+explicitly acceptable under the constitution; losing a working session is
+not"). The four other signals (idle, draft, foreground, screen-working) all
+measured clear on a stalled-main-loop agent with subagents running; the
+transcript arm is the one holding the line, so it answers unknown for the
+whole family.
+
+The cost: the fleet's dominant rows ARE agent rows, so after every deploy
+the predecessor keeps every agent PTY until process death — the zombie
+generations measured on dev (three coexisting) are not all [11.56]'s
+blindness; this guard holds them too, BY DESIGN, until the positive signal
+exists. The constitution accepts a lingering daemon; the fleet should still
+get to choose convergence once it can measure liveness positively.
+
+**Fix shape:** wire transcript freshness by session id as the positive
+signal (the CLIs' own transcript mtimes are already read elsewhere — the
+store-candidate tier reads opencode's sqlite recency; codex rollouts carry
+mtimes; claude transcripts too). `TranscriptActivity::Fresh(age)` when the
+CLI's own transcript changed within the idle threshold, `Stale` past it;
+release on Stale + the other four signals. The safe direction is preserved:
+no signal = unknown = never released.
+
+**Falsifier:** on a host with an idle agent row owned by the canonical
+daemon, force a same-version handover; with the signal wired, the
+predecessor releases the row (`progressive_migration_session_released`), the
+successor re-resumes it, and the predecessor reaches
+`progressive_migration_owner_empty_retire` and exits.
