@@ -27022,3 +27022,48 @@ Measured on the GUI host 2026-09-05 ~04:50: `dead_server_sockets_removed` report
 **Fix (`lane/trace/socket-alias-reap`):** the census now carries the INSTALLED-versions set (read from `versions/`, dot-parsed) with an explicit known flag; an alias to a live socket is load-bearing only while its own version is still installed (a rollback can return to it) — otherwise it dies on the ordinary re-proved-sighting rule; an unreadable install history keeps every alias (fail-safe). Versioned lock files are classified instead of ignored: alive while their version is listening, live, or installed; litter otherwise. Source tests pin all four arms plus the live lock.
 
 **Falsifier:** on a host carrying the graveyard, the first two sweep ticks past deploy record the aliases and ancient locks as first-seen-dead; the ticks past `SOCKET_DEAD_CONFIRM_MS` remove them (`removed` counts in the hundreds), while the installed version's alias + the live lock stay (`kept_live` collapses to single digits). The user-visible scrollbar of `~/.yggterm` empties.
+
+
+## ⛔ [11.62] DEPLOY INVISIBILITY: ONE HUNG `--version` CHILD BLOCKED THE ROTATION THREAD FOREVER — STALE DAEMONS SERVED FOR HOURS WHILE FRESH BYTES SAT ON DISK
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The signature, measured on the GUI host 2026-09-05 ~05:18-06:50: the serving
+daemon (born 05:00) announced `disk_binary_handoff_cooldown_deferred` at
+05:18:58 — and then emitted NOTHING disk-related for the rest of the morning
+while three deploys landed (05:55/06:03/06:11) and the disk version moved on.
+It was still serving at 06:50, five builds behind; three other stale
+generations (03:51/04:21/04:51) lingered beside it, and the GUI (born 03:42)
+ran deleted bytes seven builds behind disk. Rotation only resumed when the
+owner manually restarted at 13:33.
+
+**Mechanism:** the disk-binary poll is a dedicated 20 s thread whose retire
+trigger reads the replacement's version by SPAWNING it —
+`std::process::Command::output()` waits without bound, on the rotation thread
+itself. One hung child (measured live the same night: a yggterm binary that
+answers the bind-lock contention of a live daemon instead of exiting fast)
+blocks that thread forever. Every later deploy then rewrote the disk bytes
+untouched by any detector: no re-announce, no retire, no successor — the
+quiet hours of 05:18→06:50 are the hang in the record. Corroborating class:
+version-mismatched CLI verbs spawn warm daemons that lose the bind race and
+die untraced (exit 0, `another yggterm daemon owns the socket bind lock`) —
+ephemeral daemons in the process table with zero trace events are this, not a
+spawn loop.
+
+**Fix (`lane/trace/bounded-version-probe`):** the probe is bounded —
+`yggterm_executable_reported_version_bounded(path, 5 s)`: spawn, poll
+`try_wait` against a deadline, kill + reap past it, answer `None`. The
+hysteresis treats unanswered as NOT-ours, so the same-version cooldown is
+BYPASSED and rotation proceeds unversioned — the fail-safe direction is
+toward updating, never toward staleness. An unanswered probe is traced
+(`disk_version_probe_unanswered`, once per 5 min) with the hysteresis named.
+Both rotation-critical callers are covered (the poll's version read AND the
+handoff's `target_version`). Source tests: the bound actually bounds (a 60 s
+sleeper is killed, answer within 10 s) and a healthy binary still parses.
+
+**Falsifier:** on the next deploy, the incumbent daemon retires onto the new
+bytes within one poll of the cooldown policy (≤20 s if versions differ or the
+30-min hysteresis has expired — the normal case for an aged daemon); if a
+probe hangs, `disk_version_probe_unanswered` fires and the rotation happens
+ANYWAY. A stale daemon coexisting with newer disk bytes across two polls is
+the regression alarm.
