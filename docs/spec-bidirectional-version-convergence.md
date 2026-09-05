@@ -62,3 +62,27 @@ the N+1 GUI binary is installed locally. Within one status cadence, with no
 composer draft held, the GUI must restart itself into N+1 without user action,
 and the trace must carry the decision. With a draft held, it must defer and say
 so. With the newer binary absent, it must notify once and stay put.
+
+## Tightening (2026-09-05): the convergence unit is the BUILD, not the version
+
+Everything above reads "version" where it should read "build". At fleet
+update velocity a same-version newer build is a NORMAL state — dev redeploys
+many times a day and versions move far slower than builds — and the skew this
+spec exists to kill occurs just as happily within one version number:
+
+- **Detection compares build identity, not the version string.** The client
+  already has its own build stamp and the daemon's `server_build_id`; the
+  third input (the installed client binary on disk) comes with its own
+  build identity. "Newer" is: higher version, OR same version with
+  different bytes on disk (the different-bytes law the daemon already
+  obeys — size+mtime latched, `/proc/<pid>/exe` compared).
+- **Convergence is monotone in that same ordering.** A client never
+  restarts into an older build no matter what a stale peer advertises, and a
+  same-version OLDER on-disk build never triggers a restart.
+- **Downgrade refusal and binary-availability notification are unchanged**;
+  only the comparison beneath them changes.
+
+**Implementation status:** direction 1 (client → daemons) is load-bearing.
+Direction 2 (daemons → client) remains owed; the build-level comparison
+above is the shape it must implement, and until it lands a long-lived GUI
+drifts within its own version as well as across versions.

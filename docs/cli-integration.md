@@ -2061,3 +2061,39 @@ plane; every scenario's claim is falsified through yggterm's own probes.
 Spec + scenario↔riddle↔witness matrix:
 `docs/spec-mock-tui-opentui.md` (Issue 28–37 classes are the roadmap; the
 dream is the whole integration matrix falsifiable in CI without a live CLI).
+
+## Issue Heading 38: the all-CLI attach plague — rapid fleet churn orphaned CLIs, and the marker test could only recognize one family's orphans (2026-09-05)
+
+Owner eureka, 2026-09-05: the detach/attach failures "are plaguing ALL CLIs,
+not just opencode", and the trigger is the fleet's own update velocity — dev
+yggterm redeploys many times a day, and every daemon generation boundary that
+ends WITHOUT a preserving handover (crash, SIGKILL, cold-shutdown race)
+orphans its CLI children: reparented to init, terminal gone, transcript still
+locked. The resume guard knew the shape and had a bounded reap for it, but
+its "provably ours" test demanded the environ marker's LAST SEGMENT equal the
+agent session id — which holds only for CLIs whose runtime row is named
+after the session. The newer integrations name the row after the CLI's own
+runtime uuid, so their orphans classified External and every reopen refused
+forever with the orphan banner asking for a hand `kill`. Measured live the
+same hour: an `opencode2 --auto --session ses_f998…` holder, ppid 1, environ
+stamped `LC_YGGTERM_SESSION_ID=opencode-runtime://8a59fba6…`, refusing
+resumes for hours on dev while the same daemon had reaped a codex orphan
+(codex rows ARE session-named) — the plague was per-CLI by row-naming
+scheme. The same day's screenshots of two different CLIs showing identical
+"held by an orphaned process" banners under rapid churn were one defect, not
+a CLI-behaviour difference; and the daemon-side restart churn behind them is
+the hot-restart plane (see `docs/daemon-handoff.md` §the orphan-zero
+contract, `docs/spec-hot-restart-relay-gate.md` §9-10).
+
+**Fix (`lane/cli/orphan-holder-reap`, [11.63]):** the marker proves yggterm
+BIRTH, not the session's name — any yggterm stamp makes the holder
+`StrandedYggtermOwned` (argv names the session). Plus the owner-ruled widen:
+an orphan of ANY tenancy whose stdout and stderr both point into vanished
+pts devices is unrecoverable by anyone (a pts exists only while its master
+lives) and reads as the corpse it is. Refusals carry per-holder
+`why_not_reaped` notes — the banner arrives with its own diagnosis.
+
+**Falsifier:** the dev orphan at filing time is the live falsifier — after
+the deploy rotates a daemon onto the fix, that row's reopen must reap
+(`external_stranded_orphan_reaped_by_ensure`, `reason` field), respawn the
+TUI, and paint the session with no hand kill.

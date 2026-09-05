@@ -1992,9 +1992,22 @@ fn agent_resume_process_holder_for_session(
     if !agent_resume_args_match_session(kind, args, session_id) {
         return None;
     }
-    if marker.is_some_and(|marker| {
-        session_tenancy::session_marker_names_session(marker, session_id)
-    }) {
+    // ⛔ THE MARKER PROVES BIRTH, NOT THIS SESSION'S NAME (2026-09-05, the
+    // all-CLI orphan-refusal plague). This test used to demand the marker's
+    // LAST SEGMENT be the agent session id — an assumption that held only for
+    // CLIs whose runtime row is named after the session. The newer
+    // integrations name the row after the CLI's own runtime uuid instead
+    // (`opencode-runtime://<row-uuid>` while the process holds
+    // `ses_…`), so every orphan of that family classified External: the
+    // stranded-orphan reap never armed and each resume retry refused forever
+    // with a banner telling a human to kill by hand what yggterm itself had
+    // launched (measured live: `opencode2 --auto --session ses_f998…`,
+    // ppid 1, environ stamped `LC_YGGTERM_SESSION_ID=opencode-runtime://
+    // 8a59fba6…`, refused by every resume for hours). The stamp is fixed at
+    // exec and only yggterm writes it, so a marker naming ANY row is the
+    // yggterm-birth proof this kind wants; argv already supplies which
+    // session the process holds.
+    if marker.is_some() {
         return Some(AgentResumeHolderKind::StrandedYggtermOwned);
     }
     // The ancestry walk stays as a FALLBACK for anything predating the marker:
@@ -2132,9 +2145,11 @@ fn external_agent_resume_processes_for_session(
             continue;
         }
         let marker = session_tenancy::session_marker_from_proc_environ(pid);
-        let holder = if marker.is_some_and(|marker| {
-            session_tenancy::session_marker_names_session(&marker, session_id)
-        }) {
+        // Same widening as [`agent_resume_process_holder_for_session`]: the
+        // marker proves yggterm birth whatever row it names; a last-segment
+        // id match would re-create the External misclassification here for
+        // every CLI whose row id is not its agent session id.
+        let holder = if marker.is_some() {
             AgentResumeHolderKind::StrandedYggtermOwned
         } else if linux_proc_ancestor_cmdline_args(pid)
             .iter()
@@ -2348,8 +2363,10 @@ fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) -> Ext
 ///
 /// True only when BOTH hold for every holder:
 /// 1. **provably ours** — `StrandedYggtermOwned`: the process's environ marker
-///    names this session, so it was yggterm-launched and is nobody else's work
-///    to protect; and
+///    proves yggterm launched it (2026-09-05: ANY yggterm marker, not only one
+///    whose last segment names this session — newer CLIs name their row after
+///    a runtime uuid, and demanding an id match misclassified their orphans
+///    External forever); and
 /// 2. **orphaned** — reparented to init (ppid 1): its original terminal and
 ///    owning daemon are gone, so no one can ever attach to it again and no
 ///    reader is watching it work.
@@ -2364,6 +2381,106 @@ fn stranded_orphan_holders_recoverable(processes: &[ExternalCodexResumeProcess])
             .iter()
             .all(|process| process.holder == AgentResumeHolderKind::StrandedYggtermOwned)
         && processes.iter().all(|process| process.ppid == Some(1))
+}
+
+/// The owner-ruled widen of the recovery predicate (2026-09-05): a holder that
+/// is **orphaned to init** AND whose **output pipe is dead** is unrecoverable
+/// by anyone, whatever its tenancy stamp — a `/dev/pts/N` entry exists only
+/// while some process holds that PTY's master, so a vanished pts means nobody
+/// can ever again read what the holder writes, and no live parent can adopt
+/// it. Legacy holders predating the environ stamp (and any foreign holder
+/// orphaned the same way) used to block a session forever behind a banner
+/// instructing a hand `kill`; now they read as the corpses they are. Anything
+/// that CAN still be observed (a live pts, a file, a pipe) keeps the strict
+/// wait-and-banner behaviour: "cannot say dead" must never widen the kill.
+#[cfg(target_os = "linux")]
+fn orphaned_dead_output_holders_recoverable(processes: &[ExternalCodexResumeProcess]) -> bool {
+    if processes.is_empty() || processes.iter().any(|process| process.ppid != Some(1)) {
+        return false;
+    }
+    let live = live_pts_devices();
+    processes.iter().all(|process| {
+        holder_output_fd_targets(process.pid).is_some_and(|targets| {
+            pts_outputs_are_dead(&targets, &live)
+        })
+    })
+}
+
+/// Every pts device currently allocated on this host — a `/dev/pts/N` entry
+/// disappears the moment its master fd closes, which is the whole signal.
+#[cfg(target_os = "linux")]
+fn live_pts_devices() -> HashSet<String> {
+    std::fs::read_dir("/dev/pts")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| format!("/dev/pts/{}", entry.file_name().to_string_lossy()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A holder's stdout and stderr link targets, when both are readable. A closed
+/// or unreadable fd returns `None` — "cannot say", which keeps the holder
+/// protected.
+#[cfg(target_os = "linux")]
+fn holder_output_fd_targets(pid: u32) -> Option<[String; 2]> {
+    let out = std::fs::read_link(format!("/proc/{pid}/fd/1")).ok()?;
+    let err = std::fs::read_link(format!("/proc/{pid}/fd/2")).ok()?;
+    Some([
+        out.to_string_lossy().into_owned(),
+        err.to_string_lossy().into_owned(),
+    ])
+}
+
+/// The pure decision core of [`orphaned_dead_output_holders_recoverable`]:
+/// output is dead only when BOTH fds name `/dev/pts/N` entries ABSENT from
+/// `live`. A live pts, a regular file, a pipe or a socket all mean the holder
+/// can still be observed somewhere, and one observable fd is enough to keep
+/// the kill from arming.
+fn pts_outputs_are_dead(targets: &[String; 2], live: &HashSet<String>) -> bool {
+    targets.iter().all(|target| {
+        let Some(rest) = target.strip_prefix("/dev/pts/") else {
+            return false;
+        };
+        !rest.is_empty()
+            && !rest.contains('/')
+            && rest
+                .chars()
+                .all(|character| character.is_ascii_digit())
+            && !live.contains(target)
+    })
+}
+
+/// Per-holder notes for the refusal trace: WHY the reap did not arm. The
+/// banner alone cost the owner a hand diagnosis per occurrence (the 2026-09-05
+/// plague); the refusal event now carries its own diagnosis — a live parent to
+/// return to, output someone can still read, or a process that could not be
+/// interrogated at all.
+#[cfg(target_os = "linux")]
+fn holder_unreapable_notes(processes: &[ExternalCodexResumeProcess]) -> Vec<serde_json::Value> {
+    let live = live_pts_devices();
+    processes
+        .iter()
+        .map(|process| {
+            let parent = if process.ppid == Some(1) {
+                "orphaned_to_init"
+            } else {
+                "live_parent"
+            };
+            let output = match holder_output_fd_targets(process.pid) {
+                Some(targets) if pts_outputs_are_dead(&targets, &live) => "dead_pts",
+                Some(_) => "reachable",
+                None => "unreadable",
+            };
+            json!({
+                "pid": process.pid,
+                "ppid": process.ppid,
+                "parent": parent,
+                "output": output,
+            })
+        })
+        .collect()
 }
 
 /// How long the banner may sit unchanged before it is re-rendered with the
@@ -2434,7 +2551,7 @@ fn wait_for_external_agent_resume_to_clear(
         if started.elapsed() >= EXTERNAL_ACTIVE_WAIT_DEADLINE {
             // ⛔ BUG B2 SELF-RECOVERY (owner-caught 2026-09-02, "sessions opened
             // in the ether"): a holder that is PROVABLY OURS
-            // (`StrandedYggtermOwned` — its environ marker names this session)
+            // (`StrandedYggtermOwned` — its environ marker names a yggterm row)
             // AND orphaned to init (ppid 1 — its terminal and owning daemon are
             // both gone) can never be observed by anyone again. Before this
             // branch the wait expired, the caller retried later, the retry
@@ -2446,7 +2563,18 @@ fn wait_for_external_agent_resume_to_clear(
             // 08-29 "reader's choice" rule is explicitly OVERRIDDEN here for
             // the stranded-orphan case only — an EXTERNAL holder, or a holder
             // still attached to any live parent, still expires without a kill.
-            if stranded_orphan_holders_recoverable(&processes) {
+            // 2026-09-05 widen (owner-ruled): an orphan of ANY tenancy whose
+            // stdout AND stderr point into vanished pts devices is equally
+            // unobservable — a pts exists only while its master lives — so the
+            // same override covers it (`orphaned_dead_output_holders_recoverable`).
+            let reap_reason = if stranded_orphan_holders_recoverable(&processes) {
+                Some("stranded_orphan")
+            } else if orphaned_dead_output_holders_recoverable(&processes) {
+                Some("orphaned_dead_output")
+            } else {
+                None
+            };
+            if let Some(reason) = reap_reason {
                 let pids = processes.iter().map(|process| process.pid).collect::<Vec<_>>();
                 append_trace_event(
                     home,
@@ -2456,6 +2584,7 @@ fn wait_for_external_agent_resume_to_clear(
                     json!({
                         "session_id": session_id,
                         "pids": pids,
+                        "reason": reason,
                         "waited_secs": started.elapsed().as_secs(),
                         "policy": "stranded_orphan_holders_block_no_one",
                     }),
@@ -11230,24 +11359,41 @@ impl YggtermServer {
                 external_agent_resume_processes_for_session(kind, session_id);
             // THE STRANDED-ORPHAN REAP, one level up (the B2 doctrine the
             // resume wrapper already lives by): a holder that is PROVABLY
-            // OURS (its environ marker names this session) AND orphaned to
+            // OURS (its environ marker names a yggterm row — 2026-09-05: ANY
+            // row, because newer CLIs name rows after their own runtime uuid,
+            // and demanding the marker's last segment be the session id
+            // misclassified their orphans External forever) AND orphaned to
             // init (ppid 1 — its terminal and owning daemon are both gone)
             // can never be observed by anyone again, and its transcript is
             // already in the session file, so ending it loses the
-            // conversation nothing. The wrapper reaps this corpse inside
-            // its wait (`external_active_wait_recovered_stranded_orphan`);
+            // conversation nothing. The owner-ruled widen
+            // ([`orphaned_dead_output_holders_recoverable`]) adds the legacy
+            // shape: an orphan of ANY tenancy whose stdout and stderr both
+            // point into vanished pts devices is equally unrecoverable —
+            // nobody can ever read it again. The wrapper reaps this corpse
+            // inside its wait (`external_active_wait_recovered_stranded_orphan`);
             // the ensure used to refuse outright, so a GUI row-open
             // against a handover-lost runtime (the [11.57] class) stayed
             // broken until a human ran the kill the wrapper would have
-            // run. Reap here under the SAME predicate, bounded: one
+            // run. Reap here under the SAME predicates, bounded: one
             // SIGTERM round, one short yield, one rescan — anything still
             // alive, and every EXTERNAL holder, still refuses exactly as
             // before. Never an unconditional kill, never a wait long
             // enough to hold the request loop.
             #[cfg(target_os = "linux")]
-            if !external_processes.is_empty()
-                && stranded_orphan_holders_recoverable(&external_processes)
-            {
+            let reap_reason = if !external_processes.is_empty() {
+                if stranded_orphan_holders_recoverable(&external_processes) {
+                    Some("stranded_orphan")
+                } else if orphaned_dead_output_holders_recoverable(&external_processes) {
+                    Some("orphaned_dead_output")
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            if let Some(reason) = reap_reason {
                 let pids = external_processes
                     .iter()
                     .map(|process| process.pid)
@@ -11261,6 +11407,7 @@ impl YggtermServer {
                         json!({
                             "session_id": session_id,
                             "pids": pids,
+                            "reason": reason,
                             "policy": "stranded_orphan_holders_block_no_one",
                         }),
                     );
@@ -11290,6 +11437,12 @@ impl YggtermServer {
                                         "stranded_yggterm_owned",
                                 })
                                 .collect::<Vec<_>>(),
+                            // ⭐ SELF-EXPLAINING REFUSAL (the tracing contract):
+                            // the next screenshot of this banner must carry its
+                            // own diagnosis — per holder, why the reap did not
+                            // arm (a live parent to return to, output someone
+                            // can still read, or an unreadable process).
+                            "why_not_reaped": holder_unreapable_notes(&external_processes),
                             "policy": "session_survival_before_yggterm_attach",
                         }),
                     );
@@ -16387,6 +16540,126 @@ mod restored_runtime_repair_tests {
         ]));
         // Nothing to recover from is not a recovery.
         assert!(!stranded_orphan_holders_recoverable(&[]));
+    }
+
+    /// ⛔ THE MARKER PROVES BIRTH, NOT THE SESSION'S NAME (2026-09-05, the
+    /// all-CLI orphan-refusal plague). The holder test demanded the marker's
+    /// last segment BE the agent session id — true only for CLIs whose row is
+    /// named after the session. An `opencode-runtime://<row-uuid>` holder
+    /// carrying `ses_…` in its argv classified External, the stranded-orphan
+    /// reap never armed, and every resume retry refused forever with a banner
+    /// telling a human to kill what yggterm itself had launched (measured
+    /// live on dev: pid orphaned to init, environ stamped
+    /// `LC_YGGTERM_SESSION_ID=opencode-runtime://<uuid>`, refused for hours).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_row_uuid_marker_proves_the_holder_is_yggterm_launched() {
+        use super::AgentResumeHolderKind;
+        let session_id = "ses_fa81cc6f5ffeW0DjEXb8idKoWo";
+        let args = vec![
+            "opencode2".to_string(),
+            "--auto".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+        ];
+        // The exact live shape: a marker naming the ROW (a runtime uuid, not
+        // the session id) must read as ours.
+        assert_eq!(
+            super::agent_resume_process_holder_for_session(
+                SessionKind::OpenCode,
+                &args,
+                &[],
+                Some("opencode-runtime://3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011"),
+                session_id,
+            ),
+            Some(AgentResumeHolderKind::StrandedYggtermOwned)
+        );
+        // A marker naming the session the old way stays ours too.
+        assert_eq!(
+            super::agent_resume_process_holder_for_session(
+                SessionKind::OpenCode,
+                &args,
+                &[],
+                Some(&format!("opencode-runtime://{session_id}")),
+                session_id,
+            ),
+            Some(AgentResumeHolderKind::StrandedYggtermOwned)
+        );
+        // No marker and no yggterm ancestor is still somebody else's work.
+        assert_eq!(
+            super::agent_resume_process_holder_for_session(
+                SessionKind::OpenCode,
+                &args,
+                &[],
+                None,
+                session_id,
+            ),
+            Some(AgentResumeHolderKind::External)
+        );
+        // An unreadable environ ("cannot say") still never widens the kind.
+        assert_eq!(
+            super::agent_resume_process_holder_for_session(
+                SessionKind::OpenCode,
+                &args,
+                &[vec!["bash".to_string()]],
+                None,
+                session_id,
+            ),
+            Some(AgentResumeHolderKind::External)
+        );
+    }
+
+    /// ⛔ THE DEAD-OUTPUT WIDEN (owner-ruled 2026-09-05): output is dead only
+    /// when BOTH fds name `/dev/pts/N` entries that no longer exist. A live
+    /// pts, a file, a pipe, a socket, a relative or malformed target, and an
+    /// unreadable fd all keep the holder protected — "cannot say dead" must
+    /// never widen the kill.
+    #[test]
+    fn only_vanished_pts_devices_on_both_fds_count_as_dead_output() {
+        let live: std::collections::HashSet<String> =
+            ["/dev/pts/3".to_string()].into_iter().collect();
+        let dead = |a: &str, b: &str| {
+            super::pts_outputs_are_dead(&[a.to_string(), b.to_string()], &live)
+        };
+        // The corpse shape: both fds into a pts that is gone.
+        assert!(dead("/dev/pts/29", "/dev/pts/29"));
+        // One live pts anywhere means someone can still read it.
+        assert!(!dead("/dev/pts/29", "/dev/pts/3"));
+        assert!(!dead("/dev/pts/3", "/dev/pts/29"));
+        // Files, pipes, sockets, ttys elsewhere: reachable, protected.
+        assert!(!dead("/dev/pts/29", "/home/user/log.txt"));
+        assert!(!dead("pipe:[12345]", "/dev/pts/29"));
+        assert!(!dead("socket:[6789]", "socket:[6789]"));
+        assert!(!dead("/dev/tty", "/dev/pts/29"));
+        // Malformed or traversal-shaped "pts" names never count as dead.
+        assert!(!dead("/dev/pts/", "/dev/pts/"));
+        assert!(!dead("/dev/pts/../../etc", "/dev/pts/../../etc"));
+        assert!(!dead("/dev/pts/1a", "/dev/pts/1a"));
+        // Unknown (unreadable fd) is handled upstream as `None` → protected;
+        // the composite gate keeps a live-parent holder protected regardless
+        // of any fd state.
+        #[cfg(target_os = "linux")]
+        {
+            use super::{AgentResumeHolderKind, ExternalCodexResumeProcess};
+            let holder = |pid: u32, ppid: Option<u32>| ExternalCodexResumeProcess {
+                pid,
+                argv0: "opencode2".to_string(),
+                holder: AgentResumeHolderKind::External,
+                ppid,
+            };
+            // A live parent short-circuits before any fd is read.
+            assert!(!super::orphaned_dead_output_holders_recoverable(&[holder(
+                u32::MAX - 1,
+                Some(900)
+            )]));
+            // An orphan whose fds cannot be read: "cannot say" stays closed.
+            assert!(!super::orphaned_dead_output_holders_recoverable(&[holder(
+                u32::MAX - 1,
+                Some(1)
+            )]));
+            // Nothing to recover from is not a recovery.
+            assert!(!super::orphaned_dead_output_holders_recoverable(&[]));
+        }
     }
 
     /// ⛔ BUG B1 (owner-caught 2026-09-02, "sessions opened in the ether"):
@@ -34668,6 +34941,10 @@ mod tests {
         assert!(
             body.contains("stranded_orphan_holders_recoverable(&external_processes)"),
             "the ensure must consult the stranded-orphan predicate before refusing"
+        );
+        assert!(
+            body.contains("orphaned_dead_output_holders_recoverable(&external_processes)"),
+            "the ensure must also consult the dead-output widen (2026-09-05) before refusing"
         );
         let reap = body
             .find("external_stranded_orphan_reaped_by_ensure")
