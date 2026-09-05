@@ -27114,7 +27114,7 @@ the regression alarm.
 
 ## ⛔ [11.64] AN AGENT RUNTIME CAN NEVER MIGRATE — TRANSCRIPT ACTIVITY ANSWERS UNKNOWN, SO EVERY PRESERVED OWNER WITH AN AGENT ROW LINGERS FOREVER
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Found 2026-09-05 ~00:2x while falsifying [11.56]'s fix on dev: with the
 drain's adopter blindness fixed, the release path still refused the one
@@ -27147,4 +27147,21 @@ daemon, force a same-version handover; with the signal wired, the
 predecessor releases the row (`progressive_migration_session_released`), the
 successor re-resumes it, and the predecessor reaches
 `progressive_migration_owner_empty_retire` and exits.
+
+**Fix (`lane/cli/transcript-liveness`):** `agent_session_recency_ms` in the
+core reads the session's OWN record per kind — codex the newest rollout
+file's mtime under `.codex/sessions/YYYY/MM/DD/`, Claude Code the session
+jsonl under `.claude/projects/*/<id>.jsonl`, OpenCode the later of
+`time_updated`/`time_viewed` in its own store row (type-agnostic column
+read, the F3 lesson; archived answers None) — and the agent arm of
+`session_transcript_activity` now answers `TranscriptActivity::Idle(age)`
+from it instead of a blanket `Unknown`. The existing predicate already knew
+what to do: Fresh within the threshold blocks (the subagent clause — a
+stalled main loop still grows the transcript while its delegates work),
+Stale past the threshold releases with the other four signals, and a kind
+without a reader / an unreadable store / an empty id still answers
+`Unknown` → blocks. "Cannot say" never widens the release. Locked by
+`agent_session_recency_reads_each_kinds_own_records` (core) and
+`the_transcript_signal_gates_migration_fresh_blocks_stale_releases_unknown_blocks`
++ `the_agent_transcript_arm_resolves_the_positive_recency_signal` (daemon).
 
