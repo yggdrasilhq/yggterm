@@ -15682,6 +15682,47 @@ fn live_newer_daemon_socket(
     })
 }
 
+/// Is this daemon's canonical socket now answered by a DIFFERENT live daemon?
+///
+/// In a same-version preserving handoff the successor binds exactly the
+/// canonical name the predecessor yielded, so "the default endpoint answers
+/// and the pid is not ours" is the same-version successor's fingerprint —
+/// there is no version arithmetic to decide it (same version), and the socket
+/// FILENAME filter in [`live_newer_daemon_socket`] skips it by construction
+/// (`socket_version <= my_version`). A bequest alias pointing the name at a
+/// newer daemon answers the same way and is just as much an adopter. Our own
+/// still-bound socket answers with our own pid, which returns `None` — the
+/// cross-version arm decides then. One local status probe, no roster sweep.
+fn live_same_version_successor(home_dir: &Path) -> Option<u32> {
+    let status = status(&default_endpoint(home_dir)).ok()?;
+    (status.server_pid != std::process::id()).then_some(status.server_pid)
+}
+
+/// Throttled no-adopter announcement for the migration drain — once a minute,
+/// so a stalled drain is a NAMED state (`progressive_migration_no_adopter`)
+/// instead of a silent `continue` that reads as healthy. The §9 observability
+/// contract: a handover fault must arrive with its own diagnosis.
+fn announce_migration_no_adopter(home_dir: &Path, holding: usize) {
+    static LAST_ANNOUNCED_MS: AtomicU64 = AtomicU64::new(0);
+    let now = current_millis_u64();
+    let last = LAST_ANNOUNCED_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 60_000 {
+        return;
+    }
+    LAST_ANNOUNCED_MS.store(now, Ordering::Relaxed);
+    append_trace_event(
+        home_dir,
+        "daemon",
+        "lifecycle",
+        "progressive_migration_no_adopter",
+        serde_json::json!({
+            "holding_sessions": holding,
+            "note": "no same-version successor on the canonical socket and no newer-version peer; the drain is stalled and the PTYs stay here",
+            "current_pid": std::process::id(),
+        }),
+    );
+}
+
 /// ⭐ **A RETIRING DAEMON ALIASES ITS OWN VERSION TO ITS SUCCESSOR, as part of
 /// retiring.** Called immediately before the exit that releases this daemon's
 /// socket.
@@ -21511,6 +21552,9 @@ fn spawn_progressive_session_migration(
     std::thread::spawn(move || {
         // Paced cadence: one release per tick, oldest-idle first.
         const POLL_INTERVAL_MS: u64 = 5_000;
+        // The adopter identity is traced once per drain (§9 observability):
+        // the first tick an adopter answers, name WHICH arm found it.
+        let mut adopter_seen_traced = false;
         // Releases attempted per runtime key, held on the DAEMON so the
         // allowance survives this thread — see MIGRATION_RELEASE_ATTEMPTS.
         loop {
@@ -21560,15 +21604,49 @@ fn spawn_progressive_session_migration(
             // across every idle agent session, and the same key released seven
             // times in twenty minutes without ever converging.
             //
-            // A successor is a daemon running a STRICTLY NEWER version — that is
-            // the whole point of the handoff (converge ownership onto the newest
-            // build). An older or same-version peer means there is nobody to
-            // converge onto, and lingering harmlessly is the correct outcome.
-            // ⛔ On a 5 s loop, so this MUST be the cheap probe: pulling every
-            // peer's full session roster here is half of the O(N²·M) that cost
-            // 8.12 cores on `dev`. See [`live_newer_daemon_version`].
-            if live_newer_daemon_version(&home_dir, &endpoint).is_none() {
+            // ⛔ THE ADOPTER GATE — never release a session without a live
+            // adopter. This gate accepted ONLY a strictly-newer VERSION peer,
+            // and that was the [11.56] keystone: the fleet's dominant handoff
+            // is a SAME-VERSION NEWER-BUILD swap (every ygg-ci lane merge that
+            // is not a release roll), where the successor takes over THIS
+            // daemon's own canonical socket name — invisible to a filename
+            // version filter, which skips `socket_version <= my_version`. The
+            // drain then `continue`d forever: the predecessor kept every PTY
+            // until process death (three generations measured coexisting on
+            // dev, 2026-09-05), the successor stayed owned:0, and a GUI that
+            // mounted the canonical socket sat at zero rows for ~15 minutes.
+            // The canonical endpoint is therefore probed FIRST: a live answer
+            // from a pid that is not ours is an adopter — the same-version
+            // successor the handshake made take our name, or a bequest alias
+            // pointing at a newer one. The newer-version probe remains the
+            // cross-version arm, and both stay CHEAP: 0-2 local status calls
+            // on a 5 s loop, never a peer roster sweep (the O(N²·M) lesson,
+            // 8.12 cores on dev). Spec §10 — the convergence unit is the
+            // BUILD; docs/daemon-handoff.md §the orphan-zero contract, law 5.
+            let adopter = live_same_version_successor(&home_dir)
+                .map(|pid| format!("same-version-successor-pid:{pid}"))
+                .or_else(|| {
+                    live_newer_daemon_version(&home_dir, &endpoint)
+                        .map(|version| format!("newer-version:{version}"))
+                });
+            let Some(adopter) = adopter else {
+                // §9 observability law: a drain that cannot find its adopter
+                // says so by name, throttled — silence reads as healthy.
+                announce_migration_no_adopter(&home_dir, owned.len());
                 continue;
+            };
+            if !adopter_seen_traced {
+                adopter_seen_traced = true;
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "progressive_migration_adopter_seen",
+                    serde_json::json!({
+                        "adopter": adopter,
+                        "current_pid": std::process::id(),
+                    }),
+                );
             }
             // Snapshot the ledger and release its lock BEFORE taking the daemon
             // runtime lock: two locks held in one order here and the other order
@@ -27506,6 +27584,38 @@ mod tests {
             .split("\n    fn ")
             .next()
             .expect("the end of the function")
+    }
+
+    /// ⛔ THE ADOPTER GATE MUST KNOW ITS SAME-VERSION SUCCESSOR ([11.56]'s
+    /// keystone). The fleet's dominant handoff is a same-version newer-BUILD
+    /// swap where the successor binds the predecessor's own canonical socket
+    /// name — invisible to `live_newer_daemon_socket`'s
+    /// `socket_version <= my_version` filter. The drain must therefore probe
+    /// the canonical endpoint FIRST (a live answer from a foreign pid IS the
+    /// adopter) and keep the newer-version probe as the cross-version arm; a
+    /// stalled drain must announce by name instead of `continue`ing silently.
+    #[test]
+    fn the_migration_drain_accepts_a_same_version_successor_not_only_a_newer_one() {
+        let source = include_str!("daemon.rs");
+        let body = daemon_fn_body(source, "fn spawn_progressive_session_migration(");
+        let same_version = body
+            .find("live_same_version_successor(&home_dir)")
+            .expect("the drain must consult the same-version successor arm");
+        let newer = body
+            .find("live_newer_daemon_version(&home_dir, &endpoint)")
+            .expect("the cross-version arm must remain");
+        assert!(
+            same_version < newer,
+            "the same-version arm must be probed before the newer-version fallback"
+        );
+        assert!(
+            body.contains("announce_migration_no_adopter("),
+            "a stalled drain must announce by name (the §9 observability contract)"
+        );
+        assert!(
+            body.contains("progressive_migration_adopter_seen"),
+            "the adopter's identity must be traced when first seen"
+        );
     }
 
     /// ⛔⛔ ONE STUCK KEY MUST NOT ABANDON THE OTHER TEN.
