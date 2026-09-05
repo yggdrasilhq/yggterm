@@ -27165,6 +27165,28 @@ without a reader / an unreadable store / an empty id still answers
 `the_transcript_signal_gates_migration_fresh_blocks_stale_releases_unknown_blocks`
 + `the_agent_transcript_arm_resolves_the_positive_recency_signal` (daemon).
 
+**Also landed: the drain now NAMES the gate that holds each row**
+(`first_blocking_migration_gate` — one SSOT the predicate reads as a bool;
+`progressive_migration_candidates_blocked` announces every held row's
+`blocking_gate` + idle_ms every 30s), and the store opener waits
+(`busy_timeout` 2s — a WAL store mid-append answered SQLITE_BUSY instantly,
+which the probe read as "cannot say"; the instrument caught this live as a
+`transcript_unknown` on a row whose store read fine by hand).
+
+**LIVE PROOF OWED — the exact recipe and the one trap:** the drain's
+release runs only on the NATURAL deploy rotation (disk-replaced
+self-retire → preserving handoff → drain). `update-daemons --force` on a
+QUIET host takes the COLD-WITH-PERSIST arm instead (killing PTYs), so a
+force-driven falsifier never exercises the release. Recipe: canonical owns
+an idle agent row (resume it there), a new deploy lands, the daemon
+self-retires into the preserving handoff, and the trace must carry
+`progressive_migration_session_released {kind: …}` for the stale row, the
+successor's re-resume, and `progressive_migration_owner_empty_retire` —
+the predecessor exiting. The `progressive_migration_candidates_blocked`
+announcements name any gate that would hold the row (transcript_unknown /
+transcript_fresh / foreground_command / …) — a stalled falsifier is now
+self-diagnosing.
+
 **Second gate found while falsifying (same lane): the foreground signal is
 UNINFORMATIVE for agent rows by construction.** The wrapper `bash -c` runs
 the TUI in its own process group, so the tty's foreground pgid differs from
