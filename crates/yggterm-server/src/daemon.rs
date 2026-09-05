@@ -23281,6 +23281,15 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             "endpoint": format!("{endpoint:?}"),
         }),
     );
+    // THE SAME-VERSION HYSTERESIS IS SEEDED AT BOOT — the static's doc
+    // promises it, and measured 2026-09-05 (GUI host) it was NOT: the clock
+    // only started at the FIRST `binary_replaced` poll, so an aged daemon's
+    // first same-version deploy opened a brand-new 30-minute staleness window
+    // (one deploy, deferred 21:27:39→21:58 on a daemon born 13:33) instead of
+    // rotating on the next poll. Birth-seeding means a long-lived daemon's
+    // window is already spent: its first eligible deploy lands on the next
+    // poll, which is what the doc's deploy-storm law intends.
+    SAME_VERSION_HANDOFF_LAST_MS.store(current_millis_u64(), Ordering::Relaxed);
     // ⛔ Win the server-socket bind lock BEFORE binding the pty-handoff
     // listener. The listener bind unlinks the socket path unconditionally, so a
     // starter that later loses the lock used to destroy the WINNING daemon's
