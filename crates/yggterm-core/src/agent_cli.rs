@@ -4899,8 +4899,22 @@ def read_text(path):
 found = {}
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'fish'}
 OWN = {'yggterm', 'yggterm-headless', 'yggterm-server'}
+# ⛔ THE PROBE IS ITS OWN FALSE POSITIVE. The ids ride here as ARGV, so the
+# ssh hop's bash and this very python process carry every id in their
+# command lines — the first live run read every corpse on the host as
+# ALIVE because it found the probe looking at it. Skip the probe's whole
+# ancestor chain: a real holder is never an ancestor of the probe.
+skip = set()
+walker = os.getpid()
+while walker and walker > 1 and walker not in skip:
+    skip.add(walker)
+    try:
+        stat = read_text(f'/proc/{walker}/stat')
+        walker = int(stat.rsplit(')', 1)[1].split()[1])
+    except Exception:
+        break
 for pid in os.listdir('/proc'):
-    if not pid.isdigit():
+    if not pid.isdigit() or int(pid) in skip:
         continue
     raw = read_text(f'/proc/{pid}/cmdline')
     if raw is None:
