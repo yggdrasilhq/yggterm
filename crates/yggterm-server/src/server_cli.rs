@@ -1019,6 +1019,34 @@ mod screen_verb_tests {
     ///
     /// Compiling proves a handler exists. Nothing but this proves it can be
     /// CALLED.
+    /// ⛔ THE DESPAWN VERB MUST BE REACHABLE FROM BOTH BINARIES — the same
+    /// law `the_screen_verb_is_dispatched_by_both_binaries` guards, for the
+    /// ghost sweep ([11.74]): a verb only `yggterm-headless` can reach is
+    /// invisible on the remote hop, which runs `yggterm-headless` through a
+    /// LOGIN shell whose PATH the fleet's non-login ssh prunes. Both
+    /// binaries carry the dispatch so the sweep works whichever the
+    /// operator (or the ssh hop) reaches first.
+    #[test]
+    fn the_despawn_verb_is_dispatched_by_both_binaries() {
+        for (binary, source) in [
+            ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
+            (
+                "yggterm-headless",
+                include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains(r#"args[2] == "despawn""#),
+                "`server rows despawn` is not dispatched by {binary} — the ghost \
+                 sweep exists but nothing can reach it",
+            );
+            assert!(
+                source.contains("run_rows_despawn("),
+                "{binary} matches the despawn verb without calling its handler",
+            );
+        }
+    }
+
     #[test]
     fn the_screen_verb_is_dispatched_by_both_binaries() {
         for (binary, source) in [

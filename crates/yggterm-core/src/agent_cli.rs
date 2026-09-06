@@ -4873,6 +4873,43 @@ for sid in ids:
 conn.close()
 "#;
 
+/// The process-truth holder probe ([11.74]): for each row id, is there ANY
+/// process on this host still carrying it? The witness is deliberately
+/// over-broad in what it reads and narrow in what it concludes — a row's id
+/// survives in exactly two places a live holder touches: its own command
+/// line (the `resume-<kind> <uuid>` wrapper yggterm composes, or the CLI's
+/// `--session ses_…`) and the environment yggterm stamps at exec
+/// (`LC_YGGTERM_SESSION_ID=…`), which survives reparenting and daemon
+/// death. Neither present ⇒ nothing on this host can serve the row ⇒
+/// `gone`. This verdict is INSTRUMENT-ONLY: it never reaps, it answers the
+/// sweep so a human (or the despawn verb) decides.
+pub const ROW_HOLDER_PROBE_SCRIPT: &str = r#"
+import json, os, sys
+ids = [v for v in sys.argv[1:] if v.strip()]
+if not ids:
+    sys.exit(0)
+
+def read_text(path):
+    try:
+        with open(path, 'rb') as handle:
+            return handle.read().decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+
+found = {}
+for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+        continue
+    blob = (read_text(f'/proc/{pid}/cmdline') or '') + '\x00' + (read_text(f'/proc/{pid}/environ') or '')
+    if not blob.strip('\x00'):
+        continue
+    for id_ in ids:
+        if id_ not in found and id_ in blob:
+            found[id_] = pid
+for id_ in ids:
+    print(json.dumps({'session_id': id_, 'holder': 'alive' if id_ in found else 'gone'}))
+"#;
+
 const OPENCODE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: OPENCODE_REMOTE_TITLE_SCRIPT,
     locators: RemoteStoreLocators::HomeRelative(".local/share/opencode/opencode.db"),

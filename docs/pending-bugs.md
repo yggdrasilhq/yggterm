@@ -27520,6 +27520,25 @@ live — the recency machinery from [11.64] is the classifier. Auto-despawn
 is NOT the shape: a row whose CLI is momentarily unreachable must not
 vanish; the verb + the verdict make the owner the finisher.
 
+**Fix (same night, `lane/cli/ghost-despawn-rebind`): the verdict and the
+verb.** `server rows live` now answers a `holder` verdict per agent row —
+`alive` / `gone`, from a process scan of the row's host (the id in any
+process's cmdline or exec-stamped environment; shell rows are not probed —
+the ghost family is agent rows). One measured trap is baked in: yggterm's
+OWN wrapper layers are skipped, because a failed restore leaves its
+`resume-<kind> <uuid>` wrapper sitting at the error prompt carrying the id
+— counting it read the corpse row as alive. `server rows despawn <key>…`
+then closes the row on the host its key names (remote keys hop via ssh to
+`rows despawn-local` on the owner) and records the close in
+`live_row_tombstones` BEFORE the close, so the restore plane's import veto
+stops the next rotation from resurrecting it — the resurrection engine the
+census measured is exactly what the veto sits in front of. The
+both-binaries dispatch law has its guard test. STILL OPEN: the
+missing-session row class (the "saved Codex session … is no longer
+available" error frame) demoting itself out of the live set — until then
+the sweep is the finisher: `rows live` names the ghosts, `rows despawn`
+removes them.
+
 ## ⛔ [11.74] UUID-KEYED CODEX ROWS HAD NO WORKING RESUME IDENTITY — A RE-SPAWN COMPOSED `codex resume <ROW UUID>` THAT CODEX REFUSES, STRANDING THE ROW (found diagnosing a live -32600 dead-end, 2026-09-06)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

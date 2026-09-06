@@ -26700,6 +26700,94 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
             .map(|title| title.trim().to_string())
             .filter(|title| !title.is_empty())
     };
+    // [11.74] The holder verdict: is any process on the row's host STILL
+    // carrying the row id (its command line, or the environment yggterm
+    // stamped at exec)? A live row whose host answers `gone` is a ghost —
+    // the exact population the sidebar fills with after every rotation, and
+    // the input the despawn verb consumes. Shell rows are not probed: the
+    // ghost family is agent rows, and a shell row's holder question is
+    // answered by its PTY, not by an id hunt.
+    let mut holder_batches: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut local_holder_ids: Vec<String> = Vec::new();
+    for (_endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
+        for row in &runtime.live_terminal_sessions {
+            if row.kind == SessionKind::Shell {
+                continue;
+            }
+            if row.ssh_target.trim().is_empty() {
+                if !local_holder_ids.contains(&row.id) {
+                    local_holder_ids.push(row.id.clone());
+                }
+            } else if !holder_batches
+                .entry(row.ssh_target.clone())
+                .or_default()
+                .contains(&row.id)
+            {
+                holder_batches
+                    .entry(row.ssh_target.clone())
+                    .or_default()
+                    .push(row.id.clone());
+            }
+        }
+    }
+    let mut holder_answers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut run_holder_probe = |script_host: Option<&str>, ids: &[String]| {
+        if ids.is_empty() {
+            return;
+        }
+        let lines: Vec<String> = match script_host {
+            Some(ssh_target) => {
+                match crate::run_remote_python_lines(
+                    ssh_target,
+                    None,
+                    yggterm_core::agent_cli::ROW_HOLDER_PROBE_SCRIPT,
+                    ids,
+                ) {
+                    Ok(lines) => lines,
+                    Err(_) => return,
+                }
+            }
+            None => {
+                use std::io::Write as _;
+                let mut child = match std::process::Command::new("python3")
+                    .arg("-")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(_) => return,
+                };
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(yggterm_core::agent_cli::ROW_HOLDER_PROBE_SCRIPT.as_bytes());
+                }
+                match child.wait_with_output() {
+                    Ok(output) => String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                    Err(_) => return,
+                }
+            }
+        };
+        for line in &lines {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(id) = value.get("session_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(holder) = value.get("holder").and_then(|v| v.as_str()) {
+                holder_answers.insert(id.to_string(), holder.to_string());
+            }
+        }
+    };
+    for (ssh_target, ids) in &holder_batches {
+        run_holder_probe(Some(ssh_target), ids);
+    }
+    run_holder_probe(None, &local_holder_ids);
     for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
         for (position, row) in runtime.live_terminal_sessions.iter().enumerate() {
             let cli_store_title = cli_store_title_for(row);
@@ -26736,6 +26824,12 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
                 "ssot_match": !is_mismatch,
                 "mismatch": is_mismatch,
                 "owner_set": owner_set,
+                "holder": if row.kind == SessionKind::Shell {
+                    serde_json::Value::Null
+                } else {
+                    holder_answers.get(&row.id).cloned().map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null)
+                },
                 "cwd": row.cwd,
                 "ssh_target": row.ssh_target,
                 "keep_alive": row.keep_alive,
@@ -26749,6 +26843,134 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
         "rows": rows,
     }))?)?;
     Ok(())
+}
+
+/// `server rows despawn <key>…` — the ghost sweep ([11.74]): close a row on
+/// the host that actually owns it AND veto its re-import, so the next
+/// rotation's restore cannot resurrect it. Plain close is not enough by
+/// construction: a remote row closed on the GUI detaches only the local
+/// viewport, the owning daemon still holds and advertises it, and the
+/// stored set re-restores it on the next deploy — the exact engine that
+/// filled the sidebar with birth-named corpses.
+///
+/// The key's own shape names the owning host (`remote-<kind>://<machine>/<id>`
+/// ⇒ that machine; anything else ⇒ here), so one command sweeps a mixed
+/// selection. The remote hop runs `rows despawn-local` over a LOGIN shell —
+/// non-login ssh on the fleet prunes `~/.local/bin` from PATH, which ate
+/// verbs before this comment existed.
+pub fn run_rows_despawn(keys: &[String]) -> anyhow::Result<()> {
+    let mut local_keys: Vec<String> = Vec::new();
+    let mut remote_keys: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for key in keys {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        match parse_remote_scanned_session_path(key) {
+            Some((machine, _id)) => {
+                remote_keys
+                    .entry(machine.to_string())
+                    .or_default()
+                    .push(key.to_string());
+            }
+            None => local_keys.push(key.to_string()),
+        }
+    }
+    if local_keys.is_empty() && remote_keys.is_empty() {
+        anyhow::bail!("no row keys given; usage: server rows despawn <key>…");
+    }
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for key in &local_keys {
+        results.push(despawn_local_row(key));
+    }
+    for (machine, keys) in &remote_keys {
+        for key in keys {
+            let remote = format!(
+                "yggterm-headless server rows despawn-local {}",
+                shell_single_quote(key)
+            );
+            let output = std::process::Command::new("ssh")
+                .arg(machine)
+                .arg("bash")
+                .arg("-lc")
+                .arg(&remote)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    results.push(serde_json::json!({
+                        "key": key,
+                        "machine": machine,
+                        "despawned": true,
+                        "via": "ssh",
+                    }));
+                }
+                Ok(output) => {
+                    results.push(serde_json::json!({
+                        "key": key,
+                        "machine": machine,
+                        "despawned": false,
+                        "error": String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                    }));
+                }
+                Err(error) => {
+                    results.push(serde_json::json!({
+                        "key": key,
+                        "machine": machine,
+                        "despawned": false,
+                        "error": error.to_string(),
+                    }));
+                }
+            }
+        }
+    }
+    let despawned = results
+        .iter()
+        .filter(|r| r.get("despawned").and_then(|v| v.as_bool()) == Some(true))
+        .count();
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "despawned": despawned,
+        "attempted": results.len(),
+        "results": results,
+    }))?)?;
+    Ok(())
+}
+
+/// One host's half of [`run_rows_despawn`]: veto the row's re-import FIRST
+/// (a racing restore between close and tombstone would win otherwise), then
+/// ask this host's daemon to close whatever it holds — answering
+/// "no live session" is SUCCESS here, because the tombstone is the point.
+pub fn run_rows_despawn_local(key: &str) -> anyhow::Result<()> {
+    let outcome = despawn_local_row(key);
+    write_stdout_payload(&serde_json::to_string_pretty(&outcome)?)?;
+    Ok(())
+}
+
+fn despawn_local_row(key: &str) -> serde_json::Value {
+    let home = match resolve_yggterm_home() {
+        Ok(home) => home,
+        Err(error) => {
+            return serde_json::json!({ "key": key, "despawned": false, "error": error.to_string() })
+        }
+    };
+    let now = crate::live_row_tombstones::now_secs();
+    let mut tombstones = crate::live_row_tombstones::LiveRowTombstones::load(&home, now);
+    let veto_recorded = tombstones.record_close(&home, key, now).unwrap_or(false);
+    let endpoint = server_cli::cli_server_endpoint(&home);
+    match crate::remove_session(&endpoint, key) {
+        Ok((_snapshot, message)) => serde_json::json!({
+            "key": key,
+            "despawned": true,
+            "tombstone_recorded": veto_recorded,
+            "close_message": message,
+        }),
+        Err(error) => serde_json::json!({
+            "key": key,
+            "despawned": veto_recorded,
+            "tombstone_recorded": veto_recorded,
+            "close_error": error.to_string(),
+        }),
+    }
 }
 
 /// `server rows show <key|id|title-substring>` — ONE row's metadata, the
