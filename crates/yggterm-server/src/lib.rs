@@ -26423,14 +26423,93 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
     let mut rows = Vec::new();
     let mut mismatches = 0usize;
     let mut store_named = 0usize;
+    // ⛔ A REMOTE ROW'S STORE LIVES ON THE FAR SIDE OF THE SSH HOP. The local
+    // reader would answer from THIS host's stores (or its generated-title
+    // cache — yesterday's titles posing as the CLI's word), which is exactly
+    // the false-mismatch storm the first live run produced. Remote rows are
+    // answered through their descriptor's remote probe, one ssh per
+    // (host, CLI), the same shape the title chore uses.
+    let mut remote_answers: std::collections::HashMap<(String, SessionKind), std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let mut remote_missing: std::collections::HashSet<(String, SessionKind)> =
+        std::collections::HashSet::new();
+    {
+        let mut remote_batches: std::collections::HashMap<(String, SessionKind), Vec<String>> =
+            std::collections::HashMap::new();
+        for (_endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
+            for row in &runtime.live_terminal_sessions {
+                if row.ssh_target.trim().is_empty() {
+                    continue;
+                }
+                remote_batches
+                    .entry((row.ssh_target.clone(), row.kind))
+                    .or_default()
+                    .push(row.id.clone());
+            }
+        }
+        for ((ssh_target, kind), ids) in remote_batches {
+            let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(kind) else {
+                continue;
+            };
+            let Some(probe) = descriptor.remote_live_store_title else {
+                continue;
+            };
+            let mut args = descriptor.remote_store_title_locators();
+            args.push("--".to_string());
+            args.extend(ids.iter().cloned());
+            let Ok(lines) =
+                run_remote_python_lines(&ssh_target, None, probe.script, &args)
+            else {
+                remote_missing.insert((ssh_target, kind));
+                continue;
+            };
+            let answers = remote_answers.entry((ssh_target, kind)).or_default();
+            for line in &lines {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let Some(id) = value.get("session_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let candidates: Vec<String> = value
+                    .get("candidates")
+                    .and_then(|v| v.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(title) = (probe.choose)(&candidates) {
+                    let title = title.trim().to_string();
+                    if !title.is_empty() {
+                        answers.insert(id.to_string(), title);
+                    }
+                }
+            }
+        }
+    }
+    let cli_store_title_for = |row: &crate::PersistedLiveSession| -> Option<String> {
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(row.kind)?;
+        if !row.ssh_target.trim().is_empty() {
+            let key = (row.ssh_target.clone(), row.kind);
+            if remote_missing.contains(&key) {
+                return None;
+            }
+            return remote_answers
+                .get(&key)
+                .and_then(|answers| answers.get(&row.id).cloned());
+        }
+        descriptor
+            .read_live_store_title?
+            (&user_home, &row.id)
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+    };
     for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
         for (position, row) in runtime.live_terminal_sessions.iter().enumerate() {
-            let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(row.kind);
-            let cli_store_title = descriptor
-                .and_then(|d| d.read_live_store_title)
-                .and_then(|read| read(&user_home, &row.id))
-                .map(|title| title.trim().to_string())
-                .filter(|title| !title.is_empty());
+            let cli_store_title = cli_store_title_for(row);
             let row_title = row.title.trim().to_string();
             // The SSOT comparison: the row against the CLI's own store. An
             // owner-set title never counts as a mismatch — a human rename is
