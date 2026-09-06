@@ -2889,6 +2889,56 @@ pub(crate) fn agent_session_identity_from_open_paths<'a>(
     }
 }
 
+/// The session id named in one process's argv tokens, for kinds whose
+/// identity rides their own command line
+/// ([`yggterm_core::agent_cli::AgentCliDescriptor::live_session_argv_flag`]).
+///
+/// Pure so the SELECTION RULE can be tested without a live process — the rule
+/// is the part that has to be right, and the `/proc` read around it is not
+/// where the mistakes live.
+///
+/// ⛔ The value must look like a session id, not another flag: a bare flag
+/// with no value, or one immediately followed by another flag, names nothing.
+/// Two DIFFERENT ids in one cmdline are ambiguous, and an ambiguous bind is
+/// strictly worse than none — the same law as the open-paths marker walk.
+pub(crate) fn agent_session_identity_from_cmdline_tokens<'a, I>(
+    flag: &str,
+    tokens: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let tokens: Vec<&str> = tokens.into_iter().collect();
+    let mut ids: Vec<&str> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == flag {
+            if let Some(value) = tokens.get(index + 1) {
+                if !value.starts_with('-') && !value.trim().is_empty() {
+                    ids.push(value);
+                }
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    match ids.len() {
+        1 => ids.into_iter().next().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The session id a live process of this CLI names in its own argv.
+#[cfg(target_os = "linux")]
+pub(crate) fn agent_session_identity_from_process_argv(
+    flag: &str,
+    pid: u32,
+) -> Option<String> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let cmdline = String::from_utf8_lossy(&bytes);
+    let tokens = cmdline.split('\0').filter(|token| !token.is_empty());
+    agent_session_identity_from_cmdline_tokens(flag, tokens)
+}
+
 /// The session id a live process of this CLI is running, from the marker files
 /// it holds open.
 #[cfg(target_os = "linux")]
@@ -2918,7 +2968,12 @@ pub(crate) fn agent_runtime_session_id_from_root_pid(
     root_pid: u32,
 ) -> Option<String> {
     let descriptor = agent_cli_descriptor(kind)?;
-    descriptor.live_session_marker?;
+    if descriptor.live_session_marker.is_none()
+        && descriptor.live_session_argv_flag.is_none()
+    {
+        return None;
+    }
+    let argv_flag = descriptor.live_session_argv_flag;
     let home = dirs::home_dir()?;
     let mut queue = VecDeque::from([root_pid]);
     let mut seen = HashSet::new();
@@ -2928,6 +2983,11 @@ pub(crate) fn agent_runtime_session_id_from_root_pid(
         }
         if let Some(id) = agent_session_identity_from_process_fds(descriptor, &home, pid) {
             return Some(id);
+        }
+        if let Some(flag) = argv_flag {
+            if let Some(id) = agent_session_identity_from_process_argv(flag, pid) {
+                return Some(id);
+            }
         }
         queue.extend(linux_proc_child_pids(pid));
     }
@@ -7758,7 +7818,11 @@ impl YggtermServer {
                     return None;
                 }
                 let descriptor = agent_cli_descriptor(session.kind)?;
-                descriptor.live_session_marker?;
+                if descriptor.live_session_marker.is_none()
+                    && descriptor.live_session_argv_flag.is_none()
+                {
+                    return None;
+                }
                 Some((key.clone(), session.kind))
             })
             .collect()
@@ -41417,6 +41481,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_argv_flag_names_the_session_token_that_follows_it() {
+        let tokens = ["opencode2", "--auto", "--session", "ses_argvidentity"];
+        assert_eq!(
+            agent_session_identity_from_cmdline_tokens("--session", tokens),
+            Some("ses_argvidentity".to_string())
+        );
+    }
+
+    #[test]
+    fn an_argv_flag_without_a_value_names_no_session() {
+        let tokens = ["opencode2", "--auto", "--session"];
+        assert_eq!(
+            agent_session_identity_from_cmdline_tokens("--session", tokens),
+            None
+        );
+    }
+
+    #[test]
+    fn an_argv_flag_value_shaped_like_another_flag_names_no_session() {
+        let tokens = ["opencode2", "--session", "--auto"];
+        assert_eq!(
+            agent_session_identity_from_cmdline_tokens("--session", tokens),
+            None
+        );
+    }
+
+    #[test]
+    fn two_different_argv_session_ids_are_ambiguous_and_stay_silent() {
+        let tokens = [
+            "opencode2", "--session", "ses_alpha", "--session", "ses_beta",
+        ];
+        assert_eq!(
+            agent_session_identity_from_cmdline_tokens("--session", tokens),
+            None
+        );
+    }
+
+    #[test]
+    fn a_flag_is_matched_as_a_whole_token_not_a_prefix() {
+        let tokens = ["opencode2", "--sessionfile", "ses_wrong", "--session", "ses_right"];
+        assert_eq!(
+            agent_session_identity_from_cmdline_tokens("--session", tokens),
+            Some("ses_right".to_string())
+        );
+    }
+
+    #[test]
+    fn the_argv_identity_walk_reads_a_live_tuis_own_cmdline() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import time; time.sleep(60)",
+                "--session",
+                "ses_argvidentity",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in TUI process");
+        let pid = child.id();
+        let walked = agent_runtime_session_id_from_root_pid(SessionKind::OpenCode, pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(walked, Some("ses_argvidentity".to_string()));
     }
 
     #[test]

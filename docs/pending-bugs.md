@@ -27392,7 +27392,7 @@ recurrs, it gets its own entry.
 
 ## ⛔ [11.73] AN OPENCODE ROW NEVER FOLLOWS THE SESSION ITS TUI IS ACTUALLY RUNNING — THE IDENTITY REBIND ARM IS STRUCTURALLY DEAD FOR THE WHOLE FAMILY, AND THE STORE RECORDS NOTHING AT /sessions SWITCH TIME (measured live 2026-09-06 23:16-00:00, the owner's d4090efe row)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 **Owner:** the cli-integration / metadata-SSOT lane (Issue 38 open item "opencode
 /sessions switch rebind")
@@ -27438,6 +27438,32 @@ switch-following needs the opencode server API (or an upstream event);
 until then a row re-follows its session at every re-resume (the resume path
 already resolves recency-per-directory — measured: the 23:16 re-resume
 launched exactly `ses_f998a9`).
+
+**Fix (`lane/cli/oc-argv-identity`):** a descriptor-declared
+`live_session_argv_flag` — `Some("--session")`, OpenCode only, measured off
+the live TUI's argv rather than inferred from the resume selector — feeds a
+new ARGV arm in the same process-tree walk the fd marker uses:
+`/proc/<pid>/cmdline` tokens, the flag matched WHOLE-token, a flag-shaped
+value names nothing, and two different ids in one cmdline stay silent (the
+open-paths ambiguity law). Three gates widen to the marker-or-argv
+capability: the persistence chore's row selector (the load-bearing one —
+`apply_agent_runtime_session_id_to_live_session` moves the row id and
+re-points the stored launch command, and the STATUS wire's
+`live_terminal_sessions` then carries the real id to the remote title
+batch, the SSOT audit and the store-title lookup), the snapshot overlay
+(the panels), and the walker itself. SUPERSEDED: the per-row pid anchor
+specced for `RemoteStoreTitleProbe` argv is NOT needed — the batch caller
+sends the owning daemon's own ids, so the owner-side rebind feeds the probe
+directly. Bonus: opencode rows now carry real session ids for the [11.64]
+recency reader, whose store lookup by the birth uuid answered None →
+Unknown → never released.
+
+**Falsifier (live, on the owner's d4090efe row after the deploy):**
+`server rows live` answers a `cli_store_title` equal to opencode's own
+`session_v2.title` for `ses_f998a9…` (not null); the metadata panel shows
+the `ses_…` id where the runtime uuid used to be; an `/sessions` switch
+followed by a re-resume launches the switched session. The frozen-argv
+boundary stands: a switch moves nothing until the re-resume.
 
 ## ⛔ [11.74] THE SIDEBAR FILLS WITH GHOST FRAMES — ROWS WHOSE CLI PROCESSES ARE LONG DEAD ADVERTISE AS LIVE AND ARE RESTORED FOREVER (measured 2026-09-06 23:2x, dev + the GUI host)
 
