@@ -4897,12 +4897,32 @@ def read_text(path):
         return None
 
 found = {}
+SHELLS = {'bash', 'sh', 'zsh', 'dash', 'fish'}
+OWN = {'yggterm', 'yggterm-headless', 'yggterm-server'}
 for pid in os.listdir('/proc'):
     if not pid.isdigit():
         continue
-    blob = (read_text(f'/proc/{pid}/cmdline') or '') + '\x00' + (read_text(f'/proc/{pid}/environ') or '')
-    if not blob.strip('\x00'):
+    raw = read_text(f'/proc/{pid}/cmdline')
+    if raw is None:
         continue
+    parts = [p for p in raw.split('\x00') if p]
+    if not parts:
+        continue
+    # ⛔ TWO classes of process are not holders, measured live:
+    # (1) shells and yggterm's own binaries — a failed restore leaves its
+    #     `resume-<kind> <uuid>` wrapper and the row's replacement shell
+    #     sitting at the error prompt carrying the id (in argv, or inherited
+    #     through the environment); counting them read corpse rows alive.
+    # (2) the wrapper COMPOSITION (`yggterm server remote …`) hosted by any
+    #     other shell. ⛔ the CLI BINARIES themselves must NOT be skipped by
+    #     name — the fleet's npm CLIs install under a yggterm-named prefix,
+    #     and a path substring skip read every live CLI as its own corpse.
+    argv0 = os.path.basename(parts[0])
+    if argv0 in SHELLS or argv0 in OWN:
+        continue
+    if 'yggterm server remote' in raw:
+        continue
+    blob = raw + '\x00' + (read_text(f'/proc/{pid}/environ') or '')
     for id_ in ids:
         if id_ not in found and id_ in blob:
             found[id_] = pid
