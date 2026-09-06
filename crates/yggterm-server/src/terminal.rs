@@ -1483,11 +1483,15 @@ impl TerminalManager {
     /// `None` means neither could answer — which is not permission. The costs
     /// are not symmetric: a needless refusal delays a wake, and a wrong "it is
     /// empty" spends somebody's unsent sentence.
-    pub fn session_composer_holds_draft(&self, key: &str) -> Option<bool> {
+    pub fn session_composer_holds_draft(
+        &self,
+        key: &str,
+        kind: Option<yggterm_core::SessionKind>,
+    ) -> Option<bool> {
         let keystrokes = self.session_has_pending_input_draft(key);
         let grid = self
             .session_screen_plain_rows(key)
-            .and_then(|rows| yggterm_core::composer_row_holds_text(&rows));
+            .and_then(|rows| yggterm_core::composer_row_holds_text(kind, &rows));
         match (keystrokes, grid) {
             (None, None) => None,
             (left, right) => Some(left.unwrap_or(false) || right.unwrap_or(false)),
