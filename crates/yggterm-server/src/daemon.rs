@@ -6087,7 +6087,9 @@ impl DaemonRuntime {
                     // the roll takes a handover every hour. This verb exists to
                     // answer "may a bump be taken", so the one window it was
                     // blind in is the one a bump happens in.
-                    has_pending_draft: self.terminals.session_composer_holds_draft(key),
+                    has_pending_draft: self
+                        .terminals
+                        .session_composer_holds_draft(key, self.server.live_session_kind(key)),
                 })
                 .collect::<Vec<_>>(),
         );
@@ -6417,7 +6419,12 @@ impl DaemonRuntime {
             // ⛔ The union: migratability decides whether a release may destroy
             // this row's composer, and the keystroke arm is zeroed by the very
             // handover it is being consulted about.
-            has_pending_draft: self.terminals.session_composer_holds_draft(runtime_key),
+            has_pending_draft: self
+                        .terminals
+                        .session_composer_holds_draft(
+                            runtime_key,
+                            self.server.live_session_kind(runtime_key),
+                        ),
             foreground_command_running: self
                 .terminals
                 .session_foreground_process_active(runtime_key),
@@ -12461,9 +12468,10 @@ impl DaemonRuntime {
                         .session_post_resize_output_seen(&runtime_path),
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
                     runtime_spawn_id: self.terminals.session_runtime_spawn_id(&runtime_path),
-                    composer_holds_draft: self
-                        .terminals
-                        .session_composer_holds_draft(&runtime_path),
+                    composer_holds_draft: self.terminals.session_composer_holds_draft(
+                        &runtime_path,
+                        self.server.live_session_kind(&runtime_path),
+                    ),
                     pty_in_alternate_screen: self
                         .terminals
                         .session_in_alternate_screen(&runtime_path),
@@ -12694,7 +12702,10 @@ impl DaemonRuntime {
                 // "unknown" would make every proxied row unbootable, which on
                 // the GUI host is all of them.
                 if refuse_if_draft
-                    && self.terminals.session_composer_holds_draft(&runtime_path) == Some(true)
+                    && self.terminals.session_composer_holds_draft(
+                        &runtime_path,
+                        self.server.live_session_kind(&runtime_path),
+                    ) == Some(true)
                 {
                     return Ok(ServerResponse::Ack {
                         message: Some(format!(
@@ -31389,14 +31400,17 @@ mod tests {
         let terminal_source = include_str!("terminal.rs");
 
         for (name, needle) in [
-            ("the drafts sweep", "has_pending_draft: self.terminals.session_composer_holds_draft(key)"),
+            (
+                "the drafts sweep",
+                "session_composer_holds_draft(key, self.server.live_session_kind(key))",
+            ),
             (
                 "the migratability signals",
-                "has_pending_draft: self.terminals.session_composer_holds_draft(runtime_key)",
+                "session_composer_holds_draft(\n                            runtime_key,\n                            self.server.live_session_kind(runtime_key),\n                        )",
             ),
             (
                 "--refuse-if-draft on server terminal write",
-                "session_composer_holds_draft(&runtime_path) == Some(true)",
+                "session_composer_holds_draft(\n                        &runtime_path,\n                        self.server.live_session_kind(&runtime_path),\n                    ) == Some(true)",
             ),
         ] {
             assert!(

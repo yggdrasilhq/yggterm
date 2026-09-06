@@ -1663,7 +1663,7 @@ pub fn screen_text_shows_agent_background_hint(sample: &str) -> bool {
 /// stopped carrying the distinction — in the direction that types over a
 /// sentence. A discriminator that has died is not repaired by reading it more
 /// carefully.
-pub fn composer_row_holds_text(rows: &[String]) -> Option<bool> {
+pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Option<bool> {
     // How far above the CLI's own chrome the marker may sit. A long line wraps
     // over a few rows; anything deeper is transcript, not composer.
     const COMPOSER_WRAP_ROWS: usize = 14;
@@ -1675,16 +1675,24 @@ pub fn composer_row_holds_text(rows: &[String]) -> Option<bool> {
         return None;
     }
     let floor = end.saturating_sub(COMPOSER_WRAP_ROWS);
+    // ⛔ [11.66] THE MARKER IS THE SESSION'S OWN — the match was KIND-AGNOSTIC
+    // (any CLI's marker matched any row), and codex's own error line starts
+    // with `>` — agy's marker — so a bootstrapping-failed codex screen read
+    // its ERROR TEXT as typed composer text and held the row in
+    // pending_draft forever. A session without a known descriptor answers
+    // `None` — cannot say, which keeps the row protected.
+    let Some(marker) = kind
+        .and_then(|kind| agent_cli::agent_cli_descriptor(kind))
+        .map(|descriptor| descriptor.composer_marker)
+    else {
+        return None;
+    };
     let mut content = String::new();
     for index in (floor..end).rev() {
         let text = rows[index]
             .trim()
             .trim_start_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
-        if let Some(marker) = agent_cli::AGENT_CLIS
-            .iter()
-            .map(|descriptor| descriptor.composer_marker)
-            .find(|marker| text.starts_with(*marker))
-        {
+        if text.starts_with(marker) {
             let head = text[marker.len_utf8()..].trim();
             return Some(!head.is_empty() || !content.trim().is_empty());
         }
@@ -3577,7 +3585,7 @@ mod tests {
             &footer,
         ]);
         assert_eq!(
-            super::composer_row_holds_text(&delivered),
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &delivered),
             Some(false),
             "a delivered message in the transcript is not composer content"
         );
@@ -3591,7 +3599,7 @@ mod tests {
             &border,
             &footer,
         ]);
-        assert_eq!(super::composer_row_holds_text(&wrapped), Some(true));
+        assert_eq!(super::composer_row_holds_text(Some(SessionKind::OpenCode), &wrapped), Some(true));
 
         // ⛔ NO COMPOSER IS NOT AN EMPTY COMPOSER. One may be typed into and the
         // other may not, and answering `false` for both is how a watchdog types
@@ -3601,13 +3609,45 @@ mod tests {
             "  Ran 1 shell command",
             "  ...still going",
         ]);
-        assert_eq!(super::composer_row_holds_text(&mid_output), None);
-        assert_eq!(super::composer_row_holds_text(&[]), None);
+        assert_eq!(super::composer_row_holds_text(Some(SessionKind::OpenCode), &mid_output), None);
+        assert_eq!(super::composer_row_holds_text(Some(SessionKind::OpenCode), &[]), None);
 
         // Codex draws a different glyph, and the reader must not be tuned to one
         // CLI's marker.
         let codex = rows(&["  earlier output", "\u{203a} write the brief", "", "  gpt-5.5 xhigh"]);
-        assert_eq!(super::composer_row_holds_text(&codex), Some(true));
+        assert_eq!(super::composer_row_holds_text(Some(SessionKind::Codex), &codex), Some(true));
+    }
+
+    /// ⛔ [11.66] THE MARKER IS THE SESSION'S OWN. The match was KIND-AGNOSTIC:
+    /// codex's own error line starts with `>` — agy's marker — so a
+    /// bootstrapping-failed codex screen read its ERROR TEXT as typed composer
+    /// text and held the row in pending_draft forever (measured live: idle
+    /// 800+ s, never typed into, refused release). With the session's own
+    /// marker the same screen answers None (no composer here = cannot say),
+    /// and a foreign-marker row can never read as this session's draft.
+    #[test]
+    fn a_foreign_marker_line_is_not_this_sessions_draft() {
+        let rows = |lines: &[&str]| {
+            lines.iter().map(|line| (*line).to_string()).collect::<Vec<_>>()
+        };
+        // The measured codex bootstrapping-failure screen (wrapped error tail
+        // + the hints footer). Codex's own marker `›` appears NOWHERE.
+        let failed = rows(&[
+            "> Error: Failed to resume session from the rollout file: thread/resume",
+            "failed during TUI bootstrap: already has an active writer (code -32600)",
+            "? for shortcuts",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Codex), &failed),
+            None,
+            "codex's error text is not a typed draft, whatever marker it starts with"
+        );
+        // And agy's own marker still reads for agy itself.
+        let agy = rows(&["> please hold the door", "? for shortcuts"]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Antigravity), &agy),
+            Some(true)
+        );
     }
 
     use super::*;
