@@ -3920,6 +3920,13 @@ pub enum ServerRequest {
     },
     RemoveSession {
         path: String,
+        /// [11.74] the DESPAWN arm: evict a CORPSE record — remove + tombstone,
+        /// no teardown. Refused while the row still holds a live local runtime,
+        /// because despawn must never be what kills a working row (close it
+        /// instead). `#[serde(default)]` + Option: an older client never sends
+        /// it, an older daemon ignores the unknown field.
+        #[serde(default)]
+        despawn: Option<bool>,
     },
     DropTerminalRuntime {
         runtime_key: String,
@@ -7501,7 +7508,7 @@ impl DaemonRuntime {
             .map(|entry| entry.endpoint.to_endpoint())
             .filter(|endpoint| !server_endpoints_same_target(endpoint, &current_endpoint));
         if let Some(owner_endpoint) = owner_endpoint {
-            match remove_session(&owner_endpoint, runtime_key) {
+            match remove_session(&owner_endpoint, runtime_key, false) {
                 Ok((_snapshot, message)) => {
                     append_trace_event(
                         self.store.home_dir(),
@@ -11656,7 +11663,42 @@ impl DaemonRuntime {
                     format!("removed {removed} saved ssh targets for {machine_key}")
                 }))
             }
-            ServerRequest::RemoveSession { path } => {
+            ServerRequest::RemoveSession { path, despawn } => {
+                // [11.74] THE DESPAWN ARM — a corpse record's eviction, not a
+                // close. A ghost row's CLI process is long dead; the record
+                // alone re-advertises after every rotation. Despawn removes the
+                // persisted live record AND tombstones it so the restore plane
+                // and peer imports stop resurrecting it — and it REFUSES while
+                // the row still holds a live local runtime, because despawn has
+                // no teardown and must never be what kills a working row.
+                if despawn == Some(true) {
+                    let runtime_path = self.terminal_runtime_key_for_path(&path);
+                    if let Some(pid) = self.terminals.session_process_id(&runtime_path) {
+                        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                            return Ok(self.snapshot_response(Some(format!(
+                                "refused to despawn {path}: a live runtime (pid {pid}) holds it — close it instead"
+                            ))));
+                        }
+                    }
+                    self.tombstone_live_row(&path);
+                    let removed = self.server.remove_live_session(&path)?;
+                    self.persist()?;
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "session",
+                        "row_despawned",
+                        serde_json::json!({
+                            "path": path,
+                            "removed": removed,
+                        }),
+                    );
+                    return Ok(self.snapshot_response(Some(if removed {
+                        format!("despawned {path} (record removed + tombstoned)")
+                    } else {
+                        format!("nothing to despawn for {path}")
+                    })));
+                }
                 if remove_session_should_detach_keep_alive_runtime(
                     self.server.live_session_keep_alive(&path),
                 ) {
@@ -19931,11 +19973,13 @@ pub fn remove_ssh_target(
 pub fn remove_session(
     endpoint: &ServerEndpoint,
     path: &str,
+    despawn: bool,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::RemoveSession {
             path: path.to_string(),
+            despawn: despawn.then_some(true),
         },
     )?)
 }
@@ -28258,11 +28302,46 @@ mod tests {
     /// that clears and expires them. Structural, because the alternative is a
     /// full DaemonRuntime; the ordering is the part that silently breaks.
     #[test]
+    fn the_despawn_arm_tombstones_before_removal_and_refuses_a_live_runtime() {
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let arm = source
+            .split("ServerRequest::RemoveSession { path, despawn } => {")
+            .nth(1)
+            .expect("the RemoveSession request arm");
+        let arm = arm
+            .split("ServerRequest::DropTerminalRuntime")
+            .next()
+            .expect("the end of the RemoveSession arm");
+        assert!(
+            arm.contains("despawn == Some(true)"),
+            "the despawn arm must gate on the explicit flag, never on a bare close"
+        );
+        let refuse = arm.find("refused to despawn").expect(
+            "despawn must refuse while a live runtime holds the row — it has no teardown",
+        );
+        let recorded = arm.find("self.tombstone_live_row(&path);").expect(
+            "despawn must record the tombstone, or the restore plane resurrects the ghost",
+        );
+        let removed = arm
+            .find("self.server.remove_live_session(&path)")
+            .expect("despawn must remove the persisted live record");
+        assert!(
+            refuse < recorded && recorded < removed,
+            "refuse first, then tombstone, then remove — the same ordering law as close"
+        );
+        assert!(
+            arm.contains("row_despawned"),
+            "the despawn must name itself on the trace"
+        );
+    }
+
+    #[test]
     fn the_close_path_writes_a_tombstone_and_persist_reconciles_them() {
         let source = daemon_product_source();
         let source = source.as_str();
         let arm = source
-            .split("ServerRequest::RemoveSession { path } => {")
+            .split("ServerRequest::RemoveSession { path, despawn } => {")
             .nth(1)
             .expect("the RemoveSession request arm");
         let arm = arm
@@ -33004,7 +33083,7 @@ mod tests {
         // The user-facing MESSAGE stays with the request arm, which is what
         // bulk Close All counts.
         let arm = source
-            .split("ServerRequest::RemoveSession { path } => {")
+            .split("ServerRequest::RemoveSession { path, despawn } => {")
             .nth(1)
             .and_then(|suffix| suffix.split("ServerRequest::DropTerminalRuntime").next())
             .expect("remove session handler should be present");
@@ -36104,6 +36183,7 @@ mod tests {
         assert_eq!(
             super::daemon_request_io_timeout_ms(&super::ServerRequest::RemoveSession {
                 path: "local://slow-close".to_string(),
+                despawn: None,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
@@ -40146,8 +40226,8 @@ mod tests {
         // Option: an older owner's absence deserializes as `None` = "nobody
         // could answer", and the seed falls through byte-identically; an
         // older client ignores the unknown field.
-        const STAMPED_AT_VERSION: &str = "3.2.57";
-        const STAMPED_SHAPE_HASH: u64 = 0xa58b2ab9c739cb88;
+        const STAMPED_AT_VERSION: &str = "3.2.75";
+        const STAMPED_SHAPE_HASH: u64 = 0x27409daba4c646d4;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

@@ -39413,7 +39413,7 @@ fn spawn_heal_split_panes(members: Vec<String>) {
 fn spawn_close_session_runtime(state: Signal<ShellState>, path: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     spawn(async move {
-        let _ = task::spawn_blocking(move || remove_session(&endpoint, &path)).await;
+        let _ = task::spawn_blocking(move || remove_session(&endpoint, &path, false)).await;
     });
 }
 
@@ -59112,7 +59112,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                             continue;
                         }
                     }
-                    let result = remove_session(&endpoint, session_path)?;
+                    let result = remove_session(&endpoint, session_path, false)?;
                     if result
                         .1
                         .as_deref()
@@ -86668,7 +86668,7 @@ async fn process_pending_app_control_requests(
                     &home,
                     move || {
                         let (mut snapshot, message) =
-                            remove_session(&endpoint, &session_path_for_task)?;
+                            remove_session(&endpoint, &session_path_for_task, false)?;
                         let mut redirect_error = None::<String>;
                         if let Some(target) = close_redirect_target_for_task.as_ref()
                             && let Some(sync_result) =

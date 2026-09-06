@@ -27538,6 +27538,23 @@ missing-session row class (the "saved Codex session … is no longer
 available" error frame) demoting itself out of the live set — until then
 the sweep is the finisher: `rows live` names the ghosts, `rows despawn`
 removes them.
+**Fix part (b) LANDED (`lane/cli/rows-despawn`):** `RemoveSession` carries a
+serde-default `despawn` flag (wire 3.2.75 + stamps re-cut in the same
+commit) and the daemon grew the DESPAWN arm — tombstone (the close path's
+own identity), remove the persisted live record, persist, traced as
+`row_despawned` — REFUSED with a named message while a live local runtime
+(a /proc-alive pid) holds the row: despawn has no teardown and must never
+be what kills a working row. CLI surface: `server rows despawn <key>` (the
+`rows` verb family's first member; the SSOT audit verb still owes its
+surface). Boundary: the verb acts on the daemon it talks to — for a ghost
+whose record lives on another host's daemon, run it there until remote
+forwarding grows. Parts (a) holder verdict and (c)
+restore-as-stored-only remain OPEN.
+
+**Falsifier (live):** despawn a ghost on its owner (a process-dead
+ClaudeCode row), let a deploy rotate that daemon — the row must NOT come
+back (tombstone veto + removed record). A despawn aimed at a live row must
+answer the refusal.
 
 ## ⛔ [11.74] UUID-KEYED CODEX ROWS HAD NO WORKING RESUME IDENTITY — A RE-SPAWN COMPOSED `codex resume <ROW UUID>` THAT CODEX REFUSES, STRANDING THE ROW (found diagnosing a live -32600 dead-end, 2026-09-06)
 

@@ -994,7 +994,7 @@ pub fn run_server_remove_session_cli(store: &SessionStore, args: &[String]) -> a
     let key = args.get(2).ok_or_else(|| anyhow::anyhow!("missing session key for server remove"))?;
     ensure_local_server_ready_for_cli(store)?;
     let endpoint = cli_server_endpoint(store.home_dir());
-    let (snapshot, msg) = crate::remove_session(&endpoint, key)?;
+    let (snapshot, msg) = crate::remove_session(&endpoint, key, false)?;
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "removed": true,
         "session_path": key,
