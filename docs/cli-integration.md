@@ -2060,6 +2060,55 @@ Known-red on clean main (live-daemon interference, pre-existing):
 a_symlink_to_our_own_socket, a_reparented_agent, a_stampless_anchor,
 install::promote_direct_install.
 
+### Addendum 7 — the SSOT correction: the CLI's display IS the title, even when it is a prompt (2026-09-06, hours later)
+
+The owner's screenshot settled it: a codex row (01a043ae on dev, old codex)
+wore yggterm's generated "Update Diagrams Page" while codex's own picker
+showed "Continue practice data polishing" — a condensation of that rollout's
+measured first real prompt. Addendum 6's "prompts are not titles" ruling
+INVERTED the actual law. **The law is the metadata SSOT: a row's title must
+EQUAL what the CLI itself displays** — catalog Thread name on new codex, the
+rollout's first real prompt on old codex, muse's `session_name`, CC's store
+title. The rollout arm is RESTORED in the reader and the remote probe,
+ABOVE the generated cache; generation now answers only for rows with no
+knowable display at all (id-drifted), and the Dynamic poll replaces even
+that the moment the display becomes knowable. The store-silent fallback,
+the cache loop and the strip law survive unchanged — they were display-
+agnostic; only the precedence was wrong.
+
+## Issue Heading 38: the metadata SSOT program — the rows verb, the lifecycle probes, bidirectional titles, CLI-induced switches (2026-09-06)
+
+Owner directive: "Titles of a session as shown by any of our integrated CLIs
+and the corresponding what yggterm shows are different. There is no metadata
+SSOT!" — with the screenshot above as the exemplar. The program, in the
+owner's own breakdown:
+
+1. **A rows verb, shaped like startpage/cwdtree** — quickly see the rows, a
+   particular row's metadata, spawn rows, despawn rows. LANDED this lane:
+   `server rows live [--mismatches-only]` (every live row beside its own
+   CLI store's title, mismatch flagged — the SSOT instrument) and
+   `server rows show <key|id|title-substring>` (one row's full metadata,
+   the verb half of the Session Metadata panel). Spawn/despawn wrappers are
+   the open half: `server attach` / `terminal new` already spawn; a
+   first-class per-row close verb is owed.
+2. **ytrace lifecycle probes with row positions.** LANDED this lane: the
+   `rows_order` probe — one trace event per change in the live rows' set or
+   order (spawn/close/drag-reorder/migration), carrying before-and-after
+   positions. It is the drag diagnostic too: an event STORM during a drag
+   means per-move persistence; silence until drop means render-side cost
+   (see [11.67]).
+3. **Dynamic both ways.** CLI-induced session changes (opencode `/sessions`
+   switch) must re-bind the row to the new session — Issue 34's binding is
+   the machine; its F2 store-fallback repair is still the open queue. And
+   yggterm-side renames must flow BACK into the CLI's own store so the CLI
+   itself thinks the title changed — Claude Code has worked this way since
+   long ago; codex/muse/opencode write-backs are owed (muse: `sessions.title`
+   via the dormant push path; opencode: `session_v2.title`; codex: no
+   writable title store pre-catalog — the catalog is the CLI's own
+   projection and stays read-only).
+4. **Use the CLI understanding to find all faults**: `server rows live` is
+   the standing audit — every mismatch it reports is a campaign work item.
+
 
 ### The contract, as landed
 

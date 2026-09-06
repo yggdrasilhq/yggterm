@@ -26411,6 +26411,138 @@ pub fn run_row_departures(limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `server rows live` — THE METADATA SSOT INSTRUMENT (owner directive
+/// 2026-09-06, docs/cli-integration.md Issue Heading 38): every live row on
+/// every reachable daemon, each beside what its own CLI store says the
+/// session should be titled, with the mismatch flagged.
+///
+/// The law it serves: **a row's title must equal what the CLI itself
+/// displays** — the CLI is the single source of truth for its sessions'
+/// metadata, and any disagreement is a fault. Before this verb the mismatch
+/// class (yggterm's generated title beside a CLI picker showing something
+/// else) was found by a human reading a sidebar next to a picker; this verb
+/// answers it in one call, and feeds the campaign's "use the CLI
+/// understanding of yggterm metadata to find all faults" loop.
+///
+/// ⛔ FANS OUT OVER EVERY DAEMON, like `rows drafts`: the rows a person sees
+/// need not live in the newest daemon's population.
+pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let user_home = dirs::home_dir().unwrap_or_else(|| home.clone());
+    let mut rows = Vec::new();
+    let mut mismatches = 0usize;
+    let mut store_named = 0usize;
+    for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
+        for (position, row) in runtime.live_terminal_sessions.iter().enumerate() {
+            let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(row.kind);
+            let cli_store_title = descriptor
+                .and_then(|d| d.read_live_store_title)
+                .and_then(|read| read(&user_home, &row.id))
+                .map(|title| title.trim().to_string())
+                .filter(|title| !title.is_empty());
+            let row_title = row.title.trim().to_string();
+            // The SSOT comparison: the row against the CLI's own store. An
+            // owner-set title never counts as a mismatch — a human rename is
+            // a deliberate divergence, not a fault. No store answer is not a
+            // mismatch either (the birth/generated fallback is the designed
+            // state for an unknowable id).
+            let owner_set = row.title_is_explicit;
+            let is_mismatch = match &cli_store_title {
+                Some(store_title) => store_title != &row_title && !owner_set,
+                None => false,
+            };
+            if is_mismatch {
+                mismatches += 1;
+            }
+            if cli_store_title.is_some() {
+                store_named += 1;
+            }
+            if mismatches_only && !is_mismatch {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "daemon_pid": runtime.server_pid,
+                "daemon_version": runtime.server_version,
+                "endpoint": format!("{endpoint:?}"),
+                "position": position,
+                "key": row.key,
+                "kind": format!("{:?}", row.kind),
+                "id": row.id,
+                "row_title": row_title,
+                "cli_store_title": cli_store_title,
+                "ssot_match": !is_mismatch,
+                "mismatch": is_mismatch,
+                "owner_set": owner_set,
+                "cwd": row.cwd,
+                "ssh_target": row.ssh_target,
+                "keep_alive": row.keep_alive,
+            }));
+        }
+    }
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "row_count": rows.len(),
+        "store_named": store_named,
+        "mismatches": mismatches,
+        "rows": rows,
+    }))?)?;
+    Ok(())
+}
+
+/// `server rows show <key|id|title-substring>` — ONE row's metadata, the
+/// verb half of the GUI's Session Metadata panel, so an agent can read what
+/// the owner sees without a screenshot (Issue Heading 38). The selector
+/// matches a row's key, then its id, then a substring of its title — first
+/// hit across every reachable daemon wins, and the answer names which
+/// daemon said it.
+pub fn run_row_show(selector: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let user_home = dirs::home_dir().unwrap_or_else(|| home.clone());
+    for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
+        for (position, row) in runtime.live_terminal_sessions.iter().enumerate() {
+            let matched = row.key == selector
+                || row.id == selector
+                || (!selector.trim().is_empty() && row.title.contains(selector.trim()));
+            if !matched {
+                continue;
+            }
+            let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(row.kind);
+            let cli_store_title = descriptor
+                .and_then(|d| d.read_live_store_title)
+                .and_then(|read| read(&user_home, &row.id))
+                .map(|title| title.trim().to_string())
+                .filter(|title| !title.is_empty());
+            let row_title = row.title.trim().to_string();
+            let mut value = serde_json::to_value(row)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "position".to_string(),
+                    serde_json::json!(position),
+                );
+                object.insert(
+                    "daemon".to_string(),
+                    serde_json::json!({
+                        "pid": runtime.server_pid,
+                        "version": runtime.server_version,
+                        "endpoint": format!("{endpoint:?}"),
+                    }),
+                );
+                object.insert(
+                    "ssot".to_string(),
+                    serde_json::json!({
+                        "row_title": row_title,
+                        "cli_store_title": cli_store_title,
+                        "mismatch": matches!(&cli_store_title, Some(t) if t != &row_title)
+                            && !row.title_is_explicit,
+                    }),
+                );
+            }
+            write_stdout_payload(&serde_json::to_string_pretty(&value)?)?;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("no live row matches {selector:?} on any reachable daemon");
+}
+
 /// `server rows drafts` — which live rows hold a typed-but-unsent line, host-wide.
 ///
 /// **The question it exists to answer is "may a daemon bump be taken right now?"**
