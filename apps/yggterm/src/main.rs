@@ -1429,6 +1429,19 @@ fn main() -> Result<()> {
     if args.len() >= 3 && args[0] == "server" && args[1] == "remove" {
         return yggterm_server::server_cli::run_server_remove_session_cli(&store, &args);
     }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn" {
+        // The ghost sweep ([11.74]) — reachable from BOTH binaries by the
+        // both-binaries law (server_cli.rs screen_verb_tests tells why).
+        let keys: Vec<String> = args[3..]
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .cloned()
+            .collect();
+        return yggterm_server::run_rows_despawn(&keys);
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn-local" {
+        return yggterm_server::run_rows_despawn_local(&args[3]);
+    }
     // ⛔ THE LAST THREE `server` DIVERGENCES, AND THEY WERE ACCIDENTAL TOO.
     // These three were read as deploy/relay machinery that belonged to the
     // headless CLI by design — the one real fork this surface was said to

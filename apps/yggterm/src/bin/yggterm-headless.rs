@@ -1708,6 +1708,23 @@ impl std::io::Write for LossyStderrHandle {
     if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "drafts" {
         return yggterm_server::run_row_drafts();
     }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn" {
+        // The ghost sweep ([11.74]): close on the owning host AND veto
+        // re-import, so the next rotation's restore cannot resurrect the
+        // row. Remote keys hop via ssh to the owning machine.
+        let keys: Vec<String> = args[3..]
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .cloned()
+            .collect();
+        return yggterm_server::run_rows_despawn(&keys);
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn-local" {
+        // One host's half of despawn — the ssh hop's landing site, not a
+        // human verb: closes whatever THIS host holds and vetoes
+        // re-import here.
+        return yggterm_server::run_rows_despawn_local(&args[3]);
+    }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
         return run_trace_tail(parse_trace_limit(&args, 200)?);
     }
