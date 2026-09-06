@@ -13706,6 +13706,53 @@ fn collect_remote_copy_candidates(
 /// single row, while the CLI's own `history.jsonl` had held that conversation's
 /// title the entire time. `agent_store_home` is the one owner of this question
 /// (`AGENTS.md` §Multi-CLI, and `docs/cli-integration.md` §Issue Heading 1).
+/// THE ROWS-ORDER LIFECYCLE PROBE (owner directive 2026-09-06, Issue
+/// Heading 38): every change in the live rows' set or order — spawn, close,
+/// drag-reorder, daemon migration — emits ONE `rows_order` trace event
+/// carrying the ordered keys, before and after. Without it, "the row moved"
+/// and "a row appeared" lived only in the owner's eyes; with it, a drag or a
+/// CLI-induced session switch has a timestamped before/after in ytrace to
+/// diff against. Emitted on CHANGE only, so idling costs nothing.
+fn probe_rows_order(live_sessions: &[ManagedSessionView]) {
+    static LAST_ORDER: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    let order: Vec<String> = live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect();
+    let Ok(mut last) = LAST_ORDER.lock() else {
+        return;
+    };
+    if *last == order {
+        return;
+    }
+    let previous = last.clone();
+    *last = order;
+    if let Ok(home) = crate::resolve_yggterm_home() {
+        let current: Vec<serde_json::Value> = live_sessions
+            .iter()
+            .enumerate()
+            .map(|(position, session)| {
+                serde_json::json!({
+                    "position": position,
+                    "session_path": session.session_path,
+                    "kind": format!("{:?}", session.kind),
+                })
+            })
+            .collect();
+        append_trace_event(
+            &home,
+            "daemon",
+            "cli",
+            "rows_order",
+            serde_json::json!({
+                "previous": previous,
+                "current": current,
+            }),
+        );
+    }
+}
+
 fn collect_live_store_title_syncs(
     live_sessions: &[ManagedSessionView],
     working_paths: &HashSet<String>,
@@ -14546,6 +14593,7 @@ fn build_background_copy_updates(
     generation_enabled: bool,
 ) -> Result<Vec<BackgroundCopyUpdate>> {
     let mut updates = collect_live_store_title_syncs(live_sessions, working_paths);
+    probe_rows_order(live_sessions);
     // LLM title/summary generation is opt-in (env-gated); the store title sync
     // above is a cheap local-file/db read and always runs — a CLI's own store is
     // the SSOT for its title and needs no LLM.

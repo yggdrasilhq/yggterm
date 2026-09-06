@@ -189,6 +189,12 @@ fn print_server_help() {
   yggterm-headless server connect --list
   yggterm-headless server write-lock <acquire|release|status> [--holder <who>]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm-headless server rows live [--mismatches-only]
+    THE METADATA SSOT INSTRUMENT — every live row beside what its own CLI
+    store says the session should be titled; a mismatch is a fault made
+    visible (Issue Heading 38).
+  yggterm-headless server rows show <key|id|title-substring>
+    one row's full metadata, the verb half of the Session Metadata panel.
   yggterm-headless server rows departed [--limit <n>]
     where a row went and why. Reads the shared departure ledger; writes nothing.
   yggterm-headless server rows drafts
@@ -1690,6 +1696,15 @@ impl std::io::Write for LossyStderrHandle {
     // answer, because the only instrument that consulted draft state was a flag
     // on a WRITE. Fans out over every daemon on the host and reports presence
     // only; see `yggterm_server::run_row_drafts`.
+    if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "live" {
+        // The metadata SSOT instrument (Issue Heading 38): rows beside their
+        // CLI's own store title, mismatches flagged. Read-only.
+        let mismatches_only = args.iter().any(|arg| arg == "--mismatches-only");
+        return yggterm_server::run_rows_live(mismatches_only);
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "show" {
+        return yggterm_server::run_row_show(&args[3]);
+    }
     if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "drafts" {
         return yggterm_server::run_row_drafts();
     }

@@ -3987,20 +3987,116 @@ fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> 
             return Some(title);
         }
     }
-    // 2. yggterm's own cache — the generation chore's output. This is ALSO
-    // the store-silent fallback's landing place: a generated title becomes
-    // the store answer, which is what keeps the title chore's strip rule
-    // (store silent + no cache ⇒ machine copy) from ever fighting the
-    // generation that named the row.
+    // 2. THE ROLLOUT'S FIRST REAL USER PROMPT — the metadata SSOT (owner law,
+    // 2026-09-06): the row title must EQUAL what the CLI itself displays, and
+    // an old codex install's picker renders exactly this prompt (measured
+    // against the owner's screenshot: picker "Continue practice data
+    // polishing" = a condensation of rollout 01a043ae's first real prompt).
+    // The generated-title cache is therefore DEMOTED below it — yesterday's
+    // "prompts are not titles" ruling inverted the SSOT and put yggterm's own
+    // invention ("Update Diagrams Page") where the CLI's word belongs.
+    for (sessions_root, _codex_home) in &homes {
+        let Some(rollout) = find_file_by_suffix(sessions_root, 4, &format!("-{session_id}.jsonl"))
+        else {
+            continue;
+        };
+        if let Some(title) = title_without_fallbacks(codex_first_real_user_prompt(&rollout)) {
+            return Some(title);
+        }
+    }
+    // 3. yggterm's own cache — the generation chore's output, LAST: only a
+    // session with no catalog row and no readable rollout (id-drifted rows)
+    // is named by us, and the Dynamic title poll replaces it the moment the
+    // CLI's own display becomes knowable.
     if let Some(title) = cached_session_title(session_id) {
         return Some(title);
     }
-    // ⛔ There is NO rollout-prompt arm. The rollout's first user prompt was
-    // this reader's third answer for one day (2026-09-05 → 2026-09-06) and it
-    // pumped raw prompts onto rows as "titles" on every codex install too old
-    // to carry the Thread-name catalog — "You are being consulted as a depth
-    // advisor (gpt-5.6-sol) by …" wore a row for days. A prompt is INPUT, not
-    // a title; on a silent store the row is the generation chore's to name.
+    None
+}
+
+/// The FIRST REAL USER PROMPT in a codex rollout — the display an old codex
+/// install's own picker renders for the thread, and therefore the metadata
+/// SSOT for installs that predate the Thread-name catalog (owner law
+/// 2026-09-06). The rollout's first `role:"user"` item is NOT the prompt:
+/// codex writes the AGENTS.md/instructions block and environment context as
+/// user messages first (measured 2026-08-30). Skip those wrappers; take the
+/// first user text that is neither, cleaned to one line.
+fn codex_first_real_user_prompt(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for (index, line) in reader.lines().enumerate() {
+        // The real prompt is near the top; a bound keeps this cheap no matter
+        // how long the rollout grows.
+        if index > 400 {
+            return None;
+        }
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let payload = value.get("payload")?;
+        if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let text = payload
+            .get("content")
+            .and_then(|content| content.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("text"))
+                    .filter_map(|text| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        let Some(text) = text else { continue };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let is_wrapper = lower.starts_with("# agents.md")
+            || lower.contains("<user_instructions>")
+            || lower.contains("<environment_context>")
+            || lower.contains("<permissions")
+            || lower.contains("<turn_context>")
+            || lower.starts_with("<instructions>");
+        if is_wrapper {
+            continue;
+        }
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with('<')
+                || line.starts_with("```")
+            {
+                continue;
+            }
+            let candidate: String = {
+                let mut end = line
+                    .char_indices()
+                    .nth(120)
+                    .map(|(offset, _)| offset)
+                    .unwrap_or(line.len());
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line[..end].trim_end().to_string()
+            };
+            if candidate.is_empty()
+                || crate::looks_like_generated_fallback_title(&candidate)
+                || crate::looks_like_low_signal_generated_copy(&candidate)
+            {
+                continue;
+            }
+            return Some(candidate);
+        }
+    }
     None
 }
 
@@ -4448,13 +4544,15 @@ for session_id in ids:
 /// the transcript could name reports `no_title_in_store`, which is true and
 /// cheap; guessing it would have cost a store walk per tick.
 /// The codex/codex-litellm remote title script: the CLI's own Thread-name
-/// catalog ONLY (`<store home>/sqlite/codex-dev.db`,
+/// catalog first (`<store home>/sqlite/codex-dev.db`,
 /// `local_thread_catalog.display_title` — the home dir name derived from each
-/// passed glob's first segment, so the per-CLI globs decide which homes are
-/// probed). ⛔ NO rollout arm: for one day the rollout's first real prompt
-/// answered here and pumped raw prompts onto rows as titles on every codex
-/// install too old for the catalog. A silent store means the remote row is
-/// the generation chore's to name — not the transcript's.
+/// passed glob's first segment), then the rollout's FIRST REAL USER PROMPT —
+/// which is what an old codex install's own picker renders, so it IS the
+/// metadata SSOT for those hosts (owner law 2026-09-06; the picker shows
+/// "Continue practice data polishing" for rollout 01a043ae whose first real
+/// prompt is "continue the practice campaign. It will mostly be a
+/// tweaking/polishing session of the data"). A session with neither is
+/// SILENCE — the generation fallback's to name.
 const CODEX_REMOTE_TITLE_SCRIPT: &str = r#"
 import json, os, sqlite3, sys
 from pathlib import Path
@@ -4469,6 +4567,7 @@ if not ids or not globs:
 home = Path(os.path.expanduser('~'))
 wanted = set(ids)
 answered = {}
+WRAPPER_MARKS = ('<user_instructions>', '<environment_context>', '<permissions', '<turn_context>')
 
 def read_catalog(path):
     if not path.exists():
@@ -4501,6 +4600,62 @@ for g in globs:
     first = g.split('/')[0] if g else ''
     if first:
         read_catalog(home / first / 'sqlite' / 'codex-dev.db')
+
+def first_real_prompt(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+            for i, line in enumerate(fh):
+                if i > 400:
+                    return None
+                try:
+                    v = json.loads(line)
+                except Exception:
+                    continue
+                if v.get('type') != 'response_item':
+                    continue
+                p = v.get('payload') or {}
+                if p.get('role') != 'user':
+                    continue
+                c = p.get('content')
+                if not isinstance(c, list):
+                    continue
+                text = '\n'.join(x.get('text', '') for x in c if isinstance(x, dict))
+                t = text.strip()
+                if not t:
+                    continue
+                low = t.lower()
+                if low.startswith('# agents.md') or low.startswith('<instructions>'):
+                    continue
+                if any(m in low for m in WRAPPER_MARKS):
+                    continue
+                for ln in text.splitlines():
+                    ln = ln.strip()
+                    if not ln or ln.startswith(('#', '<', '`')):
+                        continue
+                    return ln[:120]
+    except Exception:
+        return None
+    return None
+
+for sid in ids:
+    if sid in answered:
+        continue
+    found = None
+    for g in globs:
+        try:
+            matches = home.glob(g)
+        except Exception:
+            continue
+        for p in matches:
+            if p.is_file() and p.name.endswith('-' + sid + '.jsonl'):
+                t = first_real_prompt(p)
+                if t:
+                    found = t
+                    break
+        if found:
+            break
+    if found:
+        answered[sid] = found
 
 for sid in ids:
     if sid in answered:
@@ -7307,13 +7462,17 @@ mod tests {
     /// wired when something has run it against a store shaped like the real
     /// one.
     #[test]
-    fn a_codex_rollout_prompt_is_never_a_title() {
+    fn a_codex_rollout_prompt_is_the_display_ssot() {
         // Measured 2026-08-30: a codex rollout's FIRST role:"user" item is the
-        // AGENTS.md/instructions block, not the prompt — and for one day
-        // (2026-09-05 → 09-06) the reader's third arm answered with the first
-        // REAL prompt anyway, pumping raw prompts onto rows as titles on
-        // every codex install too old for the Thread-name catalog. The arm
-        // is deleted: a rollout can never answer, whatever it contains.
+        // AGENTS.md/instructions block, not the prompt — the reader must skip
+        // the wrapper or the row gets titled with the fleet steer file.
+        // ⚠ THE SSOT LAW (owner, 2026-09-06): the rollout's first REAL prompt
+        // is what an old codex install's own picker renders, so it IS the
+        // row's title. For one day (2026-09-06) this arm was deleted and the
+        // generated cache answered instead: yggterm wore "Update Diagrams
+        // Page" while the CLI's picker said "Continue practice data
+        // polishing" — THAT mismatch is the defect the metadata SSOT law
+        // exists to kill, not the prompt.
         let home =
             std::env::temp_dir().join(format!("yggterm-codex-title-{}", uuid::Uuid::new_v4()));
         let dir = home.join(".codex/sessions/2026/08/30");
@@ -7329,11 +7488,10 @@ mod tests {
         .unwrap();
 
         // The cache lookup consults the machine's real session-titles.db; a
-        // fresh random id cannot be cached there, so nothing answers.
+        // fresh random id cannot be cached there, so the rollout answers.
         assert_eq!(
-            read_codex_live_store_title(&home, id),
-            None,
-            "a rollout is input, not a title — silence is the answer"
+            read_codex_live_store_title(&home, id).as_deref(),
+            Some("Fix the agy restart bug please"),
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -8965,14 +9123,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
-    /// ⛔ The rollout prompt is NOT a title (2026-09-06): the litellm fork's
-    /// transcripts live under `.codex-litellm`, both homes are walked for the
-    /// CATALOG — and when no catalog answers, the reader answers None. It
-    /// must never fall back to the rollout's first prompt: for one day that
-    /// arm pumped raw prompts onto rows as titles on every codex install too
-    /// old for the Thread-name catalog.
+    /// The SSOT law over both codex homes (2026-09-06): the litellm fork's
+    /// transcripts live under `.codex-litellm`, both homes are walked — the
+    /// catalog first, then the rollout's first real prompt, which is what the
+    /// fork's own picker renders. The wrapper is skipped, the prompt answers.
     #[test]
-    fn codex_reader_never_serves_a_rollout_prompt() {
+    fn codex_reader_serves_the_rollout_prompt_in_the_forks_home_too() {
         let home = std::env::temp_dir().join(format!("ygg-codex-lit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let day = home.join(".codex-litellm/sessions/2026/09/05");
@@ -8987,9 +9143,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_codex_live_store_title(&home, "test-codex-lit-3"),
-            None,
-            "a silent store answers None — the rollout prompt is input, not a title"
+            read_codex_live_store_title(&home, "test-codex-lit-3").as_deref(),
+            Some("Fix the login redirect loop for expired sessions"),
+            "the CLI's own display (first real prompt) is the title, in either home"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -9039,11 +9195,11 @@ mod tests {
     }
 
     /// Exercise the actual codex Python probe, not a Rust paraphrase: the
-    /// Thread-name catalog answers, and an install without the catalog (or a
-    /// thread it does not know) is SILENCE — the rollout prompt is never a
-    /// candidate (2026-09-06).
+    /// Thread-name catalog answers for a named thread; a thread the catalog
+    /// does not know falls to its rollout's first real prompt — the picker's
+    /// own display on old codex (SSOT law, 2026-09-06).
     #[test]
-    fn remote_codex_title_probe_answers_catalog_only() {
+    fn remote_codex_title_probe_answers_catalog_then_rollout() {
         let root = dirs::home_dir()
             .unwrap()
             .join(".yggterm/scratchpad")
@@ -9063,8 +9219,9 @@ mod tests {
             rusqlite::params!["Catalogued thread name"],
         )
         .unwrap();
-        // A rollout whose first real prompt WOULD have answered under the
-        // deleted arm — its presence must change nothing now.
+        // A rollout whose first real prompt is the picker display on an old
+        // codex install — the SSOT arm answers for it when the catalog does
+        // not know the thread.
         std::fs::create_dir_all(root.join(".codex/sessions/2026/09/05")).unwrap();
         std::fs::write(
             root.join(".codex/sessions/2026/09/05/rollout-2026-09-05T10-00-00-thread-raw.jsonl"),
@@ -9098,18 +9255,30 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let answered: Vec<String> = stdout
+        let answered: std::collections::HashMap<String, Vec<String>> = stdout
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).expect("JSON lines");
-                value["session_id"].as_str().expect("session_id").to_string()
+                let id = value["session_id"].as_str().expect("session_id").to_string();
+                let candidates = value["candidates"]
+                    .as_array()
+                    .expect("candidates")
+                    .iter()
+                    .filter_map(|candidate| candidate.as_str().map(ToOwned::to_owned))
+                    .collect();
+                (id, candidates)
             })
             .collect();
         assert_eq!(
-            answered,
-            vec!["thread-catalogued".to_string()],
-            "the catalog answers; the rollout-bearing thread stays silent"
+            answered.get("thread-catalogued").map(Vec::as_slice),
+            Some(&["Catalogued thread name".to_string()][..]),
+            "the Thread-name catalog outranks everything"
+        );
+        assert_eq!(
+            answered.get("thread-raw").map(Vec::as_slice),
+            Some(&["the raw first prompt for thread b".to_string()][..]),
+            "no catalog row: the rollout's first real prompt IS the picker display"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

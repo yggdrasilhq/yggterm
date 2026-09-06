@@ -27221,3 +27221,26 @@ found above accumulated non-chrome rows is transcript wearing the marker,
 which must answer `None` ("no composer here"), never "draft". The same
 ambiguity probably affects every CLI whose history rendering reuses its
 composer marker.
+
+## [11.67] ROW (AND PANE) DRAGGING IS SLUGGISH — THE SHARED LIBYGGTERM DRAG PATH PAYING PER-FRAME COSTS EVERYWHERE
+
+**Status:** OPEN
+
+Owner report 2026-09-06: "row dragging around is sluggish. There are drag UX
+blocks everywhere (any libyggterm app's implementation also suffers the same
+issue)." Not a yggterm-row-only defect: the drag/reorder interaction lives in
+the SHARED libyggterm app-platform layer, so every app that hosts a draggable
+list/pane inherits the jank.
+
+Symptom class to measure first: drag latency (pointer event -> visual
+movement), frame drops during drag, and whether each pointer move triggers a
+full relayout/re-render of the whole list instead of a transform on the
+dragged element. The cli-integration suspicion: reorder writes may be
+synchronous-and-durable per move (persisted order on every pointer delta)
+rather than on drop.
+
+Falsifier recipe: `server perf-summary --category render` (or perf-incidents)
+while a drag runs, plus ytrace `rows_order` events (landed this lane — one
+event per ORDER CHANGE, so a drag storm of events = per-move persistence, no
+events until drop = render-side cost). Fix owner: the libyggterm pane/drag
+layer (ymacs campaign shares the fix).
