@@ -4158,6 +4158,52 @@ pub struct AppTitlebarSwitch {
     pub segments: Vec<AppTitlebarSwitchSegment>,
 }
 
+/// One row of an app-declared command palette. `id` is the app's own
+/// handle and comes straight back on a `palette-accept` POST; this host
+/// never parses it (the yggui component's law, verbatim).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaletteItem {
+    id: String,
+    label: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    hint: String,
+}
+
+/// The app's COMMAND PALETTE surface (spec-primitives S3; ymacs' M-x is
+/// the forcing consumer). Present in a document schema ⇒ the surface
+/// renders the yggui command palette — the same component the shell's
+/// own omnibox uses — centered over its own scrim, with the app's query,
+/// rows and selection. The app owns ALL of that state (ymacs: the
+/// minibuffer state machine); this host only renders it and routes its
+/// two gestures: a row click / Enter POST `palette-accept` with the
+/// row's id, the scrim / Escape POST `palette-dismiss`. The component's
+/// arrows and Home/End POST `palette-move`; those chords never reach the
+/// app as key events (the root key plane skips exactly the component's
+/// vocabulary), so typing, TAB, C-n/C-p and C-g keep flowing through the
+/// key plane and the palette stays Emacs-keyed. Absent ⇒ closed: the
+/// key is OMITTED by an app, never null (serde(default) keeps older
+/// apps rendering untouched).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPanePalette {
+    /// The query as the app holds it. The field is a VIEW of this.
+    query: String,
+    /// The field's placeholder — the minibuffer prompt ("M-x").
+    #[serde(default)]
+    prompt: String,
+    /// Index into `items`; out-of-range clamps in the component.
+    #[serde(default)]
+    selected: usize,
+    /// ALREADY filtered and ordered — ranking is the app's business.
+    #[serde(default)]
+    items: Vec<AppPaletteItem>,
+    /// The empty-list voice (ymacs: the last "[No match]" refusal).
+    /// Empty means the component's own "No matches".
+    #[serde(default)]
+    empty: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct AppPaneSchema {
     #[serde(default)]
@@ -4211,6 +4257,9 @@ struct AppPaneSchema {
     /// a second, drifting door (the 2026-07-22 two-arms lesson).
     #[serde(default)]
     key_capture: bool,
+    /// The app's command palette overlay (S3) — see [`AppPanePalette`].
+    #[serde(default)]
+    palette: Option<AppPanePalette>,
 }
 
 fn app_pane_text_input_word_wrap_default() -> bool {
@@ -25941,6 +25990,8 @@ impl ShellState {
             split_ratio: None,
             // A modal is a form, not an editor: its keys are its own.
             key_capture: false,
+            // No overlay over a dialog.
+            palette: None,
         };
         let mounted = self
             .app_pane_modal
@@ -26690,6 +26741,15 @@ impl ShellState {
         let state = channel.schema.as_ref()?;
         state.schema.key_capture.then(|| state.pane_id.clone())
     }
+    /// Whether the live document schema of the session declares the app's
+    /// command palette overlay (S3). ONE reader (the two-arms lesson):
+    /// the root key plane asks it before forwarding chords, so the
+    /// component's consumed keys and the skip-set cannot drift apart.
+    fn document_pane_palette_open(&self, session_path: &str) -> bool {
+        self.document_pane_channel(session_path)
+            .and_then(|channel| channel.schema.as_ref())
+            .is_some_and(|state| state.schema.palette.is_some())
+    }
     fn document_pane_next_request(&mut self, session_path: &str) -> u64 {
         let channel = self
             .document_panes
@@ -26781,6 +26841,22 @@ impl ShellState {
             // The app now knows this declared value; it becomes the settled
             // baseline for the next echo comparison.
             last_sent.insert(id, declared);
+        }
+        // The palette overlay's field revision (S3): the field remounts
+        // only when the app re-declared a DIFFERENT palette block. The app
+        // echoes the query per keystroke — ymacs' per-chord render — and
+        // an echo must not remount the field the user is reading, exactly
+        // like the widget echo law above. One epoch id, "palette".
+        if let Some(palette) = schema.palette.as_ref() {
+            let epoch = previous_epochs.get("palette").copied().unwrap_or(0);
+            let changed = mounted
+                .and_then(|state| state.schema.palette.as_ref())
+                .map(|previous| previous != palette)
+                .unwrap_or(true);
+            value_epochs.insert(
+                "palette".to_string(),
+                if changed { epoch.wrapping_add(1) } else { epoch },
+            );
         }
         channel.values = values;
         channel.last_sent = last_sent;

@@ -54,6 +54,34 @@ mod tests {
     /// screenshot) while the frame-hash probes report a persistent
     /// mismatch nobody could attribute. The startup resize repair must
     /// classify that error class and name the divorce beside the probes.
+    /// The app's command palette (S3) renders with the yggui component —
+    /// never as document widgets (the owner correction, 2026-09-06: a
+    /// palette is a surface like the sidebar is a surface).
+    #[test]
+    fn document_surface_renders_a_declared_palette_with_the_yggui_component() {
+        let body = include_str!("right_rail.rs");
+        assert!(
+            body.contains("yggui::CommandPalette {"),
+            "the overlay is the shared component, not a hand-rolled list"
+        );
+        assert!(
+            body.contains("yggui::YGGUI_COMMAND_PALETTE_CSS"),
+            "the component's stylesheet rides the overlay"
+        );
+        for action in ["palette-move", "palette-accept", "palette-dismiss"] {
+            assert!(
+                body.contains(&format!("\"{action}\"")),
+                "{action} must POST on the document channel"
+            );
+        }
+        // The key plane's skip-set lives with the chord speller it guards.
+        let launch = include_str!("launch.rs");
+        assert!(
+            launch.contains("palette_surface_consumes"),
+            "the gate is one helper, tested in the key plane locks"
+        );
+    }
+
     #[test]
     fn the_unownable_remote_resize_divorce_is_named_on_the_gui_side() {
         let source = SHELL_SOURCE;
@@ -2475,6 +2503,7 @@ mod tests {
             ribbon: Vec::new(),
             split_ratio: None,
             key_capture: false,
+            palette: None,
         };
 
         let seq_a = shell.document_pane_next_request("local://a");
@@ -4404,6 +4433,7 @@ JSON.stringify({{
             title: "Doc".to_string(),
             titlebar_switch: None,
             key_capture: false,
+            palette: None,
             widgets: vec![AppPaneWidget::TextInput {
                 id: "editor".into(),
                 label: String::new(),

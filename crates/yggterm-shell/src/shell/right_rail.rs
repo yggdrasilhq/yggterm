@@ -3324,6 +3324,22 @@ fn DocumentSurfaceBody(
         .iter()
         .any(|w| matches!(w, AppPaneWidget::Tabs { id, active, .. } if id == "view_mode" && active == "icons"));
 
+    // The palette rows, mapped to the component's type BEFORE the rsx —
+    // a generic `let` inside rsx! trips the macro's parser.
+    let palette_items: Vec<yggui::CommandPaletteItem> = schema
+        .as_ref()
+        .and_then(|s| s.palette.as_ref())
+        .map(|spec| {
+            spec.items
+                .iter()
+                .map(|item| {
+                    yggui::CommandPaletteItem::new(item.id.clone(), item.label.clone())
+                        .detail(item.detail.clone())
+                        .hint(item.hint.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     rsx! {
         div {
             "data-document-surface": "{pane_id}",
@@ -3532,6 +3548,70 @@ fn DocumentSurfaceBody(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // The app's COMMAND PALETTE surface (spec-primitives S3;
+            // ymacs' M-x the forcing consumer): the app declares the
+            // palette in its schema, the shell renders it with the yggui
+            // palette component — the SAME object the shell's own omnibox
+            // uses — centered, over its own scrim. The app owns query,
+            // items and selection; this is a VIEW. The component's keys
+            // (arrows/Home/End/Enter/Escape) never reach the app as
+            // chords — the key plane skips exactly that set — they arrive
+            // as the actions below. Mouse: a row accepts, the scrim
+            // dismisses.
+            if let Some(app_palette) = schema.as_ref().and_then(|s| s.palette.as_ref()) {
+                div {
+                    style { {yggui::YGGUI_COMMAND_PALETTE_CSS} }
+                    yggui::CommandPalette {
+                        palette: yggui::CommandPalettePalette::new(
+                            snapshot.palette.text.clone(),
+                            snapshot.palette.muted.clone(),
+                            snapshot.palette.panel.clone(),
+                            snapshot.palette.border.clone(),
+                            snapshot.palette.accent_soft.clone(),
+                            "rgba(16,24,34,0.34)",
+                        ),
+                        query: app_palette.query.clone(),
+                        items: palette_items.clone(),
+                        selected: app_palette.selected,
+                        placeholder: app_palette.prompt.clone(),
+                        empty_label: if app_palette.empty.is_empty() {
+                            "No matches".to_string()
+                        } else {
+                            app_palette.empty.clone()
+                        },
+                        // The field's remount stamp: moves only when the
+                        // app re-declared a DIFFERENT palette — the
+                        // per-keystroke echo must not remount the field
+                        // under the user's eyes.
+                        revision: value_epochs.get("palette").copied().unwrap_or(0),
+                        on_query: move |_| {},
+                        on_move: {
+                            let run_action = run_action.clone();
+                            move |dir: yggui::PaletteMove| {
+                                let dir = match dir {
+                                    yggui::PaletteMove::Next => "next",
+                                    yggui::PaletteMove::Previous => "previous",
+                                    yggui::PaletteMove::First => "first",
+                                    yggui::PaletteMove::Last => "last",
+                                };
+                                run_action("palette-move".to_string(), Some(dir.to_string()));
+                            }
+                        },
+                        on_accept: {
+                            let run_action = run_action.clone();
+                            move |id: String| {
+                                run_action("palette-accept".to_string(), Some(id));
+                            }
+                        },
+                        on_dismiss: {
+                            let run_action = run_action.clone();
+                            move |_| {
+                                run_action("palette-dismiss".to_string(), None);
+                            }
+                        },
                     }
                 }
             }
