@@ -16040,8 +16040,15 @@ fn live_same_version_successor(home_dir: &Path) -> Option<u32> {
 }
 
 /// Throttled blocked-drain announcement: rows exist, an adopter may even be
-/// live, but nothing is migratable THIS tick — carry each row's blocking gate
-/// by name, once a minute (the §9 observability contract).
+/// live, but NO row passes the selector THIS tick — and the selector is
+/// `re_resumable && migratable`, NOT `migratable` alone. A row can be fully
+/// migratable with no gate and still never move because it is not a
+/// re-resumable agent (a plain shell); measured on the GUI host 2026-09-06 a
+/// drain announced `migratable: true` rows for an hour while nothing was
+/// eligible, and the event's own wording read as a contradiction. The
+/// payload now carries the selector and the eligible count (always 0 when
+/// this fires — the count is the proof, the selector is the reason), and
+/// each row's blocking gate verbatim, once a minute (§9 observability).
 fn announce_migration_candidates_blocked(home_dir: &Path, rows: &[MigrationCandidateRow]) {
     static LAST_ANNOUNCED_MS: AtomicU64 = AtomicU64::new(0);
     let now = current_millis_u64();
@@ -16066,6 +16073,17 @@ fn announce_migration_candidates_blocked(home_dir: &Path, rows: &[MigrationCandi
                     "blocking_gate": row.blocking_gate,
                 }))
                 .collect::<Vec<_>>(),
+            // The selector, stated where the rows are read: a row with
+            // `migratable: true` here is NOT eligible unless it is ALSO
+            // re-resumable. This count is 0 whenever this event fires (the
+            // caller only announces when the selector found nothing), and
+            // carrying it turns "migratable but not moving" from a
+            // contradiction into a reading.
+            "selector": "re_resumable && migratable",
+            "eligible": rows
+                .iter()
+                .filter(|row| row.re_resumable && row.migratable)
+                .count(),
             "current_pid": std::process::id(),
         }),
     );
@@ -23038,6 +23056,31 @@ impl Drop for HotRestartRepairInFlight {
 /// [`hot_restart_repair::REPAIR_WINDOW_MS`], which dispatch can never be
 /// acting on (an expired record is never dispatched, so no batch can be in
 /// flight against one) — the two cannot collide.
+
+/// [11.68] The preserved-owner registry only pruned itself WHEN SOMEBODY
+/// READ IT: `load()` carries the prune (dead-pid entries past the recent
+/// window), but every load-site is an operation ON the registry — a host
+/// with no hot-restart activity never runs one, so orphaned holder entries
+/// persisted for as long as the host stayed quiet (measured: two entries
+/// whose holder pid died 12h+ earlier, still in the file). The prune's
+/// 5-minute threshold already encodes the decision; what was missing was a
+/// TRIGGER that does not depend on a reader. This thread is that trigger:
+/// one load per minute, which prunes + saves only when something was
+/// actually removed (the load's own `stale_registry_pruned_on_load` event
+/// is the trace), and reads as a no-op the rest of the time.
+fn spawn_preserved_owner_registry_prune(home_dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("owner-registry-prune".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            // The prune is load()'s own side effect; nothing else to do here.
+            PreservedTerminalOwnerRegistry::load(&home_dir);
+        });
+    if let Err(error) = spawned {
+        warn!(error=%error, "failed to spawn the preserved-owner registry prune thread");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn spawn_interrupted_record_expiry_sweeper(home_dir: PathBuf) {
     let spawned = std::thread::Builder::new()
@@ -24627,6 +24670,8 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // executor is the thread most likely to die is no law. Own thread.
         #[cfg(target_os = "linux")]
         spawn_interrupted_record_expiry_sweeper(home_dir.clone());
+        // [11.68] The registry's prune must not wait for a reader either.
+        spawn_preserved_owner_registry_prune(home_dir.clone());
         spawn_superseded_daemon_takeover(runtime.clone());
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();

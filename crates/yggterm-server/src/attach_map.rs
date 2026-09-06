@@ -200,10 +200,20 @@ pub struct DaemonMapRow {
     /// asked" are different facts.
     pub answer_ms: Option<u64>,
     pub uptime_ms: u64,
-    pub owned_terminal_session_count: usize,
-    pub preserved_terminal_owner_count: usize,
-    pub live_terminal_session_count: usize,
-    pub stored_terminal_session_count: usize,
+    /// ⛔ `None` is "nothing answered, so this is UNAVAILABLE" — never a
+    /// zero. The zero-fill cost a misread on the first diagnosis session: a
+    /// bequeathed predecessor read as "owns 0" in JSON while it held live
+    /// PTYs, and only the process table said otherwise. See
+    /// [`crate::attach_map::classify_stranded_daemon`].
+    pub owned_terminal_session_count: Option<usize>,
+    pub preserved_terminal_owner_count: Option<usize>,
+    pub live_terminal_session_count: Option<usize>,
+    pub stored_terminal_session_count: Option<usize>,
+    /// PTY masters the process holds, straight from its descriptor table —
+    /// the one count that survives when the daemon answers nothing (the
+    /// census computes it for stranded rows; a bequeathed predecessor
+    /// holding 13 of them is a DIFFERENT fact from one holding none).
+    pub pty_master_count: Option<usize>,
     pub hot_restart_pending: bool,
     pub hot_restart_blocker_count: usize,
     pub permanent_blocker_count: usize,
@@ -371,6 +381,73 @@ pub(crate) fn probe_daemons(_home_dir: &Path) -> Vec<ProbedDaemon> {
     Vec::new()
 }
 
+/// The socket inodes a process actually holds, from its own descriptor table.
+#[cfg(target_os = "linux")]
+fn process_socket_inodes(pid: u32) -> std::collections::BTreeSet<u64> {
+    let mut inodes = std::collections::BTreeSet::new();
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return inodes;
+    };
+    for fd in fds.flatten() {
+        let Ok(target) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        let raw = target.to_string_lossy();
+        if let Some(inner) = raw.strip_prefix("socket:[").and_then(|rest| rest.strip_suffix(']')) {
+            if let Ok(ino) = inner.parse::<u64>() {
+                inodes.insert(ino);
+            }
+        }
+    }
+    inodes
+}
+
+/// Decide [`StrandedListenerState`] for one stranded daemon: does any socket
+/// path it bound still carry an inode THE PROCESS holds (OwnsItsName —
+/// wedged), or does every surviving name belong to someone else (NameTaken —
+/// bequeathed)? Unreadable inputs are [`StrandedListenerState::Unverifiable`],
+/// never a guess in either direction.
+#[cfg(target_os = "linux")]
+pub(crate) fn stranded_listener_state(
+    pid: u32,
+    bound_names: &[BoundNameRow],
+) -> StrandedListenerState {
+    use std::os::unix::fs::MetadataExt as _;
+    let process_inodes = process_socket_inodes(pid);
+    if process_inodes.is_empty() {
+        return StrandedListenerState::Unverifiable;
+    }
+    let mut saw_a_name = false;
+    for name in bound_names {
+        // A path that no longer exists or was diverted says nothing about
+        // ownership of the LISTENER; only a real socket file at the path can
+        // be compared by inode.
+        if name.verdict.starts_with("diverted") || name.verdict == "unlinked" {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&name.path) else {
+            continue;
+        };
+        saw_a_name = true;
+        if process_inodes.contains(&meta.ino()) {
+            return StrandedListenerState::OwnsItsName;
+        }
+    }
+    if saw_a_name {
+        StrandedListenerState::NameTaken
+    } else {
+        StrandedListenerState::Unverifiable
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn stranded_listener_state(
+    _pid: u32,
+    _bound_names: &[BoundNameRow],
+) -> StrandedListenerState {
+    StrandedListenerState::Unverifiable
+}
+
 // ---------------------------------------------------------------------------
 // Classification — pure, so every rule here is testable without a daemon
 // ---------------------------------------------------------------------------
@@ -414,24 +491,57 @@ pub(crate) fn classify_reached_daemon(
     state
 }
 
-/// The findings for one STRANDED daemon: it is failed by definition — alive in
-/// the process table, answering nothing — and the bound-name verdicts say WHY
-/// a dial cannot reach it.
-pub(crate) fn classify_stranded_daemon(bound_names: &[BoundNameRow]) -> MapState {
-    let summary = if bound_names.is_empty() {
-        "process alive but answered nothing; the kernel bind table could not say which names it holds"
-            .to_string()
+/// Whose listener is at the socket path a stranded process bound?
+///
+/// ⛔ A bequeathed predecessor and a wedged daemon both "answer nothing", and
+/// they are DIFFERENT diagnoses with different remedies. The bequeathed
+/// predecessor is UNADDRESSABLE BY DESIGN — the successor rebound its name,
+/// no path reaches it, and it lingers only while its drain is working (or
+/// stuck, which the drain's own events name). A daemon that still owns its
+/// name and answers nothing has a wedged accept loop or a held runtime lock
+/// — a genuinely broken process. Measured on the first diagnosis session:
+/// the predecessor's listeners were NAMELESS in the kernel table (its inode
+/// lives nowhere) while the path carried the successor's inode — the census's
+/// `Present` verdict on that path is the successor's health, not its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StrandedListenerState {
+    /// The path's socket file carries an inode the process does NOT hold —
+    /// the name was taken (a successor rebound it).
+    NameTaken,
+    /// At least one bound path still carries an inode the process itself
+    /// holds — it owns its name and answered nothing anyway: wedged.
+    OwnsItsName,
+    /// The inodes could not be read — say so, never guess.
+    Unverifiable,
+}
+
+/// The findings for one STRANDED daemon. The bound-name verdicts say WHY a
+/// dial cannot reach it; the listener state says whether that is the handoff
+/// working as designed or a process gone deaf.
+pub(crate) fn classify_stranded_daemon(
+    bound_names: &[BoundNameRow],
+    listener_state: &StrandedListenerState,
+) -> MapState {
+    let names = if bound_names.is_empty() {
+        "the kernel bind table could not say which names it holds".to_string()
     } else {
         let names: Vec<String> = bound_names
             .iter()
             .map(|name| format!("{} [{}]", name.path, name.verdict))
             .collect();
-        format!(
-            "process alive but answered nothing; names it bound: {}",
-            names.join(", ")
-        )
+        format!("names it bound: {}", names.join(", "))
     };
-    MapState::failed(summary)
+    match listener_state {
+        StrandedListenerState::NameTaken => MapState::warning(format!(
+            "bequeathed predecessor: its socket name now belongs to another listener —              unaddressable by design, no dial can reach it; it retires when its drain              empties ({names})"
+        )),
+        StrandedListenerState::OwnsItsName => MapState::failed(format!(
+            "process alive, still owns its socket name, and answered nothing — wedged              accept loop or a held runtime lock ({names})"
+        )),
+        StrandedListenerState::Unverifiable => MapState::failed(format!(
+            "process alive but answered nothing; the inode check could not say whether              it still owns its name ({names})"
+        )),
+    }
 }
 
 /// The findings for one client-instance record.
@@ -725,6 +835,7 @@ pub(crate) fn assemble_report(
     machines: Vec<RemoteMachineMapRow>,
     newest_installed: Option<(u64, u64, u64)>,
     default_label: String,
+    stranded_listener_states: &std::collections::BTreeMap<u32, StrandedListenerState>,
 ) -> AttachMapReport {
     let peer_summaries: Vec<PeerDaemonSummary> = probes
         .iter()
@@ -795,10 +906,11 @@ pub(crate) fn assemble_report(
             endpoint: probe.label.clone(),
             answer_ms: Some(*answer_ms),
             uptime_ms: status.daemon_uptime_ms,
-            owned_terminal_session_count: status.owned_terminal_session_count,
-            preserved_terminal_owner_count: status.preserved_terminal_owner_count,
-            live_terminal_session_count: status.live_terminal_sessions.len(),
-            stored_terminal_session_count: status.stored_terminal_session_count,
+            owned_terminal_session_count: Some(status.owned_terminal_session_count),
+            preserved_terminal_owner_count: Some(status.preserved_terminal_owner_count),
+            live_terminal_session_count: Some(status.live_terminal_sessions.len()),
+            stored_terminal_session_count: Some(status.stored_terminal_session_count),
+            pty_master_count: None,
             hot_restart_pending: status.hot_restart_pending,
             hot_restart_blocker_count: status.hot_restart_blockers.len(),
             permanent_blocker_count: status
@@ -824,7 +936,11 @@ pub(crate) fn assemble_report(
                 is_request_socket: name.is_request_socket,
             })
             .collect();
-        let state = classify_stranded_daemon(&bound_names);
+        let listener_state = stranded_listener_states
+            .get(&stranded.pid)
+            .cloned()
+            .unwrap_or(StrandedListenerState::Unverifiable);
+        let state = classify_stranded_daemon(&bound_names, &listener_state);
         daemons.push(DaemonMapRow {
             pid: stranded.pid,
             version: "<unanswered>".to_string(),
@@ -832,13 +948,14 @@ pub(crate) fn assemble_report(
             endpoint: String::new(),
             answer_ms: None,
             uptime_ms: stranded.uptime_ms.unwrap_or(0),
-            owned_terminal_session_count: 0,
-            preserved_terminal_owner_count: 0,
-            live_terminal_session_count: 0,
-            stored_terminal_session_count: 0,
+            owned_terminal_session_count: None,
+            preserved_terminal_owner_count: None,
+            live_terminal_session_count: None,
+            stored_terminal_session_count: None,
             hot_restart_pending: false,
             hot_restart_blocker_count: 0,
             permanent_blocker_count: 0,
+            pty_master_count: stranded.pty_master_count,
             exe_deleted: stranded.exe_deleted,
             is_default_endpoint: false,
             bound_names,
@@ -984,6 +1101,29 @@ pub fn run_server_attach_map(home_dir: &Path, json: bool) -> Result<()> {
 
     let default_label = crate::daemon::owner_endpoint_label_for_map(&default_endpoint(home_dir));
 
+    // The listener-state probe for stranded daemons: whose inode is at each
+    // bound path? This is what splits the bequeathed predecessor (name taken,
+    // by design) from the wedged daemon (owns its name, deaf anyway).
+    let stranded_listener_states: std::collections::BTreeMap<u32, StrandedListenerState> = census
+        .stranded
+        .iter()
+        .map(|stranded| {
+            let names: Vec<BoundNameRow> = stranded
+                .bound_names
+                .iter()
+                .map(|name| BoundNameRow {
+                    path: name.path.clone(),
+                    verdict: bound_name_verdict_label(&name.verdict),
+                    is_request_socket: name.is_request_socket,
+                })
+                .collect();
+            (
+                stranded.pid,
+                stranded_listener_state(stranded.pid, &names),
+            )
+        })
+        .collect();
+
     let report = assemble_report(
         host.clone(),
         generated_at_ms,
@@ -994,6 +1134,7 @@ pub fn run_server_attach_map(home_dir: &Path, json: bool) -> Result<()> {
         machines,
         newest_installed_version(home_dir),
         default_label,
+        &stranded_listener_states,
     );
 
     emit_map_trace_events(home_dir, &report);
@@ -1233,17 +1374,21 @@ fn format_daemon_row(daemon: &DaemonMapRow) -> String {
             daemon.endpoint,
             daemon.answer_ms.unwrap_or(0),
             human_duration(daemon.uptime_ms),
-            daemon.owned_terminal_session_count,
-            daemon.preserved_terminal_owner_count,
-            daemon.live_terminal_session_count,
-            daemon.stored_terminal_session_count,
+            daemon.owned_terminal_session_count.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
+            daemon.preserved_terminal_owner_count.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
+            daemon.live_terminal_session_count.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
+            daemon.stored_terminal_session_count.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into()),
         )
     } else {
         format!(
-            "  {:<8} pid {:<7} · up {} · counts unavailable when nothing answers",
+            "  {:<8} pid {:<7} · up {} · owns n/a{} · counts unavailable when nothing answers",
             daemon.state.label(),
             daemon.pid,
             human_duration(daemon.uptime_ms),
+            match daemon.pty_master_count {
+                Some(n) => format!(" · {} pty masters held", n),
+                None => String::new(),
+            },
         )
     };
     if daemon.is_default_endpoint {
@@ -1330,11 +1475,14 @@ mod tests {
 
     #[test]
     fn a_stranded_daemon_names_its_bound_names_and_their_verdicts() {
-        let state = classify_stranded_daemon(&[BoundNameRow {
-            path: "/home/x/.yggterm/server-3-1-12.sock".to_string(),
-            verdict: "diverted → /home/x/.yggterm/server-3-2-0.sock".to_string(),
-            is_request_socket: true,
-        }]);
+        let state = classify_stranded_daemon(
+            &[BoundNameRow {
+                path: "/home/x/.yggterm/server-3-1-12.sock".to_string(),
+                verdict: "diverted → /home/x/.yggterm/server-3-2-0.sock".to_string(),
+                is_request_socket: true,
+            }],
+            &StrandedListenerState::OwnsItsName,
+        );
         match &state {
             MapState::Failed { reason } => {
                 assert!(reason.contains("server-3-1-12.sock"), "{reason}");
@@ -1345,9 +1493,51 @@ mod tests {
     }
 
     #[test]
-    fn a_stranded_daemon_without_names_says_the_bind_table_could_not_say() {
-        match classify_stranded_daemon(&[]) {
-            MapState::Failed { reason } => assert!(reason.contains("could not say"), "{reason}"),
+    fn a_stranded_daemon_without_names_says_so_under_any_listener_state() {
+        for state in [StrandedListenerState::OwnsItsName, StrandedListenerState::Unverifiable] {
+            match classify_stranded_daemon(&[], &state) {
+                MapState::Failed { reason } => {
+                    assert!(reason.contains("could not say") || reason.contains("could not"), "{reason}")
+                }
+                other => panic!("expected failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bequeathed_predecessor_is_a_warning_that_names_the_design_not_a_failure() {
+        let state = classify_stranded_daemon(
+            &[BoundNameRow {
+                path: "/home/x/.yggterm/server-3-2-71.sock".to_string(),
+                verdict: "present".to_string(),
+                is_request_socket: true,
+            }],
+            &StrandedListenerState::NameTaken,
+        );
+        match &state {
+            MapState::Warning { reason } => {
+                assert!(reason.contains("bequeathed predecessor"), "{reason}");
+                assert!(reason.contains("unaddressable by design"), "{reason}");
+                assert!(reason.contains("server-3-2-71.sock"), "{reason}");
+            }
+            other => panic!("expected warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_daemon_still_owning_its_name_and_deaf_reads_wedged() {
+        let state = classify_stranded_daemon(
+            &[BoundNameRow {
+                path: "/home/x/.yggterm/server-3-2-71.sock".to_string(),
+                verdict: "present".to_string(),
+                is_request_socket: true,
+            }],
+            &StrandedListenerState::OwnsItsName,
+        );
+        match &state {
+            MapState::Failed { reason } => {
+                assert!(reason.contains("wedged"), "{reason}");
+            }
             other => panic!("expected failed, got {other:?}"),
         }
     }
@@ -1457,10 +1647,11 @@ mod tests {
                 endpoint: "unix-/tmp/x.sock".to_string(),
                 answer_ms: Some(2),
                 uptime_ms: 0,
-                owned_terminal_session_count: 0,
-                preserved_terminal_owner_count: 0,
-                live_terminal_session_count: 0,
-                stored_terminal_session_count: 0,
+                owned_terminal_session_count: Some(0),
+                preserved_terminal_owner_count: Some(0),
+                live_terminal_session_count: Some(0),
+                stored_terminal_session_count: Some(0),
+                pty_master_count: None,
                 hot_restart_pending: false,
                 hot_restart_blocker_count: 0,
                 permanent_blocker_count: 0,
