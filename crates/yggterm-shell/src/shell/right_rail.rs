@@ -3587,6 +3587,13 @@ fn DocumentSurfaceBody(
                         // per-keystroke echo must not remount the field
                         // under the user's eyes.
                         revision: value_epochs.get("palette").copied().unwrap_or(0),
+                        // The omnibox flourish, fed by the app: the
+                        // top-ranked candidate extends the query, shown
+                        // with the tail selected so typing is
+                        // uninterrupted; TAB/Enter take it.
+                        completion: (!app_palette.completion.is_empty())
+                            .then(|| app_palette.completion.clone()),
+                        completion_typed_len: app_palette.completion_typed_len,
                         on_query: move |_| {},
                         on_move: {
                             let run_action = run_action.clone();
