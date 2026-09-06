@@ -27199,7 +27199,7 @@ foreground veto at full force for shell rows and unreadable transcripts
 
 ## ⛔ [11.66] THE COMPOSER DRAFT DETECTOR FALSE-POSITIVES ON RESUMED CODEX SCREENS — HISTORY USER-MESSAGES WEAR THE COMPOSER'S OWN MARKER
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Found 2026-09-06 ~03:1x by the migration drain's own blocked announcements:
 a resumed codex row (idle 800+ s, never typed into) held
