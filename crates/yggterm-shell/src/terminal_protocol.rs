@@ -67,6 +67,11 @@ pub(crate) enum TerminalJsCommand {
     /// the thing being avoided, so a spinner would be the opposite of the point.
     SetHandoverPaintSuspended {
         suspended: bool,
+        /// The honest veil text ([11.68]): `None` = an update is genuinely in
+        /// flight and the default wording applies; `Some(text)` names what is
+        /// actually happening instead (preserved rows on an older daemon).
+        #[serde(default)]
+        label: Option<String>,
     },
 }
 
