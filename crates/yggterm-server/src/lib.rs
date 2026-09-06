@@ -25065,14 +25065,14 @@ pub fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow
         endpoints.sort_by_key(|endpoint| format!("{endpoint:?}"));
         endpoints.dedup();
         for endpoint in endpoints {
-            let _ = remove_session(&endpoint, &runtime_key);
+            let _ = remove_session(&endpoint, &runtime_key, false);
             if let Ok((daemon_snapshot, _)) = snapshot(&endpoint) {
                 for live in daemon_snapshot
                     .live_sessions
                     .into_iter()
                     .filter(|live| live.id == session_id)
                 {
-                    let _ = remove_session(&endpoint, &live.session_path);
+                    let _ = remove_session(&endpoint, &live.session_path, false);
                 }
             }
         }
@@ -26957,7 +26957,11 @@ fn despawn_local_row(key: &str) -> serde_json::Value {
     let mut tombstones = crate::live_row_tombstones::LiveRowTombstones::load(&home, now);
     let veto_recorded = tombstones.record_close(&home, key, now).unwrap_or(false);
     let endpoint = server_cli::cli_server_endpoint(&home);
-    match crate::remove_session(&endpoint, key) {
+    // despawn=true: the daemon arm refuses while a live runtime holds the
+    // row, then does the tombstone + removal + row_despawned trace itself
+    // (the local record_close above stays — it wins the restore race the
+    // daemon cannot see).
+    match crate::remove_session(&endpoint, key, true) {
         Ok((_snapshot, message)) => serde_json::json!({
             "key": key,
             "despawned": true,

@@ -74,6 +74,7 @@ use yggterm_server::{
     run_app_control_trigger_update_check, run_attach, run_daemon,
     run_screenrecord_capture, run_screenshot_capture, run_screenshot_capture_with_post_process,
     parse_trace_limit, parse_trace_poll_ms,
+    remove_session,
     run_trace_bundle, run_trace_follow, run_trace_tail, run_trace_transitions, shutdown, snapshot,
     start_local_session, status, terminal_history, terminal_resize, terminal_restart,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, try_run_remote_server_command,
@@ -939,6 +940,9 @@ fn print_server_help() {
   yggterm server terminal screen <session> [--retained] [--raw] [--history]
   yggterm server terminal app-declares <session>
   yggterm server terminal resize <session> --cols <n> --rows <n>
+  yggterm server rows despawn <session-key>
+    evict a dead row's record: remove + tombstone so it stops resurrecting
+    (refused while a live runtime holds the row — close that instead)
   yggterm server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
   yggterm server smoke
