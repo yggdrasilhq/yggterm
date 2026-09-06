@@ -27222,58 +27222,35 @@ which must answer `None` ("no composer here"), never "draft". The same
 ambiguity probably affects every CLI whose history rendering reuses its
 composer marker.
 
-## [11.67] ROW (AND PANE) DRAGGING IS SLUGGISH — THE SHARED LIBYGGTERM DRAG PATH PAYING PER-FRAME COSTS EVERYWHERE
+## ⛔ [11.72] THE WRAPPER TREE DEFEATED THE STRANDED-ORPHAN REAP — CODEX'S WRITER LOCK STAYED HELD FOR 19 HOURS (-32600 ON EVERY RESUME)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-Owner report 2026-09-06: "row dragging around is sluggish. There are drag UX
-blocks everywhere (any libyggterm app's implementation also suffers the same
-issue)." Not a yggterm-row-only defect: the drag/reorder interaction lives in
-the SHARED libyggterm app-platform layer, so every app that hosts a draggable
-list/pane inherits the jank.
+The 2026-09-06 22:05 owner screenshot: the ydesign codex row answering
+`thread … already has an active writer (code -32600)` AGAIN, on the
+CONVERGED fleet (daemon 3.2.71, 4 owned · 0 preserved). The holder pair was
+found live and measured: the npm shim (`node …/bin/codex … resume … <id>`,
+ppid 1 — orphaned to init) with the real codex binary hanging UNDER it
+(ppid = the shim's pid). The [11.63] reap predicate demanded EVERY holder
+carry `ppid == 1`; the wrapper tree can never match (only the shim's parent
+is init), so no reap arm ever fired — the pair sat orphaned for 19 hours
+holding codex's writer lock while every resume bounced off -32600.
 
-Symptom class to measure first: drag latency (pointer event -> visual
-movement), frame drops during drag, and whether each pointer move triggers a
-full relayout/re-render of the whole list instead of a transform on the
-dragged element. The cli-integration suspicion: reorder writes may be
-synchronous-and-durable per move (persisted order on every pointer delta)
-rather than on drop.
+**Fix (`lane/cli/wrapper-tree-orphan`):** the orphan test is TREE-AWARE — a
+holder is orphaned when its parent is init OR another member of the same
+holder set (the wrapper); a parent outside the set keeps the veto. Applied
+to both recoverable predicates (the stranded-orphan reap and the
+dead-output widen). Locked by
+`a_wrapper_tree_of_stranded_orphans_is_recoverable`.
 
-Falsifier recipe: `server perf-summary --category render` (or perf-incidents)
-while a drag runs, plus ytrace `rows_order` events (landed this lane — one
-event per ORDER CHANGE, so a drag storm of events = per-move persistence, no
-events until drop = render-side cost). Fix owner: the libyggterm pane/drag
-layer (ymacs campaign shares the fix).
+**Cure applied by hand first (the pair was this seat's own 03:02 test
+spawn):** SIGTERM both members — the thread lock freed; the row resumes
+clean on the next open.
 
-## ⛔ [11.68] THE PRESERVED-OWNER REGISTRY ONLY CLEANS ITSELF WHEN SOMEBODY READS IT — ORPHANED HOLDER ENTRIES PERSIST ON A QUIET HOST (found by the first `server map` run, 2026-09-06)
-
-**Status:** OPEN
-
-**Owner:** the hot-restart/preserved-owner lane
-
-Measured on the build host 2026-09-06 ~21:05, by the first live run of the
-new `server map` verb: two entries in the hot-update terminal owners file
-whose holder pid (an old daemon generation) had been dead for 12h+ were
-still sitting in the registry — the map read them as `orphaned holder: pid
-gone for 12h34m, nobody can adopt this runtime`. The load-time prune
-(`PreservedTerminalOwnerRegistry::load`) removes exactly this shape — a
-dead-pid entry older than the 5-minute recent window — but it only runs WHEN
-SOMETHING CALLS `load()`. On a host with no hot-restart activity, nothing
-does: the registry is write-pruned, never sweep-pruned, so an orphan's
-persistence is a function of how quiet the host is, not of how dead the
-entry is. The daemon serving at read time was born 22 minutes earlier and
-had not yet touched the registry.
-
-Counter-hypothesis checked: the entries were not kept alive by re-writes —
-their `created_at_ms` sat ~12h back, matching the pid death window.
-
-**Why it matters:** the registry is the adopter's map of what is preserved.
-Stale entries make every reader re-derive "is this real?" by hand — the same
-tax the socket graveyard ([11.61]) collected, in a third registry. The
-prune's threshold already encodes the decision (5 min); the TRIGGER is what
-is wrong.
-
-**Fix shape (suggestion, owner to rule):** prune on a cadence the daemon
-already runs (the socket sweep's round, or a periodic task), not only at
-load. A read-only instrument must stay read-only — the cleanup belongs to
-the owner lane, not to whoever looks.
+**Open half of this entry:** the -32600 text was PAINTED, which means a
+resume SPAWNED at 02:34 despite the holder scan — the restore/recovery
+re-resume path may bypass the guard and twin-write during churn. With
+[11.67] retiring zombie holders that path may be unreachable in practice;
+falsify on the next natural rotation with an orphaned wrapper-tree present
+(the ensure path must reap, no -32600 may paint). If a spawn bypass
+recurrs, it gets its own entry.

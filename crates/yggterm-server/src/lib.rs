@@ -2398,7 +2398,27 @@ fn stranded_orphan_holders_recoverable(processes: &[ExternalCodexResumeProcess])
         && processes
             .iter()
             .all(|process| process.holder == AgentResumeHolderKind::StrandedYggtermOwned)
-        && processes.iter().all(|process| process.ppid == Some(1))
+        && holders_all_orphaned(processes)
+}
+
+/// ⛔ THE ORPHAN TEST IS TREE-AWARE (2026-09-06, the -32600 resurrection): the
+/// demand that EVERY holder carry `ppid == 1` fails on the WRAPPER TREE — the
+/// npm shim (`node …/bin/codex …`) orphans to init while the real CLI binary
+/// hangs under IT (ppid = the wrapper's pid, never 1), so a stranded pair
+/// {wrapper(ppid 1), binary(ppid wrapper)} defeated the test forever: no reap
+/// arm could fire, the writer lock stayed held, and codex refused every
+/// resume with its own -32600 "already has an active writer" (measured live:
+/// the pair sat orphaned for 19 hours while the row refused every attach).
+/// A holder counts as orphaned when its parent is init OR another member of
+/// this same holder set — a parent outside the set is a live process nobody
+/// may orphan by assertion.
+fn holders_all_orphaned(processes: &[ExternalCodexResumeProcess]) -> bool {
+    let holder_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+    processes.iter().all(|process| match process.ppid {
+        Some(1) => true,
+        Some(parent) => holder_pids.contains(&parent),
+        None => false,
+    })
 }
 
 /// The owner-ruled widen of the recovery predicate (2026-09-05): a holder that
@@ -2413,7 +2433,7 @@ fn stranded_orphan_holders_recoverable(processes: &[ExternalCodexResumeProcess])
 /// wait-and-banner behaviour: "cannot say dead" must never widen the kill.
 #[cfg(target_os = "linux")]
 fn orphaned_dead_output_holders_recoverable(processes: &[ExternalCodexResumeProcess]) -> bool {
-    if processes.is_empty() || processes.iter().any(|process| process.ppid != Some(1)) {
+    if processes.is_empty() || !holders_all_orphaned(processes) {
         return false;
     }
     let live = live_pts_devices();
@@ -16558,6 +16578,47 @@ mod restored_runtime_repair_tests {
         ]));
         // Nothing to recover from is not a recovery.
         assert!(!stranded_orphan_holders_recoverable(&[]));
+    }
+
+    /// ⛔ THE WRAPPER TREE IS ORPHANED ([11.63] completion, 2026-09-06): the
+    /// npm shim orphans to init while the real CLI hangs under IT — the
+    /// all(ppid==1) form never matched and the pair stranded for 19 hours
+    /// holding codex's writer lock (-32600 on every resume). A member whose
+    /// parent is another member of the set counts as orphaned; a parent
+    /// outside the set is a live process and keeps the veto.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wrapper_tree_of_stranded_orphans_is_recoverable() {
+        use super::{stranded_orphan_holders_recoverable, AgentResumeHolderKind};
+        let holder = |pid: u32, ppid: Option<u32>| super::ExternalCodexResumeProcess {
+            pid,
+            argv0: "codex".to_string(),
+            holder: AgentResumeHolderKind::StrandedYggtermOwned,
+            ppid,
+        };
+        // The measured tree: wrapper (ppid 1) + the real binary under it.
+        assert!(stranded_orphan_holders_recoverable(&[
+            holder(10, Some(1)),
+            holder(11, Some(10)),
+        ]));
+        // Three deep still reads as one orphaned tree.
+        assert!(stranded_orphan_holders_recoverable(&[
+            holder(10, Some(1)),
+            holder(11, Some(10)),
+            holder(12, Some(11)),
+        ]));
+        // A member hanging under a LIVE OUTSIDE parent keeps the veto —
+        // mixed with an orphaned wrapper, the strictest reading wins.
+        assert!(!stranded_orphan_holders_recoverable(&[
+            holder(10, Some(1)),
+            holder(11, Some(10)),
+            holder(12, Some(900)),
+        ]));
+        // No member orphaned to init: a live tree, never recoverable.
+        assert!(!stranded_orphan_holders_recoverable(&[
+            holder(20, Some(300)),
+            holder(21, Some(20)),
+        ]));
     }
 
     /// ⛔ THE MARKER PROVES BIRTH, NOT THE SESSION'S NAME (2026-09-05, the
