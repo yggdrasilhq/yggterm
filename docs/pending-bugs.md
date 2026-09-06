@@ -27254,3 +27254,95 @@ re-resume path may bypass the guard and twin-write during churn. With
 falsify on the next natural rotation with an orphaned wrapper-tree present
 (the ensure path must reap, no -32600 may paint). If a spawn bypass
 recurrs, it gets its own entry.
+
+## ⛔ [11.68] THE PRESERVED-OWNER REGISTRY ONLY CLEANS ITSELF WHEN SOMEBODY READS IT — ORPHANED HOLDER ENTRIES PERSIST ON A QUIET HOST (found by the first `server map` run, 2026-09-06)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Owner:** the hot-restart/preserved-owner lane
+
+Measured on the build host 2026-09-06 ~21:05, by the first live run of the
+new `server map` verb: two entries in the hot-update terminal owners file
+whose holder pid (an old daemon generation) had been dead for 12h+ were
+still sitting in the registry — the map read them as `orphaned holder: pid
+gone for 12h34m, nobody can adopt this runtime`. The load-time prune
+(`PreservedTerminalOwnerRegistry::load`) removes exactly this shape — a
+dead-pid entry older than the 5-minute recent window — but it only runs WHEN
+SOMETHING CALLS `load()`. On a host with no hot-restart activity, nothing
+does: the registry is write-pruned, never sweep-pruned, so an orphan's
+persistence is a function of how quiet the host is, not of how dead the
+entry is. The daemon serving at read time was born 22 minutes earlier and
+had not yet touched the registry.
+
+Counter-hypothesis checked: the entries were not kept alive by re-writes —
+their `created_at_ms` sat ~12h back, matching the pid death window.
+
+**Why it matters:** the registry is the adopter's map of what is preserved.
+Stale entries make every reader re-derive "is this real?" by hand — the same
+tax the socket graveyard ([11.61]) collected, in a third registry. The
+prune's threshold already encodes the decision (5 min); the TRIGGER is what
+is wrong.
+
+**Fix shape (suggestion, owner to rule):** prune on a cadence the daemon
+already runs (the socket sweep's round, or a periodic task), not only at
+load. A read-only instrument must stay read-only — the cleanup belongs to
+the owner lane, not to whoever looks.
+
+## ⛔ [11.69] A BEQUEATHED PREDECESSOR WHOSE ROWS ARE ALL NON-RESUMABLE NEVER RETIRES — EVERY DEPLOY MINTS ANOTHER FOREVER-DAEMON (diagnosed live 2026-09-06 with `server map` + the kernel bind table)
+
+**Status:** OPEN
+
+**Owner:** the daemon-handoff/drain lane (complements [11.64] and the
+stale-owner-retirement lane; diagnosis posted to infra/meta ACK-bb1117455c)
+
+The full life of one predecessor, measured on the GUI host: pid 4041056
+(v3.2.71, born ~20:27) was bequeathed twice (successors 4081064 ~21:13,
+4147285 ~21:5x) and survived both.
+
+1. **It is structurally unaddressable.** Its unix listeners are NAMELESS in
+   `/proc/net/unix` (inodes 35312425/35312426/35320957 carry no path),
+   while `server-3-2-71.sock` carries the successor's inode (9578090). No
+   filesystem path reaches the predecessor's listener, so every dial lands
+   on the successor and any host-wide read (census, map) marks it "answered
+   nothing". That half is the handoff working as designed.
+2. **Its drain cannot empty it.** `spawn_progressive_session_migration`
+   adopts out ONLY rows that are `re_resumable && migratable`. Its remaining
+   owned rows are plain shells (`re_resumable: false, migratable: true,
+   blocking_gate: null`), so `select_next_migration_candidate` returns None
+   every tick and the drain announced `progressive_migration_candidates_blocked`
+   every 30 s for an hour — the code's own comment calls this "lingering
+   harmlessly". It is not harmless: the process held 13 PTY masters, and a
+   host that deploys N times a day mints up to N such forever-daemons, one
+   per generation that happened to own a shell row. This is the engine
+   behind the measured "three daemon generations coexisting" shape.
+3. **Nothing else retires it.** The successor's `linux_daemon_sweep`
+   correctly refuses (`clean_preserved_owner_available: false` — the
+   predecessor holds live sessions; killing it would strand them), and the
+   once-per-boot sweep cadence never revisits.
+
+**Fix shapes (owner to rule):**
+- The drain hands off non-resumable rows too — a shell PTY can cross via
+  the preserve/adopt machinery the same way preserved owners already hold
+  rows across generations; or
+- a whole-succession arm: a same-version successor adopts the predecessor's
+  registry entries and sessions wholesale (it already holds the bequest
+  relationship and the retired-socket re-pointing mechanism), instead of
+  row-by-row release; or
+- at minimum, a bounded linger: a predecessor whose drain has been blocked
+  on `re_resumable: false` rows for a window (hours, not minutes) hands its
+  rows to the successor as preserved rows and exits, instead of holding
+  PTYs forever.
+
+**Instrument note:** `server map` now classifies this shape by inode
+comparison (warning: "bequeathed predecessor: its socket name now belongs to
+another listener") instead of a bare "answered nothing" failure, and carries
+the PTY-master count for unanswered daemons.
+
+**Fix (same session, `lane/trace/map-round-2`):** the prune no longer waits
+for a reader. The daemon spawns a dedicated `owner-registry-prune` thread at
+startup — one `load()` per minute, whose existing prune-and-save side effect
+(5-minute dead-pid window, `stale_registry_pruned_on_load` trace) now runs on
+a quiet host too. **Falsifier:** after the next daemon birth on the build
+host, the two 12h-old orphaned entries are gone from the registry within one
+prune tick, with the trace event naming the prune.
+
