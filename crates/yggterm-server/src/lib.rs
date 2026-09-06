@@ -38,6 +38,7 @@ mod frame_hash;
 // THE `server <verb>` surface's shared implementations. ⛔ Per-verb, NOT a
 // wholesale collapse — see the module note for why this surface differs from
 // `server app`.
+pub use attach_map::run_server_attach_map;
 pub mod server_cli;
 // NATIVE notification audio. It lived in the GUI binary's own module tree,
 // which is why `server app audio` did not exist on the headless CLI — the one
@@ -53,6 +54,7 @@ mod browser_import_cli;
 pub use browser_import_cli::{browser_import_usage_block, run_browser_import_cli};
 pub mod app_declare;
 mod attach;
+mod attach_map;
 /// Where a running process publishes the source it was built from — the plane
 /// `--build-commit` cannot reach, because it can only ask a file.
 pub mod build_identity;
@@ -25175,6 +25177,13 @@ fn client_instances_dir(home: &Path, endpoint: &ServerEndpoint) -> PathBuf {
     client_instances_root(home).join(client_instance_scope(endpoint))
 }
 
+/// The scope-directory spelling of an endpoint, for callers that must match a
+/// record's scope against a known endpoint (the attach map matches client
+/// claims to the sockets it actually dialled).
+pub fn client_instance_scope_label(endpoint: &ServerEndpoint) -> String {
+    client_instance_scope(endpoint)
+}
+
 fn client_instance_dirs_for_scan(home: &Path, endpoint: &ServerEndpoint) -> Vec<PathBuf> {
     let current = client_instances_dir(home, endpoint);
     let root = client_instances_root(home);
@@ -25251,7 +25260,7 @@ fn process_has_gui_client_argv(_pid: u32) -> bool {
     true
 }
 
-fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) -> bool {
+pub fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) -> bool {
     if !process_is_alive(record.pid) {
         return false;
     }

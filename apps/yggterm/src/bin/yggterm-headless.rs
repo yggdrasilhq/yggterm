@@ -2152,6 +2152,16 @@ impl std::io::Write for LossyStderrHandle {
         );
     }
     if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "map")
+    {
+        // ONE owner, both binaries — the live daemon attach map, the same
+        // host-fact shape as the census arm above.
+        return yggterm_server::run_server_attach_map(
+            store.home_dir(),
+            args.iter().any(|arg| arg == "--json"),
+        );
+    }
+    if args.first().is_some_and(|arg| arg == "server")
         && args.get(1).is_some_and(|arg| arg == "relay-boundary")
     {
         return yggterm_server::server_cli::run_server_relay_boundary_cli(&store, &args);
