@@ -20784,6 +20784,20 @@ impl ShellState {
         let Some(status) = self.latest_runtime_status.as_ref() else {
             return;
         };
+        // ⛔ [11.68] THE HONEST VEIL: name the actual state at observation
+        // time. An update genuinely in flight keeps the default "Daemon
+        // updating" wording (it is then TRUE); any other veil — preserved
+        // rows still served by an older daemon — must say so instead, never
+        // claim an update that is not happening.
+        let veil_label = if runtime_status_handoff_active(status) {
+            None
+        } else {
+            Some(format!(
+                "{} session(s) are still served by an older daemon — they settle as they idle.",
+                status.preserved_terminal_owner_keys.len()
+            ))
+        };
+        self.handover_gate.set_veil_label(veil_label);
         let observation = handover_observation_from_parts(
             runtime_status_handoff_active(status),
             &format!("pid={}:{}", status.server_pid, status.server_version),
@@ -20814,11 +20828,23 @@ impl ShellState {
                 // job notification, not a stack of toasts. No progress fraction —
                 // the daemon cannot tell us how far along a handover is, and a
                 // fake bar would be an invented source of truth.
+                // [11.68] The title and body name the truth: an update only
+                // when one is in flight; otherwise the preserved-rows state.
+                let (title, body) = match self.handover_gate.veil_label() {
+                    Some(label) => (
+                        "Sessions settling".to_string(),
+                        label,
+                    ),
+                    None => (
+                        "Daemon updating".to_string(),
+                        "Sessions will settle in a moment. The terminal is paused so the update stays cheap.".to_string(),
+                    ),
+                };
                 self.upsert_job_notification(
                     HANDOVER_NOTIFICATION_JOB_KEY,
                     NotificationTone::Info,
-                    "Daemon updating",
-                    "Sessions will settle in a moment. The terminal is paused so the update stays cheap.",
+                    &title,
+                    &body,
                     None,
                     false,
                     // Not about one session — every row is settling.
@@ -20851,6 +20877,10 @@ impl ShellState {
     /// runtime status at a call site.
     fn handover_paint_suspended(&self) -> bool {
         self.handover_gate.paint_suspended()
+    }
+    /// The honest veil text for the viewport script ([11.68]).
+    fn handover_veil_label(&self) -> Option<String> {
+        self.handover_gate.veil_label()
     }
     /// Project the daemon's own status into what the metadata rail renders. The daemon
     /// remains the single source of truth for every one of these facts — this narrows

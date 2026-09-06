@@ -6520,13 +6520,17 @@ fn TerminalCanvas(
                             tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
                     }
                 }
-                let (bridge_read_policy, handover_paint_suspended) = state.with(|shell| {
-                    (
-                        terminal_session_bridge_read_policy(shell, &session_path),
-                        // ⛔ THE handover predicate, read from its one owner.
-                        shell.handover_paint_suspended(),
-                    )
-                });
+                let (bridge_read_policy, handover_paint_suspended, handover_veil_label) =
+                    state.with(|shell| {
+                        (
+                            terminal_session_bridge_read_policy(shell, &session_path),
+                            // ⛔ THE handover predicate, read from its one owner.
+                            // ⛔ THE handover predicate + the honest veil
+                            // label ([11.68]), read from their one owner.
+                            shell.handover_paint_suspended(),
+                            shell.handover_veil_label(),
+                        )
+                    });
                 // Tell the host to stop its own render-health / visible-paint
                 // work and drop a static veil over the viewport for the
                 // duration. A spinner would be the opposite of the point.
@@ -6537,6 +6541,7 @@ fn TerminalCanvas(
                     last_handover_paint_suspended = handover_paint_suspended;
                     let _ = eval.send(TerminalJsCommand::SetHandoverPaintSuspended {
                         suspended: handover_paint_suspended,
+                        label: handover_veil_label,
                     });
                     append_trace_event(
                         &trace_home,
@@ -13992,6 +13997,7 @@ fn TerminalCanvas(
             if last_handover_paint_suspended {
                 let _ = eval.send(TerminalJsCommand::SetHandoverPaintSuspended {
                     suspended: false,
+                    label: None,
                 });
                 append_trace_event(
                     &trace_home,

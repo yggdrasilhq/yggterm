@@ -5767,7 +5767,7 @@ fn terminal_eval_script_with_canvas_renderer(
         // cold-mount veil uses (`.yggterm-cold-mount-veil`), so attachment
         // checks that count host children keep working. Solid host background +
         // one line of static text: no animation, no spinner, no timer.
-        const applyHandoverPaintVeil = (on) => {{
+        const applyHandoverPaintVeil = (on, veilText) => {{
             try {{
                 const existing = host.querySelector('.yggterm-handover-veil');
                 if (!on) {{
@@ -5791,7 +5791,9 @@ fn terminal_eval_script_with_canvas_renderer(
                 veil.style.backgroundColor =
                     window.getComputedStyle(host).backgroundColor || '#000';
                 const label = document.createElement('div');
-                label.textContent = 'Daemon updating. Sessions will settle in a moment.';
+                label.textContent = (typeof veilText === 'string' && veilText)
+                    ? veilText
+                    : 'Daemon updating. Sessions will settle in a moment.';
                 label.style.fontSize = '12px';
                 label.style.fontFamily = 'var(--yggterm-term-font-family, monospace)';
                 label.style.letterSpacing = '0.2px';
@@ -12652,7 +12654,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 const nextSuspended = Boolean(message.suspended);
                 if (nextSuspended !== handoverPaintSuspended) {{
                     handoverPaintSuspended = nextSuspended;
-                    applyHandoverPaintVeil(nextSuspended);
+                    applyHandoverPaintVeil(nextSuspended, message.label);
                     if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                         window.__yggtermXtermHosts[hostId].handoverPaintSuspended = nextSuspended;
                     }}

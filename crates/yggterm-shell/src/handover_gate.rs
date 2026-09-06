@@ -211,6 +211,12 @@ pub(crate) struct HandoverPaintGate {
     daemon_identity_changed_latch: bool,
     last_observation: HandoverObservation,
     last_observed_at_ms: u64,
+    /// The honest veil text for the CURRENT state, computed at observation
+    /// time ([11.68]): `None` = an update really is in flight (the default
+    /// "Daemon updating" wording is then TRUE); `Some(text)` = no update is
+    /// in flight and the veil must say what is actually happening (preserved
+    /// rows still served by an older daemon).
+    veil_label: Option<String>,
     suspend_count: u64,
     last_transition: Option<HandoverPaintTransition>,
     last_transition_at_ms: u64,
@@ -223,6 +229,7 @@ impl Default for HandoverPaintGate {
             resolved_fingerprint: None,
             last_daemon_identity: None,
             daemon_identity_changed_latch: false,
+            veil_label: None,
             last_observation: HandoverObservation::default(),
             last_observed_at_ms: 0,
             suspend_count: 0,
@@ -234,6 +241,17 @@ impl Default for HandoverPaintGate {
 
 impl HandoverPaintGate {
     /// ⛔ The ONE question every paint/read site asks. Never re-derive it.
+    /// The honest veil text computed at the last observation ([11.68]): `None`
+    /// means an update is genuinely in flight and the default wording is true;
+    /// `Some(text)` names what is actually happening instead.
+    pub(crate) fn veil_label(&self) -> Option<String> {
+        self.veil_label.clone()
+    }
+
+    pub(crate) fn set_veil_label(&mut self, label: Option<String>) {
+        self.veil_label = label;
+    }
+
     pub(crate) fn paint_suspended(&self) -> bool {
         matches!(self.phase, HandoverPaintPhase::Suspended { .. })
     }

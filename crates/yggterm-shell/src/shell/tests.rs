@@ -42432,21 +42432,25 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
              or the suspension would still hand bytes to term.write"
         );
         let loop_predicate = concat!(
-            "                        shell.handover_paint_suspended(),\n",
-            "                    )\n",
-            "                });\n",
+            "                            shell.handover_paint_suspended(),\n",
+            "                            shell.handover_veil_label(),\n",
+            "                        )\n",
+            "                    });\n",
         );
         assert!(
             source.contains(loop_predicate),
-            "the loop must read the predicate once per tick to drive the veil command"
+            "the loop must read the predicate — and the honest label ([11.68]) — \
+             once per tick to drive the veil command"
         );
         let veil_command = concat!(
             "eval.send(TerminalJsCommand::SetHandoverPaintSuspended {\n",
             "                        suspended: handover_paint_suspended,\n",
+            "                        label: handover_veil_label,\n",
         );
         assert!(
             source.contains(veil_command),
-            "the host must be told to stop its own render work, not just the reads"
+            "the host must be told to stop its own render work, not just the reads — \
+             and the veil carries the honest label ([11.68])"
         );
     }
 
