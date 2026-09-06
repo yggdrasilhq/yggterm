@@ -107,7 +107,12 @@ async function main() {
       n += 1;
       emit(built.tick.ops(n), args.engine);
     }, built.tick.everyMs);
-    timer.unref();
+    // ⛔ NOT unref'd: a launched row's stdin can be a pipe that never feeds
+    // data, and an unref'd timer lets the event loop empty and the process
+    // exit after the first frame — a flowing stimulus that flows once.
+    // The scenario exits explicitly (q, SIGINT, --hold-ms); a TUI that
+    // silently self-exits is worse than one that must be quit.
+    timer.ref();
   }
   if (Number.isFinite(args.holdMs)) {
     setTimeout(() => {

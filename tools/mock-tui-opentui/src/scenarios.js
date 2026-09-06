@@ -93,6 +93,48 @@ const SCENARIOS = {
       { op: 'text', row: 1, col: 1, text: 'MOCKTUI paste-bracketed — paste a multi-line blob; it lands as one bracketed paste' },
     ],
   }),
+
+  // The codex-shaped streaming stimulus (owner directive 2026-09-06 late:
+  // "make the mock-tui have a codex like flowing mode generating gibberish
+  // and we switch around the daemons" — codex sessions lose their history
+  // when a row is switched out and back). Committed, numbered, token-stamped
+  // lines scroll every MOCKTUI_EVERY_MS (default 500). The token is the
+  // identity witness: the launcher stamps one per run (MOCKTUI_TOKEN), so
+  // whatever a switch retains is readable in the content itself.
+  //
+  // Witness recipe (docs/spec-mock-tui-opentui.md, flowing row):
+  //   BEFORE the switch: note the newest line's counter and the token.
+  //   Switch the row away and back (or hot-restart / rotate the daemon).
+  //   PASS: pre-switch lines are still in the scrollback AND the counter
+  //         continues from where it was (same PTY, same process).
+  //   FAIL (the codex signature): the counter restarts at 00001 and/or the
+  //         token changed — a FRESH process was spawned and the history is
+  //         gone. A blank frame with neither is the ghost-frame shape.
+  'flowing': () => {
+    const token = process.env.MOCKTUI_TOKEN || 'tok-???';
+    let n = 0;
+    const words = 'ember drift quartz lantern moss tuple vector hush plinth cider glean folio brush knoll tarp wick'.split(' ');
+    const gibberish = () => {
+      const parts = [];
+      const count = 4 + Math.floor(Math.random() * 5);
+      for (let i = 0; i < count; i += 1) parts.push(words[Math.floor(Math.random() * words.length)]);
+      return parts.join(' ');
+    };
+    return {
+      ops: [
+        { op: 'title', text: `MOCKTUI flowing ${token}` },
+        { op: 'text', row: 1, col: 1, text: `MOCKTUI flowing ${token} — numbered lines; history must survive switches` },
+        { op: 'line', text: `00000 ${token} flowing begins` },
+      ],
+      tick: {
+        everyMs: Number(process.env.MOCKTUI_EVERY_MS) || 500,
+        ops: () => {
+          n += 1;
+          return [{ op: 'line', text: `${String(n).padStart(5, '0')} ${token} ${gibberish()}` }];
+        },
+      },
+    };
+  },
 };
 
 function scenarioNames() {

@@ -27254,3 +27254,86 @@ re-resume path may bypass the guard and twin-write during churn. With
 falsify on the next natural rotation with an orphaned wrapper-tree present
 (the ensure path must reap, no -32600 may paint). If a spawn bypass
 recurrs, it gets its own entry.
+
+
+## ⛔ [11.73] AN OPENCODE ROW NEVER FOLLOWS THE SESSION ITS TUI IS ACTUALLY RUNNING — THE IDENTITY REBIND ARM IS STRUCTURALLY DEAD FOR THE WHOLE FAMILY, AND THE STORE RECORDS NOTHING AT /sessions SWITCH TIME (measured live 2026-09-06 23:16-00:00, the owner's d4090efe row)
+
+**Status:** OPEN
+
+**Owner:** the cli-integration / metadata-SSOT lane (Issue 38 open item "opencode
+/sessions switch rebind")
+
+The owner opened `/sessions` inside an opencode TUI row and loaded a different
+session; the row kept its birth identity everywhere yggterm speaks. Measured
+chain, every link live:
+
+- The row binds `remote-opencode://dev/d4090efe-...` — yggterm's OWN runtime
+  uuid. The TUI process actually runs `opencode2 --auto --session
+  ses_f998a9c76ffehgkGVvdWmlJgBE` (argv, `/proc/<pid>/cmdline` on the row's
+  host) — opencode's real session, whose `session_v2.title` is "Fixing
+  yggterm <gui-host> UI blocks in ychrome". The metadata panel shows the uuid under
+  "OpenCode Session"; the sidebar shows birth-name "New dev OpenCode";
+  `server rows live` answers `cli_store_title: null` — the store lookup runs
+  by the uuid, which matches NOTHING (opencode ids are `ses_...`).
+- WHY the rebind never fires: the identity rebind arm
+  (`agent_runtime_session_id_from_root_pid` ->
+  `agent_session_identity_from_process_fds`, daemon.rs ~6770) is gated on
+  `descriptor.live_session_marker` — and the OpenCode descriptor declares
+  `live_session_marker: None` (agent_cli.rs ~2543). The arm returns None
+  before reading anything: for the whole opencode family, `session.id` is
+  frozen at birth. Codex/claude have markers (fd-store shaped) and rebind;
+  opencode's equivalent witness is its ARGV, which no arm reads.
+- WHY live switch-following cannot be polled from the store: measured at the
+  owner's switch (~23:25), opencode's db records NOTHING at switch time —
+  `session_v2.time_updated`, `time_viewed`, `message` recency and the
+  `event` tables were all re-read within minutes and none moved (the newest
+  `time_viewed` in the db is ~2 days old). The switch lives only in the
+  TUI's runtime state; `opencode2.exe serve --service` is an SPA frontend
+  whose API shape is unverified.
+- The v1/v2 split is real but already handled: the readers prefer
+  `session_v2` (agent_cli.rs 4194, 5529).
+
+**Fix shape:** (a) an ARGV identity arm for marker-less kinds — read
+`/proc/<pid>/cmdline` of the row's TUI (local: direct; remote: through the
+probe contract, which needs a per-row pid anchor added to
+`RemoteStoreTitleProbe` argv — the batch caller has the row's remote shell
+pid) — parse `--session <ses_...>`, rebind `session.id` + the
+`session_metadata_label` stamp exactly as the codex arm does; the store title
+lookup then resolves by the real id and the title follows. (b) Live
+switch-following needs the opencode server API (or an upstream event);
+until then a row re-follows its session at every re-resume (the resume path
+already resolves recency-per-directory — measured: the 23:16 re-resume
+launched exactly `ses_f998a9`).
+
+## ⛔ [11.74] THE SIDEBAR FILLS WITH GHOST FRAMES — ROWS WHOSE CLI PROCESSES ARE LONG DEAD ADVERTISE AS LIVE AND ARE RESTORED FOREVER (measured 2026-09-06 23:2x, dev + the GUI host)
+
+**Status:** OPEN
+
+**Owner:** the cli-integration lane (the owed despawn verb, Issue 38 open
+queue; [11.64]-adjacent corpses)
+
+Owner report: "ghost frames" — sidebar rows that are not real sessions,
+multiplying as identical birth-named entries ("New dev OpenCode" x5, "New
+dev Antigravity" x7, "New dev Codex" x5). Measured against the process
+table on dev: 32 remote rows advertise, and the live CLI process census is
+~4 pairs (two codex TUIs, one opencode TUI, wrappers) — the 12 ClaudeCode
+rows and 7 Antigravity rows have ZERO processes on the host; several
+opencode/codex rows likewise. The daemon's own numbers agree
+(`Sessions 2 owned - 7 total - 5 preserved` while the sidebar shows 37).
+Every rotation re-restores the stored live set (`restored_live_sessions:
+37`), so a corpse row is re-advertised after EVERY deploy, repaints as an
+empty recovered frame (the "Recovering Local Terminal" toast class), and
+can never die on its own.
+
+**Fix shape:** (a) process-truth on the rows plane — `server rows live`
+gains a `holder` verdict per row (the remote probe checks the row's host
+for a process carrying the row's marker/argv session; `gone` / `alive` /
+`external`), so ghosts are visible by instrument and not by vibes;
+(b) the owed DESPAWN verb (`server rows despawn <key>`): remove the stored
+live-session record AND tombstone it (the `live_row_tombstones` machinery)
+so the restore plane stops resurrecting it — plain close is not enough,
+the record comes back with the next rotation; (c) the restore plane should
+restore process-dead, non-resumable rows as STORED-ONLY (History), not
+live — the recency machinery from [11.64] is the classifier. Auto-despawn
+is NOT the shape: a row whose CLI is momentarily unreachable must not
+vanish; the verb + the verdict make the owner the finisher.
