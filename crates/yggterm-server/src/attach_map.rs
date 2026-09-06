@@ -533,13 +533,13 @@ pub(crate) fn classify_stranded_daemon(
     };
     match listener_state {
         StrandedListenerState::NameTaken => MapState::warning(format!(
-            "bequeathed predecessor: its socket name now belongs to another listener —              unaddressable by design, no dial can reach it; it retires when its drain              empties ({names})"
+            "bequeathed predecessor: its socket name now belongs to another listener — unaddressable by design, no dial can reach it; it retires when its drain empties ({names})"
         )),
         StrandedListenerState::OwnsItsName => MapState::failed(format!(
-            "process alive, still owns its socket name, and answered nothing — wedged              accept loop or a held runtime lock ({names})"
+            "process alive, still owns its socket name, and answered nothing — wedged accept loop or a held runtime lock ({names})"
         )),
         StrandedListenerState::Unverifiable => MapState::failed(format!(
-            "process alive but answered nothing; the inode check could not say whether              it still owns its name ({names})"
+            "process alive but answered nothing; the inode check could not say whether it still owns its name ({names})"
         )),
     }
 }
