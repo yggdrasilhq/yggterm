@@ -16411,6 +16411,77 @@ fn pid_is_a_yggterm_server_daemon(_pid: u32) -> bool {
     false
 }
 
+/// The (kind, session id) of every LIVE agent CLI this pid directly parents —
+/// the process tree is the truth about what a holder actually holds; its
+/// registry rows may be records of rows that died generations ago.
+#[cfg(target_os = "linux")]
+fn live_agent_children_session_ids(pid: u32) -> Vec<(SessionKind, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(child) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(format!("/proc/{child}/stat")) else {
+            continue;
+        };
+        // The ppid sits after the comm's closing parenthesis (comm may contain
+        // spaces and parentheses; split after the LAST ')').
+        let stat = String::from_utf8_lossy(&bytes).into_owned();
+        let Some(ppid) = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if ppid != pid {
+            continue;
+        }
+        let Ok(cmdline_bytes) = std::fs::read(format!("/proc/{child}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = cmdline_bytes
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let Some(argv0) = args.first().map(|a| a.to_ascii_lowercase()) else {
+            continue;
+        };
+        let Some((kind, selector)) = yggterm_core::agent_cli::AGENT_CLIS.iter().find_map(|d| {
+            let binary = d.binary_name.to_ascii_lowercase();
+            let base = std::path::Path::new(&argv0)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_ascii_lowercase())?;
+            let base = base.strip_suffix(".exe").unwrap_or(&base);
+            let bin = binary.strip_suffix(".exe").unwrap_or(&binary);
+            if base != bin && !base.ends_with(bin) {
+                return None;
+            }
+            Some((d.kind, d.resume_selector_token()))
+        }) else {
+            continue;
+        };
+        // The session id rides the resume selector (–-session/--conversation/
+        // --resume/resume) or is the last argument.
+        let id = args
+            .windows(2)
+            .find(|w| w[0] == selector)
+            .map(|w| w[1].clone())
+            .or_else(|| args.last().cloned());
+        if let Some(id) = id {
+            if !id.trim().is_empty() {
+                found.push((kind, id));
+            }
+        }
+    }
+    found
+}
+
 /// One retirement pass: group the registry by owner pid, admit owners by
 /// [`stale_owner_retire_verdict`] (with the per-row transcript staleness
 /// computed host-locally — the transcripts are files, daemon-agnostic),
@@ -16446,25 +16517,24 @@ fn retire_stale_preserved_owners_once(
     for (pid, (build, created, keys)) in by_owner {
         let owner_alive = hot_update_owner_pid_is_alive(pid);
         let owner_is_daemon = owner_alive && pid_is_a_yggterm_server_daemon(pid);
-        // Every held row must be VERIFIABLY stale: agent kinds read their own
-        // transcript (host-local, daemon-agnostic); anything we cannot read —
-        // a kind with no reader, a remote-row scheme, an unreadable store —
-        // answers Unknown and blocks the whole retirement.
+        // ⛔ THE STALENESS ORACLE IS THE HOLDER'S LIVE AGENT CHILDREN — the
+        // PROCESS tree, not the registry. The registry records rows that may
+        // have died generations ago (a 18-entry snapshot naming 17 dead
+        // `local://` rows measured blocking a retirement whose holder really
+        // held ONE live opencode TUI); a dead record cannot be protected, and
+        // a live one cannot be missed. Every live agent child's own
+        // transcript must be verifiably stale; a live NON-agent child (a
+        // plain shell) or an unreadable transcript answers "cannot say" and
+        // blocks — the safety bias of the whole plane.
+        let children = live_agent_children_session_ids(pid);
         let mut all_stale: Option<bool> = Some(true);
-        for key in &keys {
-            let session_id = key.rsplit('/').next().unwrap_or("");
-            let stale = match key_scheme_kind(key) {
-                Some(kind) => yggterm_core::agent_cli::agent_session_recency_ms(
-                    &user_home,
-                    kind,
-                    session_id,
-                )
-                .map(|recency_ms| {
-                    (now as i64 - recency_ms).max(0) as u64
-                        >= migration_idle_threshold_ms()
-                }),
-                None => None,
-            };
+        for (kind, session_id) in &children {
+            let stale = yggterm_core::agent_cli::agent_session_recency_ms(
+                &user_home,
+                *kind,
+                session_id,
+            )
+            .map(|recency_ms| (now as i64 - recency_ms).max(0) as u64 >= migration_idle_threshold_ms());
             match (all_stale, stale) {
                 (Some(true), Some(true)) => {}
                 _ => {
@@ -16523,20 +16593,6 @@ fn retire_stale_preserved_owners_once(
         }
     }
     retired
-}
-
-/// The scheme → kind map for rows whose transcript recency this host can
-/// read. Remote schemes name stores on OTHER hosts — Unknown here, by design.
-fn key_scheme_kind(runtime_key: &str) -> Option<SessionKind> {
-    if runtime_key.starts_with("codex-runtime://") {
-        Some(SessionKind::Codex)
-    } else if runtime_key.starts_with("cc-runtime://") {
-        Some(SessionKind::ClaudeCode)
-    } else if runtime_key.starts_with("opencode-runtime://") {
-        Some(SessionKind::OpenCode)
-    } else {
-        None
-    }
 }
 
 /// The pass thread. Kill-switch: `YGGTERM_DISABLE_STALE_OWNER_RETIRE=1`.
