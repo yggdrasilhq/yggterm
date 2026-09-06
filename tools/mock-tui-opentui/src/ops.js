@@ -67,6 +67,15 @@ function compileOps(ops, { cols, rows }) {
         out += C.cup(op.row, op.col) + C.sgrFg(fr, fg_, fb) + C.sgrBg(br, bgc, bb) + op.text + C.reset;
         break;
       }
+      case 'line':
+        // A COMMITTED line: newline-terminated, scrolling the grid the way a
+        // streaming CLI's output does (codex token flow, build logs). No CUP,
+        // no repaint — the bytes are append-only so the terminal's own
+        // scrollback accumulates them. That scrollback IS the history
+        // witness: whatever survives a row switch or a daemon handoff is
+        // exactly what yggterm retained.
+        out += `${op.text}\r\n`;
+        break;
       case 'frame-marker':
         out += C.cup(rows, 1) + `WINCH_FRAME_${op.n}`;
         break;
