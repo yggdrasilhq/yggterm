@@ -27222,6 +27222,140 @@ which must answer `None` ("no composer here"), never "draft". The same
 ambiguity probably affects every CLI whose history rendering reuses its
 composer marker.
 
+## ⛔ [11.69] A BEQUEATHED PREDECESSOR WHOSE ROWS ARE ALL NON-RESUMABLE NEVER RETIRES — EVERY DEPLOY MINTS ANOTHER FOREVER-DAEMON (diagnosed live 2026-09-06 with `server map` + the kernel bind table)
+
+**Status:** OPEN
+
+**Owner:** the daemon-handoff/drain lane (complements [11.64] and the
+stale-owner-retirement lane; diagnosis posted to infra/meta ACK-bb1117455c)
+
+The full life of one predecessor, measured on the GUI host: pid 4041056
+(v3.2.71, born ~20:27) was bequeathed twice (successors 4081064 ~21:13,
+4147285 ~21:5x) and survived both.
+
+1. **It is structurally unaddressable.** Its unix listeners are NAMELESS in
+   `/proc/net/unix` (inodes 35312425/35312426/35320957 carry no path),
+   while `server-3-2-71.sock` carries the successor's inode (9578090). No
+   filesystem path reaches the predecessor's listener, so every dial lands
+   on the successor and any host-wide read (census, map) marks it "answered
+   nothing". That half is the handoff working as designed.
+2. **Its drain cannot empty it.** `spawn_progressive_session_migration`
+   adopts out ONLY rows that are `re_resumable && migratable`. Its remaining
+   owned rows are plain shells (`re_resumable: false, migratable: true,
+   blocking_gate: null`), so `select_next_migration_candidate` returns None
+   every tick and the drain announced `progressive_migration_candidates_blocked`
+   every 30 s for an hour — the code's own comment calls this "lingering
+   harmlessly". It is not harmless: the process held 13 PTY masters, and a
+   host that deploys N times a day mints up to N such forever-daemons, one
+   per generation that happened to own a shell row. This is the engine
+   behind the measured "three daemon generations coexisting" shape.
+3. **Nothing else retires it.** The successor's `linux_daemon_sweep`
+   correctly refuses (`clean_preserved_owner_available: false` — the
+   predecessor holds live sessions; killing it would strand them), and the
+   once-per-boot sweep cadence never revisits.
+
+**Fix shapes (owner to rule):**
+- The drain hands off non-resumable rows too — a shell PTY can cross via
+  the preserve/adopt machinery the same way preserved owners already hold
+  rows across generations; or
+- a whole-succession arm: a same-version successor adopts the predecessor's
+  registry entries and sessions wholesale (it already holds the bequest
+  relationship and the retired-socket re-pointing mechanism), instead of
+  row-by-row release; or
+- at minimum, a bounded linger: a predecessor whose drain has been blocked
+  on `re_resumable: false` rows for a window (hours, not minutes) hands its
+  rows to the successor as preserved rows and exits, instead of holding
+  PTYs forever.
+
+**Instrument note:** `server map` now classifies this shape by inode
+comparison (warning: "bequeathed predecessor: its socket name now belongs to
+another listener") instead of a bare "answered nothing" failure, and carries
+the PTY-master count for unanswered daemons.
+
+**Fix (same session, `lane/trace/map-round-2`):** the prune no longer waits
+for a reader. The daemon spawns a dedicated `owner-registry-prune` thread at
+startup — one `load()` per minute, whose existing prune-and-save side effect
+(5-minute dead-pid window, `stale_registry_pruned_on_load` trace) now runs on
+a quiet host too. **Falsifier:** after the next daemon birth on the build
+host, the two 12h-old orphaned entries are gone from the registry within one
+prune tick, with the trace event naming the prune.
+
+**Addendum (same night, `lane/cli/registry-sweep-cadence` — the cadence was
+only half the hole; the predicate is the other half, measured live):** the
+young daemon HAD called `load()` at birth (it runs in
+`DaemonRuntime::load`), and the prune kept the entries anyway — its
+liveness instrument `kill(pid, 0)` answers EXISTENCE, not identity, and on
+a busy host the dead holders' pids had been REBORN as unrelated processes;
+22 minutes later those processes exited and the map (correctly) read "gone
+12h34m". A per-minute prune running the same bare-existence check keeps a
+recycled-pid entry FOREVER — the falsifier above passes only while the
+recycled pids stay dead. The same weak predicate sat under every holder
+decision: the revalidation chore probes the entry's ENDPOINT, and a
+self-resolving entry (endpoint = the canonical name the CURRENT daemon
+serves, the [11.65] shape) answers OK from us forever, so the probe can
+never see a dead holder; the [11.65] repoint arm and the census's
+`pid_alive` read the same check. This lane lands one identity-aware
+predicate (`preserved_owner_holder_is_alive` — the pid exists AND its
+cmdline still names a yggterm server daemon, the retirement oracle's own
+check now shared) used by the load-time prune, the census, the repoint arm,
+and the revalidation chore — which now judges the holder BEFORE its
+endpoint probe and drops a dead holder past the recent window immediately
+with reason `revalidate_holder_dead` (a dead pid is authoritative; it earns
+none of the two-miss grace a probe miss gets). Off Linux the identity
+oracle does not exist, so the predicate falls back to bare existence rather
+than mass-dropping. Locked by
+`a_recycled_pid_wearing_a_foreign_cmdline_is_not_a_live_holder` (a real
+foreign process wears the pid in the test) and
+`the_load_prune_drops_an_old_entry_whose_holder_pid_was_recycled`.
+
+
+**Addendum 2 (independent measurement, `lane/cli/registry-sweep-cadence`,
+convergent with infra/meta ACK-bb1117455c; this seat's post ACK-6e4a39f9d7):
+the same predecessor watched through the 21:36 deploy adds three facts.**
+(1) Its self-retire event at 21:45:24 — `daemon_self_retire_handoff_ok` —
+reports "preserving 4 live terminal runtime(s)" against
+`owned_terminal_session_count: 3` and names the OTHER daemon's
+`.retired-4103255` socket as its preserve target: an off-by-one and a
+crossed endpoint in one event, or a real bequest toward a retired
+generation. (2) Twenty seconds later it logged
+`disk_binary_handoff_cooldown_deferred {cooldown_ms: 1800000,
+ms_since_last_same_version_handoff: 20001}` — the 30-minute same-version
+cooldown defers the next handoff attempt of a half-drained generation, so
+fleet deploy velocity (~hourly) arithmetic converts into pinned invisible
+rows for 30+ minutes per generation. (3) The 21:44 map run counted 77
+`progressive_migration_candidates_blocked` announcements over two hours,
+every one reading `blocking_gate: null, migratable: true`, with ZERO
+`no_adopter` events — the drain announces its row gates but not its
+selector, which is exactly the gap the truthful-announcement fix above
+closes. A duplicate [11.73] filed from the same evidence by this lane was
+struck; this entry is the canonical record.
+
+**Addendum 3 (2026-09-07 ~01:2x, zcode seat — entry RESTORED after an
+accidental deletion; the specimen lifecycle RESOLVED, the decision still
+open):** the [11.66] docs commit 3260b0b49 (a pending-bugs conflict
+resolution) deleted this entry together with the closed [11.68] record;
+caught by the next seat's id audit (main's pending-bugs jumped from [11.66]
+straight to [11.72]) and restored verbatim from 3260b0b49^. The shape was
+live again the same hour on the GUI host: a v3.2.73 predecessor (born
+~00:13, 20 pty masters held, three rows) sat bequeathed and unaddressable
+while its drain announced `candidates_blocked ... eligible:0` every 30 s
+with the gates named per row (`null` / `pty_recently_active` /
+`pending_draft`) — and it did NOT retire via the drain. It retired at ~62
+minutes of age when the NEXT generation (the 3.2.74 rotation) issued
+`stale_owner_retired {signal: SIGTERM, held_rows: ...}` — the [11.67]
+stale-preserved-owner retirement plane, not the drain. The held rows
+SURVIVED the kill: the mock-tui flowing falsifier row's buffer counter
+continued across the boundary without reset (frames 01704 to 01856+
+measured straight through the event), so the retirement plane's row
+handling keeps runtimes alive across a forced retirement. Net: the defect
+is now bounded by the next generation's arrival instead of truly forever,
+at the price of one stale generation per deploy and one forced kill per
+specimen. The owner's ruling among the fix shapes above is still owed, now
+with a measured question attached: is "a predecessor lives until the next
+generation retires it" the sanctioned steady state, or does an
+in-generation remedy (hand off non-resumable rows / whole-succession /
+bounded linger) still want to exist?
+
 ## ⛔ [11.72] THE WRAPPER TREE DEFEATED THE STRANDED-ORPHAN REAP — CODEX'S WRITER LOCK STAYED HELD FOR 19 HOURS (-32600 ON EVERY RESUME)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
