@@ -4202,6 +4202,17 @@ struct AppPanePalette {
     /// Empty means the component's own "No matches".
     #[serde(default)]
     empty: String,
+    /// The OMNIBOX FLOURISH (the owner's "typing suggestions in selection
+    /// mode"): the top-ranked candidate EXTENDING the query, shown in the
+    /// field with the tail selected — typing continues over it, TAB/Enter
+    /// take it. Empty string = no completion offered (the component's own
+    /// guard treats empty/0 as none).
+    #[serde(default)]
+    completion: String,
+    /// How many bytes of `completion` are the USER'S typing (the rest is
+    /// the selected tail).
+    #[serde(default)]
+    completion_typed_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]

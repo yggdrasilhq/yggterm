@@ -104,6 +104,8 @@ mod key_plane_locks {
                 selected: 0,
                 items: Vec::new(),
                 empty: String::new(),
+                completion: String::new(),
+                completion_typed_len: 0,
             }),
         };
         let seq = shell.document_pane_next_request("local://a");
@@ -132,6 +134,8 @@ mod key_plane_locks {
                 selected: 0,
                 items: Vec::new(),
                 empty: String::new(),
+                completion: String::new(),
+                completion_typed_len: 0,
             }),
         };
         let revision = |shell: &ShellState| {
@@ -163,6 +167,36 @@ mod key_plane_locks {
         shell.document_pane_apply_schema(seq, "local://a", "doc", schema("", false));
         let channel = shell.document_pane_channel("local://a").unwrap();
         assert!(channel.schema.as_ref().unwrap().schema.palette.is_none());
+    }
+
+    #[test]
+    fn palette_completion_fields_parse_and_default_empty() {
+        let on: AppPaneSchema = serde_json::from_value(json!({
+            "title": "t",
+            "palette": {
+                "query": "find-f",
+                "prompt": "M-x",
+                "items": [{"id": "find-file", "label": "find-file"}],
+                "completion": "find-file",
+                "completion_typed_len": 6
+            }
+        }))
+        .expect("a schema with a completion parses");
+        let palette = on.palette.as_ref().expect("palette present");
+        assert_eq!(palette.completion, "find-file");
+        assert_eq!(palette.completion_typed_len, 6);
+
+        let off: AppPaneSchema = serde_json::from_value(json!({
+            "title": "t",
+            "palette": {"query": "", "items": []}
+        }))
+        .expect("parses");
+        let palette = off.palette.as_ref().expect("palette present");
+        assert!(
+            palette.completion.is_empty(),
+            "no completion offered: empty, never null"
+        );
+        assert_eq!(palette.completion_typed_len, 0);
     }
 
     #[test]

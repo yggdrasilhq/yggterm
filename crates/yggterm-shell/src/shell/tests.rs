@@ -80,6 +80,11 @@ mod tests {
             launch.contains("palette_surface_consumes"),
             "the gate is one helper, tested in the key plane locks"
         );
+        // The omnibox flourish is fed by the app's schema.
+        assert!(
+            body.contains("app_palette.completion_typed_len"),
+            "the inline completion must reach the component"
+        );
     }
 
     #[test]
