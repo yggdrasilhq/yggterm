@@ -58,6 +58,18 @@
 //! re-proved-sighting removal. The pid witness needs no census, so this one
 //! branch stays decidable even when the kernel socket table cannot be read.
 //!
+//! ## The pty-handoff graveyard (2026-09-06)
+//!
+//! Every daemon spawn binds a `pty-handoff-<version>.sock` listener (the
+//! same-version successor rebinds the same name), and until now nothing ever
+//! swept the name shape — it parsed as NotOurs. Counted on the GUI host
+//! 2026-09-06: **218 of them back to August**, beside the retired-socket and
+//! lock litter the branches above already reap. They classify by the same
+//! census the server sockets use: bound here, or a live daemon of that
+//! version anywhere on the host, ⇒ load-bearing; otherwise the ordinary
+//! re-proved-sighting rule. The parse lives beside the name's builder
+//! (`pty_handoff::parse_handoff_socket_name`) so the shape has one owner.
+//!
 //! ## Platform
 //!
 //! Unix only (the socket names are), and the liveness proof is Linux's
@@ -87,6 +99,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::daemon::{parse_retired_server_socket_artifact, parse_versioned_server_socket_name};
+use crate::pty_handoff::parse_handoff_socket_name;
 use yggterm_core::append_trace_event;
 
 /// How long a socket must have been continuously observed dead before it is
@@ -436,6 +449,34 @@ pub(crate) fn classify_socket_entry(
                 _ => SocketVerdict::ConfirmLater,
             };
         }
+        // 1d. A pty-handoff listener's socket (`pty-handoff-X-Y-Z.sock`, the
+        //     name shape `pty_handoff::handoff_socket_path` mints). The
+        //     2026-09-06 GUI-host census counted 218 of them back to August —
+        //     every daemon spawn mints one and nothing ever swept it. Fate:
+        //     alive while it is itself bound (a live daemon's handoff
+        //     listener) or while a daemon of that version lives anywhere on
+        //     the host (a same-version successor rebinds the same name);
+        //     litter on the ordinary re-proved-sighting terms otherwise. No
+        //     rollback arm, unlike the lock files above: a rolled-back daemon
+        //     binds this path FRESH at spawn (the bind replaces the file), so
+        //     a dead socket of an installed version is never load-bearing.
+        if let Some(version) = parse_handoff_socket_name(path) {
+            if !census.complete {
+                return SocketVerdict::Keep(KeepReason::CensusIncomplete);
+            }
+            if census.listening.contains(path) {
+                return SocketVerdict::Keep(KeepReason::Listening);
+            }
+            if census.live_versions.contains(&version) {
+                return SocketVerdict::Keep(KeepReason::LiveDaemonVersion);
+            }
+            return match first_seen_dead_ms {
+                Some(first) if now_ms.saturating_sub(first) >= SOCKET_DEAD_CONFIRM_MS => {
+                    SocketVerdict::Remove
+                }
+                _ => SocketVerdict::ConfirmLater,
+            };
+        }
         return SocketVerdict::NotOurs;
     };
     // 2. No proof of what is alive ⇒ no deletions at all.
@@ -748,7 +789,6 @@ mod tests {
             "server.sock",
             "server-3-0.sock",
             "server-3-0-32-1.sock",
-            "pty-handoff-3-0-32.sock",
             "session-titles.db",
             ".socket-sweep-dead",
         ] {
@@ -759,6 +799,99 @@ mod tests {
                 "{name} is not a versioned server socket and must be untouched"
             );
         }
+    }
+
+    #[test]
+    fn a_listening_handoff_socket_is_kept() {
+        let tmp = Scratch::new("handoff-live");
+        let handoff = tmp.path().join("pty-handoff-3-2-71.sock");
+        let census = census_with(&[handoff.as_path()]);
+        assert_eq!(
+            classify_socket_entry(
+                &handoff,
+                Some(&handoff),
+                true,
+                &census,
+                None,
+                None,
+                100 * DAY_MS
+            ),
+            SocketVerdict::Keep(KeepReason::Listening),
+            "a bound handoff listener belongs to a live daemon — never garbage"
+        );
+    }
+
+    #[test]
+    fn a_handoff_socket_of_a_live_version_elsewhere_is_kept() {
+        let tmp = Scratch::new("handoff-version");
+        let handoff = tmp.path().join("pty-handoff-3-2-71.sock");
+        // A same-version successor REBINDS the same name, so between one
+        // daemon's exit and the next's bind the file can be unbound while its
+        // version is still alive — the census's live-version arm covers that
+        // window, and the bound-elsewhere case (`pty-handoff` of a version
+        // whose daemon listens on a different socket file) besides.
+        let server = tmp.path().join("server-3-2-71.sock");
+        let census = census_with(&[server.as_path()]);
+        assert_eq!(
+            classify_socket_entry(
+                &handoff,
+                Some(&handoff),
+                true,
+                &census,
+                None,
+                None,
+                100 * DAY_MS
+            ),
+            SocketVerdict::Keep(KeepReason::LiveDaemonVersion),
+            "a live daemon of this version may rebind the name at any moment"
+        );
+    }
+
+    #[test]
+    fn a_dead_version_handoff_socket_is_removed_after_confirmation() {
+        let tmp = Scratch::new("handoff-dead");
+        let handoff = tmp.path().join("pty-handoff-3-0-101.sock");
+        let live = tmp.path().join("server-3-2-71.sock");
+        let census = census_with(&[live.as_path()]);
+        let now = 100 * DAY_MS;
+        assert_eq!(
+            classify_socket_entry(&handoff, Some(&handoff), true, &census, None, None, now),
+            SocketVerdict::ConfirmLater,
+            "a first sighting never deletes"
+        );
+        assert_eq!(
+            classify_socket_entry(
+                &handoff,
+                Some(&handoff),
+                true,
+                &census,
+                None,
+                Some(now - SOCKET_DEAD_CONFIRM_MS),
+                now
+            ),
+            SocketVerdict::Remove,
+            "a version no daemon holds, dead across the confirm window, is the graveyard"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_census_keeps_every_handoff_socket() {
+        let tmp = Scratch::new("handoff-degraded");
+        let handoff = tmp.path().join("pty-handoff-3-0-101.sock");
+        let census = LiveDaemonCensus::from_parts(HashSet::new(), false);
+        assert_eq!(
+            classify_socket_entry(
+                &handoff,
+                Some(&handoff),
+                true,
+                &census,
+                None,
+                Some(0),
+                100 * DAY_MS
+            ),
+            SocketVerdict::Keep(KeepReason::CensusIncomplete),
+            "\"I could not look\" keeps the file, however dead its name looks"
+        );
     }
 
     #[test]

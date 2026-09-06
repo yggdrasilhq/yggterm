@@ -146,6 +146,26 @@ pub(crate) fn handoff_socket_path(home_dir: &Path, version: &str) -> PathBuf {
     home_dir.join(format!("pty-handoff-{}.sock", version.replace('.', "-")))
 }
 
+/// The inverse of [`handoff_socket_path`]'s file-name shape: parse
+/// `pty-handoff-<major>-<minor>-<patch>.sock` back into its version triple.
+/// Lives beside the builder so the name shape has exactly one owner — the
+/// socket sweep classifies graveyard files by this parse ([11.61]'s census
+/// never covered this name shape; 218 of them, some months old, stood on the
+/// GUI host on 2026-09-06).
+pub(crate) fn parse_handoff_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("pty-handoff-")?.strip_suffix(".sock")?;
+    let mut parts = rest.split('-');
+    let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?, patch.parse().ok()?))
+}
+
 /// The token that rides the same `sendmsg` as the descriptor.
 ///
 /// Deliberately tiny and self-describing: it repeats the identity from the
@@ -835,6 +855,29 @@ mod tests {
             Path::new("/home/user/.yggterm/pty-handoff-3-0-30.sock"),
             "dots become dashes exactly as the request socket does"
         );
+    }
+
+    #[test]
+    fn the_handoff_socket_name_parses_back_to_its_version() {
+        let built = handoff_socket_path(Path::new("/home/user/.yggterm"), "3.2.71");
+        assert_eq!(
+            parse_handoff_socket_name(&built),
+            Some((3, 2, 71)),
+            "the sweep's graveyard classifier must read the builder's own shape"
+        );
+        for name in [
+            "pty-handoff-3-2.sock",      // short version
+            "pty-handoff-3-2-71-9.sock", // over-long version
+            "pty-handoff-x-y-z.sock",    // not numbers
+            "pty-handoff-3-2-71",        // no suffix
+            "server-3-2-71.sock",        // another plane's name
+        ] {
+            assert_eq!(
+                parse_handoff_socket_name(Path::new(name)),
+                None,
+                "{name} is not a handoff socket name"
+            );
+        }
     }
 
     /// A round trip over a real socketpair: metadata, then the descriptor.

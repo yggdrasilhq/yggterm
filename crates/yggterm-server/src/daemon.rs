@@ -1172,6 +1172,12 @@ fn hot_update_target_regression(
 
 const HOT_UPDATE_OWNERS_STALE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Entries younger than this are shielded from every dead-holder prune: the
+/// writer of an entry is its holder, so a just-registered holder's pid cannot
+/// be dead unless it crashed within the window — and tests register synthetic
+/// pids that were never alive.
+const HOT_UPDATE_OWNERS_RECENT_MS: u64 = 5 * 60 * 1000;
+
 #[cfg(unix)]
 fn hot_update_owner_pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -1183,6 +1189,28 @@ fn hot_update_owner_pid_is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn hot_update_owner_pid_is_alive(pid: u32) -> bool {
     pid != 0
+}
+
+/// Holder liveness for REGISTRY decisions ([11.68]): the pid must still exist
+/// AND still wear a yggterm server daemon's cmdline. `kill(pid, 0)` answers
+/// existence, and a busy host recycles pids within hours — the recycled pid
+/// is how two holders dead for 12h+ survived the load-time prune (measured on
+/// the build host 2026-09-06: the entries outlived a daemon birth by 22
+/// minutes before the map called them orphaned, because by load time their
+/// pids had been reborn as unrelated processes). A recycled pid must read
+/// DEAD here: nobody can adopt a runtime from a pid that no longer names the
+/// daemon that registered the entry.
+#[cfg(target_os = "linux")]
+fn preserved_owner_holder_is_alive(pid: u32) -> bool {
+    hot_update_owner_pid_is_alive(pid) && pid_is_a_yggterm_server_daemon(pid)
+}
+
+/// Off Linux there is no cmdline oracle, so the identity check cannot run —
+/// the predicate falls back to bare existence (the pre-[11.68] behaviour)
+/// rather than mass-dropping every entry.
+#[cfg(not(target_os = "linux"))]
+fn preserved_owner_holder_is_alive(pid: u32) -> bool {
+    hot_update_owner_pid_is_alive(pid)
 }
 
 /// Default idle window an agent CLI session must be quiet for before a
@@ -2239,21 +2267,21 @@ pub fn preserved_owner_census_rows(home_dir: &Path) -> Vec<PreservedOwnerCensusR
     };
     let registry: PreservedTerminalOwnerRegistry =
         serde_json::from_slice(&bytes).unwrap_or_default();
-    registry
-        .entries
-        .into_iter()
-        .map(|entry| PreservedOwnerCensusRow {
-            endpoint: match &entry.endpoint {
-                PreservedOwnerEndpoint::Unix { path } => path.clone(),
-                PreservedOwnerEndpoint::Tcp { host, port } => format!("{host}:{port}"),
-            },
-            runtime_key: entry.runtime_key,
-            owner_server_pid: entry.owner_server_pid,
-            owner_server_version: entry.owner_server_version,
-            created_at_ms: entry.created_at_ms,
-            pid_alive: hot_update_owner_pid_is_alive(entry.owner_server_pid),
-        })
-        .collect()
+        registry
+            .entries
+            .into_iter()
+            .map(|entry| PreservedOwnerCensusRow {
+                endpoint: match &entry.endpoint {
+                    PreservedOwnerEndpoint::Unix { path } => path.clone(),
+                    PreservedOwnerEndpoint::Tcp { host, port } => format!("{host}:{port}"),
+                },
+                runtime_key: entry.runtime_key,
+                owner_server_pid: entry.owner_server_pid,
+                owner_server_version: entry.owner_server_version,
+                created_at_ms: entry.created_at_ms,
+                pid_alive: preserved_owner_holder_is_alive(entry.owner_server_pid),
+            })
+            .collect()
 }
 
 #[cfg(not(unix))]
@@ -2297,14 +2325,15 @@ impl PreservedTerminalOwnerRegistry {
         let now_ms = current_millis_u64();
         let orig_len = registry.entries.len();
         let orig_expected = registry.expected_server_version.clone();
-        const HOT_UPDATE_OWNERS_RECENT_MS: u64 = 5 * 60 * 1000;
         registry.entries.retain(|entry| {
             let age_ms = now_ms.saturating_sub(entry.created_at_ms);
             let age_ok = age_ms < HOT_UPDATE_OWNERS_STALE_MS;
             let recent = age_ms < HOT_UPDATE_OWNERS_RECENT_MS;
             // Keep recent entries even if pid just died (tests use synthetic pids);
             // stale dead-pid entries older than RECENT_MS are true orphans from a crashed daemon.
-            (hot_update_owner_pid_is_alive(entry.owner_server_pid) || recent) && age_ok
+            // The liveness check is IDENTITY-aware ([11.68]): a recycled pid is not the
+            // holder that registered the entry.
+            (preserved_owner_holder_is_alive(entry.owner_server_pid) || recent) && age_ok
         });
         if registry.entries.is_empty() && registry.expected_server_version.is_some() {
             registry.expected_server_version = None;
@@ -7368,7 +7397,11 @@ impl DaemonRuntime {
             return None;
         }
         let owner_pid = entry.owner_server_pid;
-        if owner_pid == std::process::id() || !hot_update_owner_pid_is_alive(owner_pid) {
+        // [11.68] identity-aware: a recycled pid must not earn the repoint —
+        // the holder that registered the entry is gone, so the purge arm (a
+        // dead-or-ours pid earns the purge) is the correct verdict, not a
+        // repoint at a name a stranger now wears.
+        if owner_pid == std::process::id() || !preserved_owner_holder_is_alive(owner_pid) {
             return None;
         }
         let (retired, _lock) = retired_daemon_socket_names(path, owner_pid);
@@ -17425,6 +17458,21 @@ fn run_preserved_owner_revalidation_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
     let mut dropped: Vec<(String, &'static str)> = Vec::new();
     let mut first_misses: Vec<String> = Vec::new();
     for entry in &entries {
+        // ⛔ [11.68] The holder pid is judged BEFORE the probe, because a
+        // self-resolving entry's endpoint is the canonical name the CURRENT
+        // daemon itself serves — the probe answers OK from us and can never
+        // see that the pid which registered the entry is gone. A dead holder
+        // is authoritative (nothing can adopt a runtime from it), so unlike a
+        // probe miss it earns no two-miss grace; the recent window shields a
+        // handover still in flight and the tests' synthetic pids.
+        let age_ms = now_ms.saturating_sub(entry.created_at_ms);
+        if age_ms >= HOT_UPDATE_OWNERS_RECENT_MS
+            && !preserved_owner_holder_is_alive(entry.owner_server_pid)
+        {
+            miss_counts.remove(&owner_endpoint_label(&entry.endpoint.to_endpoint()));
+            dropped.push((entry.runtime_key.clone(), "revalidate_holder_dead"));
+            continue;
+        }
         let endpoint = entry.endpoint.to_endpoint();
         let label = owner_endpoint_label(&endpoint);
         let owner_status = owner_statuses
@@ -36633,6 +36681,145 @@ mod tests {
             .find("owner_is_self_alias")
             .expect("the purge must remain for dead-or-ours claims");
         assert!(repoint < purge, "the repoint must be attempted before the purge");
+    }
+
+    /// [11.68] The recycled-pid hole, measured 2026-09-06 on the build host:
+    /// two holders dead for 12h+ stayed registered because their pids had
+    /// been reborn as unrelated processes, and `kill(pid, 0)` — the load-time
+    /// prune's whole liveness instrument — cheerfully answered ALIVE for
+    /// each. The registry's notion of holder liveness is IDENTITY-aware: a
+    /// pid whose cmdline no longer names a yggterm server daemon is a dead
+    /// holder even though bare existence says alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recycled_pid_wearing_a_foreign_cmdline_is_not_a_live_holder() {
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a foreign process to wear the pid");
+        let pid = foreign.id();
+        assert!(
+            super::hot_update_owner_pid_is_alive(pid),
+            "the pid genuinely exists — bare existence answers ALIVE"
+        );
+        assert!(
+            !super::preserved_owner_holder_is_alive(pid),
+            "a foreign cmdline is a DEAD holder: this pid was recycled"
+        );
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    /// [11.68] The load-time prune must read the holder's IDENTITY: an aged
+    /// entry whose holder pid was recycled is an orphan and goes, while the
+    /// recent window still shields a just-registered entry wearing the same
+    /// kind of pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_load_prune_drops_an_old_entry_whose_holder_pid_was_recycled() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-holder-recycle-{}-{}",
+            std::process::id(),
+            super::current_millis_u64()
+        ));
+        let home = root.join(".yggterm");
+        fs::create_dir_all(&home).expect("create temp home");
+        let owner_endpoint = super::ServerEndpoint::UnixSocket(home.join("server-2-7-12.sock"));
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.7.12",
+            "server_build_id": 12,
+            "server_pid": 2712,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 2,
+            "owned_terminal_session_keys": [
+                "local://aged-orphan",
+                "local://fresh-entry"
+            ],
+            "terminal_session_count": 2,
+            "terminal_session_keys": [
+                "local://aged-orphan",
+                "local://fresh-entry"
+            ],
+        }))
+        .expect("status");
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a foreign process to wear the recycled pid");
+        super::PreservedTerminalOwnerRegistry::write_handoff(
+            &home,
+            &owner_endpoint,
+            &owner_status,
+            None,
+            vec![
+                "local://aged-orphan".to_string(),
+                "local://fresh-entry".to_string(),
+            ],
+            Vec::new(),
+        )
+        .expect("write registry");
+        // Age ONE entry past the recent window; its holder pid now belongs
+        // to a foreign process. The other entry stays fresh.
+        let now = super::current_millis_u64();
+        let path = home.join(super::HOT_UPDATE_OWNERS_FILE);
+        let mut file_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read registry"))
+                .expect("parse registry");
+        let mut aged_one = false;
+        for entry in file_json["entries"].as_array_mut().expect("entries array") {
+            // Both entries wear the foreign pid (the registered holder "died"
+            // and the pid was reborn as `sleep`); only ONE is aged past the
+            // recent window.
+            entry["owner_server_pid"] = serde_json::json!(foreign.id());
+            if entry["runtime_key"] == serde_json::json!("local://aged-orphan") {
+                entry["created_at_ms"] = serde_json::json!(now - 10 * 60 * 1000);
+                aged_one = true;
+            }
+        }
+        assert!(aged_one, "the entry to age must exist in the written file");
+        fs::write(&path, serde_json::to_string(&file_json).expect("reserialize"))
+            .expect("write aged registry");
+        let loaded = super::PreservedTerminalOwnerRegistry::load(&home);
+        assert_eq!(
+            loaded.keys(),
+            vec!["local://fresh-entry".to_string()],
+            "the aged recycled-pid entry is an orphan; the fresh one is shielded"
+        );
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// [11.68] The revalidation chore judges the holder pid BEFORE the probe:
+    /// a self-resolving entry's endpoint is the canonical name the current
+    /// daemon itself serves, so the probe answers OK forever and can never
+    /// see a dead holder — only the pid check can.
+    #[test]
+    fn the_revalidation_checks_the_holder_before_the_probe_and_drops_it_dead() {
+        let source = include_str!("daemon.rs");
+        let body = daemon_fn_body(source, "fn run_preserved_owner_revalidation_if_due(");
+        let holder_check = body
+            .find("!preserved_owner_holder_is_alive(entry.owner_server_pid)")
+            .expect("the dead-holder check must exist");
+        let probe = body
+            .find("status(&endpoint)")
+            .expect("the owner probe must remain");
+        assert!(
+            holder_check < probe,
+            "the holder check must precede the probe, or a self-resolving entry keeps its dead holder forever"
+        );
+        assert!(
+            body.contains("\"revalidate_holder_dead\""),
+            "the drop must carry its own reason so the trace can count it"
+        );
+        let load_body = daemon_fn_body(source, "fn load(home_dir: &Path) -> Self {");
+        assert!(
+            load_body.contains("preserved_owner_holder_is_alive"),
+            "the load-time prune must use the identity-aware holder check, not bare pid existence"
+        );
     }
 
     #[test]
