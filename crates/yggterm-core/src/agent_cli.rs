@@ -940,6 +940,16 @@ pub struct AgentCliDescriptor {
     ///
     /// `None` ⇒ this CLI is not identified this way and the route is not tried.
     pub live_session_marker: Option<LiveSessionMarker>,
+    /// Identity from the CLI's own argv, for kinds with no fd marker to read.
+    ///
+    /// ⛔ MEASURED, never inferred from the resume selector: [11.73] — the
+    /// OpenCode TUI runs `opencode2 --auto --session ses_…`, so a process-tree
+    /// cmdline names the session the TUI is showing. The id is frozen at
+    /// launch: an in-TUI `/sessions` switch moves neither the argv nor
+    /// (measured) the store, so a row follows a switch only at its next
+    /// re-resume. `None` ⇒ this CLI is not identified this way and the route
+    /// is not tried.
+    pub live_session_argv_flag: Option<&'static str>,
     /// This CLI's OWN title for one LIVE session, keyed by session id, read
     /// from the CLI's own store — the pickup a [`TitleAuthority::Store`] CLI
     /// depends on entirely, because yggterm refuses to generate copy for one.
@@ -1936,6 +1946,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: Some(crate::ENV_YGGTERM_CODEX_HOME),
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         // ⚠ SUPERSEDED (2026-09-05): the 2026-06-06 "codex titles are
         // YGGTERM-owned" spec is dead — codex stores its own Thread name now.
@@ -2061,6 +2072,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         read_store_entry: read_codex_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         // ⚠ SUPERSEDED (2026-09-05): the 2026-06-06 "codex titles are
         // YGGTERM-owned" spec is dead — codex stores its own Thread name
@@ -2304,6 +2316,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_home_env_override: None,
         read_store_entry: read_claude_code_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         read_live_store_title: Some(read_claude_code_live_store_title),
         remote_live_store_title: Some(CLAUDE_CODE_REMOTE_TITLE_PROBE),
@@ -2432,6 +2445,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_pi_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         // The 12-second title chore serves live pi rows from the session's
         // own jsonl (header id == file name uuid — measured 2026-08-30).
@@ -2540,6 +2554,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_no_store_entry,
         store_membership_index: Some(opencode_store_index_holds_session),
+        live_session_argv_flag: Some("--session"),
         live_session_marker: None,
         // opencode2 self-titles prompted sessions in session_v2 (the scanner
         // reads the same column); the chore reads it for live rows too.
@@ -2670,6 +2685,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_qwen_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         read_live_store_title: Some(read_qwen_live_store_title),
         remote_live_store_title: Some(QWEN_REMOTE_TITLE_PROBE),
@@ -2830,6 +2846,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_kimi_code_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         // The session's own state.json carries `title` (the first prompt,
         // `isCustomTitle` when the user renamed) — read it for live rows too.
@@ -2987,6 +3004,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_muse_store_entry,
         store_membership_index: Some(muse_store_index_holds_session),
+        live_session_argv_flag: None,
         live_session_marker: Some(LiveSessionMarker::EnclosingDirectory {
             root: ".local/share/muse/sessions",
             file_name: ".session.lock",
@@ -3170,6 +3188,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // not exist yet. Once a turn has happened it holds
         // `presence/<conversation-id>.lock`, and the id is the file's own stem
         // rather than a directory name.
+        live_session_argv_flag: None,
         live_session_marker: Some(LiveSessionMarker::FileStem {
             root: ".gemini/antigravity-cli/presence",
             extension: "lock",
@@ -3378,6 +3397,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_scan_gap: None,
         read_store_entry: read_grok_build_store_entry,
         store_membership_index: None,
+        live_session_argv_flag: None,
         live_session_marker: None,
         // Grok keeps summary.json per session directory; the chore reads the
         // session's own summary for live rows.

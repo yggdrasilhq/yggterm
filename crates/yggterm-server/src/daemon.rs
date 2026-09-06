@@ -6768,7 +6768,10 @@ impl DaemonRuntime {
         let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(session.kind) else {
             return;
         };
-        if descriptor.id_assigned_at_birth || descriptor.live_session_marker.is_none() {
+        if descriptor.id_assigned_at_birth
+            || (descriptor.live_session_marker.is_none()
+                && descriptor.live_session_argv_flag.is_none())
+        {
             return;
         }
         let Some(pid) = session.terminal_process_id else {
@@ -18316,7 +18319,7 @@ fn recover_missing_row_for_adopted_agent_runtime(
             )
         }
         _ => crate::agent_runtime_session_id_from_root_pid(kind, metadata.shell_pid).map(|id| {
-            id_origin = "live_session_marker";
+            id_origin = "live_session_identity";
             id
         }),
     };
