@@ -40,6 +40,7 @@ mod key_plane_locks {
             ribbon: Vec::new(),
             split_ratio: None,
             key_capture: true,
+            palette: None,
         };
         let seq = shell.document_pane_next_request("local://a");
         shell.document_pane_apply_schema(seq, "local://a", "doc", schema);
@@ -51,6 +52,137 @@ mod key_plane_locks {
     }
 
     #[test]
+    #[test]
+    fn palette_schema_field_parses_and_defaults_absent() {
+        let on: AppPaneSchema = serde_json::from_value(json!({
+            "title": "t",
+            "palette": {
+                "query": "org",
+                "prompt": "M-x",
+                "selected": 1,
+                "items": [
+                    {"id": "org-mode", "label": "org-mode", "hint": "RET"},
+                    {"id": "org-agenda", "label": "org-agenda"}
+                ]
+            }
+        }))
+        .expect("a schema declaring the palette parses");
+        let palette = on.palette.as_ref().expect("palette present");
+        assert_eq!(palette.query, "org");
+        assert_eq!(palette.selected, 1);
+        assert_eq!(palette.items.len(), 2);
+        assert_eq!(palette.items[0].hint, "RET");
+        assert_eq!(palette.items[1].detail, "", "detail defaults empty");
+
+        let off: AppPaneSchema =
+            serde_json::from_value(json!({"title": "t"})).expect("parses");
+        assert!(
+            off.palette.is_none(),
+            "absent means CLOSED: the overlay is omitted, never null"
+        );
+    }
+
+    #[test]
+    fn document_pane_palette_open_reads_the_live_schema() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        assert!(
+            !shell.document_pane_palette_open("local://a"),
+            "no schema yet: no overlay"
+        );
+        let schema = AppPaneSchema {
+            title: "ymacs".to_string(),
+            widgets: Vec::new(),
+            titlebar_switch: None,
+            footer: Vec::new(),
+            ribbon: Vec::new(),
+            split_ratio: None,
+            key_capture: true,
+            palette: Some(AppPanePalette {
+                query: String::new(),
+                prompt: "M-x".to_string(),
+                selected: 0,
+                items: Vec::new(),
+                empty: String::new(),
+            }),
+        };
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", schema);
+        assert!(
+            shell.document_pane_palette_open("local://a"),
+            "the one reader answers from the live schema"
+        );
+    }
+
+    #[test]
+    fn palette_revision_moves_only_when_the_block_changes() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let schema = |query: &str, with_palette: bool| AppPaneSchema {
+            title: "ymacs".to_string(),
+            widgets: Vec::new(),
+            titlebar_switch: None,
+            footer: Vec::new(),
+            ribbon: Vec::new(),
+            split_ratio: None,
+            key_capture: true,
+            palette: with_palette.then(|| AppPanePalette {
+                query: query.to_string(),
+                prompt: "M-x".to_string(),
+                selected: 0,
+                items: Vec::new(),
+                empty: String::new(),
+            }),
+        };
+        let revision = |shell: &ShellState| {
+            shell
+                .document_pane_channel("local://a")
+                .unwrap()
+                .schema
+                .as_ref()
+                .unwrap()
+                .value_epochs
+                .get("palette")
+                .copied()
+                .unwrap_or(0)
+        };
+
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", schema("or", true));
+        assert_eq!(revision(&shell), 1, "first palette: the field mounts");
+        // The per-keystroke echo — same block, new schema — must NOT move
+        // the stamp, or the field remounts under the user's eyes.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", schema("or", true));
+        assert_eq!(revision(&shell), 1, "an unchanged echo keeps the stamp");
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", schema("org", true));
+        assert_eq!(revision(&shell), 2, "a changed query remounts the field");
+        // Palette gone (the app finished the read): the key is dropped.
+        let seq = shell.document_pane_next_request("local://a");
+        shell.document_pane_apply_schema(seq, "local://a", "doc", schema("", false));
+        let channel = shell.document_pane_channel("local://a").unwrap();
+        assert!(channel.schema.as_ref().unwrap().schema.palette.is_none());
+    }
+
+    #[test]
+    fn the_palette_skip_set_is_the_component_keyboard() {
+        // The component consumes these WITH any modifiers.
+        for chord in ["RET", "C-RET", "M-RET", "ESC", "C-ESC", "<up>", "M-<down>", "<home>", "C-<end>"] {
+            assert!(
+                palette_surface_consumes(chord),
+                "{chord} is the component's: it arrives as an action, never a chord"
+            );
+        }
+        // Everything else still flows through the key plane.
+        for chord in ["C-m", "TAB", "SPC", "C-n", "C-p", "C-g", "g", "DEL", "<prior>", "M-x"] {
+            assert!(
+                !palette_surface_consumes(chord),
+                "{chord} must reach the app: C-m is the m key, not Enter"
+            );
+        }
+    }
+
     fn emacs_chord_spells_the_key_plane_table() {
         let none = Modifiers::empty();
         // Printable characters; shift is folded into the produced character.

@@ -8,6 +8,21 @@
 // printable key is folded into the produced character ("A", "?"); Shift
 // on a special spells "S-" (S-TAB). Prefix order is C-, M-, S-.
 // ============================================================================
+/// Whether CHORD is one of the palette component's own keys — the
+/// vocabulary it consumes while an app palette overlay is up (any
+/// modifiers, so C-RET and M-<down> are consumed as surely as RET).
+/// The m KEY is a distinct chord from Enter and still forwards.
+pub(crate) fn palette_surface_consumes(chord: &str) -> bool {
+    let base = chord
+        .trim_start_matches("C-")
+        .trim_start_matches("M-")
+        .trim_start_matches("S-");
+    matches!(
+        base,
+        "RET" | "ESC" | "<up>" | "<down>" | "<home>" | "<end>"
+    )
+}
+
 pub(crate) fn emacs_chord(key: &Key, modifiers: Modifiers) -> Option<String> {
     let ctrl = modifiers.contains(Modifiers::CONTROL);
     let alt = modifiers.contains(Modifiers::ALT);
@@ -3200,6 +3215,22 @@ fn app() -> Element {
                 };
                 if let Some((session, pane_id)) = capture_target {
                     if let Some(chord) = emacs_chord(&evt.key(), evt.modifiers()) {
+                        // The app's command palette overlay (S3) consumes
+                        // its OWN keys: the yggui palette component handles
+                        // arrows/Home/End/Enter/Escape (with any modifiers)
+                        // and POSTs them as palette-move/accept/dismiss.
+                        // The key plane must not ALSO forward those chords,
+                        // or one Enter accepts the row AND lands as RET in
+                        // the freshly-advanced read. Everything else —
+                        // typing, DEL, TAB, C-n/C-p, C-g, prefixes — still
+                        // flows: the palette field is a VIEW of the app's
+                        // query, and the app owns the keyboard.
+                        if state.read().document_pane_palette_open(&session)
+                            && palette_surface_consumes(&chord)
+                        {
+                            evt.prevent_default();
+                            return;
+                        }
                         evt.prevent_default();
                         evt.stop_propagation();
                         spawn(document_pane_forward_key(state, session, pane_id, chord));
