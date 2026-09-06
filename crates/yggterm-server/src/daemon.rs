@@ -16334,6 +16334,233 @@ fn daemon_binary_path() -> Option<std::path::PathBuf> {
     }
 }
 
+
+/// [11.67] THE STALE-PRESERVED-OWNER RETIREMENT PLANE — the answer to
+/// "nothing attaches deterministically while a zombie holds rows".
+///
+/// A predecessor daemon that handed off rows and then STOPPED draining (its
+/// bytes predate the [11.64] transcript signal, or its rows are blocked by a
+/// detector defect) pins those rows forever: the canonical cannot attach
+/// (the holder is alive under a live parent — the banner is unending), the
+/// proxy paints but never converges, and every rotation re-veils the
+/// viewport ([11.68]). Four generations were measured coexisting on one host
+/// with EIGHT preserved rows. The graceful drain ([11.64]) cannot run in
+/// bytes that predate it, so the canonical — always the newest build by this
+/// plane's own admission test — retires the stale holder the way the
+/// hand-measured cure did three times that night: SIGTERM. The PTY trees
+/// exit via SIGHUP with no orphans (measured), the transcript lives in the
+/// session store, and the row re-resumes on the canonical at its next open.
+///
+/// Admission (ALL of it, every pass, re-verified just before the signal):
+/// older build than ours, alive, still a yggterm server daemon by cmdline,
+/// entries older than the fresh-handoff grace, every held row's transcript
+/// verifiably STALE (a kind without a recency reader, a remote row, or an
+/// unreadable store answers "cannot say" and BLOCKS the retirement — the
+/// safety bias of the whole migration plane). One retirement per pass.
+const STALE_OWNER_RETIRE_CHECK_MS: u64 = 60_000;
+const STALE_OWNER_MIN_HOLD_MS: u64 = 10 * 60 * 1000;
+
+/// The pure admission core: `None` = retire this owner; `Some(reason)` =
+/// leave it alone this pass. Split from the IO so the table is lockable in
+/// a unit test.
+fn stale_owner_retire_verdict(
+    is_our_own_pid: bool,
+    owner_alive: bool,
+    owner_is_daemon: bool,
+    owner_build: u64,
+    my_build: u64,
+    entry_age_ms: u64,
+    min_hold_ms: u64,
+    all_held_rows_transcript_stale: Option<bool>,
+) -> Option<&'static str> {
+    if is_our_own_pid {
+        return Some("our_own_pid");
+    }
+    if owner_build >= my_build {
+        return Some("build_not_older");
+    }
+    if !owner_alive {
+        return Some("owner_dead");
+    }
+    if !owner_is_daemon {
+        return Some("pid_not_a_daemon");
+    }
+    if entry_age_ms < min_hold_ms {
+        return Some("fresh_handoff_grace");
+    }
+    match all_held_rows_transcript_stale {
+        Some(true) => None,
+        Some(false) => Some("a_held_row_transcript_fresh"),
+        None => Some("a_held_row_transcript_unknown"),
+    }
+}
+
+/// Does `/proc/<pid>/cmdline` still name a yggterm server daemon? Guards the
+/// signal against a recycled pid.
+#[cfg(target_os = "linux")]
+fn pid_is_a_yggterm_server_daemon(pid: u32) -> bool {
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&bytes);
+    cmdline.contains("yggterm") && cmdline.contains("server") && cmdline.contains("daemon")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_a_yggterm_server_daemon(_pid: u32) -> bool {
+    false
+}
+
+/// One retirement pass: group the registry by owner pid, admit owners by
+/// [`stale_owner_retire_verdict`] (with the per-row transcript staleness
+/// computed host-locally — the transcripts are files, daemon-agnostic),
+/// SIGTERM the admitted owner, drop its registry entries, and trace every
+/// step. Returns the number of owners retired.
+#[cfg(target_os = "linux")]
+fn retire_stale_preserved_owners_once(
+    home_dir: &Path,
+    rt: &mut DaemonRuntime,
+) -> usize {
+    use std::collections::HashMap;
+    let my_build = *DAEMON_RUNNING_BUILD_ID;
+    let my_pid = std::process::id();
+    let now = current_millis_u64();
+    let Some(user_home) = dirs::home_dir() else {
+        return 0;
+    };
+    let mut by_owner: HashMap<u32, (u64, u64, Vec<String>)> = HashMap::new();
+    let snapshot = rt.preserved_terminal_owners.entries.clone();
+    for entry in &snapshot {
+        if entry.owner_server_pid == my_pid || entry.owner_server_build_id >= my_build {
+            continue;
+        }
+        if now.saturating_sub(entry.created_at_ms) < STALE_OWNER_MIN_HOLD_MS {
+            continue;
+        }
+        let slot = by_owner
+            .entry(entry.owner_server_pid)
+            .or_insert((entry.owner_server_build_id, entry.created_at_ms, Vec::new()));
+        slot.2.push(entry.runtime_key.clone());
+    }
+    let mut retired = 0usize;
+    for (pid, (build, created, keys)) in by_owner {
+        let owner_alive = hot_update_owner_pid_is_alive(pid);
+        let owner_is_daemon = owner_alive && pid_is_a_yggterm_server_daemon(pid);
+        // Every held row must be VERIFIABLY stale: agent kinds read their own
+        // transcript (host-local, daemon-agnostic); anything we cannot read —
+        // a kind with no reader, a remote-row scheme, an unreadable store —
+        // answers Unknown and blocks the whole retirement.
+        let mut all_stale: Option<bool> = Some(true);
+        for key in &keys {
+            let session_id = key.rsplit('/').next().unwrap_or("");
+            let stale = match key_scheme_kind(key) {
+                Some(kind) => yggterm_core::agent_cli::agent_session_recency_ms(
+                    &user_home,
+                    kind,
+                    session_id,
+                )
+                .map(|recency_ms| {
+                    (now as i64 - recency_ms).max(0) as u64
+                        >= migration_idle_threshold_ms()
+                }),
+                None => None,
+            };
+            match (all_stale, stale) {
+                (Some(true), Some(true)) => {}
+                _ => {
+                    all_stale = if stale.is_none() { None } else { Some(false) };
+                    break;
+                }
+            }
+        }
+        let verdict = stale_owner_retire_verdict(
+            pid == my_pid,
+            owner_alive,
+            owner_is_daemon,
+            build,
+            my_build,
+            now.saturating_sub(created),
+            STALE_OWNER_MIN_HOLD_MS,
+            all_stale,
+        );
+        if let Some(reason) = verdict {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "hot_update",
+                "stale_owner_retirement_skipped",
+                serde_json::json!({
+                    "owner_pid": pid,
+                    "owner_build": build,
+                    "verdict": reason,
+                    "held_rows": keys,
+                }),
+            );
+            continue;
+        }
+        // SAFETY: signal-only; the pid was just verified alive and a daemon.
+        unsafe { let _ = libc::kill(pid as i32, libc::SIGTERM); }
+        for key in &keys {
+            rt.preserved_terminal_owners.remove_key(key);
+        }
+        let _ = rt.preserved_terminal_owners.save(home_dir);
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "hot_update",
+            "stale_owner_retired",
+            serde_json::json!({
+                "owner_pid": pid,
+                "owner_build": build,
+                "my_build": my_build,
+                "held_rows": keys,
+                "signal": "SIGTERM",
+            }),
+        );
+        retired += 1;
+        if retired >= 1 {
+            break;
+        }
+    }
+    retired
+}
+
+/// The scheme → kind map for rows whose transcript recency this host can
+/// read. Remote schemes name stores on OTHER hosts — Unknown here, by design.
+fn key_scheme_kind(runtime_key: &str) -> Option<SessionKind> {
+    if runtime_key.starts_with("codex-runtime://") {
+        Some(SessionKind::Codex)
+    } else if runtime_key.starts_with("cc-runtime://") {
+        Some(SessionKind::ClaudeCode)
+    } else if runtime_key.starts_with("opencode-runtime://") {
+        Some(SessionKind::OpenCode)
+    } else {
+        None
+    }
+}
+
+/// The pass thread. Kill-switch: `YGGTERM_DISABLE_STALE_OWNER_RETIRE=1`.
+fn spawn_stale_owner_retirement(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
+    if parse_self_retire_handoff_disabled(
+        std::env::var("YGGTERM_DISABLE_STALE_OWNER_RETIRE")
+            .ok()
+            .as_deref(),
+    ) {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(
+            STALE_OWNER_RETIRE_CHECK_MS,
+        ));
+        let mut guard = lock_daemon_runtime(&runtime, "stale_owner_retire_pass");
+        let retired = retire_stale_preserved_owners_once(&home_dir, &mut guard);
+        if retired > 0 {
+            let _ = std::io::Write::flush(&mut std::io::stdout().lock());
+        }
+        drop(guard);
+    });
+}
+
 fn current_build_id() -> u64 {
     daemon_binary_path()
         .and_then(|path| fs::metadata(path).ok())
@@ -24237,6 +24464,11 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // Started at most once: the drain thread polls until our hands are empty
         // and retires us itself, so a second handoff RPC must not stack another.
         let mut migration_drain_started = false;
+            // [11.67] THE RETIREMENT PLANE: this daemon is the newest build
+            // on the host by admission, so it owns the job of retiring
+            // stale preserved owners whose bytes predate the drain's
+            // signals. One pass per minute, kill-switched.
+            spawn_stale_owner_retirement(home_dir.clone(), runtime.clone());
         loop {
             let mut start_migration_drain = false;
             if drain_unix_client_outcomes(
@@ -30538,6 +30770,43 @@ mod tests {
             idle_ms,
             blocking_gate: None,
         }
+    }
+
+    /// ⛔ [11.67] THE RETIREMENT ADMISSION TABLE. Older build + alive daemon
+    /// + past the fresh-handoff grace + every held row verifiably stale =
+    /// retire. Any single miss = leave alone, by name.
+    #[test]
+    fn stale_owner_retirement_admits_only_older_dead_transcripts_daemons() {
+        let v = super::stale_owner_retire_verdict;
+        // The zombie: older build, alive, a daemon, rows verifiably stale.
+        assert_eq!(v(false, true, true, 100, 200, 900_000, 600_000, Some(true)), None);
+        // Fresh handoff: the grace holds.
+        assert_eq!(
+            v(false, true, true, 100, 200, 60_000, 600_000, Some(true)),
+            Some("fresh_handoff_grace")
+        );
+        // Same or newer build: not ours to judge.
+        assert_eq!(v(false, true, true, 200, 200, 900_000, 600_000, Some(true)), Some("build_not_older"));
+        assert_eq!(v(false, true, true, 300, 200, 900_000, 600_000, Some(true)), Some("build_not_older"));
+        // A fresh transcript anywhere in the holding set blocks.
+        assert_eq!(
+            v(false, true, true, 100, 200, 900_000, 600_000, Some(false)),
+            Some("a_held_row_transcript_fresh")
+        );
+        // An unreadable transcript blocks — cannot say never widens the kill.
+        assert_eq!(
+            v(false, true, true, 100, 200, 900_000, 600_000, None),
+            Some("a_held_row_transcript_unknown")
+        );
+        // A dead owner has nothing to retire (its sweep path handles it).
+        assert_eq!(v(false, false, false, 100, 200, 900_000, 600_000, Some(true)), Some("owner_dead"));
+        // A recycled pid that is not a daemon is never signalled.
+        assert_eq!(
+            v(false, true, false, 100, 200, 900_000, 600_000, Some(true)),
+            Some("pid_not_a_daemon")
+        );
+        // Our own pid is never a candidate.
+        assert_eq!(v(true, true, true, 100, 200, 900_000, 600_000, Some(true)), Some("our_own_pid"));
     }
 
     #[test]
