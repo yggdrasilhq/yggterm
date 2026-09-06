@@ -11381,8 +11381,14 @@ impl YggtermServer {
         // and the wrapper twin below. The probe still runs: a present answer
         // (a rebind landed) resumes exactly as before.
         let picker_fallback = remote_resume_absent_opens_picker(kind);
-        let saved_session_exists = live_runtime_held
-            || remote_saved_agent_session_exists(kind, session_id)?;
+        // The RAW store answer, kept separate from the gate below: the gate
+        // must fail OPEN for a held row (a live PTY must never be refused for
+        // a missing transcript — the 2026-08-28 strandings), but the LAUNCH
+        // composition needs the truth, because it is what gets executed in a
+        // fresh PTY: `resume <row id>` for an id the CLI never minted dies
+        // there (see [`live_held_row_resumes_by_row_id`]).
+        let saved_session_in_store = remote_saved_agent_session_exists(kind, session_id)?;
+        let saved_session_exists = live_runtime_held || saved_session_in_store;
         if !picker_fallback
             && remote_require_existing_refusal_allowed(
                 live_runtime_held,
@@ -11520,7 +11526,15 @@ impl YggtermServer {
         // wrapper's live-runtime arm bridges the existing PTY. The picker arm
         // is only for a cold row nothing holds and no transcript names; typing
         // it into a running TUI's PTY would drive that TUI's own UI.
-        let resumable = saved_session_exists || live_runtime_held;
+        // ⛔ — and a daemon-owned re-spawn composes THIS command into a fresh
+        // PTY, where no wrapper intercepts. There, `resume <row id>` needs the
+        // id to be one the CLI itself knows: a uuid-keyed codex row re-spawned
+        // as `codex resume <row uuid>` died on "No saved session found" (see
+        // [`live_held_row_resumes_by_row_id`]), so a held codex row without a
+        // saved session gets the picker arm — the user picks their
+        // conversation, instead of a row that can never reach one.
+        let resumable = saved_session_in_store
+            || (live_runtime_held && live_held_row_resumes_by_row_id(kind, saved_session_in_store));
         let launch_command = if resumable {
             remote_persistent_resume_shell_command_with_terminal_appearance(
                 kind,
@@ -14900,6 +14914,51 @@ fn remote_require_existing_refusal_allowed(
 /// keep the refusal: their stores ARE keyed by the row id, so absence is real.
 fn remote_resume_absent_opens_picker(kind: SessionKind) -> bool {
     agent_cli_descriptor(kind).is_some_and(|descriptor| !descriptor.id_assigned_at_birth)
+}
+
+/// Whether a HELD live row may re-spawn through `resume <row id>` when the
+/// re-spawning daemon has to compose the launch itself.
+///
+/// ⛔ THE ROW ID IS A RESUME ID ONLY IF THE CLI ITSELF WAS BORN WITH IT.
+/// Claude Code is launched with `--session-id <row uuid>`, so its rollout
+/// basename IS the row id and `resume <row id>` always resolves. Codex mints
+/// its own thread ids (`id_assigned_at_birth: false`): a uuid-keyed codex row
+/// (every `start-codex` birth) carries an id codex has NEVER heard of, and a
+/// re-spawn of `codex resume <row id>` dies on the spot — probed live
+/// 2026-09-06: `ERROR: No saved session found with ID <uuid>`. Such a row
+/// must re-open codex's own PICKER instead (the wrapper's live-runtime arm is
+/// unaffected: it bridges a held PTY before any compose happens). Measured
+/// cost of the old shape: a codex row stranded without any conversation path
+/// after every daemon swap, and a user reachable only by hand-editing the
+/// PTY. A saved session in the store resumes by id exactly as before.
+fn live_held_row_resumes_by_row_id(kind: SessionKind, saved_session_exists: bool) -> bool {
+    saved_session_exists
+        || agent_cli_descriptor(kind).is_some_and(|descriptor| descriptor.id_assigned_at_birth)
+}
+
+#[cfg(test)]
+mod live_held_row_resume_tests {
+    use super::*;
+
+    #[test]
+    fn a_codex_row_without_a_saved_session_never_resumes_by_row_id() {
+        // THE regression: a held uuid-keyed codex row used to compose
+        // `codex resume <row uuid>` — an id codex refuses — and the row
+        // stranded with no conversation path.
+        assert!(!live_held_row_resumes_by_row_id(SessionKind::Codex, false));
+    }
+
+    #[test]
+    fn a_codex_row_with_a_saved_session_still_resumes_by_id() {
+        assert!(live_held_row_resumes_by_row_id(SessionKind::Codex, true));
+    }
+
+    #[test]
+    fn an_id_at_birth_cli_keeps_the_old_shape_even_without_a_saved_session() {
+        // Claude Code is born with `--session-id <row uuid>`: the row id IS a
+        // CC session id, and the resume must keep working without a probe.
+        assert!(live_held_row_resumes_by_row_id(SessionKind::ClaudeCode, false));
+    }
 }
 
 fn remote_resume_seed_fallback_text(session: &ManagedSessionView) -> Option<String> {

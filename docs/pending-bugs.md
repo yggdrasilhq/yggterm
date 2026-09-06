@@ -27337,3 +27337,26 @@ restore process-dead, non-resumable rows as STORED-ONLY (History), not
 live — the recency machinery from [11.64] is the classifier. Auto-despawn
 is NOT the shape: a row whose CLI is momentarily unreachable must not
 vanish; the verb + the verdict make the owner the finisher.
+
+## ⛔ [11.74] UUID-KEYED CODEX ROWS HAD NO WORKING RESUME IDENTITY — A RE-SPAWN COMPOSED `codex resume <ROW UUID>` THAT CODEX REFUSES, STRANDING THE ROW (found diagnosing a live -32600 dead-end, 2026-09-06)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The chain, measured on the dev fleet host: a `start-codex` birth mints a
+yggterm uuid row id that codex never hears of (no rollout carries it —
+grepped the whole store). On the next daemon-owned re-spawn the launch
+composition ran `codex resume <row uuid>`, which codex refuses outright
+(probed: `ERROR: No saved session found with ID <uuid>`); the row kept no
+path to ANY conversation. The same night, a resume attempt inside such a row
+named ANOTHER live row's thread and died on codex's writer lock
+(`-32600 already has an active writer`), leaving a bare dead-end error that
+named neither the holder row nor the way back — codex's lock correctly
+protected the live session; yggterm painted nothing usable.
+
+**Fix:** the launch composition now asks whether the CLI assigns ids at
+birth. Id-at-birth CLIs keep `resume <row id>`; self-minting CLIs (codex)
+with no saved session get their own picker arm. The refusal gates keep the
+fail-open held-row shape. **Open half:** the -32600 painting comes from
+codex inside its own TUI; yggterm cannot intercept it there — the picker fix
+removes the main road into it, and a row-side explanation of a refused
+resume (naming the holder row) remains a dream.
