@@ -27438,6 +27438,28 @@ switch-following needs the opencode server API (or an upstream event);
 until then a row re-follows its session at every re-resume (the resume path
 already resolves recency-per-directory — measured: the 23:16 re-resume
 launched exactly `ses_f998a9`).
+**LIVE PROOF, OWNER SIDE (2026-09-07 ~01:55, build ddd4276c on the fleet):**
+after the deploy, the owner daemon's persistence chore rebound the row ON
+THE FIRST TICKS — `session_id` moved from the birth uuid
+`d4090efe…` to `ses_f998a9c76ffehgkGVvdWmlJgBE` (argv read off the live
+TUI's cmdline), and the row's label became opencode's own
+`session_v2.title` "Fixing yggterm <gui-host> UI blocks in ychrome" — the
+store lookup that answered `null` since birth now resolves by the real id.
+
+**TWIN BOUNDARY (measured, same hour):** the runtime-key scheme embeds the
+id (`opencode-runtime://<id>`), so the move RENAMES the row key while the
+preserved owner of the rotation window still advertises the birth-keyed
+row — both keys answer live with the same real title until the preserved
+PTY hands over and the predecessor retires. This twin is the move
+machinery meeting the preserved-owner window, not a second runtime; it
+collapses (or gets despawned per [11.74]) when the old daemon retires.
+**Falsifiers owed:** (a) the twin disappears at the preserved-owner
+retirement; (b) the GUI host's remote view flips from the birth key +
+"New <host> OpenCode" to the ses_ key + the real title on its remote
+re-enumeration (its first view after the rebind was still the stale cached
+record); (c) an `/sessions` switch followed by a re-resume launches the
+switched session.
+
 
 **Fix (`lane/cli/oc-argv-identity`):** a descriptor-declared
 `live_session_argv_flag` — `Some("--session")`, OpenCode only, measured off
