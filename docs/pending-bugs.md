@@ -27538,6 +27538,24 @@ missing-session row class (the "saved Codex session … is no longer
 available" error frame) demoting itself out of the live set — until then
 the sweep is the finisher: `rows live` names the ghosts, `rows despawn`
 removes them.
+
+**Live-sweep round (2026-09-07 ~03:0x, same lane):** the refined probe
+landed after two measured false-positive classes - the probe's OWN argv
+self-match (the ssh hop's bash/python carry every id; the first live run
+read every corpse ALIVE off the probe looking at it) and the naive
+yggterm-substring skip (the fleet npm CLIs install under a yggterm-named
+prefix, which read every live CLI as its own corpse). Final rule verified
+on real rows: a live codex reads alive; the unrecoverable error-frame row,
+the drain-released codex and the dead-opencode row read gone. First sweep:
+29 holder:gone of 39 rows; 16 birth-named corpses despawned 16/16 - and
+the honest boundary: `server rows live` STILL advertises all 16, because
+the despawn arm closes the daemon sessions map while Status advertises
+from the PERSISTED SNAPSHOT's live_sessions (despawn-local answers
+`nothing to despawn` for exactly this reason). The missing half - the
+RemoveSession{despawn:true} arm purging the persisted projection - is
+posted to the rows-despawn owner (infra/meta ACK-dd1ab25c6a); the
+tombstones are recorded, so if the restore import consults them the next
+rotation clears the list - falsifier armed.
 **Fix part (b) LANDED (`lane/cli/rows-despawn`):** `RemoveSession` carries a
 serde-default `despawn` flag (wire 3.2.75 + stamps re-cut in the same
 commit) and the daemon grew the DESPAWN arm — tombstone (the close path's
