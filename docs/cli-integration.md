@@ -2109,6 +2109,29 @@ owner's own breakdown:
 4. **Use the CLI understanding to find all faults**: `server rows live` is
    the standing audit — every mismatch it reports is a campaign work item.
 
+### Issue 38, live verification round (2026-09-06 ~23:5x)
+
+The owner re-tested with a brand-new codex session + resume and reported
+"New dev Codex" in row and sidebar. Measured end to end:
+
+* The screenshot was the PRE-REBIND moment. The row keyed
+  `remote-session://dev/d5d9f9fd-fec2-4b6b-ade9-104fd9067943` (the fresh
+  wrapper) REBOUND to the resumed thread
+  `01a05190-b999-79d1-9f13-1c124083eadf` and now wears that thread's first
+  prompt as its title — the SSOT chain (rebind → rollout arm) verified on
+  the owner's own live case.
+* Two OTHER rows still wear "New dev Codex" (`715ed3fa-4d7e-4119-8749-cb8199424896`,
+  `8a5749e0-1a52-4dbc-af17-73ee48595caf`):
+  PHANTOM rows — dev runs exactly four live codex processes, the remote
+  identity enumeration answers exactly those four, and neither phantom id
+  exists in any rollout or process. They are restart-storm corpses, not a
+  titling fault: the [11.64] transcript-liveness drain (armed on main)
+  releases them, or the owed per-row despawn verb kills them. Until then
+  they honestly wear their birth names.
+* A just-opened codex session (picker open, no turn committed) has NO
+  rollout and NO catalog row — "New dev Codex" until the first turn is the
+  SSOT-honest state: codex itself displays nothing for it yet.
+
 
 ### The contract, as landed
 
