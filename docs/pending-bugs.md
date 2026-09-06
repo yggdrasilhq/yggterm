@@ -27346,3 +27346,52 @@ a quiet host too. **Falsifier:** after the next daemon birth on the build
 host, the two 12h-old orphaned entries are gone from the registry within one
 prune tick, with the trace event naming the prune.
 
+**Addendum (same night, `lane/cli/registry-sweep-cadence` — the cadence was
+only half the hole; the predicate is the other half, measured live):** the
+young daemon HAD called `load()` at birth (it runs in
+`DaemonRuntime::load`), and the prune kept the entries anyway — its
+liveness instrument `kill(pid, 0)` answers EXISTENCE, not identity, and on
+a busy host the dead holders' pids had been REBORN as unrelated processes;
+22 minutes later those processes exited and the map (correctly) read "gone
+12h34m". A per-minute prune running the same bare-existence check keeps a
+recycled-pid entry FOREVER — the falsifier above passes only while the
+recycled pids stay dead. The same weak predicate sat under every holder
+decision: the revalidation chore probes the entry's ENDPOINT, and a
+self-resolving entry (endpoint = the canonical name the CURRENT daemon
+serves, the [11.65] shape) answers OK from us forever, so the probe can
+never see a dead holder; the [11.65] repoint arm and the census's
+`pid_alive` read the same check. This lane lands one identity-aware
+predicate (`preserved_owner_holder_is_alive` — the pid exists AND its
+cmdline still names a yggterm server daemon, the retirement oracle's own
+check now shared) used by the load-time prune, the census, the repoint arm,
+and the revalidation chore — which now judges the holder BEFORE its
+endpoint probe and drops a dead holder past the recent window immediately
+with reason `revalidate_holder_dead` (a dead pid is authoritative; it earns
+none of the two-miss grace a probe miss gets). Off Linux the identity
+oracle does not exist, so the predicate falls back to bare existence rather
+than mass-dropping. Locked by
+`a_recycled_pid_wearing_a_foreign_cmdline_is_not_a_live_holder` (a real
+foreign process wears the pid in the test) and
+`the_load_prune_drops_an_old_entry_whose_holder_pid_was_recycled`.
+
+
+**Addendum 2 (independent measurement, `lane/cli/registry-sweep-cadence`,
+convergent with infra/meta ACK-bb1117455c; this seat's post ACK-6e4a39f9d7):
+the same predecessor watched through the 21:36 deploy adds three facts.**
+(1) Its self-retire event at 21:45:24 — `daemon_self_retire_handoff_ok` —
+reports "preserving 4 live terminal runtime(s)" against
+`owned_terminal_session_count: 3` and names the OTHER daemon's
+`.retired-4103255` socket as its preserve target: an off-by-one and a
+crossed endpoint in one event, or a real bequest toward a retired
+generation. (2) Twenty seconds later it logged
+`disk_binary_handoff_cooldown_deferred {cooldown_ms: 1800000,
+ms_since_last_same_version_handoff: 20001}` — the 30-minute same-version
+cooldown defers the next handoff attempt of a half-drained generation, so
+fleet deploy velocity (~hourly) arithmetic converts into pinned invisible
+rows for 30+ minutes per generation. (3) The 21:44 map run counted 77
+`progressive_migration_candidates_blocked` announcements over two hours,
+every one reading `blocking_gate: null, migratable: true`, with ZERO
+`no_adopter` events — the drain announces its row gates but not its
+selector, which is exactly the gap the truthful-announcement fix above
+closes. A duplicate [11.73] filed from the same evidence by this lane was
+struck; this entry is the canonical record.
