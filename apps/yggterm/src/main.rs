@@ -1399,6 +1399,16 @@ fn main() -> Result<()> {
             args.iter().any(|arg| arg == "--json"),
         );
     }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "map")
+    {
+        // ONE owner, both binaries — the live daemon attach map, the same
+        // host-fact shape as the census arm above.
+        return yggterm_server::run_server_attach_map(
+            store.home_dir(),
+            args.iter().any(|arg| arg == "--json"),
+        );
+    }
     if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
         // ONE owner, both binaries — `yggterm_server::server_cli`.
         return yggterm_server::server_cli::run_server_ledger_cli(&store, &args);

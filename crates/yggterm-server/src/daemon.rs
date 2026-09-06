@@ -2209,6 +2209,58 @@ struct PreservedTerminalOwnerRegistry {
     entries: Vec<PreservedTerminalOwnerEntry>,
 }
 
+
+/// One preserved-owner entry, flattened for the attach map.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PreservedOwnerCensusRow {
+    pub runtime_key: String,
+    pub endpoint: String,
+    pub owner_server_pid: u32,
+    pub owner_server_version: String,
+    pub created_at_ms: u64,
+    /// Liveness of the holder pid, as this module's own probe sees it. Kept on
+    /// the row (not re-derived by the map) so the registry and the map can
+    /// never disagree about what "alive" meant at read time.
+    pub pid_alive: bool,
+}
+
+/// READ-ONLY read of the preserved-owner registry, for the attach map.
+///
+/// ⛔ Deliberately NOT `PreservedTerminalOwnerRegistry::load`, which PRUNES and
+/// SAVES — a read-only map must never mutate the registry it reports on: a map
+/// run would otherwise delete entries as a side effect of looking, and the
+/// next reader would see a different host than the map just described.
+#[cfg(unix)]
+pub fn preserved_owner_census_rows(home_dir: &Path) -> Vec<PreservedOwnerCensusRow> {
+    let Ok(bytes) = fs::read(PreservedTerminalOwnerRegistry::path(home_dir)) else {
+        // An absent or unreadable registry is an EMPTY answer, not an error:
+        // no entries is the ordinary state of a host with nothing preserved.
+        return Vec::new();
+    };
+    let registry: PreservedTerminalOwnerRegistry =
+        serde_json::from_slice(&bytes).unwrap_or_default();
+    registry
+        .entries
+        .into_iter()
+        .map(|entry| PreservedOwnerCensusRow {
+            endpoint: match &entry.endpoint {
+                PreservedOwnerEndpoint::Unix { path } => path.clone(),
+                PreservedOwnerEndpoint::Tcp { host, port } => format!("{host}:{port}"),
+            },
+            runtime_key: entry.runtime_key,
+            owner_server_pid: entry.owner_server_pid,
+            owner_server_version: entry.owner_server_version,
+            created_at_ms: entry.created_at_ms,
+            pid_alive: hot_update_owner_pid_is_alive(entry.owner_server_pid),
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+pub fn preserved_owner_census_rows(_home_dir: &Path) -> Vec<PreservedOwnerCensusRow> {
+    Vec::new()
+}
+
 fn preserved_terminal_owner_schema_version() -> u32 {
     1
 }
@@ -18446,6 +18498,35 @@ pub fn resolve_daemon_endpoint_selector(
 /// re-pointed at a successor had nothing left to enumerate and never appeared —
 /// the one instrument an agent reaches for to find a lingering daemon was blind
 /// to exactly the daemons this project's hardest lane is about.
+
+/// The versioned sockets a host-wide probe should dial, each with the census's
+/// endpoint label. `server daemons` owns the census read; this is the dial list
+/// behind it, exposed so the attach map dials the SAME set the census counts —
+/// two dial lists is exactly how hand-assembled reads answered a different
+/// subset every time.
+#[cfg(unix)]
+pub fn versioned_status_probe_endpoints(home_dir: &Path) -> Vec<(ServerEndpoint, String)> {
+    versioned_server_status_probe_paths(home_dir)
+        .into_iter()
+        .map(|path| {
+            let endpoint = ServerEndpoint::UnixSocket(path);
+            let label = owner_endpoint_label(&endpoint);
+            (endpoint, label)
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+pub fn versioned_status_probe_endpoints(_home_dir: &Path) -> Vec<(ServerEndpoint, String)> {
+    Vec::new()
+}
+
+/// The endpoint label the census prints, for callers outside this module (the
+/// attach map compares its probe labels against the default endpoint's).
+pub fn owner_endpoint_label_for_map(endpoint: &ServerEndpoint) -> String {
+    owner_endpoint_label(endpoint)
+}
+
 #[cfg(unix)]
 pub fn daemon_census(home_dir: &Path) -> HostDaemonCensus {
     let default_label = owner_endpoint_label(&default_endpoint(home_dir));
@@ -26062,6 +26143,21 @@ fn expect_ack(response: ServerResponse) -> Result<Option<String>> {
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected ack response: {:?}", other),
     }
+}
+
+
+/// The remote machines as the last persist recorded them, for the attach map.
+///
+/// ⛔ This is the PERSISTED view — a snapshot of the last successful refresh —
+/// never a live probe of the machines themselves. The map classifies the
+/// recorded `health` (healthy / cached / offline) rather than dialling, because
+/// a map that ssh-swept the fleet would take minutes and hang on exactly the
+/// broken host it exists to diagnose.
+pub fn persisted_remote_machines_for_map(
+    home_dir: &Path,
+) -> Result<Vec<RemoteMachineSnapshot>> {
+    let (state, _recovery) = load_persisted_state_recovering(&home_dir.join("server-state.json"))?;
+    Ok(state.map(|state| state.remote_machines).unwrap_or_default())
 }
 
 fn load_persisted_state(path: &Path) -> Result<Option<PersistedDaemonState>> {

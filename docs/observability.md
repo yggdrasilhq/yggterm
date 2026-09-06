@@ -164,7 +164,28 @@ The on-demand row witness carries the same final facts under `server app rows`:
 the projection after live-title enrichment. They do not replace the store or
 daemon as title/identity authority.
 
-### 2.2 Observed — and the gap is the point
+#### 2.1b The attach map (`server map`)
+
+`yggterm server map` is the on-demand instrument for "how is yggterm connected
+right now, from where, and what is broken". A HOST fact like the census it sits
+beside: it dials every versioned socket itself (2 s per-dial budget, the answer
+timed), checks every client-instance record's pid against the process table,
+reads the preserved-owner registry READ-ONLY, and lists the remote machines from
+the last persisted refresh — their RECORDED health, never a live ssh probe, so
+the map cannot hang on the broken host it exists to diagnose.
+
+Every row carries `ok` / `warning` / `failed` with the reason on the row; several
+findings merge worst-wins with every reason kept. A live client whose daemon
+endpoint answers nothing reads as a warning on the CLIENT row — that is the
+attach wound the map exists to expose, and it must not hide in the daemon
+section.
+
+The run lands on the trace stream, component `server-map`: one `run` event with
+the true counts, then at most 20 `flagged` echoes and a `flagged_suppressed`
+count when the cap bit (a graveyard must not flood the trace). `--json` carries
+the same document for scripts.
+
+## 2.2 Observed — and the gap is the point
 
 ⭐ **Registration is not emission.** A probe is registered at provider construction; whether it ever
 fires depends on a code path being reached. Measured over a 36-minute live window on the GUI host:
