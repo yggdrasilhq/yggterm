@@ -1048,6 +1048,39 @@ mod screen_verb_tests {
     }
 
     #[test]
+    fn the_read_rows_verbs_are_dispatched_by_both_binaries() {
+        // [audit-1] `live`/`show`/`drafts`/`departed` went missing from the
+        // yggterm binary while `yggterm-headless` kept them — the exact
+        // accidental divergence the both-binaries law exists for. The
+        // metadata SSOT audit is unreachable without `live`.
+        for (binary, source) in [
+            ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
+            (
+                "yggterm-headless",
+                include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            ),
+        ] {
+            for verb in ["departed", "live", "show", "drafts"] {
+                assert!(
+                    source.contains(&format!(r#"args[2] == "{verb}""#)),
+                    "`server rows {verb}` is not dispatched by {binary}",
+                );
+            }
+            for handler in [
+                "run_row_departures(",
+                "run_rows_live(",
+                "run_row_show(",
+                "run_row_drafts(",
+            ] {
+                assert!(
+                    source.contains(handler),
+                    "{binary} dispatches a rows read verb without calling {handler}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_re_point_verb_is_dispatched_by_both_binaries() {
         for (binary, source) in [
             ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
