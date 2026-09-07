@@ -12688,11 +12688,21 @@ impl DaemonRuntime {
                         });
                         continue;
                     }
+                    // [11.80] same live-first / snapshot-fallback split as
+                    // the single-row arm above.
+                    let records = match self.terminals.session_app_declares(&runtime_path) {
+                        Some(records) => {
+                            self.server
+                                .record_last_known_app_declares(
+                                    &runtime_path,
+                                    records.clone(),
+                                );
+                            records
+                        }
+                        None => self.server.last_known_app_declares(&runtime_path),
+                    };
                     sessions.push(TerminalAppDeclareSession {
-                        records: self
-                            .terminals
-                            .session_app_declares(&runtime_path)
-                            .unwrap_or_default(),
+                        records,
                         running: self.terminals.session_is_running(&runtime_path),
                         session_path,
                         owner_remote: false,
@@ -12722,11 +12732,19 @@ impl DaemonRuntime {
                         }
                     }
                 }
+                // [11.80] Live truth first (and it refreshes the snapshot —
+                // empty clears it, so an app's Clear propagates); the
+                // last-known snapshot answers only when the runtime is gone.
+                let records = match self.terminals.session_app_declares(&runtime_path) {
+                    Some(records) => {
+                        self.server
+                            .record_last_known_app_declares(&runtime_path, records.clone());
+                        records
+                    }
+                    None => self.server.last_known_app_declares(&runtime_path),
+                };
                 ServerResponse::TerminalAppDeclares {
-                    records: self
-                        .terminals
-                        .session_app_declares(&runtime_path)
-                        .unwrap_or_default(),
+                    records,
                     running: self.terminals.session_is_running(&runtime_path),
                 }
             }
@@ -38935,6 +38953,7 @@ mod tests {
         ));
         let state_path = root.join("nested").join("server-state.json");
         let expected = PersistedDaemonState {
+            last_known_app_declares: Default::default(),
             active_session_path: Some("remote-session://guihost/demo".to_string()),
             active_view_mode: super::WorkspaceViewMode::Terminal,
             ssh_targets: Vec::new(),
@@ -38973,6 +38992,7 @@ mod tests {
 
     fn persist_gate_test_state(active: &str) -> PersistedDaemonState {
         PersistedDaemonState {
+            last_known_app_declares: Default::default(),
             active_session_path: Some(active.to_string()),
             active_view_mode: super::WorkspaceViewMode::Terminal,
             ssh_targets: Vec::new(),
@@ -39407,6 +39427,7 @@ mod tests {
         ));
         let state_path = root.join("server-state.json");
         let first = PersistedDaemonState {
+            last_known_app_declares: Default::default(),
             active_session_path: Some("remote-session://dev/first".to_string()),
             active_view_mode: super::WorkspaceViewMode::Terminal,
             ssh_targets: Vec::new(),
@@ -39416,6 +39437,7 @@ mod tests {
             session_pty_grids: Vec::new(),
         };
         let second = PersistedDaemonState {
+            last_known_app_declares: Default::default(),
             active_session_path: Some("remote-session://dev/second".to_string()),
             active_view_mode: super::WorkspaceViewMode::Rendered,
             ssh_targets: Vec::new(),
