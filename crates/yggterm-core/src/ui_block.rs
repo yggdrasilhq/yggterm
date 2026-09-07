@@ -45,6 +45,44 @@ const POLL_MS: u64 = 50;
 /// Rolling window for the blocks-per-minute density figure.
 const DENSITY_WINDOW_MS: u64 = 60_000;
 
+/// The OS tid of the UI thread, captured on its first `stamp()` so the
+/// watchdog can read that thread's kernel wait channel mid-stall.
+static UI_TID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The calling thread's OS tid, read from `/proc/thread-self/stat` (no libc).
+fn current_tid() -> Option<u64> {
+    std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()
+        .and_then(|stat| {
+            stat.split_whitespace()
+                .next()
+                .and_then(|field| field.parse::<u64>().ok())
+        })
+}
+
+/// WHAT the UI thread is waiting on, read while the stall is in progress.
+///
+/// The fault witness answers "how busy was the machine"; this answers "what
+/// was the thread doing" — `wchan` names the kernel wait channel (a futex
+/// means a lock, epoll means idle, 0 means running) and `syscall` names the
+/// call in flight. Both are read by the WATCHDOG thread mid-stall, so the
+/// capture cannot be delayed by the very stall it describes.
+fn ui_thread_wait() -> serde_json::Value {
+    let Some(tid) = UI_TID.get() else {
+        return serde_json::Value::Null;
+    };
+    let base = format!("/proc/self/task/{tid}");
+    serde_json::json!({
+        "tid": tid,
+        "wchan": std::fs::read_to_string(format!("{base}/wchan"))
+            .map(|w| w.trim().to_string())
+            .unwrap_or_else(|_| "unreadable".to_string()),
+        "syscall": std::fs::read_to_string(format!("{base}/syscall"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unreadable".to_string()),
+    })
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -58,6 +96,9 @@ fn now_ms() -> u64 {
 /// to call it less often than the block threshold, because the resolution of
 /// the whole instrument is the interval between two stamps.
 pub fn stamp() {
+    if let Some(tid) = current_tid() {
+        let _ = UI_TID.set(tid);
+    }
     UI_STAMP_MS.store(now_ms(), Ordering::Relaxed);
 }
 
@@ -370,14 +411,22 @@ fn watch_loop(home: PathBuf) {
         let stamped = UI_STAMP_MS.load(Ordering::Relaxed);
         let now = now_ms();
         let ui_stalled = stamped != 0 && now.saturating_sub(stamped) >= threshold;
+        let mut ui_wait = serde_json::Value::Null;
         if ui_stalled && pre_witness.is_none() {
             pre_witness = ProcWitness::read();
+            // MID-STALL, while the wait is live: the kernel names it.
+            ui_wait = ui_thread_wait();
         }
         let Some(measured) = tracker.observe(stamped, now, threshold) else {
             continue;
         };
         let post_witness = ProcWitness::read();
-        let witness = witness_json(pre_witness.as_ref(), post_witness.as_ref());
+        let mut witness = witness_json(pre_witness.as_ref(), post_witness.as_ref());
+        if !ui_wait.is_null()
+            && let Some(map) = witness.as_object_mut()
+        {
+            map.insert("ui_thread_wait".to_string(), ui_wait);
+        }
         pre_witness = None;
         let sample = ytrace::diagnosis::UiBlockSample {
             gap_ms: measured.gap_ms,
