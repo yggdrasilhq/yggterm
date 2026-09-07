@@ -27688,6 +27688,21 @@ is ALREADY live (its runtime key answers), re-attach instead of spawning,
 and name the holding row in the refusal. The re-point is the same move the
 live rebind already makes; it is missing from the persisted→restore seam.
 
+**Falsifier FAILED live (2026-09-07 17:14, the owner's PTY read of the
+"New dev Codex" row, key remote-session://dev/d5d9f9fd-…):** the restore
+still composed the dead persisted id and errored ("saved Codex session … no
+longer available" + the Session-No-Longer-On-Remote toast). Reason: the
+re-point is SINGLE-HOP off the recorded Rollout filename, and this row's
+chain is longer — `d5d9f9fd` (dead) names no rollout file; its content
+continues inside `rollout-…-01a0709f-…jsonl` (Sep 5), which continues inside
+`rollout-…-01a07a88-…jsonl` (Sep 7 11:52). Codex mints a fresh rollout on
+every /resume, so the persisted id drifts one hop per resume and the stored
+`Rollout file` field itself goes stale. The re-point must CHASE the chain —
+grep persisted-id → owning rollout → its filename id → recurse — and prefer
+a LIVE writer over any stored field (a live codex holds its rollout OPEN in
+/proc/<pid>/fd; the filename there IS the current thread id). Routed back to
+the codex-resume-identity owner with the measured chain.
+
 **Code fix:** restore now derives a Codex-family id from the UUID suffix of
 the persisted rollout path, carries it through the stable daemon runtime row,
 rebuilds the resume command and Codex metadata from that id, and uses the same
@@ -27808,6 +27823,23 @@ scope so the [11.73] rebind arms stay untouched.
 Falsifier: the owner's agy row (key remote-agy://dev/7f56c798-…) after
 deploy + first chore tick: the record's session id reads 7f56c798-…, the
 next open attaches to pid 2957600 without the banner.
+
+**Addendum (2026-09-07 17:15, the owner's PTY reads falsified the wave's
+"unblocked" claim — two of three rows still fail to attach):**
+
+- **OpenCode row `remote-opencode://dev/d4090efe-…` wedged in the SAME
+  external-active shape**: "OpenCode session ses_f998a9c76ffehgkGVvdWmlJgBE
+  is already running under yggterm (pid 3348247); waiting to attach". The
+  holder is NOT external — `/proc` shows pid 3348247 is a child of DEV'S OWN
+  CURRENT DAEMON (3325546, `opencode2 --auto --session ses_f998a9c…`). The
+  daemon refused to resume a session it could have attached to directly.
+  This is the [11.73]/Issue-38-F2 seam: the restore/ensure path needs an
+  ATTACH-TO-OWN-LIVE-RUNTIME arm (holder in my runtime table ⇒ bridge the
+  row to it; never wait). The [11.79] row-key guard deliberately excludes
+  opencode (row-named keys) — that exclusion stands; the hole here is the
+  attach arm, owned by the opencode lane.
+- The agy row from this entry's falsifier DID heal: it opened attached on
+  7f56c798 (owner screenshot 17:15). One of three.
 
 ## ⛔ [11.80] EVERY DAEMON SUCCESSION EMPTIES THE APP-DECLARE REGISTRY — 558 `daemon_declare_absent` EVENTS IN 40 MINUTES, ROWS LOSE THEIR APP SIDEBARS (measured live 2026-09-07 15:19-16:20)
 
