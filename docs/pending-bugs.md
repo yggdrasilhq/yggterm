@@ -28001,7 +28001,43 @@ id instead of the view's birth id. The audit's read key (the persisted
 `row.id`) is the one that tracks the runtime; verify which of view.id /
 persisted id the identity overlay actually writes before choosing.
 
-**Falsifier:** after the fix, a rebound codex row (persisted id ≠ key id)
-gets exactly one store answer in the chore's tick, the row title flows to
-the rebound thread's catalog title, and the audit's mismatch clears within
-one tick without a manual rename.
+**Also:** the [11.80] durable falsifier (last_known_app_declares survives a
+rotation non-empty) stays ARMED — the GUI host's 3 entries (02:12) were
+written under the daemon that still owns the socket, so no rotation has
+tested them yet.
+
+
+## [11.85] `terminal new --kind zcode-tui` misroutes to an opencode resume on a foreign host (OPEN, 2026-09-08)
+
+Repro (guihost, yggterm 3.2.84 daemon + GUI, zcode-tui descriptor registered
+on main):
+
+```
+yggterm-headless server app terminal new --kind zcode-tui \
+  --cwd <repo-checkout> --no-activate \
+  --purpose "zcode-tui pixel test 2" --agent zcode-probe
+```
+
+Reply: `session_path: remote-opencode://dev/d4090efe-…`,
+`launch.launch_command` = `ssh -tt dev '… resume-opencode d4090efe-…
+<yggterm-checkout> --require-existing'`.
+
+Three faults in one: (1) the kind was not honoured — the launch is an
+OPENCODE resume; (2) the `--cwd` was rewritten to a different directory on a
+different machine (`dev:<yggterm-checkout>`); (3) `--require-existing` means
+it attaches a foreign live session rather than starting the requested CLI.
+The reply's `agent_title` names zcode-tui, so the ROW claims zcode-tui while
+running something else — the one-shape law violated on the launch plane.
+
+Suspects: the terminal-new kind→launch resolution for the newest registered
+kind (agent_scheme.rs has NO ZcodeTui scheme rows — every other kind has
+row-identity/runtime descriptors; the launcher may fall through to
+"latest session in cwd" when the scheme table misses), and/or a
+desktop-only provider assumption in the resume path.
+
+This is exactly the class the dual-source probes catch: yggterm witnesses a
+launch, zcode-tui never fires `boot` (no stimulus) → the pairing fails on
+the launch milestone. Verify after fix: the same command spawns
+`zcode-tui --resume`-less TUI in a PTY rooted at --cwd, and
+`zcode-tui|boot` appears on the title channel.
+(pending-bugs [11.85]: terminal new --kind zcode-tui misroutes to an opencode resume on a foreign host (repro de-identified))
