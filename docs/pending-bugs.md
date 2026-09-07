@@ -27773,6 +27773,17 @@ Two open questions, evidence attached:
    whose replacement probes OLDER than the running version, and drop
    non-canonical graves from the candidate list (a backup never hands off).
 
+**ATTRIBUTION CORRECTION (2026-09-07 22:5x, the evening falsifier):** with a
+1-second watcher sitting on the daemon binary (`open-fd snapshot on every
+stat change`), NO binary write occurred outside deploys — and the next churn
+wave (22:27, three more daemon generations on BOTH hosts) was preceded at
+22:26:27 by `notify_spawned {incident_id: "host_panic_ui_thrash", severity:
+error}` — **the UI-thrash rescue plane**, not the disk detector: the UI
+thread was blocking ~6 times a minute (socket_watts ~15), the rescue fired,
+and the rescue's relaunch churned the daemons. The disk-cascade shape in this
+entry stays real for deploy windows; tonight's floor is [11.81]. The watcher
+instrument stays armed (`/tmp/zseat-phantom-binwatch.log` on the GUI host).
+
 Falsifier: quiet host + the graveyard present + one daemon → expect ZERO
 `hot_restart_same_version_cold_swap_armed` events over an hour.
 
@@ -27890,3 +27901,33 @@ Falsifier: force a same-version cold swap with a ychrome row open → count
 `daemon_declare_absent` for its path across the succession; expect the
 registry inherited (zero absents) or one re-declare ping, not a permanent
 absent storm.
+
+## ⛔ [11.81] THE UI THREAD BLOCKS ~6 TIMES A MINUTE, THE RESCUE PLANE RESPONDS, AND THE RESCUE CHURNS THE DAEMONS — THE REAL FLOOR UNDER THE ROTATION CASCADE (measured on the GUI host, 2026-09-07 22:2x)
+
+**Status:** OPEN
+
+**Owner:** the libyggterm/GUI plane (the ui/block throttle and its rescue are
+that plane's [11.53] machinery).
+
+The evening rotation cascade ([11.77]) was attributed to the disk-binary
+detector; the falsifier instead caught the rescue plane:
+`notify_spawned {incident_id: "host_panic_ui_thrash", pid: 1926803,
+socket_watts: 15.0}` at 22:26:27, with the diagnosis "UI thread blocking 6
+times a minute — the interface is thrashing", followed by two fresh daemon
+generations at 22:27:12-13 on both hosts. Every row-level defect of the day
+(wedged resumes, lost sidebars, ghost rows) got another churn wave each time
+the rescue fired.
+
+**The open question is the blocking itself**: WHAT blocks the UI thread, 6
+times a minute, for long enough to trip the throttle? The event-trace carries
+no per-block samples in the planes searched (`ui` component, "block"-named
+events — zero rows in the window); the block-watts number arrives only
+pre-aggregated inside the rescue incident. Fix shape: first give the block
+plane per-sample witnesses (component, duration, correlated request/op) so
+the attribution is measurable, then fix the top offender. Until the blocking
+stops, the rescue plane will keep churning daemons every ~30 minutes and
+every succession-adjacent bug stays noisy.
+
+Falsifier: with per-sample witnesses landed, the next `host_panic_ui_thrash`
+incident must arrive WITH its top blocking samples attached; fixing the top
+offender must push socket_watts below the throttle threshold for a full day.
