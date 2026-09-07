@@ -3402,11 +3402,88 @@ fn favicon_store_live_lookup(
     (entry.fetched_at.elapsed() < FAVICON_STORE_TTL).then(|| entry.png.clone())
 }
 
+/// THE PERSISTENT FAVICON CACHE, one PNG per URL under
+/// `$HOME/.yggterm/web-favicons/`, named by the URL's SHA-256.
+///
+/// ⛔ WHY IT EXISTS: the in-memory store dies with the process, and the
+/// engine's WebKit favicon database answers ONLY through a live webview —
+/// so after a restart (or in a restored tab that was never revealed) every
+/// icon vanished, restart after restart, exactly what the owner reported:
+/// *"Every restart of yggterm or a new ychrome row I see NO favicons."*
+/// Chrome keeps a per-profile favicon store it reads WITHOUT loading the
+/// page; this is that layer. Earned icons land here the moment the
+/// database serves them, and every later restart, row, and restored tab
+/// reads them straight off disk.
+const FAVICON_DISK_TTL: std::time::Duration = std::time::Duration::from_secs(90 * 24 * 60 * 60);
+
+fn favicon_disk_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::Path::new(&home).join(".yggterm").join("web-favicons"))
+}
+
+/// The cache file for one URL: `sha256(url).png`. Content-addressed, so no
+/// index exists to corrupt and a lookup is one stat.
+fn favicon_disk_path_in(dir: &std::path::Path, uri: &str) -> std::path::PathBuf {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(uri.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    dir.join(format!("{hex}.png"))
+}
+
+fn favicon_disk_write_in(dir: &std::path::Path, uri: &str, png: &[u8]) {
+    if png.is_empty() {
+        return;
+    }
+    let path = favicon_disk_path_in(dir, uri);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, png);
+}
+
+/// The disk's answer for `uri`, if a live (non-expired) entry exists. The
+/// file's mtime is the fetch time — no index, no journal, nothing to lose.
+fn favicon_disk_read_in(dir: &std::path::Path, uri: &str) -> Option<Vec<u8>> {
+    let path = favicon_disk_path_in(dir, uri);
+    let age = std::fs::metadata(&path).ok()?.modified().ok()?.elapsed().ok()?;
+    if age > FAVICON_DISK_TTL {
+        return None;
+    }
+    std::fs::read(&path).ok()
+}
+
+fn favicon_disk_delete_in(dir: &std::path::Path, uri: &str) {
+    let _ = std::fs::remove_file(favicon_disk_path_in(dir, uri));
+}
+
+fn favicon_disk_write(uri: &str, png: &[u8]) {
+    if let Some(dir) = favicon_disk_dir() {
+        favicon_disk_write_in(&dir, uri, png);
+    }
+}
+
+fn favicon_disk_read(uri: &str) -> Option<Vec<u8>> {
+    let dir = favicon_disk_dir()?;
+    favicon_disk_read_in(&dir, uri)
+}
+
+fn favicon_disk_delete(uri: &str) {
+    if let Some(dir) = favicon_disk_dir() {
+        favicon_disk_delete_in(&dir, uri);
+    }
+}
+
 #[cfg(test)]
 mod page_menu_position_tests {
     use super::{
-        favicon_store_live_lookup, page_menu_insert_position_after_reload,
-        rearm_favicons_after_database_clear, FAVICON_STORE_TTL, FaviconStoreEntry,
+        favicon_disk_delete_in, favicon_disk_path_in, favicon_disk_read_in,
+        favicon_disk_write_in, favicon_store_live_lookup,
+        page_menu_insert_position_after_reload, rearm_favicons_after_database_clear,
+        FAVICON_STORE_TTL, FaviconStoreEntry,
     };
     use std::{cell::RefCell, collections::HashMap};
     use webkit2gtk::ContextMenuAction;
@@ -3458,6 +3535,63 @@ mod page_menu_position_tests {
 
     /// The store's contract: a live entry answers, an expired one does not,
     /// and the TTL is measured from the FETCH, lazily — no timer, no sweep.
+    /// The PERSISTENT cache round-trips by URL: a written icon reads back
+    /// (last write wins), an unknown URL reads nothing, and the file name is
+    /// a pure function of the URL — the whole no-index design rests on that.
+    #[test]
+    fn the_disk_cache_round_trips_by_url() {
+        let dir = std::env::temp_dir().join(format!("ygg-favicon-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        favicon_disk_write_in(&dir, "https://example.test/a", b"png-a");
+        favicon_disk_write_in(&dir, "https://example.test/a", b"png-a2");
+        assert_eq!(
+            favicon_disk_read_in(&dir, "https://example.test/a"),
+            Some(b"png-a2".to_vec())
+        );
+        assert_eq!(favicon_disk_read_in(&dir, "https://example.test/b"), None);
+        assert_eq!(
+            favicon_disk_path_in(&dir, "https://example.test/a"),
+            favicon_disk_path_in(&dir, "https://example.test/a")
+        );
+        assert_ne!(
+            favicon_disk_path_in(&dir, "https://example.test/a"),
+            favicon_disk_path_in(&dir, "https://example.test/b")
+        );
+        // The drop-cache reaches the disk: the deleted URL reads nothing.
+        favicon_disk_delete_in(&dir, "https://example.test/a");
+        assert_eq!(favicon_disk_read_in(&dir, "https://example.test/a"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Product source only — a string quoted inside a test must not satisfy
+    /// a source lock.
+    fn product() -> String {
+        let src = include_str!("web_surface.rs");
+        // This file carries SEVERAL test modules; the product source is
+        // everything before the LAST one.
+        match src.rfind("\n#[cfg(test)]") {
+            Some(i) => src[..i].to_string(),
+            None => src.to_string(),
+        }
+    }
+
+    /// The WIRING is locked: every earned icon lands on disk (write-through
+    /// at the database callback), and the hard reload's drop-cache deletes
+    /// the surviving entry too — the owner's "until reload (drop cache)"
+    /// must reach the layer that outlives the process.
+    #[test]
+    fn earned_icons_land_on_disk_and_reload_drops_them() {
+        let src = product();
+        assert!(
+            src.contains("favicon_disk_write(&uri, &png);"),
+            "the earn path no longer writes the disk"
+        );
+        assert!(
+            src.contains("favicon_disk_delete(uri.as_str());"),
+            "the hard reload no longer drops the disk entry"
+        );
+    }
+
     #[test]
     fn a_stored_icon_answers_until_its_ttl_expires() {
         let fresh = HashMap::from([(
@@ -4758,6 +4892,20 @@ impl WebSurfaceHost {
             self.favicon_pngs.borrow_mut().insert(id, Some(png.clone()));
             return Some(png);
         }
+        // THE DISK ANSWERS NEXT — the layer a restart cannot take away. A
+        // cache hit also warms the memory store, so this surface's later
+        // polls read memory like every other tab.
+        if let Some(png) = favicon_disk_read(&page_uri) {
+            self.favicon_store.borrow_mut().insert(
+                page_uri.clone(),
+                FaviconStoreEntry { png: png.clone(), fetched_at: std::time::Instant::now() },
+            );
+            self.favicon_requests
+                .borrow_mut()
+                .insert(id, page_uri.clone());
+            self.favicon_pngs.borrow_mut().insert(id, Some(png.clone()));
+            return Some(png);
+        }
         let needs_request = {
             let mut requests = self.favicon_requests.borrow_mut();
             match requests.get(&id) {
@@ -4775,6 +4923,25 @@ impl WebSurfaceHost {
             self.request_page_favicon(id, &page_uri);
         }
         self.favicon_pngs.borrow().get(&id).cloned().flatten()
+    }
+
+    /// THE PERSISTENT CACHE, READ WITHOUT A WEBVIEW: `uri`'s icon from the
+    /// memory store, else the disk store. This is what a restored tab asks
+    /// before any webview exists — the question that used to have no answer
+    /// and left every restart's tab rows bare.
+    pub fn favicon_for_uri(&self, uri: &str) -> Option<Vec<u8>> {
+        if uri.is_empty() {
+            return None;
+        }
+        if let Some(png) = favicon_store_live_lookup(&self.favicon_store.borrow(), uri) {
+            return Some(png);
+        }
+        let png = favicon_disk_read(uri)?;
+        self.favicon_store.borrow_mut().insert(
+            uri.to_string(),
+            FaviconStoreEntry { png: png.clone(), fetched_at: std::time::Instant::now() },
+        );
+        Some(png)
     }
 
     /// Kick ONE async `get_favicon` for surface `id` at `page_uri`. The
@@ -4827,6 +4994,9 @@ impl WebSurfaceHost {
                     uri.clone(),
                     FaviconStoreEntry { png: png.clone(), fetched_at: std::time::Instant::now() },
                 );
+                // And lands on disk for every restart, row and restored tab
+                // that will ask for this URI after this process is gone.
+                favicon_disk_write(&uri, &png);
                 // The per-surface model, though, is only written while the
                 // surface still asks for this URI — an answer for a page the
                 // surface has left must not paint that page's icon.
@@ -5960,6 +6130,12 @@ impl WebSurfaceHost {
             self.favicon_requests.as_ref(),
             self.favicon_store.as_ref(),
         );
+        // The drop-cache reaches the layer that SURVIVES the process: the
+        // reloaded page's disk entry goes too, so the next answer is the
+        // database's fresh one and not the cache's old one.
+        if let Some(uri) = webview.uri() {
+            favicon_disk_delete(uri.as_str());
+        }
 
         webview.reload_bypass_cache();
         Ok(())
