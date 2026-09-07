@@ -55101,6 +55101,9 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert!(terminal_chunk_is_daemon_launch_seed(
             "Remote bootstrap: copying yggterm binary"
         ));
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Codex session rooted at /home/user/project; the daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."
+        ));
         // …but real CLI / shell output is NOT (no false positives on agent text).
         assert!(!terminal_chunk_is_daemon_launch_seed(
             "• wezterm is installed and available"
