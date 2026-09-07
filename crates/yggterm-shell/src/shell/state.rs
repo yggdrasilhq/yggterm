@@ -27954,7 +27954,20 @@ impl ShellState {
             total_kb / 1024
         }
         if outcome == "ready" && notify_total_ms >= SLOW_REVEAL_NOTIFY_MS {
-            let seconds = notify_total_ms as f64 / 1000.0;
+            // ⛔ THE STALE-ATTEMPT GUARD (2026-09-07, GUI host): a reveal whose
+            // session is no longer the active terminal was never a wait the
+            // user experienced. Measured: 33 "Slow terminal reveal" cards in
+            // two days, topped by "took 1233.0s" — the attempt had sat since a
+            // click two hours earlier while the user worked in other rows
+            // (mount fine, ready-proof missing in the background), and the
+            // latch fired on their RETURN, blaming a reveal that took seconds.
+            // The reveal log + `reveal_ready` trace above keep every number
+            // for the post-mortem; the card is only for a wait the user actually
+            // stood in.
+            let still_watching = self.server.active_view_mode() == WorkspaceViewMode::Terminal
+                && self.server.active_session_path() == Some(session_path);
+            if still_watching {
+                let seconds = notify_total_ms as f64 / 1000.0;
             // ⛔ THE 2026-08-10 INVERSION HAD A BLIND SPOT, measured 2026-08-20:
             // PSI `full` is machine-wide (every non-idle task stalled at once),
             // so it reads ~0 while the ONE process the user is watching pays
@@ -27991,11 +28004,12 @@ impl ShellState {
                     ),
                 }
             };
-            self.push_notification(
-                NotificationTone::Info,
-                "Slow terminal reveal",
-                format!("Revealing {notify_label} took {seconds:.1}s. {detail}"),
-            );
+                self.push_notification(
+                    NotificationTone::Info,
+                    "Slow terminal reveal",
+                    format!("Revealing {notify_label} took {seconds:.1}s. {detail}"),
+                );
+            }
         }
     }
 

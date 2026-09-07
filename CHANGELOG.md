@@ -3,6 +3,7 @@
 This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
+- **Slow-reveal notifications no longer blame reveals you never waited on.** An open-reveal attempt left behind by a click can sit for hours while you work in other rows — the ready-proof only latches when you return — and the completion then reported the whole wall time as a slow reveal: 33 cards in two days on one desktop, topped by a reveal that had allegedly taken 20.5 minutes. The card now fires only while the revealed row is still the one you are looking at; the full numbers stay in the reveal log and trace for the post-mortem.
 
 - [11.79] the agent identity chore never re-points a row against its
   session-named runtime key; the key's id wins and already-drifted rows heal

@@ -39205,6 +39205,38 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
+    /// ⛔ THE STALE-ATTEMPT GUARD (2026-09-07, GUI host): 33 "Slow terminal
+    /// reveal" cards in two days, topped by "took 1233.0s" — attempts left
+    /// Pending by a click the user made hours earlier, latching ready on their
+    /// RETURN and blaming a reveal that took seconds. A slow reveal whose
+    /// session is no longer the active terminal was never a wait the user
+    /// experienced: resolve it (the reveal log keeps the numbers) and stay
+    /// quiet.
+    #[test]
+    fn slow_reveal_on_a_session_the_user_has_moved_on_from_does_not_notify() {
+        let attempted = "remote-session://dev/stale-attempt-row";
+        let moved_on_to = "remote-session://dev/where-the-user-actually-is";
+        let bootstrap = test_shell_bootstrap_with_active_session(moved_on_to);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(attempted, "req-stale", 3, "open_row");
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = current_millis().saturating_sub(1_233_000);
+        }
+        shell.mark_terminal_open_attempt_ready_for_session(attempted, "test_ready");
+        assert!(
+            !shell
+                .notifications
+                .iter()
+                .any(|notification| notification.title == "Slow terminal reveal"),
+            "a reveal the user never waited on must not become a card"
+        );
+    }
+
     /// The other side: when the honest predicate agrees the machine is short,
     /// freeing RAM really is the advice, and it must still be given.
     #[test]
