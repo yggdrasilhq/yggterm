@@ -126,6 +126,9 @@ pub enum ManagedCliTool {
     Antigravity,
     // The 2026-08-13 intake.
     GrokBuild,
+    // The 2026-09-08 intake: the house's own ZCode TUI client
+    // (@avikalpa/zcode-tui, GPL-3.0-or-later).
+    ZcodeTui,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +233,7 @@ impl ManagedCliTool {
             Self::Muse => SessionKind::Muse,
             Self::Antigravity => SessionKind::Antigravity,
             Self::GrokBuild => SessionKind::GrokBuild,
+            Self::ZcodeTui => SessionKind::ZcodeTui,
         }
     }
 
@@ -255,6 +259,7 @@ impl ManagedCliTool {
             SessionKind::Muse => Self::Muse,
             SessionKind::Antigravity => Self::Antigravity,
             SessionKind::GrokBuild => Self::GrokBuild,
+            SessionKind::ZcodeTui => Self::ZcodeTui,
             SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => return None,
         })
     }

@@ -14820,7 +14820,10 @@ fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
         SessionKind::Muse => RemoteRuntimeKind::Muse,
         SessionKind::Antigravity => RemoteRuntimeKind::Antigravity,
         SessionKind::GrokBuild => RemoteRuntimeKind::GrokBuild,
-        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
+        // zcode-tui is local-only (no remote rows exist to file); the Shell
+        // bucket is the honest "never a remote runtime" answer, shared with
+        // the shells.
+        SessionKind::ZcodeTui | SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
             RemoteRuntimeKind::Shell
         }
     }
