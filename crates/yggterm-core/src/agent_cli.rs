@@ -5157,6 +5157,19 @@ const MUSE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     choose: first_muse_title_candidate,
 };
 
+/// Whether a row's store titles are read on THIS host rather than through the
+/// remote probe. An empty ssh target means local; `"localhost"` is a row that
+/// was born as a loopback ssh and still lives on this host's own stores.
+/// ⭐ THE ONE SPELLING: the `rows live` audit and the title-follow chore must
+/// classify a row the same way, or the two wires answer different readers and
+/// the audit flags mismatches the follower can never see (measured 2026-09-08:
+/// the muse row answered the remote probe's condensed first prompt in the
+/// audit and the db session_name in the chore).
+pub fn store_title_read_is_loopback(ssh_target: &str) -> bool {
+    let trimmed = ssh_target.trim();
+    trimmed.is_empty() || trimmed == "localhost"
+}
+
 fn first_muse_title_candidate(candidates: &[String]) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         let trimmed = candidate.trim();
@@ -5294,21 +5307,27 @@ def read_jsonl(path):
     except Exception:
         pass
 
+# db locators are processed BEFORE the transcript globs: candidates are
+# consumed first-match by the chooser, and the index's session_name is the
+# CLI's own display word. Glob-first ordering answered the jsonl's first
+# raw prompt and starved the name — the measured audit/chore divergence
+# of 2026-09-08 (the local reader answers name-first from the same store).
 for locator in locators:
     if any(character in locator for character in '*?['):
-        try:
-            matches = sorted(home.glob(locator))
-        except Exception:
-            continue
-        for match in matches:
-            if match.name == 'session.jsonl':
-                read_jsonl(match)
         continue
     path = home / locator
-    if not path.exists():
-        continue
-    if path.suffix == '.db':
+    if path.exists() and path.suffix == '.db':
         read_db(path)
+for locator in locators:
+    if not any(character in locator for character in '*?['):
+        continue
+    try:
+        matches = sorted(home.glob(locator))
+    except Exception:
+        continue
+    for match in matches:
+        if match.name == 'session.jsonl':
+            read_jsonl(match)
 
 for session_id in ids:
     found = candidates.get(session_id) or []
@@ -9381,6 +9400,41 @@ mod tests {
         assert_eq!(
             first_muse_title_candidate(&["arctic-exosphere".to_string()]).as_deref(),
             Some("arctic-exosphere"),
+        );
+    }
+
+    /// The audit (`rows live`) and the title-follow chore classify rows with
+    /// this one predicate. Divergent spellings sent the muse row to the remote
+    /// probe in one wire and the local reader in the other, and the two wires
+    /// then disagreed about what the CLI said (measured 2026-09-08).
+    #[test]
+    fn loopback_store_reads_cover_empty_and_localhost_only() {
+        assert!(store_title_read_is_loopback(""));
+        assert!(store_title_read_is_loopback("  "));
+        assert!(store_title_read_is_loopback("localhost"));
+        assert!(!store_title_read_is_loopback("oc"));
+        assert!(!store_title_read_is_loopback(" dev "));
+        assert!(!store_title_read_is_loopback("localhost.example"));
+    }
+
+    /// The muse remote script must consult the session-index.db BEFORE the
+    /// transcript globs. The chooser is first-match, the db's session_name is
+    /// the CLI's own display word, and a glob-first order fed it the jsonl's
+    /// first raw prompt instead (the measured 2026-09-08 divergence: the same
+    /// row answered "amber-menkar" locally and a condensed Aug-24 prompt
+    /// remotely).
+    #[test]
+    fn muse_remote_script_reads_the_db_before_the_transcript_globs() {
+        let script = MUSE_REMOTE_TITLE_SCRIPT;
+        let db_arm = script
+            .find("if path.exists() and path.suffix == '.db':")
+            .expect("db branch present");
+        let glob_arm = script
+            .find("matches = sorted(home.glob(locator))")
+            .expect("glob branch present");
+        assert!(
+            db_arm < glob_arm,
+            "the db arm must be processed before the transcript globs"
         );
     }
 
