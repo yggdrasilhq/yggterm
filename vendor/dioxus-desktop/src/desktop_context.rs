@@ -787,6 +787,37 @@ impl DesktopService {
         }
     }
 
+    /// A URI's icon from the PERSISTENT cache — memory, then disk — with no
+    /// webview required. This is the read a restored tab makes before any
+    /// surface exists for it, the one that used to answer `None` and leave
+    /// every restart's tab rows bare; see
+    /// [`crate::web_surface::WebSurfaceHost::favicon_for_uri`].
+    pub fn web_surface_favicon_for_uri(&self, uri: &str) -> Option<Vec<u8>> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.favicon_for_uri(uri));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = uri;
+            None
+        }
+    }
+
     /// Drain the popups pages opened from inside surfaces (a link
     /// middle-clicked, ctrl-clicked, `target="_blank"`, or `window.open`).
     ///

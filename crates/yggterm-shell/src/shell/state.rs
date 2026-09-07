@@ -13489,7 +13489,7 @@ mod web_surface_download_locks {
 }
 
 async fn web_surface_native_reconcile_loop(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     desktop: dioxus::desktop::DesktopContext,
     trace_home: std::path::PathBuf,
 ) {
@@ -14095,10 +14095,36 @@ async fn web_surface_native_reconcile_loop(
         // read once at the top of this tick and is the SAME value the chrome
         // mirror used. Placement and chrome can never disagree about who owns
         // the screen because there is only one read.
+        // Per-tick budget for disk-cache lookups: a tab the cache cannot
+        // answer yet must not turn every tick into a hundred stats. Found
+        // icons consume budget; misses just wait for the next tick.
+        let mut favicon_disk_lookups = 0usize;
         for (session_path, active_tab, tabs, policy_gate) in desired {
             let rect = rects.get(&session_path).copied();
             for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
                 let key = (session_path.clone(), tab_id);
+                // THE PERSISTENT CACHE, READ WITHOUT A WEBVIEW. A restored tab
+                // that has never been revealed has no surface, so no poll ever
+                // serves its icon — after every restart its row stayed bare
+                // (owner report: "every restart ... I see NO favicons"). The
+                // disk store answers by URL instead: one lookup, the model
+                // writes the bytes, the row shows the icon the moment it
+                // exists. Edge discipline as everywhere else: only a real
+                // answer is written through, so a miss costs the lookup alone.
+                {
+                    let model_icon_missing = state.peek().web_surfaces
+                        .get(&session_path)
+                        .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
+                        .is_some_and(|tab| tab.favicon_png.is_none() && !tab.url.is_empty());
+                    if model_icon_missing && favicon_disk_lookups < 32
+                        && let Some(png) = desktop.web_surface_favicon_for_uri(&effective_url)
+                    {
+                        favicon_disk_lookups += 1;
+                        state.with_mut_counted(|shell| {
+                            shell.set_web_tab_favicon(&session_path, tab_id, Some(png));
+                        });
+                    }
+                }
                 // Is THIS tab the one on the whole screen? A fullscreen surface
                 // exists by construction (WebKit only fullscreens a live view),
                 // so an un-applied tab is never it.
