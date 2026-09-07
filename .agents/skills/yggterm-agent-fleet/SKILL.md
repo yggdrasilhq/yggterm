@@ -1,6 +1,6 @@
 ---
 name: yggterm-agent-fleet
-description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, to build through the fleet's single-build plane (ygg-ci) instead of per-worktree `cargo build`, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before building any gitcoding project (ygg-ci §3c — the single integration build on dev), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`), and before driving a row that is not answering (§11 — the PER-CLI NUANCES register, one subsection per agent CLI, covering the startup gates and menus that hold a row before its composer). ⛔ §11 is written to GROW: hitting an undocumented CLI quirk obliges you to append it there in the same session, because a session's discipline resets at every launch and the register's does not.
+description: What an agent CLI gains by running inside yggterm — its own addressable row, the ability to spawn and verify delegate sessions, to message any other session, to read its own context budget, to build through the fleet's single-build plane (ygg-ci) instead of per-worktree `cargo build`, and a one-time bootstrap that wires a durable memory + campaign system. Read this before spawning any session, before claiming a row at the start of a campaign (§1), before building any gitcoding project (ygg-ci §3c — the single integration build on dev), before SUCCEEDING a session that has gone cold (§6 — harvest its transcript, never prompt it), before trusting any row-management verb's own success field (§7), before HANDING OFF a campaign to a successor (§8 — the baton relay, and how to write the brief), before messaging another campaign or recovering a stalled one (§9 — cross-talk and the single `continue`), before driving a row that is not answering (§11 — the PER-CLI NUANCES register, one subsection per agent CLI, covering the startup gates and menus that hold a row before its composer), and before SPAWNING or working a campaign line (§0.5 — the row REGISTRY `ygg_row.py`: conditional claiming, the N.X/N.0/N.XR grammar, the one-stop list; and the BRIDGE `ygg_bridge.py`, the audited broker for external GUI harnesses that hold no row primitive). ⛔ §11 is written to GROW: hitting an undocumented CLI quirk obliges you to append it there in the same session, because a session's discipline resets at every launch and the register's does not.
 ---
 
 # You are running inside yggterm. Here is what that gives you.
@@ -24,28 +24,80 @@ is a campaign that silently stops. That has happened; §3 exists because of it.
 
 **⛔ Never use the harness's own subagent primitive for complex jobs.** Opencode `subagent`, Claude Code subagents, and any harness-provided `subagent`/`task` tool are **token-hungry (3–10× cost, cold cache), primitive (no row address, no verify, no reap), and bypass the fleet's verification.** For multi-step, multi-file, or cross-repo work: decompose via files + `msgGraph` posts in your own session. For read-only recon you may use a short-lived helper, but prefer in-session tools unless the campaign explicitly authorizes a fleet spawn.
 
-Not every verb in this skill is for every turn. Four planes are **gated-alpha** and
-only run when the user tells you to, or when `msgGraph`/`MEMORY.md` makes it
-obvious a campaign needs them — **and while the row-primitive stability work is in flight, they are additionally blocked by the root steer (`yggterm-steer:primitive`): do not spawn/message/claim/relay/orchestrate unless the human explicitly says so in this session:**
+Not every verb in this skill is for every turn. **The row primitive and this skill are PRODUCTION (owner, 2026-09-07 — the alpha blocker is lifted and REPLACED by the row-registry law, `ygg_row.py`):** spawn/message/relay/orchestrate are trusted mechanisms governed by the registry, not by a ban. The registry law is CONDITIONAL claiming: **sure the work belongs to a campaign line → claim a number (one verb, at spawn); vague one-off chat → continue UNCLAIMED (a first-class state the owner can attach/renumber later); a spawned row is despawned autonomously when done (veto-first).** What remains consent-gated as POLICY (not instability) — a wave-scoped orchestrator run and a campaign relay still want the owner's GO or an explicit campaign law:
 
-| gated plane | when it runs |
+| consent-gated plane (policy) | when it runs |
 |---|---|
 | **orchestrator** (§10) | a wave of parallel lanes, clustered by locality, explicitly scoped |
-| **row claiming** (§1 `ygg-claim.sh`) | the first act of a relay/succeed, or when a fresh row must be named |
 | **relay** (§8) | a campaign hands itself off to a successor |
 | **sub-session / delegate spawn** (§3) | you own the work and are fanning it out |
+
+Row CLAIMING itself is no longer gated — it is the registry law above (`ygg_row.py claim`, conditional; the grammar and the one-stop view live in §0.5).
 
 Everything else in this skill is **base** and every agent is expected to know
 it without being told: `ygg-babysit.py` / `ygg-booter.py` / `ygg-monitor.py`
 for liveness, `ygg-memory` for cross-harness memory, `ygg-board`/`msgGraph`
 for fleet talk — **use `msgGraph` liberally, each row is the primitive org unit** (see root steer `yggterm-steer:primitive` + `yggterm-steer:msgboard` for the `boards/README.md` guardrails: append-only, provenance UUID+harness, post≠law, verify-before-relay, graduate-to-memory), **`ygg-ci.py` for building** (§3c — the single fleet build
-plane), the context gauge (§2, beta — consult before stop/relay), and the row verbs `server app rows` / `server app terminal` for
-addressing (gated while alpha), and **advisors (§0) — search-first second opinions: SOTA search, then chosen models spawned with full data; you still execute everything**. **Any gitcoding project (cargo, npm, make) should build through
+plane), the context gauge (§2, beta — consult before stop/relay), the row verbs `server app rows` / `server app terminal` for
+addressing (production), **`ygg_row.py` — the row REGISTRY (§0.5: conditional claiming, the N.X/N.0/N.XR grammar, the one-stop `list`)**, **`ygg_bridge.py` — the BROKER for external GUI harnesses (§0.5: mailboxes + audited row intents; zcode et al hold no row primitive and go through this)**, and **advisors (§0) — search-first second opinions: SOTA search, then chosen models spawned with full data; you still execute everything**. **Any gitcoding project (cargo, npm, make) should build through
 `ygg-ci`, not with a bare `cargo build` in a worktree** — per-worktree builds
 collide on `target/`, trip the deploy lease, and replace the daemon other
 agents are testing (see §3c).
 
-**Primitive graph (token-efficient):** `L0 stable` = msgGraph + gauge + file/memory hub → `L0 stable swarm-cognition` = **advisors (§0)** — SOTA search + second opinions carried by the boards + lores (msgGraph `lores/<topic>`), rows only as the gated spawn transport → `L0 alpha` = row (daemon PTY+identity) → `L1 gated` = relay/orchestrator/seat/spawn-verify/cross-talk → `L2 composition` = campaign/lore/binding. The board is the emergent swarm plane; the graphs are the swarm's persistent memory; the row is the gated compute plane. When the blocker lifts, §1/§3/§8/§10 become the contract.
+**Primitive graph (token-efficient):** `L0 stable` = msgGraph + gauge + file/memory hub → `L0 stable swarm-cognition` = **advisors (§0)** — SOTA search + second opinions carried by the boards + lores (msgGraph `lores/<topic>`) → `L0 stable identity` = **the row registry (`ygg_row.py`) + bridge (`ygg_bridge.py`)** — every agent, row or external harness, visible in one place → `L0 production` = row (daemon PTY+identity, registry-governed) → `L1 policy-gated` = relay/orchestrator/seat/spawn-verify/cross-talk (consent, not instability) → `L2 composition` = campaign/lore/binding. The board is the emergent swarm plane; the graphs are the swarm's persistent memory; the row is the compute plane; **the registry is the accountability plane — the blocker's replacement**. §1/§3/§8/§10 are the contract.
+
+---
+
+## 0.5 The row registry (`ygg_row.py`) and the bridge (`ygg_bridge.py`) — production
+
+**The registry is the accountability plane.** It replaces the old alpha
+blocker: instead of "do not touch rows until told", every agent is VISIBLE.
+State is per-host files under `~/.yggterm/rows/` (`claims/<id>.json`,
+`bridges/<sub>.json`, `campaigns.json`, append-only `journal.jsonl`) — never
+msggraph (yggterm is public, msggraph is private).
+
+**The number grammar (the owner's visual language — one number space per
+campaign, shared with the campaign's memory/defect numbering):**
+
+| id | meaning |
+|---|---|
+| `N` | a campaign (`campaigns.json`: `11` = cli-integration) |
+| `N.X` | a worker / subsession row — X is never reused after release |
+| `N.0` | the campaign's MASTER orchestrator (only when one exists) |
+| `N.X.0` | a sub-orchestrator under `N.X` |
+| `N.XR` | a relay |
+
+**The conditional-claim law:** sure it belongs to a line of work → claim at
+spawn (`ygg_row.py claim --campaign 11 --model <model> --purpose "..."` —
+idempotent per session); vague one-off chat → continue unclaimed (first-class;
+the owner attaches/renumbers later with `claim --id` / `renumber`). Release
+when done (`ygg_row.py release`); heartbeat long-running claims; `gc` reaps
+what goes quiet past its ttl (default 24h).
+
+**`ygg_row.py list [--all-hosts]` is the one-stop view** — id, role, **model**,
+harness, freshness, host, purpose — claims first, then bridge subscribers.
+Know who is working before you start a wave in a shared area; it is the first
+thing an orchestrator reads and the first thing the owner reads.
+
+**The bridge is the sanctioned path for EXTERNAL GUI harnesses** (zcode and
+friends hold no row primitive — no PTY, no seat; the daemon does not own their
+process). It is a BROKER, not just a mailbox: `~/.yggterm/bridge/<sub>/`
+(meta + append-only `inbox.jsonl` in msgGraph post shape + heartbeat + read
+cursor), a detached toucher keeps the heartbeat while the session PROCESS is
+alive (an idle harness must not die of quiet), and the PRIVILEGED verbs are
+intents executed through `ygg_appctl` — `intent spawn-row|submit|despawn` —
+with intent+outcome pairs journalled into the inbox: **the audit trail is the
+thread itself.** monitor/booter alerts fan out via `_broadcast/`. `subscribe`
+registers the harness in the row registry (unclaimed). Fresh = heartbeat
+< 10 min; a dead subscription's thread is reaped within its ttl (24h).
+
+```sh
+python3 .agents/skills/yggterm-agent-fleet/ygg_row.py claim --campaign 11 --model glm-5.3-flash --purpose "fixing [11.58]"
+python3 .agents/skills/yggterm-agent-fleet/ygg_row.py list --all-hosts
+python3 .agents/skills/yggterm-agent-fleet/ygg_bridge.py subscribe
+python3 .agents/skills/yggterm-agent-fleet/ygg_bridge.py intent spawn-row --cli opencode --cwd ~/git/x --title "x: task" --purpose "..." --brief-text "the brief"
+python3 .agents/skills/yggterm-agent-fleet/ygg_bridge.py wait --thread intent:1788787781 --timeout 300
+```
 
 ---
 
