@@ -27941,3 +27941,37 @@ still does not cancel the attempt (the bookkeeping entry lives until the
 return latch) — harmless to the user, visible in trace as long-lived
 attempts.
 
+
+## ⛔ [11.85] `TERMINAL NEW --TITLE X --NO-ACTIVATE` RENAMED THE OWNER'S ACTIVE ROW AND STAMPED THE RENAME EXPLICIT — THE CREATED-PATH RESOLVER TRUSTED THE SNAPSHOT'S ACTIVE PATH OVER THE VERB'S OWN "STARTED" MESSAGE (caught live by the metadata open/switch matrix, 2026-09-08 ~04:15, fixed same session)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Six matrix probe spawns (`server app terminal new --kind … --title "zseat
+matrix <kind>" --no-activate`) each returned `data.session_path` pointing at
+`local://847c11b8` — the row the GUI had ACTIVE — and that row's title
+became "zseat matrix shell" with `title_is_explicit: true`. The created rows
+existed and carried their own titles; the explicit birth title went to the
+ACTIVE row, because `app_control_created_session_path` answered the
+snapshot's active path FIRST and only fell back to the verb's own
+`"started <key>"` message, which names the row that was actually created.
+Under `--no-activate` (the documented agent-spawn posture) the two disagree
+by construction, so EVERY `--no-activate --title` spawn since this resolver
+landed has renamed whatever row the owner was reading — and an explicit
+stamp blocks the CLI's own title flow, the title-follow chore, and every
+other derived writer until a human renames it back.
+
+**Fix (`lane/cli/noactivate-created-path`):** the resolver reads the
+`"started <key>"` message FIRST (it names the created row); the snapshot's
+active path is the legacy fallback for replies with no started message —
+there an activated create makes the two agree. The test that encoded the
+old precedence is rewritten as the no-activate regression test. Owner note:
+the clobbered row (`local://847c11b8`) was renamed back to its title by
+hand during the session; OTHER rows renamed by earlier `--no-activate
+--title` spawns would carry a `title_is_explicit: true` stamp with a
+foreign title — grep `server rows live` for `owner_set: true` rows whose
+titles read like spawn purposes before trusting their titles.
+
+**Falsifier:** `terminal new --title X --no-activate` with a foreign row
+active must title ONLY the created row (`rows show` on the active row keeps
+its title, `owner_set` unchanged), and the response's `data.session_path`
+must name the created row.
