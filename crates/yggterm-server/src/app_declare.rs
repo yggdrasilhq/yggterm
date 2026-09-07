@@ -58,7 +58,7 @@ pub struct AppDeclareMessage {
 }
 
 /// A retained declare, as handed to the GUI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppDeclareRecord {
     pub verb: String,
     pub action: String,

@@ -4685,6 +4685,11 @@ pub struct PersistedDaemonState {
     pub live_sessions: Vec<PersistedLiveSession>,
     #[serde(default)]
     pub session_pty_grids: Vec<PersistedSessionGrid>,
+    /// [11.80] Last-known OSC 7717 declares per session key — see
+    /// `YggtermServer::last_known_app_declares`. `#[serde(default)]` so an
+    /// older state file reads empty, i.e. today's behaviour.
+    #[serde(default)]
+    pub last_known_app_declares: BTreeMap<String, Vec<crate::app_declare::AppDeclareRecord>>,
 }
 
 fn default_workspace_view_mode() -> WorkspaceViewMode {
@@ -5026,6 +5031,14 @@ pub struct YggtermServer {
     /// `TerminalManager::session_size` (daemon-owned); this is the persisted
     /// last-known used only at re-resume time.
     session_pty_grids: HashMap<String, (u16, u16)>,
+    /// [11.80] Last-known OSC 7717 declares per session key — the same shape
+    /// as `session_pty_grids`: the live truth is the terminal runtime's own
+    /// declare log (daemon-owned, dies with the runtime); this is the
+    /// persisted last-known, refreshed on every read while the runtime is
+    /// mounted, answered when it is not. Without it every daemon succession
+    /// and every GUI restart turns into a `daemon_declare_absent` storm and
+    /// the row's sidebars vanish until the app happens to re-declare.
+    last_known_app_declares: BTreeMap<String, Vec<crate::app_declare::AppDeclareRecord>>,
     /// The grid of the VIEWER's terminal viewport, as last asserted by a client
     /// resize. A different question from `session_pty_grids` — that one answers
     /// "what grid is session X's PTY", this one answers "what grid does a
@@ -5123,6 +5136,7 @@ impl YggtermServer {
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
             session_pty_grids: HashMap::new(),
+            last_known_app_declares: BTreeMap::new(),
             client_viewport_grid: None,
             preview_history_budgets: HashMap::new(),
             working_last_informed: BTreeMap::new(),
@@ -5502,6 +5516,35 @@ impl YggtermServer {
         }
         let key = self.resolve_session_storage_key(path)?;
         self.session_pty_grids.get(key).copied()
+    }
+
+    /// [11.80] Refresh the last-known declares for ONE row. Empty records are
+    /// the app's Clear (or a live runtime reporting nothing yet): they erase
+    /// the snapshot, because a live answer always outranks a remembered one.
+    pub fn record_last_known_app_declares(
+        &mut self,
+        key: &str,
+        records: Vec<crate::app_declare::AppDeclareRecord>,
+    ) {
+        if records.is_empty() {
+            self.last_known_app_declares.remove(key);
+        } else {
+            self.last_known_app_declares
+                .insert(key.to_string(), records);
+        }
+    }
+
+    /// [11.80] The snapshot to answer when the terminal runtime is gone
+    /// (daemon succession, GUI restart): the surfaces the row last declared,
+    /// so the metadata rail keeps them until the app re-declares for real.
+    pub fn last_known_app_declares(
+        &self,
+        key: &str,
+    ) -> Vec<crate::app_declare::AppDeclareRecord> {
+        self.last_known_app_declares
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Record the grid a client just asserted as its own terminal viewport.
@@ -5973,6 +6016,11 @@ impl YggtermServer {
                     Some(repaired_row_key.clone()),
                     ActivationOrigin::recovery("reclassify_owned_agent_runtime_row"),
                 );
+            }
+            if let Some(declares) = self.last_known_app_declares.remove(&old_row_key) {
+                self.last_known_app_declares
+                    .entry(repaired_row_key.clone())
+                    .or_insert(declares);
             }
             if let Some(grid) = self.session_pty_grids.remove(&old_row_key) {
                 self.session_pty_grids
@@ -8546,6 +8594,12 @@ impl YggtermServer {
             .collect();
         session_pty_grids.sort_by(|a, b| a.key.cmp(&b.key));
 
+        // [11.80] Persist the last-known declares for every session we still
+        // know about, pruned the same way the grids are.
+        let mut last_known_app_declares = self.last_known_app_declares.clone();
+        last_known_app_declares
+            .retain(|key, _| self.sessions.contains_key(key.as_str()));
+
         PersistedDaemonState {
             active_session_path,
             active_view_mode,
@@ -8554,6 +8608,7 @@ impl YggtermServer {
             stored_sessions,
             live_sessions,
             session_pty_grids,
+            last_known_app_declares,
         }
     }
 
@@ -8748,6 +8803,8 @@ impl YggtermServer {
             .map(|home| PerfSpan::start(home, "server", "restore_persisted_state"));
         // Restore last-known PTY grids first so a re-resumed session (squish fix,
         // Bug 10) comes back at its real grid instead of DEFAULT 120×36.
+        // [11.80] the declares ride the same restore door as the grids.
+        self.last_known_app_declares = state.last_known_app_declares;
         self.session_pty_grids = state
             .session_pty_grids
             .iter()
@@ -36716,6 +36773,7 @@ mod tests {
             UiTheme::ZedLight,
         );
         let persisted = super::PersistedDaemonState {
+            last_known_app_declares: Default::default(),
             active_session_path: Some(path.to_string()),
             active_view_mode: WorkspaceViewMode::Terminal,
             ssh_targets: Vec::new(),
@@ -40797,6 +40855,7 @@ mod tests {
         // End-to-end: a persisted state carrying the bogus twin must not survive a
         // restore (the daemon-process restart that re-reads disk drops it).
         let bogus = PersistedDaemonState {
+            last_known_app_declares: Default::default(),
             active_session_path: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             ssh_targets: Vec::new(),
@@ -46977,6 +47036,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: None,
                 active_view_mode: WorkspaceViewMode::Rendered,
                 ssh_targets: vec![SshConnectTarget {
@@ -47019,6 +47079,7 @@ terminal_window_id: None,
         let active_path = remote_scanned_session_path("dev", "abc123");
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(active_path.clone()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: vec![SshConnectTarget {
@@ -47146,6 +47207,7 @@ terminal_window_id: None,
         let stale_path = remote_scanned_session_path("dev", "missing");
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: None,
                 active_view_mode: WorkspaceViewMode::Rendered,
                 ssh_targets: Vec::new(),
@@ -47205,6 +47267,7 @@ terminal_window_id: None,
         let stale_path = remote_scanned_session_path("dev", "missing-runtime");
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(stale_path.clone()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -47286,6 +47349,7 @@ terminal_window_id: None,
         let kept_path = remote_scanned_session_path("dev", "kept-runtime");
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(kept_path.clone()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -48260,6 +48324,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some("local://old-shell".to_string()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -48310,6 +48375,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some("local://agent-row".to_string()),
                 // The whole point: the file says Rendered.
                 active_view_mode: WorkspaceViewMode::Rendered,
@@ -48397,6 +48463,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some("local::old-shell".to_string()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -48885,6 +48952,7 @@ terminal_window_id: None,
         let remote_path = remote_scanned_session_path(machine_key, "kept-remote");
         server.restore_persisted_state_with_launch_policy(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(remote_path.clone()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -48962,6 +49030,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some("local::dead-shell".to_string()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -49064,6 +49133,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some("local::second-shell".to_string()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -49152,6 +49222,7 @@ terminal_window_id: None,
         let second_path = remote_scanned_session_path("dev", "def456");
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(second_path.clone()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: vec![SshConnectTarget {
@@ -50465,6 +50536,7 @@ terminal_window_id: None,
 
         server.restore_persisted_state_with_launch_policy(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(phantom_path.clone()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
@@ -51485,6 +51557,7 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
+                last_known_app_declares: Default::default(),
                 active_session_path: Some(active_path.display().to_string()),
                 active_view_mode: WorkspaceViewMode::Rendered,
                 ssh_targets: Vec::new(),
