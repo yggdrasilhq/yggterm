@@ -16056,6 +16056,11 @@ fn terminal_chunk_is_daemon_launch_seed(text: &str) -> bool {
         "resume daemon-owned ",
         "queue daemon-owned ",
         "remote bootstrap: ",
+        // This is the daemon's sidebar summary, not PTY output. A restore
+        // that races a live Codex composer must never seed this sentence into
+        // the xterm buffer, where an inline TUI may leave it painted in place.
+        " session rooted at ",
+        "the daemon owns the pty so the conversation can survive",
     ];
     SEED_MARKERS
         .iter()

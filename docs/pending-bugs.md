@@ -27600,7 +27600,7 @@ resume (naming the holder row) remains a dream.
 
 ## ⛔ [11.75] A ROW'S PERSISTED SESSION ID DRIFTED FROM ITS LIVE RUNTIME — RESTORE RESUMES A DEAD UUID, THE SURVIVING WRITER IS INVISIBLE, THE TITLE MISSES, AND THE PREAMBLE PAINTS INTO A LIVE COMPOSER (measured on the "Ydesign fresh probe" row, 2026-09-07 11:07-11:11)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 **Owner:** the codex-resume-identity lane (the restore composition is that
 lane's registry arm); four owner-reported symptoms, ONE root cause.
@@ -27645,3 +27645,12 @@ title/metadata consumers follow the corrected id; when that uuid's runtime
 is ALREADY live (its runtime key answers), re-attach instead of spawning,
 and name the holding row in the refusal. The re-point is the same move the
 live rebind already makes; it is missing from the persisted→restore seam.
+
+**Code fix:** restore now derives a Codex-family id from the UUID suffix of
+the persisted rollout path, carries it through the stable daemon runtime row,
+rebuilds the resume command and Codex metadata from that id, and uses the same
+restore key owner for active-path and duplicate-row decisions. The terminal
+prefill guard also rejects the daemon's `session rooted at ...` summary so a
+restore race cannot write sidebar copy into a live TUI composer. Unit guards
+cover the persisted-id re-point, successor restore, and prefill rejection;
+live daemon/GUI proof remains owed.

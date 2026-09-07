@@ -1168,8 +1168,19 @@ fn restored_local_runtime_id(
     storage_path: Option<&str>,
 ) -> Option<String> {
     let has_storage = storage_path.is_some_and(|path| !path.trim().is_empty());
-    if kind == SessionKind::Codex && has_storage && !id.trim().is_empty() {
-        return Some(id.to_string());
+    if yggterm_core::CODEX_FAMILY.contains(&kind) && has_storage {
+        // A Codex rollout's filename carries the CLI-minted thread id. The
+        // persisted `id` can be the synthetic row id left behind before the
+        // live PTY identity overlay learned that thread, so the storage path
+        // is the authoritative restore witness when it has a UUID suffix.
+        // Keeping this in the pure key helper makes the pre-restore key,
+        // dedupe, active-path and restore decisions agree.
+        if let Some(storage_id) = storage_path.and_then(codex_session_id_from_storage_path) {
+            return Some(storage_id);
+        }
+        if !id.trim().is_empty() {
+            return Some(id.to_string());
+        }
     }
     // ⚖ A CLI that MINTS ITS OWN id has no reason for the row key to outrank
     // the id the row is carrying. The key holds the uuid yggterm invented at
@@ -1197,6 +1208,26 @@ fn restored_local_runtime_id(
         .map(ToOwned::to_owned)
         .filter(|value| !value.trim().is_empty())
         .or_else(|| (!id.trim().is_empty()).then(|| id.to_string()))
+}
+
+/// Read the CLI-minted Codex thread id from a rollout filename.
+///
+/// Codex names rollouts `rollout-<timestamp>-<thread-id>.jsonl`. The timestamp
+/// itself contains hyphens, so splitting on a fixed number of components is
+/// brittle; the UUID is the final 36-byte suffix. This is lexical evidence
+/// only and deliberately does not walk the store during daemon restore.
+fn codex_session_id_from_storage_path(storage_path: &str) -> Option<String> {
+    if !is_local_codex_storage_session_path(storage_path) {
+        return None;
+    }
+    let path = Path::new(storage_path);
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let start = stem.len().checked_sub(36)?;
+    let suffix = stem.get(start..)?;
+    Uuid::parse_str(suffix).ok().map(|uuid| uuid.to_string())
 }
 
 /// The live-order key [`YggtermServer::restore_live_session`] will file this row
@@ -8823,8 +8854,17 @@ impl YggtermServer {
             }
         }
         let desired_active_path = state.active_session_path.clone();
+        let restored_active_path = desired_active_path.as_deref().and_then(|path| {
+            state
+                .live_sessions
+                .iter()
+                .find(|live| live.key == path)
+                .and_then(restored_live_row_key)
+        });
         let normalized_desired_active_path = desired_active_path.as_deref().map(|path| {
-            if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) {
+            if let Some(restored_path) = restored_active_path.clone() {
+                restored_path
+            } else if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) {
                 remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
             } else if path.starts_with("codex-runtime://") {
                 path.to_string()
@@ -8861,15 +8901,7 @@ impl YggtermServer {
             // Same builder as the active path above and as
             // `restore_live_session`'s own key, or the three disagree about
             // what one row is called.
-            let dedupe_key = if let Some(normalized) = normalized_remote_row_key(&live.key) {
-                normalized
-            } else if live.key.starts_with("codex-runtime://") {
-                live.key.clone()
-            } else if let Some(session_id) = local_runtime_id_from_key(&live.key) {
-                local_live_runtime_key(session_id)
-            } else {
-                live.key.clone()
-            };
+            let dedupe_key = restored_live_row_key(&live).unwrap_or_else(|| live.key.clone());
             if !restored_live_keys.insert(dedupe_key) {
                 continue;
             }
@@ -8879,7 +8911,9 @@ impl YggtermServer {
         self.active_view_mode = state.active_view_mode;
         if let Some(path) = desired_active_path {
             let active_path =
-                if let Some(normalized) = normalized_remote_row_key(&path) {
+                if let Some(restored_path) = restored_active_path {
+                    restored_path
+                } else if let Some(normalized) = normalized_remote_row_key(&path) {
                     normalized
                 } else if path.starts_with("codex-runtime://") {
                     path
@@ -12068,6 +12102,17 @@ impl YggtermServer {
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
         let rekeys_onto_local_runtime =
             live_row_rekeys_onto_local_runtime(&key, &ssh_target, normalized_kind);
+        if rekeys_onto_local_runtime
+            && restored_local_id != id
+            && yggterm_core::CODEX_FAMILY.contains(&normalized_kind)
+        {
+            emit_identity_trace(
+                "identity_restore_repoint",
+                &key,
+                Some(&id),
+                &restored_local_id,
+            );
+        }
         // The key this row lands under is `restored_live_row_key`'s answer —
         // the same function every cross-daemon judgement about the row asks.
         // It declines only when the id had to be minted just now, which is the
@@ -12426,6 +12471,15 @@ impl YggtermServer {
             let _ = refresh_restored_remote_runtime_codex_launch_command(&key, session);
             if let Some(storage_path) = storage_path.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
+                if yggterm_core::CODEX_FAMILY.contains(&session.kind) {
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        agent_cli_descriptor(session.kind)
+                            .map(|descriptor| descriptor.session_metadata_label)
+                            .unwrap_or("Codex Session"),
+                        id.clone(),
+                    );
+                }
                 // For a LOCAL Claude Code row the TRANSCRIPT owns the cwd — see
                 // `local_cc_resume_cwd`. This restore path reaches rows whose cwd has
                 // already been defaulted to $HOME, and a bare `Cwd` read would then bake
@@ -50741,6 +50795,88 @@ terminal_window_id: None,
             }
         }
         let _ = std::fs::remove_dir_all(&fixture_root);
+    }
+
+    #[test]
+    fn restore_repoints_codex_id_from_the_rollout_filename_and_keeps_runtime_key() {
+        // Regression for [11.75]: the live identity overlay had already
+        // learned the CLI-minted thread id, but restore trusted the stale
+        // persisted row id and rebuilt `codex resume <dead-row-id>`.
+        let birth_id = "11111111-2222-4333-8444-555555555555";
+        let real_id = "019f5a3c-9b21-7e44-8c11-2f6d8a90e3b7";
+        let runtime_key = format!("local://{birth_id}");
+        let storage_path = format!(
+            "/home/user/.codex/sessions/2026/09/07/rollout-2026-09-07T01-02-03-{real_id}.jsonl"
+        );
+        let persisted = PersistedLiveSession {
+            app_launch: None,
+            key: runtime_key.clone(),
+            id: birth_id.to_string(),
+            title: "New Codex Session".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/user/project".to_string()),
+            remote_launch_action: None,
+            storage_path: Some(storage_path.clone()),
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(persisted);
+
+        let live = server
+            .sessions
+            .get(&runtime_key)
+            .expect("the stable daemon runtime row remains addressable");
+        assert_eq!(live.id, real_id);
+        assert_eq!(live.session_path, runtime_key);
+        assert_eq!(
+            session_metadata_value(live, "Codex Session").as_deref(),
+            Some(real_id)
+        );
+        assert!(live.launch_command.contains(real_id), "{}", live.launch_command);
+        assert!(
+            !live.launch_command.contains(birth_id),
+            "restore must not compose the stale row id: {}",
+            live.launch_command
+        );
+        assert_eq!(
+            session_metadata_value(live, "Storage").as_deref(),
+            Some(storage_path.as_str())
+        );
+
+        let persisted_again = server.persisted_state_for_update_restart();
+        let live_again = persisted_again
+            .live_sessions
+            .iter()
+            .find(|live| live.key == runtime_key)
+            .expect("the corrected identity must be persisted");
+        assert_eq!(live_again.id, real_id);
+        assert_eq!(live_again.storage_path.as_deref(), Some(storage_path.as_str()));
+
+        let mut successor = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        successor.restore_live_session(live_again.clone());
+        let restored = successor
+            .sessions
+            .get(&runtime_key)
+            .expect("the successor keeps the runtime address");
+        assert_eq!(restored.id, real_id);
+        assert!(restored.launch_command.contains(real_id));
+        assert!(!restored.launch_command.contains(birth_id));
     }
 
     #[test]
