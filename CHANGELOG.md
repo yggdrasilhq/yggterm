@@ -3,6 +3,8 @@
 This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
+- **A pending same-version handoff is now visible in `server status`.** Three deploys landed inside the 30-minute same-version handoff cooldown and the fleet had no way to see that a rotation was designed-in rather than stuck — the deferral lived only in the poll thread. The daemon status now carries the remaining cooldown, so an agent (or the owner) reads "retire in N ms" instead of guessing whether the daemon is wedged.
+
 - **Slow-reveal notifications no longer blame reveals you never waited on.** An open-reveal attempt left behind by a click can sit for hours while you work in other rows — the ready-proof only latches when you return — and the completion then reported the whole wall time as a slow reveal: 33 cards in two days on one desktop, topped by a reveal that had allegedly taken 20.5 minutes. The card now fires only while the revealed row is still the one you are looking at; the full numbers stay in the reveal log and trace for the post-mortem.
 
 - [11.79] the agent identity chore never re-points a row against its

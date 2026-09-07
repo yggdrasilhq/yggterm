@@ -3459,6 +3459,18 @@ pub struct ServerRuntimeStatus {
     /// treated as `Active`. See [`daemon_enforces_client_roles`].
     #[serde(default)]
     pub role_enforcement: bool,
+    /// A SAME-VERSION binary handoff is pending and this daemon is sitting in its
+    /// deploy-storm cooldown: `Some(ms)` = milliseconds left before this daemon
+    /// retires and the on-disk bytes take over; `None` = no handoff is pending.
+    /// Measured 2026-09-08 ([11.84]): three deploys landed inside the cooldown and
+    /// an agent reading the fleet could not tell a designed 30-minute defer from a
+    /// wedged daemon — every instrument it read (the gen-suffixed trace
+    /// projections, the succession churn) said "dead", while the truth lived only
+    /// in this poll thread's head. `#[serde(default)]` so an older daemon's status
+    /// parses with `None`; the wrong "no" here costs one wasted grep, not a
+    /// session, so fail-open is the honest default.
+    #[serde(default)]
+    pub same_version_handoff_cooldown_remaining_ms: Option<u64>,
 }
 
 /// A session is working right now (`esc to interrupt` on its screen).
@@ -6196,6 +6208,13 @@ impl DaemonRuntime {
             // A pre-4.0 daemon lacks the field entirely; its status deserializes
             // `false`, and a Shadow client fails closed against it (D7).
             role_enforcement: true,
+            same_version_handoff_cooldown_remaining_ms: {
+                let last = SAME_VERSION_HANDOFF_LAST_MS.load(Ordering::Relaxed);
+                (last != 0).then(|| current_millis_u64().saturating_sub(last)).and_then(|elapsed| {
+                    (elapsed < SAME_VERSION_HANDOFF_COOLDOWN_MS)
+                        .then_some(SAME_VERSION_HANDOFF_COOLDOWN_MS - elapsed)
+                })
+            },
         }
     }
 
