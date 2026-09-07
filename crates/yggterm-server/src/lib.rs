@@ -26794,7 +26794,16 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
             std::collections::HashMap::new();
         for (_endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(&home) {
             for row in &runtime.live_terminal_sessions {
-                if row.ssh_target.trim().is_empty() {
+                // ⭐ THE ONE SPELLING: the title-follow chore classifies
+                // loopback rows through
+                // `store_title_read_is_loopback` and reads their stores
+                // LOCALLY. Batching a "localhost" row into the remote probe
+                // made the audit answer from the jsonl-first remote wire
+                // while the follower answered from the local reader — the
+                // same row wore two different CLI words and the audit
+                // flagged a mismatch the follower could never see
+                // (measured 2026-09-08, the muse row on dev).
+                if yggterm_core::agent_cli::store_title_read_is_loopback(&row.ssh_target) {
                     continue;
                 }
                 remote_batches
@@ -26848,7 +26857,7 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
     }
     let cli_store_title_for = |row: &crate::PersistedLiveSession| -> Option<String> {
         let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(row.kind)?;
-        if !row.ssh_target.trim().is_empty() {
+        if !yggterm_core::agent_cli::store_title_read_is_loopback(&row.ssh_target) {
             let key = (row.ssh_target.clone(), row.kind);
             if remote_missing.contains(&key) {
                 return None;
@@ -35705,6 +35714,33 @@ mod tests {
         assert!(
             !runner.contains("should_fallback_to_python") && !runner.contains("cache.remove"),
             "the no-fallback runner grew fallback machinery back"
+        );
+    }
+
+
+    /// ⭐ THE AUDIT AND THE FOLLOWER MUST CLASSIFY ROWS THROUGH ONE PREDICATE.
+    /// Measured 2026-09-08: `rows live` batched an `ssh_target == "localhost"`
+    /// row into the remote probe (non-empty check only) while the title-follow
+    /// chore treated the same row as loopback — the audit answered from the
+    /// jsonl-first remote wire, the follower from the local db reader, and the
+    /// audit flagged a mismatch the follower can never see. Both call sites
+    /// must spell `store_title_read_is_loopback`.
+    #[test]
+    fn rows_live_and_title_follow_read_loopback_stores_through_one_predicate() {
+        let server = include_str!("lib.rs");
+        let daemon = include_str!("daemon.rs");
+        let audit_uses = server
+            .find("store_title_read_is_loopback(&row.ssh_target)")
+            .is_some();
+        let chore_uses = daemon
+            .find("store_title_read_is_loopback(ssh_target)")
+            .is_some();
+        assert!(
+            audit_uses && chore_uses,
+            "run_rows_live and run_row_title_follow_chore must both classify \
+             loopback rows through yggterm_core::agent_cli::\
+             store_title_read_is_loopback — divergent spellings are the \
+             measured two-wires fault"
         );
     }
 

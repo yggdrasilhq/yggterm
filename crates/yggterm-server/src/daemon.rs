@@ -15766,7 +15766,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
         let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
             continue;
         };
-        let loopback = ssh_target.trim().is_empty() || ssh_target == "localhost";
+        let loopback = yggterm_core::agent_cli::store_title_read_is_loopback(ssh_target);
         if loopback {
             if let Some(read) = descriptor.read_live_store_title
                 && let Some(title) = read(&user_home, id)
@@ -15834,7 +15834,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
             let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
                 continue;
             };
-            let loopback = ssh_target.trim().is_empty() || ssh_target == "localhost";
+            let loopback = yggterm_core::agent_cli::store_title_read_is_loopback(ssh_target);
             let title = if loopback {
                 local_answers.get(path).cloned()
             } else {
@@ -15875,9 +15875,23 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                     }),
                 );
             } else if outcomes.len() < 12 {
+                // `set_session_title_hint` answers false for a refusal AND
+                // for an already-equal no-op — its contract says "nothing
+                // about this row changed" and nothing more. Labelling every
+                // false "refused_explicit_or_missing" is how a healthy tick
+                // (equal titles) read as an owner-titled desync and sent the
+                // 2026-09-08 night run chasing a birth-path stamp that does
+                // not exist. Name the two distinguishable facts instead.
+                let owner_titled = runtime.server.session_title_is_explicit(path);
+                let row_resolved = runtime.server.live_session_path(path).is_some();
                 outcomes.push(serde_json::json!({
                     "path": path,
-                    "outcome": "refused_explicit_or_missing",
+                    "outcome": if owner_titled {
+                        "refused_owner_set"
+                    } else {
+                        "no_change_or_missing"
+                    },
+                    "row_resolved": row_resolved,
                     "store_title": title,
                 }));
             }
