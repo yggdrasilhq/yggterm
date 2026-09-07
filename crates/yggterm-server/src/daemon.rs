@@ -12720,6 +12720,16 @@ impl DaemonRuntime {
                 {
                     match terminal_app_declares(&owner_endpoint, &runtime_path) {
                         Ok((records, running)) => {
+                            // [11.80] the owner answer is also LAST-KNOWN
+                            // truth for this daemon: record it, so a later
+                            // succession or restart keeps the row surfaces
+                            // answerable even after the owner is gone.
+                            if !records.is_empty() {
+                                self.server.record_last_known_app_declares(
+                                    &runtime_path,
+                                    records.clone(),
+                                );
+                            }
                             return Ok(ServerResponse::TerminalAppDeclares { records, running });
                         }
                         Err(error) => {
