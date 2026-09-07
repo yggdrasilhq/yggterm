@@ -27031,6 +27031,23 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
 /// non-login ssh on the fleet prunes `~/.local/bin` from PATH, which ate
 /// verbs before this comment existed.
 pub fn run_rows_despawn(keys: &[String]) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    // ⭐ THE OWNING DAEMON DECIDES WHERE THE DESPAWN LANDS. The key's machine
+    // prefix spells where the RUNTIME is, not where the row's RECORD lives: a
+    // `remote-session://dev/<uuid>` row opened from THIS host's GUI is held by
+    // THIS host's daemon. Sending the despawn to the runtime host tombstoned
+    // a file the owning daemon never reads and answered `despawned:true`
+    // while the row resurrected on the next rotation — the measured
+    // 2026-09-08 resurrection of the [11.74]-despawned codex ghosts
+    // (tombstones landed on dev; the rows lived on the GUI host). Search the
+    // reachable local daemons first; the ssh hop is the fallback for a row no
+    // local daemon holds.
+    let locally_held: std::collections::HashSet<String> =
+        daemon::reachable_versioned_daemon_statuses(&home)
+            .into_iter()
+            .flat_map(|(_endpoint, runtime)| runtime.live_terminal_sessions)
+            .map(|row| row.key)
+            .collect();
     let mut local_keys: Vec<String> = Vec::new();
     let mut remote_keys: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -27040,13 +27057,13 @@ pub fn run_rows_despawn(keys: &[String]) -> anyhow::Result<()> {
             continue;
         }
         match parse_remote_scanned_session_path(key) {
-            Some((machine, _id)) => {
+            Some((machine, _id)) if !locally_held.contains(key) => {
                 remote_keys
                     .entry(machine.to_string())
                     .or_default()
                     .push(key.to_string());
             }
-            None => local_keys.push(key.to_string()),
+            _ => local_keys.push(key.to_string()),
         }
     }
     if local_keys.is_empty() && remote_keys.is_empty() {
@@ -27075,6 +27092,7 @@ pub fn run_rows_despawn(keys: &[String]) -> anyhow::Result<()> {
                         "machine": machine,
                         "despawned": true,
                         "via": "ssh",
+                        "note": "row not held by any reachable local daemon; the tombstone landed on the runtime host",
                     }));
                 }
                 Ok(output) => {
@@ -35741,6 +35759,30 @@ mod tests {
              loopback rows through yggterm_core::agent_cli::\
              store_title_read_is_loopback — divergent spellings are the \
              measured two-wires fault"
+        );
+    }
+
+    /// ⭐ THE DESPAWN LANDS WHERE THE ROW'S RECORD LIVES. Measured
+    /// 2026-09-08: `rows despawn` hopped to the key's machine prefix (the
+    /// RUNTIME host) and answered despawned:true while the owning daemon on
+    /// the GUI host never saw a tombstone — the [11.74]-despawned codex
+    /// ghosts resurrected on the next rotation. The verb must consult the
+    /// reachable local daemons FIRST and treat the hop as the fallback.
+    #[test]
+    fn rows_despawn_lands_on_the_owning_daemon_not_the_runtime_host() {
+        let source = include_str!("lib.rs");
+        let fn_start = source
+            .find("pub fn run_rows_despawn(")
+            .expect("run_rows_despawn must exist");
+        let body_len = source[fn_start..]
+            .find("\npub fn ")
+            .expect("the despawn is followed by another fn");
+        let body = &source[fn_start..fn_start + body_len];
+        assert!(
+            body.contains("reachable_versioned_daemon_statuses")
+                && body.contains("locally_held"),
+            "the despawn must resolve the OWNING daemon from the reachable \
+             local daemons before hopping to the key's machine prefix"
         );
     }
 
