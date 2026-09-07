@@ -15689,6 +15689,166 @@ fn match_agent_identities_to_targets(
 /// happen again unnoticed.
 ///
 /// Returns the number of rows rebound this tick.
+/// [Issue-38 completion] The title-follow chore: a row's title must EQUAL
+/// what the CLI itself displays, and the CLI stores are readable — local
+/// rows directly, remote rows through the same batched probe the
+/// `rows live` audit uses. The audit measured 4/4 live rows mismatched on
+/// dev (2026-09-07): an agy row, a muse row and two codex threads had been
+/// RENAMED in their CLIs after the row learned its birth title, and nothing
+/// ever followed. Owner-set titles never follow — `set_session_title_hint`
+/// refuses them, so a human's name outranks the store.
+const ROW_TITLE_FOLLOW_INTERVAL_MS: u64 = 120_000;
+
+fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
+    // 1. Snapshot the candidates under the lock: live agent rows only.
+    let (candidates, user_home) = {
+        let runtime = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
+        let rows: Vec<(String, SessionKind, String, String)> = runtime
+            .server
+            .live_session_views()
+            .into_iter()
+            .filter(|view| {
+                matches!(
+                    view.source,
+                    SessionSource::LiveLocal | SessionSource::LiveSsh
+                )
+            })
+            .filter(|view| {
+                yggterm_core::agent_cli::agent_cli_descriptor(view.kind).is_some()
+            })
+            .map(|view| {
+                (
+                    view.session_path.clone(),
+                    view.kind,
+                    view.id.clone(),
+                    view.ssh_target.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        (rows, dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+    };
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    // 2. The reads run OUTSIDE the lock: local stores directly, remote stores
+    // through one batched probe per (host, kind) — the exact wire the
+    // `rows live` audit uses, so the audit and the follower can never
+    // disagree about what the CLI said.
+    let mut remote_answers: HashMap<(String, SessionKind), HashMap<String, String>> =
+        HashMap::new();
+    let mut remote_missing: HashSet<(String, SessionKind)> = HashSet::new();
+    let mut remote_batches: HashMap<(String, SessionKind), Vec<String>> = HashMap::new();
+    let mut local_answers: HashMap<String, String> = HashMap::new();
+    for (path, kind, id, ssh_target) in &candidates {
+        let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
+            continue;
+        };
+        let loopback = ssh_target.trim().is_empty() || ssh_target == "localhost";
+        if loopback {
+            if let Some(read) = descriptor.read_live_store_title
+                && let Some(title) = read(&user_home, id)
+            {
+                let title = title.trim().to_string();
+                if !title.is_empty() {
+                    local_answers.insert(path.clone(), title);
+                }
+            }
+            continue;
+        }
+        remote_batches_entry(&mut remote_batches, ssh_target.clone(), *kind, id.clone());
+    }
+    for (host_kind, ids) in remote_batches.drain() {
+        let (ssh_target, kind) = &host_kind;
+        let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
+            continue;
+        };
+        let Some(probe) = descriptor.remote_live_store_title else {
+            continue;
+        };
+        let mut args = descriptor.remote_store_title_locators();
+        args.push("--".to_string());
+        args.extend(ids.iter().cloned());
+        let Ok(lines) =
+            crate::run_remote_python_lines(ssh_target, None, probe.script, &args)
+        else {
+            remote_missing.insert(host_kind.clone());
+            continue;
+        };
+        let answers = remote_answers.entry(host_kind).or_default();
+        for line in &lines {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(id) = value.get("session_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let candidates: Vec<String> = value
+                .get("candidates")
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(title) = (probe.choose)(&candidates) {
+                let title = title.trim().to_string();
+                if !title.is_empty() {
+                    answers.insert(id.to_string(), title);
+                }
+            }
+        }
+    }
+    // 3. Apply under the lock: the setter refuses owner-set titles itself.
+    let mut applied = 0usize;
+    {
+        let mut runtime = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
+        for (path, kind, id, ssh_target) in &candidates {
+            let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
+                continue;
+            };
+            let loopback = ssh_target.trim().is_empty() || ssh_target == "localhost";
+            let title = if loopback {
+                local_answers.get(path).cloned()
+            } else {
+                remote_answers
+                    .get(&(ssh_target.clone(), *kind))
+                    .and_then(|answers| answers.get(id).cloned())
+            };
+            let Some(title) = title else { continue };
+            if runtime.server.set_session_title_hint(path, &title) {
+                applied += 1;
+                append_trace_event(
+                    runtime.store.home_dir(),
+                    "daemon",
+                    "persistence",
+                    "row_title_followed_cli_store",
+                    serde_json::json!({
+                        "session_path": path,
+                        "kind": yggterm_core::agent_cli::session_kind_label(*kind),
+                        "title": title,
+                    }),
+                );
+            }
+        }
+    }
+    Ok(applied)
+}
+
+fn remote_batches_entry(
+    remote_batches: &mut HashMap<(String, SessionKind), Vec<String>>,
+    ssh_target: String,
+    kind: SessionKind,
+    id: String,
+) {
+    remote_batches.entry((ssh_target, kind)).or_default().push(id);
+}
+
 fn run_remote_agent_identity_poll_chore(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     attempts: &mut HashMap<String, u32>,
@@ -24734,6 +24894,26 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                             (sleep_ms.saturating_mul(2)).min(BACKGROUND_COPY_MAX_IDLE_CHORE_MS);
                         warn!(error=%error, "daemon background copy chore failed");
                     }
+                }
+            }
+        });
+    }
+    {
+        // [Issue-38 completion] The title-follow thread: own 2-minute
+        // interval, the reads happen outside the runtime lock.
+        let runtime = runtime.clone();
+        let last_activity_ms = last_activity_ms.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(
+                ROW_TITLE_FOLLOW_INTERVAL_MS,
+            ));
+            match run_row_title_follow_chore(&runtime) {
+                Ok(applied) if applied > 0 => {
+                    mark_daemon_activity(&last_activity_ms);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "daemon row title follow chore failed");
                 }
             }
         });

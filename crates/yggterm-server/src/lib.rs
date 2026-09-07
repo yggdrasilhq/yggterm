@@ -19228,7 +19228,7 @@ fn update_remote_generated_copy_in_mirror(
     Ok(())
 }
 
-fn run_remote_python_lines(
+pub(crate) fn run_remote_python_lines(
     ssh_target: &str,
     exec_prefix: Option<&str>,
     script: &str,
