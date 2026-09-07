@@ -167,6 +167,7 @@ impl KindLabel for StartpageDurableRow {
             yggterm_core::SessionKind::QwenCode => "qwen",
             yggterm_core::SessionKind::Muse => "muse",
             yggterm_core::SessionKind::GrokBuild => "grok",
+            yggterm_core::SessionKind::ZcodeTui => "zcode_tui",
             yggterm_core::SessionKind::Kimi => "kimi",
             yggterm_core::SessionKind::OpenCode => "opencode",
             yggterm_core::SessionKind::Shell => "shell",

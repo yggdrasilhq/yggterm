@@ -2,26 +2,26 @@
   "_doc": [
     "Where each agent CLI keeps a session's transcript, and WHERE IN THAT PATH THE",
     "",
-    "⛔ `icon_kind` IS THE SPELLING A ROW REPORTS, AND IT IS NOT ALWAYS THE SLUG.",
+    "\u26d4 `icon_kind` IS THE SPELLING A ROW REPORTS, AND IT IS NOT ALWAYS THE SLUG.",
     "A codex row's `icon_kind` is the historical `session`, which ships on the wire",
     "and may not be renamed. A resolver that matched a row's kind against these KEYS",
-    "therefore never narrowed for codex — 410 of 742 live rows on 2026-08-22 — and",
+    "therefore never narrowed for codex \u2014 410 of 742 live rows on 2026-08-22 \u2014 and",
     "fell through to trying every declared store, which was right only by luck.",
     "`session_kind_for_row` in yggterm-core is the one owner of this question and",
     "the Rust lock makes it ratify every alias here.",
-    "SESSION ID SITS — the one thing the fleet verbs need that the CLI registry does",
+    "SESSION ID SITS \u2014 the one thing the fleet verbs need that the CLI registry does",
     "not already publish on a row.",
     "",
-    "⛔ THIS FILE IS NOT A SECOND COPY OF THE REGISTRY. `store_globs` is transcribed",
+    "\u26d4 THIS FILE IS NOT A SECOND COPY OF THE REGISTRY. `store_globs` is transcribed",
     "from `AgentCliDescriptor::session_store_globs` and is checked against it by",
     "`the_fleet_transcript_table_matches_the_registry` in yggterm-core, which FAILS",
     "the build if the two drift. The registry stays the owner of where a store is;",
     "this file adds only the id position, expressed as `{id}` inside the glob.",
     "",
-    "⚠ Every template here was resolved against a REAL store, not a fixture: a genuine",
+    "\u26a0 Every template here was resolved against a REAL store, not a fixture: a genuine",
     "session id taken from disk, substituted in, and required to return exactly the",
     "file it came from. A CLI with no store, or one whose store has never been seen on",
-    "a real machine, says so rather than guessing — an unverified template that looks",
+    "a real machine, says so rather than guessing \u2014 an unverified template that looks",
     "plausible is the failure this whole area keeps repeating.",
     "",
     "`verified_on_disk` means exactly that and nothing weaker."
@@ -75,7 +75,7 @@
       "transcript": ".qwen/projects/*/chats/{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": false,
-      "note": "⛔ UNVERIFIED AND THE ONLY ONE THAT LOOKS WRONG. 27 sessions across two hosts hold ONLY `<id>.runtime.json` sidecars — a pid/cwd marker with no title and no conversation — and zero `.jsonl` files. Every one of them was an unauthenticated probe that never exchanged a message, so this cannot yet be told apart from `a transcript appears only once a session says something`. Settle it by authenticating this CLI and running ONE exchange; until then neither this template nor the registry's live reader has been shown to resolve a real session."
+      "note": "\u26d4 UNVERIFIED AND THE ONLY ONE THAT LOOKS WRONG. 27 sessions across two hosts hold ONLY `<id>.runtime.json` sidecars \u2014 a pid/cwd marker with no title and no conversation \u2014 and zero `.jsonl` files. Every one of them was an unauthenticated probe that never exchanged a message, so this cannot yet be told apart from `a transcript appears only once a session says something`. Settle it by authenticating this CLI and running ONE exchange; until then neither this template nor the registry's live reader has been shown to resolve a real session."
     },
     "muse": {
       "store_globs": [
@@ -97,7 +97,7 @@
       "transcript": ".gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript_full.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
-      "note": "The id names a directory several levels above the file, and every session's file has the SAME name — which is why slicing a row's path for its id collapsed five rows onto one. The `.db` in the store is a summaries index, not the transcript."
+      "note": "The id names a directory several levels above the file, and every session's file has the SAME name \u2014 which is why slicing a row's path for its id collapsed five rows onto one. The `.db` in the store is a summaries index, not the transcript."
     },
     "grok-build": {
       "store_globs": [
@@ -115,15 +115,27 @@
       "transcript": null,
       "format": null,
       "verified_on_disk": false,
-      "note": "Declares no store in the registry. Nothing to resolve, and saying so is the honest answer — a guessed path here would read as measured."
+      "note": "Declares no store in the registry. Nothing to resolve, and saying so is the honest answer \u2014 a guessed path here would read as measured."
     },
     "kimi": {
-      "store_globs": [],
+      "store_globs": [
+        ".kimi-code/sessions/*/*/state.json"
+      ],
       "icon_kind": "kimi",
-      "transcript": null,
+      "transcript": ".kimi-code/sessions/*/{id}/state.json",
       "format": null,
-      "verified_on_disk": false,
-      "note": "Declares no store in the registry."
+      "verified_on_disk": true,
+      "note": "store_globs restored 2026-09-08 (the dormant fleet lock had let this drift). The session id is the whole session_<uuid> directory name, read by read_kimi_code_store_entry from path.parent(); verified 2026-09-08 by substituting the real id session_f25e941b-4a38-4d6d-9f95-135cf9a2a6af and matching its state.json exactly."
+    },
+    "zcode-tui": {
+      "store_globs": [
+        ".zcode/cli/rollout/model-io-*.jsonl"
+      ],
+      "icon_kind": "zcode-tui",
+      "transcript": ".zcode/cli/rollout/model-io-{id}.jsonl",
+      "format": "jsonl",
+      "verified_on_disk": true,
+      "note": "The file NAME is the id, whole: model-io-<session-uuid>.jsonl. One rollout file per session; the session title lives in the shared store (.zcode/cli/db/db.sqlite session.title). Measured 2026-09-07 against the zcode-tui campaign sessions on a fleet host."
     }
   }
 }

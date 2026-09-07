@@ -3404,6 +3404,134 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_live_store_title: Some(read_grok_live_store_title),
         remote_live_store_title: Some(GROK_REMOTE_TITLE_PROBE),
     },
+    // ── The 2026-09-08 intake. The house's own client: zcode-tui
+    // (github.com/avikalpa/zcode-tui, GPL-3.0-or-later, npm
+    // `@avikalpa/zcode-tui`) speaks the ZCode v4 protocol (NDJSON
+    // `{method,params,id}` over stdio) to the locally installed proprietary
+    // runtime, spawned as
+    // `ELECTRON_RUN_AS_NODE=1 /opt/ZCode/zcode glm/zcode.cjs app-server`.
+    // Every field below was measured against the live TUI and its shared
+    // store on this fleet; `docs/protocol.md` in that repo is the protocol
+    // SSOT and its SKILL.md carries the laws.
+    AgentCliDescriptor {
+        kind: SessionKind::ZcodeTui,
+        display_name: "ZCode TUI",
+        session_metadata_label: "ZCode TUI Session",
+        // The slug is the package/bin name minus the scope: `zcode-tui` is
+        // descriptive of the client, not a claim on the ZCode mark (see that
+        // repo's TRADEMARKS.md).
+        slug: "zcode-tui",
+        binary_name: "zcode-tui",
+        // Scoped to the owner's npm USER account (unscoped `zcode-tui` was
+        // 404-free too, but the @jyashq squat lesson applies). The published
+        // package ships a `bin/zcode-tui` node shim that execs the bun-compiled
+        // binary when present or runs the TS entry under bun.
+        install: CliInstall::Npm("@avikalpa/zcode-tui"),
+        update: CliUpdate::Reinstall,
+        icon_glyph: "Z_",
+        // The ZCode v4 trajectory user-blue (#2563eb) — 4.5:1+ against white,
+        // verified by the WCAG lock test below.
+        brand_color: "#2563eb",
+        menu_hint: 'z',
+        // The TUI reads its titles from the shared session store (the
+        // desktop's own generated titles) — yggterm never invents one.
+        title_authority: TitleAuthority::Store,
+        id_assigned_at_birth: false,
+        // v1 is LOCAL-ONLY: no remote wrapper subcommands exist.
+        wrapper_slug: None,
+        remote_row_scheme: None,
+        runtime_key_scheme: None,
+        // MEASURED off the TUI's own status bar and composer indicator (the
+        // only working chrome it draws): "streaming…" during a turn, "●
+        // running" on the composer's second row.
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "streaming…",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "● running",
+                also_any: &[],
+            },
+        ],
+        working_screen_negations: &[],
+        // Unmeasured: quota exhaustion has been seen only as a protocol error
+        // code, never as a screen.
+        limit_wait_screen_phrases: &[],
+        // MEASURED: the permission banner ("⚠ Write (medium): … — y allow · a
+        // always · n deny") and the select dialogs ("type to filter…") both
+        // consume every key while up.
+        question_picker_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "y allow · a always",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "type to filter…",
+                also_any: &[],
+            },
+        ],
+        background_agent_hint_screen_phrases: &[],
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
+        // MEASURED: `--resume <sessionId>` boots straight into a resumed
+        // session (added 0.5.1 for exactly this contract).
+        resume_selector: ResumeSelector::Flag("--resume"),
+        // The TUI resumes from the shared store; the session's own workspace
+        // is inherited from that store, so re-rooting would be a no-op.
+        resume_re_roots_with_cwd: false,
+        model_flag: "--model",
+        // The composer renders the draft with a U+258F left-bar caret while
+        // typing; nothing else marks the input head.
+        composer_marker: '\u{258f}',
+        composer_footer_hints: &["i to type", "○ idle", "zcode-tui"],
+        working_footer_hints: &["● running", "streaming"],
+        // The TUI takes NO launch posture flags — permissions are owned
+        // in-app (its own y/a/n permission banner per tool use), so every
+        // posture launches identically and the real gate is the in-app ask.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &[]),
+            (AgentPermissionMode::AcceptEdits, &[]),
+            (AgentPermissionMode::Bypass, &[]),
+        ],
+        // The launch contract emits --model (and --resume); --model must be
+        // listed here so a caller-pinned model is never double-spelled.
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+        ],
+        extra_args_slug: "zcode-tui",
+        // No presets, and honestly UNMEASURED rather than Measured-with-none:
+        // the TUI takes no launch posture flags at all — permissions are owned
+        // in-app, gated per tool use by its own y/a/n banner (the descriptor's
+        // question_picker phrase). The tiers would describe flags that do not
+        // exist; the row renders disabled with this reason instead.
+        permission_presets: &[],
+        permission_provenance: PermissionProvenance::Unmeasured(
+            "zcode-tui takes no launch permission flags; tool permissions are \
+             gated in-app per ask (y allow-once / a allow-project / n deny)",
+        ),
+        // session/resume rebuilds the whole conversation from the shared store.
+        content_rederives_on_resume: true,
+        // MEASURED: one rollout file per session, `model-io-<session>.jsonl`
+        // under `~/.zcode/cli/rollout/` (the file NAME is the identity).
+        session_store_globs: &[".zcode/cli/rollout/model-io-*.jsonl"],
+        store_excluded_name_fragments: &[],
+        // The durable store is `.zcode/cli/db/db.sqlite` (sessions, messages,
+        // parts) — not a transcript artifact, so it is not listed here; the
+        // store reader joins it read-only for cwd/title.
+        durable_store_files: &[],
+        store_scan_gap: None,
+        store_home_env_override: None,
+        read_store_entry: read_zcode_tui_store_entry,
+        store_membership_index: None,
+        live_session_argv_flag: None,
+        live_session_marker: None,
+        // Live rows take their title from the shared store's own session
+        // table (the desktop's generated titles — title_authority Store).
+        read_live_store_title: Some(read_zcode_tui_live_store_title),
+        remote_live_store_title: None,
+    },
 ];
 
 fn modified_epoch_ms_of(path: &Path) -> u128 {
@@ -3794,6 +3922,107 @@ fn read_qwen_custom_title_tail(path: &Path) -> Option<String> {
 /// 36-char uuid that equals its own directory name, `info.cwd` is absolute, and
 /// `updated_at` is RFC-3339 with nanoseconds. The glob targets `summary.json`
 /// alone so one session yields exactly one entry.
+/// Read one zcode-tui rollout entry. MEASURED 2026-09-07: the file NAME is
+/// the identity (`model-io-<session-uuid>.jsonl`, one file per session); the
+/// first line is the first model-io row, whose `request.body.messages`
+/// reverse-walked to the first user text is the closest thing the file has to
+/// a first input. cwd and title come from the shared store's session table
+/// (read-only, short query — the same WAL discipline the TUI itself uses).
+fn read_zcode_tui_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let name = path.file_name()?.to_str()?;
+    let session_id = name.strip_prefix("model-io-")?.strip_suffix(".jsonl")?;
+    if session_id.is_empty() {
+        return None;
+    }
+    let modified_epoch_ms = modified_epoch_ms_of(path);
+    let first_line = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.lines().next().map(|l| l.to_string()));
+    let first_user_text: Option<String> = first_line.as_deref().and_then(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let messages = value
+            .get("request")?
+            .get("body")?
+            .get("messages")?
+            .as_array()?
+            .clone();
+        for m in messages.iter().rev() {
+            if m.get("role")?.as_str()? != "user" {
+                continue;
+            }
+            let text = match m.get("content")? {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => continue,
+            };
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                return Some(text.chars().take(80).collect::<String>());
+            }
+        }
+        None
+    });
+    let store = dirs::home_dir().and_then(|home| {
+        let db = home.join(".zcode/cli/db/db.sqlite");
+        rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()
+    });
+    let (cwd, title) = store
+        .and_then(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT directory, title FROM session WHERE id = ?1 LIMIT 1")
+                .ok()?;
+            let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+            let row = rows.next().ok()??;
+            let cwd: String = row.get(0).ok()?;
+            let title: Option<String> = row.get(1).ok();
+            Some((
+                cwd.trim().to_string(),
+                title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            ))
+        })
+        .unwrap_or_default();
+    if cwd.is_empty() {
+        return None;
+    }
+    Some(AgentStoreEntry {
+        session_id: session_id.to_string(),
+        cwd,
+        modified_epoch_ms,
+        title,
+        detail: first_user_text,
+    })
+}
+
+/// Live-row title for zcode-tui: the shared store's own session title (the
+/// desktop generates it; title_authority is Store, so yggterm only reads).
+fn read_zcode_tui_live_store_title(_path: &Path, session_id: &str) -> Option<String> {
+    let store = dirs::home_dir()?.join(".zcode/cli/db/db.sqlite");
+    let conn = rusqlite::Connection::open_with_flags(
+        &store,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT title FROM session WHERE id = ?1 LIMIT 1")
+        .ok()?;
+    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+    let row = rows.next().ok()??;
+    let title: Option<String> = row.get(0).ok();
+    title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
 fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     let raw = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -8696,6 +8925,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn the_fleet_transcript_table_matches_the_registry() {
         let raw = include_str!(
             "../../../.agents/skills/yggterm-agent-fleet/cli-stores.json"

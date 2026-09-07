@@ -23,6 +23,9 @@ pub enum SessionKind {
     Antigravity,
     /// `grok` — xAI's Grok Build CLI, `@xai-official/grok`, Apache-2.0.
     GrokBuild,
+    /// `zcode-tui` — avikalpa/zcode-tui, GPL-3.0-or-later. The house's own
+    /// TUI client for the ZCode runtime (@avikalpa/zcode-tui on npm).
+    ZcodeTui,
     Shell,
     SshShell,
     Document,
@@ -44,6 +47,7 @@ impl SessionKind {
         SessionKind::Muse,
         SessionKind::Antigravity,
         SessionKind::GrokBuild,
+        SessionKind::ZcodeTui,
         SessionKind::Shell,
         SessionKind::SshShell,
         SessionKind::Document,
@@ -119,13 +123,14 @@ mod tests {
                 SessionKind::Muse => 7,
                 SessionKind::Antigravity => 8,
                 SessionKind::GrokBuild => 9,
-                SessionKind::Shell => 10,
-                SessionKind::SshShell => 11,
-                SessionKind::Document => 12,
+                SessionKind::ZcodeTui => 10,
+                SessionKind::Shell => 11,
+                SessionKind::SshShell => 12,
+                SessionKind::Document => 13,
             };
             assert_eq!(index, slot, "{kind:?} is listed out of order in ALL");
         }
-        assert_eq!(SessionKind::ALL.len(), 13);
+        assert_eq!(SessionKind::ALL.len(), 14);
     }
 
     // The rendered-view question, answered once. Before this, a plain shell
