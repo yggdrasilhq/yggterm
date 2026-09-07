@@ -15729,6 +15729,17 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
             .collect();
         (rows, dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
     };
+    // [11.80 diagnosability] one line per tick — silence must be
+    // distinguishable from absence.
+    if let Ok(home) = crate::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "daemon",
+            "persistence",
+            "row_title_follow_tick",
+            serde_json::json!({ "candidates": candidates.len() }),
+        );
+    }
     if candidates.is_empty() {
         return Ok(0);
     }
