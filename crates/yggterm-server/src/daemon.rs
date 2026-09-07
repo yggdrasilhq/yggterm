@@ -24914,7 +24914,13 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // interval, the reads happen outside the runtime lock.
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
-        std::thread::spawn(move || loop {
+        std::thread::spawn(move || {
+            // The FIRST tick runs immediately: a thread whose first action is
+            // a sleep is indistinguishable from a thread that never spawned.
+            if let Err(error) = run_row_title_follow_chore(&runtime) {
+                warn!(error = %error, "daemon row title follow chore failed");
+            }
+            loop {
             std::thread::sleep(std::time::Duration::from_millis(
                 ROW_TITLE_FOLLOW_INTERVAL_MS,
             ));
@@ -24923,8 +24929,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     mark_daemon_activity(&last_activity_ms);
                 }
                 Ok(_) => {}
-                Err(error) => {
-                    warn!(error = %error, "daemon row title follow chore failed");
+                    Err(error) => {
+                        warn!(error = %error, "daemon row title follow chore failed");
+                    }
                 }
             }
         });
