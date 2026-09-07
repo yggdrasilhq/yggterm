@@ -5089,6 +5089,14 @@ struct AppPaneActionReply {
     /// under the user's click.
     #[serde(default)]
     refetch_document: bool,
+    /// The mirror arm: re-fetch the RAIL pane's schema now. A document-pane
+    /// action also moves rail rows (a mode switch repaints the shelf, a
+    /// contents row moves the selection), and waiting for the next ~2.5s ping
+    /// to notice the moved `document_version` leaves the shelf stale under
+    /// the user's click. Handled in BOTH action runners — the reply contract
+    /// is per-reply, never per-pane (the two-arm law).
+    #[serde(default)]
+    refetch_rail: bool,
     /// Re-read `<control>/appearance` now: the app changed the chrome's light/dark
     /// choice from its pane and wants the live chrome repainted at once, not at
     /// the next ~4s declare. Same immediate-refetch shape as `refetch_zoom`.
@@ -18046,6 +18054,10 @@ struct ShellState {
     optimistic_drag_paths: Vec<String>,
     optimistic_drag_target: Option<DragDropTarget>,
     drag_pointer: Option<(f64, f64)>,
+    /// When the current tree drag began (`begin_drag`); `clear_drag_state`
+    /// reads it for the `tree_drag_ended` elapsed — the drag-UX timing the
+    /// begin/hover telemetry lacked.
+    drag_started_at_ms: u64,
     pending_tree_drag: Option<PendingTreeDrag>,
     suppress_tree_click_until_ms: u64,
     suppress_sidebar_autoscroll_until_ms: u64,
@@ -20443,6 +20455,7 @@ impl ShellState {
             optimistic_drag_paths: Vec::new(),
             optimistic_drag_target: None,
             drag_pointer: None,
+            drag_started_at_ms: 0,
             pending_tree_drag: None,
             suppress_tree_click_until_ms: 0,
             suppress_sidebar_autoscroll_until_ms: 0,
@@ -34322,6 +34335,7 @@ impl ShellState {
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
         self.drag_pointer = Some(pointer);
+        self.drag_started_at_ms = current_millis();
         if cfg!(debug_assertions) {
             info!(drag_count=%self.drag_paths.len(), anchor=%row.full_path, "tree drag started");
         }
@@ -34473,14 +34487,30 @@ impl ShellState {
     }
     fn clear_drag_state(&mut self) {
         let had_drag = !self.drag_paths.is_empty();
+        let drag_path_count = self.drag_paths.len();
+        let drag_elapsed_ms = if self.drag_started_at_ms != 0 {
+            current_millis().saturating_sub(self.drag_started_at_ms)
+        } else {
+            0
+        };
         self.pending_tree_drag = None;
         self.drag_paths.clear();
         self.drag_hover_target = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
         self.drag_pointer = None;
+        self.drag_started_at_ms = 0;
         if had_drag {
             self.suppress_tree_click_until_ms = current_millis().saturating_add(220);
+            // The END edge the drag plane never had: begin→clear elapsed, so
+            // a "the drag feels laggy" report reads as a number first.
+            self.record_ui_telemetry(
+                "tree_drag_ended",
+                json!({
+                    "ms": drag_elapsed_ms,
+                    "paths": drag_path_count,
+                }),
+            );
         }
         self.refresh_tree_debug("clear_drag_state");
     }
@@ -34589,6 +34619,19 @@ impl ShellState {
                 &pending.session_paths,
                 &self.server.live_sessions(),
             );
+        // THE REQUESTED EDGE of the modal probes: paired with the overlay's
+        // `ui/modal shown` mount event, the two ts_ms's give the
+        // request→paint latency per open.
+        self.record_ui_telemetry(
+            "modal_open_requested",
+            json!({
+                "kind": "delete",
+                "rows": pending.session_paths.len()
+                    + pending.document_paths.len()
+                    + pending.group_paths.len()
+                    + pending.ssh_machine_keys.len(),
+            }),
+        );
         self.pending_delete = Some(pending);
         self.close_context_menu();
         self.last_action = if hard_delete {
@@ -34627,6 +34670,14 @@ impl ShellState {
             });
             session_paths.push(session.session_path);
         }
+        self.record_ui_telemetry(
+            "modal_open_requested",
+            json!({
+                "kind": "delete",
+                "rows": session_paths.len(),
+                "bulk": true,
+            }),
+        );
         self.pending_delete = Some(PendingDeleteDialog {
             document_paths: Vec::new(),
             group_paths: Vec::new(),
@@ -70352,9 +70403,16 @@ async fn app_pane_fetch_schema(
     if !query.is_empty() {
         url = format!("{url}?{}", query.join("&"));
     }
+    let fetch_started = std::time::Instant::now();
     let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("schema fetch panicked: {error}")));
+    let fetched_ok = fetched.is_ok();
+    let fetched_bytes = fetched
+        .as_ref()
+        .ok()
+        .and_then(|value| serde_json::to_vec(value).ok())
+        .map(|bytes| bytes.len());
     match fetched.and_then(|value| {
         serde_json::from_value::<AppPaneSchema>(value)
             .map_err(|error| format!("pane schema is malformed: {error}"))
@@ -70373,6 +70431,23 @@ async fn app_pane_fetch_schema(
         }
         Err(error) => state.with_mut_counted(|shell| shell.app_pane_apply_error(seq, error)),
     }
+    // THE PANE-FETCH PROBE: the app side of every contributed-pane timeline,
+    // queryable next to the app's own ytrace records (`ydesign` carries the
+    // twin). The populate-lag diagnosis of 2026-09-07 was half-inferred
+    // because the GUI emitted nothing here.
+    append_trace_event(
+        &resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from(".")),
+        "ui",
+        "app_pane",
+        "fetch",
+        json!({
+            "session_path": session_path,
+            "pane": pane_id,
+            "ms": fetch_started.elapsed().as_millis() as u64,
+            "bytes": fetched_bytes,
+            "ok": fetched_ok,
+        }),
+    );
 }
 
 /// Fetch the DOCUMENT SURFACE's schema — the viewport-placement pane of
@@ -70396,9 +70471,16 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
     };
     let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_pane_schema_url(&control_url, &pane_id);
+    let fetch_started = std::time::Instant::now();
     let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
         .await
         .unwrap_or_else(|error| Err(format!("document schema fetch panicked: {error}")));
+    let fetched_ok = fetched.is_ok();
+    let fetched_bytes = fetched
+        .as_ref()
+        .ok()
+        .and_then(|value| serde_json::to_vec(value).ok())
+        .map(|bytes| bytes.len());
     match fetched.and_then(|value| {
         serde_json::from_value::<AppPaneSchema>(value)
             .map_err(|error| format!("document schema is malformed: {error}"))
@@ -70420,6 +70502,20 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
             state.with_mut_counted(|shell| shell.document_pane_apply_error(seq, &session_path, error))
         }
     }
+    // The document channel's twin of the rail fetch probe.
+    append_trace_event(
+        &resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from(".")),
+        "ui",
+        "app_pane",
+        "fetch",
+        json!({
+            "session_path": session_path,
+            "pane": pane_id,
+            "ms": fetch_started.elapsed().as_millis() as u64,
+            "bytes": fetched_bytes,
+            "ok": fetched_ok,
+        }),
+    );
 }
 
 /// POST a document-surface action to the app and apply the reply to the
@@ -70499,6 +70595,16 @@ async fn document_pane_run_action(
                 .unwrap_or_else(|| pane_id.clone());
             shell.push_notification(NotificationTone::Info, title, toast);
         });
+    }
+    if reply.refetch_rail
+        && let Some((rail_pane, seq)) =
+            state.with_mut_counted(|shell| shell.document_rail_pane_to_refetch(&session_path))
+    {
+        // A document-pane action moved rail rows; repaint the shelf now
+        // instead of at the next ping-discovered version edge. The rail arm
+        // of the refetch contract, served from the document channel (the
+        // two-arm law: the reply flag works no matter which pane posted).
+        spawn(app_pane_fetch_schema(state, session_path.clone(), rail_pane, seq));
     }
 }
 
@@ -71444,6 +71550,19 @@ async fn app_pane_run_action_with_order(
         if let Some(session) = session {
             let seq = state.with_mut_counted(|shell| shell.document_pane_next_request(&session));
             spawn(document_pane_fetch_schema(state, session, seq));
+        }
+    }
+    if reply.refetch_rail {
+        // The document also moved rail rows; repaint the shelf now rather
+        // than a ping-edge later. Same active-session guard the declare/ping
+        // rail arm enforces.
+        let session = state.peek().server.active_session_path().map(str::to_string);
+        if let Some(session) = session {
+            if let Some((pane_id, seq)) =
+                state.with_mut_counted(|shell| shell.document_rail_pane_to_refetch(&session))
+            {
+                spawn(app_pane_fetch_schema(state, session, pane_id, seq));
+            }
         }
     }
     if reply.refetch_zoom {

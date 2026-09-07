@@ -1,0 +1,26 @@
+Probe the modal, drag and app-pane planes; reply gains refetch_rail
+
+Owner directive 2026-09-07: modal spawn reads as ~1s everywhere (sharpest on
+ALT+E,X -> the delete-confirm dialog), row-tree drag UX feels laggy, and the
+planes left a lag report unattributable — the modal plane emitted ZERO trace
+events and the drag events carried no timing.
+
+Probes (all append_trace_event, ui component):
+- ui/modal requested: `modal_open_requested` telemetry at the two
+  delete-dialog setters (kind, rows).
+- ui/modal shown: DeleteConfirmOverlay mounts with a use_effect emit — the
+  ts pair with `requested` IS the request->paint latency, the number the
+  owner's ALT+E,X,L report names. The same one-effect pattern grows onto the
+  other modal components as their latencies matter.
+- ui/app_pane fetch: both pane-fetch channels (rail + document) emit pane,
+  bytes, ms, ok — the GUI half of every contributed-pane timeline (dreams
+  ACK-816f5d39ef; ydesign ships the app half).
+- ui_telemetry tree_drag_ended: begin->clear elapsed + path count, the end
+  edge the drag plane never had.
+
+Fix: AppPaneActionReply gains serde-default `refetch_rail`, handled in BOTH
+action runners (the two-arm law) via the same active-session-guarded
+document_rail_pane_to_refetch the declare/ping arm uses. A document-pane
+action that moves rail rows (ydesign's mode switch, a contents row) repaints
+the shelf now instead of at the next ~2.5s ping-discovered version edge.
+Pairs with the ydesign lane setting the flag.

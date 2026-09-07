@@ -599,6 +599,17 @@ fn DeleteConfirmOverlay(
 ) -> Element {
     let item_count = pending_delete_display_count(&pending);
     let preview = pending.labels.iter().take(4).cloned().collect::<Vec<_>>();
+    // THE SHOWN EDGE of the modal probes: this effect runs when the dialog
+    // MOUNTS, so its ts_ms minus the `modal_open_requested` event's ts_ms is
+    // the request→paint latency — the number that names the modal-spawn lag
+    // the owner measures on ALT+E,X (2026-09-07). Same one-effect pattern
+    // grows onto the other modal components as their latencies matter.
+    {
+        let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+        use_effect(move || {
+            append_trace_event(&trace_home, "ui", "modal", "shown", json!({"kind": "delete"}));
+        });
+    }
     let dialog_text = delete_confirm_dialog_text(&pending);
     let bulk_live_close = pending.live_session_bulk_close;
     let unkept_count = pending.live_session_unkept_paths.len();
