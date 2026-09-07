@@ -20849,13 +20849,27 @@ impl ShellState {
         // updating" wording (it is then TRUE); any other veil — preserved
         // rows still served by an older daemon — must say so instead, never
         // claim an update that is not happening.
-        let veil_label = if runtime_status_handoff_active(status) {
+        // [11.78] THE WORDING FOLLOWS THE FACTS. "Daemon updating" is only
+        // true when the daemon now serving us is not the version this client
+        // already runs. A same-version handover — the fleet's cold-swap
+        // convergence, a GUI relaunch — is a settling event, and saying
+        // "updating" while no build changed is the phantom-update lie the
+        // owner lived through on 2026-09-07 (five daemon generations between
+        // 15:19 and 16:20 on the GUI host, not one deploy after 12:19).
+        let same_version_as_client =
+            crate::hot_update_policy::runtime_status_is_current_app_version(status);
+        let preserved_count = status.preserved_terminal_owner_keys.len();
+        let veil_label = if !same_version_as_client {
             None
-        } else {
+        } else if preserved_count > 0 {
             Some(format!(
-                "{} session(s) are still served by an older daemon — they settle as they idle.",
-                status.preserved_terminal_owner_keys.len()
+                "{preserved_count} session(s) are still served by an older daemon generation — they settle as they idle."
             ))
+        } else {
+            Some(
+                "The daemon handed over between generations; sessions will settle in a moment."
+                    .to_string(),
+            )
         };
         self.handover_gate.set_veil_label(veil_label);
         let observation = handover_observation_from_parts(
