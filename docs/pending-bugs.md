@@ -27596,3 +27596,52 @@ fail-open held-row shape. **Open half:** the -32600 painting comes from
 codex inside its own TUI; yggterm cannot intercept it there — the picker fix
 removes the main road into it, and a row-side explanation of a refused
 resume (naming the holder row) remains a dream.
+
+
+## ⛔ [11.75] A ROW'S PERSISTED SESSION ID DRIFTED FROM ITS LIVE RUNTIME — RESTORE RESUMES A DEAD UUID, THE SURVIVING WRITER IS INVISIBLE, THE TITLE MISSES, AND THE PREAMBLE PAINTS INTO A LIVE COMPOSER (measured on the "Ydesign fresh probe" row, 2026-09-07 11:07-11:11)
+
+**Status:** OPEN
+
+**Owner:** the codex-resume-identity lane (the restore composition is that
+lane's registry arm); four owner-reported symptoms, ONE root cause.
+
+One row, measured end to end on dev + the GUI host:
+
+- The row's PERSISTED record names session `67d7aef1-...`. That rollout does
+  NOT exist on dev (find: zero hits). The row's own recorded Rollout file is
+  `rollout-...-01a0709f-0345-7281-9967-9bef550cbaf1.jsonl` — a DIFFERENT
+  uuid, alive on dev. The drift: the row's TUI rebound to the 01a0709f
+  thread (the live record carried it — the rebind plane moved `session.id`),
+  but every RESTORE-path consumer reads the persisted id.
+- **Symptom 1 (restore):** after a GUI restart the restore composed
+  `resume-codex 67d7aef1 --require-existing` → "saved Codex session ...
+  no longer available on this machine" error frame — while the row's own
+  recorded rollout sat right there.
+- **Symptom 2 (reattach skipped):** the thread's writer is ALIVE and
+  daemon-owned (pid 3294837, `codex-runtime://01a0709f`, adopted by the
+  current dev daemon, 8.5h old) — the restore could have re-attached the row
+  to it; the drifted id made the runtime invisible to the restore.
+- **Symptom 3 (-32600):** the owner opened a NEW codex and /resumed the
+  thread → "already has an active writer" — codex correctly refusing; with
+  the drifted title the owner cannot SEE which row already holds the
+  thread, so the refusal reads as a wall. (The refusal message naming the
+  holding row would turn a wall into a signpost.)
+- **Symptom 4 (title):** the row keeps its birth/owner-set title while
+  codex's thread name (local_thread_catalog.display_title, keyed by thread
+  id 01a0709f) never flows — the catalog lookup runs by the drifted
+  67d7aef1 and misses.
+- **Separate but same row: the preamble painted INTO the live composer**
+  ("Codex session rooted at ..." drawn over the codex prompt area) — the
+  restore preamble was written after the TUI had painted its composer; a
+  TUI that only repaints changed cells never clears it. The preamble must
+  be emitted BEFORE the TUI spawn (or suppressed when the row carries TUI
+  content).
+
+**Fix shape:** at restore-resume composition, when the persisted session
+id's rollout is absent on the host but the record's `storage_path` exists
+and embeds a uuid — codex rollout filenames embed the thread id — re-point
+the record to that uuid (persist the re-point), resume IT, and let the
+title/metadata consumers follow the corrected id; when that uuid's runtime
+is ALREADY live (its runtime key answers), re-attach instead of spawning,
+and name the holding row in the refusal. The re-point is the same move the
+live rebind already makes; it is missing from the persisted→restore seam.
