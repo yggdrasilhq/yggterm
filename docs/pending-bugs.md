@@ -27688,6 +27688,22 @@ is ALREADY live (its runtime key answers), re-attach instead of spawning,
 and name the holding row in the refusal. The re-point is the same move the
 live rebind already makes; it is missing from the persisted→restore seam.
 
+**CHAIN-CHASE CORRECTION (2026-09-07 19:0x, the same evening - the chase
+hotted onto this entry was itself falsified and REVERTED):** the
+content-mention chase cannot distinguish a rebind chain from ids merely
+SPOKEN ABOUT in a long transcript. Measured: the live 23.8 MB rollout of an
+UNRELATED conversation mentions five different dead row ids at offsets
+3.5M-19.6M; the first chain-arm poll (18:45:53) re-pointed five rows onto
+that one live thread, four of them phantom twins. Codex rollout heads carry
+NO structured parent-thread marker (session_meta has no parent field in
+0.153.x), so NO content-based chase is sound. The wiring (verb, dispatch,
+poll arm, pure fn) is reverted; the correct identity sources stay: the row's
+recorded Rollout file when it EXISTS ([11.75] single hop), live writers
+matched BY ID (argv/marker), and the [11.74] picker arm for dead-id rows.
+The five over-claimed rows (715ed3fa/7f25f9f5/86940711/8a5749e0/ebc15020)
+need their ids rolled back to their key suffixes (or despawn per [11.74]) -
+a `server rows re-point` verb is the missing cure tool.
+
 **Falsifier FAILED live (2026-09-07 17:14, the owner's PTY read of the
 "New dev Codex" row, key remote-session://dev/d5d9f9fd-…):** the restore
 still composed the dead persisted id and errored ("saved Codex session … no
