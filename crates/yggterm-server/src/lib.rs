@@ -1230,6 +1230,256 @@ fn codex_session_id_from_storage_path(storage_path: &str) -> Option<String> {
     Uuid::parse_str(suffix).ok().map(|uuid| uuid.to_string())
 }
 
+/// Chase a dead Codex thread id through the rebind chain to the id that is
+/// alive TODAY.
+///
+/// Codex mints a fresh rollout on every `/resume`, and each new rollout's
+/// content names the thread it was resumed FROM. A persisted id can therefore
+/// be several hops behind the live thread: `d5d9f9fd` (dead) names no rollout
+/// file, its conversation continues inside `rollout-…-01a0709f-…jsonl`, which
+/// continues inside `rollout-…-01a07a88-…jsonl`. The single-hop filename
+/// re-point ([11.75]) stops at the first dead hop; this chase walks the chain
+/// to its end.
+///
+/// **A live writer outranks the chain.** A running codex holds its rollout
+/// OPEN — the caller passes the open rollout filenames read from
+/// `/proc/<pid>/fd` — and a live writer whose rollout mentions `start_id` IS
+/// the current thread, whatever the disk chain says (the disk can be a
+/// further hop behind a resumed process). `open_rollouts` maps rollout
+/// filename → filename id; pass the live ones first.
+///
+/// Bounded by `depth_cap` hops (measured chains: 1–2; the cap exists so a
+/// pathological store degrades to the [11.75] single-hop answer, never to a
+/// hang). Pure fs over `sessions_dir` — the caller runs it on the OWNING
+/// host, through the remote probe channel, never across ssh per hop.
+pub(crate) fn codex_chase_session_id(
+    start_id: &str,
+    sessions_dir: &Path,
+    open_rollouts: &[(String, String)],
+    depth_cap: usize,
+) -> Option<String> {
+    let parsed = Uuid::parse_str(start_id).ok()?;
+    let mut current = parsed.to_string();
+    for _ in 0..depth_cap {
+        // Live writers first: a live rollout that mentions the current id
+        // names the thread's continuation, and it is RUNNING — the strongest
+        // witness there is.
+        if let Some((_, live_id)) = open_rollouts.iter().find(|(_, id)| {
+            id != &current
+                && rollout_content_mentions_thread(sessions_dir, &current, id)
+        }) {
+            current = live_id.clone();
+            continue;
+        }
+        // Disk chain: the NEWEST rollout whose content mentions the current
+        // id donates its filename id as the successor.
+        let successor = newest_rollout_mentioning_thread(sessions_dir, &current)
+            .and_then(|file_name| {
+                codex_session_id_from_storage_path(&file_name.to_string_lossy())
+            })
+            .filter(|next| next != &current);
+        match successor {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    (current != parsed.to_string()).then_some(current)
+}
+
+/// Does the rollout named `thread_id`'s filename mention `needle` in its
+/// content? One bounded read; missing files answer false (the caller treats
+/// that hop as dead and keeps walking).
+fn rollout_content_mentions_thread(sessions_dir: &Path, needle: &str, thread_id: &str) -> bool {
+    let Ok(dir) = std::fs::read_dir(sessions_dir) else {
+        return false;
+    };
+    let _ = dir;
+    // The live writer's rollout may sit in any date directory; the caller
+    // passes the OPEN path from /proc, so read it directly rather than scan.
+    if let Some(path) = find_rollout_path_by_thread_id(sessions_dir, thread_id) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return windows_contain(&bytes, needle.as_bytes());
+        }
+    }
+    false
+}
+
+/// The newest rollout file under `sessions_dir` whose content mentions
+/// `needle`. Newest by modified time — a chain's successor is always younger
+/// than its predecessor, so the newest mention is the next hop.
+fn newest_rollout_mentioning_thread(sessions_dir: &Path, needle: &str) -> Option<std::path::PathBuf> {
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let mut stack = vec![sessions_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            if let Some((best_time, _)) = &best
+                && modified <= *best_time
+            {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path)
+                && windows_contain(&bytes, needle.as_bytes())
+            {
+                best = Some((modified, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Resolve a rollout FILE PATH for a thread id by filename under
+/// `sessions_dir` (any date directory).
+fn find_rollout_path_by_thread_id(sessions_dir: &Path, thread_id: &str) -> Option<std::path::PathBuf> {
+    let mut stack = vec![sessions_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.contains(thread_id)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Substring search across chunk boundaries — rollout lines can be longer
+/// than one read, so `read`-once semantics would miss needle splits. We read
+/// the whole file, so this is a plain windowed contains over the tail seam.
+fn windows_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return haystack.starts_with(needle);
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(test)]
+mod codex_chase_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn rollout_name(ts: &str, id: &str) -> String {
+        format!("rollout-{ts}-wave-lets-just-say-{id}.jsonl")
+    }
+
+    /// The validator demands a real codex-store prefix, so the fixtures live
+    /// under the actual sessions dir in a throwaway subdirectory.
+    fn chase_root(tag: &str) -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap();
+        let root = std::path::Path::new(&home)
+            .join(".codex/sessions/chase-test")
+            .join(format!("{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn write_rollout(
+        root: &Path,
+        date_dir: &str,
+        ts: &str,
+        id: &str,
+        mentions: Option<&str>,
+    ) -> std::path::PathBuf {
+        let dir = root.join(date_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(rollout_name(ts, id));
+        let mut body = format!("{{\"session_id\":\"{id}\"}}\n");
+        if let Some(needle) = mentions {
+            body.push_str(&format!("{{\"resumed_from\":\"{needle}\"}}\n"));
+        }
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn backdate(path: &Path, secs_ago: u64) {
+        let t = SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    const DEAD: &str = "d5d9f9fd-fec2-4b6b-ade9-104fd9067943";
+    const HOP1: &str = "01a0709f-0345-7281-9967-9bef550cbaf1";
+    const HOP2: &str = "01a07a88-0485-7790-b2a8-32306c14ed58";
+
+    #[test]
+    fn a_two_hop_chain_chases_to_the_live_thread() {
+        let root = chase_root("two-hop");
+        // hop 1: mentions the dead id; hop 2 (newest): mentions hop 1.
+        write_rollout(&root, "2026/09/05", "20260905T1341", HOP1, Some(DEAD));
+        write_rollout(&root, "2026/09/07", "20260907T1152", HOP2, Some(HOP1));
+        let chased = codex_chase_session_id(DEAD, &root, &[], 5).unwrap();
+        assert_eq!(chased, HOP2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_live_writer_outranks_the_disk_chain() {
+        let root = chase_root("live");
+        // Disk chain says HOP1; a RUNNING codex holds HOP2's rollout open and
+        // that rollout mentions the dead id — the live writer wins in one hop.
+        write_rollout(&root, "2026/09/05", "20260905T1341", HOP1, Some(DEAD));
+        write_rollout(&root, "2026/09/07", "20260907T1152", HOP2, Some(DEAD));
+        backdate(&root.join("2026/09/07").join(rollout_name("20260907T1152", HOP2)), 3600);
+        let chased = codex_chase_session_id(
+            DEAD,
+            &root,
+            &[(rollout_name("20260907T1152", HOP2), HOP2.to_string())],
+            5,
+        )
+        .unwrap();
+        assert_eq!(chased, HOP2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dead_id_mentioned_nowhere_chases_to_nothing() {
+        let root = chase_root("none");
+        write_rollout(&root, "2026/09/07", "20260907T1152", HOP2, None);
+        assert_eq!(codex_chase_session_id(DEAD, &root, &[], 5), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_depth_cap_degrades_to_the_single_hop_answer() {
+        let root = chase_root("cap");
+        write_rollout(&root, "2026/09/05", "20260905T1341", HOP1, Some(DEAD));
+        write_rollout(&root, "2026/09/07", "20260907T1152", HOP2, Some(HOP1));
+        let chased = codex_chase_session_id(DEAD, &root, &[], 1).unwrap();
+        assert_eq!(chased, HOP1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_uuid_start_is_refused() {
+        let root = chase_root("uuid");
+        assert_eq!(codex_chase_session_id("ses_f998not-a-uuid", &root, &[], 5), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 /// The live-order key [`YggtermServer::restore_live_session`] will file this row
 /// under — `None` when that key depends on a freshly minted uuid.
 ///
@@ -21826,6 +22076,38 @@ pub(crate) fn poll_remote_local_codex_identities(
     Ok(identities)
 }
 
+/// Chase a dead Codex id on the OWNING host over ssh — the remote half of
+/// [`run_remote_codex_id_chase`]. `None` = the chase found nothing (or the
+/// remote install predates the verb; the poll degrades to today's behavior).
+pub(crate) fn poll_remote_codex_id_chase(
+    ssh_target: &str,
+    ssh_prefix: Option<&str>,
+    dead_id: &str,
+) -> Option<(String, String)> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        ssh_prefix,
+        &["server", "remote", "codex-chase-id", dead_id],
+        None,
+    )
+    .ok()?;
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|candidate| candidate.starts_with('{'))?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let chased = value.get("session_id")?.as_str()?.to_string();
+    if chased.is_empty() || chased == dead_id {
+        return None;
+    }
+    let storage_path = value
+        .get("storage_path")
+        .and_then(|path| path.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some((chased, storage_path))
+}
+
 /// The cwd and title of ONE local Claude Code session, read from its own
 /// transcript. Returns `None` when the file is unreadable or carries no
 /// identity, so the caller can fall back rather than seat a wrong cwd.
@@ -32101,6 +32383,45 @@ pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// `yggterm server remote codex-chase-id <dead-id>` — runs on the OWNING
+/// host. Chases a dead persisted Codex thread id through the rebind chain
+/// (rollout contents, newest first, live-writer precedence from the open
+/// /proc fds) and prints ONE JSON line `{"session_id": ..., "storage_path":
+/// ...}` — `{}` when the chase finds nothing. The GUI host's identity poll
+/// calls this over ssh when a Codex row's saved id is dead on this machine
+/// ([11.75] addendum: the rebind is a CHAIN, one rollout per /resume).
+#[cfg(target_os = "linux")]
+pub fn run_remote_codex_id_chase(dead_id: &str) -> anyhow::Result<()> {
+    let open_rollouts: Vec<(String, String)> = enumerate_local_agent_cli_identities()
+        .into_iter()
+        .filter(|identity| identity.kind == "codex" && !identity.storage_path.is_empty())
+        .map(|identity| (identity.storage_path.clone(), identity.session_id))
+        .collect();
+    let sessions_dir = dirs::home_dir()
+        .context("no home dir")?
+        .join(".codex/sessions");
+    let Some(chased) = codex_chase_session_id(dead_id, &sessions_dir, &open_rollouts, 5) else {
+        write_stdout_line_strict("{}")?;
+        return Ok(());
+    };
+    let storage_path = find_rollout_path_by_thread_id(&sessions_dir, &chased)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    write_stdout_line_strict(
+        &serde_json::json!({
+            "session_id": chased,
+            "storage_path": storage_path,
+        })
+        .to_string(),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_remote_codex_id_chase(_dead_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
