@@ -27975,3 +27975,33 @@ titles read like spawn purposes before trusting their titles.
 active must title ONLY the created row (`rows show` on the active row keeps
 its title, `owner_set` unchanged), and the response's `data.session_path`
 must name the created row.
+
+## ⛔ [11.86] THE TITLE-FOLLOW READS THE STORE BY THE ROW'S BIRTH ID AFTER A REBIND — A REBOUND CODEX ROW WEARS ITS OLD THREAD'S TITLE WHILE THE AUDIT (READING THE REBOUND ID) FLAGS IT, AND THE CHORE CALLS IT SATISFIED (caught live by the metadata open/switch matrix, 2026-09-08 ~04:30)
+
+**Status:** OPEN
+
+Measured on dev: row `codex-runtime://01a0349d` (an ACTIVE advisor row,
+holder alive) rebound onto live thread `01a06d75` — the persisted record's
+id IS the rebound id (the identity overlay wrote it; the `rows live` audit
+reads the store by it and answers the NEW thread's catalog title). The
+title-follow chore reads `live_session_views()` and keys its store read by
+`view.id` — which still carries the BIRTH id `01a0349d` — so the chore
+reads the OLD thread's catalog title ("We are going to continue the
+practice campaign."), finds it equal to the row's title, and skips
+silently. One row, two ids, two store answers: the audit flags a mismatch
+the follower believes does not exist — the same two-wires shape as
+[11.82], one level down: this time it is the ID the two wires read by, not
+the reader they use.
+
+**Fix shape:** one id authority for a rebound row. Either the identity
+overlay's apply path updates the live view's `id` (and the persisted
+record) together — the [11.79] lesson, key and id move as one — or the
+title-follow (and every store read) keys by the persisted record's current
+id instead of the view's birth id. The audit's read key (the persisted
+`row.id`) is the one that tracks the runtime; verify which of view.id /
+persisted id the identity overlay actually writes before choosing.
+
+**Falsifier:** after the fix, a rebound codex row (persisted id ≠ key id)
+gets exactly one store answer in the chore's tick, the row title flows to
+the rebound thread's catalog title, and the audit's mismatch clears within
+one tick without a manual rename.
