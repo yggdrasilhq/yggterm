@@ -3,6 +3,17 @@
 This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
+
+- [11.79] the agent identity chore never re-points a row against its
+  session-named runtime key; the key's id wins and already-drifted rows heal
+  on the first tick (the wedged agy attach-wait, fixed).
+- [11.78] the handover veil wording follows the facts — same-version
+  handovers say "Sessions settling", never "Daemon updating"; a staged
+  install registry older than the running binary no longer reads as a
+  pending update.
+- [11.77] filed: the same-version rotation cascade (five daemon generations
+  in an hour with no deploy) and [11.80] the post-succession
+  declare-registry emptiness — both OPEN with evidence.
 - **Ghost rows can finally be swept — and the instrument says which rows are ghosts.** Every deploy re-restored a host's stored row set, so rows whose CLI process died long ago kept re-appearing in the sidebar as birth-named empty frames (measured: a host advertising 32 agent rows while ~4 real CLIs ran). `server rows live` now answers a per-row `holder` verdict from a process scan of the owning host — deliberately ignoring yggterm's own failed-restore wrappers, which is how a corpse read as alive before — and `server rows despawn <key>` closes the row on whichever host its key names and vetoes its re-import, so the next rotation cannot bring it back.
 - **A ghost row can finally be evicted: `yggterm server rows despawn <session-key>`.** Rows whose CLI processes are long dead kept re-appearing in the sidebar after every deploy — plain close was never enough to keep a corpse down. Despawn removes the persisted live record AND tombstones the row's identity (the same memory that stops a peer daemon re-offering a closed row), so the corpse stops re-advertising across rotations. It refuses by name while a live runtime still holds the row — killing a working row remains close's job, and despawn never takes it.
 - **An OpenCode row finally wears the session its TUI is actually running.** The identity rebind machinery was gated on a CLI holding its session FILE open, but OpenCode declares no such marker, so its rows froze at the yggterm birth uuid forever: the store-title lookup ran by an id opencode has never heard of and answered nothing, and the metadata panel showed a uuid where a `ses_…` id belongs. A CLI can now declare identity-by-argv (measured: `opencode2 --auto --session ses_…`), the same process-tree walk reads the command line under the marker walk's ambiguity laws — the flag matches as a whole token, a flag-shaped value names nothing, two different ids stay silent — and the persistence chore moves the row, so the real id flows to the store title, the metadata stamp and the SSOT audit. The boundary stays honest: an in-TUI `/sessions` switch moves neither the argv nor (measured) the store, so a row follows a switch at its next re-resume.

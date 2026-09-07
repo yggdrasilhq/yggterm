@@ -2179,11 +2179,28 @@ fn client_close_should_preserve_for_update(
     staged_version: Option<&str>,
     running_version: &str,
 ) -> bool {
-    update_restart_state_written
-        || staged_version
-            .map(str::trim)
-            .filter(|version| !version.is_empty())
-            .is_some_and(|version| version != running_version)
+    if update_restart_state_written {
+        return true;
+    }
+    staged_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .is_some_and(|version| {
+            // [11.78] A staged registry entry OLDER than the running binary is
+            // not a pending update; it is a stale install root still naming the
+            // version it served months ago (measured live 2026-09-07: the
+            // direct-install root held 2.9.48 while the fleet build ran
+            // 3.2.76, and every client close read as "preserve for update").
+            // A staged version is an update only when it is NEWER than what
+            // is running; unparsable strings keep the conservative reading.
+            match (
+                crate::attach_map::parse_version_triple(version),
+                crate::attach_map::parse_version_triple(running_version),
+            ) {
+                (Some(staged), Some(running)) => staged > running,
+                _ => version != running_version,
+            }
+        })
 }
 
 fn owner_endpoint_label(endpoint: &ServerEndpoint) -> String {
@@ -15490,6 +15507,16 @@ fn normalize_cwd_for_identity_match(cwd: &str) -> String {
 /// The alias arm accepts BOTH the row's current id and its PATH-carried
 /// birth id (`target.birth_id`), so a row a previous poll froze on a wrong
 /// or re-birthed id can repair instead of being wrong forever.
+/// The session id embedded in a session-named runtime key, when the key's
+/// scheme names sessions rather than rows. `remote-agy://dev/<uuid>` yields
+/// `<uuid>`; row-named schemes (opencode-runtime://<row-uuid>) yield None so
+/// the [11.73] rebind arms stay untouched by the [11.79] guard.
+fn session_named_runtime_key_id(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("remote-agy://")?;
+    let id = rest.rsplit('/').next()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 fn match_agent_identities_to_targets(
     group: &[crate::RemoteAgentIdentityPollTarget],
     identities: &[crate::LocalAgentCliIdentity],
@@ -15506,6 +15533,39 @@ fn match_agent_identities_to_targets(
     let mut claimed: HashSet<(String, String)> = HashSet::new();
     let mut rebinds = Vec::new();
     for target in group {
+        // ⛔ [11.79] THE PATH-CARRIED ID IS THE LIVE TRUTH. A session-named
+        // runtime key (`remote-agy://dev/<id>`) embeds the id the LIVE runtime
+        // answers to — the rebind plane renames the key when the CLI mints a
+        // new session. A store alias (or the record itself) that disagrees
+        // with it is the STALE side of the drift: rebinding onto it
+        // resurrects a dead birth id, the next resume composes that id, the
+        // live writer becomes invisible to every consumer, and the row wedges
+        // in an attach-wait that can never match (measured live 2026-09-07
+        // 15:40-15:53: the agy row's key carried the live conversation
+        // 7f56c798 while this chore re-pointed its record onto the dead birth
+        // id 0a1f852d; the GUI restart then resumed the dead id, the owning
+        // daemon answered "already running" with the row's OWN live holder,
+        // and the wait could never end). The key wins; the record re-points.
+        if target.kind == SessionKind::Antigravity
+            && let Some(key_id) = session_named_runtime_key_id(&target.key)
+            && key_id != target.current_id
+        {
+            let kind_slug = yggterm_core::agent_cli::session_kind_label(target.kind);
+            claimed.insert((kind_slug.to_string(), key_id.clone()));
+            rebinds.push((
+                target.key.clone(),
+                target.kind,
+                crate::LocalAgentCliIdentity {
+                    kind: kind_slug.to_string(),
+                    session_id: key_id,
+                    cwd: String::new(),
+                    storage_path: String::new(),
+                    birth_session_id: target.birth_id.clone(),
+                },
+                "row_key_repoint",
+            ));
+            continue;
+        }
         let kind_slug = yggterm_core::agent_cli::session_kind_label(target.kind);
         // Exact owner-reported alias first — from the row's current id when it
         // is still the synthesized birth, else from the path-carried birth id
@@ -15543,8 +15603,17 @@ fn match_agent_identities_to_targets(
         let Some((identity, arm)) = identity else {
             continue;
         };
+        let mut identity = identity.clone();
+        // [11.79] the alias path too: an alias arm that lands the row on an id
+        // the session-named key contradicts is the stale side of the drift.
+        if target.kind == SessionKind::Antigravity
+            && let Some(key_id) = session_named_runtime_key_id(&target.key)
+            && key_id != identity.session_id
+        {
+            identity.session_id = key_id;
+        }
         claimed.insert((identity.kind.clone(), identity.session_id.clone()));
-        rebinds.push((target.key.clone(), target.kind, identity.clone(), arm));
+        rebinds.push((target.key.clone(), target.kind, identity, arm));
     }
     rebinds
 }
@@ -36098,6 +36167,49 @@ mod tests {
         assert!(!super::client_close_should_preserve_for_update(
             false, None, "2.8.87"
         ));
+    }
+
+    #[test]
+    fn a_staged_registry_older_than_running_is_not_a_pending_update() {
+        // [11.78] the stale direct-install root (2.9.48) must not read as a
+        // pending update while the fleet build runs 3.2.76.
+        assert!(!super::client_close_should_preserve_for_update(
+            false,
+            Some("2.9.48"),
+            "3.2.76",
+        ));
+        assert!(super::client_close_should_preserve_for_update(
+            false,
+            Some("3.2.77"),
+            "3.2.76",
+        ));
+        assert!(!super::client_close_should_preserve_for_update(
+            false,
+            Some("3.2.76"),
+            "3.2.76",
+        ));
+        // Unparsable staged strings keep the conservative not-equal reading.
+        assert!(super::client_close_should_preserve_for_update(
+            false,
+            Some("beta-nine"),
+            "3.2.76",
+        ));
+    }
+
+    #[test]
+    fn the_row_key_repoint_helper_reads_session_named_keys_only() {
+        // [11.79] session-named keys expose the live id; row-named schemes
+        // (opencode-runtime://<row-uuid>) must stay None so [11.73] rebinds
+        // are never fenced by this guard.
+        assert_eq!(
+            super::session_named_runtime_key_id(
+                "remote-agy://dev/7f56c798-f960-4b1f-b095-a184a85f63b6"
+            )
+            .as_deref(),
+            Some("7f56c798-f960-4b1f-b095-a184a85f63b6")
+        );
+        assert_eq!(super::session_named_runtime_key_id("opencode-runtime://8a59fba6"), None);
+        assert_eq!(super::session_named_runtime_key_id("local://2b3f938b"), None);
     }
 
     #[test]

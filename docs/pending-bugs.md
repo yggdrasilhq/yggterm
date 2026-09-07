@@ -27222,6 +27222,48 @@ which must answer `None` ("no composer here"), never "draft". The same
 ambiguity probably affects every CLI whose history rendering reuses its
 composer marker.
 
+## ⛔ [11.68] THE PRESERVED-OWNER REGISTRY ONLY CLEANS ITSELF WHEN SOMEBODY READS IT — ORPHANED HOLDER ENTRIES PERSIST ON A QUIET HOST (found by the first `server map` run, 2026-09-06)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Owner:** the hot-restart/preserved-owner lane
+
+Measured on the build host 2026-09-06 ~21:05, by the first live run of the
+new `server map` verb: two entries in the hot-update terminal owners file
+whose holder pid (an old daemon generation) had been dead for 12h+ were
+still sitting in the registry — the map read them as `orphaned holder: pid
+gone for 12h34m, nobody can adopt this runtime`. The load-time prune
+(`PreservedTerminalOwnerRegistry::load`) removes exactly this shape — a
+dead-pid entry older than the 5-minute recent window — but it only runs WHEN
+SOMETHING CALLS `load()`. On a host with no hot-restart activity, nothing
+does: the registry is write-pruned, never sweep-pruned, so an orphan's
+persistence is a function of how quiet the host is, not of how dead the
+entry is. The daemon serving at read time was born 22 minutes earlier and
+had not yet touched the registry.
+
+Counter-hypothesis checked: the entries were not kept alive by re-writes —
+their `created_at_ms` sat ~12h back, matching the pid death window.
+
+**Why it matters:** the registry is the adopter's map of what is preserved.
+Stale entries make every reader re-derive "is this real?" by hand — the same
+tax the socket graveyard ([11.61]) collected, in a third registry. The
+prune's threshold already encodes the decision (5 min); the TRIGGER is what
+is wrong.
+
+**Fix shape (suggestion, owner to rule):** prune on a cadence the daemon
+already runs (the socket sweep's round, or a periodic task), not only at
+load. A read-only instrument must stay read-only — the cleanup belongs to
+the owner lane, not to whoever looks.
+
+**Addendum (2026-09-07, restored verbatim from 3260b0b49^ by the
+phantom-update lane):** the docs commit 3260b0b49 deleted this record a
+second time; the standing id-audit law caught it again. Live proof DID land
+2026-09-06 evening: the dedicated owner-registry-prune thread ships and the
+fleet-convergence sweep verified it on both hosts (see the daemon-handover
+family record). Label hygiene: commit 8ed3757f6 ("the honest veil") reused
+this id in its message — the honest veil's own record is [11.78], filed when
+its wording was made to follow the facts.
+
 ## ⛔ [11.69] A BEQUEATHED PREDECESSOR WHOSE ROWS ARE ALL NON-RESUMABLE NEVER RETIRES — EVERY DEPLOY MINTS ANOTHER FOREVER-DAEMON (diagnosed live 2026-09-06 with `server map` + the kernel bind table)
 
 **Status:** OPEN
@@ -27574,7 +27616,7 @@ ClaudeCode row), let a deploy rotate that daemon — the row must NOT come
 back (tombstone veto + removed record). A despawn aimed at a live row must
 answer the refusal.
 
-## ⛔ [11.74] UUID-KEYED CODEX ROWS HAD NO WORKING RESUME IDENTITY — A RE-SPAWN COMPOSED `codex resume <ROW UUID>` THAT CODEX REFUSES, STRANDING THE ROW (found diagnosing a live -32600 dead-end, 2026-09-06)
+## ⛔ [11.76] UUID-KEYED CODEX ROWS HAD NO WORKING RESUME IDENTITY — A RE-SPAWN COMPOSED `codex resume <ROW UUID>` THAT CODEX REFUSES, STRANDING THE ROW (found diagnosing a live -32600 dead-end, 2026-09-06)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
@@ -27654,3 +27696,143 @@ prefill guard also rejects the daemon's `session rooted at ...` summary so a
 restore race cannot write sidebar copy into a live TUI composer. Unit guards
 cover the persisted-id re-point, successor restore, and prefill rejection;
 live daemon/GUI proof remains owed.
+
+## ⛔ [11.77] THE SAME-VERSION ROTATION CASCADE: FIVE DAEMON GENERATIONS IN ONE HOUR WITH NOT ONE DEPLOY — THE VEIL READ "DAEMON UPDATING" THE WHOLE TIME (measured live on the GUI host, 2026-09-07 15:19-16:20)
+
+**Status:** OPEN
+
+**Owner:** the daemon-handoff/drain lane (the disk-binary detector and the
+same-version hysteresis are that lane's instruments).
+
+The owner was sitting in an agy row when "suddenly Daemon started updating".
+No build had shipped since 12:19 (`install-state.json` mtime, build
+1788763776) — the owner checked. Measured generation chain, all same version
+3.2.76, all same build id: 729994 (born 02:44, exe deleted at the 12:19
+deploy, STILL ALIVE at 16:20 holding preserved rows) → 1385346 (born
+15:19:54) → 1413545 (born 15:49:54 as a hot-restart child of 1385346) →
+1443363 (born 16:19:55, `hot_restart_same_version_cold_swap_armed {reason:
+"disk_binary_replaced_self_retire"}`). Each succession left the predecessor
+alive as a preserved owner; rows migrate only one-by-one when opened
+(`preserved_owner_runtime_removed {reason: saved_session_mismatch}`), so
+`preserved_terminal_owner_count` stays > 0 for hours and the fleet never
+converges.
+
+Two open questions, evidence attached:
+
+1. **What differs?** The byte-compare detector
+   (`disk_replacement_differs_from_running_bytes`) fired `disk_binary_replaced`
+   with no deploy on disk. Candidate resolution
+   (`disk_replace_handoff_candidates`) compares against deploy-backup graves
+   (`*.old.*, *.rollback*, *.bak-*` — the GUI host's `~/.local/bin` holds a
+   dozen, some 3.0.x-era) and against the deleted-exe path. A same-version
+   DIFFERENT-build copy in any candidate position re-arms the trigger in
+   every running daemon, every ~25-30 min, forever.
+2. **Same-version hysteresis gap.** `hot_restart_same_version_cold_swap_armed`
+   treats same-version different-bytes as a convergence unit (relay-gate §10:
+   the unit is the BUILD). That is correct for CI's newer build of the same
+   version — and a phantom when the differing bytes are an OLD backup grave.
+   Fix shape: the bounded `--version` probe already exists
+   (`disk_replacement_version`); extend the hysteresis to refuse a cold swap
+   whose replacement probes OLDER than the running version, and drop
+   non-canonical graves from the candidate list (a backup never hands off).
+
+Falsifier: quiet host + the graveyard present + one daemon → expect ZERO
+`hot_restart_same_version_cold_swap_armed` events over an hour.
+
+## ⛔ [11.78] THE UPDATE PLANE CLAIMED AN UPDATE THAT WAS NOT HAPPENING — TWICE: THE VEIL SAID "DAEMON UPDATING" ON SAME-VERSION HANDOVERS, AND A STALE 2.9.48 INSTALL REGISTRY FED THE PRESERVE-FOR-UPDATE GATE (measured live 2026-09-07, fixed same session)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Owner:** the cli-integration loop (both arms fixed on
+lane/cli/phantom-update-web).
+
+Arm 1 — the wording. The honest veil ([11.68]'s successor, commit
+8ed3757f6) computed its label from `runtime_status_handoff_active`, which is
+`preserved_terminal_owner_count > 0` — a STEADY STATE, so the else-branch
+(the honest "served by an older daemon" text) was unreachable and every
+suspension said "Daemon updating". With [11.77]'s cascade running, the owner
+read "Daemon updating" for an hour with no build. Fix: the label is computed
+from the version FACT — "Daemon updating" only when the serving daemon's
+version differs from the client's; a same-version handover says "Sessions
+settling" and names the preserved count.
+
+Arm 2 — the staged registry. `staged_direct_install_version()` reads
+`direct_install_root()/install-state.json` — on the GUI host that is
+`~/.local/share/yggterm/direct/install-state.json`, UNCHANGED SINCE 2.9.48
+(June), while the fleet registry lives at `~/.yggterm/install-state.json`
+(3.2.76). `client_close_should_preserve_for_update` compared the stale
+2.9.48 ≠ running 3.2.76 and engaged the update plane on every client close
+(measured: `client_close_preserved_for_update {running_version: "3.2.76",
+staged_version: "2.9.48"}` at 15:52:57). Fix: a staged version is an update
+only when it parses NEWER than the running version; older or equal reads as
+no update; unparsable strings keep the conservative not-equal reading.
+
+Falsifier: on a host with the stale root present, open+close a client during
+a same-version handover → expect the "Sessions settling" wording, zero
+`client_close_preserved_for_update` events naming an older staged version.
+
+## ⛔ [11.79] THE IDENTITY CHORE RE-POINTED A ROW ONTO ITS DEAD BIRTH ID AGAINST THE ROW'S OWN RENAMED KEY — THE AGY ROW WEDGED IN AN ATTACH-WAIT THAT COULD NEVER MATCH (measured live 2026-09-07 15:40-15:53, fixed same session)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Owner:** the cli-integration loop (the identity poll is
+lane/cli/phantom-update-web's arm).
+
+The row's key had been renamed onto the live runtime
+(`remote-agy://dev/7f56c798-…`, the marker
+`LC_YGGTERM_SESSION_ID=agy-runtime://7f56c798-…`, the holder's argv
+`--conversation 7f56c798-…` — three sources agreeing). The identity poll's
+`birth_key_alias` arm looked the row's BIRTH id up in the remote store,
+found the dead birth session `0a1f852d-…` still listed there, and
+"repaired" the record onto it
+(`remote_agent_runtime_identity_refreshed {session_id: "0a1f852d-…"}`,
+15:40:04). The GUI restart's restore then composed the resume from the
+record: `server remote resume-agy 0a1f852d-… --require-existing`. The
+owning daemon found the row's OWN live holder (pid 2957600) via the
+registry — matched by ROW, not by session — answered external-active, and
+waited "to attach" to an id that matches nothing; each ~2-min ensure cycle
+spawned a fresh bridge, each bridge printed its own banner line (the
+in-place reprint law only works within one bridge), so the viewport
+accumulated identical "Waiting 73s so far." lines. The [11.75] root
+(persisted id vs live runtime), agy flavor, with the chore as the drift
+SOURCE this time.
+
+Fix: the path-carried id of a session-named runtime key is the live truth.
+The chore never re-binds an Antigravity row onto an id its key contradicts;
+when the key and the record disagree, the record re-points TO the key's id
+(`row_key_repoint` arm) — the same move [11.75] makes for codex rollouts,
+and it heals the already-corrupted rows on the first tick after deploy.
+Row-named schemes (opencode-runtime://<row-uuid>) are explicitly out of
+scope so the [11.73] rebind arms stay untouched.
+
+Falsifier: the owner's agy row (key remote-agy://dev/7f56c798-…) after
+deploy + first chore tick: the record's session id reads 7f56c798-…, the
+next open attaches to pid 2957600 without the banner.
+
+## ⛔ [11.80] EVERY DAEMON SUCCESSION EMPTIES THE APP-DECLARE REGISTRY — 558 `daemon_declare_absent` EVENTS IN 40 MINUTES, ROWS LOSE THEIR APP SIDEBARS (measured live 2026-09-07 15:19-16:20)
+
+**Status:** OPEN
+
+**Owner:** the declare-plane lane (the [11.60] provenance gate and the
+[11.58] web-corpse reload are that plane's arms).
+
+After each of the five successions, the UI's declare polls for ALL rows —
+dev codex/opencode/cc, remote agy, local shells — answered absent; the
+victim the owner saw was the ychrome row that lost its Vault and settings
+sidebars (its Session Metadata panel empty with them). The declare registry
+is in-memory per daemon; apps declare on connect, the apps stay connected to
+the PREDECESSOR's socket across a succession, and the successor's registry
+starts pruned-empty — the exact shape [11.58] fixed for WEB surfaces
+(corpse-reload arm), never generalized to app declares. Until an app
+re-connects, every poll is a named absence.
+
+Fix shape: the successor inherits the predecessor's declare registry at
+adoption (the same bequest that carries PTYs), or the adoption path pings
+each live app endpoint to re-declare; a named absence older than N minutes
+with a live app process should escalate to the re-declare ping rather than
+re-answering absent forever.
+
+Falsifier: force a same-version cold swap with a ychrome row open → count
+`daemon_declare_absent` for its path across the succession; expect the
+registry inherited (zero absents) or one re-declare ping, not a permanent
+absent storm.
