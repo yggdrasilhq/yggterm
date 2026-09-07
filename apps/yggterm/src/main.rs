@@ -1433,6 +1433,26 @@ fn main() -> Result<()> {
     if args.len() >= 3 && args[0] == "server" && args[1] == "remove" {
         return yggterm_server::server_cli::run_server_remove_session_cli(&store, &args);
     }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "departed" {
+        // "Where did my row go?" — the departure ledger, read-only. Both
+        // binaries by the both-binaries law (server_cli.rs screen_verb_tests).
+        let limit = args
+            .windows(2)
+            .find_map(|window| (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?)
+            .unwrap_or(50);
+        return yggterm_server::run_row_departures(limit);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "live" {
+        // The metadata SSOT instrument (Issue Heading 38). Read-only.
+        let mismatches_only = args.iter().any(|arg| arg == "--mismatches-only");
+        return yggterm_server::run_rows_live(mismatches_only);
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "show" {
+        return yggterm_server::run_row_show(&args[3]);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "drafts" {
+        return yggterm_server::run_row_drafts();
+    }
     if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn" {
         // The ghost sweep ([11.74]) — reachable from BOTH binaries by the
         // both-binaries law (server_cli.rs screen_verb_tests tells why).
