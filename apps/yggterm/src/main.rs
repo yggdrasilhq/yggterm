@@ -1446,6 +1446,11 @@ fn main() -> Result<()> {
     if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn-local" {
         return yggterm_server::run_rows_despawn_local(&args[3]);
     }
+    if args.len() >= 5 && args[0] == "server" && args[1] == "rows" && args[2] == "re-point" {
+        // The identity cure verb ([11.75] addendum) — reachable from BOTH
+        // binaries by the both-binaries law.
+        return yggterm_server::run_row_re_point(&args[3], &args[4]);
+    }
     // ⛔ THE LAST THREE `server` DIVERGENCES, AND THEY WERE ACCIDENTAL TOO.
     // These three were read as deploy/relay machinery that belonged to the
     // headless CLI by design — the one real fork this surface was said to

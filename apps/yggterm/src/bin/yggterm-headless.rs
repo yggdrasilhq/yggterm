@@ -1708,6 +1708,12 @@ impl std::io::Write for LossyStderrHandle {
     if args.len() >= 3 && args[0] == "server" && args[1] == "rows" && args[2] == "drafts" {
         return yggterm_server::run_row_drafts();
     }
+    if args.len() >= 5 && args[0] == "server" && args[1] == "rows" && args[2] == "re-point" {
+        // The identity cure verb ([11.75] addendum): move a live row onto the
+        // session id the owner names. Daemon-side: the in-memory table, the
+        // persistence and the trace move together.
+        return yggterm_server::run_row_re_point(&args[3], &args[4]);
+    }
     if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn" {
         // The ghost sweep ([11.74]): close on the owning host AND veto
         // re-import, so the next rotation's restore cannot resurrect the

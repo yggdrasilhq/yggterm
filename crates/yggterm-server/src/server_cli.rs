@@ -1048,6 +1048,27 @@ mod screen_verb_tests {
     }
 
     #[test]
+    fn the_re_point_verb_is_dispatched_by_both_binaries() {
+        for (binary, source) in [
+            ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
+            (
+                "yggterm-headless",
+                include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains(r#"args[2] == "re-point""#),
+                "`server rows re-point` is not dispatched by {binary} - the \
+                 identity cure exists but nothing can reach it",
+            );
+            assert!(
+                source.contains("run_row_re_point("),
+                "{binary} matches the re-point verb without calling its handler",
+            );
+        }
+    }
+
+    #[test]
     fn the_screen_verb_is_dispatched_by_both_binaries() {
         for (binary, source) in [
             ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),

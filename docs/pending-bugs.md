@@ -27701,8 +27701,14 @@ poll arm, pure fn) is reverted; the correct identity sources stay: the row's
 recorded Rollout file when it EXISTS ([11.75] single hop), live writers
 matched BY ID (argv/marker), and the [11.74] picker arm for dead-id rows.
 The five over-claimed rows (715ed3fa/7f25f9f5/86940711/8a5749e0/ebc15020)
-need their ids rolled back to their key suffixes (or despawn per [11.74]) -
-a `server rows re-point` verb is the missing cure tool.
+need their ids rolled back to their key suffixes (or despawn per [11.74]).
+The cure tool SHIPPED with the revert lane: `server rows re-point <key>
+<new-session-id>` (wire variant RowsRePointSession; daemon-side apply, so the
+in-memory table, the persistence and the trace move together). Cure for the
+five rows, run on the GUI host:
+  yggterm server rows re-point remote-session://dev/715ed3fa-4d7e-4119-8749-cb8199424896 715ed3fa-4d7e-4119-8749-cb8199424896
+  (and the same shape for 7f25f9f5 / 86940711 / 8a5749e0 / ebc15020 - each
+  row re-pointed onto its own key-suffix uuid, its birth identity).
 
 **Falsifier FAILED live (2026-09-07 17:14, the owner's PTY read of the
 "New dev Codex" row, key remote-session://dev/d5d9f9fd-…):** the restore
