@@ -27931,3 +27931,40 @@ every succession-adjacent bug stays noisy.
 Falsifier: with per-sample witnesses landed, the next `host_panic_ui_thrash`
 incident must arrive WITH its top blocking samples attached; fixing the top
 offender must push socket_watts below the throttle threshold for a full day.
+
+
+## ⛔ [11.70] STALE OPEN ATTEMPTS COMPLETED AS "SLOW REVEALS" THE USER NEVER WAITED ON — 33 NOTIFICATION CARDS IN TWO DAYS, TOPPED BY "took 1233.0s" (2026-09-07)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Measured on the GUI host from `notifications.json` + ytrace: the tray held 79
+cards, 33 of them "Slow terminal reveal", with reported durations growing
+through the day (27.3s → 80.7s → 1233.0s). The attempts were not slow — they
+were STALE: an open-reveal attempt begun by a click stays Pending while the
+mount proceeds but the strict ready-proof (first meaningful output read by the
+client) never latches in the background; when the user finally returns to the
+row, the latch fires and the card reports the FULL wall time since the
+original click. The 1233.0s card was a row clicked at 21:35 and revisited at
+23:56. The per-attempt status re-emissions every 30-60s in ytrace are the
+attempts sitting open (one remote row stayed in-flight 19:46→22:45).
+
+The cancel machinery exists
+(`cancel_terminal_open_attempt_for_inactive_session`, with the
+host-already-live nuance that latches ready instead of destroying the proof)
+but was wired only to the bootstrap-skip branch — a click whose mount proceeds
+down any other path leaves the attempt unowned until the user returns.
+
+**Fix (`lane/trace/stale-reveal-guard`):** the slow-reveal card fires only
+while the revealed session is STILL the active terminal at ready time — a
+wait the user actually stood in. Moved-on attempts resolve exactly as before
+(reveal log entry + `reveal_ready` trace keep every number for the
+post-mortem); they just stop becoming cards. Source test: a 1233-second
+attempt on a row the user has left must not notify.
+
+**Falsifier:** click a row, switch away before its ready-proof latches, work
+elsewhere for >SLOW_REVEAL_NOTIFY_MS, return — the reveal completes with NO
+"Slow terminal reveal" card, and `ui/reveal/reveal_ready` still carries the
+full elapsed. Remaining known gap (not this fix): the switch-away itself
+still does not cancel the attempt (the bookkeeping entry lives until the
+return latch) — harmless to the user, visible in trace as long-lived
+attempts.
