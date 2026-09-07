@@ -15825,6 +15825,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
     }
     // 3. Apply under the lock: the setter refuses owner-set titles itself.
     let mut applied = 0usize;
+    let mut outcomes: Vec<serde_json::Value> = Vec::new();
     {
         let mut runtime = runtime
             .lock()
@@ -15841,9 +15842,27 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                     .get(&(ssh_target.clone(), *kind))
                     .and_then(|answers| answers.get(id).cloned())
             };
-            let Some(title) = title else { continue };
+            let Some(title) = title else {
+                continue;
+            };
+            let current = runtime
+                .server
+                .live_session_views()
+                .into_iter()
+                .find(|view| view.session_path == *path)
+                .map(|view| view.title.clone());
+            if current.as_deref() == Some(title.as_str()) {
+                continue;
+            }
             if runtime.server.set_session_title_hint(path, &title) {
                 applied += 1;
+                if outcomes.len() < 12 {
+                    outcomes.push(serde_json::json!({
+                        "path": path,
+                        "outcome": "applied",
+                        "title": title,
+                    }));
+                }
                 append_trace_event(
                     runtime.store.home_dir(),
                     "daemon",
@@ -15855,8 +15874,30 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                         "title": title,
                     }),
                 );
+            } else if outcomes.len() < 12 {
+                outcomes.push(serde_json::json!({
+                    "path": path,
+                    "outcome": "refused_explicit_or_missing",
+                    "store_title": title,
+                }));
             }
         }
+    }
+    if let Ok(home) = crate::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "daemon",
+            "persistence",
+            "row_title_follow_tick",
+            serde_json::json!({
+                "candidates": candidates.len(),
+                "applied": applied,
+                "local_answers": local_answers.len(),
+                "remote_hosts_answered": remote_answers.len(),
+                "remote_missing": remote_missing.len(),
+                "outcomes": outcomes,
+            }),
+        );
     }
     Ok(applied)
 }
@@ -24924,7 +24965,13 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // interval, the reads happen outside the runtime lock.
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
-        std::thread::spawn(move || loop {
+        std::thread::spawn(move || {
+            // The FIRST tick runs immediately: a thread whose first action is
+            // a sleep is indistinguishable from a thread that never spawned.
+            if let Err(error) = run_row_title_follow_chore(&runtime) {
+                warn!(error = %error, "daemon row title follow chore failed");
+            }
+            loop {
             std::thread::sleep(std::time::Duration::from_millis(
                 ROW_TITLE_FOLLOW_INTERVAL_MS,
             ));
@@ -24933,8 +24980,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     mark_daemon_activity(&last_activity_ms);
                 }
                 Ok(_) => {}
-                Err(error) => {
-                    warn!(error = %error, "daemon row title follow chore failed");
+                    Err(error) => {
+                        warn!(error = %error, "daemon row title follow chore failed");
+                    }
                 }
             }
         });
