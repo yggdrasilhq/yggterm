@@ -27968,3 +27968,83 @@ full elapsed. Remaining known gap (not this fix): the switch-away itself
 still does not cancel the attempt (the bookkeeping entry lives until the
 return latch) — harmless to the user, visible in trace as long-lived
 attempts.
+
+## ⛔ [11.82] THE AUDIT AND THE TITLE-FOLLOW READ "THE CLI'S WORD" THROUGH TWO DIFFERENT WIRES — A LOCALHOST ROW WORE TWO STORE TITLES AND THE AUDIT FLAGGED MISMATCHES THE FOLLOWER CAN NEVER SEE (measured live 2026-09-08 02:06-02:20 on dev, fixed same session)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The muse row `muse-runtime://9009ec01` (ssh_target "localhost") answered TWO
+different CLI store titles to two instruments minutes apart: `rows live` said
+"Wow You Dumb How You" (the remote store-title probe, whose script processes
+transcript globs BEFORE the session-index.db locator and whose chooser is
+first-match — the jsonl's Aug-24 first prompt, condensed) while the
+title-follow chore read the same store locally (session_name "amber-menkar",
+which EQUALS the row title). The audit therefore flagged a mismatch the
+follower could never see, and its own comment promises the two wires "can
+never disagree". The night run's OPEN theory — a birth/restore path stamping
+`title_is_explicit=true` on derived titles — FALSIFIED in this chase: every
+stamp site is a sanctioned human door (rename dialog, sidebar rename,
+copy-edit dialog, caller-named create); the chore's `refused_explicit_or_missing`
+outcomes were equal-title no-ops mislabelled, because
+`set_session_title_hint` answers false for a refusal AND an equal no-op.
+
+**Fix (`lane/cli/audit-loopback`, both tips in main):**
+`agent_cli::store_title_read_is_loopback` is THE one spelling both wires
+classify rows through; `rows live` routes loopback rows to the local reader;
+the muse remote script reads `.db` locators before the globs; the chore's
+false-return outcome splits `refused_owner_set` vs `no_change_or_missing`.
+Lock tests pin the predicate into both call sites and the script order.
+
+**Live:** dev audit 2→1 mismatches (02:48, deployed client c73911bd);
+the GUI host 0. **Falsifier owed:** the chore's new outcome labels on a live
+tick (blocked by [11.84]; the GUI host's daemon-side fix needs a rotation).
+
+## ⛔ [11.83] `ROWS DESPAWN` HOPPED TO THE RUNTIME HOST AND ANSWERED despawned:true WHILE THE OWNING DAEMON NEVER SAW A TOMBSTONE — OWNER-DECIDED DESPAWNS RESURRECTED ON THE NEXT ROTATION (measured live 2026-09-08 02:07-02:55, fixed same session)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The addendum-5 night-run despawns (715ed3fa / 8a5749e0 / ebc15020, "veto
+tombstones via ssh to dev") landed their tombstones on dev while the rows
+lived on the GUI host's daemon; all three were back in the sidebar by 02:07.
+The verb resolved its ssh hop from the key's machine prefix — which names the
+RUNTIME host, not the host whose daemon owns the row record and the restore
+decision. `removed-rows.json` on dev carried one of the three; the GUI
+host's carried none.
+
+**Fix (`lane/cli/audit-loopback` tip 2, main 87bd4b03):**
+`run_rows_despawn` consults the reachable local daemons FIRST — a key any of
+them holds is despawned locally (record removal + tombstone on the owner);
+the ssh hop is the fallback and its success answer now says exactly that.
+Lock test pins the consult into the verb body.
+
+**Live:** the three codex ghosts re-despawned on the owning host at 02:53
+(record removed + tombstoned ×3), together with the three find-3 opencode
+twins (owner-decided); all six stayed down through the 02:54 deploy window.
+**Falsifier owed:** they must still be down after the GUI host's next full
+daemon rotation.
+
+## ⛔ [11.84] SAME-VERSION DEPLOYS NEVER ROTATE THE DAEMON, THE OLD GENERATION KEEPS THE SOCKET, AND THE NEW GENERATION RUNS UNBOUND — THE [11.77] FLOOR WITH THE VERSION-POLL EXIT THAT MAKES IT PERMANENT (measured live 2026-09-08 02:45-02:56 on the GUI host and dev)
+
+**Status:** OPEN
+
+The 02:45:59 deploy (sha c73911bd) shipped WITHOUT a version bump — the
+binary stayed 3.2.82. On the GUI host the succession spawned a new daemon
+(born 02:45:31, new bytes) that NEVER BOUND: the old daemon (born 01:44:12,
+its exe deleted under it) still owned server-3-2-82.sock at 02:56 and
+answered every verb. The fleet therefore runs its CLIENT-side fixes
+immediately while every DAEMON-side fix waits behind a rotation the
+version-poll will never fire for a version that did not move. On dev the
+succession DID converge (the new daemon owns the socket) — but that daemon
+emitted no `row_title_follow_tick` in its first 12+ minutes (the chore's
+first tick is immediate by design; no panic in any log; cause unattributed),
+while old-generation daemons tick every 2 min on the same fleet.
+
+**Fix shape:** the retire trigger needs a same-version-different-bytes arm
+(content hash, not version string — the inverse of the same-bytes skip), and
+the silent first tick wants its [11.80 diagnosability] line BEFORE the
+runtime lock so a wedged lock is distinguishable from a dead thread.
+
+**Also:** the [11.80] durable falsifier (last_known_app_declares survives a
+rotation non-empty) stays ARMED — the GUI host's 3 entries (02:12) were
+written under the daemon that still owns the socket, so no rotation has
+tested them yet.
