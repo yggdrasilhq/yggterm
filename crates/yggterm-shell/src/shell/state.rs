@@ -61613,11 +61613,26 @@ fn app_control_created_session_path(
     snapshot: &ServerUiSnapshot,
     message: Option<&str>,
 ) -> Option<String> {
-    snapshot
-        .active_session_path
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-        .map(ToOwned::to_owned)
+    // ⭐ THE "STARTED <KEY>" MESSAGE NAMES THE CREATED ROW — trust it BEFORE
+    // the snapshot's active path. Under `--no-activate` (the agent-spawn
+    // posture) the snapshot's active path is whatever row the OWNER was
+    // reading, and preferring it handed the created row's explicit birth
+    // title to that unrelated row: measured 2026-09-08, a
+    // `terminal new --title X --no-activate` renamed the owner's active
+    // row and stamped the rename beyond the reach of every derived writer
+    // (the title-follow, the CLI's own title flow). The active path stays
+    // as the legacy fallback for creates whose message predates the
+    // "started" spelling — an activated create makes the two agree anyway.
+    message
+        .and_then(|value| value.trim().strip_prefix("started "))
+        .and_then(public_live_session_path_from_started_key)
+        .or_else(|| {
+            snapshot
+                .active_session_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
         .or_else(|| {
             snapshot
                 .active_session
@@ -61625,11 +61640,6 @@ fn app_control_created_session_path(
                 .map(|session| session.session_path.trim())
                 .filter(|path| !path.is_empty())
                 .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            message
-                .and_then(|value| value.trim().strip_prefix("started "))
-                .and_then(public_live_session_path_from_started_key)
         })
 }
 fn render_snapshot_session_view_contract_violations(

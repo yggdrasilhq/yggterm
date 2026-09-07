@@ -9096,9 +9096,16 @@ JSON.stringify({{
         );
     }
     #[test]
-    fn app_control_created_session_path_prefers_snapshot_path() {
+    fn a_no_activate_create_resolves_the_created_row_not_the_active_one() {
+        // Measured 2026-09-08: under `--no-activate` the snapshot's active path
+        // is the row the OWNER was reading — and the old snapshot-first order
+        // handed the created row's explicit birth title to that unrelated row
+        // (an owner's active row was renamed and stamped explicit by a probe
+        // spawn). The "started <key>" message names the row that was actually
+        // created and must win; the active path is only the legacy fallback
+        // for creates whose reply carries no started message.
         let snapshot = ServerUiSnapshot {
-            active_session_path: Some("codex://from-snapshot".to_string()),
+            active_session_path: Some("local://owner-active-row".to_string()),
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: Vec::new(),
@@ -9110,7 +9117,11 @@ JSON.stringify({{
         assert_eq!(
             app_control_created_session_path(&snapshot, Some("started codex::from-message"))
                 .as_deref(),
-            Some("codex://from-snapshot")
+            Some("local://from-message")
+        );
+        assert_eq!(
+            app_control_created_session_path(&snapshot, None).as_deref(),
+            Some("local://owner-active-row")
         );
     }
     #[test]
