@@ -3884,7 +3884,7 @@ fn DocumentSurfaceBody(
                                     div {
                                         key: "{widget_key}",
                                         "data-document-markdown": "{id}",
-                                        style: "padding:16px 28px 40px 28px; max-width:980px; width:100%; margin:0 auto; box-sizing:border-box;",
+                                        style: "padding:16px 28px 40px 28px; max-width:880px; width:100%; margin:0 auto; box-sizing:border-box;",
                                         if live_from.is_empty() {
                                             // The pure READER: no sibling editor, so
                                             // blocks are click-to-edit in place
@@ -4099,7 +4099,7 @@ fn DocumentSurfaceBody(
                                                 "data-document-row": "{id}",
                                                 "data-selected": if *selected { "true" } else { "false" },
                                                 style: format!(
-                                                    "display:flex; align-items:center; gap:12px; margin:2px 20px; padding:8px 12px;                                                  border-radius:8px; background:{}; color:{}; max-width:860px; cursor:pointer;                                                  border:1px solid {}; transition: background 120ms, border-color 120ms;",
+                                                    "display:flex; align-items:center; gap:16px; margin:2px auto; padding:10px 28px;                                                  border-radius:8px; background:{}; color:{}; max-width:824px; width:100%; box-sizing:border-box; cursor:pointer;                                                  border:1px solid {}; transition: background 120ms, border-color 120ms;",
                                                     if *selected { format!("color-mix(in srgb, {} 14%, transparent)", doc.accent) } else { "transparent".to_string() },
                                                     doc.fg,
                                                     if *selected { format!("color-mix(in srgb, {} 22%, transparent)", doc.accent) } else { "transparent".to_string() },
@@ -4143,18 +4143,20 @@ fn DocumentSurfaceBody(
                                                             }
                                                         }
                                                     } else {
-                                                        rsx! { span { style: "width:32px; height:32px; flex:0 0 32px;" } }
+                                                        // Editorial list: an absent icon reserves NO slot
+                                                        // (notebook 15) — titles start on the row's text edge.
+                                                        rsx! {}
                                                     }
                                                 }
                                                 div {
-                                                    style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                                    style: "display:flex; flex-direction:column; gap:4px; min-width:0; flex:1 1 auto;",
                                                     div {
-                                                        style: "font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.2;",
+                                                        style: "font-size:16px; font-weight:650; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; word-break:break-word;",
                                                         "{title}"
                                                     }
                                                     if !subtitle.is_empty() {
                                                         div {
-                                                            style: format!("font-size:11.5px; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", doc.muted),
+                                                            style: format!("font-size:13.5px; line-height:1.45; color:{}; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; word-break:break-word;", doc.muted),
                                                             "{subtitle}"
                                                         }
                                                     }

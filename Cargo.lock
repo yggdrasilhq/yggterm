@@ -1634,7 +1634,7 @@ dependencies = [
 [[package]]
 name = "emd-renderer"
 version = "0.14.4"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.4#877f6ec6616364d44f00685f3d66428d6c048e68"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.5#5649380facf296cccc6086d74ccfeded2074ac3c"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -7362,7 +7362,7 @@ dependencies = [
 [[package]]
 name = "yggui"
 version = "0.14.4"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.4#877f6ec6616364d44f00685f3d66428d6c048e68"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.5#5649380facf296cccc6086d74ccfeded2074ac3c"
 dependencies = [
  "anyhow",
  "dioxus",
@@ -7371,14 +7371,23 @@ dependencies = [
  "serde_json",
  "tracing",
  "yggui-contract",
+ "yggui-icons",
 ]
 
 [[package]]
 name = "yggui-contract"
 version = "0.14.4"
-source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.4#877f6ec6616364d44f00685f3d66428d6c048e68"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.5#5649380facf296cccc6086d74ccfeded2074ac3c"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "yggui-icons"
+version = "0.14.4"
+source = "git+https://github.com/yggdrasilhq/libyggterm?tag=v0.14.5#5649380facf296cccc6086d74ccfeded2074ac3c"
+dependencies = [
+ "dioxus",
 ]
 
 [[package]]
