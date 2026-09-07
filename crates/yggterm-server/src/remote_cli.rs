@@ -80,6 +80,9 @@ pub enum RemoteServerCommand {
     /// live remote-Codex rows that still carry a synthesized UUIDv4 id
     /// (`[[finding-uuidv4-codex-session-drift]]` Stage 2).
     LocalCodexIdentities,
+    CodexChaseId {
+        dead_id: String,
+    },
     /// Append a Claude Code `custom-title` (user rename) to a session's JSONL
     /// on this (remote) machine — the SSH-invoked half of yggterm's CC rename
     /// write-back. See memory finding-cc-title-storage-custom-title.
@@ -272,6 +275,9 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "apps" if args.len() == 3 => RemoteServerCommand::Apps,
         "cli-presence" if args.len() == 3 => RemoteServerCommand::CliPresence,
         "local-codex-identities" if args.len() == 3 => RemoteServerCommand::LocalCodexIdentities,
+        "codex-chase-id" if args.len() == 4 => RemoteServerCommand::CodexChaseId {
+            dead_id: args[3].clone(),
+        },
         "cc-rename" if args.len() == 5 => RemoteServerCommand::CcRename {
             session_id: args[3].clone(),
             title: args[4].clone(),
@@ -385,6 +391,7 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::Apps => run_remote_apps(),
         RemoteServerCommand::CliPresence => run_remote_cli_presence(),
         RemoteServerCommand::LocalCodexIdentities => run_remote_local_codex_identities(),
+        RemoteServerCommand::CodexChaseId { dead_id } => crate::run_remote_codex_id_chase(&dead_id),
         RemoteServerCommand::CcRename { session_id, title } => {
             run_remote_cc_rename(&session_id, &title)
         }

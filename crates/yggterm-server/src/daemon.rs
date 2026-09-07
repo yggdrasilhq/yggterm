@@ -15696,6 +15696,22 @@ fn run_remote_agent_identity_poll_chore(
             .or_default()
             .push(target);
     }
+    // [11.75] addendum: snapshot the Codex targets BEFORE the consuming loop
+    // so the chain-chase arm (post-alias-join) knows which rows still carry a
+    // dead id.
+    let codex_dead: Vec<(String, String, Option<String>, String)> = machines
+        .values()
+        .flat_map(|group| group.iter())
+        .filter(|target| target.kind == SessionKind::Codex && !target.current_id.trim().is_empty())
+        .map(|target| {
+            (
+                target.key.clone(),
+                target.ssh_target.clone(),
+                target.ssh_prefix.clone(),
+                target.current_id.trim().to_string(),
+            )
+        })
+        .collect();
 
     let mut rebinds: Vec<(String, SessionKind, crate::LocalAgentCliIdentity, &'static str)> =
         Vec::new();
@@ -15852,6 +15868,33 @@ fn run_remote_agent_identity_poll_chore(
         }
     }
 
+    // ⛔ [11.75] addendum, the CHAIN arm: a Codex row whose saved id is DEAD
+    // on the owning host got no alias join (the live-writer probe answers
+    // only for RUNNING processes) — chase the rebind chain on the owning
+    // host and re-bind onto the chased id. Owner PTY falsifier 2026-09-07
+    // 17:14: d5d9f9fd → 01a0709f → 01a07a88, three hops of /resume rebinds,
+    // every consumer still reading the birth id.
+    for (key, ssh_target, ssh_prefix, dead_id) in &codex_dead {
+        if rebinds.iter().any(|(bound, ..)| bound == key) {
+            continue;
+        }
+        if let Some((chased_id, chased_path)) =
+            crate::poll_remote_codex_id_chase(ssh_target, ssh_prefix.as_deref(), dead_id)
+        {
+            rebinds.push((
+                key.clone(),
+                SessionKind::Codex,
+                crate::LocalAgentCliIdentity {
+                    kind: "codex".to_string(),
+                    session_id: chased_id,
+                    cwd: String::new(),
+                    storage_path: chased_path,
+                    birth_session_id: None,
+                },
+                "chain_chase",
+            ));
+        }
+    }
     let rebound_keys = rebinds
         .iter()
         .map(|(key, ..)| key.as_str())
