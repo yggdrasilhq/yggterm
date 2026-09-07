@@ -22076,38 +22076,6 @@ pub(crate) fn poll_remote_local_codex_identities(
     Ok(identities)
 }
 
-/// Chase a dead Codex id on the OWNING host over ssh — the remote half of
-/// [`run_remote_codex_id_chase`]. `None` = the chase found nothing (or the
-/// remote install predates the verb; the poll degrades to today's behavior).
-pub(crate) fn poll_remote_codex_id_chase(
-    ssh_target: &str,
-    ssh_prefix: Option<&str>,
-    dead_id: &str,
-) -> Option<(String, String)> {
-    let output = run_remote_yggterm_command(
-        ssh_target,
-        ssh_prefix,
-        &["server", "remote", "codex-chase-id", dead_id],
-        None,
-    )
-    .ok()?;
-    let line = output
-        .lines()
-        .map(str::trim)
-        .find(|candidate| candidate.starts_with('{'))?;
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let chased = value.get("session_id")?.as_str()?.to_string();
-    if chased.is_empty() || chased == dead_id {
-        return None;
-    }
-    let storage_path = value
-        .get("storage_path")
-        .and_then(|path| path.as_str())
-        .unwrap_or_default()
-        .to_string();
-    Some((chased, storage_path))
-}
-
 /// The cwd and title of ONE local Claude Code session, read from its own
 /// transcript. Returns `None` when the file is unreadable or carries no
 /// identity, so the caller can fall back rather than seat a wrong cwd.
@@ -32383,45 +32351,6 @@ pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
-    Ok(())
-}
-
-/// `yggterm server remote codex-chase-id <dead-id>` — runs on the OWNING
-/// host. Chases a dead persisted Codex thread id through the rebind chain
-/// (rollout contents, newest first, live-writer precedence from the open
-/// /proc fds) and prints ONE JSON line `{"session_id": ..., "storage_path":
-/// ...}` — `{}` when the chase finds nothing. The GUI host's identity poll
-/// calls this over ssh when a Codex row's saved id is dead on this machine
-/// ([11.75] addendum: the rebind is a CHAIN, one rollout per /resume).
-#[cfg(target_os = "linux")]
-pub fn run_remote_codex_id_chase(dead_id: &str) -> anyhow::Result<()> {
-    let open_rollouts: Vec<(String, String)> = enumerate_local_agent_cli_identities()
-        .into_iter()
-        .filter(|identity| identity.kind == "codex" && !identity.storage_path.is_empty())
-        .map(|identity| (identity.storage_path.clone(), identity.session_id))
-        .collect();
-    let sessions_dir = dirs::home_dir()
-        .context("no home dir")?
-        .join(".codex/sessions");
-    let Some(chased) = codex_chase_session_id(dead_id, &sessions_dir, &open_rollouts, 5) else {
-        write_stdout_line_strict("{}")?;
-        return Ok(());
-    };
-    let storage_path = find_rollout_path_by_thread_id(&sessions_dir, &chased)
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
-    write_stdout_line_strict(
-        &serde_json::json!({
-            "session_id": chased,
-            "storage_path": storage_path,
-        })
-        .to_string(),
-    )?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn run_remote_codex_id_chase(_dead_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
