@@ -11564,8 +11564,12 @@ impl YggtermServer {
             if !external_processes.is_empty() {
                 // ⛔ [11.79] addendum, the ADOPTION arm: a live holder that is
                 // THIS daemon's own child is not an external competitor — it
-                // is a runtime we just spawned for this row (the start arm
-                // racing the ensure arm across a restore). Adopt it: answer
+                // is a runtime yggterm birthed and whose output is still
+                // LIVE — ours to serve across daemon generations (the start
+                // arm racing the ensure arm across a restore; a preserved
+                // owner's runtime after a rotation). ppid == my pid was the
+                // first cut and missed exactly the cross-generation case:
+                // the holder's parent is the RETIRED daemon. Adopt it: answer
                 // the live session's own key so the row mounts onto the
                 // RUNNING TUI, and compose nothing. Measured 2026-09-07
                 // 17:14: the opencode row d4090efe — the start arm's `--auto`
@@ -11575,7 +11579,8 @@ impl YggtermServer {
                 #[cfg(target_os = "linux")]
                 if external_processes
                     .iter()
-                    .any(|process| process.ppid == Some(std::process::id()))
+                    .all(|process| process.holder == AgentResumeHolderKind::StrandedYggtermOwned)
+                    && !orphaned_dead_output_holders_recoverable(&external_processes)
                 {
                     let adopted = self
                         .sessions
