@@ -3760,6 +3760,13 @@ pub struct TerminalStreamChunk {
 pub enum ServerRequest {
     Ping,
     Status,
+    /// The identity cure verb ([11.75] addendum): move ONE live row's session
+    /// id onto the id the owner names. Daemon-side so the in-memory table,
+    /// the persistence and the trace move together.
+    RowsRePointSession {
+        key: String,
+        session_id: String,
+    },
     WorkingFlags,
     Snapshot,
     PrepareUpdateRestart,
@@ -4714,6 +4721,7 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         | ServerRequest::SetSessionOutlinePrefix { .. }
         | ServerRequest::RemoveSshTarget { .. }
         | ServerRequest::RemoveSession { .. }
+        | ServerRequest::RowsRePointSession { .. }
         | ServerRequest::DropTerminalRuntime { .. }
         | ServerRequest::SetSessionKeepAlive { .. }
         | ServerRequest::ReorderLiveSessions { .. }
@@ -11680,6 +11688,37 @@ impl DaemonRuntime {
                     format!("removed {removed} saved ssh targets for {machine_key}")
                 }))
             }
+            ServerRequest::RowsRePointSession { key, session_id } => {
+                // The identity cure ([11.75] addendum): the apply re-points the
+                // record, migrates the codex title aliases and persists; the
+                // answer names what happened so a wrong key is never silent.
+                let changed = self
+                    .server
+                    .apply_agent_runtime_session_id_to_live_session(&key, &session_id);
+                if changed {
+                    self.persist()?;
+                }
+                {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "session",
+                        "row_re_pointed",
+                        serde_json::json!({
+                            "key": key,
+                            "session_id": session_id,
+                            "changed": changed,
+                        }),
+                    );
+                }
+                ServerResponse::Ack {
+                    message: Some(if changed {
+                        format!("re-pointed {key} to {session_id}")
+                    } else {
+                        format!("no live session matched {key} — nothing changed")
+                    }),
+                }
+            }
             ServerRequest::RemoveSession { path, despawn } => {
                 // [11.74] THE DESPAWN ARM — a corpse record's eviction, not a
                 // close. A ghost row's CLI process is long dead; the record
@@ -16529,6 +16568,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::SetSessionOutlinePrefix { .. } => "set_session_outline_prefix",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
+        ServerRequest::RowsRePointSession { .. } => "rows_re_point_session",
         ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::TerminalTenants { .. } => "terminal_tenants",
@@ -20051,6 +20091,23 @@ pub fn remove_session(
             despawn: despawn.then_some(true),
         },
     )?)
+}
+
+/// The client half of `server rows re-point` ([11.75] addendum): dial the
+/// daemon that owns the record and move ONE live row's session id.
+pub fn re_point_row_session(
+    endpoint: &ServerEndpoint,
+    key: &str,
+    session_id: &str,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::RowsRePointSession {
+            key: key.to_string(),
+            session_id: session_id.to_string(),
+        },
+    )?)?
+    .with_context(|| format!("missing re-point answer for {key}"))
 }
 
 pub fn drop_terminal_runtime(
@@ -40338,8 +40395,8 @@ mod tests {
         // Option: an older owner's absence deserializes as `None` = "nobody
         // could answer", and the seed falls through byte-identically; an
         // older client ignores the unknown field.
-        const STAMPED_AT_VERSION: &str = "3.2.75";
-        const STAMPED_SHAPE_HASH: u64 = 0x27409daba4c646d4;
+        const STAMPED_AT_VERSION: &str = "3.2.78";
+        const STAMPED_SHAPE_HASH: u64 = 0x74843ba79da0f1fa;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

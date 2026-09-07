@@ -182,6 +182,7 @@ pub use daemon::{
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
     refresh_preview_with_history, remove_managed_cli,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
+    re_point_row_session,
     reorder_live_sessions_scoped, row_order_ledger_report,
     request_terminal_launch, request_terminal_launch_for_path, retire_daemon,
     retire_stale_daemons, RetireStaleDaemonOutcome, RetireStaleDaemonsReport, run_daemon,
@@ -27048,6 +27049,26 @@ pub fn run_rows_despawn(keys: &[String]) -> anyhow::Result<()> {
 pub fn run_rows_despawn_local(key: &str) -> anyhow::Result<()> {
     let outcome = despawn_local_row(key);
     write_stdout_payload(&serde_json::to_string_pretty(&outcome)?)?;
+    Ok(())
+}
+
+/// `server rows re-point <key> <new-session-id>` — the identity cure verb
+/// ([11.75] addendum): move ONE live row onto the session id the owner
+/// names. Dials the LOCAL daemon (the records live where the row's GUI
+/// host's daemon persists them), so the in-memory table, the persistence and
+/// the trace move together instead of a hand edit racing persist().
+pub fn run_row_re_point(key: &str, session_id: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let endpoint = server_cli::cli_server_endpoint(&home);
+    let answer = re_point_row_session(&endpoint, key, session_id)?;
+    write_stdout_payload(
+        &serde_json::json!({
+            "key": key,
+            "session_id": session_id,
+            "answer": answer,
+        })
+        .to_string(),
+    )?;
     Ok(())
 }
 
