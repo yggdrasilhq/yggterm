@@ -11812,6 +11812,52 @@ impl YggtermServer {
                     external_agent_resume_processes_for_session(kind, session_id);
             }
             if !external_processes.is_empty() {
+                // ⛔ [11.79] addendum, the ADOPTION arm: a live holder that is
+                // THIS daemon's own child is not an external competitor — it
+                // is a runtime we just spawned for this row (the start arm
+                // racing the ensure arm across a restore). Adopt it: answer
+                // the live session's own key so the row mounts onto the
+                // RUNNING TUI, and compose nothing. Measured 2026-09-07
+                // 17:14: the opencode row d4090efe — the start arm's `--auto`
+                // TUI (pid 3348247, ppid = this daemon) held exactly the
+                // session the ensure arm was resuming, and the ensure bailed
+                // into an external-active wait that could never end.
+                #[cfg(target_os = "linux")]
+                if external_processes
+                    .iter()
+                    .any(|process| process.ppid == Some(std::process::id()))
+                {
+                    let adopted = self
+                        .sessions
+                        .iter()
+                        .find(|(_, session)| {
+                            session.id == session_id
+                                && matches!(
+                                    session.source,
+                                    SessionSource::LiveLocal | SessionSource::LiveSsh
+                                )
+                        })
+                        .map(|(key, _)| key.clone());
+                    if let Some(adopted) = adopted {
+                        if let Ok(home) = resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "remote_runtime",
+                                "external_own_child_runtime_adopted",
+                                json!({
+                                    "session_id": session_id,
+                                    "adopted_key": adopted,
+                                    "pids": external_processes
+                                        .iter()
+                                        .map(|process| process.pid)
+                                        .collect::<Vec<_>>(),
+                                }),
+                            );
+                        }
+                        return Ok(adopted);
+                    }
+                }
                 if let Ok(home) = resolve_yggterm_home() {
                     append_trace_event(
                         &home,
