@@ -2281,3 +2281,14 @@ parent — the session daemon-owned again, no hand kill. Also live-proofed:
 the corrected banner wording ("already running under yggterm … Nothing to
 close") replaced the eternal "end it with kill" refusal from the first
 resume attempt on the fixed bytes.
+
+
+## The zcode-tui guinea pig — dual-source probes (2026-09-08)
+
+zcode-tui announces every integration milestone on the terminal-title channel
+(`zcode-tui|<milestone>|<detail>`, written to /dev/tty so the renderer cannot
+swallow it; fires only under YGGTERM_SESSION_ID). The daemon's own cli/* chain
+is the witness. One milestone, two sources; a half that never fired is the
+bug, pinned to a side. Milestone table + pairing queries: the repo's
+docs/probes.md (github.com/avikalpa/zcode-tui). The follow-up: a
+pairing-verifier verb that asserts the pairs over a launch→quit window.
