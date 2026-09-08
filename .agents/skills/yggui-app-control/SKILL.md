@@ -375,6 +375,69 @@ verb you wished existed** rather than routing around its absence. Most of the ve
 skill useful were added exactly that way, mid-task. A missing affordance is a work item, not an
 excuse to hand the task back.
 
+## ★★★ TUI UX development loop — pixels, PTY frame, and control together
+
+For a full-screen TUI, the terminal is the product surface. Use yggterm's
+three witnesses as one loop: the **faithful screenshot** answers what a human
+sees, the **daemon PTY frame** answers what the TUI actually painted, and the
+**control verb** exercises the same input path a human uses. This is the
+OpenCode/zcode-tui development recipe (added 2026-09-08 after the zcode-tui
+polish pass):
+
+1. Create or reuse a named shadow and put all captures in disk-backed scratch:
+
+   ```bash
+   LIVE_HOST=$(scripts/ygg-live-host.sh) || exit 1
+   RUN="$HOME/.yggterm/scratchpad/tui-ux/<run-name>"
+   ssh "$LIVE_HOST" "mkdir -p '$RUN'"
+   ssh "$LIVE_HOST" 'cd ~/gh/yggterm && ./scripts/shadow-client.sh start --name tui-ux'
+   ```
+
+2. Spawn the TUI in a background row with `--no-activate`, then open that row
+   on the named shadow. Use the user worker (`--pid` or `--client`) for the
+   create/send action when the shadow role refuses ownership; never foreground
+   a reference or work row on the user's GUI.
+
+3. Capture both sides at each checkpoint. `server snapshot` is the daemon's
+   authoritative `live_sessions[].terminal_lines`/`pty_cols`/`pty_rows`
+   witness; `server app screenshot … --pid <shadow-pid>` is the pixel witness.
+   Read the screenshot response's `capture_faithful` and `paint_frame` fields.
+   A raw `script` capture is a frame-diff stream, not a layout image.
+
+   ```bash
+   ssh "$LIVE_HOST" 'yggterm-headless server snapshot' > "$RUN/pty.json"
+   ssh "$LIVE_HOST" "yggterm-headless server app screenshot '$RUN/frame.png' --pid <shadow-pid>"
+   ```
+
+4. Drive the TUI only after reading its current PTY frame. For a state-
+   controlled OpenTUI composer, text plus Enter may arrive before React commits
+   the draft; exercise both the realistic two-write path and the fast burst
+   path when that is part of the bug:
+
+   ```bash
+   printf '/sessions' | ssh "$LIVE_HOST" \
+     'yggterm-headless server app terminal send <row-path> --pid <action-pid> --stdin'
+   sleep 1
+   printf '\r' | ssh "$LIVE_HOST" \
+     'yggterm-headless server app terminal send <row-path> --pid <action-pid> --stdin'
+   ```
+
+   Re-read `server snapshot` and take another faithful screenshot after every
+   transition. `accepted:true` proves only that bytes were written; the frame
+   and pixels prove that the TUI consumed them.
+
+5. Compare the work against the reference in the same PTY geometry and the
+   same task path: launch/home, `/sessions` picker, selected session, composer,
+   theme dialog, and any transient state. Record the build/commit, PTY size,
+   theme, input sequence, daemon frame, and screenshot path. `captureCharFrame`
+   from `@opentui/react/test-utils` belongs in deterministic tests; yggterm
+   screenshots and PTY frames belong in live acceptance. Neither replaces the
+   other.
+
+Stop the shadow and leave the work row only if it is intentionally part of the
+user's workflow. For a proof row, remove it and verify both the row and its
+process are gone; a successful removal response alone is not proof.
+
 ## ⛔ THE SHADOW-PROBE LAW (user-directed 2026-07-23) — probe through the shadow client, never the user's GUI
 
 Any probe that changes what the viewport shows — `app open`, view switches,
