@@ -27978,7 +27978,35 @@ must name the created row.
 
 ## ⛔ [11.86] THE TITLE-FOLLOW READS THE STORE BY THE ROW'S BIRTH ID AFTER A REBIND — A REBOUND CODEX ROW WEARS ITS OLD THREAD'S TITLE WHILE THE AUDIT (READING THE REBOUND ID) FLAGS IT, AND THE CHORE CALLS IT SATISFIED (caught live by the metadata open/switch matrix, 2026-09-08 ~04:30)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Fixed on lane/cli/title-dance (729cbeb6, 2026-09-08 evening sitting); the
+live falsifier (specimen row follows within a tick, PTY proof) is the owed
+proof. The fix makes the follower and the audit read by ONE id authority BY
+CONSTRUCTION: the chore now snapshots its candidates from
+`persisted_live_sessions()` — the `rows live` audit's own source, same keys,
+same ids — instead of `live_session_views()`; its equal-skip reads the
+current title through `live_session_title_resolved` (the setter's own
+resolution, so it can never "satisfy" itself against a twin it does not
+write); and every silent continue is now a NAMED tick outcome
+(`store_silent` with the read id, `equal_skip` with the store title) — the
+diagnosability half, because the silent continue is what made this bug cost
+a full sitting of forensics. `rows live` gained `ssot_verdict`
+(match / mismatch / **store_silent**) + a `store_silent` count: the
+birth-named army read as `ssot_match: true` for weeks because
+null-vs-anything never flags. Lock test:
+`title_follow_reads_the_persisted_records_the_audit_reads` (the sibling of
+the [11.82] loopback predicate pin).
+
+**Mechanism correction from the evening's live forensics (dev):** the
+specimen `codex-runtime://01a0349d` turned out to be a TWIN PAIR — the
+rebind re-keyed the live row onto `codex-runtime://01a06d75` (correctly
+titled) and left TWO stale copies behind: a persisted record keyed by the
+birth key carrying the REBOUND id, and a runtime-keyed twin row. The
+duplicate-holder stamp refusal (which the twin triggers) is what keeps such
+a pair alive. The follower-side fix above makes the pair's fault visible and
+self-healing on the title plane; the twin-corpses themselves are the despawn
+verb's population (despawn the non-canonical, find-3 doctrine).
 
 Measured on dev: row `codex-runtime://01a0349d` (an ACTIVE advisor row,
 holder alive) rebound onto live thread `01a06d75` — the persisted record's
@@ -28130,3 +28158,53 @@ field the enum did not declare. The three fields now ride the wire twin
 (serde-default) and the trace payload; a guard test pins the trace-writer
 keys. Lesson: an annotation is only shipped when the TYPED event carries it
 — JSON.stringify drops undefined and the parse drops unknowns.
+
+## ⛔ [11.89] THE REMOTE MIRROR ROW NEVER LEARNS THE OWNING DAEMON'S ID REBIND — THE GUI-SIDE ROW PROBES ITS BIRTH ID FOREVER, THE STORE ANSWERS NOTHING, AND THE ROW WEARS ITS BIRTH NAME WHILE THE OWNING HOST'S ROW IS CORRECTLY TITLED (measured 2026-09-08 evening, GUI host + dev, the per-CLI title sitting)
+
+**Status:** OPEN
+
+Measured: the GUI host's live row `remote-opencode://dev/a0c182a5-9e8e…` wears
+"New dev OpenCode" with `cli_store_title: null` while the SAME session on
+dev (`opencode-runtime://a0c182a5…`) is titled "Greeting message" with the
+store agreeing. The uuid `a0c182a5…` is ABSENT from dev's opencode.db —
+dev's row answers because its persisted id was REBOUND to the CLI's real
+session id, while the GUI host's mirror record still carries the birth uuid and
+batches its remote store probe by that dead id. Store silent ⇒ no mismatch
+⇒ the audit read green; the row is what the OWNER'S GUI displays. THE SAME
+CLASS, MEASURED PER CLI in the same sitting:
+
+- **zcode-tui** (dev rows `zcode-tui-runtime://30df160d…`, `d232b5a5…`):
+  the reader (`~/.zcode/cli/db/db.sqlite`, `session.title`) is correct and
+  the store is rich (the GUI host's own db: 118 titled `sess_<uuid>` rows) — but
+  the rows' ids are bare birth uuids, never rebound to the `sess_…` id the
+  CLI keys its store by. Reader answers nothing forever.
+- **The ghost cc army** (dev, ~30 `local://<uuid>` ClaudeCode rows with
+  real flowed titles and store None): their Storage stamps name
+  `~/.claude/projects/-home-pi-gh-yggterm/<id>.jsonl` files that NO LONGER
+  EXIST (measured: 46a90820, 351f9eb4, abd2cc68 — none under ~/.claude
+  anywhere; cc housekeeping deleted them). The reader is CORRECT to answer
+  None. Holder probes still say "alive". These rows are the despawn-verb's
+  population (with codex `55961098`, whose rollout is absent and whose
+  holder the /proc fd scan cannot find), not the title plane's — but the
+  title-follow's `store_silent` verdict now makes them COUNTABLE per tick.
+- **agy fresh rows** (`agy-runtime://92ad4e7a…`, birth-named): no
+  conversation dir, no summaries-db row — an honest no-turn birth name, NOT
+  a fault. The store_silent verdict will flag it anyway; treat honest
+  no-turn rows as the acceptable face of that class.
+
+**Fix shape:** (a) the rebind plane propagates the rebound id to the
+peer-daemon mirror records — the [11.79] key-and-id-move-as-one law, one
+level up (cross-host); the owning daemon already knows the rebound id, and
+the GUI host already syncs DaemonStatus from it, so the mirror record's
+re-point belongs in that sync's apply path. (b) OR the remote store-title
+probe resolves the holder's REAL session id first (ROW_HOLDER_PROBE already
+reads the env/cmdline truth) and reads the store by it, answering with the
+resolved id so the audit can name the divergence. (a) is the law-conforming
+shape; (b) is the cheap diagnostic. Either way the audit's new
+store_silent verdict is the falsifier: GUI-side agent rows may not sit in
+it for more than a tick when their owning host's row is store-named.
+
+**Falsifier:** after (a), the GUI host's `remote-opencode://dev/a0c182a5` row
+re-points to the rebound id and wears "Greeting message" within one
+title-follow tick; after (b), the audit names the id divergence as a
+mismatch instead of answering silent.
