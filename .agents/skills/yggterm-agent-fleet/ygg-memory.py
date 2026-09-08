@@ -1577,6 +1577,16 @@ def append_journal_entry(
     event_id = str(uuid.uuid4())
     origin = origin or memory_origin(root)
     previous = latest_version_for(root, ns, filename) if base_version is _AUTOMATIC_BASE else base_version
+    # A delete is total: it must supersede every head visible in the journal,
+    # not only the latest version, or two concurrent deleters (per-host native
+    # GC on stale views) fork the lineage and the door never converges —
+    # the 2026-09-08 _global storm (135 doors, up to 8 unconnected delete
+    # heads each) is that exact failure.
+    if action == "delete" and not base_versions:
+        base_versions = [
+            head["version_id"]
+            for head in causal_heads_for(root, ns, filename, coalesce=False)
+        ]
     digest = None
     source = root / "namespaces" / ns / filename
     if action != "delete" and source.is_file():
