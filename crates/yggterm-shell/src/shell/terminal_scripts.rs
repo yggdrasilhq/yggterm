@@ -15650,5 +15650,15 @@ mod frame_hash_protocol_only_settle_tests {
             SHELL_SOURCE.contains("protocol_only: bool"),
             "TerminalJsCommand::Write must carry the classification field"
         );
+        // The typed event boundary must carry the story to the trace plane,
+        // or the JS-side annotations die at parse and a throttled divergence
+        // reads as healed (measured 2026-09-08: the first deploy's events
+        // lacked every new key for exactly this reason).
+        assert!(
+            viewport.contains("\"consecutive_mismatch\"")
+                && viewport.contains("\"backed_off\"")
+                && viewport.contains("\"protocol_only_settle_skips\""),
+            "the frame_hash_probe trace payload must carry the settle-gate story"
+        );
     }
 }

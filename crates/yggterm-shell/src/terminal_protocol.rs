@@ -183,6 +183,15 @@ pub(crate) enum TerminalJsEvent {
         /// wire twin carries serde(default) for older in-page scripts).
         buffer_kind: String,
         buffer_transitions: u32,
+        /// ⭐ THE SETTLE GATE'S STORY (2026-09-08): how many consecutive
+        /// mismatch emits have carried this same daemon hash, whether this
+        /// emit landed under the 30 s persistent-mismatch backoff, and how
+        /// many protocol-only-only settles the gate skipped on this mount.
+        /// Without them the trace cannot tell a throttled standing divergence
+        /// from a healed one, nor a gate-suppressed storm from silence.
+        consecutive_mismatch: u32,
+        backed_off: bool,
+        protocol_only_settle_skips: u64,
         visual_reason: String,
         host_age_ms: u64,
         wheel_events: u64,
@@ -530,6 +539,12 @@ enum TerminalJsEventWire {
         host_age_ms: u64,
         #[serde(default)]
         wheel_events: u64,
+        #[serde(default)]
+        consecutive_mismatch: u32,
+        #[serde(default)]
+        backed_off: bool,
+        #[serde(default)]
+        protocol_only_settle_skips: u64,
     },
     Clipboard {
         action: String,
@@ -761,6 +776,9 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 visual_reason,
                 host_age_ms,
                 wheel_events,
+                consecutive_mismatch,
+                backed_off,
+                protocol_only_settle_skips,
             } => TerminalJsEvent::FrameHash {
                 daemon_hash,
                 client_hash,
@@ -773,6 +791,9 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 visual_reason,
                 host_age_ms,
                 wheel_events,
+                consecutive_mismatch,
+                backed_off,
+                protocol_only_settle_skips,
             },
             TerminalJsEventWire::Clipboard {
                 action,

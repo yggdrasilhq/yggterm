@@ -28093,3 +28093,11 @@ Source contracts: `a_protocol_only_settle_never_pairs_a_mismatch_verdict`,
 `a_persistent_mismatch_backs_off_after_three_emits_and_says_so`,
 `the_forward_loops_stamp_the_protocol_only_classification_on_writes`; the
 pairing wiring test rewritten for the new signature.
+
+MEASURED ADDENDUM (same evening): the first deploy's events carried NONE of
+the new keys despite the new GUI binary — the JS payload crosses the TYPED
+`TerminalJsEventWire::FrameHash` boundary, which silently dropped every
+field the enum did not declare. The three fields now ride the wire twin
+(serde-default) and the trace payload; a guard test pins the trace-writer
+keys. Lesson: an annotation is only shipped when the TYPED event carries it
+— JSON.stringify drops undefined and the parse drops unknowns.
