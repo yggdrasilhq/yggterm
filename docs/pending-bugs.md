@@ -28015,10 +28015,12 @@ symptoms of the one inverted priority in
 `app_control_created_session_path`. The zcode-tui row was born correctly as
 `local::<uuid>` with the managed launch; the REPLY named the owner's active
 remote-opencode row on dev and read that row's ssh resume command as the
-launch report. Message-first resolves it. Post-deploy verification owed:
-the repro below must reply with the created `local://…` row and a
-zcode-tui launch command, and the PTY must show the TUI (`zcode-tui|boot`
-on the title channel).
+launch report. Message-first resolves it. Post-deploy VERIFIED (2026-09-08,
+3.2.85-deployed build on guihost): the repro replies with the created
+`local://…` row and the managed zcode-tui launch (managed bin dir on PATH),
+the PTY shows the TUI (sessions list + "zcode-tui · 100 sessions ·
+GLM-5.3-Flash (free)" status bar), and `renderer-live`/`backend-live`/
+`list-ok` milestones fired on the title channel.
 
 Repro (guihost, yggterm 3.2.84 daemon + GUI, zcode-tui descriptor registered
 on main):
