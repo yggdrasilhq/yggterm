@@ -5693,6 +5693,124 @@ JSON.stringify({{
         );
     }
 
+    // ⛔ The measured storm of 2026-09-08 (the GUI host, [11.87]): a row whose
+    // runtime token flickers through `None` used to restart the schedule on
+    // EVERY flicker, so the ask never climbed past the base window — 59-68
+    // asks per never-declaring row in 8.5 minutes where the 60 s ceiling
+    // promises ~8. Unknown is not a new runtime.
+    #[test]
+    fn a_runtime_token_flickering_through_none_keeps_its_backoff_schedule() {
+        let mut attempts = HashMap::new();
+        for ask in 0..6 {
+            mark_app_surface_restore_attempted(
+                &mut attempts,
+                "local://alpha",
+                Some("42".to_string()),
+                ask * 10,
+            );
+        }
+        mark_app_surface_restore_attempted(&mut attempts, "local://alpha", None, 1_000);
+        assert_eq!(
+            attempts["local://alpha"].asks, 7,
+            "an unreadable runtime does not restart the schedule"
+        );
+        mark_app_surface_restore_attempted(
+            &mut attempts,
+            "local://alpha",
+            Some("42".to_string()),
+            2_000,
+        );
+        assert_eq!(
+            attempts["local://alpha"].asks, 8,
+            "the same pid returning is not a handover either"
+        );
+    }
+
+    // A ledger that never met a pid keeps climbing when the first one arrives:
+    // unknown -> known is not a handover, only pid -> different-pid is.
+    #[test]
+    fn a_first_observable_pid_does_not_restart_a_none_era_schedule() {
+        let mut attempts = HashMap::new();
+        for ask in 0..4 {
+            mark_app_surface_restore_attempted(&mut attempts, "local://alpha", None, ask * 10);
+        }
+        mark_app_surface_restore_attempted(
+            &mut attempts,
+            "local://alpha",
+            Some("7".to_string()),
+            1_000,
+        );
+        assert_eq!(
+            attempts["local://alpha"].asks, 5,
+            "only a known-different pid restarts the schedule"
+        );
+    }
+
+    // The due-side half of the same rule: a row whose view reads `None` right
+    // after an ask is not immediately due — its backoff window still stands.
+    #[test]
+    fn a_row_whose_token_reads_unknown_is_not_immediately_due() {
+        let mut shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let mut resumed = test_live_shell_session("local://alpha");
+        resumed.terminal_process_id = Some(42);
+        let resumed = snapshot_session_view_for_ui(resumed);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some("local://alpha".to_string()),
+            active_session: Some(resumed.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![resumed],
+            apps: Vec::new(),
+        });
+        let mut attempts = HashMap::new();
+        mark_app_surface_restore_attempted(
+            &mut attempts,
+            "local://alpha",
+            Some("42".to_string()),
+            1_000,
+        );
+        // The snapshot that cannot see the runtime arrives one tick later.
+        let mut unseen = test_live_shell_session("local://alpha");
+        unseen.terminal_process_id = None;
+        let unseen = snapshot_session_view_for_ui(unseen);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some("local://alpha".to_string()),
+            active_session: Some(unseen.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![unseen],
+            apps: Vec::new(),
+        });
+        assert!(
+            restore_targets_with(&shell, &attempts, 1_000 + 2_499, 8).is_empty(),
+            "the flicker must not make the row due before its window elapses"
+        );
+        assert_eq!(
+            restore_targets_with(&shell, &attempts, 1_000 + 2_500, 8).len(),
+            1,
+            "once the window elapses the ask proceeds on the ordinary schedule"
+        );
+    }
+
+    // [11.87] (c): the ask loop sits out the ticks where the active row's
+    // attach is in flight — a switch outranks the batch round trip, and the
+    // next tick picks the sweep back up.
+    #[test]
+    fn the_surface_restore_ask_defers_while_an_attach_is_in_flight() {
+        let source = SHELL_SOURCE;
+        let anchor = "spawn(restore_app_surfaces_tick(";
+        let cut = source
+            .find(anchor)
+            .unwrap_or_else(|| panic!("the scan lost its anchor {anchor:?}"));
+        let window = &source[cut.saturating_sub(600)..cut];
+        assert!(
+            window.contains("restore_deferred_for_attach"),
+            "the spawn must sit behind the attach-in-flight gate"
+        );
+    }
+
     // Each target costs a daemon round trip plus an endpoint probe. A 21-row
     // window must sweep over several ticks, not fire 21 blocking requests into
     // the startup storm.

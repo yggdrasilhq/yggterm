@@ -37951,6 +37951,27 @@ fn app_surface_restore_retry_ms(asks: u32) -> u64 {
         .min(APP_SURFACE_RESTORE_RETRY_CEILING_MS)
 }
 
+
+/// Whether `next` names a runtime the ledger has never been asked about, by
+/// the measured rule of 2026-09-08: only a SOME-to-different-SOME move is a
+/// new runtime.
+///
+/// ⛔ A token that flickers through `None` is not a handover. A row whose
+/// `terminal_process_id` reads `Some` in one snapshot and `None` in the next
+/// (a remote/preserved runtime the reporter cannot always see) used to reset
+/// the schedule on every flicker, so its ask never climbed past the base
+/// window: the GUI host measured 59-68 asks per never-declaring row in 8.5
+/// minutes (1230 `daemon_declare_absent` in one client's tail) where the 60 s
+/// ceiling promises ~8. `Some(a) -> None` keeps the schedule — unknown is not
+/// a new runtime — and `None -> Some(b)` keeps it too, so the re-arm fires
+/// exactly once per genuine handover, when the NEW pid arrives.
+fn runtime_token_is_new_runtime(old: &Option<String>, next: &Option<String>) -> bool {
+    match (old, next) {
+        (Some(old_pid), Some(next_pid)) => old_pid != next_pid,
+        _ => false,
+    }
+}
+
 /// A session this tick will ask the daemon about, and WHICH halves of its app
 /// surface are missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38009,7 +38030,7 @@ fn app_surface_restore_targets(
         .filter(|row| match attempted.get(&row.session_path) {
             None => true,
             Some(attempt) => {
-                attempt.runtime_token != row.runtime_token
+                runtime_token_is_new_runtime(&attempt.runtime_token, &row.runtime_token)
                     || now_ms.saturating_sub(attempt.last_at_ms)
                         >= app_surface_restore_retry_ms(attempt.asks)
             }
@@ -38118,7 +38139,7 @@ fn mark_app_surface_restore_attempted(
             asks: 0,
             last_at_ms: now_ms,
         });
-    if entry.runtime_token != runtime_token {
+    if runtime_token_is_new_runtime(&entry.runtime_token, &runtime_token) {
         *entry = AppSurfaceRestoreAttempt {
             runtime_token,
             asks: 0,
@@ -38520,7 +38541,12 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // clients polling doubled the declare traffic (~35
             // `daemon_declare_absent` asks/min each, `terminal_app_declares`
             // dispatches with ui_wait up to 526 ms) for zero shadow benefit.
-            if !client_is_shadow_viewer() {
+            // [11.87] (c): the ask sits out a tick whose active row has an
+            // attach in flight — the switch outranks the batch round trip, and
+            // the next tick picks the sweep back up.
+            let restore_deferred_for_attach =
+                state.with(|shell| terminal_attach_blocks_background_work(shell));
+            if !client_is_shadow_viewer() && !restore_deferred_for_attach {
                 spawn(restore_app_surfaces_tick(
                     state,
                     trace_home.clone(),
