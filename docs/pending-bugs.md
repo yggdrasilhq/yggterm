@@ -28001,7 +28001,53 @@ id instead of the view's birth id. The audit's read key (the persisted
 `row.id`) is the one that tracks the runtime; verify which of view.id /
 persisted id the identity overlay actually writes before choosing.
 
-**Falsifier:** after the fix, a rebound codex row (persisted id ≠ key id)
-gets exactly one store answer in the chore's tick, the row title flows to
-the rebound thread's catalog title, and the audit's mismatch clears within
-one tick without a manual rename.
+**Also:** the [11.80] durable falsifier (last_known_app_declares survives a
+rotation non-empty) stays ARMED — the GUI host's 3 entries (02:12) were
+written under the daemon that still owns the socket, so no rotation has
+tested them yet.
+
+
+## [11.85] `terminal new --kind zcode-tui` misroutes to an opencode resume on a foreign host (RESOLVED by the created-path fix above, 2026-09-08)
+
+Same root cause and same fix as the created-path entry above — this filing
+(named the launch plane) and that one (named the title leak) were two
+symptoms of the one inverted priority in
+`app_control_created_session_path`. The zcode-tui row was born correctly as
+`local::<uuid>` with the managed launch; the REPLY named the owner's active
+remote-opencode row on dev and read that row's ssh resume command as the
+launch report. Message-first resolves it. Post-deploy verification owed:
+the repro below must reply with the created `local://…` row and a
+zcode-tui launch command, and the PTY must show the TUI (`zcode-tui|boot`
+on the title channel).
+
+Repro (guihost, yggterm 3.2.84 daemon + GUI, zcode-tui descriptor registered
+on main):
+
+```
+yggterm-headless server app terminal new --kind zcode-tui \
+  --cwd <repo-checkout> --no-activate \
+  --purpose "zcode-tui pixel test 2" --agent zcode-probe
+```
+
+Reply: `session_path: remote-opencode://dev/d4090efe-…`,
+`launch.launch_command` = `ssh -tt dev '… resume-opencode d4090efe-…
+<yggterm-checkout> --require-existing'`.
+
+Three faults REPORTED in one: (1) the kind was not honoured — the launch is an
+OPENCODE resume; (2) the `--cwd` was rewritten to a different directory on a
+different machine (`dev:<yggterm-checkout>`); (3) `--require-existing` means
+it attaches a foreign live session rather than starting the requested CLI.
+All three were the created-path reader describing the OWNER'S ACTIVE ROW,
+not the created one; the "rewritten cwd" was that row's cwd.
+
+Suspects FALSIFIED: the terminal-new kind→launch resolution was innocent
+(the row was born `local::<uuid>` with the right kind), and the scheme-table
+half was separately closed by the remote-arm commit (ZcodeTui scheme rows).
+The "plain shell row PATH lacks ~/.yggterm/npm/bin" observation stands but
+is a manual-spawn concern only: managed launches prepend the managed bin
+dir via shell exports.
+
+This is exactly the class the dual-source probes catch: yggterm witnesses a
+launch, zcode-tui never fires `boot` (no stimulus) → the pairing fails on
+the launch milestone. Post-deploy: the repro replies with the created
+`local://…` row, and `zcode-tui|boot` appears on the title channel.
