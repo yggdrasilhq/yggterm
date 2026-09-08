@@ -1975,7 +1975,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // A cool sibling of Codex's teal — same family, because it IS codex
         // behind a proxy, but separable at a glance (5.93:1).
         brand_color: "#0369a1",
-        menu_hint: 'z',
+        // OWNER RULING (2026-09-08): 'z' belongs to ZCode TUI. This descriptor
+        // held 'z' first and outranked the younger ZcodeTui claim in registry
+        // order, so the ALT+E,S layer badged Codex-LiteLLM Z and pushed
+        // zcode-tui to the derived ladder (an N) — exactly backwards, since
+        // the letter Z reads as ZCode. 'x' was free.
+        menu_hint: 'x',
         // OWNER TITLING LAW, second half (2026-09-05): same as codex — it IS
         // codex behind a proxy, so it self-titles the same way. No
         // `~/.codex-litellm/sqlite/codex-dev.db` has been measured on any fleet
@@ -3432,6 +3437,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // The ZCode v4 trajectory user-blue (#2563eb) — 4.5:1+ against white,
         // verified by the WCAG lock test below.
         brand_color: "#2563eb",
+        // Owner ruling 2026-09-08 (pinned by the menu-hint uniqueness lock
+        // test): Z reads as ZCode. Holding 'z' here while Codex-LiteLLM also
+        // held it silently lost this badge to registry order once.
         menu_hint: 'z',
         // The TUI reads its titles from the shared session store (the
         // desktop's own generated titles) — yggterm never invents one.
@@ -8521,8 +8529,7 @@ mod tests {
     /// falls back to a bare "Open" — that fallback is reserved for the rows
     /// that genuinely have no CLI.
     #[test]
-    fn the_open_verb_names_every_registered_cli() {
-        for descriptor in AGENT_CLIS {
+    fn the_open_verb_names_every_registered_cli() {        for descriptor in AGENT_CLIS {
             assert_eq!(
                 agent_cli_open_session_label(Some(descriptor.kind)),
                 format!("Open this {} Session", descriptor.display_name),
@@ -8531,6 +8538,59 @@ mod tests {
             );
         }
         assert_eq!(agent_cli_open_session_label(None), "Open");
+    }
+
+    /// Every registered CLI owes the ALT+E,S layer a UNIQUE menu hint letter.
+    ///
+    /// ⛔ The failure it guards (live 2026-09-08): Codex-LiteLLM and ZcodeTui
+    /// both declared 'z'. The menu takes `menu_hint` verbatim, so registry
+    /// order silently decided the badge — litellm kept Z, and zcode-tui (the
+    /// letter's whole point) fell to the derived ladder and showed an N. Two
+    /// descriptors can hold the same hint without any compile error, which is
+    /// why this lock has to exist here: the collision is invisible until a
+    /// human reads the menu.
+    ///
+    /// The letter pins are owner law, not aesthetics: 'z' reads as ZCode, and
+    /// the owner moved codex-litellm to 'x' explicitly (2026-09-08). Pinned so
+    /// a future registry reorder cannot quietly re-trade the letters.
+    #[test]
+    fn every_cli_owns_a_unique_menu_hint_and_z_belongs_to_zcode_tui() {
+        let mut seen: Vec<(char, SessionKind)> = Vec::new();
+        for descriptor in AGENT_CLIS {
+            assert!(
+                descriptor.menu_hint.is_ascii_lowercase(),
+                "{:?}: menu_hint {:?} must be a bare lowercase letter the ALT layer can badge",
+                descriptor.kind,
+                descriptor.menu_hint,
+            );
+            let clash = seen.iter().find(|(hint, _)| *hint == descriptor.menu_hint);
+            assert!(
+                clash.is_none(),
+                "{:?} and {:?} both claim menu_hint {:?} — the ALT+E,S layer badges only \
+                 the first and pushes the other to the derived ladder",
+                clash.map(|(_, kind)| kind),
+                descriptor.kind,
+                descriptor.menu_hint,
+            );
+            seen.push((descriptor.menu_hint, descriptor.kind));
+        }
+        let hint_of = |kind: SessionKind| {
+            AGENT_CLIS
+                .iter()
+                .find(|descriptor| descriptor.kind == kind)
+                .map(|descriptor| descriptor.menu_hint)
+                .unwrap_or('\0')
+        };
+        assert_eq!(
+            hint_of(SessionKind::ZcodeTui),
+            'z',
+            "owner ruling 2026-09-08: the Z hint belongs to ZCode TUI",
+        );
+        assert_eq!(
+            hint_of(SessionKind::CodexLiteLlm),
+            'x',
+            "owner ruling 2026-09-08: codex-litellm moves to X",
+        );
     }
 
     /// A launch refused for a missing binary shows this sentence, so every CLI

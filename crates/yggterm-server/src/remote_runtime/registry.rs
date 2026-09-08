@@ -34,6 +34,12 @@ pub enum RemoteRuntimeKind {
     Antigravity,
     // The 2026-08-13 intake, additive on the same terms.
     GrokBuild,
+    // zcode-tui (2026-09-08): the descriptor's remote arm went live
+    // (wrapper slug + remote-zcode-tui:// rows), so remote zcode-tui runtimes
+    // are real registry rows now. Filing them under Shell was the honest
+    // answer only while the CLI was local-only — the registry would have lied
+    // about which CLI owns the PTY, the exact lie this enum exists to stop.
+    ZcodeTui,
 }
 
 impl RemoteRuntimeKind {
@@ -55,6 +61,7 @@ impl RemoteRuntimeKind {
             Self::Muse => "muse",
             Self::Antigravity => "antigravity",
             Self::GrokBuild => "grok_build",
+            Self::ZcodeTui => "zcode_tui",
         }
     }
 
@@ -69,6 +76,7 @@ impl RemoteRuntimeKind {
             "muse" => Self::Muse,
             "antigravity" => Self::Antigravity,
             "grok_build" => Self::GrokBuild,
+            "zcode_tui" => Self::ZcodeTui,
             // Unrecognized values stay codex: a row written by a NEWER daemon
             // than this one must still read back as *something*, and codex is
             // the value this column held for its whole history.

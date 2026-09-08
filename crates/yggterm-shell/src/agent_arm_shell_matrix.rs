@@ -162,6 +162,7 @@ fn arm_session_id(kind: SessionKind) -> &'static str {
         SessionKind::Muse => "88888888-9999-aaaa-bbbb-cccccccccccc",
         SessionKind::Antigravity => "99999999-aaaa-bbbb-cccc-dddddddddddd",
         SessionKind::GrokBuild => "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        SessionKind::ZcodeTui => "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
         // The matrix is derived from AGENT_CLIS, so a new CLI reaching here
         // without an id is the same class of miss the table exists to catch.
         other => panic!("{other:?} is in the arm matrix but has no fixture session id"),
@@ -418,6 +419,35 @@ const SHELL_ARMS: &[ShellArm] = &[
         kind: SessionKind::GrokBuild,
         locality: Locality::Remote,
         row_scheme: "remote-grok://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::ZcodeTui,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::ZcodeTui,
+        locality: Locality::Remote,
+        // The remote arm went live 2026-09-08 (wrapper_slug zcode-tui,
+        // remote-zcode-tui:// rows, zcode-tui-runtime:// runtime keys) — the
+        // descriptor generates the start/resume verbs, so the four remote
+        // readiness axes assert the SAME machinery every other remote arm
+        // uses, instead of a local-only pretence.
+        row_scheme: "remote-zcode-tui://",
         remote_resume_readiness: true,
         scanned_sidebar_row: true,
         remote_runtime_by_scheme: true,
