@@ -2021,6 +2021,14 @@ fn terminal_eval_script_with_canvas_renderer(
         let frameHashLastStateKey = '';
         let frameHashLastEmitMs = 0;
         let frameHashRequestInFlight = false;
+        // Persistent-mismatch backoff state: how many consecutive mismatch
+        // emits have carried the SAME daemon hash, and what that hash was.
+        // A mismatch that survives three emits with the daemon grid unchanged
+        // is a standing divergence, not a fresh artifact — the 1 Hz
+        // re-announce buys nothing past the third (measured 2026-09-08: one
+        // per ~3s for hours on a working codex row, each a UI dispatch).
+        let frameHashConsecutiveMismatchEmits = 0;
+        let frameHashLastMismatchDaemonHash = '';
         // QUIETNESS: a pairing is only honest when the surface has been
         // silent — no queued writes for >=800ms — so the daemon hash fetched
         // at request time describes the same frame the client holds.
@@ -2031,7 +2039,7 @@ fn terminal_eval_script_with_canvas_renderer(
             const lastQueued = Number(entry.lastWriteQueuedAtMs || 0);
             return (Date.now() - lastQueued) >= 800;
         }};
-        const maybePairFrameHash = (hasPendingWrites) => {{
+        const maybePairFrameHash = (hasPendingWrites, settleHadMeaningful) => {{
             try {{
                 if (!window.__yggtermFrameHash || !term) {{
                     return;
@@ -2052,6 +2060,26 @@ fn terminal_eval_script_with_canvas_renderer(
                     }}
                     return;
                 }}
+                // ⛔ A settle that applied ONLY control-only forwarded bytes
+                // (spinner frames, cursor show/hide — withheld from the
+                // daemon's screen model) cannot pair: the client viewport
+                // legitimately differs from a grid that never saw those
+                // bytes, so the pair can NEVER agree. Pairing here
+                // manufactured a permanent mismatch storm (measured
+                // 2026-09-08: 501/501 probes mismatched across one working
+                // codex row, one UI dispatch every ~3s for hours — the felt
+                // row/modal lag). The skip is counted on the host entry so it
+                // stays visible in host-health without touching the trace
+                // plane; the next meaningful settle pairs normally.
+                if (settleHadMeaningful === false) {{
+                    const skipEntry = window.__yggtermXtermHosts
+                        && window.__yggtermXtermHosts[hostId];
+                    if (skipEntry) {{
+                        skipEntry.frameHashProtocolOnlySettleSkips =
+                            Number(skipEntry.frameHashProtocolOnlySettleSkips || 0) + 1;
+                    }}
+                    return;
+                }}
                 const reading = window.__yggtermFrameHash.frameHashOf(term);
                 if (!reading) {{
                     return;
@@ -2064,6 +2092,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     + (mismatch ? 'm' : 'a');
                 const nowMs = Date.now();
                 const stateChanged = stateKey !== frameHashLastStateKey;
+                // Any agreement clears the persistent-mismatch streak.
+                if (!mismatch) {{
+                    frameHashConsecutiveMismatchEmits = 0;
+                    frameHashLastMismatchDaemonHash = '';
+                }}
                 // Emission discipline: a changed pair emits at most every
                 // 250ms (a busy row changes the pair every flush — an
                 // uncapped changed-pair stream was measured at ~27 events
@@ -2078,6 +2111,26 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 if (!stateChanged && nowMs - frameHashLastEmitMs < 1000) {{
                     return;
+                }}
+                if (mismatch) {{
+                    frameHashConsecutiveMismatchEmits =
+                        frameHashLastMismatchDaemonHash === frameHashDaemonHash
+                            ? frameHashConsecutiveMismatchEmits + 1
+                            : 1;
+                    frameHashLastMismatchDaemonHash = frameHashDaemonHash;
+                    // PERSISTENT-MISMATCH BACKOFF: a mismatch that has
+                    // already emitted three times against an UNCHANGED daemon
+                    // hash is a standing divergence, not a fresh artifact —
+                    // re-announcing it every second buys nothing. Back off to
+                    // one per 30s; the emit that does land carries
+                    // `backed_off: true` so a reader knows the cadence was
+                    // throttled, not that the fault healed.
+                    if (
+                        frameHashConsecutiveMismatchEmits > 3
+                        && nowMs - frameHashLastEmitMs < 30000
+                    ) {{
+                        return;
+                    }}
                 }}
                 frameHashLastStateKey = stateKey;
                 frameHashLastEmitMs = nowMs;
@@ -2105,7 +2158,10 @@ fn terminal_eval_script_with_canvas_renderer(
                     buffer_transitions: Number((gateEntry && gateEntry.bufferTransitionCount) || 0),
                     visual_reason: String((gateEntry && gateEntry.lastVisualTransitionReason) || ''),
                     host_age_ms: Number((gateEntry && gateEntry.mountedAtMs) ? (Date.now() - gateEntry.mountedAtMs) : 0),
-                    wheel_events: Number((gateEntry && gateEntry.wheelEventCount) || 0)
+                    wheel_events: Number((gateEntry && gateEntry.wheelEventCount) || 0),
+                    consecutive_mismatch: frameHashConsecutiveMismatchEmits,
+                    backed_off: frameHashConsecutiveMismatchEmits > 3,
+                    protocol_only_settle_skips: Number((gateEntry && gateEntry.frameHashProtocolOnlySettleSkips) || 0)
                 }});
             }} catch (_probeError) {{
                 // A probe failure must never disturb the flush path.
@@ -11344,9 +11400,21 @@ fn terminal_eval_script_with_canvas_renderer(
             if (currentEntry) {{
                 currentEntry.writeBridgeInFlight = false;
                 // The frame-hash probe pairs at flush settle — this is the
-                // quiescence point the mismatch verdict is defined at.
+                // quiescence point the mismatch verdict is defined at. When
+                // the drain just ENDED, classify it once: a drain that
+                // carried only control-only forwarded bytes must not pair
+                // (its client viewport diverges from the daemon grid by
+                // design), and its counters reset with the queue.
+                const __ygPendingAfterFlush = String(currentEntry.writeBridgePendingData || '').length;
+                if (__ygPendingAfterFlush === 0) {{
+                    currentEntry.writeBridgeLastSettleHadMeaningful =
+                        Number(currentEntry.writeBridgePendingMeaningfulChars || 0) > 0;
+                    currentEntry.writeBridgePendingMeaningfulChars = 0;
+                    currentEntry.writeBridgePendingProtocolOnlyChars = 0;
+                }}
                 maybePairFrameHash(
-                    String(currentEntry.writeBridgePendingData || '').length > 0
+                    __ygPendingAfterFlush > 0,
+                    currentEntry.writeBridgeLastSettleHadMeaningful !== false
                 );
                 if (flushElapsedMs !== null) {{
                     currentEntry.writeBridgeFlushMaxElapsedMs = Math.max(
@@ -12735,6 +12803,20 @@ fn terminal_eval_script_with_canvas_renderer(
                         incomingWriteData.slice(-200);
                     window.__yggtermXtermHosts[hostId].lastWriteError = '';
                     window.__yggtermXtermHosts[hostId].lastWriteQueuedAtMs = Date.now();
+                    // Classify the enqueue for the frame-hash probe's settle
+                    // gate: control-only forwarded bytes (spinner frames,
+                    // cursor show/hide) are withheld from the daemon's screen
+                    // model, so a drain that carried none of the meaningful
+                    // kind must not pair a mismatch verdict at its settle.
+                    if (message.protocol_only) {{
+                        window.__yggtermXtermHosts[hostId].writeBridgePendingProtocolOnlyChars =
+                            Number(window.__yggtermXtermHosts[hostId].writeBridgePendingProtocolOnlyChars || 0)
+                            + incomingWriteData.length;
+                    }} else {{
+                        window.__yggtermXtermHosts[hostId].writeBridgePendingMeaningfulChars =
+                            Number(window.__yggtermXtermHosts[hostId].writeBridgePendingMeaningfulChars || 0)
+                            + incomingWriteData.length;
+                    }}
                     window.__yggtermXtermHosts[hostId].recentInlineStatusAnimationUntilMs =
                         recentInlineStatusAnimationUntilMs;
                     window.__yggtermXtermHosts[hostId].recentInlineStatusAnimationHot =
@@ -12772,10 +12854,23 @@ fn terminal_eval_script_with_canvas_renderer(
                 // the read that carried it returned NO chunks, so this surface
                 // is caught up — pair right now (deferred to a task so the
                 // command loop is never blocked), not at some later flush
-                // whose content would already be newer than the hash.
+                // whose content would already be newer than the hash. A
+                // bridge still holding un-applied bytes (or a last drain that
+                // was all control-only forwarded output) defers/skips the
+                // pairing inside, same as a flush settle.
                 frameHashDaemonHash = typeof message.hash === 'string' ? message.hash : null;
                 frameHashRequestInFlight = false;
-                setTimeout(() => {{ maybePairFrameHash(false); }}, 0);
+                setTimeout(() => {{
+                    const __ygEntry = window.__yggtermXtermHosts
+                        && window.__yggtermXtermHosts[hostId];
+                    const __ygPending = __ygEntry
+                        ? String(__ygEntry.writeBridgePendingData || '').length
+                        : 0;
+                    maybePairFrameHash(
+                        __ygPending > 0,
+                        __ygEntry ? __ygEntry.writeBridgeLastSettleHadMeaningful !== false : true
+                    );
+                }}, 0);
             }} else if (message.kind === "set_input_enabled") {{
                 setInputEnabled(Boolean(message.enabled), Boolean(message.focus), true, 'rust_policy');
                 emitHostHealth();
@@ -15423,6 +15518,137 @@ mod flood_adaptive_paint_tests {
         assert!(
             parse(concat!("YGG_FLOOD_ENTER", "_CHARS_PER_S")) > parse(concat!("YGG_FLOOD_EXIT", "_CHARS_PER_S")),
             "enter threshold must exceed exit threshold — equal values flap the cadence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_hash_protocol_only_settle_tests {
+    use super::*;
+
+    /// The PRODUCT half of this file — test modules stripped, so a scan cannot
+    /// be satisfied by the needle its own assertion spells.
+    fn product_source() -> String {
+        let source = SHELL_SOURCE;
+        let product = yggterm_core::agent_cli::product_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !product.contains("mod frame_hash_protocol_only_settle_tests"),
+            "the scan is reading this test module"
+        );
+        product
+    }
+
+    /// ⛔ THE FRAME-HASH SETTLE GATE (measured 2026-09-08, GUI host): control-only
+    /// output (spinner frames, cursor show/hide) is forwarded to xterm but withheld
+    /// from the daemon's authoritative screen model, so a settle that applied only
+    /// such bytes pairs a client viewport against a grid that never saw them — the
+    /// mismatch can NEVER clear. One working codex row produced 501/501 mismatched
+    /// probes, one UI dispatch every ~3s for hours. The pairing must gate on the
+    /// drain's composition, and the gate must sit BEFORE the read that hashes.
+    #[test]
+    fn a_protocol_only_settle_never_pairs_a_mismatch_verdict() {
+        let product = product_source();
+        // The receiver classifies every enqueue by the write command's flag.
+        assert!(
+            product.contains("if (message.protocol_only)"),
+            "the write receiver must branch on the command's protocol_only flag"
+        );
+        assert!(
+            product.contains("writeBridgePendingProtocolOnlyChars")
+                && product.contains("writeBridgePendingMeaningfulChars"),
+            "the bridge must accumulate meaningful and control-only chars separately"
+        );
+        // The drain-end classification feeds the pairing call, and the pairing
+        // function consults it BEFORE hashing the buffer.
+        let classify = product
+            .find("writeBridgeLastSettleHadMeaningful")
+            .expect("the drain-end settle classification must exist");
+        let gate = product
+            .find("settleHadMeaningful === false")
+            .expect("the protocol-only settle gate must exist");
+        let read = product
+            .find("frameHashOf(term)")
+            .expect("the client hash read must exist");
+        assert!(
+            gate < read,
+            "the protocol-only gate must run before the buffer hash read"
+        );
+        assert!(
+            product.contains(
+                "currentEntry.writeBridgeLastSettleHadMeaningful !== false",
+            ),
+            "the settle pairing call must pass the drain composition"
+        );
+        // Inside the finalize block the classification must run before the
+        // call that consumes it (the pairing fn itself is defined earlier in
+        // the file — that order carries no wiring meaning).
+        let pending_after = product
+            .find("__ygPendingAfterFlush")
+            .expect("the finalize drain-end classification must exist");
+        let call_with_flag = product
+            .find("currentEntry.writeBridgeLastSettleHadMeaningful !== false")
+            .expect("the settle pairing call must exist");
+        assert!(
+            pending_after < call_with_flag,
+            "the drain must be classified before the pairing call reads the verdict"
+        );
+    }
+
+    /// A mismatch that survives three emits against an UNCHANGED daemon hash is a
+    /// standing divergence: the 1 Hz re-announce must back off to 30 s, and the
+    /// emit that lands must say so, or a reader mistakes throttling for healing.
+    #[test]
+    fn a_persistent_mismatch_backs_off_after_three_emits_and_says_so() {
+        let product = product_source();
+        let one_hz = product
+            .find("nowMs - frameHashLastEmitMs < 1000")
+            .expect("the 1 Hz persisting-mismatch gate must exist");
+        assert!(product.contains("frameHashConsecutiveMismatchEmits"),);
+        let backoff = product
+            .find("frameHashConsecutiveMismatchEmits > 3")
+            .expect("the 3-emit backoff threshold must exist");
+        let thirty_s = product
+            .find("nowMs - frameHashLastEmitMs < 30000")
+            .expect("the 30 s backoff window must exist");
+        assert!(
+            backoff > one_hz && thirty_s > backoff,
+            "the backoff must engage only after the 1 Hz gate declined to fire"
+        );
+        assert!(
+            product.contains("frameHashLastMismatchDaemonHash"),
+            "the streak must be keyed on the daemon hash, so a fresh daemon frame re-arms 1 Hz"
+        );
+        assert!(
+            product.contains("consecutive_mismatch: frameHashConsecutiveMismatchEmits")
+                && product.contains("backed_off: frameHashConsecutiveMismatchEmits > 3"),
+            "the frame_hash event must carry the streak and the backoff flag"
+        );
+    }
+
+    /// The Rust forward path must TELL the client which batches are control-only,
+    /// or the whole gate above is dead code. Guarded on the viewport source: the
+    /// live forward loops stamp the classification, and the enum carries the field.
+    #[test]
+    fn the_forward_loops_stamp_the_protocol_only_classification_on_writes() {
+        let viewport = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/shell/viewport.rs"))
+        .expect("viewport source");
+        assert!(
+            viewport.contains("protocol_only: forward_terminal_protocol_only_output"),
+            "the live forward loops must stamp the batch classification on Write"
+        );
+        let plain = viewport.matches("protocol_only: false").count();
+        assert!(
+            plain >= 10,
+            "every non-forward Write site must stamp an explicit false (found {plain})"
+        );
+        assert!(
+            SHELL_SOURCE.contains("protocol_only: bool"),
+            "TerminalJsCommand::Write must carry the classification field"
         );
     }
 }

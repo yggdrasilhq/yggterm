@@ -16428,8 +16428,8 @@ console.log('ok');
             "the daemon hash command must be consumed by the client"
         );
         assert!(
-            script.contains("const maybePairFrameHash = (hasPendingWrites)"),
-            "the pairing hook must be defined in the glue"
+            script.contains("const maybePairFrameHash = (hasPendingWrites, settleHadMeaningful)"),
+            "the pairing hook must be defined in the glue, taking the drain composition"
         );
         assert_eq!(
             script.matches("maybePairFrameHash(").count(),
@@ -16448,6 +16448,20 @@ console.log('ok');
         assert!(
             script.contains("frameHashLastEmitMs < 1000"),
             "a persisting mismatch must re-announce at 1 Hz so it cannot be missed"
+        );
+        // The settle gate (2026-09-08 wave): a drain that applied only
+        // control-only forwarded bytes (withheld from the daemon screen
+        // model) can never pair — its mismatch is manufactured, and one
+        // working codex row measured 501/501 probes mismatched, one UI
+        // dispatch every ~3s for hours.
+        assert!(
+            script.contains("settleHadMeaningful === false"),
+            "a protocol-only settle must never reach the pairing verdict"
+        );
+        assert!(
+            script.contains("nowMs - frameHashLastEmitMs < 30000"),
+            "a mismatch standing across three emits with an unchanged daemon \
+             hash must back off from 1 Hz to 30 s"
         );
     }
 

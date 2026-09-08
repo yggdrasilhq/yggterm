@@ -6589,7 +6589,7 @@ fn TerminalCanvas(
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
                 {
                     record_terminal_forward_sample(&trace_home, data.len(), current_millis());
-                    let _ = eval.send(TerminalJsCommand::Write { data });
+                    let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
                 }
                 // Post-resize background reconcile: a settled column-resize reflow
                 // may have dropped cell backgrounds (codex composer bg-split bug). Once
@@ -6921,7 +6921,7 @@ fn TerminalCanvas(
                                             "source": "js_ready",
                                         }),
                                     );
-                                    let _ = eval.send(TerminalJsCommand::Write { data });
+                                    let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
                                     set_signal_if_changed(terminal_resume_surface_staged, true);
                                     if !is_remote_resume_session {
                                         set_signal_if_changed(
@@ -7586,7 +7586,7 @@ fn TerminalCanvas(
                                                 let _ = eval.send(terminal_reset_command(&title, &theme));
                                                 placeholder_rendered = false;
                                             }
-                                            let _ = eval.send(TerminalJsCommand::Write { data: replay });
+                                            let _ = eval.send(TerminalJsCommand::Write { data: replay, protocol_only: false });
                                             set_signal_if_changed(
                                                 terminal_resume_surface_staged,
                                                 true,
@@ -7596,7 +7596,7 @@ fn TerminalCanvas(
                                             && terminal_prefill_should_render_to_host(&prefill)
                                         {
                                             let _ = eval.send(TerminalJsCommand::Write {
-                                                data: prefill,
+                                                data: prefill, protocol_only: false,
                                             });
                                             set_signal_if_changed(
                                                 terminal_resume_surface_staged,
@@ -9635,7 +9635,7 @@ fn TerminalCanvas(
                                         }),
                                     );
                                     let _ = eval.send(terminal_reset_command(&title, &theme));
-                                    let _ = eval.send(TerminalJsCommand::Write { data });
+                                    let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
                                     let _ = eval.send(TerminalJsCommand::Refit);
                                     set_signal_if_changed(terminal_resume_surface_staged, true);
                                 }
@@ -9866,7 +9866,7 @@ fn TerminalCanvas(
                                     // docs/xterm-bugs.md#screen-model-wider-than-viewer.
                                     let screen_text = screen_text.clone();
                                     let _ = eval.send(TerminalJsCommand::Write {
-                                        data: screen_text.clone(),
+                                        data: screen_text.clone(), protocol_only: false,
                                     });
                                     append_trace_event(
                                         &trace_home,
@@ -10309,7 +10309,7 @@ fn TerminalCanvas(
                                             );
                                             let _ = eval.send(terminal_reset_command(&title, &theme));
                                             let _ = eval.send(TerminalJsCommand::Write {
-                                                data: snapshot_text,
+                                                data: snapshot_text, protocol_only: false,
                                             });
                                             let _ = eval.send(TerminalJsCommand::Refit);
                                             let _ = eval.send(TerminalJsCommand::SetInputEnabled {
@@ -10550,7 +10550,7 @@ fn TerminalCanvas(
                                         );
                                         let _ = eval.send(terminal_reset_command(&title, &theme));
                                         let _ = eval.send(TerminalJsCommand::Write {
-                                            data: snapshot_text,
+                                            data: snapshot_text, protocol_only: false,
                                         });
                                         let _ = eval.send(TerminalJsCommand::Refit);
                                         let _ = eval.send(TerminalJsCommand::SetInputEnabled {
@@ -10708,7 +10708,7 @@ fn TerminalCanvas(
                                         }),
                                     );
                                     if !flushed.is_empty() {
-                                        let _ = eval.send(TerminalJsCommand::Write { data: flushed });
+                                        let _ = eval.send(TerminalJsCommand::Write { data: flushed, protocol_only: false });
                                     }
                                 }
                             }
@@ -11434,7 +11434,7 @@ fn TerminalCanvas(
                                             );
                                             let _ = eval.send(terminal_reset_command(&title, &theme));
                                             let _ = eval.send(TerminalJsCommand::Write {
-                                                data: snapshot_text,
+                                                data: snapshot_text, protocol_only: false,
                                             });
                                             let _ = eval.send(TerminalJsCommand::Refit);
                                             let _ = eval.send(TerminalJsCommand::SetInputEnabled {
@@ -12092,7 +12092,7 @@ fn TerminalCanvas(
                                                     );
                                                     if !flushed.is_empty() {
                                                         let _ = eval.send(TerminalJsCommand::Write {
-                                                            data: flushed,
+                                                            data: flushed, protocol_only: false,
                                                         });
                                                     }
                                                 }
@@ -12120,7 +12120,7 @@ fn TerminalCanvas(
                                                 );
                                                 let write_len = write.len();
                                                 if eval
-                                                    .send(TerminalJsCommand::Write { data: write })
+                                                    .send(TerminalJsCommand::Write { data: write, protocol_only: forward_terminal_protocol_only_output })
                                                     .is_err()
                                                 {
                                                     trace_terminal_write_send_failure(
@@ -12289,7 +12289,7 @@ fn TerminalCanvas(
                                                     let write_len = write.len();
                                                     if eval
                                                         .send(TerminalJsCommand::Write {
-                                                            data: write,
+                                                            data: write, protocol_only: forward_terminal_protocol_only_output,
                                                         })
                                                         .is_err()
                                                     {
@@ -12328,7 +12328,7 @@ fn TerminalCanvas(
                                             );
                                         }
                                         let _ = eval.send(TerminalJsCommand::Write {
-                                            data: prefill,
+                                            data: prefill, protocol_only: false,
                                         });
                                         set_signal_if_changed(
                                             terminal_resume_surface_staged,
@@ -12367,7 +12367,7 @@ fn TerminalCanvas(
                                         }),
                                     );
                                     if render_prefill_to_host {
-                                        let _ = eval.send(TerminalJsCommand::Write { data });
+                                        let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
                                         set_signal_if_changed(
                                             terminal_resume_surface_staged,
                                             true,
@@ -13059,7 +13059,7 @@ fn TerminalCanvas(
                                             let _ = eval.send(terminal_reset_command(&title, &theme));
                                             placeholder_rendered = false;
                                         }
-                                        let _ = eval.send(TerminalJsCommand::Write { data: replay });
+                                        let _ = eval.send(TerminalJsCommand::Write { data: replay, protocol_only: false });
                                         set_signal_if_changed(
                                             terminal_resume_surface_staged,
                                             true,
@@ -13068,7 +13068,7 @@ fn TerminalCanvas(
                                         && let Some(prefill) = placeholder.clone()
                                         && (is_remote_resume_session || terminal_prefill_should_render_to_host(&prefill))
                                     {
-                                        let _ = eval.send(TerminalJsCommand::Write { data: prefill });
+                                        let _ = eval.send(TerminalJsCommand::Write { data: prefill, protocol_only: false });
                                         set_signal_if_changed(
                                             terminal_resume_surface_staged,
                                             true,
