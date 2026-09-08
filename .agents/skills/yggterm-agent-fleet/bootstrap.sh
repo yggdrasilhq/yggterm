@@ -113,11 +113,12 @@ WITH_TIMERS=false
 for arg in "$@"; do
   case "$arg" in --with-timers) WITH_TIMERS=true ;; esac
 done
-# Also auto-install timers on first-ever bootstrap in this repo (created>0)
-# so a new user gets fleet sync without asking. Re-runs are no-ops.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Auto-install timers on first-ever bootstrap in this repo (created>0), or
+# whenever --with-timers is requested. Installed verb copies refresh below on
+# every bootstrap so code updates cannot remain stranded in the checkout.
 if [ "$WITH_TIMERS" = true ] || [ "$created" -gt 0 ]; then
   if command -v systemctl >/dev/null 2>&1 && [ -d "$HOME/.config/systemd/user" ] || mkdir -p "$HOME/.config/systemd/user" 2>/dev/null; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # Install ygg-memory fleet/harness + booter/monitor timers if not already enabled
     for pair in "ygg-memory-fleet" "ygg-memory-harness" "ygg-booter-tick" "ygg-monitor-tick"; do
       if [ -f "$SCRIPT_DIR/../yggterm-agent-fleet/ygg-memory.py" ] || [ -f "$HOME/.local/bin/ygg-memory" ]; then
@@ -130,23 +131,23 @@ if [ "$WITH_TIMERS" = true ] || [ "$created" -gt 0 ]; then
       fi
     done
   fi
-  # Ensure ygg-memory and ygg-memory-sync are on PATH for hooks — and keep the
-  # installed copies fresh. The checkout is the SSOT for the verb's code the same
-  # way the hub is the SSOT for memory content: every other CLI's memory is a
-  # cache the sync refreshes unconditionally, and this install once guarded the
-  # installed base so hard that the zcode adapter drifted for days existing only
-  # in ~/.local/bin (a reinstall would have silently regressed fleet-memory
-  # sync). Refresh unconditionally; hot-patching an installed copy is now
-  # correctly impossible — land it in the checkout and re-run bootstrap.
-  if [ -f "$SCRIPT_DIR/ygg-memory" ]; then
-    mkdir -p "$HOME/.local/bin"
-    cp "$SCRIPT_DIR/ygg-memory" "$HOME/.local/bin/ygg-memory" 2>/dev/null || true
-    cp "$SCRIPT_DIR/ygg-memory.py" "$HOME/.local/bin/ygg-memory.py" 2>/dev/null || true
-    cp "$SCRIPT_DIR/ygg-memory-sync" "$HOME/.local/bin/ygg-memory-sync" 2>/dev/null || true
-    chmod +x "$HOME/.local/bin/ygg-memory"* 2>/dev/null || true
-    note "installed/refreshed ygg-memory to ~/.local/bin"
-  fi
-  # Backfill Muse/Gemini/Codex from unified if they are empty (new user with only Claude)
+fi
+
+# Ensure ygg-memory and ygg-memory-sync are on PATH for hooks — and keep the
+# installed copies fresh on every bootstrap, even when the memory tree already
+# exists. The checkout is the SSOT for the verb's code the same way the hub is
+# the SSOT for memory content: refreshes must not depend on first-run creation.
+if [ -f "$SCRIPT_DIR/ygg-memory" ]; then
+  mkdir -p "$HOME/.local/bin"
+  cp "$SCRIPT_DIR/ygg-memory" "$HOME/.local/bin/ygg-memory" 2>/dev/null || true
+  cp "$SCRIPT_DIR/ygg-memory.py" "$HOME/.local/bin/ygg-memory.py" 2>/dev/null || true
+  cp "$SCRIPT_DIR/ygg-memory-sync" "$HOME/.local/bin/ygg-memory-sync" 2>/dev/null || true
+  chmod +x "$HOME/.local/bin/ygg-memory"* 2>/dev/null || true
+  note "installed/refreshed ygg-memory to ~/.local/bin"
+fi
+
+# Backfill Muse/Gemini/Codex from unified if they are empty (new user with only Claude)
+if [ "$WITH_TIMERS" = true ] || [ "$created" -gt 0 ]; then
   if command -v ygg-memory >/dev/null 2>&1 || [ -x "$HOME/.local/bin/ygg-memory" ]; then
     YM="$HOME/.local/bin/ygg-memory"; [ -x "$YM" ] || YM="ygg-memory"
     for h in muse gemini codex grok; do
