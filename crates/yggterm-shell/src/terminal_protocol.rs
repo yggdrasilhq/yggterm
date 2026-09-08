@@ -41,6 +41,15 @@ pub(crate) enum TerminalJsCommand {
     },
     Write {
         data: String,
+        /// The batch was classified control-only (spinner frames, cursor
+        /// show/hide) and was withheld from the daemon's authoritative screen
+        /// model while being forwarded here. The frame-hash probe must not
+        /// pair a mismatch verdict at the settle of such a batch: the client
+        /// viewport legitimately differs from a daemon grid that never saw
+        /// these bytes, so the pair can never agree (measured 2026-09-08:
+        /// 501/501 mismatch probes across one working codex row, one UI
+        /// dispatch every ~3s for hours — the felt row/modal lag).
+        protocol_only: bool,
     },
     /// The frame-hash probe's daemon half (frame_hash.rs): the daemon's
     /// authoritative-grid hash, forwarded to the client half which pairs it

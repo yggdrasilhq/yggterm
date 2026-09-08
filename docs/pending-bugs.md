@@ -28006,3 +28006,90 @@ rotation non-empty) stays ARMED — the GUI host's 3 entries (02:12) were
 written under the daemon that still owns the socket, so no rotation has
 tested them yet.
 
+
+## ⛔ [11.87] THE SWITCH STORM STARVES THE UI THREAD — 10-15 SECOND FREEZES DURING ROW SWITCHES AND A ROW REORDER, THE OWNER'S GHOST FRAME, DRAG LAG AND ROW/MODAL LAG IN ONE WINDOW (caught live, 2026-09-08 ~14:32 IST, GUI host)
+
+**Status:** OPEN
+
+The owner reported a ghost frame on switching back to a codex row, "ui blocks
+from switching out", and dragging/row/modal lag. All four felt symptoms are one
+measured fault: during a switch the GUI's own render + web processes burn half
+a core each and the UI thread goes silent for seconds at a stretch.
+
+Measured (owner's GUI client, pid 3242531, trace + ytrace):
+
+- UI-thread blocks (the watchdog's gap_ms): 10.4 s ending 14:32:54, 10.6 s
+  ending 14:33:58, **14.9 s ending 14:35:55 — the instant of a
+  `live_session_reorder_succeeded` (the owner dragging a row)**, and 12.8 s at
+  14:36:16. The 14:32:54 gap begins at the exact `ensure_end` of an unrelated
+  remote row's mount (14:32:43.47); UI events resume only with the recovery
+  burst and a `reveal_ghost_attached` mount of a third row.
+- `render/gui` hot_cpu 27.7 s in a 60 s window (core_fraction 0.46) with
+  `render/web_content` 24.7-27.6 s beside it; committed memory ~900 MB. The
+  SECOND GUI window (pid 3131528) burned 7.8-10.2 s CPU in the same windows —
+  a switch storm taxes every client on the machine.
+- 12-hour ui/block totals across the plane: 2609 events, p50 425 ms, p95
+  2.0 s, max 14.9 s — the standing bar is ≤1/min and p95 ≤ 50 ms. 30× over.
+- The ghost frame itself: the reveal ghost canvas is bounded (2.4 s deadline
+  release) and was falsified as the July husk cause; what the owner saw is the
+  STALE SURFACE UNDER it — the real paint starved behind the storm, so after
+  the ghost lifts the old frame is still what is on screen.
+
+Mechanism: a switch fans out into full xterm rebuilds of rows the user never
+clicked (one local shell remounted twice in 80 s; the bootstrap
+reset→skip→spawn-scheduled triplet repeating per render), each rebuild paying
+construct + snapshot-restore + reveal on the UI thread while the web process
+chews the retained replay; meanwhile the restore tick's describe_rows storm
+(3-6 s cadence), declare-absent batch and corpse-reload renders interleave.
+During all of it the working codex row keeps forwarding control-only spinner
+frames ([11.88]'s subject), each one a UI dispatch.
+
+**Fix shape (next session, in attack order):** (a) dedup the per-render
+bootstrap reset/skip churn so a switch rebuilds only the row the user clicked;
+(b) pace the retained-replay drain under the frame budget on switch-back (the
+117 KB drain measured fine; the multi-MB agy backlog is the freeze); (c) gate
+the describe_rows/declare-absent render fan-out while a switch is in flight;
+(d) re-measure ui/block p95 against the bar after (a)-(c).
+
+**Falsifier:** the next owner switch between agent rows on a busy desktop
+shows ui/block p95 under 100 ms for the switch leg and no gap over 1 s; the
+drag leg shows no gap over 250 ms.
+
+## ⛔ [11.88] THE FRAME-HASH PROBE MISMATCHED FOREVER ON WORKING ROWS — CONTROL-ONLY FORWARDED OUTPUT MUTATES THE CLIENT VIEWPORT THE DAEMON GRID NEVER MODELS, ONE UI DISPATCH EVERY ~3 s FOR HOURS (caught live 2026-09-08, GUI host, fixed in code same session)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The observation that falsifies the fix: after the deploy, a working codex/agy
+row (spinner active) shows ZERO new `frame_hash_probe` mismatch events whose
+`protocol_only_settle_skips` is not also advancing on the same mount; a real
+ghost (mismatch at a settle that DID apply meaningful bytes) still emits at
+1 Hz.
+
+Measured: 501/501 mismatched probes on one dev codex row in a 38-minute
+window, and the storm persisting on two more rows right now (b22f17ec,
+agy 92ad4e7a) — client hash changing every ~3 s probe while the daemon's
+authoritative grid hash stayed frozen (`fnv32:9fd5bcb5` for the whole window;
+`fnv32:3b1018c3` on the live row for 5+ minutes). The forward path is BY
+DESIGN asymmetric: control-only output (spinner frames, cursor show/hide,
+frame-like high-volume repaints) is forwarded to the client xterm but
+withheld from the daemon's screen model (`suppress_resume_control_only_
+output`), so every spinner burst legitimately moves the client viewport,
+the burst's end crosses the probe's 800 ms quiet line, the settle pairs,
+and the mismatch — unresolvable by construction — emits with a UI dispatch
+per event. The probe's own design doc ("a mismatch at quiescence while
+at_bottom IS artifacting") assumed the two surfaces see the same bytes; the
+control-only forward broke that assumption the day it landed.
+
+**Fixed here:** `TerminalJsCommand::Write` carries `protocol_only`; the
+bridge accumulates meaningful vs control-only chars per drain; the settle
+classification gates the pairing (a protocol-only-only settle increments the
+host entry's `frameHashProtocolOnlySettleSkips` — visible in host-health,
+silent on the trace plane); and a mismatch that has already emitted three
+times against an UNCHANGED daemon hash backs off 1 Hz → 30 s, annotated
+(`consecutive_mismatch`, `backed_off`) so throttling never reads as healing.
+A fresh daemon hash or a meaningful settle re-arms the 1 Hz announce.
+
+Source contracts: `a_protocol_only_settle_never_pairs_a_mismatch_verdict`,
+`a_persistent_mismatch_backs_off_after_three_emits_and_says_so`,
+`the_forward_loops_stamp_the_protocol_only_classification_on_writes`; the
+pairing wiring test rewritten for the new signature.
