@@ -9103,6 +9103,9 @@ fn TerminalCanvas(
                                 visual_reason,
                                 host_age_ms,
                                 wheel_events,
+                                consecutive_mismatch,
+                                backed_off,
+                                protocol_only_settle_skips,
                             }) => {                                // The frame-hash probe's client half
                                 // (frame_hash_probe.js): the applied viewport hash
                                 // paired against the daemon's authoritative-grid
@@ -9133,6 +9136,9 @@ fn TerminalCanvas(
                                         "visual_reason": visual_reason,
                                         "host_age_ms": host_age_ms,
                                         "wheel_events": wheel_events,
+                                        "consecutive_mismatch": consecutive_mismatch,
+                                        "backed_off": backed_off,
+                                        "protocol_only_settle_skips": protocol_only_settle_skips,
                                     }),
                                 );
                             }
