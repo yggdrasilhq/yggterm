@@ -28051,6 +28051,35 @@ bootstrap reset/skip churn so a switch rebuilds only the row the user clicked;
 the describe_rows/declare-absent render fan-out while a switch is in flight;
 (d) re-measure ui/block p95 against the bar after (a)-(c).
 
+**MEASURED VERDICT (2026-09-08 ~21:40-21:50, live on 3.2.87, zcode seat):**
+the storm is still live post-[11.88] — 8 gaps over 1.5 s in 8.5 minutes
+across both GUI clients (p95 2.0 s, max 5.7 s). The block watchdog's kernel
+witness names a deeper layer every fix shape above only trims around: each
+big gap carries 185-582 MAJOR page faults on the UI thread (the 5.7 s gap:
+582 maj_flt, 2778 min_flt, 517 voluntary context switches) — the switch
+path's working set is cold, and the loop pages it in serially against the
+host's ~9.6 GiB swap debt. The fan-outs decide how many cold pages one
+switch touches, and the felt freeze is swap-in latency times that set; the
+structural half is the memory-footprint bound (the cgroup memory.high queue
+item), which this verdict moves UP the queue. Live anatomy of the worst gap:
+show_start_page -> activation -> four foreground refresh_remote_machine
+surface requests -> open_path, 5.7 s end to end — but the refresh WORK runs
+on the blocking pool (not the blocker), each apply is a ~1 ms sidebar merge,
+and the loop's own instrumented branches total ~150 ms in the window: the
+dark time is the loop paging its own heap back in, not one traceable call.
+
+LANDED (lane/trace/switch-storm, same session): (c-1) the surface-restore
+ask's runtime-token re-arm treated a snapshot that cannot see the runtime as
+a new runtime, so a known-pid <-> unknown flicker reset the backoff forever —
+measured 1230 `daemon_declare_absent` in one 8.5-minute tail, 59-68 asks per
+never-declaring row where the 60 s ceiling promises ~8 (six times over). The
+re-arm now fires only on a known-different pid; unknown keeps the schedule.
+(c-2) the ask tick sits out while the active row's attach is in flight. Four
+tests lock both. STILL OWED: (a) the bootstrap-churn dedup (the agy row took
+8 real remounts in 8.5 idle minutes), (b) retained-replay pacing (wants a
+live multi-MB switch-back repro before touching), (d) the re-measure below
+after the roll.
+
 **Falsifier:** the next owner switch between agent rows on a busy desktop
 shows ui/block p95 under 100 ms for the switch leg and no gap over 1 s; the
 drag leg shows no gap over 250 ms.
