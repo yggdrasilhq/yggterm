@@ -245,6 +245,24 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         legacy: false,
         example: "grok-runtime://00000000-0000-4000-8000-0000000000ce",
     },
+    SchemeDescriptor {
+        prefix: "remote-zcode-tui://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::ZcodeTui),
+        agent: true,
+        legacy: false,
+        example: "remote-zcode-tui://devhost/00000000-0000-4000-8000-000000000032",
+    },
+    SchemeDescriptor {
+        prefix: "zcode-tui-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::ZcodeTui),
+        agent: true,
+        legacy: false,
+        example: "zcode-tui-runtime://00000000-0000-4000-8000-000000000033",
+    },
     // ── Non-agent (registered so shared predicates can be locked too) ──────
     SchemeDescriptor {
         prefix: "live::",

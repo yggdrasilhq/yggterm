@@ -3437,10 +3437,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // desktop's own generated titles) — yggterm never invents one.
         title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
-        // v1 is LOCAL-ONLY: no remote wrapper subcommands exist.
-        wrapper_slug: None,
-        remote_row_scheme: None,
-        runtime_key_scheme: None,
+        // Fleet spawning (owner directive 2026-09-08): the remote wrapper
+        // arms (`resume-zcode-tui`, `start-zcode-tui`,
+        // `zcode-tui-session-exists`) are generated from this slug, and the
+        // resume contract is the descriptor's own `--resume <sessionId>`.
+        wrapper_slug: Some("zcode-tui"),
+        remote_row_scheme: Some("remote-zcode-tui://"),
+        runtime_key_scheme: Some("zcode-tui-runtime://"),
         // MEASURED off the TUI's own status bar and composer indicator (the
         // only working chrome it draws): "streaming…" during a turn, "●
         // running" on the composer's second row.
@@ -3530,7 +3533,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Live rows take their title from the shared store's own session
         // table (the desktop's generated titles — title_authority Store).
         read_live_store_title: Some(read_zcode_tui_live_store_title),
-        remote_live_store_title: None,
+        remote_live_store_title: Some(ZCODE_TUI_REMOTE_TITLE_PROBE),
     },
 ];
 
@@ -5025,6 +5028,39 @@ for g in globs:
         if candidates:
             print(json.dumps({'session_id': sid, 'candidates': candidates}, ensure_ascii=False))
 "#;
+
+/// zcode-tui's remote twin: the shared store's own `session.title` (the
+/// desktop generates it; title_authority is Store, so the remote probe only
+/// reads). SQLite read-only URI mode, short query — the same WAL discipline
+/// the TUI's local reader uses.
+const ZCODE_TUI_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+ids = [v for v in argv[argv.index('--') + 1:] if v.strip()]
+if not ids:
+    sys.exit(0)
+db = os.path.expanduser('~/.zcode/cli/db/db.sqlite')
+if not os.path.exists(db):
+    sys.exit(0)
+conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+cur = conn.cursor()
+for sid in ids:
+    try:
+        cur.execute('SELECT title FROM session WHERE id = ?1 LIMIT 1', (sid,))
+        row = cur.fetchone()
+    except Exception:
+        continue
+    if row and row[0] and str(row[0]).strip():
+        print(json.dumps({'session_id': sid, 'candidates': [str(row[0]).strip()]}, ensure_ascii=False))
+"#;
+
+const ZCODE_TUI_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: ZCODE_TUI_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
 
 const GROK_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: GROK_REMOTE_TITLE_SCRIPT,
