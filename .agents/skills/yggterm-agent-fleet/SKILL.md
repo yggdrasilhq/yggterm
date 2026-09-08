@@ -1284,26 +1284,34 @@ maintain local memory stores in `~/.{claude,gemini,grok,codex}/`. `~/.yggterm/me
 acts as the unified cross-harness memory hub with an append-only event journal
 (`journal.jsonl`) and per-harness watermark tracking (`watermarks/<harness>.json`).
 
-### The Turn-One Retrieval Ritual (<40 tokens):
+### The Turn-One Retrieval Ritual:
 
-At the start of any session or campaign, check if other harnesses have published
-new findings or handover updates since your last sync:
+At the start of any session or campaign, synchronize the requested project area
+before relying on memory. The area gate is mandatory; a status/diff read against
+a stale native store is not a memory check:
 
 ```sh
-# 1. Cheap status check (~25 tokens)
-python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness <me>
+# 1. Strict native-memory ↔ unified-hub area gate
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py sync --harness <me> --ns=<area>
 
-# 2. View delta summaries if behind (~80 tokens)
-python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness <me>
+# 2. Verify the synchronized area and inspect its delta
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness <me> --ns=<area>
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness <me> --ns=<area>
 
-# 3. Impatient / selective absorption (fetch only what you need)
-python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py get --file <campaign-or-finding.md>
+# 3. Open one relevant door
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py get --file <campaign-or-finding.md> --ns=<area>
 
 # 4. Acknowledge absorbed items
-python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness <me> --files <campaign-or-finding.md>
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness <me> --ns=<area> --files <campaign-or-finding.md>
 # Or acknowledge all up to latest:
-python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness <me> --all
+python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py ack --harness <me> --ns=<area> --all
 ```
+
+`sync` is a strict one-namespace gate and fails on conflicts or missing
+content. Add `--fleet` when another host may have learned something since the
+last mesh convergence. Resolve the campaign area from the request, not blindly
+from the execution cwd, and do not begin source exploration before the gate
+succeeds.
 
 ### Publishing New Findings Across Harnesses:
 

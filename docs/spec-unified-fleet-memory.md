@@ -124,13 +124,13 @@ Tracks the sequence number and file state absorbed by each CLI harness:
 To ensure any agent automatically discovers and leverages unified memory without hardcoded model modifications, every root `MEMORY.md` index includes an **Intelligent Ingestion Steering Block** at the very top:
 
 ```markdown
-> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, or Gemini. Ingest full or partial diffs as needed.
+> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall, campaign continuation, or after a handover, run `ygg-memory sync --harness <me> --ns=<area>` first. Then inspect `status`/`diff` and open the relevant door with `get` in the same namespace. Add `--fleet` when another host may have learned something.
 ```
 
 When an agent reads `MEMORY.md` at session start:
 1. It sees the steering prompt.
-2. It executes `ygg-memory status --harness <me>`.
-3. If updates exist, it reviews the diff and chooses whether to selectively ingest the active campaign door or perform a full sync.
+2. It resolves the requested campaign area and executes the strict `ygg-memory sync --harness <me> --ns=<area>` gate.
+3. It verifies the synchronized area with `status`/`diff` and opens the active campaign door with `get`.
 
 ---
 
@@ -145,6 +145,7 @@ The CLI tool lives in `.agents/skills/yggterm-agent-fleet/ygg-memory.py` and is 
 | `status` | Reports whether harness is behind on shared doors + its own scoped steers | **~25–40 tokens** |
 | `diff` | Outputs compact delta list with one-line descriptions/hooks | **~80–150 tokens** |
 | `get` | Fetches full Markdown content of a specific memory door | Variable (file size) |
+| `sync` | Strictly synchronizes one explicit native-memory area and fails on conflicts or missing objects; `--fleet` adds mesh convergence | Local filesystem, or network with `--fleet` |
 | `ack` | Advances harness watermark globally (`--all`) or for specific files | **~10–20 tokens** |
 | `publish` | Ingests a memory door with optional `--target-harness` scope | **~20 tokens** |
 | `sync-harness` | Two-way sync between harness-local directory and matching unified doors | Local filesystem |
@@ -152,15 +153,20 @@ The CLI tool lives in `.agents/skills/yggterm-agent-fleet/ygg-memory.py` and is 
 
 ### 4.2 Example Interaction Workflows
 
-#### Fast Startup Check (Turn 1)
+#### Area-Gated Startup Check (Turn 1)
 ```bash
-$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness gemini
+$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py sync --harness gemini --ns=-home-user-proj
+{"status": "ok", "namespace": "-home-user-proj", "conflicts": 0, "missing_objects": 0}
+```
+
+```bash
+$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py status --harness gemini --ns=-home-user-proj
 {"behind": 2, "last_seq": 1039, "latest_seq": 1041, "changed_doors": ["campaign-6.0-orchestrator-handover.md", "steer-gemini-ytop-pixel-test.md"]}
 ```
 
 #### Scoped Diff Inspection
 ```bash
-$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness gemini
+$ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py diff --harness gemini --ns=-home-user-proj
 [#1040 | campaign] campaign-6.0-orchestrator-handover.md (by claude): Seat 6.0 orchestrator cluster state & dead SHA sweep
 [#1041 | steer -> gemini] steer-gemini-ytop-pixel-test.md (by gemini): Iterative ytop UI updates must be verified with screenshots until finished
 ```
@@ -193,4 +199,4 @@ it never degrades to a silent no-op that reports success.
 
 1. **Privacy Guard (`scripts/check-privacy.sh`):** Unit tests and documentation must only use synthetic test fixtures (invented UUIDs, invented project paths like `/home/user/proj`). Zero real filings, personal paths, or credentials in fixtures.
 2. **Locking & Concurrency:** File locks (`flock`) prevent interleaving when multiple agents read/write concurrently.
-3. **Idempotence:** Every operation (`ack`, `publish`, `sync-harness`) is strictly idempotent.
+3. **Idempotence:** Every operation (`ack`, `publish`, `sync`, `sync-harness`) is strictly idempotent.

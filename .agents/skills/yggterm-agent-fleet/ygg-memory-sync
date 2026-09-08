@@ -31,6 +31,14 @@ if ! command -v "$YGG_MEM" >/dev/null 2>&1 && [ ! -x "$YGG_MEM" ]; then
   YGG_MEM="$(dirname "$0")/ygg-memory.py"
 fi
 
+# Scratch is disk-backed by contract. The old /tmp fallback charged desktop
+# memory/swap and could outlive the session that created it.
+SYNC_SCRATCH="${YGGTERM_SCRATCHPAD:-${HOME}/.yggterm/scratchpad}"
+SYNC_LOG="${SYNC_SCRATCH}/ygg-memory-sync.log"
+if ! mkdir -p "$SYNC_SCRATCH" 2>/dev/null; then
+  SYNC_LOG=/dev/null
+fi
+
 # Blocking: sync current namespace + yggterm (fast, <500ms)
 # These are the "at least these regions" you asked for
 CRITICAL_NS=("-home-pi-gh-yggterm" "$NS")
@@ -55,10 +63,10 @@ if command -v systemd-run >/dev/null 2>&1 && systemctl --user is-system-running 
   systemd-run --user --on-active=2 --unit="ygg-memory-sync-${HARNESS}-$$" --quiet \
     bash -c "$TRIGGER_CMD" 2>/dev/null || {
     # Fallback if systemd-run fails
-    setsid bash -c "sleep 2; $TRIGGER_CMD" </dev/null >>/tmp/ygg-memory-sync.log 2>&1 &
+    setsid bash -c "sleep 2; $TRIGGER_CMD" </dev/null >>"$SYNC_LOG" 2>&1 &
   }
 else
-  setsid bash -c "sleep 2; $TRIGGER_CMD" </dev/null >>/tmp/ygg-memory-sync.log 2>&1 &
+  setsid bash -c "sleep 2; $TRIGGER_CMD" </dev/null >>"$SYNC_LOG" 2>&1 &
 fi
 
 exit 0

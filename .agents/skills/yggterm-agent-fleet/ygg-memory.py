@@ -79,7 +79,7 @@ def resolve_fleet_mesh(explicit=None):
 
 STEERING_HEADER = """# Memory Index
 
-> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall or after campaign handovers, consult `ygg-memory status --harness <me>` or `ygg-memory diff` to catch updates from Claude, Grok, Codex, Gemini, Zcode, or Muse. Ingest full or partial diffs as needed.
+> 🌐 **UNIFIED FLEET MEMORY**: Before deep memory recall, campaign continuation, or after a handover, run `ygg-memory sync --harness <me> --ns=<area>` first. Then inspect `status`/`diff` and open only the relevant door with `get --file=<door> --ns=<area>`. If another host may have learned something, add `--fleet` to the sync.
 > ⛔ **Doors, not rooms.** Rules (`feedback-/spec-/reference-/user-`) · ledgers (`campaign-/project-`) · findings (`finding-/bug-class-`) · steers (`steer-<harness>-`).
 > One line, one door. Detail belongs in the target file, never here.
 """
@@ -89,6 +89,30 @@ MANAGED_BLOCK_BEGIN = "<!-- BEGIN yggterm-memory -->"
 MANAGED_BLOCK_END = "<!-- END yggterm-memory -->"
 
 
+def validate_namespace(namespace: str) -> str:
+    """Return a single safe namespace directory name."""
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("memory namespace must not be empty")
+    if namespace in {".", "..", "-"} or any(char in namespace for char in ("/", "\\", "\x00")):
+        raise ValueError(f"invalid memory namespace: {namespace!r}")
+    if any(ord(char) < 32 for char in namespace):
+        raise ValueError(f"invalid control character in memory namespace: {namespace!r}")
+    return namespace
+
+
+def validate_door_filename(filename: str) -> str:
+    """Return a single Markdown filename that cannot escape its namespace."""
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("memory door filename must not be empty")
+    if filename in {".", ".."} or Path(filename).name != filename:
+        raise ValueError(f"memory door must be a filename, not a path: {filename!r}")
+    if any(char in filename for char in ("/", "\\", "\x00")):
+        raise ValueError(f"invalid character in memory door filename: {filename!r}")
+    if any(ord(char) < 32 for char in filename):
+        raise ValueError(f"invalid control character in memory door filename: {filename!r}")
+    return filename
+
+
 def memory_bridge(harness: str) -> str:
     """Small always-loaded door; the hub remains the room and source of truth."""
     canonical = normalize_harness_name(harness)
@@ -96,9 +120,9 @@ def memory_bridge(harness: str) -> str:
         f"{MANAGED_BLOCK_BEGIN}\n"
         "## Yggterm fleet memory\n\n"
         "Yggterm synchronizes semantic memory before managed CLI startup and by a catch-up timer. "
-        "Before deep recall, after a handover, or whenever another machine or CLI may have learned "
-        f"something, run `ygg-memory status --harness {canonical}` and `ygg-memory diff --harness {canonical}`, then open only the relevant door "
-        "with `ygg-memory get --file <name>`. Publish durable findings through `ygg-memory publish`; "
+        "Before deep recall, campaign continuation, or after a handover, run the area gate "
+        f"`ygg-memory sync --harness {canonical} --ns=<area>` first, then inspect status/diff and open only the relevant door "
+        "with `ygg-memory get --file <name> --ns=<area>`. Publish durable findings through `ygg-memory publish`; "
         "never copy credentials, sessions, databases, indexes, or lock files between machines.\n\n"
         f"This harness name is `{canonical}`. The current project namespace is derived from the cwd.\n"
         f"{MANAGED_BLOCK_END}"
@@ -1329,17 +1353,19 @@ def detect_namespace(cwd: Path = None, override: str = None) -> str:
     if override:
         ns = override.strip()
         if not ns.startswith("-"):
-            ns = "-" + ns.replace("/", "-").strip("-")
-        return ns
+            ns = "-" + ns.replace("/", "-").replace("\\", "-").strip("-")
+        return validate_namespace(ns)
     target = (cwd or Path.cwd()).resolve()
     # Normalize absolute path to slug: /home/user/proj -> -home-user-proj
-    slug = str(target).replace("/", "-")
-    return slug
+    slug = str(target).replace("/", "-").replace("\\", "-")
+    return validate_namespace(slug)
 
 
-def get_namespace_dir(root: Path, namespace: str) -> Path:
+def get_namespace_dir(root: Path, namespace: str, create: bool = True) -> Path:
+    namespace = validate_namespace(namespace)
     d = root / "namespaces" / namespace
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -1403,6 +1429,8 @@ def memory_origin(root: Path) -> str:
 
 
 def object_path(root: Path, digest: str) -> Path:
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+        raise ValueError(f"invalid content-object digest: {digest!r}")
     return root / "objects" / digest[:2] / digest
 
 
@@ -1610,7 +1638,7 @@ def causal_heads_for(
     return list(semantic.values())
 
 
-def materialize_store(root: Path) -> dict:
+def materialize_store(root: Path, namespaces: set[str] | None = None) -> dict:
     """Materialize content-addressed event heads without hiding divergence.
 
     A causal successor names ``base_version`` and supersedes that version. Two
@@ -1629,6 +1657,8 @@ def materialize_store(root: Path) -> dict:
 
     written = deleted = conflicts = missing_objects = 0
     for (namespace, filename), records in groups.items():
+        if namespaces is not None and namespace not in namespaces:
+            continue
         heads = causal_heads_for(root, namespace, filename, records)
         if not heads:
             continue
@@ -1823,10 +1853,11 @@ def cmd_diff(args):
 def cmd_get(args):
     root = Path(args.root)
     ns = detect_namespace(override=args.ns)
-    ns_dir = get_namespace_dir(root, ns)
-    target = ns_dir / args.file
+    filename = validate_door_filename(args.file)
+    ns_dir = get_namespace_dir(root, ns, create=False)
+    target = ns_dir / filename
     if not target.exists():
-        print(f"Error: Door '{args.file}' not found in namespace '{ns}'.", file=sys.stderr)
+        print(f"Error: Door '{filename}' not found in namespace '{ns}'.", file=sys.stderr)
         sys.exit(1)
     with open(target, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -1844,7 +1875,7 @@ def cmd_get(args):
     if len(shown) != total:
         cut = f" (match /{args.grep}/)" if args.grep else ""
         print(
-            f"[ygg-memory] showing {len(shown)} of {total} lines of {args.file}{cut}"
+            f"[ygg-memory] showing {len(shown)} of {total} lines of {filename}{cut}"
             " — this is a SLICE; run without --lines/--grep for the whole door.",
             file=sys.stderr,
         )
@@ -1879,7 +1910,8 @@ def cmd_ack(args):
         elif args.files:
             acked_files = []
             ns_dir = get_namespace_dir(root, ns)
-            for fname in [f.strip() for f in args.files.split(",") if f.strip()]:
+            requested_files = [validate_door_filename(f.strip()) for f in args.files.split(",") if f.strip()]
+            for fname in requested_files:
                 fpath = ns_dir / fname
                 if fpath.exists():
                     ns_map[fname] = file_sha256(fpath)
@@ -1978,24 +2010,25 @@ def cmd_resolve(args):
     root = Path(args.root)
     harness = detect_harness(args.harness)
     namespace = detect_namespace(override=args.ns)
+    filename = validate_door_filename(args.file)
     source = Path(args.using).resolve()
     if not source.is_file():
         raise SystemExit(f"ygg-memory: resolution source does not exist: {source}")
     lock = _flock_open(root / ".ygg-memory.lock")
     try:
-        heads = causal_heads_for(root, namespace, args.file)
-        raw_heads = causal_heads_for(root, namespace, args.file, coalesce=False)
+        heads = causal_heads_for(root, namespace, filename)
+        raw_heads = causal_heads_for(root, namespace, filename, coalesce=False)
         if len(heads) < 2:
-            raise SystemExit(f"ygg-memory: {namespace}/{args.file} has fewer than two divergent heads")
-        destination = get_namespace_dir(root, namespace) / args.file
+            raise SystemExit(f"ygg-memory: {namespace}/{filename} has fewer than two divergent heads")
+        destination = get_namespace_dir(root, namespace, create=False) / filename
         if source != destination.resolve():
             shutil.copyfile(source, destination)
         content = destination.read_text(encoding="utf-8")
-        kind, summary, target = extract_metadata_and_summary(content, args.file)
+        kind, summary, target = extract_metadata_and_summary(content, filename)
         record = append_journal_entry(
             root,
             namespace,
-            args.file,
+            filename,
             kind,
             "resolve",
             harness,
@@ -2007,9 +2040,9 @@ def cmd_resolve(args):
             base_versions=[head["version_id"] for head in raw_heads],
         )
         report = materialize_store(root)
-        remaining = causal_heads_for(root, namespace, args.file)
+        remaining = causal_heads_for(root, namespace, filename)
         if len(remaining) != 1:
-            raise RuntimeError(f"resolution did not converge {args.file}: {len(remaining)} heads remain")
+            raise RuntimeError(f"resolution did not converge {filename}: {len(remaining)} heads remain")
         if args.json:
             print(json.dumps({"status": "ok", "record": record, "report": report}))
         else:
@@ -2138,48 +2171,111 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
     return in_count, out_count, del_count
 
 
+def _sync_harness_namespace(
+    root: Path,
+    harness: str,
+    namespace: str,
+    local_dir: str | None = None,
+) -> dict:
+    """Synchronize one native area and return its convergence report."""
+    adapter = get_harness_adapter(harness)
+    lock = _flock_open(root / ".ygg-memory.lock")
+    try:
+        migrate_legacy_store(root)
+        if local_dir:
+            if not isinstance(adapter, ProjectMemoryAdapter):
+                raise ValueError(f"{harness} does not support --local-dir; use its native adapter")
+            ingested, delivered, deleted = _sync_project_memory_namespace(
+                root, harness, namespace, Path(local_dir)
+            )
+        else:
+            ingested, delivered, deleted = adapter.sync_namespace(root, harness, namespace)
+
+        # The area gate must report a broken causal store instead of silently
+        # handing the caller a partially materialized door.
+        materialized = materialize_store(root, namespaces={namespace, GLOBAL_NAMESPACE})
+        watermark = load_watermark(root, harness)
+        if not materialized["conflicts"] and not materialized["missing_objects"]:
+            mark_events_seen(root, watermark, namespace, harness)
+            watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            save_watermark(root, watermark)
+        return {
+            "status": "ok",
+            "harness": harness,
+            "namespace": namespace,
+            "pulled_in": ingested,
+            "pushed_out": delivered,
+            "deleted": deleted,
+            **materialized,
+        }
+    finally:
+        _flock_close(lock)
+
+
 def cmd_sync_harness(args):
     """Bidirectional sync between harness-local directory and ~/.yggterm/memory."""
     root = Path(args.root)
     harness = detect_harness(args.harness)
     adapter = get_harness_adapter(harness)
+
+    if not getattr(args, "all", False):
+        ns = detect_namespace(override=args.ns)
+        result = _sync_harness_namespace(root, harness, ns, getattr(args, "local_dir", None))
+        if args.json:
+            print(json.dumps(result))
+        else:
+            extra = f", {result['deleted']} deleted" if result["deleted"] else ""
+            print(f"Harness sync completed ({harness} <-> {ns}): {result['pulled_in']} ingested, {result['pushed_out']} propagated{extra}.")
+        return
+
     lock = _flock_open(root / ".ygg-memory.lock")
 
     try:
         migrate_legacy_store(root)
-        if getattr(args, "all", False):
-            namespace_count, total_in, total_out, total_del = adapter.sync_all(root, harness)
-            watermark = load_watermark(root, harness)
-            mark_events_seen(root, watermark, None, harness)
-            watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            save_watermark(root, watermark)
-            if args.json:
-                print(json.dumps({"status": "ok", "harness": harness, "namespaces": namespace_count, "pulled_in": total_in, "pushed_out": total_out, "deleted": total_del}))
-            else:
-                print(f"Harness sync completed ({harness} all {namespace_count} ns): {total_in} ingested, {total_out} propagated, {total_del} deleted.")
-            return
-
-        ns = detect_namespace(override=args.ns)
-        # ``--local-dir`` is an explicit test/operator override for project-style
-        # adapters.  Codex deliberately has no such escape hatch: its inbox is
-        # the only sanctioned native write surface.
-        if getattr(args, "local_dir", None):
-            if not isinstance(adapter, ProjectMemoryAdapter):
-                raise ValueError(f"{harness} does not support --local-dir; use its native adapter")
-            inc, outc, delc = _sync_project_memory_namespace(root, harness, ns, Path(args.local_dir))
-        else:
-            inc, outc, delc = adapter.sync_namespace(root, harness, ns)
+        namespace_count, total_in, total_out, total_del = adapter.sync_all(root, harness)
+        materialized = materialize_store(root)
         watermark = load_watermark(root, harness)
-        mark_events_seen(root, watermark, ns, harness)
+        mark_events_seen(root, watermark, None, harness)
         watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         save_watermark(root, watermark)
         if args.json:
-            print(json.dumps({"status": "ok", "harness": harness, "namespace": ns, "pulled_in": inc, "pushed_out": outc, "deleted": delc}))
+            print(json.dumps({"status": "ok", "harness": harness, "namespaces": namespace_count, "pulled_in": total_in, "pushed_out": total_out, "deleted": total_del, **materialized}))
         else:
-            extra = f", {delc} deleted" if delc else ""
-            print(f"Harness sync completed ({harness} <-> {ns}): {inc} ingested, {outc} propagated{extra}.")
+            print(f"Harness sync completed ({harness} all {namespace_count} ns): {total_in} ingested, {total_out} propagated, {total_del} deleted.")
     finally:
         _flock_close(lock)
+
+
+def cmd_sync(args):
+    """Strict area gate used before campaign-memory recall."""
+    root = Path(args.root)
+    harness = detect_harness(args.harness)
+    if not args.ns:
+        raise SystemExit("ygg-memory sync requires an explicit --ns=<area>")
+    ns = detect_namespace(override=args.ns)
+
+    fleet_report = None
+    if getattr(args, "fleet", False):
+        fleet_report = _run_fleet_sync(root, resolve_fleet_mesh(getattr(args, "mesh", None)), quick=getattr(args, "quick", False))
+
+    result = _sync_harness_namespace(root, harness, ns, getattr(args, "local_dir", None))
+    if result["conflicts"] or result["missing_objects"]:
+        print(
+            f"ygg-memory: area sync did not converge for {ns}: "
+            f"{result['conflicts']} conflict(s), {result['missing_objects']} missing object(s)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if fleet_report is not None:
+        result["fleet"] = fleet_report
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(
+            f"Area sync completed ({harness} <-> {ns}): "
+            f"{result['pulled_in']} ingested, {result['pushed_out']} propagated, "
+            f"{result['deleted']} deleted."
+        )
 
 
 def _merge_journals(local_path: Path, peer_content: str):
@@ -2557,13 +2653,20 @@ def cmd_startup(args):
 
 
 def main():
-    common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("--root", default=str(DEFAULT_MEMORY_ROOT), help="Root path for ~/.yggterm/memory")
-    common_parser.add_argument("--harness", default=None, help="Agent CLI harness name")
-    common_parser.add_argument("--ns", default=None, help="Project namespace (e.g. -home-pi-gh-yggterm)")
+    # The same options are accepted before or after the subcommand. Subparser
+    # defaults must be suppressed or argparse will overwrite a value parsed
+    # before the subcommand with None (observed with --harness codex sync ...).
+    common_parser = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    common_parser.add_argument("--root", help="Root path for ~/.yggterm/memory")
+    common_parser.add_argument("--harness", help="Agent CLI harness name")
+    common_parser.add_argument("--ns", help="Project namespace (e.g. -home-pi-gh-yggterm)")
     common_parser.add_argument("--json", action="store_true", help="Format output as JSON for tool calls")
 
-    parser = argparse.ArgumentParser(description="Unified Cross-Harness Fleet Memory Tool", parents=[common_parser])
+    parser = argparse.ArgumentParser(description="Unified Cross-Harness Fleet Memory Tool")
+    parser.add_argument("--root", default=str(DEFAULT_MEMORY_ROOT), help="Root path for ~/.yggterm/memory")
+    parser.add_argument("--harness", default=None, help="Agent CLI harness name")
+    parser.add_argument("--ns", default=None, help="Project namespace (e.g. -home-pi-gh-yggterm)")
+    parser.add_argument("--json", action="store_true", help="Format output as JSON for tool calls")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # status
@@ -2595,6 +2698,13 @@ def main():
     p_resolve = subparsers.add_parser("resolve", parents=[common_parser], help="Resolve all divergent heads of one door")
     p_resolve.add_argument("--file", required=True, help="Conflicted door filename")
     p_resolve.add_argument("--using", required=True, help="Reviewed Markdown file containing the merged result")
+
+    # strict area gate
+    p_sync = subparsers.add_parser("sync", parents=[common_parser], help="Strictly sync one memory area before recall")
+    p_sync.add_argument("--local-dir", default=None, help=argparse.SUPPRESS)
+    p_sync.add_argument("--fleet", action="store_true", help="Sync the fleet mesh before the local area")
+    p_sync.add_argument("--mesh", default=None, help="Optional fleet roster override used with --fleet")
+    p_sync.add_argument("--quick", action="store_true", help="Use quick fleet probes with --fleet")
 
     # sync-harness
     p_sync_h = subparsers.add_parser("sync-harness", parents=[common_parser], help="Bi-directional sync with local harness store")
@@ -2633,6 +2743,8 @@ def main():
         cmd_publish(args)
     elif args.subcommand == "resolve":
         cmd_resolve(args)
+    elif args.subcommand == "sync":
+        cmd_sync(args)
     elif args.subcommand == "sync-harness":
         cmd_sync_harness(args)
     elif args.subcommand == "sync-fleet":
@@ -2648,4 +2760,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as error:
+        print(f"ygg-memory: {error}", file=sys.stderr)
+        sys.exit(2)

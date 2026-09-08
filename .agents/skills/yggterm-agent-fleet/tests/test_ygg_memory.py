@@ -188,6 +188,104 @@ Never wait on human if clear directive exists.
         # CRITICAL CHECK: Gemini-only steer must NOT be pushed to claude_memory!
         check("harness sync DID NOT push steer-gemini to claude dir", not (claude_dir / "steer-gemini-subagent-dispatch.md").exists())
 
+        # 9b. The strict one-area gate is explicit, testable, and reports a
+        # converged namespace without requiring the live native store.
+        class ArgsSync:
+            pass
+
+        args_gate = ArgsSync()
+        args_gate.root = str(root)
+        args_gate.harness = "claude"
+        args_gate.ns = ns
+        args_gate.local_dir = str(claude_dir)
+        args_gate.fleet = False
+        args_gate.mesh = None
+        args_gate.quick = False
+        args_gate.json = True
+        mod.cmd_sync(args_gate)
+        check("strict area sync gate completed", True)
+
+        # Global options must work before the subcommand as well as after it.
+        saved_argv = sys.argv[:]
+        try:
+            sys.argv = [
+                "ygg-memory.py", "--root", str(root), "--harness", "claude",
+                "sync", f"--ns={ns}", "--local-dir", str(claude_dir), "--json",
+            ]
+            mod.main()
+            global_options_before_subcommand = True
+        except SystemExit:
+            global_options_before_subcommand = False
+        finally:
+            sys.argv = saved_argv
+        check("global options survive parsing before the subcommand", global_options_before_subcommand)
+
+        # 9c. User-controlled namespace and door paths cannot escape the hub.
+        try:
+            mod.validate_namespace("-safe/../outside")
+            safe_namespace = False
+        except ValueError:
+            safe_namespace = True
+        check("namespace traversal is rejected", safe_namespace)
+        try:
+            mod.validate_door_filename("../outside.md")
+            safe_filename = False
+        except ValueError:
+            safe_filename = True
+        check("door filename traversal is rejected", safe_filename)
+        try:
+            mod.object_path(root, "../outside")
+            safe_object = False
+        except ValueError:
+            safe_object = True
+        check("object digest traversal is rejected", safe_object)
+
+        missing_ns = "-missing-read-only-namespace"
+        args_get = type("ArgsGet", (), {
+            "root": str(root), "ns": missing_ns, "file": "missing.md",
+            "grep": None, "lines": None,
+        })()
+        try:
+            mod.cmd_get(args_get)
+        except SystemExit:
+            pass
+        check("missing get does not create a namespace directory",
+              not (root / "namespaces" / missing_ns).exists())
+
+        # 9d. The strict gate fails closed on a real divergent causal area.
+        conflict_root = tmp_root / "conflict-memory"
+        conflict_ns = "-conflict-area"
+        conflict_dir = mod.get_namespace_dir(conflict_root, conflict_ns)
+        conflict_file = conflict_dir / "campaign-conflict.md"
+        conflict_file.write_text("# first head\n", encoding="utf-8")
+        mod.append_journal_entry(
+            conflict_root, conflict_ns, conflict_file.name, "campaign", "create",
+            "claude", "first head",
+        )
+        conflict_file.write_text("# second head\n", encoding="utf-8")
+        mod.append_journal_entry(
+            conflict_root, conflict_ns, conflict_file.name, "campaign", "update",
+            "claude", "second head", base_version=None,
+        )
+        conflict_native = tmp_root / "conflict-native"
+        args_conflict = ArgsSync()
+        args_conflict.root = str(conflict_root)
+        args_conflict.harness = "claude"
+        args_conflict.ns = conflict_ns
+        args_conflict.local_dir = str(conflict_native)
+        args_conflict.fleet = False
+        args_conflict.mesh = None
+        args_conflict.quick = False
+        args_conflict.json = True
+        try:
+            mod.cmd_sync(args_conflict)
+            conflict_failed_closed = False
+        except SystemExit as exc:
+            conflict_failed_closed = exc.code == 2
+        check("strict area sync fails closed on conflicts", conflict_failed_closed)
+        check("failed area sync does not advance its watermark",
+              mod.load_watermark(conflict_root, "claude").get("last_sync_ts") is None)
+
         # 10. Muse adapter resolves the XDG native store, never another harness's.
         fake_home = (tmp_root / "fakehome").resolve()
         muse_projects = fake_home / ".local" / "share" / "muse" / "memory" / "projects"
