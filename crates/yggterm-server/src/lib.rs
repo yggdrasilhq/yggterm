@@ -6992,6 +6992,21 @@ impl YggtermServer {
         applied
     }
 
+    /// The row's current title, resolved the way [`Self::set_session_title_hint`]
+    /// resolves writes. The title-follow chore reads the row through THIS door so
+    /// its equal-skip decision addresses the same row the write will — a read
+    /// that resolves a different twin than the write is the [11.86] shape, where
+    /// the follower "satisfies" itself against a row it never writes.
+    pub fn live_session_title_resolved(&self, session_path: &str) -> Option<String> {
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .map(|session| session.title.clone())
+    }
+
     /// Whether this row's title was set by a human. The scanned mirror carries
     /// no provenance of its own, so the live row is the one owner of the
     /// answer — asking it here keeps the two copies from disagreeing.
@@ -26784,6 +26799,7 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
     let mut rows = Vec::new();
     let mut mismatches = 0usize;
     let mut store_named = 0usize;
+    let mut store_silent_count = 0usize;
     // ⛔ A REMOTE ROW'S STORE LIVES ON THE FAR SIDE OF THE SSH HOP. The local
     // reader would answer from THIS host's stores (or its generated-title
     // cache — yesterday's titles posing as the CLI's word), which is exactly
@@ -26982,6 +26998,16 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
             if is_mismatch {
                 mismatches += 1;
             }
+            // A store that answers nothing is a VERDICT, not an absence: the
+            // birth-named army (rows wearing "New dev <CLI>" for days) read as
+            // `ssot_match: true` here because null-vs-anything never flags.
+            // Naming the class is what made the 2026-09-08 title wave visible:
+            // ghost rows whose transcripts were deleted, and rows whose id was
+            // never rebound to the id their CLI actually keys its store by.
+            let store_silent = cli_store_title.is_none();
+            if store_silent {
+                store_silent_count += 1;
+            }
             if cli_store_title.is_some() {
                 store_named += 1;
             }
@@ -27000,6 +27026,13 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
                 "cli_store_title": cli_store_title,
                 "ssot_match": !is_mismatch,
                 "mismatch": is_mismatch,
+                "ssot_verdict": if is_mismatch {
+                    "mismatch"
+                } else if store_silent {
+                    "store_silent"
+                } else {
+                    "match"
+                },
                 "owner_set": owner_set,
                 "holder": if row.kind == SessionKind::Shell {
                     serde_json::Value::Null
@@ -27016,6 +27049,7 @@ pub fn run_rows_live(mismatches_only: bool) -> anyhow::Result<()> {
     write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
         "row_count": rows.len(),
         "store_named": store_named,
+        "store_silent": store_silent_count,
         "mismatches": mismatches,
         "rows": rows,
     }))?)?;
@@ -35764,6 +35798,46 @@ mod tests {
              loopback rows through yggterm_core::agent_cli::\
              store_title_read_is_loopback — divergent spellings are the \
              measured two-wires fault"
+        );
+    }
+
+    /// ⭐ THE FOLLOWER READS THE RECORDS THE AUDIT READS — ONE ID AUTHORITY.
+    /// Measured 2026-09-08 ([11.86]): the chore snapshotted candidates from
+    /// `live_session_views()` and keyed its store read by `view.id`, while the
+    /// audit keyed by the persisted record's id. On a rebound row the two ids
+    /// differ: the chore read the OLD thread's title, found it equal to the
+    /// row's title, and skipped silently while the audit flagged the very
+    /// mismatch the follower believed it had satisfied. The chore must consume
+    /// `persisted_live_sessions()` — the audit's own source — so both wires
+    /// key their store reads by the SAME id BY CONSTRUCTION, and its
+    /// equal-skip must resolve the row the way the setter does.
+    #[test]
+    fn title_follow_reads_the_persisted_records_the_audit_reads() {
+        let daemon = include_str!("daemon.rs");
+        let chore_start = daemon
+            .find("fn run_row_title_follow_chore(")
+            .expect("run_row_title_follow_chore must exist");
+        let body_len = daemon[chore_start..]
+            .find("\nfn ")
+            .expect("the chore is followed by another fn");
+        let body = &daemon[chore_start..chore_start + body_len];
+        assert!(
+            body.contains("persisted_live_sessions()"),
+            "the title-follow chore must snapshot candidates from \
+             persisted_live_sessions() — the `rows live` audit's own source — \
+             so the follower and the audit key their store reads by the SAME id"
+        );
+        assert!(
+            !body.contains("live_session_views()"),
+            "the chore must not read candidates from live_session_views(): \
+             a view id can diverge from the persisted record id on a rebound \
+             row (the measured [11.86] two-wires fault)"
+        );
+        assert!(
+            body.contains("live_session_title_resolved"),
+            "the chore's equal-skip must read the current title through the \
+             setter's own resolution (live_session_title_resolved), or it can \
+             satisfy itself against a row it never writes"
         );
     }
 

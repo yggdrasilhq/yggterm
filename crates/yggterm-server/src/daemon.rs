@@ -15729,30 +15729,31 @@ fn match_agent_identities_to_targets(
 const ROW_TITLE_FOLLOW_INTERVAL_MS: u64 = 120_000;
 
 fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
-    // 1. Snapshot the candidates under the lock: live agent rows only.
+    // 1. Snapshot the candidates under the lock — from THE SAME SOURCE the
+    // `rows live` audit reads: the persisted live records, keyed and ID'd the
+    // same way. [11.86] (measured live, 2026-09-08): reading candidates from
+    // `live_session_views()` let the follower key its store read by an id the
+    // audit never sees — a rebound row's OLD id — so the chore read the old
+    // thread's title, found it equal to the row's title, and skipped silently
+    // while the audit flagged the very mismatch the follower believed it had
+    // satisfied. One id authority: both wires read the persisted record.
     let (candidates, user_home) = {
         let runtime = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
         let rows: Vec<(String, SessionKind, String, String)> = runtime
             .server
-            .live_session_views()
+            .persisted_live_sessions()
             .into_iter()
-            .filter(|view| {
-                matches!(
-                    view.source,
-                    SessionSource::LiveLocal | SessionSource::LiveSsh
-                )
+            .filter(|row| {
+                yggterm_core::agent_cli::agent_cli_descriptor(row.kind).is_some()
             })
-            .filter(|view| {
-                yggterm_core::agent_cli::agent_cli_descriptor(view.kind).is_some()
-            })
-            .map(|view| {
+            .map(|row| {
                 (
-                    view.session_path.clone(),
-                    view.kind,
-                    view.id.clone(),
-                    view.ssh_target.clone().unwrap_or_default(),
+                    row.key.clone(),
+                    row.kind,
+                    row.id.clone(),
+                    row.ssh_target.clone(),
                 )
             })
             .collect();
@@ -15844,15 +15845,17 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
     }
     // 3. Apply under the lock: the setter refuses owner-set titles itself.
     let mut applied = 0usize;
+    let mut store_silent = 0usize;
+    let mut equal_skips = 0usize;
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     {
         let mut runtime = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
         for (path, kind, id, ssh_target) in &candidates {
-            let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
+            if yggterm_core::agent_cli::agent_cli_descriptor(*kind).is_none() {
                 continue;
-            };
+            }
             let loopback = yggterm_core::agent_cli::store_title_read_is_loopback(ssh_target);
             let title = if loopback {
                 local_answers.get(path).cloned()
@@ -15862,15 +15865,33 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                     .and_then(|answers| answers.get(id).cloned())
             };
             let Some(title) = title else {
+                // A store that answers nothing is a NAMED outcome, not
+                // silence. The birth-named army stayed invisible for weeks
+                // because a silent read produced no tick evidence at all —
+                // [11.86]'s diagnosability half.
+                store_silent += 1;
+                if outcomes.len() < 12 {
+                    outcomes.push(serde_json::json!({
+                        "path": path,
+                        "outcome": "store_silent",
+                        "read_id": id,
+                    }));
+                }
                 continue;
             };
-            let current = runtime
-                .server
-                .live_session_views()
-                .into_iter()
-                .find(|view| view.session_path == *path)
-                .map(|view| view.title.clone());
+            // Read the current title through the SETTER's own resolution, so
+            // the equal-skip addresses the same row the write would have —
+            // a read that resolves a different twin is the [11.86] shape.
+            let current = runtime.server.live_session_title_resolved(path);
             if current.as_deref() == Some(title.as_str()) {
+                equal_skips += 1;
+                if outcomes.len() < 12 {
+                    outcomes.push(serde_json::json!({
+                        "path": path,
+                        "outcome": "equal_skip",
+                        "store_title": title,
+                    }));
+                }
                 continue;
             }
             if runtime.server.set_session_title_hint(path, &title) {
@@ -15925,6 +15946,8 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
             serde_json::json!({
                 "candidates": candidates.len(),
                 "applied": applied,
+                "store_silent": store_silent,
+                "equal_skips": equal_skips,
                 "local_answers": local_answers.len(),
                 "remote_hosts_answered": remote_answers.len(),
                 "remote_missing": remote_missing.len(),
