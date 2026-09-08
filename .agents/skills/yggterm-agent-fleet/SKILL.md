@@ -374,6 +374,25 @@ failing in opposite directions.
    one way: sessions under-estimate their remaining window and land too early, shredding
    continuity into micro-relays. The wall is real but it is measured, not felt.
 
+### Codex gauge reader
+
+Codex writes one rollout JSONL under `~/.codex/sessions/` for each session. Run the
+shared gauge with the exact rollout session id:
+
+```sh
+python3 ~/.claude/hooks/context-relay-gauge.py \
+  --cli codex --session <codex-session-id> --report
+```
+
+The Codex reader uses the latest `token_usage_record.payload.usage.input_tokens`
+as the current context size. `cached_input_tokens` is a subset of that value and
+must not be added again. It reads the recorded
+`event_msg/token_count.payload.info.model_context_window` as the window, publishes
+the same gauge JSON under `~/.claude/context-gauge/`, and uses NOTICE 55 / LAND 70 /
+CRITICAL 85. A session id is required; never select the newest rollout when more
+than one Codex row may be active. Before a relay, compare this reading with the
+Codex PTY/footer instrument and repair the gauge if they disagree.
+
 ### The interactive check, for when you want the CLI's own breakdown
 
 You cannot read your own token count directly — but you can ask
