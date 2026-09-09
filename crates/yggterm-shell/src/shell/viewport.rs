@@ -7866,7 +7866,16 @@ fn TerminalCanvas(
                                 // branch resets the cadence exactly as the inline
                                 // error path did.
                                 let track_completion = is_remote_resume_session;
-                                if track_completion {
+                                // Normal healthy input has a small in-flight
+                                // queue on every key. Keep that count local to
+                                // the writer instead of publishing a transient
+                                // ShellState status that would re-render the
+                                // whole sidebar and flash amber for 50–100 ms.
+                                // Publish queued bytes only while transport or
+                                // the frame is genuinely under attention.
+                                if track_completion
+                                    && (terminal_transport_degraded || terminal_ghost_frame)
+                                {
                                     cached_input_bytes = cached_input_bytes.saturating_add(data.len());
                                     update_terminal_surface_status(
                                         state,

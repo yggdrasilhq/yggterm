@@ -28291,3 +28291,44 @@ before the recovery timeout, the last faithful frame remains visible, typed
 bytes remain ordered and counted, one fresh painted frame turns the status
 green, and the ytrace/file history contains the complete hold → recovery →
 paint sequence without a UI-block gap caused by the recovery RPC.
+
+## ⛔ [11.91] LOCAL MODAL AND MODEL-LAUNCH FEEDBACK WAITS BEHIND SIDEBAR REBUILDS (reported 2026-09-09)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The owner reports that opening a modal or spawning a model still feels slow.
+Local feedback must be immediate even when the remote model or daemon is slow;
+remote inference and SSH startup themselves remain network-bound and are not
+promised to be instantaneous.
+
+The measured GUI-host window had 43 `ui/block` spans in one hour (p50 515 ms, p95
+1405 ms, max 2038 ms), `sidebar/merge_rows` up to 2016 ms, and app-control
+state/screenshot requests timing out at 15 s while the daemon remained the
+source of truth. The render root had three neighbouring effects that called
+`snapshot()` directly, bypassing the epoch-cached snapshot and rebuilding the
+full sidebar merge a second time. The Sidebar then repeated busy, unanswered,
+and ghost descendant walks for each row. Both costs sat ahead of a modal's
+first paint.
+
+**Fixed in code:** those effects now use `snapshot_shared()`, and the sidebar
+derives session/group/machine status once per render with a depth-ordered status
+index. App-row diagnostics use the same index. Ghost tooltips now distinguish
+`fresh_frame_pending` with healthy transport and zero queued bytes from a real
+degraded transport, so successful typing in an amber ghost row is explained
+instead of contradicted.
+
+Normal healthy remote input is not itself attention: the writer's short
+in-flight byte count is kept off the reactive status path, and
+`TerminalSurfaceStatus::needs_attention` requires degraded transport or a held
+ghost frame. This prevents the 50–100 ms amber flash on every typable
+keystroke while preserving cached-byte reporting after a real write failure.
+The launch-flags and CLI-install settings modals also use a modal-only state
+write path: their current open bits are read directly by the overlay and input
+cover, while the large data snapshot is reused for the first paint.
+
+**Falsifier:** on a large-tree shadow, opening a local modal or initiating a
+model launch must paint its local feedback on the first post-action render
+without a duplicate sidebar merge; the UI trace must attribute any later wait
+to the remote operation rather than the modal state write. A remote ensure may
+still take network time, but it must not hold the modal, keystroke loop, or
+existing terminal input hostage.

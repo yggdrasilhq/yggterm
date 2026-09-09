@@ -1,3 +1,92 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidebarRowStatus {
+    busy: bool,
+    busy_reason: &'static str,
+    attention: bool,
+    input_unanswered: bool,
+    ghost_frame: bool,
+}
+
+impl Default for SidebarRowStatus {
+    fn default() -> Self {
+        Self {
+            busy: false,
+            busy_reason: "idle",
+            attention: false,
+            input_unanswered: false,
+            ghost_frame: false,
+        }
+    }
+}
+
+/// Derive all sidebar status dots once per render, in one linear tree walk.
+///
+/// The old render loop asked three independent recursive helpers for every
+/// row. With a large remote tree that repeated the same descendant walk while
+/// a modal was waiting to paint. The session predicates remain the existing
+/// SSOT; this index only memoizes their result and propagates it to ancestors.
+fn sidebar_row_statuses(snapshot: &RenderSnapshot) -> Vec<SidebarRowStatus> {
+    let mut statuses = vec![SidebarRowStatus::default(); snapshot.rows.len()];
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        if row.kind != BrowserRowKind::Session {
+            continue;
+        }
+        let busy_state = sidebar_row_busy_state(snapshot, row);
+        let input_unanswered = sidebar_row_input_unanswered(snapshot, row);
+        let ghost_frame = sidebar_row_has_ghost_frame(snapshot, row);
+        let terminal_attention = terminal_surface_status_for_snapshot(snapshot, &row.full_path)
+            .is_some_and(TerminalSurfaceStatus::needs_attention);
+        statuses[index] = SidebarRowStatus {
+            busy: busy_state.visible,
+            busy_reason: busy_state.reason,
+            attention: input_unanswered || terminal_attention,
+            input_unanswered,
+            ghost_frame,
+        };
+    }
+
+    // Groups are depth-ordered. Keep their ancestor indexes, then propagate
+    // each session's already-derived status to every containing group. Machine
+    // roots additionally summarize live sessions that live in the flat Live
+    // Sessions group rather than in their cwd subtree.
+    let mut group_stack = Vec::<usize>::new();
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        while group_stack
+            .last()
+            .is_some_and(|group_index| snapshot.rows[*group_index].depth >= row.depth)
+        {
+            group_stack.pop();
+        }
+        if row.kind == BrowserRowKind::Group {
+            let machine_root = row.full_path == "local"
+                || row.full_path.starts_with("__remote_machine__/");
+            if machine_root {
+                statuses[index].busy |= sidebar_machine_row_has_working_live_session(snapshot, row);
+                statuses[index].input_unanswered |=
+                    sidebar_machine_row_has_input_unanswered_live_session(snapshot, row);
+                statuses[index].attention |=
+                    sidebar_machine_row_has_attention_live_session(snapshot, row);
+                statuses[index].ghost_frame |=
+                    sidebar_machine_row_has_ghost_frame_live_session(snapshot, row);
+            }
+            group_stack.push(index);
+        } else if row.kind == BrowserRowKind::Session {
+            for &group_index in &group_stack {
+                statuses[group_index].busy |= statuses[index].busy;
+                statuses[group_index].attention |= statuses[index].attention;
+                statuses[group_index].input_unanswered |= statuses[index].input_unanswered;
+                statuses[group_index].ghost_frame |= statuses[index].ghost_frame;
+            }
+        }
+    }
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        if row.kind == BrowserRowKind::Group && statuses[index].busy {
+            statuses[index].busy_reason = "group_descendant_working";
+        }
+    }
+    statuses
+}
+
 #[component]
 fn Sidebar(
     snapshot: SharedSnapshot,
@@ -61,22 +150,23 @@ fn Sidebar(
     // every render, across ~223 rows. A real `BrowserRow` clone now only happens
     // when an event actually fires (and once for the SidebarRow prop). See
     // [[finding-gui-latency-render-path-campaign]].
+    let row_statuses = sidebar_row_statuses(&snapshot);
     let visible_rows = snapshot
         .rows
         .iter()
-        .cloned()
-        .map(Rc::new)
-        .scan(false, |in_live_group, row| {
+        .enumerate()
+        .map(|(row_index, row)| (row_index, Rc::new(row.clone())))
+        .scan(false, |in_live_group, (row_index, row)| {
             if row.depth == 0 {
                 *in_live_group = row.full_path == "__live_sessions__";
             }
             let live_group_member = *in_live_group && row.depth > 0;
-            Some((row, live_group_member))
+            Some((row_index, row, live_group_member))
         })
         .collect::<Vec<_>>();
     let live_group_paths = visible_rows
         .iter()
-        .filter_map(|(row, live_group_member)| {
+        .filter_map(|(_, row, live_group_member)| {
             (*live_group_member && row.kind == BrowserRowKind::Session)
                 .then(|| row.full_path.clone())
         })
@@ -362,7 +452,7 @@ fn Sidebar(
                 if snapshot.show_loading_tree && snapshot.rows.is_empty() {
                     SidebarLoadingState { palette: snapshot.palette }
                 } else {
-                    for (row, live_group_member) in visible_rows.into_iter() {
+                    for (row_index, row, live_group_member) in visible_rows.into_iter() {
                     {
                         let select_row = row.clone();
                         let press_highlight_row = row.clone();
@@ -383,9 +473,29 @@ fn Sidebar(
                             }
                         }
                         .to_string();
-                        let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
-                        let input_unanswered = sidebar_row_input_unanswered(&snapshot, &row);
-                        let ghost_frame = sidebar_row_has_ghost_frame(&snapshot, &row);
+                        let row_status = row_statuses
+                            .get(row_index)
+                            .copied()
+                            .unwrap_or_default();
+                        let busy_icon = row_status.busy;
+                        let attention = row_status.attention;
+                        let input_unanswered = row_status.input_unanswered;
+                        let ghost_frame = row_status.ghost_frame;
+                        let terminal_attention_message = terminal_surface_status_for_snapshot(
+                            &snapshot,
+                            &row.full_path,
+                        )
+                        .filter(|status| status.needs_attention())
+                        .map(terminal_surface_attention_message)
+                        .unwrap_or_else(|| {
+                            if ghost_frame {
+                                "Held terminal frame inside — expand to inspect; machine transport may still be healthy".to_string()
+                            } else if attention {
+                                "Attention inside — expand to inspect the terminal state".to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
                         let row_dragging = sidebar_row_dragging_for_projection(
                             snapshot.drag_paths.as_slice(),
                             &live_group_paths,
@@ -433,8 +543,10 @@ fn Sidebar(
                                 visible_label: visible_label.clone(),
                                 icon_kind: icon_kind.clone(),
                                 busy_icon,
+                                attention,
                                 input_unanswered,
                                 ghost_frame,
+                                terminal_attention_message,
                                 selected: row_selected,
                                 drop_target: snapshot
                                     .drag_hover_target
@@ -885,20 +997,19 @@ fn sidebar_row_input_unanswered(snapshot: &RenderSnapshot, row: &BrowserRow) -> 
         // A group is COLLAPSED far more often than not, and a deaf row hidden
         // inside one is invisible for exactly as long as it stays folded —
         // which is the failure this whole signal exists to end, merely moved up
-        // one level. The busy state has aggregated over descendants since issue
-        // #3; attention has to, for the same reason and by the same walk.
+        // one level. The broad attention projection uses the same walk, but
+        // this helper stays narrow so a held frame is not mislabeled as an
+        // unanswered input.
         return sidebar_group_has_input_unanswered_descendant(snapshot, row)
             || sidebar_machine_row_has_input_unanswered_live_session(snapshot, row);
     }
     if row.kind != BrowserRowKind::Session {
         return false;
     }
-    let daemon_attention = yggterm_core::input_unanswered_suggests_wedge(
+    let wedge_suspected = yggterm_core::input_unanswered_suggests_wedge(
         sidebar_row_session_for_icon(snapshot, row).and_then(|session| session.input_unanswered_ms),
     );
-    daemon_attention
-        || terminal_surface_status_for_snapshot(snapshot, &row.full_path)
-            .is_some_and(TerminalSurfaceStatus::needs_attention)
+    wedge_suspected
 }
 
 /// Look up a terminal surface status by either its live URI or its normalized
@@ -921,6 +1032,49 @@ fn terminal_surface_status_for_snapshot<'a>(
                     (normalize_live_session_path(path) == normalized).then_some(status)
                 })
         })
+}
+
+/// Explain the amber session dot from the observable fields that caused it.
+///
+/// A recovered transport can still be waiting for its first fresh Paint, and
+/// that is exactly the state reported by the user's screenshot: typing works,
+/// but the visible frame is not yet proven current. The old tooltip always said
+/// "connection degraded" and "input is cached", which contradicted
+/// `transport_degraded:false` and `cached_input_bytes:0` and made a correct
+/// ghost warning look like a broken input path.
+fn terminal_surface_attention_message(status: &TerminalSurfaceStatus) -> String {
+    if status.ghost_frame {
+        if status.transport_degraded {
+            if status.cached_input_bytes > 0 {
+                return format!(
+                    "Held last frame — transport degraded; {} input bytes are queued until recovery",
+                    status.cached_input_bytes
+                );
+            }
+            return "Held last frame — transport degraded; fresh Paint is required before the frame is current".to_string();
+        }
+        if status.cached_input_bytes > 0 {
+            return format!(
+                "Held last frame — fresh Paint pending; transport is healthy and {} input bytes remain queued",
+                status.cached_input_bytes
+            );
+        }
+        return "Held last frame — fresh Paint pending; transport is healthy and input is live".to_string();
+    }
+    if status.transport_degraded {
+        return "Transport degraded — new input is cached until recovery".to_string();
+    }
+    if status.cached_input_bytes > 0 {
+        return format!(
+            "{} input bytes are queued — delivery has not completed",
+            status.cached_input_bytes
+        );
+    }
+    if status.reason.trim().is_empty() {
+        "Terminal attention requires a fresh observation".to_string()
+    } else {
+        format!("Terminal attention — {}", status.reason)
+    }
 }
 
 /// Does this row contain a held/ghost frame? This is kept separate from the
@@ -1015,20 +1169,50 @@ fn sidebar_machine_row_has_input_unanswered_live_session(
                 .as_deref()
                 .is_none_or(yggterm_server::is_loopback_ssh_target)
                 && is_local_live_session_path(&session.session_path)
-                && (yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
-                    || terminal_surface_status_for_snapshot(snapshot, &session.session_path)
-                        .is_some_and(TerminalSurfaceStatus::needs_attention))
+                && yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
         });
     }
     let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
         return false;
     };
     snapshot.live_sessions.iter().any(|session| {
-        (yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
-            || terminal_surface_status_for_snapshot(snapshot, &session.session_path)
-                .is_some_and(TerminalSurfaceStatus::needs_attention))
+        yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
             && (session.ssh_target.as_deref() == Some(machine_key)
                 || session.host_label == machine_key)
+    })
+}
+
+/// A machine root's single indicator also carries terminal-surface attention
+/// from its flat Live Sessions rows. This is the broad attention projection;
+/// the narrower input-unanswered fact remains available separately for
+/// diagnostics and the group gutter's wording.
+fn sidebar_machine_row_has_attention_live_session(
+    snapshot: &RenderSnapshot,
+    row: &BrowserRow,
+) -> bool {
+    let belongs_to_machine = |session: &ManagedSessionView, machine_key: &str| {
+        if machine_key == "local" {
+            session
+                .ssh_target
+                .as_deref()
+                .is_none_or(yggterm_server::is_loopback_ssh_target)
+                && is_local_live_session_path(&session.session_path)
+        } else {
+            session.ssh_target.as_deref() == Some(machine_key)
+                || session.host_label == machine_key
+        }
+    };
+    let Some(machine_key) = (row.full_path == "local")
+        .then_some("local")
+        .or_else(|| row.full_path.strip_prefix("__remote_machine__/"))
+    else {
+        return false;
+    };
+    snapshot.live_sessions.iter().any(|session| {
+        belongs_to_machine(session, machine_key)
+            && (yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
+                || terminal_surface_status_for_snapshot(snapshot, &session.session_path)
+                    .is_some_and(TerminalSurfaceStatus::needs_attention))
     })
 }
 /// Aggregate working state for a machine/cwd group row (issue #3): a group
@@ -2210,13 +2394,20 @@ fn SidebarRow(
     icon_kind: String,
     busy_icon: bool,
     /// This row has been written to and has said nothing back for longer than
-    /// any normal round trip — DESIGN.md's amber ATTENTION state. ⚠ A trigger,
+    /// any normal round trip — the narrower input-wedge fact. ⚠ A trigger,
     /// never a verdict; `terminal input-check` settles it.
     input_unanswered: bool,
     /// This row (or one of its live descendants) is showing the last faithful
-    /// frame while transport is degraded. It shares the attention dot with
-    /// queued input and owns the more precise tooltip wording.
+    /// frame while a fresh Paint is still pending. It shares the attention dot
+    /// with queued input and owns the more precise tooltip wording.
     ghost_frame: bool,
+    /// Any terminal attention, including a ghost frame or queued bytes. This
+    /// is intentionally broader than `input_unanswered`: a user can type into
+    /// a healthy transport while the last faithful frame is still held.
+    attention: bool,
+    /// The precise, content-free explanation for terminal attention when this
+    /// row owns it. Group rows receive the generic descendant explanation.
+    terminal_attention_message: String,
     selected: bool,
     drop_target: Option<DragDropPlacement>,
     dragging: bool,
@@ -2483,7 +2674,7 @@ fn SidebarRow(
     let row_set_member_count = row.descendant_sessions.saturating_sub(1);
     let row_expanded = row.expanded;
     let row_toggle_target_expanded = !row.expanded;
-    let machine_attention = machine_health.is_some() && input_unanswered;
+    let machine_attention = machine_health.is_some() && attention;
     let machine_blink = machine_health.is_some_and(|health| {
         machine_indicator_should_blink(health, busy_icon, machine_attention)
     });
@@ -2667,10 +2858,10 @@ fn SidebarRow(
                     // dot to the right of its own members'. Out here it cannot.
                     if !show_live_close
                         && row_is_group
-                        && input_unanswered
+                        && attention
                         && machine_health.is_none()
                     {
-                        // A GROUP holding a row that has stopped answering.
+                        // A GROUP holding a row that needs attention.
                         //
                         // ⛔ It goes in THE GUTTER, not beside the group's own
                         // dot, and the reason is a COLLISION rather than taste:
@@ -2678,24 +2869,27 @@ fn SidebarRow(
                         // on `MachineHealth::Cached`
                         // (`machine_indicator_color_value`), so repainting it
                         // would make "this machine is a cached snapshot" and
-                        // "something inside has gone deaf" the same pixel. The
+                        // "something inside needs attention" the same pixel. The
                         // gutter is empty on every group row, is the column
                         // DESIGN.md reserves for "the status dot, nothing
                         // else", and lines this dot up with the session dots it
                         // is standing in for.
                         //
-                        // STEADY, never blinking: blink means work is
-                        // happening, and the whole claim here is that it has
-                        // stopped.
+                        // STEADY, never blinking: blink means work is happening;
+                        // attention is a separate state, including a held
+                        // frame whose input path is still live.
                         span {
                             "data-sidebar-live-session-status-rail": "1",
                             style: session_row_dot_rail_style(SessionRowDensity::Sidebar),
                             span {
-                                "data-sidebar-group-input-unanswered-dot": "1",
+                                "data-sidebar-group-attention-dot": "1",
+                                "data-sidebar-group-input-unanswered": if input_unanswered { "1" } else { "0" },
                                 title: if ghost_frame {
-                                    "A session inside is holding its last frame because transport degraded — expand to inspect"
-                                } else {
+                                    "A session inside is holding its last frame — expand to inspect"
+                                } else if input_unanswered {
                                     "A session inside has been typed to with no response — expand to find it"
+                                } else {
+                                    "A session inside needs attention — expand to inspect"
                                 },
                                 style: live_session_status_dot_style_with_attention(palette, false, false, true),
                             }
@@ -2712,6 +2906,7 @@ fn SidebarRow(
                                 "data-sidebar-live-session-status-dot": "1",
                                 "data-sidebar-live-session-keep-alive": if row_kept_alive { "1" } else { "0" },
                                 "data-sidebar-live-session-working": if busy_icon { "1" } else { "0" },
+                                "data-sidebar-live-session-attention": if attention { "1" } else { "0" },
                                 "data-sidebar-live-session-input-unanswered": if input_unanswered { "1" } else { "0" },
                                 "data-sidebar-live-session-ghost-frame": if ghost_frame { "1" } else { "0" },
                                 // The attention state OWNS the tooltip when it
@@ -2721,10 +2916,12 @@ fn SidebarRow(
                                 // and the next step, and it does NOT say
                                 // "wedged" — that is a verdict this signal is
                                 // not entitled to make.
-                                title: if ghost_frame {
-                                    "Held last frame — connection degraded; input is cached until transport recovers"
+                                title: if !terminal_attention_message.is_empty() {
+                                    terminal_attention_message.as_str()
                                 } else if input_unanswered {
                                     "Typed to, no response yet — may not be listening. Check with: server app terminal input-check"
+                                } else if attention {
+                                    "Terminal attention inside — expand to inspect"
                                 } else {
                                     match (row_kept_alive, busy_icon) {
                                         (true, true) => "Keep-alive · working",
@@ -2733,7 +2930,7 @@ fn SidebarRow(
                                         (false, false) => "Live (closes with the app)",
                                     }
                                 },
-                                style: live_session_status_dot_style_with_attention(palette, row_kept_alive, busy_icon, input_unanswered),
+                                style: live_session_status_dot_style_with_attention(palette, row_kept_alive, busy_icon, attention),
                             }
                         }
                     }
@@ -2908,10 +3105,12 @@ fn SidebarRow(
                             "data-machine-working": if busy_icon { "1" } else { "0" },
                             "data-machine-attention": if machine_attention { "1" } else { "0" },
                             "data-machine-ghost-frame": if ghost_frame { "1" } else { "0" },
-                            title: if ghost_frame {
-                                "Held last frame inside — connection degraded; input is cached until transport recovers"
-                            } else if machine_attention {
-                                "Attention inside — expand to inspect the held terminal"
+                            title: if attention {
+                                if terminal_attention_message.is_empty() {
+                                    "Terminal attention inside — expand to inspect"
+                                } else {
+                                    terminal_attention_message.as_str()
+                                }
                             } else if health == MachineHealth::Cached {
                                 "Cached machine snapshot — reachability has not been freshly confirmed"
                             } else if busy_icon {
@@ -2925,7 +3124,7 @@ fn SidebarRow(
                                 status_dot_blink_opacity_css(machine_blink)
                             ),
                         }
-                    } else if row_is_group && busy_icon {
+                    } else if row_is_group && busy_icon && !attention {
                         // Non-machine groups (cwd folders, the local root) have no
                         // health dot; surface their aggregate working state with the
                         // same blinking working dot the live rows use.

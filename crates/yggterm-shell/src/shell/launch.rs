@@ -2239,7 +2239,11 @@ fn app() -> Element {
         let (scroll_path, show_loading_tree, suppress_autoscroll, bounds_repair_key) = {
             let shell = state.read();
             let active_path = shell.server.active_session_path().map(ToOwned::to_owned);
-            let snapshot = shell.snapshot();
+            // Reuse the render-epoch snapshot. Calling `snapshot()` here
+            // bypasses the shared cache, rebuilds the whole sidebar merge, and
+            // delays a local modal behind remote/tree work. This effect only
+            // needs the same immutable render facts as the root below.
+            let snapshot = shell.snapshot_shared();
             let selected_path = shell
                 .selection_anchor
                 .as_ref()
@@ -2304,7 +2308,7 @@ fn app() -> Element {
     });
     use_effect(move || {
         let target_dom_id = {
-            let snapshot = state.read().snapshot();
+            let snapshot = state.read().snapshot_shared();
             snapshot.search_content_hit_index.and_then(|ix| {
                 snapshot
                     .search_content_hits
@@ -2357,7 +2361,7 @@ fn app() -> Element {
     let dock_desktop = desktop.clone();
     use_effect(move || {
         let _ = *window_epoch.read();
-        let snapshot = state.read().snapshot();
+        let snapshot = state.read().snapshot_shared();
         let request = ghostty_dock_request(&dock_desktop, &snapshot);
         let (should_sync, window_to_hide) = {
             let shell = state.read();
@@ -2614,6 +2618,19 @@ fn app() -> Element {
     // top of this render body — reused here instead of rebuilding the ~223-row
     // projection a second time. See [[finding-gui-latency-render-path-campaign]].
     let app_control_backgrounded = state.read().app_control_backgrounded;
+    // These settings overlays are mounted from the current modal bits,
+    // not from the large data snapshot. Their click handlers intentionally use
+    // the modal-only write wrapper, so opening them cannot invalidate the
+    // snapshot that contains the 800+ row tree.
+    let (launch_flags_open, cli_install_open, keymap_editor_open, keymap_editor_error) = {
+        let shell = state.read();
+        (
+            shell.launch_flags_open,
+            shell.cli_install_open,
+            shell.keymap_editor_open,
+            shell.keymap_editor_error.clone(),
+        )
+    };
     let window_focused = state.read().effective_window_focused();
     let inner = desktop.inner_size();
     // PHYSICAL px → CSS px, once. A menu anchors at `evt.client_coordinates()`,
@@ -3346,7 +3363,7 @@ fn app() -> Element {
                 if evt.key() == Key::Escape {
                     if state.read().keymap_editor_open {
                         evt.prevent_default();
-                        state.with_mut_counted(|shell| shell.close_keymap_editor());
+                        state.with_modal_mut_counted(|shell| shell.close_keymap_editor());
                         return;
                     }
                     if state.read().pending_delete.is_some() {
@@ -3546,12 +3563,12 @@ fn app() -> Element {
             // The ALT+ keymap editor modal (Settings ▸ "Explore & edit KeyTips").
             // Another VIEW of the command registry: rebinds write through to
             // `~/.yggterm/keymap.json` and re-render every KeyTip badge.
-            if snapshot.keymap_editor_open {
+            if keymap_editor_open {
                 {
                     let palette = snapshot.palette;
                     let dark = palette_is_dark(palette);
                     let keymap = snapshot.keymap.clone();
-                    let error = snapshot.keymap_editor_error.clone();
+                    let error = keymap_editor_error.clone();
                     // The direct-accelerator column (§11.5): command-id → its chord,
                     // from the EFFECTIVE set (shipping defaults + the user's
                     // keymap.json overrides). Rebindable — the second door to each
@@ -3568,7 +3585,7 @@ fn app() -> Element {
                             "data-yggterm-modal-root": "keymap-editor",
                             style: "position:absolute; inset:0; z-index:500; display:flex; align-items:center; \
                                     justify-content:center; background:rgba(6,10,14,0.5); backdrop-filter:blur(2px);",
-                            onclick: move |_| state.with_mut_counted(|shell| shell.close_keymap_editor()),
+                            onclick: move |_| state.with_modal_mut_counted(|shell| shell.close_keymap_editor()),
                             div {
                                 style: format!(
                                     "width:min(460px, 92vw); max-height:82vh; overflow:auto; display:flex; \
@@ -3597,7 +3614,7 @@ fn app() -> Element {
                                              cursor:pointer; line-height:1; padding:2px 6px;",
                                             palette.muted
                                         ),
-                                        onclick: move |_| state.with_mut_counted(|shell| shell.close_keymap_editor()),
+                                        onclick: move |_| state.with_modal_mut_counted(|shell| shell.close_keymap_editor()),
                                         "✕"
                                     }
                                 }
@@ -4370,9 +4387,9 @@ fn app() -> Element {
                             on_endpoint_change: move |value: String| state.with_mut_counted(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut_counted(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut_counted(|shell| shell.update_interface_llm_model(value)),
-                            on_open_launch_flags: move |_| state.with_mut_counted(|shell| shell.set_launch_flags_open(true)),
+                            on_open_launch_flags: move |_| state.with_modal_mut_counted(|shell| shell.set_launch_flags_open(true)),
                             on_open_cli_install: move |_| {
-                                state.with_mut_counted(|shell| shell.set_cli_install_open(true));
+                                state.with_modal_mut_counted(|shell| shell.set_cli_install_open(true));
                                 // Kick the launch-parity probe for the local
                                 // column as the modal opens, so the chips
                                 // converge on what a LAUNCH resolves rather
@@ -4390,7 +4407,7 @@ fn app() -> Element {
                                 apply_active_terminal_zoom(state);
                             },
                             on_open_theme_editor: move |_| state.with_mut_counted(|shell| shell.open_theme_editor()),
-                            on_open_keymap_editor: move |_| state.with_mut_counted(|shell| shell.open_keymap_editor()),
+                            on_open_keymap_editor: move |_| state.with_modal_mut_counted(|shell| shell.open_keymap_editor()),
                             on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
                                 state.with_mut_counted(|shell| shell.update_notification_delivery(mode))
                             },
@@ -4648,7 +4665,12 @@ fn app() -> Element {
                 // full-window cover routes ALL input to the shell (see
                 // `chrome_transient_over_viewport`). Invisible and
                 // pointer-events:none — it only feeds the input region.
-                if chrome_transient_over_viewport(&snapshot) {
+                if chrome_transient_over_viewport_with_settings_modals(
+                    &snapshot,
+                    launch_flags_open,
+                    cli_install_open,
+                    keymap_editor_open,
+                ) {
                     div {
                         "data-covers-web-surface": "transient-chrome",
                         style: "position:fixed; inset:0; pointer-events:none; background:transparent; z-index:0;",
@@ -4659,7 +4681,12 @@ fn app() -> Element {
                 // closed. Rendered from `render_top_modal`, the same precedence
                 // `modal_key_dispatch` uses, so the DOM and the dispatcher can
                 // never disagree about which dialog is on top.
-                if let Some(top_modal) = render_top_modal(&snapshot) {
+                if let Some(top_modal) = render_top_modal_with_settings_modals(
+                    &snapshot,
+                    launch_flags_open,
+                    cli_install_open,
+                    keymap_editor_open,
+                ) {
                     div {
                         // ONE kind table ([`TopModal::kind`]), shared with the
                         // `data-yggterm-modal-root` subtree stamps and the ALT
@@ -4918,10 +4945,10 @@ fn app() -> Element {
                         },
                     }
                 }
-                if snapshot.launch_flags_open {
+                if launch_flags_open {
                     LaunchFlagsOverlay {
                         snapshot: snapshot.clone(),
-                        on_close: move |_| state.with_mut_counted(|shell| shell.set_launch_flags_open(false)),
+                        on_close: move |_| state.with_modal_mut_counted(|shell| shell.set_launch_flags_open(false)),
                         on_change: move |(slug, value): (String, String)| state.with_mut_counted(|shell| shell.update_agent_cli_extra_args(slug, value)),
                         on_reset: move |slug: String| state.with_mut_counted(|shell| shell.reset_agent_cli_extra_args(&slug)),
                         // Same two handlers the settings rail's fields use, so
@@ -4932,7 +4959,7 @@ fn app() -> Element {
                         on_blur_input: move |_| reclaim_active_terminal_input_after_settings_blur(state),
                     }
                 }
-                if snapshot.cli_install_open {
+                if cli_install_open {
                     CliInstallOverlay {
                         palette: snapshot.palette,
                         theme: snapshot.settings.theme,
@@ -4968,7 +4995,7 @@ fn app() -> Element {
                         on_reset_selection: move |_| state.with_mut_counted(|shell| {
                             shell.reset_cli_install_selection()
                         }),
-                        on_close: move |_| state.with_mut_counted(|shell| shell.set_cli_install_open(false)),
+                        on_close: move |_| state.with_modal_mut_counted(|shell| shell.set_cli_install_open(false)),
                     }
                 }
                 // A modal an APP raised from its contributed pane. Mounted with
