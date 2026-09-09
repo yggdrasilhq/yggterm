@@ -5940,6 +5940,28 @@ fn TerminalCanvas(
                     shell.active_terminal_host_id = Some(host_id.clone());
                 }
             });
+            // A remote attach is transport uncertainty, not a reason to blank
+            // an already faithful canvas. Mark it before the first slow SSH/
+            // ensure round trip so the existing row light turns amber at the
+            // start of the outage rather than after the timeout. A retained
+            // host supplies the ghost-frame bit; a cold host gets amber with no
+            // misleading last-frame claim.
+            let initial_terminal_ghost_frame = state.with(|shell| {
+                shell
+                    .terminal_surface_status_for_path(&session_path)
+                    .is_some_and(|status| status.ghost_frame)
+                    || shell.terminal_session_host_reusable_for_reveal(&session_path)
+            });
+            if is_remote_resume_session {
+                update_terminal_surface_status(
+                    state,
+                    &session_path,
+                    true,
+                    initial_terminal_ghost_frame,
+                    0,
+                    "remote_attach_pending",
+                );
+            }
             let suppress_initial_resume_notice = state.with(|shell| {
                 shell.terminal_session_should_suppress_initial_resume_notice(&session_path)
             });
@@ -6250,15 +6272,52 @@ fn TerminalCanvas(
             // echo read burst is armed at enqueue and the daemon's own
             // `input/pty` probe still stamps the delivery.
             let (terminal_write_tx, mut terminal_write_queue_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
-            let (terminal_write_failure_tx, mut terminal_write_failure_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(serde_json::Value, anyhow::Error)>();
+                tokio::sync::mpsc::unbounded_channel::<TerminalWriteCommand>();
+            let (terminal_write_event_tx, mut terminal_write_event_rx) =
+                tokio::sync::mpsc::unbounded_channel::<TerminalWriteEvent>();
             {
                 let endpoint = endpoint.clone();
                 let write_path = terminal_input_session_path.clone();
                 tokio::spawn(async move {
                     ensure_loop_branch_share_flusher();
-                    while let Some((data, enqueued_ms)) = terminal_write_queue_rx.recv().await {
+                    let mut pending = VecDeque::<(String, u64, bool)>::new();
+                    let mut pending_bytes = 0_usize;
+                    let mut paused_after_failure = false;
+                    let mut failure_reported = false;
+                    loop {
+                        if paused_after_failure || pending.is_empty() {
+                            match terminal_write_queue_rx.recv().await {
+                                Some(TerminalWriteCommand::Input {
+                                    data,
+                                    enqueued_ms,
+                                    track_completion,
+                                }) => {
+                                    let data_bytes = data.len();
+                                    if pending_bytes.saturating_add(data_bytes)
+                                        <= TERMINAL_INPUT_CACHE_MAX_BYTES
+                                    {
+                                        pending_bytes = pending_bytes.saturating_add(data_bytes);
+                                        pending.push_back((data, enqueued_ms, track_completion));
+                                    } else if terminal_write_event_tx
+                                        .send(TerminalWriteEvent::CacheFull {
+                                            data_bytes,
+                                            pending_bytes,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Some(TerminalWriteCommand::Resume) => {
+                                    paused_after_failure = false;
+                                }
+                                None => return,
+                            }
+                            continue;
+                        }
+                        let Some((data, enqueued_ms, track_completion)) = pending.front().cloned() else {
+                            continue;
+                        };
                         // The keystroke→pty span is stamped at the Input arm
                         // (enqueue) and at the daemon's PTY write, so its p95
                         // is entirely THIS task's territory: ordering backlog
@@ -6271,18 +6330,62 @@ fn TerminalCanvas(
                             current_millis().saturating_sub(enqueued_ms),
                         );
                         let shape = yggterm_core::perf::input_shape(&data);
+                        let data_bytes = data.len();
                         let rpc_started_ms = current_millis();
-                        let outcome =
-                            terminal_write_async(endpoint.clone(), write_path.clone(), data).await;
+                        let outcome = terminal_write_async(
+                            endpoint.clone(),
+                            write_path.clone(),
+                            data,
+                        )
+                        .await;
                         record_loop_branch_share(
                             "writer:rpc",
                             current_millis().saturating_sub(rpc_started_ms),
                         );
-                        if let Err(error) = outcome {
-                            // The loop dropping its failure receiver means the
-                            // session unmounted: nothing left to recover.
-                            if terminal_write_failure_tx.send((shape, error)).is_err() {
-                                return;
+                        match outcome {
+                            Ok(()) => {
+                                let _ = pending.pop_front();
+                                // The front item was cloned above, so subtract
+                                // its size from the cache before the next
+                                // attempt. Keep this explicit rather than
+                                // deriving bytes from UTF-8 character counts.
+                                // `data` was moved into the RPC; the queue head
+                                // is the only remaining byte source.
+                                pending_bytes = pending.iter().map(|(item, _, _)| item.len()).sum();
+                                if failure_reported || track_completion {
+                                    if terminal_write_event_tx
+                                        .send(TerminalWriteEvent::Completed {
+                                            data_bytes,
+                                            pending_bytes,
+                                            recovered_transport: failure_reported,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if pending.is_empty() {
+                                        failure_reported = false;
+                                    }
+                                    paused_after_failure = false;
+                                }
+                            }
+                            Err(error) => {
+                                paused_after_failure = true;
+                                failure_reported = true;
+                                // The failed item stays at the queue head. The
+                                // event loop may keep accepting input, but no
+                                // byte is dropped or reordered while transport
+                                // is down.
+                                if terminal_write_event_tx
+                                    .send(TerminalWriteEvent::Failed {
+                                        shape,
+                                        pending_bytes,
+                                        error,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -6411,6 +6514,7 @@ fn TerminalCanvas(
             let mut non_prompt_retained_recovery_attempts = 0_u64;
             let mut non_prompt_snapshot_replay_attempts = 0_u64;
             let mut blank_host_snapshot_replay_attempts = 0_u64;
+            let mut blank_host_snapshot_fetch_in_flight = false;
             let mut codex_resume_instruction_recovery_attempts = 0_u64;
             let mut resume_visual_reveal_after_ms = None::<u64>;
             let mut first_resume_connected_output_ms = None::<u64>;
@@ -6473,6 +6577,14 @@ fn TerminalCanvas(
             let mut last_window_focused_for_read =
                 state.with(|shell| shell.effective_window_focused());
             let mut terminal_write_bridge = TerminalWriteBridge::new(terminal_write_frame_ms());
+            let mut terminal_transport_degraded = is_remote_resume_session;
+            let mut terminal_ghost_frame = initial_terminal_ghost_frame;
+            let mut cached_input_bytes = 0_usize;
+            // A successful read/write proves transport, but the held pixels are
+            // not released until a subsequent Paint event proves that fresh
+            // bytes made it through xterm's renderer.
+            let mut fresh_frame_pending = false;
+            let mut last_transport_trace_reason = String::new();
             // THE REVEAL COVER (the ghost-frame family's paint-hold): armed at
             // every repaint-nudge emit, it holds the live PTY bytes for one
             // reveal window so a fullscreen TUI's position-addressed repaint
@@ -7072,37 +7184,42 @@ fn TerminalCanvas(
                                         if !touched && let Some(control_url) = url {
                                             let resolve_url = control_url.clone();
                                             let resolve_target = web_surface_ssh_target.clone();
+                                            let mut picker_state = state;
+                                            let picker_session = surface_session_path.clone();
+                                            let picker_trace = trace_home.clone();
                                             // The GUI GETs /open on this itself,
                                             // so it needs an ssh -L forward, not
                                             // the webview's SOCKS proxy.
-                                            let (effective_control, forward_child) =
-                                                task::spawn_blocking(move || {
-                                                    resolve_control_endpoint_url(
-                                                        &resolve_url,
-                                                        resolve_target.as_deref(),
-                                                    )
-                                                })
-                                                .await
-                                                .unwrap_or_else(|_| (control_url.clone(), None));
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "web_surface",
-                                                "pick",
-                                                json!({
-                                                    "session_path": surface_session_path,
-                                                    "control_url": control_url,
-                                                    "effective_control": effective_control,
-                                                    "forwarded": forward_child.is_some(),
-                                                }),
-                                            );
-                                            state.with_mut_counted(|shell| {
-                                                shell.upsert_web_surface_picker(
-                                                    &surface_session_path,
-                                                    effective_control,
-                                                    forward_child,
-                                                    now_ms,
+                                            spawn(async move {
+                                                let (effective_control, forward_child) =
+                                                    task::spawn_blocking(move || {
+                                                        resolve_control_endpoint_url(
+                                                            &resolve_url,
+                                                            resolve_target.as_deref(),
+                                                        )
+                                                    })
+                                                    .await
+                                                    .unwrap_or_else(|_| (control_url.clone(), None));
+                                                append_trace_event(
+                                                    &picker_trace,
+                                                    "ui",
+                                                    "web_surface",
+                                                    "pick",
+                                                    json!({
+                                                        "session_path": picker_session.clone(),
+                                                        "control_url": control_url,
+                                                        "effective_control": effective_control,
+                                                        "forwarded": forward_child.is_some(),
+                                                    }),
                                                 );
+                                                picker_state.with_mut_counted(|shell| {
+                                                    shell.upsert_web_surface_picker(
+                                                        &picker_session,
+                                                        effective_control,
+                                                        forward_child,
+                                                        now_ms,
+                                                    );
+                                                });
                                             });
                                         }
                                     }
@@ -7172,27 +7289,36 @@ fn TerminalCanvas(
                                                     })
                                             });
                                         if let Some(url) = fresh_url {
-                                            materialize_declared_web_surface(
-                                                state,
-                                                trace_home.clone(),
-                                                surface_session_path.clone(),
-                                                url,
-                                                surface_title,
-                                                surface_profile.as_deref(),
-                                                start_page,
-                                                // A heartbeat (or a replayed
-                                                // `seen` open) that builds a
-                                                // FRESH surface is re-attaching
-                                                // a running app after a GUI
-                                                // restart; only a real `open`
-                                                // is the app launching.
-                                                web_surface_open_kind_for_action(&action),
-                                                web_surface_ssh_target.clone(),
-                                                &action,
-                                                Some(claimed_session.as_str()),
-                                                now_ms,
-                                            )
-                                            .await;
+                                            let materialize_state = state;
+                                            let materialize_trace = trace_home.clone();
+                                            let materialize_session = surface_session_path.clone();
+                                            let materialize_profile = surface_profile.clone();
+                                            let materialize_action = action.clone();
+                                            let materialize_claimed = claimed_session.clone();
+                                            let materialize_target = web_surface_ssh_target.clone();
+                                            spawn(async move {
+                                                materialize_declared_web_surface(
+                                                    materialize_state,
+                                                    materialize_trace,
+                                                    materialize_session,
+                                                    url,
+                                                    surface_title,
+                                                    materialize_profile.as_deref(),
+                                                    start_page,
+                                                    // A heartbeat (or a replayed
+                                                    // `seen` open) that builds a
+                                                    // FRESH surface is re-attaching
+                                                    // a running app after a GUI
+                                                    // restart; only a real `open`
+                                                    // is the app launching.
+                                                    web_surface_open_kind_for_action(&materialize_action),
+                                                    materialize_target,
+                                                    &materialize_action,
+                                                    Some(materialize_claimed.as_str()),
+                                                    now_ms,
+                                                )
+                                                .await;
+                                            });
                                         }
                                     }
                                     "close" => {
@@ -7253,6 +7379,35 @@ fn TerminalCanvas(
                                         // refused" forever). The stale entry
                                         // is torn down (its forward killed)
                                         // and the declare re-creates it.
+                                        let declare_state = state;
+                                        let declare_trace_home = trace_home.clone();
+                                        let declare_session_path = contribution_session_path.clone();
+                                        let declare_ssh_target = web_surface_ssh_target.clone();
+                                        let declare_control = control.clone();
+                                        let declare_panes = panes.clone();
+                                        let declare_policy_version = policy_version.clone();
+                                        let declare_app_name = app_name.clone();
+                                        let declare_zoom_version = zoom_version.clone();
+                                        let declare_appearance_version = appearance_version.clone();
+                                        let declare_document_version = document_version.clone();
+                                        let declare_env_id = env_id.clone();
+                                        let declare_control_token = control_token.clone();
+                                        let declare_claimed_session = claimed_session.clone();
+                                        spawn(async move {
+                                        let mut state = declare_state;
+                                        let trace_home = declare_trace_home;
+                                        let contribution_session_path = declare_session_path;
+                                        let web_surface_ssh_target = declare_ssh_target;
+                                        let control = declare_control;
+                                        let panes = declare_panes;
+                                        let policy_version = declare_policy_version;
+                                        let app_name = declare_app_name;
+                                        let zoom_version = declare_zoom_version;
+                                        let appearance_version = declare_appearance_version;
+                                        let document_version = declare_document_version;
+                                        let env_id = declare_env_id;
+                                        let control_token = declare_control_token;
+                                        let claimed_session = declare_claimed_session;
                                         let refetch = apply_sidebar_declare(
                                             state,
                                             trace_home.clone(),
@@ -7378,6 +7533,7 @@ fn TerminalCanvas(
                                                 seq,
                                             ));
                                         }
+                                        });
                                     }
                                     "close" => {
                                         state.with_mut_counted(|shell| {
@@ -7507,6 +7663,37 @@ fn TerminalCanvas(
                                         || screen_present
                                         || viewport_present
                                         || rows_present;
+                                if painted && fresh_frame_pending {
+                                    fresh_frame_pending = false;
+                                    if terminal_ghost_frame {
+                                        terminal_ghost_frame = false;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "ghost_frame_released",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "reason": "fresh_frame_painted",
+                                                "cached_input_bytes": cached_input_bytes,
+                                            }),
+                                        );
+                                    }
+                                    update_terminal_surface_status(
+                                        state,
+                                        &session_path,
+                                        terminal_transport_degraded,
+                                        terminal_ghost_frame,
+                                        cached_input_bytes,
+                                        if terminal_transport_degraded {
+                                            "transport_degraded"
+                                        } else if cached_input_bytes > 0 {
+                                            "input_cached"
+                                        } else {
+                                            "fresh_frame_painted"
+                                        },
+                                    );
+                                }
                                 current_terminal_cols = cols;
                                 current_terminal_rows = rows;
                                 let geometry_usable = terminal_geometry_is_usable(cols, rows);
@@ -7660,14 +7847,31 @@ fn TerminalCanvas(
                                 // enqueue — if the write later fails, the recovery
                                 // branch resets the cadence exactly as the inline
                                 // error path did.
-                                let _ = terminal_write_tx.send((data.clone(), current_millis()));
+                                let track_completion = is_remote_resume_session;
+                                if track_completion {
+                                    cached_input_bytes = cached_input_bytes.saturating_add(data.len());
+                                    update_terminal_surface_status(
+                                        state,
+                                        &session_path,
+                                        terminal_transport_degraded,
+                                        terminal_ghost_frame,
+                                        cached_input_bytes,
+                                        "input_queued",
+                                    );
+                                }
+                                let _ = terminal_write_tx.send(TerminalWriteCommand::Input {
+                                    data: data.clone(),
+                                    enqueued_ms: current_millis(),
+                                    track_completion,
+                                });
                                 if is_remote_resume_session {
                                     set_signal_if_changed(terminal_resume_surface_staged, true);
-                                    set_signal_if_changed(terminal_live_host_connected, true);
-                                    set_signal_if_changed(terminal_overlay_dismissed, true);
-                                    set_signal_if_changed(resume_overlay_failed, false);
-                                    set_signal_if_changed(resume_overlay_timed_out, false);
-                                    clear_terminal_resume_notification(state, &session_path);
+                                    // Enqueueing is not an acknowledgement. The
+                                    // old optimistic green transition made an
+                                    // offline peer look healthy and discarded
+                                    // the distinction between cached input and
+                                    // delivered input. The writer/read edges
+                                    // below own these transitions.
                                 }
                                 read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
                                 input_echo_read_burst_remaining =
@@ -8281,29 +8485,32 @@ fn TerminalCanvas(
                                             current_terminal_cols,
                                             current_terminal_rows,
                                         );
-                                    if let Err(error) = terminal_force_remote_restart_async(
-                                        endpoint.clone(),
-                                        session_path.clone(),
-                                        Some(terminal_appearance),
-                                        restart_terminal_size,
-                                        &trace_home,
-                                        "dead_codex_resume_instruction",
-                                        codex_resume_instruction_recovery_attempts,
-                                    )
-                                    .await
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "dead_codex_resume_instruction_recovery_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": error.to_string(),
-                                                "attempt": codex_resume_instruction_recovery_attempts,
-                                            }),
+                                    let restart_tx = off_loop_rpc_tx.clone();
+                                    let restart_endpoint = endpoint.clone();
+                                    let restart_session = session_path.clone();
+                                    let restart_trace = trace_home.clone();
+                                    let restart_attempt = codex_resume_instruction_recovery_attempts;
+                                    task::spawn(async move {
+                                        let result = terminal_force_remote_restart_async(
+                                            restart_endpoint,
+                                            restart_session,
+                                            Some(terminal_appearance),
+                                            restart_terminal_size,
+                                            &restart_trace,
+                                            "dead_codex_resume_instruction",
+                                            restart_attempt,
+                                        )
+                                        .await
+                                        .map_err(|error| format!("{error:#}"));
+                                        let _ = restart_tx.send(
+                                            OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                                error_trace: "dead_codex_resume_instruction_recovery_error",
+                                                reason: None,
+                                                attempt: restart_attempt,
+                                                result,
+                                            },
                                         );
-                                    }
+                                    });
                                     cursor = 0;
                                     read_poll_ms = 60;
                                     next_read_deadline = tokio::time::Instant::now()
@@ -9363,6 +9570,10 @@ fn TerminalCanvas(
                             }
                             Ok(TerminalJsEvent::ClipboardPasteRequest) => {
                                 warn!(session=%session_path, "terminal clipboard paste request");
+                                let state = state;
+                                let session_path = session_path.clone();
+                                let host_id = host_id.clone();
+                                spawn(async move {
                                 let paste_result =
                                     paste_terminal_native_clipboard(state, &session_path).await;
                                 match paste_result {
@@ -9464,8 +9675,12 @@ fn TerminalCanvas(
                                         refocus_terminal_session_input(&session_path);
                                     }
                                 }
+                                });
                             }
                             Ok(TerminalJsEvent::ClipboardImageRequest) => {
+                                let state = state;
+                                let session_path = session_path.clone();
+                                spawn(async move {
                                 let paste_result =
                                     stage_and_paste_terminal_clipboard_image(state, &session_path)
                                         .await;
@@ -9511,6 +9726,7 @@ fn TerminalCanvas(
                                         );
                                     }
                                 }
+                                });
                             }
                             Ok(TerminalJsEvent::ClipboardError { action, message }) => {
                                 let title = if action == "cut" {
@@ -9936,7 +10152,7 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    Some((write_shape, write_error)) = terminal_write_failure_rx.recv() => {
+                    Some(write_event) = terminal_write_event_rx.recv() => {
                         // A keystroke's daemon write failed on the writer task.
                         // This branch is the inline error path of the old Input
                         // arm, verbatim — it merely runs when the failure
@@ -9944,6 +10160,37 @@ fn TerminalCanvas(
                         // hostage while the failing write timed out.
                         let _branch_guard =
                             TerminalLoopBranchGuard::new("write_failure", &session_path);
+                        match write_event {
+                        TerminalWriteEvent::Failed {
+                            shape: write_shape,
+                            pending_bytes: write_pending_bytes,
+                            error: write_error,
+                        } => {
+                            cached_input_bytes = write_pending_bytes;
+                            terminal_transport_degraded = true;
+                            terminal_ghost_frame = terminal_paint_seen
+                                && (terminal_has_visible_output
+                                    || terminal_has_meaningful_output());
+                            update_terminal_surface_status(
+                                state,
+                                &session_path,
+                                terminal_transport_degraded,
+                                terminal_ghost_frame,
+                                cached_input_bytes,
+                                "write_failed_input_cached",
+                            );
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "terminal_transport_degraded",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "reason": "write_failed",
+                                    "ghost_frame": terminal_ghost_frame,
+                                    "cached_input_bytes": cached_input_bytes,
+                                }),
+                            );
                         let post_attach_write_retry_limit =
                             if is_remote_resume_session { 2 } else { 4 };
                         append_trace_event(
@@ -9957,7 +10204,8 @@ fn TerminalCanvas(
                                 "shape": write_shape,
                             }),
                         );
-                        if should_retry_terminal_write_error_after_attach(
+                        if !terminal_ghost_frame
+                            && should_retry_terminal_write_error_after_attach(
                             is_remote_resume_session,
                             &write_error,
                         ) && post_attach_read_recovery_attempts < post_attach_write_retry_limit
@@ -10039,6 +10287,21 @@ fn TerminalCanvas(
 }
                             cursor = 0;
                             read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                        } else if terminal_ghost_frame {
+                            if last_transport_trace_reason != "write_failed_held_frame" {
+                                last_transport_trace_reason = "write_failed_held_frame".to_string();
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "ghost_frame_held",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "reason": "write_failed",
+                                        "cached_input_bytes": cached_input_bytes,
+                                    }),
+                                );
+                            }
                         } else {
                             // ⛔⛔ THE GATE MUST RELEASE, AND THIS BRANCH USED TO
                             // ONLY NOTIFY. The retry arm above disables input on
@@ -10096,6 +10359,80 @@ fn TerminalCanvas(
                                     "{write_error}. Typing is re-enabled — the surface may need a switch away and back."
                                 ),
                             );
+                        }
+                        }
+                        TerminalWriteEvent::Completed {
+                            data_bytes,
+                            pending_bytes: write_pending_bytes,
+                            recovered_transport,
+                        } => {
+                            cached_input_bytes = cached_input_bytes.saturating_sub(data_bytes);
+                            let transport_recovered = recovered_transport
+                                || (terminal_transport_degraded && write_pending_bytes == 0);
+                            if transport_recovered {
+                                terminal_transport_degraded = false;
+                                fresh_frame_pending = terminal_ghost_frame;
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "terminal_transport_recovered",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "source": "write",
+                                        "cached_input_bytes": cached_input_bytes,
+                                        "pending_bytes": write_pending_bytes,
+                                        "ghost_frame": terminal_ghost_frame,
+                                    }),
+                                );
+                            }
+                            update_terminal_surface_status(
+                                state,
+                                &session_path,
+                                terminal_transport_degraded,
+                                terminal_ghost_frame,
+                                cached_input_bytes,
+                                if terminal_ghost_frame {
+                                    "fresh_frame_pending"
+                                } else if cached_input_bytes > 0 {
+                                    "input_cached"
+                                } else {
+                                    "write_completed"
+                                },
+                            );
+                        }
+                        TerminalWriteEvent::CacheFull {
+                            data_bytes,
+                            pending_bytes: write_pending_bytes,
+                        } => {
+                            cached_input_bytes = cached_input_bytes.saturating_sub(data_bytes);
+                            update_terminal_surface_status(
+                                state,
+                                &session_path,
+                                terminal_transport_degraded,
+                                terminal_ghost_frame,
+                                cached_input_bytes,
+                                "input_cache_full",
+                            );
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "terminal_input_cache_full",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "data_bytes": data_bytes,
+                                    "pending_bytes": write_pending_bytes,
+                                    "capacity_bytes": TERMINAL_INPUT_CACHE_MAX_BYTES,
+                                }),
+                            );
+                            safe_push_notification(
+                                state,
+                                NotificationTone::Warning,
+                                "Terminal input backlog is full",
+                                "Transport is still unavailable; the newest keystroke was not queued.",
+                            );
+                        }
                         }
                     }
                     Some(result) = off_loop_rpc_rx.recv() => {
@@ -10239,6 +10576,33 @@ fn TerminalCanvas(
                                     );
                                 }
                             },
+                            OffLoopTerminalRpcResult::ResizeNudgeSettled { cols, rows, error } => {
+                                match error {
+                                    Some(error) => append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "resize_nudge_error",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cols": cols,
+                                            "rows": rows,
+                                            "error": error,
+                                        }),
+                                    ),
+                                    None => append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "resize_nudge_end",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cols": cols,
+                                            "rows": rows,
+                                        }),
+                                    ),
+                                }
+                            }
                             OffLoopTerminalRpcResult::FrameHashFresh { hash } => {
                                 frame_hash_fetch_in_flight = false;
                                 if let Some(hash) = hash {
@@ -10271,6 +10635,9 @@ fn TerminalCanvas(
                                     "snapshot_replay_settled",
                                     &session_path,
                                 );
+                                if kind == SnapshotReplayKind::BlankHost {
+                                    blank_host_snapshot_fetch_in_flight = false;
+                                }
                                 match kind {
                                     SnapshotReplayKind::NonPrompt => {
                                             match result {
@@ -10938,6 +11305,46 @@ fn TerminalCanvas(
                                 resync_required,
                                 screen_hash,
                             )) => {
+                                // One successful daemon read is enough to
+                                // clear transport uncertainty and wake the
+                                // writer's retained queue. It is NOT enough to
+                                // clear a ghost frame: fresh bytes still have
+                                // to reach xterm and produce Paint below.
+                                if terminal_transport_degraded {
+                                    terminal_transport_degraded = false;
+                                    fresh_frame_pending = terminal_ghost_frame && !chunks.is_empty();
+                                    let _ = terminal_write_tx.send(TerminalWriteCommand::Resume);
+                                    if last_transport_trace_reason != "read_recovered" {
+                                        last_transport_trace_reason = "read_recovered".to_string();
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "terminal_transport_recovered",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "source": "read",
+                                                "chunks": chunks.len(),
+                                                "ghost_frame": terminal_ghost_frame,
+                                                "cached_input_bytes": cached_input_bytes,
+                                            }),
+                                        );
+                                    }
+                                    update_terminal_surface_status(
+                                        state,
+                                        &session_path,
+                                        terminal_transport_degraded,
+                                        terminal_ghost_frame,
+                                        cached_input_bytes,
+                                        if terminal_ghost_frame {
+                                            "fresh_frame_pending"
+                                        } else if cached_input_bytes > 0 {
+                                            "input_cached"
+                                        } else {
+                                            "read_recovered"
+                                        },
+                                    );
+                                }
                                 // Frame-hash probe forwarding (frame_hash.rs): the
                                 // daemon's authoritative-grid hash rides every read;
                                 // it is passed to the client ONLY on change. The JS
@@ -11389,158 +11796,46 @@ fn TerminalCanvas(
                                     terminal_live_host_connected(),
                                     blank_host_snapshot_replay_attempts,
                                     2,
-                                ) {
+                                ) && !blank_host_snapshot_fetch_in_flight {
                                     blank_host_snapshot_replay_attempts += 1;
-                                    match terminal_snapshot_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        &trace_home,
-                                    )
-                                    .await
-                                    {
-                                        Ok((
-                                            snapshot_text,
-                                            snapshot_running,
-                                            snapshot_output_seen,
-                                            snapshot_post_resize_output_seen,
-                                            snapshot_last_resize_seq,
-                                            _runtime_spawn_id,
-                                            ..,
-                                        ))
-                                            if remote_resume_screen_snapshot_is_replayable_for_blank_host(
-                                                &snapshot_text,
+                                    blank_host_snapshot_fetch_in_flight = true;
+                                    let snapshot_tx = off_loop_rpc_tx.clone();
+                                    let snapshot_endpoint = endpoint.clone();
+                                    let snapshot_session = runtime_session_path.clone();
+                                    let snapshot_trace = trace_home.clone();
+                                    let snapshot_attempt = blank_host_snapshot_replay_attempts;
+                                    let snapshot_cursor_line = last_host_health_cursor_line_text.clone();
+                                    let snapshot_text_tail = last_host_health_text_tail.clone();
+                                    task::spawn(async move {
+                                        let result = terminal_snapshot_async(
+                                            snapshot_endpoint,
+                                            snapshot_session,
+                                            &snapshot_trace,
+                                        )
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                        let _ = snapshot_tx.send(
+                                            OffLoopTerminalRpcResult::SnapshotReplaySettled {
+                                                kind: SnapshotReplayKind::BlankHost,
+                                                attempt: snapshot_attempt,
+                                                cursor_line_text: snapshot_cursor_line,
+                                                text_tail: snapshot_text_tail,
+                                                codex_like_session,
                                                 remote_starting_agent_session,
-                                                codex_like_session,
-                                            ) && remote_resume_geometry_fence_allows_snapshot_replay(
-                                                &snapshot_text,
-                                                codex_like_session,
-                                                snapshot_post_resize_output_seen,
-                                                snapshot_last_resize_seq,
-                                            ) =>
-                                        {
-                                            let snapshot_text =
-                                                sanitize_terminal_replay_payload(&snapshot_text);
-                                            if snapshot_text.trim().is_empty() {
-                                                continue;
-                                            }
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "blank_host_snapshot_replay_from_read",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "attempt": blank_host_snapshot_replay_attempts,
-                                                    "bytes": snapshot_text.len(),
-                                                    "running": snapshot_running,
-                                                    "runtime_output_seen": snapshot_output_seen,
-                                                    "post_resize_output_seen": snapshot_post_resize_output_seen,
-                                                    "last_resize_seq": snapshot_last_resize_seq,
-                                                }),
-                                            );
-                                            let _ = eval.send(terminal_reset_command(&title, &theme));
-                                            let _ = eval.send(TerminalJsCommand::Write {
-                                                data: snapshot_text, protocol_only: false,
-                                            });
-                                            let _ = eval.send(TerminalJsCommand::Refit);
-                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                                enabled: true,
-                                                focus: true,
-                                            });
-                                            set_signal_if_changed(
-                                                terminal_resume_surface_staged,
-                                                true,
-                                            );
-                                            set_signal_if_changed(
-                                                terminal_has_meaningful_output,
-                                                true,
-                                            );
-                                            set_signal_if_changed(terminal_prompt_only, false);
-                                            set_signal_if_changed(
-                                                terminal_live_host_connected,
-                                                true,
-                                            );
-                                            set_signal_if_changed(
-                                                terminal_overlay_dismissed,
-                                                true,
-                                            );
-                                            set_signal_if_changed(resume_overlay_failed, false);
-                                            set_signal_if_changed(resume_overlay_timed_out, false);
-                                            resume_visual_reveal_after_ms = None;
-                                            post_attach_read_recovery_attempts = 0;
-                                    transport_error_input_released = false;
-                                            clear_terminal_resume_notification(
-                                                state,
-                                                &session_path,
-                                            );
-                                            let _ = safe_shell_mut(
-                                                state,
-                                                "terminal_attach_blank_host_snapshot_replay_from_read",
-                                                |shell| {
-                                                    shell
-                                                        .retain_terminal_session_path(&session_path);
-                                                    shell
-                                                        .terminal_resume_ready_paths
-                                                        .insert(session_path.clone());
-                                                    shell.terminal_attach_in_flight
-                                                        .remove(&session_path);
-                                                    shell
-                                                        .mark_terminal_open_attempt_ready_for_session(
-                                                            &session_path,
-                                                            "blank_host_snapshot_replay",
-                                                        );
-                                                    shell
-                                                        .maybe_finish_terminal_surface_request_for_session(
-                                                            &session_path,
-                                                        );
-                                                },
-                                            );
-                                            maybe_spawn_missing_remote_machine_refreshes(state);
-                                            maybe_spawn_missing_managed_cli_refreshes(state);
-                                            read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
-                                            next_read_deadline = tokio::time::Instant::now()
-                                                + Duration::from_millis(read_poll_ms);
-                                            continue;
-                                        }
-                                        Ok((
-                                            snapshot_text,
-                                            snapshot_running,
-                                            snapshot_output_seen,
-                                            snapshot_post_resize_output_seen,
-                                            snapshot_last_resize_seq,
-                                            _runtime_spawn_id,
-                                            ..,
-                                        )) => {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "blank_host_snapshot_replay_from_read_rejected",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "attempt": blank_host_snapshot_replay_attempts,
-                                                    "bytes": snapshot_text.len(),
-                                                    "running": snapshot_running,
-                                                    "runtime_output_seen": snapshot_output_seen,
-                                                    "post_resize_output_seen": snapshot_post_resize_output_seen,
-                                                    "last_resize_seq": snapshot_last_resize_seq,
-                                                }),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "blank_host_snapshot_replay_from_read_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "attempt": blank_host_snapshot_replay_attempts,
-                                                    "error": error.to_string(),
-                                                }),
-                                            );
-                                        }
-                                    }
+                                                result,
+                                            },
+                                        );
+                                    });
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "blank_host_snapshot_replay_scheduled",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "attempt": snapshot_attempt,
+                                        }),
+                                    );
                                 }
                                 let saw_shell_prompt_output =
                                     (saw_prompt_output || tail_prompt_only_output)
@@ -11665,6 +11960,50 @@ fn TerminalCanvas(
                                         || terminal_live_host_connected()
                                         || terminal_has_meaningful_output()
                                         || terminal_has_visible_output);
+                                let established_terminal_surface = terminal_paint_seen
+                                    && (terminal_has_visible_output
+                                        || terminal_has_meaningful_output()
+                                        || terminal_overlay_dismissed());
+                                if transport_error_after_attach && established_terminal_surface {
+                                    // A live read reporting a transient transport
+                                    // failure is a held-frame state, not a
+                                    // reason to tear down the host. Keeping the
+                                    // mounted xterm and its input path avoids
+                                    // the blank/remount storm that made weak
+                                    // internet look like a frozen UI.
+                                    terminal_transport_degraded = true;
+                                    terminal_ghost_frame = true;
+                                    fresh_frame_pending = false;
+                                    update_terminal_surface_status(
+                                        state,
+                                        &session_path,
+                                        true,
+                                        true,
+                                        cached_input_bytes,
+                                        "read_transport_error_held_frame",
+                                    );
+                                    if last_transport_trace_reason
+                                        != "read_transport_error_held_frame"
+                                    {
+                                        last_transport_trace_reason =
+                                            "read_transport_error_held_frame".to_string();
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "ghost_frame_held",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "reason": "read_transport_error",
+                                                "cached_input_bytes": cached_input_bytes,
+                                            }),
+                                        );
+                                    }
+                                    read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                                    next_read_deadline = tokio::time::Instant::now()
+                                        + Duration::from_millis(read_poll_ms);
+                                    continue;
+                                }
                                 if is_remote_resume_session {
                                     if saw_meaningful_output
                                         && !saw_transcript_browser_output
@@ -13188,37 +13527,29 @@ fn TerminalCanvas(
                                             "rows": current_terminal_rows,
                                         }),
                                     );
-                                    if let Err(error) = terminal_resize_nudge_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        current_terminal_cols,
-                                        current_terminal_rows,
-                                    )
-                                    .await
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "resize_nudge_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": error.to_string(),
-                                            }),
+                                    let nudge_tx = off_loop_rpc_tx.clone();
+                                    let nudge_endpoint = endpoint.clone();
+                                    let nudge_session = runtime_session_path.clone();
+                                    let nudge_cols = current_terminal_cols;
+                                    let nudge_rows = current_terminal_rows;
+                                    task::spawn(async move {
+                                        let error = terminal_resize_nudge_async(
+                                            nudge_endpoint,
+                                            nudge_session,
+                                            nudge_cols,
+                                            nudge_rows,
+                                        )
+                                        .await
+                                        .err()
+                                        .map(|error| error.to_string());
+                                        let _ = nudge_tx.send(
+                                            OffLoopTerminalRpcResult::ResizeNudgeSettled {
+                                                cols: nudge_cols,
+                                                rows: nudge_rows,
+                                                error,
+                                            },
                                         );
-                                    } else {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "resize_nudge_end",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "cols": current_terminal_cols,
-                                                "rows": current_terminal_rows,
-                                            }),
-                                        );
-                                    }
+                                    });
                                     read_poll_ms = 60;
                                     next_read_deadline = tokio::time::Instant::now()
                                         + Duration::from_millis(read_poll_ms);
@@ -13496,29 +13827,32 @@ fn TerminalCanvas(
                                                 current_terminal_cols,
                                                 current_terminal_rows,
                                             );
-                                        if let Err(error) = terminal_force_remote_restart_async(
-                                            endpoint.clone(),
-                                            session_path.clone(),
-                                            Some(terminal_appearance),
-                                            restart_terminal_size,
-                                            &trace_home,
-                                            force_restart_reason,
-                                            1,
-                                        )
-                                        .await
-                                        {
-                                            append_trace_event(
-                                                &trace_home,
-                                                "ui",
-                                                "terminal_mount",
-                                                "force_remote_restart_error",
-                                                json!({
-                                                    "session_path": session_path.clone(),
-                                                    "reason": force_restart_reason,
-                                                    "error": error.to_string(),
-                                                }),
+                                        let restart_tx = off_loop_rpc_tx.clone();
+                                        let restart_endpoint = endpoint.clone();
+                                        let restart_session = session_path.clone();
+                                        let restart_trace = trace_home.clone();
+                                        let restart_reason = force_restart_reason.to_string();
+                                        task::spawn(async move {
+                                            let result = terminal_force_remote_restart_async(
+                                                restart_endpoint,
+                                                restart_session,
+                                                Some(terminal_appearance),
+                                                restart_terminal_size,
+                                                &restart_trace,
+                                                &restart_reason,
+                                                1,
+                                            )
+                                            .await
+                                            .map_err(|error| format!("{error:#}"));
+                                            let _ = restart_tx.send(
+                                                OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                                    error_trace: "force_remote_restart_error",
+                                                    reason: Some(restart_reason),
+                                                    attempt: 1,
+                                                    result,
+                                                },
                                             );
-                                        }
+                                        });
                                         cursor = 0;
                                         read_poll_ms = 60;
                                         next_read_deadline = tokio::time::Instant::now()
@@ -13712,6 +14046,47 @@ fn TerminalCanvas(
                                     || terminal_live_host_connected()
                                     || terminal_has_meaningful_output()
                                     || terminal_has_visible_output;
+                                if is_remote_resume_session
+                                    && attached_or_visible
+                                    && terminal_paint_seen
+                                    && (terminal_has_visible_output
+                                        || terminal_has_meaningful_output())
+                                {
+                                    terminal_transport_degraded = true;
+                                    terminal_ghost_frame = true;
+                                    fresh_frame_pending = false;
+                                    update_terminal_surface_status(
+                                        state,
+                                        &session_path,
+                                        true,
+                                        true,
+                                        cached_input_bytes,
+                                        "read_error_held_frame",
+                                    );
+                                    if last_transport_trace_reason != "read_error_held_frame" {
+                                        last_transport_trace_reason = "read_error_held_frame".to_string();
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "ghost_frame_held",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "reason": "read_error",
+                                                "error": error.to_string(),
+                                                "cached_input_bytes": cached_input_bytes,
+                                            }),
+                                        );
+                                    }
+                                    // Keep the one mounted surface alive. The
+                                    // next read gets a chance to prove recovery;
+                                    // no remount, input disable, or reset is
+                                    // allowed on this established-frame path.
+                                    read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                                    next_read_deadline = tokio::time::Instant::now()
+                                        + Duration::from_millis(read_poll_ms);
+                                    continue;
+                                }
                                 if should_retry_terminal_initial_read_error(
                                     attached_or_visible,
                                     initial_read_retry_attempts,
@@ -13732,25 +14107,28 @@ fn TerminalCanvas(
                                             "attempt": initial_read_retry_attempts,
                                         }),
                                     );
-                                    if let Err(recovery_error) = terminal_ensure_with_retry_async(
-                                        endpoint.clone(),
-                                        session_path.clone(),
-                                        &trace_home,
-                                    )
-                                    .await
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "read_error_retry_before_attach_recovery_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": recovery_error.to_string(),
-                                                "attempt": initial_read_retry_attempts,
-                                            }),
+                                    let recovery_tx = off_loop_rpc_tx.clone();
+                                    let recovery_endpoint = endpoint.clone();
+                                    let recovery_session = session_path.clone();
+                                    let recovery_trace = trace_home.clone();
+                                    let recovery_attempt = initial_read_retry_attempts;
+                                    task::spawn(async move {
+                                        let result = terminal_ensure_with_retry_async(
+                                            recovery_endpoint,
+                                            recovery_session,
+                                            &recovery_trace,
+                                        )
+                                        .await
+                                        .map_err(|error| format!("{error:#}"));
+                                        let _ = recovery_tx.send(
+                                            OffLoopTerminalRpcResult::ResumeRecoverySettled {
+                                                error_trace: "read_error_retry_before_attach_recovery_error",
+                                                reason: None,
+                                                attempt: recovery_attempt,
+                                                result: result.map(|_| ()),
+                                            },
                                         );
-                                    }
+                                    });
                                     read_poll_ms = 60;
                                     next_read_deadline = tokio::time::Instant::now()
                                         + Duration::from_millis(read_poll_ms);
@@ -16804,6 +17182,34 @@ enum SnapshotReplayKind {
     BlankHost,
 }
 
+/// Commands accepted by the dedicated terminal writer. `Resume` is an
+/// explicit transport edge: a failed write stays at the head of the queue
+/// until a successful read/recovery proves that retrying is meaningful.
+const TERMINAL_INPUT_CACHE_MAX_BYTES: usize = 256 * 1024;
+
+enum TerminalWriteCommand {
+    Input {
+        data: String,
+        enqueued_ms: u64,
+        track_completion: bool,
+    },
+    Resume,
+}
+
+enum TerminalWriteEvent {
+    Failed {
+        shape: serde_json::Value,
+        pending_bytes: usize,
+        error: anyhow::Error,
+    },
+    Completed {
+        data_bytes: usize,
+        pending_bytes: usize,
+        recovered_transport: bool,
+    },
+    CacheFull { data_bytes: usize, pending_bytes: usize },
+}
+
 enum OffLoopTerminalRpcResult {
     SnapshotReplaySettled {
         kind: SnapshotReplayKind,
@@ -16838,6 +17244,11 @@ enum OffLoopTerminalRpcResult {
         cursor_y: u32,
         rows: u16,
         blank_rows_below_cursor: u16,
+        error: Option<String>,
+    },
+    ResizeNudgeSettled {
+        cols: u16,
+        rows: u16,
         error: Option<String>,
     },
     FrameHashFresh {
@@ -17854,6 +18265,47 @@ async fn terminal_write_async(
         .await
         .map_err(|error| anyhow!("joining terminal write task: {error}"))?
         .map(|_| ())
+}
+
+/// Project off-loop terminal transport/render state into the shell only when
+/// the observable fields actually changed. This keeps the amber indicator from
+/// becoming another high-frequency render source while still making a held
+/// frame and queued input inspectable by app-control.
+fn update_terminal_surface_status(
+    state: Signal<ShellState>,
+    session_path: &str,
+    transport_degraded: bool,
+    ghost_frame: bool,
+    cached_input_bytes: usize,
+    reason: &str,
+) {
+    let unchanged = state.with(|shell| {
+        shell
+            .terminal_surface_statuses
+            .get(session_path)
+            .is_some_and(|status| {
+                status.transport_degraded == transport_degraded
+                    && status.ghost_frame == ghost_frame
+                    && status.cached_input_bytes == cached_input_bytes
+                    && status.reason == reason
+            })
+    });
+    if unchanged || (!transport_degraded && !ghost_frame && cached_input_bytes == 0
+        && !state.with(|shell| shell.terminal_surface_statuses.contains_key(session_path)))
+    {
+        return;
+    }
+    let session_path = session_path.to_string();
+    let reason = reason.to_string();
+    let _ = safe_shell_mut(state, "terminal_surface_status", move |shell| {
+        shell.set_terminal_surface_status(
+            &session_path,
+            transport_degraded,
+            ghost_frame,
+            cached_input_bytes,
+            reason,
+        );
+    });
 }
 async fn terminal_write_with_local_runtime_retry_async(
     endpoint: ServerEndpoint,

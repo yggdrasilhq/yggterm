@@ -30299,7 +30299,7 @@ console.log('ok');
         );
     }
     #[test]
-    fn merged_sidebar_rows_promote_cached_ready_machine_to_ok_affordance() {
+    fn merged_sidebar_rows_preserve_cached_health_when_remote_deploy_is_ready() {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
@@ -30339,10 +30339,45 @@ console.log('ok');
             .iter()
             .find(|row| row.full_path == "__remote_machine__/guihost")
             .expect("machine row");
-        assert_eq!(machine_row.label, "guihost [ok]");
+        assert_eq!(machine_row.label, "guihost [cached]");
         assert_eq!(
             machine_row.detail_label,
             "cached snapshot · remote yggterm ready"
+        );
+    }
+    #[test]
+    fn machine_attention_uses_one_steady_amber_indicator() {
+        assert_eq!(
+            machine_indicator_color_value_for_attention(MachineHealth::Healthy, true),
+            "#f59e0b"
+        );
+        assert_eq!(
+            machine_indicator_color_value_for_attention(MachineHealth::Cached, false),
+            "#f59e0b"
+        );
+        assert_eq!(
+            machine_indicator_color_value_for_attention(MachineHealth::Offline, true),
+            "#ef4444",
+            "offline/red outranks a child attention state"
+        );
+        assert!(!machine_indicator_should_blink(MachineHealth::Cached, true, false));
+        assert!(!machine_indicator_should_blink(MachineHealth::Healthy, true, true));
+        assert!(machine_indicator_should_blink(MachineHealth::Healthy, true, false));
+    }
+    #[test]
+    fn machine_row_does_not_render_a_second_group_attention_dot() {
+        let product = yggterm_core::agent_cli::product_lines(include_str!("sidebar.rs"))
+            .into_iter()
+            .map(|(_, line)| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            product.contains("&& machine_health.is_none()"),
+            "machine attention must stay on the machine indicator, not a second gutter dot"
+        );
+        assert!(
+            product.contains("data-machine-attention"),
+            "the single machine dot must expose its attention reason to diagnostics"
         );
     }
     #[test]
@@ -45692,6 +45727,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -46862,6 +46898,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -47074,6 +47111,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -47286,6 +47324,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -47501,6 +47540,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -47720,6 +47760,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -47931,6 +47972,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -48142,6 +48184,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -48396,6 +48439,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -48610,6 +48654,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -48865,6 +48910,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
@@ -49393,6 +49439,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             split_groups: Vec::new(),
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             active_web_surface_profile: None,
             web_surface_loading: HashMap::new(),
             web_surface_profiles: HashMap::new(),
