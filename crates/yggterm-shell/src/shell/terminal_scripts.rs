@@ -5013,12 +5013,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 // plain-text implementation below as a defensive fallback for
                 // older injected pages or a partially initialized WebView.
                 if (window.__yggtermTerminalFrameCache
-                    && typeof window.__yggtermTerminalFrameCache.serializeBuffer === 'function') {
+                    && typeof window.__yggtermTerminalFrameCache.serializeBuffer === 'function') {{
                     const cellAware = window.__yggtermTerminalFrameCache.serializeBuffer(term, maxRows);
-                    if (cellAware) {
+                    if (cellAware) {{
                         return cellAware;
-                    }
-                }
+                    }}
+                }}
                 const start = Math.max(0, length - maxRows);
                 const visualLines = [];
                 const logicalLines = [];

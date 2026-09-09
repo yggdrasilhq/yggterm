@@ -2483,6 +2483,10 @@ fn SidebarRow(
     let row_set_member_count = row.descendant_sessions.saturating_sub(1);
     let row_expanded = row.expanded;
     let row_toggle_target_expanded = !row.expanded;
+    let machine_attention = machine_health.is_some() && input_unanswered;
+    let machine_blink = machine_health.is_some_and(|health| {
+        machine_indicator_should_blink(health, busy_icon, machine_attention)
+    });
     rsx! {
         div {
             id: "{sidebar_row_dom_id(&row.full_path)}",
@@ -2899,12 +2903,6 @@ fn SidebarRow(
                     // shared hard step-end pulse) when any session in the machine's
                     // subtree is working, exactly like a live-session row's dot.
                     if let Some(health) = machine_health {
-                        let machine_attention = input_unanswered;
-                        let machine_blink = machine_indicator_should_blink(
-                            health,
-                            busy_icon,
-                            machine_attention,
-                        );
                         span {
                             "data-machine-indicator": "1",
                             "data-machine-working": if busy_icon { "1" } else { "0" },
