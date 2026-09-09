@@ -131,9 +131,13 @@ pub struct SemVer {
 impl SemVer {
     pub fn parse(text: &str) -> anyhow::Result<SemVer> {
         let text = text.trim();
-        let (core, pre) = match text.split_once('-') {
+        // npm and several native CLIs decorate a release with
+        // `+commit/build` metadata. It does not change semver ordering, but it
+        // must not make a healthy executable disappear from `ynpm list`.
+        let without_build = text.split_once('+').map_or(text, |(base, _)| base);
+        let (core, pre) = match without_build.split_once('-') {
             Some((core, pre)) => (core, Some(pre.to_string())),
-            None => (text, None),
+            None => (without_build, None),
         };
         let nums: Vec<&str> = core.split('.').collect();
         if nums.len() != 3 {
@@ -179,6 +183,21 @@ impl SemVer {
 pub fn version_answer_matches(answer: &str, expected: &str) -> bool {
     let answer = answer.trim();
     !answer.is_empty() && (answer == expected || answer.contains(expected))
+}
+
+fn version_answer_matches_identity(answer: &str, expected: &str) -> bool {
+    if version_answer_matches(answer, expected) {
+        return true;
+    }
+    let actual = version_from_answer(answer);
+    let (Ok(actual), Ok(expected)) = (
+        SemVer::parse(actual.as_deref().unwrap_or("")),
+        SemVer::parse(expected),
+    )
+    else {
+        return false;
+    };
+    (actual.major, actual.minor, actual.patch) == (expected.major, expected.minor, expected.patch)
 }
 
 /// Pull the version out of a binary's own `--version` answer, for the drift
@@ -2663,16 +2682,22 @@ fn verb_check(paths: &Paths) -> anyhow::Result<()> {
     for (key, package) in &state.packages {
         let identity = package_identity(key, package);
         let destination = package_destination(paths, package);
-        let disk = package
+        let disk_answer = package
             .bins
             .keys()
             .next()
-            .and_then(|bin| run_version(&destination.join(bin)).ok())
-            .and_then(|answer| version_from_answer(&answer));
+            .and_then(|bin| run_version(&destination.join(bin)).ok());
         let mut flags = Vec::new();
         if package.dev.is_none() {
-            match disk {
-                Some(version) if version != package.current => flags.push(format!(
+            match disk_answer
+                .as_deref()
+                .and_then(version_from_answer)
+            {
+                Some(version)
+                    if !version_answer_matches_identity(
+                        disk_answer.as_deref().unwrap_or(""),
+                        &package.current,
+                    ) => flags.push(format!(
                     "DRIFT: disk answers {version}, state says {}",
                     package.current
                 )),
@@ -4682,6 +4707,20 @@ mod tests {
             !version_answer_matches("", "0.2.1"),
             "a silent binary is a lie of silence"
         );
+    }
+
+    #[test]
+    fn build_metadata_in_a_cli_version_is_orderable_and_not_drift() {
+        let parsed = SemVer::parse("0.132.0+13595c36+litc03171d9").unwrap();
+        assert_eq!((parsed.major, parsed.minor, parsed.patch), (0, 132, 0));
+        assert_eq!(
+            version_from_answer("codex-cli 0.132.0+13595c36+litc03171d9").as_deref(),
+            Some("0.132.0+13595c36+litc03171d9")
+        );
+        assert!(version_answer_matches_identity(
+            "codex-cli 0.132.0+13595c36+litc03171d9",
+            "0.132.0-13595c36-litc03171d9"
+        ));
     }
 
     #[test]
