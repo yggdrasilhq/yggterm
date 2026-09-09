@@ -3351,18 +3351,75 @@ fn local_yggterm_production_archive(
         .managed_root
         .as_ref()
         .context("direct yggterm context has no managed root")?;
-    if !yggterm_generation_is_complete(&root.join("versions"), &context.current_version) {
+    let source_dir = root.join("versions").join(&context.current_version);
+    let extension = cfg!(target_os = "windows").then_some(".exe").unwrap_or("");
+    if !source_dir.join(format!("yggterm{extension}")).is_file()
+        || !source_dir
+            .join(format!("yggterm-headless{extension}"))
+            .is_file()
+    {
         bail!(
-            "active yggterm generation {} is incomplete under {}",
+            "active yggterm generation {} has no GUI/headless pair under {}",
             context.current_version,
-            root.display()
+            source_dir.display()
         );
+    }
+    // deploy-fleet's compatibility layout publishes ynpm/ynpx beside the
+    // `.yggterm/bin` aliases, while a native ynpm self-update keeps all four
+    // products in the version directory. Normalize either source layout into
+    // one scratch generation so fleet import never transfers a half-product.
+    let staging = paths.scratch().join(format!(
+        "yggterm-fleet-stage-{}-{}",
+        context.current_version,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    for name in ["yggterm", "yggterm-headless"] {
+        fs::copy(
+            source_dir.join(format!("{name}{extension}")),
+            staging.join(format!("{name}{extension}")),
+        )?;
+    }
+    for name in ["ynpm", "ynpx"] {
+        let candidates = [
+            root.join("versions")
+                .join(&context.current_version)
+                .join(format!("{name}{extension}")),
+            paths
+                .home
+                .join(".yggterm/bin")
+                .join(format!("{name}{extension}")),
+            paths
+                .home
+                .join(".local/bin")
+                .join(format!("{name}{extension}")),
+        ];
+        let source = candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .with_context(|| format!("active yggterm generation has no {name} product"))?;
+        fs::copy(&source, staging.join(format!("{name}{extension}")))?;
+    }
+    for name in ["yggterm", "yggterm-headless", "ynpm", "ynpx"] {
+        let path = staging.join(format!("{name}{extension}"));
+        set_executable(&path)?;
+        let answer = run_version(&path)
+            .with_context(|| format!("verifying local yggterm product {name}"))?;
+        if !version_answer_matches(&answer, &context.current_version) {
+            bail!(
+                "local yggterm product {name} answered {:?}, not {}",
+                answer.trim(),
+                context.current_version
+            );
+        }
     }
     let archive = tar_directory(
         paths,
-        &root.join("versions").join(&context.current_version),
+        &staging,
         &format!("yggterm-fleet-{}", context.current_version),
     )?;
+    let _ = fs::remove_dir_all(&staging);
     Ok(Some((
         context.current_version,
         context.asset_label,
