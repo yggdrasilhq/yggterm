@@ -7379,7 +7379,35 @@ fn TerminalCanvas(
                                         // refused" forever). The stale entry
                                         // is torn down (its forward killed)
                                         // and the declare re-creates it.
+                                        let declare_state = state;
+                                        let declare_trace_home = trace_home.clone();
+                                        let declare_session_path = contribution_session_path.clone();
+                                        let declare_ssh_target = web_surface_ssh_target.clone();
+                                        let declare_control = control.clone();
+                                        let declare_panes = panes.clone();
+                                        let declare_policy_version = policy_version.clone();
+                                        let declare_app_name = app_name.clone();
+                                        let declare_zoom_version = zoom_version.clone();
+                                        let declare_appearance_version = appearance_version.clone();
+                                        let declare_document_version = document_version.clone();
+                                        let declare_env_id = env_id.clone();
+                                        let declare_control_token = control_token.clone();
+                                        let declare_claimed_session = claimed_session.clone();
                                         spawn(async move {
+                                        let state = declare_state;
+                                        let trace_home = declare_trace_home;
+                                        let contribution_session_path = declare_session_path;
+                                        let web_surface_ssh_target = declare_ssh_target;
+                                        let control = declare_control;
+                                        let panes = declare_panes;
+                                        let policy_version = declare_policy_version;
+                                        let app_name = declare_app_name;
+                                        let zoom_version = declare_zoom_version;
+                                        let appearance_version = declare_appearance_version;
+                                        let document_version = declare_document_version;
+                                        let env_id = declare_env_id;
+                                        let control_token = declare_control_token;
+                                        let claimed_session = declare_claimed_session;
                                         let refetch = apply_sidebar_declare(
                                             state,
                                             trace_home.clone(),
