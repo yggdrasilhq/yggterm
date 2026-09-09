@@ -232,8 +232,8 @@ use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
     current_time_ms, ensure_local_managed_cli, ensure_local_managed_cli_for_focus,
     remove_local_managed_cli,
-    local_agent_cli_missing_binary_refusal, managed_cli_shell_command, managed_cli_shell_command_full,
-    managed_cli_shell_command_with_terminal_appearance,
+    local_agent_cli_missing_binary_refusal, managed_cli_shell_command_configured,
+    managed_cli_shell_command_full,
     refresh_local_managed_cli,
     summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
@@ -11759,20 +11759,22 @@ impl YggtermServer {
         let resumable = saved_session_in_store
             || (live_runtime_held && live_held_row_resumes_by_row_id(kind, saved_session_in_store));
         let launch_command = if resumable {
-            remote_persistent_resume_shell_command_with_terminal_appearance(
+            remote_persistent_resume_shell_command_with_terminal_appearance_configured(
                 kind,
                 session_id,
                 cwd,
                 terminal_appearance,
+                configured_extra_args,
             )
         } else {
-            remote_resume_picker_shell_command_with_terminal_appearance(
+            remote_resume_picker_shell_command_with_terminal_appearance_configured(
                 kind,
                 session_id,
                 cwd,
                 None,
                 true,
                 terminal_appearance,
+                configured_extra_args,
             )
         };
         let home = resolve_yggterm_home()?;
@@ -15378,11 +15380,33 @@ fn remote_resume_picker_shell_command_with_terminal_appearance(
     persistent: bool,
     terminal_appearance: Option<&str>,
 ) -> String {
-    let base = managed_cli_shell_command_with_terminal_appearance(
+    remote_resume_picker_shell_command_with_terminal_appearance_configured(
+        kind,
+        session_id,
+        cwd,
+        prefix,
+        persistent,
+        terminal_appearance,
+        None,
+    )
+}
+
+fn remote_resume_picker_shell_command_with_terminal_appearance_configured(
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    prefix: Option<&str>,
+    persistent: bool,
+    terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
+) -> String {
+    let base = managed_cli_shell_command_configured(
         kind,
         cwd,
         ManagedCliAction::ResumePicker { persistent },
         terminal_appearance,
+        &AgentLaunchOptions::default(),
+        configured_extra_args,
     )
     .unwrap_or_else(|_| {
         let descriptor = agent_cli_descriptor(kind);
@@ -15415,6 +15439,22 @@ fn remote_persistent_resume_shell_command_with_terminal_appearance(
     cwd: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> String {
+    remote_persistent_resume_shell_command_with_terminal_appearance_configured(
+        kind,
+        session_id,
+        cwd,
+        terminal_appearance,
+        None,
+    )
+}
+
+fn remote_persistent_resume_shell_command_with_terminal_appearance_configured(
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
+) -> String {
     // Per [[spec-agent-cli-wrapper-render-parity]]: render the same as a
     // clean `codex resume <UUID>` / `claude --resume <UUID>`. A previous
     // version of this wrapper prefixed `stty raw -echo opost onlcr` here,
@@ -15423,11 +15463,12 @@ fn remote_persistent_resume_shell_command_with_terminal_appearance(
     // cursor landing on the status bar instead of the input prompt row).
     // The TUI sets raw mode itself; we no longer pre-set anything and let
     // the agent CLI own the terminal state.
-    persistent_agent_resume_command_with_terminal_appearance(
+    persistent_agent_resume_command_with_terminal_appearance_configured(
         kind,
         cwd,
         session_id,
         terminal_appearance,
+        configured_extra_args,
     )
 }
 
@@ -34921,7 +34962,23 @@ fn persistent_agent_resume_command_with_terminal_appearance(
     session_id: &str,
     terminal_appearance: Option<&str>,
 ) -> String {
-    managed_cli_shell_command_with_terminal_appearance(
+    persistent_agent_resume_command_with_terminal_appearance_configured(
+        kind,
+        cwd,
+        session_id,
+        terminal_appearance,
+        None,
+    )
+}
+
+fn persistent_agent_resume_command_with_terminal_appearance_configured(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: &str,
+    terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
+) -> String {
+    managed_cli_shell_command_configured(
         kind,
         cwd,
         ManagedCliAction::Resume {
@@ -34929,6 +34986,8 @@ fn persistent_agent_resume_command_with_terminal_appearance(
             persistent: true,
         },
         terminal_appearance,
+        &AgentLaunchOptions::default(),
+        configured_extra_args,
     )
     .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, Some(session_id)))
 }
@@ -43296,6 +43355,37 @@ mod tests {
         );
         assert!(command.contains("resume"));
         assert!(command.contains("019d0000-0000"));
+    }
+
+    #[test]
+    fn remote_resume_rebuild_carries_forwarded_codex_flags() {
+        let yolo = Some("--dangerously-bypass-approvals-and-sandbox");
+        let persistent = super::remote_persistent_resume_shell_command_with_terminal_appearance_configured(
+            SessionKind::Codex,
+            "019d0000-0000",
+            Some("/home/user/git/samplenotes"),
+            None,
+            yolo,
+        );
+        assert!(
+            persistent.contains("codex '--dangerously-bypass-approvals-and-sandbox'"),
+            "forwarded settings must survive daemon resume reconstruction: {persistent}"
+        );
+        assert!(persistent.contains("resume"));
+
+        let picker = super::remote_resume_picker_shell_command_with_terminal_appearance_configured(
+            SessionKind::Codex,
+            "019d0000-0000",
+            Some("/home/user/git/samplenotes"),
+            None,
+            true,
+            None,
+            yolo,
+        );
+        assert!(
+            picker.contains("codex '--dangerously-bypass-approvals-and-sandbox'"),
+            "forwarded settings must reach the cold-row picker too: {picker}"
+        );
     }
 
     #[test]
