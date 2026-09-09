@@ -11031,7 +11031,7 @@ console.log('ok');
             "a stuck ghost must never block input"
         );
         assert!(
-            script.contains("window.setTimeout(releaseRevealGhost, 2400);"),
+            script.contains("window.setTimeout(() => releaseRevealGhost('settled_timeout'), 2400);"),
             "release must outlast the 1600ms reveal screen-reconcile settle"
         );
         assert!(
@@ -11078,6 +11078,27 @@ console.log('ok');
         assert!(
             script.contains("? Math.round(screenRect.width)"),
             "detached prior-epoch screens (rect 0x0) need the backing-store size fallback"
+        );
+    }
+    #[test]
+    fn terminal_frame_cache_is_embedded_and_ghost_reasons_are_traced() {
+        assert!(TERMINAL_FRAME_CACHE_JS.contains("ansiText"));
+        assert!(TERMINAL_FRAME_CACHE_JS.contains("isFgRGB"));
+        assert!(TERMINAL_FRAME_CACHE_JS.contains("isBgPalette"));
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        for marker in [
+            "frame_cache_captured",
+            "frame_cache_restored",
+            "ghost_frame_attached",
+            "ghost_frame_released",
+            "cache_format: 'canvas_pixels'",
+        ] {
+            assert!(script.contains(marker), "terminal script lost trace marker {marker}");
+        }
+        assert!(
+            script.contains("typeof snapshot.ansiText === 'string'"),
+            "snapshot restores must prefer ANSI cell state over plain diagnostic text"
         );
     }
     // Settle-follow watchdog: the executor for scroll_mode::should_settle_follow.
@@ -30379,6 +30400,44 @@ console.log('ok');
             product.contains("data-machine-attention"),
             "the single machine dot must expose its attention reason to diagnostics"
         );
+    }
+    #[test]
+    fn terminal_surface_attention_holds_until_fresh_paint_clears_it() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            "remote-session://example/session",
+        ));
+        assert!(shell.set_terminal_surface_status(
+            "remote-session://example/session",
+            true,
+            true,
+            19,
+            "read_error_held_frame",
+        ));
+        assert!(shell
+            .terminal_surface_status_for_path("remote-session://example/session")
+            .is_some_and(|status| {
+                status.transport_degraded && status.ghost_frame && status.cached_input_bytes == 19
+            }));
+        assert!(shell.set_terminal_surface_status(
+            "remote-session://example/session",
+            false,
+            true,
+            0,
+            "fresh_frame_pending",
+        ));
+        assert!(shell
+            .terminal_surface_status_for_path("remote-session://example/session")
+            .is_some_and(|status| status.ghost_frame));
+        assert!(shell.set_terminal_surface_status(
+            "remote-session://example/session",
+            false,
+            false,
+            0,
+            "fresh_frame_painted",
+        ));
+        assert!(shell
+            .terminal_surface_status_for_path("remote-session://example/session")
+            .is_none());
     }
     #[test]
     fn remote_folder_new_session_context_uses_remote_cwd() {
@@ -65860,7 +65919,7 @@ mod terminal_loop_input_starvation_locks {
         // The failure path survives, on its own branch, with the same
         // recovery gate the inline path had.
         let failure_at = source
-            .find("terminal_write_failure_rx.recv()")
+            .find("terminal_write_event_rx.recv()")
             .expect("write failures must come back to the loop on their own branch");
         let failure_branch = &source[failure_at..failure_at + 4_000];
         assert!(

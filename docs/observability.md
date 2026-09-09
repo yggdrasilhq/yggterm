@@ -722,10 +722,17 @@ so the event must never be interpreted as authority to rewrite ordinary rows.
 
 ## 5. Retention and cost
 
+`ytrace` has two complementary planes. The file plane is the durable JSONL
+history (`query`, `tail`, and incident review); the live control plane attaches
+and drains DTrace-like predicates and in-process aggregates against a running
+provider over its Unix socket. A live socket answer is not a substitute for
+the file record, and a file zero cannot prove that a dynamic probe reached the
+intended provider.
+
 | Stream | Bound | Where |
 |---|---|---|
-| ytrace live | 8 MiB, then rotate to a generation | `ytrace::DEFAULT_RETENTION` |
-| ytrace generations | 64 MiB total, 3-day ceiling | same |
+| ytrace live | 100 MiB per app, then rotate to a generation | `ytrace::DEFAULT_RETENTION` |
+| ytrace generations | 4 GiB total, 3-day ceiling | same |
 | perf / trace | own rotation budget | `perf::PERF_TELEMETRY_RETENTION` |
 | **registry** | **none — see §4.3** | `ytrace::registry` |
 

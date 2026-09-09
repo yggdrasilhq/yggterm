@@ -18,7 +18,10 @@ use crate::retention::{
 };
 
 pub const EVENT_TRACE_FILENAME: &str = "event-trace.jsonl";
-const EVENT_TRACE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Live event-log budget before rotation. The durable generation budget is a
+/// separate forensic window; this live file is intentionally large enough to
+/// retain a weak-network/ghost-frame episode before an investigator can attach.
+const EVENT_TRACE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// Rotated event-trace generations, hard-capped so a trace flood (a reveal
 /// loop, a render storm) cannot eat the disk.
 ///
