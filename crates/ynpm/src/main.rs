@@ -3628,7 +3628,11 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
 
 fn bootstrap_remote_ynpm(host: &str) -> anyhow::Result<()> {
     let current = std::env::current_exe().context("locating ynpm for fleet sync")?;
-    let remote = format!("{host}:.local/bin/ynpm-bootstrap-{}", std::process::id());
+    let remote_rel = format!(
+        ".yggterm/scratchpad/ynpm/ynpm-bootstrap-{}",
+        std::process::id()
+    );
+    let remote = format!("{host}:{remote_rel}");
     let status = Command::new("scp")
         .args(["-q"])
         .arg(current)
@@ -3641,8 +3645,9 @@ fn bootstrap_remote_ynpm(host: &str) -> anyhow::Result<()> {
     let status = Command::new("ssh")
         .arg(host)
         .arg(format!(
-            "mkdir -p $HOME/.local/bin $HOME/.yggterm/scratchpad/ynpm && chmod 755 $HOME/.local/bin/ynpm-bootstrap-{pid} && mv -f $HOME/.local/bin/ynpm-bootstrap-{pid} $HOME/.local/bin/ynpm",
-            pid = std::process::id()
+            "set -eu; mkdir -p $HOME/.local/bin $HOME/.yggterm/bin $HOME/.yggterm/scratchpad/ynpm && chmod 755 $HOME/{remote_rel} && for name in ynpm ynpx; do for dir in $HOME/.local/bin $HOME/.yggterm/bin; do stage=\"$dir/.${{name}}-bootstrap-{pid}\"; cp $HOME/{remote_rel} \"$stage\" && chmod 755 \"$stage\" && mv -f \"$stage\" \"$dir/$name\"; done; done; rm -f $HOME/{remote_rel}",
+            pid = std::process::id(),
+            remote_rel = remote_rel
         ))
         .status()?;
     if !status.success() {
@@ -3998,6 +4003,11 @@ fn sync_yggterm_to_hosts(paths: &Paths, hosts: &[String]) -> anyhow::Result<()> 
         if !status.success() {
             bail!("could not import yggterm {version} on {host}");
         }
+        // The yggterm archive carries ynpm/ynpx for a self-contained product
+        // install. Reassert the manager that is performing this fleet sync
+        // after import as well: it is the newest protocol peer and must not be
+        // replaced by a stale auxiliary copy left by an older deploy layout.
+        bootstrap_remote_ynpm(host)?;
         println!("ynpm: distributed yggterm {version} to {host}");
     }
     let _ = fs::remove_file(archive);
