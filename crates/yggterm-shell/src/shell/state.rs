@@ -395,6 +395,11 @@ static FORCED_WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
 // fingerprint as "shellstate_mut"; per-context histogram emitted each render so
 // the hot write reasons during a load are nameable. Gated YGGTERM_TRACE_RENDER=1.
 static SHELLSTATE_MUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+// Modal toggles still dirty the Dioxus signal, but they do not change the
+// expensive data projection consumed by the main shell. Keeping a second epoch
+// lets the settings overlays reuse the last rendered data snapshot while their
+// own current open bit is read directly by the modal layer.
+static SHELLSTATE_SNAPSHOT_DATA_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// ⭐ THE PER-SITE HISTOGRAM MOVED TO [`crate::render_attribution`] AND IS NOW
 /// ALWAYS ON (2026-08-20). It used to live here keyed on `String`, formatting a
 /// `file:line` per write, and that cost is why it sat behind an env flag or a
@@ -17679,9 +17684,12 @@ struct ShellState {
     /// counts), and it is called from the root render, from app-control's
     /// describe verbs, and from dozens of event handlers — several of which
     /// build the whole thing to read one field. The cache key is
-    /// `SHELLSTATE_MUT_TOTAL`, which every write path bumps (the counted-write
-    /// contract at [`safe_shell_mut`]/`with_mut_counted`), plus a short TTL
-    /// for the snapshot's few wall-clock-dependent bits (busy-hint expiry).
+    /// `SHELLSTATE_SNAPSHOT_DATA_TOTAL`, which every data write path bumps (the
+    /// counted-write contract at [`safe_shell_mut`]/`with_mut_counted`), plus a
+    /// short TTL for the snapshot's few wall-clock-dependent bits (busy-hint
+    /// expiry). Settings-modal open/close uses the modal-only wrapper and reads
+    /// its current bit directly at the overlay mount, so that UI-only toggle
+    /// does not invalidate the large data projection.
     /// Interior mutability on purpose: filling the cache is not a state
     /// change, and must not dirty the signal.
     render_snapshot_cache: std::cell::RefCell<Option<(u64, u64, SharedSnapshot)>>,
@@ -20344,7 +20352,12 @@ struct TerminalSurfaceStatus {
 
 impl TerminalSurfaceStatus {
     fn needs_attention(&self) -> bool {
-        self.transport_degraded || self.ghost_frame || self.cached_input_bytes > 0
+        // A healthy writer can have a short in-flight queue on every ordinary
+        // keystroke. That byte count is observability, not attention: treating
+        // it as amber made a typable remote row flash for the duration of each
+        // write RPC. Cached bytes become an attention state when the transport
+        // is degraded; a held ghost frame remains attention until fresh Paint.
+        self.transport_degraded || self.ghost_frame
     }
 }
 
@@ -21256,22 +21269,35 @@ impl ShellState {
             session.status_line = cursor_line.to_string();
         }
     }
-    /// [`Self::snapshot`], deduplicated across a stable write epoch.
+    /// [`Self::snapshot`], deduplicated across a stable data-write epoch.
     ///
-    /// Returns the SAME `Arc` while `SHELLSTATE_MUT_TOTAL` has not moved and
-    /// the entry is younger than the TTL — so the root render, app-control's
-    /// describe verbs and every handler that "just needs one field" share one
-    /// merge instead of each paying their own. The TTL exists because a few
-    /// snapshot inputs are wall-clock reads (the optimistic busy-hint filter):
-    /// 500 ms bounds how stale those can be served when no write happens.
+    /// Returns the SAME `Arc` while `SHELLSTATE_SNAPSHOT_DATA_TOTAL` has not
+    /// moved and the entry is younger than the TTL — so the root render,
+    /// app-control's describe verbs and every handler that "just needs one
+    /// field" share one merge instead of each paying their own. The three
+    /// settings-modal open bits have a deliberate stale-data exception: their
+    /// current values are read directly by the overlay layer, so a modal click
+    /// cannot make its first paint wait for the fleet merge. The TTL exists
+    /// because a few snapshot inputs are wall-clock reads (the optimistic
+    /// busy-hint filter): 500 ms bounds how stale those can be served when no
+    /// data write happens.
     fn snapshot_shared(&self) -> SharedSnapshot {
         const RENDER_SNAPSHOT_CACHE_TTL_MS: u64 = 500;
-        let epoch = SHELLSTATE_MUT_TOTAL.load(Ordering::Relaxed);
+        let epoch = SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(Ordering::Relaxed);
         let now = current_millis();
         if let Some((cached_epoch, cached_at_ms, cached)) =
             self.render_snapshot_cache.borrow().as_ref()
             && *cached_epoch == epoch
-            && now.saturating_sub(*cached_at_ms) < RENDER_SNAPSHOT_CACHE_TTL_MS
+            && (now.saturating_sub(*cached_at_ms) < RENDER_SNAPSHOT_CACHE_TTL_MS
+                // A settings-modal toggle changes no data projection. Even if
+                // the user waited past the ordinary TTL before clicking, the
+                // modal must not wait for a cold fleet merge; the data will be
+                // refreshed by the next data epoch. This branch is restricted
+                // to the three fields whose click handlers use the modal-only
+                // write wrapper below.
+                || (*cached).launch_flags_open != self.launch_flags_open
+                || (*cached).cli_install_open != self.cli_install_open
+                || (*cached).keymap_editor_open != self.keymap_editor_open)
         {
             return cached.clone();
         }
@@ -36615,6 +36641,7 @@ fn clear_terminal_resume_notification(state: Signal<ShellState>, session_path: &
 /// string when the intent, not the address, is what a future reader needs.
 trait ShellStateWriteCounted {
     fn with_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R;
+    fn with_modal_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R;
 }
 impl ShellStateWriteCounted for Signal<ShellState> {
     #[track_caller]
@@ -36623,6 +36650,20 @@ impl ShellStateWriteCounted for Signal<ShellState> {
         // `Location::caller()` is a static pointer the caller already passed in,
         // and the site tuple allocates nothing, so there is no cost left to
         // arm around.
+        SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        SHELLSTATE_SNAPSHOT_DATA_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let caller = std::panic::Location::caller();
+        crate::render_attribution::note_state_write((caller.file(), caller.line()));
+        self.with_mut(operation)
+    }
+
+    #[track_caller]
+    fn with_modal_mut_counted<R>(&mut self, operation: impl FnOnce(&mut ShellState) -> R) -> R {
+        // This is still a real ShellState write and must remain visible to the
+        // render-cause attribution. It deliberately does not move the data
+        // snapshot epoch: the settings-modal open/close bits are projected by
+        // the modal layer from current state, while the large data snapshot is
+        // safe to reuse for the same render.
         SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
         let caller = std::panic::Location::caller();
         crate::render_attribution::note_state_write((caller.file(), caller.line()));
@@ -36638,6 +36679,7 @@ fn safe_shell_mut<R>(
     // whole answer during a storm, and a probe that has to be armed in advance
     // is armed by someone who already knew.
     SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    SHELLSTATE_SNAPSHOT_DATA_TOTAL.fetch_add(1, Ordering::Relaxed);
     // Line 0 marks the label as a human-written context rather than a source
     // position — see `render_attribution::WriteSite`.
     crate::render_attribution::note_state_write((context, 0));
@@ -49500,11 +49542,29 @@ fn top_modal_of(
 
 /// Snapshot-side view of the same precedence, for the render pass.
 fn render_top_modal(snapshot: &RenderSnapshot) -> Option<TopModal> {
-    top_modal_of(
-        snapshot.keymap_editor_open,
-        snapshot.theme_editor_open,
+    render_top_modal_with_settings_modals(
+        snapshot,
         snapshot.launch_flags_open,
         snapshot.cli_install_open,
+        snapshot.keymap_editor_open,
+    )
+}
+
+/// Snapshot-side precedence with the settings-modal bits supplied from
+/// current state. Those bits use the modal-only write path so the large data
+/// snapshot can remain shared for the first modal paint; every other modal
+/// field still comes from the normal snapshot until its own fast path exists.
+fn render_top_modal_with_settings_modals(
+    snapshot: &RenderSnapshot,
+    launch_flags_open: bool,
+    cli_install_open: bool,
+    keymap_editor_open: bool,
+) -> Option<TopModal> {
+    top_modal_of(
+        keymap_editor_open,
+        snapshot.theme_editor_open,
+        launch_flags_open,
+        cli_install_open,
         snapshot.app_pane_modal.is_some(),
         snapshot.pending_media_capture.is_some(),
         snapshot.pending_fido2.is_some(),
@@ -49583,6 +49643,20 @@ fn render_top_menu(snapshot: &RenderSnapshot) -> Option<ShellMenu> {
 }
 
 fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
+    chrome_transient_over_viewport_with_settings_modals(
+        snapshot,
+        snapshot.launch_flags_open,
+        snapshot.cli_install_open,
+        snapshot.keymap_editor_open,
+    )
+}
+
+fn chrome_transient_over_viewport_with_settings_modals(
+    snapshot: &RenderSnapshot,
+    launch_flags_open: bool,
+    cli_install_open: bool,
+    keymap_editor_open: bool,
+) -> bool {
     snapshot.titlebar_new_menu_open
         || snapshot.titlebar_session_menu_open
         || snapshot.titlebar_overflow_menu_open
@@ -49623,7 +49697,9 @@ fn chrome_transient_over_viewport(snapshot: &RenderSnapshot) -> bool {
         // The ALT+ KeyTips editor is a full-window dialog like the theme editor
         // beside it; it joined `top_modal` (§4 — it owns the keys while it is up)
         // and the two lists answer the same question, so it joins here too.
-        || snapshot.keymap_editor_open
+        || keymap_editor_open
+        || launch_flags_open
+        || cli_install_open
 }
 fn titlebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
     // KeyTips need the affordances they annotate on screen: when the overlay is
@@ -63360,12 +63436,17 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 .collect()
         })
         .unwrap_or_default();
+    let row_statuses = sidebar_row_statuses(&snapshot);
     json!({
         "row_count": snapshot.rows.len(),
         "rows": snapshot.rows.iter().enumerate().map(|(index, row)| {
             let machine = remote_machine_for_sidebar_row(&shell, row);
-            let busy_state = sidebar_row_busy_state(&snapshot, row);
-            let busy = busy_state.visible;
+            let row_status = row_statuses.get(index).copied().unwrap_or_default();
+            let busy = row_status.busy;
+            let machine_row = row.kind == BrowserRowKind::Group
+                && (row.full_path == "local" || row.full_path.starts_with("__remote_machine__/"));
+            let machine_attention = machine_row && row_status.attention;
+            let machine_ghost_frame = machine_row && row_status.ghost_frame;
             // ⛔ NOT folded into `busy`/`busy_reason`. A deaf row is not busy and
             // not idle — it is a THIRD state, and answering the busy question
             // with it would make a wedged row render as working, which is a lie
@@ -63456,7 +63537,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 }).and_then(|session| session.outline_prefix.clone()),
                 "child_count": row.descendant_sessions,
                 "busy": busy,
-                "busy_reason": busy_state.reason,
+                "busy_reason": row_status.busy_reason,
                 // The FACT, and the SUSPICION derived from it by the one owner
                 // of the threshold. Both are emitted: a reader chasing "why is
                 // this row flagged" needs the gap, and a reader scanning for
@@ -63467,6 +63548,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "wedge_suspected": yggterm_core::input_unanswered_suggests_wedge(
                     input_unanswered_ms,
                 ),
+                "terminal_attention": row_status.attention,
                 "terminal_transport_degraded": terminal_surface_status
                     .map(|status| status.transport_degraded)
                     .unwrap_or(false),
@@ -63514,7 +63596,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 }),
                 "machine_health_raw": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
                 "machine_indicator_color": machine.as_ref().map(|machine| {
-                    machine_indicator_color_value(machine_display_health(
+                    let health = machine_display_health(
                         match machine.health {
                             RemoteMachineHealth::Healthy => MachineHealth::Healthy,
                             RemoteMachineHealth::Cached => MachineHealth::Cached,
@@ -63522,8 +63604,15 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                         },
                         machine.remote_deploy_state,
                         machine.sessions.len(),
-                    ))
+                    );
+                    if machine_row {
+                        machine_indicator_color_value_for_attention(health, machine_attention)
+                    } else {
+                        machine_indicator_color_value(health)
+                    }
                 }),
+                "machine_attention": machine_row && machine_attention,
+                "machine_ghost_frame": machine_ghost_frame,
                 "remote_deploy_state": machine.as_ref().map(|machine| format!("{:?}", machine.remote_deploy_state)),
             })
         }).collect::<Vec<_>>(),

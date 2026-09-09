@@ -4968,10 +4968,12 @@ JSON.stringify({{
 
     // The epoch cache's two obligations, and the property that makes it sound.
     // `snapshot_shared` may serve a cached merge ONLY while nothing wrote to
-    // `ShellState`; its key is `SHELLSTATE_MUT_TOTAL`, which every write path
-    // bumps — so (a) no write between calls ⇒ the SAME Arc comes back (the
-    // dedup that collapses probe bursts and forced-wake renders), and (b) any
-    // counted write ⇒ a fresh merge. The scan half locks the soundness: a raw
+    // `ShellState`; its key is `SHELLSTATE_SNAPSHOT_DATA_TOTAL`, which every
+    // data write path bumps — so (a) no data write between calls ⇒ the SAME Arc
+    // comes back (the dedup that collapses probe bursts and forced-wake renders),
+    // and (b) any counted data write ⇒ a fresh merge. The settings modal-only
+    // wrapper is the explicit exception: its current bits are read directly by
+    // the modal layer. The scan half locks the soundness: a raw
     // `state.with_mut(` outside the counted wrappers would mutate WITHOUT
     // bumping the epoch, and the cache would serve stale rows to the render
     // and to every agent probe at once.
@@ -4986,10 +4988,77 @@ JSON.stringify({{
             "no write happened between two snapshot_shared calls, yet the merge ran twice"
         );
         SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        SHELLSTATE_SNAPSHOT_DATA_TOTAL.fetch_add(1, Ordering::Relaxed);
         let third = shell.snapshot_shared();
         assert!(
             !std::sync::Arc::ptr_eq(&second, &third),
-            "the write epoch moved and the cache still served the old merge"
+            "the data write epoch moved and the cache still served the old merge"
+        );
+    }
+
+    #[test]
+    fn settings_modal_toggle_reuses_the_data_snapshot() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let first = shell.snapshot_shared();
+        shell.set_launch_flags_open(true);
+        SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let second = shell.snapshot_shared();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "opening a settings modal must not rebuild the large data snapshot"
+        );
+        assert!(
+            !second.launch_flags_open,
+            "the data snapshot is intentionally stale for the modal bit; the \
+             root overlay reads the current bit directly"
+        );
+    }
+
+    /// A modal/open action must not pay for a second full sidebar merge merely
+    /// because a neighbouring render effect needs the same immutable facts.
+    /// `snapshot()` bypasses the epoch cache; these three effects used that
+    /// bypass and made a local overlay wait behind remote/tree work. Keep the
+    /// root render and its effects on the one shared snapshot path.
+    #[test]
+    fn render_effects_reuse_the_shared_snapshot_cache() {
+        let launch = include_str!("launch.rs");
+        assert_eq!(
+            launch.matches("let snapshot = shell.snapshot();").count(),
+            0,
+            "a render effect bypasses snapshot_shared and rebuilds the sidebar merge"
+        );
+        assert_eq!(
+            launch.matches("let snapshot = state.read().snapshot();").count(),
+            0,
+            "a render effect bypasses snapshot_shared and rebuilds the sidebar merge"
+        );
+        assert_eq!(
+            launch.matches("snapshot_shared()").count(),
+            4,
+            "the root render and its three effects must share the epoch-cached snapshot"
+        );
+    }
+
+    #[test]
+    fn healthy_remote_input_does_not_publish_a_transient_attention_status() {
+        let viewport = include_str!("viewport.rs");
+        let input_start = viewport
+            .find("let track_completion = is_remote_resume_session;")
+            .expect("remote input completion tracking should exist");
+        let input_end = viewport[input_start..]
+            .find("let _ = terminal_write_tx.send")
+            .map(|offset| input_start + offset)
+            .expect("remote input should enqueue through the dedicated writer");
+        let input_body = &viewport[input_start..input_end];
+        assert!(
+            input_body.contains("&& (terminal_transport_degraded || terminal_ghost_frame)"),
+            "healthy in-flight bytes must stay off ShellState; publishing them \
+             re-renders the giant sidebar and flashes amber on every keystroke"
+        );
+        assert!(
+            input_body.contains("Normal healthy input has a small in-flight"),
+            "the normal queue/attention boundary must remain documented at the writer edge"
         );
     }
 
@@ -31151,6 +31220,40 @@ console.log('ok');
         );
     }
     #[test]
+    fn sidebar_status_projection_is_derived_once_per_render() {
+        let sidebar = include_str!("sidebar.rs");
+        let loop_start = sidebar
+            .find("for (row_index, row, live_group_member) in visible_rows.into_iter()")
+            .expect("sidebar row render loop should exist");
+        let loop_end = sidebar[loop_start..]
+            .find("let row_dragging")
+            .map(|offset| loop_start + offset)
+            .expect("sidebar row component call should exist");
+        let loop_body = &sidebar[loop_start..loop_end];
+        assert!(
+            loop_body.contains("row_statuses") && loop_body.contains("get(row_index)"),
+            "the row loop must consume the single precomputed source-row status index"
+        );
+        assert!(
+            sidebar.contains(".enumerate()\n        .map(|(row_index, row)| (row_index, Rc::new(row.clone())))"),
+            "filtered sidebar rows must retain their source snapshot indexes"
+        );
+        for forbidden in [
+            "sidebar_row_shows_busy_icon(&snapshot, &row)",
+            "sidebar_row_input_unanswered(&snapshot, &row)",
+            "sidebar_row_has_ghost_frame(&snapshot, &row)",
+        ] {
+            assert!(
+                !loop_body.contains(forbidden),
+                "the sidebar reintroduced a repeated per-row status walk: {forbidden}"
+            );
+        }
+        assert!(
+            sidebar.contains("fn sidebar_row_statuses(snapshot: &RenderSnapshot)"),
+            "the status index must remain an explicit render decision"
+        );
+    }
+    #[test]
     fn terminal_surface_attention_holds_until_fresh_paint_clears_it() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
             "remote-session://example/session",
@@ -31167,6 +31270,12 @@ console.log('ok');
             .is_some_and(|status| {
                 status.transport_degraded && status.ghost_frame && status.cached_input_bytes == 19
             }));
+        let degraded_message = shell
+            .terminal_surface_status_for_path("remote-session://example/session")
+            .map(terminal_surface_attention_message)
+            .expect("degraded ghost message");
+        assert!(degraded_message.contains("19 input bytes"));
+        assert!(degraded_message.contains("transport degraded"));
         assert!(shell.set_terminal_surface_status(
             "remote-session://example/session",
             false,
@@ -31177,6 +31286,15 @@ console.log('ok');
         assert!(shell
             .terminal_surface_status_for_path("remote-session://example/session")
             .is_some_and(|status| status.ghost_frame));
+        let recovered_message = shell
+            .terminal_surface_status_for_path("remote-session://example/session")
+            .map(terminal_surface_attention_message)
+            .expect("recovered ghost message");
+        assert!(recovered_message.contains("fresh Paint pending"));
+        assert!(recovered_message.contains("transport is healthy"));
+        assert!(recovered_message.contains("input is live"));
+        assert!(!recovered_message.contains("connection degraded"));
+        assert!(!recovered_message.contains("input is cached"));
         assert!(shell.set_terminal_surface_status(
             "remote-session://example/session",
             false,
@@ -47071,6 +47189,13 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
+        assert!(shell.set_terminal_surface_status(
+            live_path,
+            false,
+            true,
+            0,
+            "fresh_frame_pending",
+        ));
 
         let snapshot = shell.snapshot();
         let find = |path: &str| {
@@ -47084,6 +47209,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let deaf_row = find(deaf_path);
         let answering_row = find(live_path);
+        let answering_index = snapshot
+            .rows
+            .iter()
+            .position(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(live_path)
+            })
+            .expect("answering row index");
+        let answering_status = sidebar_row_statuses(&snapshot)[answering_index];
 
         assert!(
             sidebar_row_input_unanswered(&snapshot, deaf_row),
@@ -47094,6 +47228,55 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "a row that has answered must NOT be flagged — a detector that \
              flags everything is not a detector"
         );
+        assert!(answering_status.attention);
+        assert!(answering_status.ghost_frame);
+        assert!(
+            !answering_status.input_unanswered,
+            "a held ghost frame must not be mislabeled as unanswered input"
+        );
+
+        assert!(shell.set_terminal_surface_status(
+            live_path,
+            false,
+            false,
+            17,
+            "input_queued",
+        ));
+        let healthy_queue_snapshot = shell.snapshot();
+        let healthy_queue_row = healthy_queue_snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(live_path)
+            })
+            .expect("healthy queued row");
+        let healthy_queue_status = terminal_surface_status_for_snapshot(
+            &healthy_queue_snapshot,
+            live_path,
+        )
+        .expect("healthy queued status");
+        assert_eq!(healthy_queue_status.cached_input_bytes, 17);
+        assert!(
+            !healthy_queue_status.needs_attention(),
+            "an ordinary in-flight write must not become terminal attention"
+        );
+        assert!(
+            !sidebar_row_has_ghost_frame(&healthy_queue_snapshot, healthy_queue_row),
+            "a healthy in-flight write must not become a ghost frame"
+        );
+        let healthy_queue_index = healthy_queue_snapshot
+            .rows
+            .iter()
+            .position(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(live_path)
+            })
+            .expect("healthy queued row index");
+        let healthy_queue_row_status = sidebar_row_statuses(&healthy_queue_snapshot)
+            [healthy_queue_index];
+        assert!(!healthy_queue_row_status.attention);
+        assert!(!healthy_queue_row_status.input_unanswered);
 
         // ⛔ And it must not be reported as BUSY. Answering the busy question
         // with this signal would render the deaf row as working, which trades
@@ -64686,13 +64869,18 @@ mod menu_dismissal_locks {
             .position(|line| line.contains("\"data-yggterm-modal-open\": top_modal.kind(),"))
             .expect("the modal marker moved — move this lock with it");
         // The gate sits just above the marker; the exact offset moves with the
-        // comment block between them, so look in the handful of lines above it
-        // rather than pinning a number that a doc edit would break.
+        // comment block and the override arguments, so look in the nearby
+        // lines rather than pinning a number that a doc edit would break.
         assert!(
-            product[marker.saturating_sub(8)..marker]
+            product[marker.saturating_sub(16)..marker]
                 .iter()
-                .any(|line| line.trim() == "if let Some(top_modal) = render_top_modal(&snapshot) {"),
-            "the modal marker must be gated on the render-side precedence too"
+                .any(|line| line.trim() == "if let Some(top_modal) = render_top_modal_with_settings_modals("),
+            "the modal marker must be gated on the current render-side precedence"
+        );
+        assert!(
+            product.join("\n").contains("launch_flags_open")
+                && product.join("\n").contains("cli_install_open"),
+            "the settings modal marker must consume the current modal bits"
         );
     }
 
