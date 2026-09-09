@@ -3393,15 +3393,46 @@ fn tar_directory(paths: &Paths, source: &Path, label: &str) -> anyhow::Result<Pa
     Ok(archive)
 }
 
-fn yggterm_generation_is_complete(root: &Path, version: &str) -> bool {
-    let extension = cfg!(target_os = "windows").then_some(".exe").unwrap_or("");
-    ["yggterm", "yggterm-headless", "ynpm", "ynpx"]
+/// Activate a yggterm generation without treating a complete same-version
+/// directory as immutable. Release polish can change bytes while the public
+/// version remains the same; comparing product hashes lets that change travel
+/// through the fleet. Each differing product is atomically renamed over its
+/// old path, so a running process keeps its old inode and the next launch sees
+/// the new one.
+fn activate_yggterm_generation(
+    staging: &Path,
+    final_dir: &Path,
+    extension: &str,
+) -> anyhow::Result<usize> {
+    let names = ["yggterm", "yggterm-headless", "ynpm", "ynpx"];
+    if !final_dir.exists() {
+        fs::rename(staging, final_dir)?;
+        return Ok(names.len());
+    }
+    let complete = names
         .iter()
-        .all(|name| {
-            root.join(version)
-                .join(format!("{name}{extension}"))
-                .is_file()
-        })
+        .all(|name| final_dir.join(format!("{name}{extension}")).is_file());
+    if !complete {
+        fs::remove_dir_all(final_dir)
+            .with_context(|| format!("removing incomplete {}", final_dir.display()))?;
+        fs::rename(staging, final_dir)?;
+        return Ok(names.len());
+    }
+
+    let mut replaced = 0;
+    for name in names {
+        let incoming = staging.join(format!("{name}{extension}"));
+        let target = final_dir.join(format!("{name}{extension}"));
+        if sha256_file(&incoming)? == sha256_file(&target)? {
+            fs::remove_file(&incoming)?;
+        } else {
+            fs::rename(&incoming, &target)
+                .with_context(|| format!("activating same-version {name}"))?;
+            replaced += 1;
+        }
+    }
+    let _ = fs::remove_dir_all(staging);
+    Ok(replaced)
 }
 
 fn local_yggterm_production_archive(
@@ -3622,16 +3653,11 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     let versions = root.join("versions");
     fs::create_dir_all(&versions)?;
     let final_dir = versions.join(version);
-    if final_dir.exists() {
-        if !yggterm_generation_is_complete(&versions, version) {
-            fs::remove_dir_all(&final_dir)
-                .with_context(|| format!("removing incomplete {}", final_dir.display()))?;
-            fs::rename(&staging, &final_dir)?;
-        } else {
-            let _ = fs::remove_dir_all(&staging);
-        }
-    } else {
-        fs::rename(&staging, &final_dir)?;
+    let replaced = activate_yggterm_generation(&staging, &final_dir, extension)?;
+    if replaced > 0 && final_dir.exists() {
+        println!(
+            "ynpm: refreshed {replaced} yggterm product(s) in same-version {version}"
+        );
     }
     let yggterm = final_dir.join(format!("yggterm{extension}"));
     yggterm_core::write_direct_install_state(&root, &repo, &asset_label, version, &yggterm)?;
@@ -5012,5 +5038,45 @@ mod tests {
             candidates.get(1),
             Some(&PathBuf::from("/home/user/.yggterm/versions/3.2.91/ynpm"))
         );
+    }
+
+    #[test]
+    fn same_version_yggterm_archive_replaces_changed_products_atomically() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test home");
+        let root = home
+            .join(".yggterm/scratchpad/ynpm")
+            .join(format!("same-version-test-{}", std::process::id()));
+        let staging = root.join("staging");
+        let final_dir = root.join("final");
+        fs::create_dir_all(&staging).expect("staging");
+        fs::create_dir_all(&final_dir).expect("final");
+        for name in ["yggterm", "yggterm-headless", "ynpm", "ynpx"] {
+            fs::write(final_dir.join(name), format!("old-{name}")).expect("old product");
+            fs::write(
+                staging.join(name),
+                if name == "yggterm" {
+                    format!("new-{name}")
+                } else {
+                    format!("old-{name}")
+                },
+            )
+            .expect("incoming product");
+        }
+
+        let replaced = activate_yggterm_generation(&staging, &final_dir, "")
+            .expect("same-version activation");
+        assert_eq!(replaced, 1);
+        assert_eq!(
+            fs::read_to_string(final_dir.join("yggterm")).expect("new product"),
+            "new-yggterm"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("ynpm")).expect("unchanged manager"),
+            "old-ynpm"
+        );
+        assert!(!staging.exists(), "staging must be reaped after activation");
+        fs::remove_dir_all(root).expect("test cleanup");
     }
 }
