@@ -7394,7 +7394,7 @@ fn TerminalCanvas(
                                         let declare_control_token = control_token.clone();
                                         let declare_claimed_session = claimed_session.clone();
                                         spawn(async move {
-                                        let state = declare_state;
+                                        let mut state = declare_state;
                                         let trace_home = declare_trace_home;
                                         let contribution_session_path = declare_session_path;
                                         let web_surface_ssh_target = declare_ssh_target;
