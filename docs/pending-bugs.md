@@ -26558,7 +26558,7 @@ moves; not fixed alongside the activate half for exactly that reason.
 
 ## ⛔ [traffic-light] THE SIDEBAR MACHINE DOT STAYS AMBER ("cached") LONG AFTER THE DAEMON'S REMOTE-MACHINE HEALTH WENT HEALTHY
 
-**Status:** FIXED IN CODE — LIVE CACHED-HEALTH PROOF OWED
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Measured 2026-09-02, guihost.
 
@@ -28241,7 +28241,7 @@ mismatch instead of answering silent.
 
 ## ⛔ [11.90] WEAK REMOTE TRANSPORT BLOCKS THE UI AND FLATTENS HELD TERMINAL FRAMES (reported 2026-09-09)
 
-**Status:** FIXED IN CODE — LIVE OUTAGE REPRODUCTION AND RECOVERY PROOF OWED
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The owner reports that a weak or absent internet connection can make yggterm
 feel completely hung: the last terminal frame is not held as an explicit
