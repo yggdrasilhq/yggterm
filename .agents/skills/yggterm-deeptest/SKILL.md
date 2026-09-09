@@ -78,9 +78,12 @@ Pass `--host "$LIVE_HOST"` to every script explicitly.
 
 ## Preconditions (cheap, do every run)
 
-1. **Version parity** — the fix is actually running: `ssh "$LIVE_HOST" "$HBIN server status"`
-   (daemon `server_version`) and `ssh "$LIVE_HOST" "$BIN --version"` (GUI). Both must be
-   the build containing the fix. A stale daemon/GUI = you're testing the OLD code.
+1. **Version parity** — the fix is actually running: `ssh "$LIVE_HOST" "$HBIN server monitor --scenario server-list"`
+   (read `data.servers[].server_version`, `server_build_commit`, and the
+   single-server result) and `ssh "$LIVE_HOST" "$BIN --version"` (GUI). The
+   installed CLI has no `server status` verb; `server monitor --scenario
+   server-list` is the supported daemon witness. Both must be the build
+   containing the fix. A stale daemon/GUI = you're testing the OLD code.
 2. **Single daemon, no split-brain** — `pgrep -af 'yggterm-headless.*server daemon'` shows
    exactly one; `server monitor --scenario server-list` shows no runtime key owned by two
    daemons. SIGTERM a lingering old daemon (idle-gated retire is the backstop).
