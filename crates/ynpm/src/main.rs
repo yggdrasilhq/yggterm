@@ -3406,24 +3406,18 @@ fn local_yggterm_production_archive(
             staging.join(format!("{name}{extension}")),
         )?;
     }
+    let current_executable = std::env::current_exe().ok();
     for name in ["ynpm", "ynpx"] {
-        let candidates = [
-            root.join("versions")
-                .join(&context.current_version)
-                .join(format!("{name}{extension}")),
-            paths
-                .home
-                .join(".yggterm/bin")
-                .join(format!("{name}{extension}")),
-            paths
-                .home
-                .join(".local/bin")
-                .join(format!("{name}{extension}")),
-        ];
-        let source = candidates
-            .into_iter()
-            .find(|path| path.is_file())
-            .with_context(|| format!("active yggterm generation has no {name} product"))?;
+        let source = yggterm_aux_source_candidates(
+            &paths.home,
+            root,
+            &context.current_version,
+            &format!("{name}{extension}"),
+            current_executable.as_deref(),
+        )
+        .into_iter()
+        .find(|path| path.is_file())
+        .with_context(|| format!("active yggterm generation has no {name} product"))?;
         fs::copy(&source, staging.join(format!("{name}{extension}")))?;
     }
     for name in ["yggterm", "yggterm-headless", "ynpm", "ynpx"] {
@@ -3486,6 +3480,37 @@ fn yggterm_dev_allows_production(
             marker.dev_fingerprint.as_deref() != Some(production_fingerprint)
         }
     }
+}
+
+/// Return candidate manager binaries in trust order for a fleet archive.
+///
+/// `ynpm sync-fleet` is itself the source of truth for the auxiliary manager
+/// products. A host can still have an older copy in a managed yggterm version
+/// directory, though, and choosing that copy by filesystem order silently
+/// downgrades every peer during `import-yggterm`. When the running executable
+/// is ynpm/ynpx, it is the copy that just performed the sync and therefore the
+/// only candidate allowed to outrank those historical paths.
+fn yggterm_aux_source_candidates(
+    home: &Path,
+    root: &Path,
+    version: &str,
+    name: &str,
+    current_executable: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if current_executable.is_some_and(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "ynpm" | "ynpm.exe" | "ynpx" | "ynpx.exe"))
+    }) {
+        candidates.push(current_executable.unwrap().to_path_buf());
+    }
+    candidates.extend([
+        root.join("versions").join(version).join(name),
+        home.join(".yggterm/bin").join(name),
+        home.join(".local/bin").join(name),
+    ]);
+    candidates
 }
 
 fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
@@ -4914,6 +4939,25 @@ mod tests {
         assert_eq!(
             resolve_path_from(Path::new("/opt/tools"), Path::new("/home/user")),
             PathBuf::from("/opt/tools")
+        );
+    }
+
+    #[test]
+    fn fleet_archive_prefers_the_running_manager_over_a_stale_versioned_copy() {
+        let candidates = yggterm_aux_source_candidates(
+            Path::new("/home/user"),
+            Path::new("/home/user/.yggterm"),
+            "3.2.91",
+            "ynpm",
+            Some(Path::new("/home/user/.local/bin/ynpm")),
+        );
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from("/home/user/.local/bin/ynpm"))
+        );
+        assert_eq!(
+            candidates.get(1),
+            Some(&PathBuf::from("/home/user/.yggterm/versions/3.2.91/ynpm"))
         );
     }
 }
