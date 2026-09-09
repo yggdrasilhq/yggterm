@@ -6059,6 +6059,16 @@ worth testing:** automate the redraw the notification prescribes (the manual rem
 full replay heals it); reproduce the soup with the xterm.js write queue instrumented to see
 what actually interleaves.
 
+**CURRENT CLIENT-CACHE RESIDUAL 2026-09-09:** the retained-frame cache now
+stores a cell-aware ANSI projection alongside plain diagnostic text. RGB and
+palette colours plus standard text attributes survive hot reveal and GUI
+restart; cache capture/restore emits content-free `xterm_render` records with
+format and colour-cell counts. The existing canvas ghost remains a pixel copy
+(`canvas_pixels`) and is traced as `ghost_frame_attached`/`ghost_frame_released`.
+The daemon's formatted screen remains authoritative; this closes the known
+client-side colour flattening path but does not close the older empty-seed or
+mid-cure daemon-replay residuals in this entry.
+
 ## ⛔⛔ [11.0] THE BOOTER'S SEND PLANE HAS THREE NON-CONVERGING LOOPS, AND TWO WATCHERS RAN AT ONCE
 
 **Status:** OPEN
@@ -26548,7 +26558,7 @@ moves; not fixed alongside the activate half for exactly that reason.
 
 ## ⛔ [traffic-light] THE SIDEBAR MACHINE DOT STAYS AMBER ("cached") LONG AFTER THE DAEMON'S REMOTE-MACHINE HEALTH WENT HEALTHY
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE CACHED-HEALTH PROOF OWED
 
 Measured 2026-09-02, guihost.
 
@@ -26575,6 +26585,17 @@ owner reads color). Also repro-question: amber dots also appeared on FOLDER
 rows under the machine subtree (`/home/user`, `.ssh`) — the group-dot painter
 only knows machine-health and busy-blue, so confirm what paints those
 before touching the vocabulary.
+
+**CODE UPDATE 2026-09-09 (lane `trace/amber-ghost-cache`):**
+`machine_display_health` now preserves the daemon's raw health; deployment
+readiness and session count no longer promote `Cached` to `Healthy`. A machine
+with a terminal transport/ghost attention state projects that attention into
+the same single machine dot, with amber steady and red still dominant for an
+offline machine. The former separate group-gutter attention dot is suppressed
+on machine rows. Unit coverage pins cached+ready as `[cached]` and checks the
+one-dot/steady-amber rule. Live proof still needs a controlled cached-health
+episode; the current settled live matrix is healthy and therefore cannot close
+that falsifier.
 
 ---
 
@@ -28112,6 +28133,15 @@ after the roll.
 shows ui/block p95 under 100 ms for the switch leg and no gap over 1 s; the
 drag leg shows no gap over 250 ms.
 
+**CODE UPDATE 2026-09-09 (same lane):** the terminal loop no longer awaits the
+blank-host snapshot or resize-nudge recovery inline, and web/clipboard
+declaration work is dispatched outside the keystroke select branch. A remote
+attach marks transport uncertainty amber before the slow ensure call; failed
+writes remain ordered at the queue head and later input is bounded/counted.
+This directly addresses the weak-link half of the freeze, but it does not yet
+close the original swap-in/page-fault switch-storm falsifier above: bootstrap
+churn, retained-replay pacing, and the post-roll remeasurement remain open.
+
 ## ⛔ [11.88] THE FRAME-HASH PROBE MISMATCHED FOREVER ON WORKING ROWS — CONTROL-ONLY FORWARDED OUTPUT MUTATES THE CLIENT VIEWPORT THE DAEMON GRID NEVER MODELS, ONE UI DISPATCH EVERY ~3 s FOR HOURS (caught live 2026-09-08, GUI host, fixed in code same session)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -28208,3 +28238,46 @@ it for more than a tick when their owning host's row is store-named.
 re-points to the rebound id and wears "Greeting message" within one
 title-follow tick; after (b), the audit names the id divergence as a
 mismatch instead of answering silent.
+
+## ⛔ [11.90] WEAK REMOTE TRANSPORT BLOCKS THE UI AND FLATTENS HELD TERMINAL FRAMES (reported 2026-09-09)
+
+**Status:** FIXED IN CODE — LIVE OUTAGE REPRODUCTION AND RECOVERY PROOF OWED
+
+The owner reports that a weak or absent internet connection can make yggterm
+feel completely hung: the last terminal frame is not held as an explicit
+state, input is not visibly cached, recovery work can compete with the
+keystroke loop, and the sidebar may show contradictory green/amber lights.
+When a ghost frame does appear, it is text-only even though the formatted
+terminal stream carries SGR colour.
+
+The authoritative split is now explicit. The daemon owns PTY/session truth;
+the shell owns the client transport/render observer and projects it into the
+one sidebar dot. Remote attach uncertainty turns amber before the slow ensure
+call returns. A failed write stays at the ordered queue head, later input is
+bounded to 256 KiB and represented by byte count only, and a successful read
+or write clears transport uncertainty. A held last frame stays amber until a
+fresh xterm Paint proves that new bytes rendered, then the cache is released.
+The old machine-health promotion and machine-row second-dot path are removed.
+
+The retained-frame serializer now stores ANSI cell attributes (RGB/palette
+colour and standard text attributes) alongside plain diagnostic text. The
+canvas-pixel reveal ghost and the ANSI snapshot cache each emit content-free
+`xterm_render` records naming cache format, colour-cell count, hold/release
+reason, and timing. This makes a colourless ghost falsifiable instead of a
+screenshot-only mystery.
+
+**Fixed in code:** `crates/yggterm-shell/src/shell/viewport.rs` keeps recovery
+RPCs out of the terminal select loop for blank snapshots, resize nudges,
+clipboard, declaration, and restart paths; `terminal_frame_cache.js` has an
+exact-xterm harness test; the traffic-light projection has unit coverage;
+`yggterm-core` and ytrace use the 100 MiB live-log budget. The settled shadow
+live proof is clean: no contract violations, daemon runtime present, input
+enabled, canvas renderer active, and a faithful colored frame. A controlled
+network-outage episode is intentionally not manufactured on the user's live
+session, so outage timing and automatic re-entry remain open proof obligations.
+
+**Falsifier:** during a permitted weak-link episode, the sidebar turns amber
+before the recovery timeout, the last faithful frame remains visible, typed
+bytes remain ordered and counted, one fresh painted frame turns the status
+green, and the ytrace/file history contains the complete hold → recovery →
+paint sequence without a UI-block gap caused by the recovery RPC.
