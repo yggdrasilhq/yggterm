@@ -32,6 +32,11 @@ const TRACE_EMITTER_JS: &str = include_str!("trace_emitter.js");
 /// pin the same test vector.
 const FRAME_HASH_PROBE_JS: &str = include_str!("frame_hash_probe.js");
 
+/// Cell-aware retained-frame serialization, shared with the xterm harness so
+/// GUI-restart/hot-reveal caches preserve SGR colours and attributes rather
+/// than only the text projection.
+const TERMINAL_FRAME_CACHE_JS: &str = include_str!("terminal_frame_cache.js");
+
 fn terminal_eval_script(
     host_id: &str,
     theme: &TerminalTheme,
@@ -304,6 +309,7 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
 {trace_emitter_js}
 {frame_hash_probe_js}
+{terminal_frame_cache_js}
         // ── xterm.js probes (layer=xterm) ──────────────────────────────────
         // These serve the open ghost-frame / glyph-soup entry in
         // docs/pending-bugs.md, whose fix direction asks for "the xterm.js write
@@ -1331,18 +1337,40 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 host.appendChild(revealGhostFrame);
                 const ghostAttachedAtMs = Date.now();
-                const releaseRevealGhost = () => {{
+                const emitGhostFrameTrace = (name, extra = {{}}) => {{
+                    if (!window.__yggtermTrace) {{
+                        return;
+                    }}
+                    window.__yggtermTrace.emit({{
+                        category: 'xterm_render',
+                        name,
+                        payload: {{
+                            host_id: String(hostId || ''),
+                            source: 'previous_faithful_canvas',
+                            cache_format: 'canvas_pixels',
+                            width: Number(revealGhostFrame.width || 0),
+                            height: Number(revealGhostFrame.height || 0),
+                            ...extra,
+                        }},
+                    }});
+                }};
+                emitGhostFrameTrace('ghost_frame_attached');
+                const releaseRevealGhost = (releaseReason = 'settled_timeout') => {{
                     try {{
                         if (revealGhostFrame.isConnected) {{
                             revealGhostFrame.remove();
+                            emitGhostFrameTrace('ghost_frame_released', {{
+                                release_reason: releaseReason,
+                                held_ms: Math.max(0, Date.now() - ghostAttachedAtMs),
+                            }});
                             sendTerminalEvent({{
                                 kind: "debug",
-                                message: `reveal_ghost_released host=${{hostId}}`
+                                message: `reveal_ghost_released host=${{hostId}} reason=${{releaseReason}}`
                             }});
                         }}
                     }} catch (_error) {{}}
                 }};
-                window.setTimeout(releaseRevealGhost, 2400);
+                window.setTimeout(() => releaseRevealGhost('settled_timeout'), 2400);
                 // First keystroke releases the cover (input echo must not be
                 // hidden) — UNLESS the ghost is younger than the keystroke's
                 // own remount: when a keydown (prompt submit) is what caused
@@ -1356,7 +1384,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         window.addEventListener('keydown', releaseOnKeydown, {{ once: true, capture: true }});
                         return;
                     }}
-                    releaseRevealGhost();
+                    releaseRevealGhost('first_keydown');
                 }};
                 window.addEventListener('keydown', releaseOnKeydown, {{ once: true, capture: true }});
                 sendTerminalEvent({{
@@ -4981,6 +5009,16 @@ fn terminal_eval_script_with_canvas_renderer(
                 const length = Math.max(0, Number(buffer.length || 0));
                 const rows = Math.max(1, Number(term.rows || 1));
                 const maxRows = Math.min(length, Math.max(300, rows * 8));
+                // The cache module preserves per-cell SGR attributes. Keep the
+                // plain-text implementation below as a defensive fallback for
+                // older injected pages or a partially initialized WebView.
+                if (window.__yggtermTerminalFrameCache
+                    && typeof window.__yggtermTerminalFrameCache.serializeBuffer === 'function') {
+                    const cellAware = window.__yggtermTerminalFrameCache.serializeBuffer(term, maxRows);
+                    if (cellAware) {
+                        return cellAware;
+                    }
+                }
                 const start = Math.max(0, length - maxRows);
                 const visualLines = [];
                 const logicalLines = [];
@@ -5027,6 +5065,9 @@ fn terminal_eval_script_with_canvas_renderer(
                 const visualLineCount = serialized.visualLineCount;
                 const logicalLineCount = serialized.logicalLineCount;
                 const nonblankLineCount = serialized.nonblankLineCount;
+                const ansiText = typeof serialized.ansiText === 'string'
+                    ? serialized.ansiText
+                    : text;
                 if (!text.trim() || nonblankLineCount <= 0) {{
                     return null;
                 }}
@@ -5091,6 +5132,13 @@ fn terminal_eval_script_with_canvas_renderer(
                     nonblankLineCount,
                     text,
                     textTail: text.slice(-4096),
+                    ansiText,
+                    frameCacheFormat: typeof serialized.ansiText === 'string'
+                        ? 'ansi_cells'
+                        : 'plain_text',
+                    frameCacheHasAttributes: Boolean(serialized.hasAttributes),
+                    frameCacheColorCellCount: Number(serialized.colorCellCount || 0),
+                    frameCacheAttributeCellCount: Number(serialized.attributeCellCount || 0),
                 }};
                 window.__yggtermXtermSessionSnapshots[sessionPath] = snapshot;
                 const snapshotKeys = Object.keys(window.__yggtermXtermSessionSnapshots);
@@ -5118,6 +5166,26 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;
                     entry.lastXtermSessionSnapshotBaseY = snapshot.baseY;
                     entry.lastXtermSessionSnapshotViewportY = snapshot.viewportY;
+                    entry.lastXtermSessionSnapshotFrameCacheFormat = snapshot.frameCacheFormat;
+                    entry.lastXtermSessionSnapshotFrameCacheHasAttributes = snapshot.frameCacheHasAttributes;
+                    entry.lastXtermSessionSnapshotFrameCacheColorCellCount = snapshot.frameCacheColorCellCount;
+                }}
+                if (window.__yggtermTrace) {{
+                    window.__yggtermTrace.emit({{
+                        category: 'xterm_render',
+                        name: 'frame_cache_captured',
+                        payload: {{
+                            host_id: String(hostId || ''),
+                            session_path: String(sessionPath || ''),
+                            format: snapshot.frameCacheFormat,
+                            has_attributes: snapshot.frameCacheHasAttributes,
+                            color_cell_count: snapshot.frameCacheColorCellCount,
+                            attribute_cell_count: snapshot.frameCacheAttributeCellCount,
+                            logical_lines: snapshot.logicalLineCount,
+                            bytes: snapshot.ansiText.length,
+                            reason: snapshot.reason,
+                        }},
+                    }});
                 }}
                 // Skip persist while restore-from-localStorage is in flight.
                 const _restoreInFlight = Boolean(pendingPersistedScrollRestore)
@@ -5288,6 +5356,17 @@ fn terminal_eval_script_with_canvas_renderer(
                 return sessionPath ? `yggterm-scroll:${{sessionPath}}` : '';
             }} catch (_error) {{ return ''; }}
         }};
+        const capPersistedAnsiFrame = (value, maxChars = 48000) => {{
+            const text = typeof value === 'string' ? value : '';
+            if (text.length <= maxChars) {{
+                return text;
+            }}
+            // The serializer closes active styles at every logical line. Start
+            // at a line boundary so truncation cannot begin inside an SGR
+            // escape and poison the next restore.
+            const boundary = text.indexOf('\n', Math.max(0, text.length - maxChars));
+            return boundary >= 0 ? `\x1b[0m${{text.slice(boundary + 1)}}` : '';
+        }};
         const persistScrollStateToLocalStorage = (reason) => {{
             try {{
                 if (typeof window === 'undefined' || !window.localStorage) {{ return; }}
@@ -5314,18 +5393,32 @@ fn terminal_eval_script_with_canvas_renderer(
                 // vacuum this fix targets. Keep the prior text when the current
                 // frame is a severe collapse (<1/3 of the saved nonblank count).
                 let snapshotText = '';
+                let snapshotAnsiText = '';
                 let snapshotLineCount = 0;
                 let snapshotNonblankLineCount = 0;
+                let snapshotFrameCacheFormat = 'plain_text';
+                let snapshotFrameCacheHasAttributes = false;
+                let snapshotFrameCacheColorCellCount = 0;
+                let snapshotFrameCacheAttributeCellCount = 0;
                 try {{
-                    let prevText = ''; let prevLineCount = 0; let prevNonblank = 0;
+                    let prevText = ''; let prevAnsiText = ''; let prevLineCount = 0; let prevNonblank = 0;
+                    let prevFrameCacheFormat = 'plain_text';
+                    let prevFrameCacheHasAttributes = false;
+                    let prevFrameCacheColorCellCount = 0;
+                    let prevFrameCacheAttributeCellCount = 0;
                     try {{
                         const rawPrev = window.localStorage.getItem(key);
                         if (rawPrev) {{
                             const p = JSON.parse(rawPrev);
                             if (p && typeof p.text === 'string') {{
                                 prevText = p.text;
+                                prevAnsiText = typeof p.ansiText === 'string' ? p.ansiText : '';
                                 prevLineCount = Number(p.lineCount || 0);
                                 prevNonblank = Number(p.nonblankLineCount || 0);
+                                prevFrameCacheFormat = String(p.frameCacheFormat || (prevAnsiText ? 'ansi_cells' : 'plain_text'));
+                                prevFrameCacheHasAttributes = Boolean(p.frameCacheHasAttributes);
+                                prevFrameCacheColorCellCount = Number(p.frameCacheColorCellCount || 0);
+                                prevFrameCacheAttributeCellCount = Number(p.frameCacheAttributeCellCount || 0);
                             }}
                         }}
                     }} catch (_prevError) {{}}
@@ -5338,13 +5431,29 @@ fn terminal_eval_script_with_canvas_renderer(
                         // Cap per-session text so the localStorage origin quota
                         // (~5MB in WebKit) isn't blown across many session keys.
                         snapshotText = curText.length > 48000 ? curText.slice(-48000) : curText;
+                        snapshotAnsiText = capPersistedAnsiFrame(
+                            serialized && typeof serialized.ansiText === 'string'
+                                ? serialized.ansiText
+                                : curText
+                        );
                         snapshotLineCount = serialized ? Number(serialized.visualLineCount || 0) : 0;
                         snapshotNonblankLineCount = curNonblank;
+                        snapshotFrameCacheFormat = serialized && typeof serialized.ansiText === 'string'
+                            ? 'ansi_cells'
+                            : 'plain_text';
+                        snapshotFrameCacheHasAttributes = Boolean(serialized && serialized.hasAttributes);
+                        snapshotFrameCacheColorCellCount = Number(serialized && serialized.colorCellCount || 0);
+                        snapshotFrameCacheAttributeCellCount = Number(serialized && serialized.attributeCellCount || 0);
                     }} else if (prevText) {{
                         // Keep the previously-saved richer transcript intact.
                         snapshotText = prevText;
+                        snapshotAnsiText = prevAnsiText;
                         snapshotLineCount = prevLineCount;
                         snapshotNonblankLineCount = prevNonblank;
+                        snapshotFrameCacheFormat = prevFrameCacheFormat;
+                        snapshotFrameCacheHasAttributes = prevFrameCacheHasAttributes;
+                        snapshotFrameCacheColorCellCount = prevFrameCacheColorCellCount;
+                        snapshotFrameCacheAttributeCellCount = prevFrameCacheAttributeCellCount;
                     }}
                 }} catch (_textError) {{}}
                 const payload = JSON.stringify({{
@@ -5356,6 +5465,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     reason: String(reason || ''),
                     savedAtMs: Date.now(),
                     text: snapshotText,
+                    ansiText: snapshotAnsiText,
+                    frameCacheFormat: snapshotFrameCacheFormat,
+                    frameCacheHasAttributes: snapshotFrameCacheHasAttributes,
+                    frameCacheColorCellCount: snapshotFrameCacheColorCellCount,
+                    frameCacheAttributeCellCount: snapshotFrameCacheAttributeCellCount,
                     lineCount: snapshotLineCount,
                     nonblankLineCount: snapshotNonblankLineCount,
                 }});
@@ -5374,6 +5488,11 @@ fn terminal_eval_script_with_canvas_renderer(
                             reason: String(reason || ''),
                             savedAtMs: Date.now(),
                             text: '',
+                            ansiText: '',
+                            frameCacheFormat: 'plain_text',
+                            frameCacheHasAttributes: false,
+                            frameCacheColorCellCount: 0,
+                            frameCacheAttributeCellCount: 0,
                             lineCount: 0,
                             nonblankLineCount: 0,
                         }});
@@ -5410,6 +5529,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     // WS3 screen-restore: persisted buffer text ('' for entries written
                     // before this field existed).
                     text: typeof state.text === 'string' ? state.text : '',
+                    ansiText: typeof state.ansiText === 'string' ? state.ansiText : '',
+                    frameCacheFormat: String(state.frameCacheFormat || (state.ansiText ? 'ansi_cells' : 'plain_text')),
+                    frameCacheHasAttributes: Boolean(state.frameCacheHasAttributes),
+                    frameCacheColorCellCount: Math.max(0, Number(state.frameCacheColorCellCount || 0)),
+                    frameCacheAttributeCellCount: Math.max(0, Number(state.frameCacheAttributeCellCount || 0)),
                     lineCount: Math.max(0, Number(state.lineCount || 0)),
                     nonblankLineCount: Math.max(0, Number(state.nonblankLineCount || 0)),
                 }};
@@ -6606,10 +6730,16 @@ fn terminal_eval_script_with_canvas_renderer(
                 // daemon re-resumed on a fresh PTY). Marking the host non-blank + seeding the
                 // nonblank-max stops the blank-host replay from clobbering it with the sparse
                 // fresh-PTY screen. Gated by the same collapsed-poison rule as the cache.
-                if (persisted && typeof persisted.text === 'string' && persisted.text.trim()
+                const persistedFrameText = persisted && typeof persisted.ansiText === 'string'
+                    && persisted.ansiText.trim()
+                    ? persisted.ansiText
+                    : persisted && typeof persisted.text === 'string'
+                        ? persisted.text
+                        : '';
+                if (persisted && persistedFrameText.trim()
                     && persisted.nonblankLineCount > 1
                     && !xtermSessionSnapshotIsCollapsedPoison(currentHostSessionPath(), persisted.nonblankLineCount)) {{
-                    const restoredText = persisted.text.replace(/\r?\n/g, "\r\n");
+                    const restoredText = persistedFrameText.replace(/\r?\n/g, "\r\n");
                     const ws = term && term._core && typeof term._core.writeSync === "function"
                         ? term._core.writeSync.bind(term._core)
                         : (term && term._core && term._core._writeBuffer && typeof term._core._writeBuffer.writeSync === "function"
@@ -6632,12 +6762,18 @@ fn terminal_eval_script_with_canvas_renderer(
                             tentry.lastRetainedReplayRecoveredFromSnapshot = true;
                             tentry.lastLocalStorageTextRestoreLineCount = persisted.lineCount;
                             tentry.lastLocalStorageTextRestoreAtMs = Date.now();
+                            tentry.lastLocalStorageFrameCacheFormat = persisted.frameCacheFormat;
+                            tentry.lastLocalStorageFrameCacheHasAttributes = persisted.frameCacheHasAttributes;
+                            tentry.lastLocalStorageFrameCacheColorCellCount = persisted.frameCacheColorCellCount;
                         }}
                         // Stash for re-application after the daemon `reset` command
                         // (which fires once on attach AFTER this construct-time
                         // restore and would otherwise wipe the transcript).
                         pendingPostResetTranscript = {{
                             text: restoredText,
+                            frameCacheFormat: persisted.frameCacheFormat,
+                            frameCacheHasAttributes: persisted.frameCacheHasAttributes,
+                            frameCacheColorCellCount: persisted.frameCacheColorCellCount,
                             lineCount: persisted.lineCount,
                             nonblankLineCount: persisted.nonblankLineCount,
                         }};
@@ -6684,7 +6820,10 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 return false;
             }}
-            const normalizedText = String(snapshot.text || '').replace(/\r?\n/g, "\r\n");
+            const snapshotFrameText = typeof snapshot.ansiText === 'string' && snapshot.ansiText.trim()
+                ? snapshot.ansiText
+                : snapshot.text;
+            const normalizedText = String(snapshotFrameText || '').replace(/\r?\n/g, "\r\n");
             if (!normalizedText.trim()) {{
                 return false;
             }}
@@ -6737,6 +6876,24 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.lastXtermSessionSnapshotNonblankLineCount = Number(snapshot.nonblankLineCount || 0);
                 entry.lastXtermSessionSnapshotBaseY = Number(snapshot.baseY || 0);
                 entry.lastXtermSessionSnapshotViewportY = Number(snapshot.viewportY || 0);
+                entry.lastXtermSessionSnapshotFrameCacheFormat = String(
+                    snapshot.frameCacheFormat || (snapshot.ansiText ? 'ansi_cells' : 'plain_text')
+                );
+                entry.lastXtermSessionSnapshotFrameCacheHasAttributes = Boolean(snapshot.frameCacheHasAttributes);
+                entry.lastXtermSessionSnapshotFrameCacheColorCellCount = Number(snapshot.frameCacheColorCellCount || 0);
+            }}
+            if (window.__yggtermTrace) {{
+                window.__yggtermTrace.emit({{
+                    category: 'xterm_render',
+                    name: 'frame_cache_restored',
+                    payload: {{
+                        host_id: String(hostId || ''),
+                        format: String(snapshot.frameCacheFormat || (snapshot.ansiText ? 'ansi_cells' : 'plain_text')),
+                        has_attributes: Boolean(snapshot.frameCacheHasAttributes),
+                        color_cell_count: Number(snapshot.frameCacheColorCellCount || 0),
+                        source: 'in_memory_snapshot',
+                    }},
+                }});
             }}
             // XTERM-BUG: phantom-scrollback-latch — the teardown snapshot copies
             // the dying host's scroll intent verbatim, and this restore used to
@@ -12879,6 +13036,7 @@ fn terminal_eval_script_with_canvas_renderer(
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,
         frame_hash_probe_js = FRAME_HASH_PROBE_JS,
+        terminal_frame_cache_js = TERMINAL_FRAME_CACHE_JS,
         font_size = theme.font_size,
         background = background,
         foreground = foreground,
@@ -14501,7 +14659,10 @@ fn terminal_replay_retained_data_script_for_session(
           }};
           const replaySessionSnapshotIntoEntry = (entry, snapshot) => {{
             try {{
-              const normalizedText = String(snapshot.text || '').replace(/\r?\n/g, "\r\n");
+              const snapshotFrameText = typeof snapshot.ansiText === 'string' && snapshot.ansiText.trim()
+                ? snapshot.ansiText
+                : snapshot.text;
+              const normalizedText = String(snapshotFrameText || '').replace(/\r?\n/g, "\r\n");
               if (!normalizedText.trim()) {{
                 return false;
               }}
@@ -14520,6 +14681,11 @@ fn terminal_replay_retained_data_script_for_session(
               entry.lastRetainedReplaySource = 'xterm_session_snapshot';
               entry.lastRetainedReplayRecoveredFromSnapshot = true;
               entry.lastRetainedReplaySnapshotAgeMs = Number(snapshot.ageMs || 0);
+              entry.lastRetainedReplayFrameCacheFormat = String(
+                snapshot.frameCacheFormat || (snapshot.ansiText ? 'ansi_cells' : 'plain_text')
+              );
+              entry.lastRetainedReplayFrameCacheHasAttributes = Boolean(snapshot.frameCacheHasAttributes);
+              entry.lastRetainedReplayFrameCacheColorCellCount = Number(snapshot.frameCacheColorCellCount || 0);
               entry.lastRetainedReplaySnapshotError = '';
               entry.lastRetainedReplayRejectedVisibleText =
                 'retained_replay_cursor_addressed_scrollback_risk_recovered_from_xterm_snapshot';

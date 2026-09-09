@@ -385,6 +385,7 @@ fn Sidebar(
                         .to_string();
                         let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
                         let input_unanswered = sidebar_row_input_unanswered(&snapshot, &row);
+                        let ghost_frame = sidebar_row_has_ghost_frame(&snapshot, &row);
                         let row_dragging = sidebar_row_dragging_for_projection(
                             snapshot.drag_paths.as_slice(),
                             &live_group_paths,
@@ -433,6 +434,7 @@ fn Sidebar(
                                 icon_kind: icon_kind.clone(),
                                 busy_icon,
                                 input_unanswered,
+                                ghost_frame,
                                 selected: row_selected,
                                 drop_target: snapshot
                                     .drag_hover_target
@@ -891,9 +893,90 @@ fn sidebar_row_input_unanswered(snapshot: &RenderSnapshot, row: &BrowserRow) -> 
     if row.kind != BrowserRowKind::Session {
         return false;
     }
-    yggterm_core::input_unanswered_suggests_wedge(
+    let daemon_attention = yggterm_core::input_unanswered_suggests_wedge(
         sidebar_row_session_for_icon(snapshot, row).and_then(|session| session.input_unanswered_ms),
-    )
+    );
+    daemon_attention
+        || terminal_surface_status_for_snapshot(snapshot, &row.full_path)
+            .is_some_and(TerminalSurfaceStatus::needs_attention)
+}
+
+/// Look up a terminal surface status by either its live URI or its normalized
+/// session path. The daemon and the client use both spellings during a remote
+/// resume; the sidebar must not lose an amber verdict merely because the URI
+/// normalization happened on the other side of the handoff.
+fn terminal_surface_status_for_snapshot<'a>(
+    snapshot: &'a RenderSnapshot,
+    session_path: &str,
+) -> Option<&'a TerminalSurfaceStatus> {
+    snapshot
+        .terminal_surface_statuses
+        .get(session_path)
+        .or_else(|| {
+            let normalized = normalize_live_session_path(session_path);
+            snapshot
+                .terminal_surface_statuses
+                .iter()
+                .find_map(|(path, status)| {
+                    (normalize_live_session_path(path) == normalized).then_some(status)
+                })
+        })
+}
+
+/// Does this row contain a held/ghost frame? This is kept separate from the
+/// generic attention predicate so the single dot's tooltip can name the actual
+/// observable state rather than calling every transport problem a wedge.
+fn sidebar_row_has_ghost_frame(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
+    if row.kind == BrowserRowKind::Group {
+        return sidebar_group_has_ghost_frame_descendant(snapshot, row)
+            || sidebar_machine_row_has_ghost_frame_live_session(snapshot, row);
+    }
+    row.kind == BrowserRowKind::Session
+        && terminal_surface_status_for_snapshot(snapshot, &row.full_path)
+            .is_some_and(|status| status.ghost_frame)
+}
+
+fn sidebar_group_has_ghost_frame_descendant(
+    snapshot: &RenderSnapshot,
+    group_row: &BrowserRow,
+) -> bool {
+    let Some(start) = snapshot.rows.iter().position(|candidate| {
+        candidate.kind == BrowserRowKind::Group && candidate.full_path == group_row.full_path
+    }) else {
+        return false;
+    };
+    let group_depth = group_row.depth;
+    snapshot.rows[start + 1..]
+        .iter()
+        .take_while(|descendant| descendant.depth > group_depth)
+        .filter(|descendant| descendant.kind == BrowserRowKind::Session)
+        .any(|descendant| sidebar_row_has_ghost_frame(snapshot, descendant))
+}
+
+fn sidebar_machine_row_has_ghost_frame_live_session(
+    snapshot: &RenderSnapshot,
+    row: &BrowserRow,
+) -> bool {
+    if row.full_path == "local" {
+        return snapshot.live_sessions.iter().any(|session| {
+            session
+                .ssh_target
+                .as_deref()
+                .is_none_or(yggterm_server::is_loopback_ssh_target)
+                && is_local_live_session_path(&session.session_path)
+                && terminal_surface_status_for_snapshot(snapshot, &session.session_path)
+                    .is_some_and(|status| status.ghost_frame)
+        });
+    }
+    let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
+        return false;
+    };
+    snapshot.live_sessions.iter().any(|session| {
+        (session.ssh_target.as_deref() == Some(machine_key)
+            || session.host_label == machine_key)
+            && terminal_surface_status_for_snapshot(snapshot, &session.session_path)
+                .is_some_and(|status| status.ghost_frame)
+    })
 }
 
 /// Any session in this group's subtree that has stopped answering — the
@@ -925,11 +1008,25 @@ fn sidebar_machine_row_has_input_unanswered_live_session(
     snapshot: &RenderSnapshot,
     row: &BrowserRow,
 ) -> bool {
+    if row.full_path == "local" {
+        return snapshot.live_sessions.iter().any(|session| {
+            session
+                .ssh_target
+                .as_deref()
+                .is_none_or(yggterm_server::is_loopback_ssh_target)
+                && is_local_live_session_path(&session.session_path)
+                && (yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
+                    || terminal_surface_status_for_snapshot(snapshot, &session.session_path)
+                        .is_some_and(TerminalSurfaceStatus::needs_attention))
+        });
+    }
     let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
         return false;
     };
     snapshot.live_sessions.iter().any(|session| {
-        yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
+        (yggterm_core::input_unanswered_suggests_wedge(session.input_unanswered_ms)
+            || terminal_surface_status_for_snapshot(snapshot, &session.session_path)
+                .is_some_and(TerminalSurfaceStatus::needs_attention))
             && (session.ssh_target.as_deref() == Some(machine_key)
                 || session.host_label == machine_key)
     })
@@ -2116,6 +2213,10 @@ fn SidebarRow(
     /// any normal round trip — DESIGN.md's amber ATTENTION state. ⚠ A trigger,
     /// never a verdict; `terminal input-check` settles it.
     input_unanswered: bool,
+    /// This row (or one of its live descendants) is showing the last faithful
+    /// frame while transport is degraded. It shares the attention dot with
+    /// queued input and owns the more precise tooltip wording.
+    ghost_frame: bool,
     selected: bool,
     drop_target: Option<DragDropPlacement>,
     dragging: bool,
@@ -2560,7 +2661,11 @@ fn SidebarRow(
                     // is inserted ahead of it or the cluster is indented, which
                     // is exactly how the first build of row sets put a header's
                     // dot to the right of its own members'. Out here it cannot.
-                    if !show_live_close && row_is_group && input_unanswered {
+                    if !show_live_close
+                        && row_is_group
+                        && input_unanswered
+                        && machine_health.is_none()
+                    {
                         // A GROUP holding a row that has stopped answering.
                         //
                         // ⛔ It goes in THE GUTTER, not beside the group's own
@@ -2583,7 +2688,11 @@ fn SidebarRow(
                             style: session_row_dot_rail_style(SessionRowDensity::Sidebar),
                             span {
                                 "data-sidebar-group-input-unanswered-dot": "1",
-                                title: "A session inside has been typed to with no response — expand to find it",
+                                title: if ghost_frame {
+                                    "A session inside is holding its last frame because transport degraded — expand to inspect"
+                                } else {
+                                    "A session inside has been typed to with no response — expand to find it"
+                                },
                                 style: live_session_status_dot_style_with_attention(palette, false, false, true),
                             }
                         }
@@ -2600,6 +2709,7 @@ fn SidebarRow(
                                 "data-sidebar-live-session-keep-alive": if row_kept_alive { "1" } else { "0" },
                                 "data-sidebar-live-session-working": if busy_icon { "1" } else { "0" },
                                 "data-sidebar-live-session-input-unanswered": if input_unanswered { "1" } else { "0" },
+                                "data-sidebar-live-session-ghost-frame": if ghost_frame { "1" } else { "0" },
                                 // The attention state OWNS the tooltip when it
                                 // holds: the durability phrasings answer a
                                 // question nobody is asking of a row that has
@@ -2607,7 +2717,9 @@ fn SidebarRow(
                                 // and the next step, and it does NOT say
                                 // "wedged" — that is a verdict this signal is
                                 // not entitled to make.
-                                title: if input_unanswered {
+                                title: if ghost_frame {
+                                    "Held last frame — connection degraded; input is cached until transport recovers"
+                                } else if input_unanswered {
                                     "Typed to, no response yet — may not be listening. Check with: server app terminal input-check"
                                 } else {
                                     match (row_kept_alive, busy_icon) {
@@ -2787,14 +2899,32 @@ fn SidebarRow(
                     // shared hard step-end pulse) when any session in the machine's
                     // subtree is working, exactly like a live-session row's dot.
                     if let Some(health) = machine_health {
+                        let machine_attention = input_unanswered;
+                        let machine_blink = machine_indicator_should_blink(
+                            health,
+                            busy_icon,
+                            machine_attention,
+                        );
                         span {
                             "data-machine-indicator": "1",
                             "data-machine-working": if busy_icon { "1" } else { "0" },
-                            title: if busy_icon { "Working inside" } else { "" },
+                            "data-machine-attention": if machine_attention { "1" } else { "0" },
+                            "data-machine-ghost-frame": if ghost_frame { "1" } else { "0" },
+                            title: if ghost_frame {
+                                "Held last frame inside — connection degraded; input is cached until transport recovers"
+                            } else if machine_attention {
+                                "Attention inside — expand to inspect the held terminal"
+                            } else if health == MachineHealth::Cached {
+                                "Cached machine snapshot — reachability has not been freshly confirmed"
+                            } else if busy_icon {
+                                "Working inside"
+                            } else {
+                                ""
+                            },
                             style: format!(
                                 "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{};{}",
-                                machine_indicator_color_value(health),
-                                status_dot_blink_opacity_css(busy_icon)
+                                machine_indicator_color_value_for_attention(health, machine_attention),
+                                status_dot_blink_opacity_css(machine_blink)
                             ),
                         }
                     } else if row_is_group && busy_icon {
@@ -2969,6 +3099,25 @@ fn machine_health_from_label(label: &str) -> Option<MachineHealth> {
     } else {
         None
     }
+}
+fn machine_indicator_color_value_for_attention(
+    health: MachineHealth,
+    attention: bool,
+) -> &'static str {
+    if attention && health != MachineHealth::Offline {
+        "#f59e0b"
+    } else {
+        machine_indicator_color_value(health)
+    }
+}
+fn machine_indicator_should_blink(
+    health: MachineHealth,
+    busy: bool,
+    attention: bool,
+) -> bool {
+    // Amber is a steady attention signal. A cached machine must also remain
+    // steady; only a freshly healthy machine may use the working pulse.
+    health == MachineHealth::Healthy && busy && !attention
 }
 fn machine_label_text(label: &str) -> Option<String> {
     machine_health_from_label(label).map(|_| {
@@ -3424,4 +3573,3 @@ fn split_divider_drag_script(axis: SplitAxis, ratio: f32) -> String {
         "#
     )
 }
-

@@ -17872,6 +17872,11 @@ struct ShellState {
     generated_summaries: BTreeMap<String, String>,
     cached_hot_session_views: HashMap<String, ManagedSessionView>,
     live_terminal_sidebar_samples: HashMap<String, LiveTerminalSidebarSample>,
+    /// Per-session terminal transport/render attention. This is an observer of
+    /// the off-loop terminal bridge, not a replacement for daemon machine
+    /// reachability. It exists so a held last frame and cached keystrokes have
+    /// one durable render projection instead of competing dots.
+    terminal_surface_statuses: HashMap<String, TerminalSurfaceStatus>,
     terminal_busy_hint_until_ms: HashMap<String, u64>,
     title_requests_in_flight: HashSet<String>,
     precis_requests_in_flight: HashSet<String>,
@@ -18829,6 +18834,10 @@ struct RenderSnapshot {
     /// remains `split_groups`.
     active_split_group: Option<SplitGroup>,
     terminal_mount_epochs: HashMap<String, u64>,
+    /// Per-session transport/render attention projected into the sidebar and
+    /// app-control snapshot. Content is never stored here — only state and
+    /// byte counts, so a diagnostic read cannot leak terminal input.
+    terminal_surface_statuses: HashMap<String, TerminalSurfaceStatus>,
     ssh_targets: Vec<SshConnectTarget>,
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_sessions: Vec<ManagedSessionView>,
@@ -20179,6 +20188,27 @@ enum MachineHealth {
     Offline,
 }
 
+/// The terminal surface's transport/render attention state.
+///
+/// This is deliberately separate from [`MachineHealth`]. A machine can be
+/// reachable while one terminal write is queued, and a terminal can still be
+/// showing a faithful last frame while its next transport read is down. The
+/// sidebar owns the one-dot projection of this state; it must never invent a
+/// second traffic light beside the machine's reachability light.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalSurfaceStatus {
+    transport_degraded: bool,
+    ghost_frame: bool,
+    cached_input_bytes: usize,
+    reason: String,
+}
+
+impl TerminalSurfaceStatus {
+    fn needs_attention(&self) -> bool {
+        self.transport_degraded || self.ghost_frame || self.cached_input_bytes > 0
+    }
+}
+
 // ============================================================================
 // SECTION: `impl ShellState`
 // ----------------------------------------------------------------------------
@@ -20396,6 +20426,7 @@ impl ShellState {
             generated_summaries: BTreeMap::new(),
             cached_hot_session_views: HashMap::new(),
             live_terminal_sidebar_samples: HashMap::new(),
+            terminal_surface_statuses: HashMap::new(),
             terminal_busy_hint_until_ms: HashMap::new(),
             title_requests_in_flight: HashSet::new(),
             precis_requests_in_flight: HashSet::new(),
@@ -21110,6 +21141,50 @@ impl ShellState {
         *self.render_snapshot_cache.borrow_mut() = Some((epoch, now, fresh.clone()));
         fresh
     }
+
+    /// Record the terminal bridge's current attention state without changing
+    /// daemon truth. The map is intentionally edge-oriented: an unchanged
+    /// transport event must not turn a weak connection into a render loop.
+    fn set_terminal_surface_status(
+        &mut self,
+        session_path: &str,
+        transport_degraded: bool,
+        ghost_frame: bool,
+        cached_input_bytes: usize,
+        reason: impl Into<String>,
+    ) -> bool {
+        let reason = reason.into();
+        if !transport_degraded && !ghost_frame && cached_input_bytes == 0 {
+            return self.terminal_surface_statuses.remove(session_path).is_some();
+        }
+        let next = TerminalSurfaceStatus {
+            transport_degraded,
+            ghost_frame,
+            cached_input_bytes,
+            reason,
+        };
+        if self.terminal_surface_statuses.get(session_path) == Some(&next) {
+            return false;
+        }
+        self.terminal_surface_statuses
+            .insert(session_path.to_string(), next);
+        true
+    }
+
+    fn terminal_surface_status_for_path(
+        &self,
+        session_path: &str,
+    ) -> Option<&TerminalSurfaceStatus> {
+        self.terminal_surface_statuses
+            .get(session_path)
+            .or_else(|| {
+                let normalized = normalize_live_session_path(session_path);
+                self.terminal_surface_statuses.iter().find_map(|(path, status)| {
+                    (normalize_live_session_path(path) == normalized).then_some(status)
+                })
+            })
+    }
+
     fn snapshot(&self) -> RenderSnapshot {
         let active_theme_spec = if self.theme_editor_open {
             clamp_theme_spec(&self.theme_editor_draft)
@@ -21742,6 +21817,7 @@ impl ShellState {
             split_groups: self.split_groups.clone(),
             active_split_group: self.active_split_group().cloned(),
             terminal_mount_epochs: self.terminal_mount_epochs.clone(),
+            terminal_surface_statuses: self.terminal_surface_statuses.clone(),
             ssh_targets: self.server.ssh_targets().to_vec(),
             remote_machines: self.server.remote_machines().to_vec(),
             live_sessions,
@@ -27681,6 +27757,7 @@ impl ShellState {
         self.clear_terminal_open_attempt_for_session(session_path, reason);
         self.retained_terminal_session_paths.remove(session_path);
         self.terminal_mount_epochs.remove(session_path);
+        self.terminal_surface_statuses.remove(session_path);
         self.cached_hot_session_views.remove(session_path);
         self.terminal_attach_in_flight.remove(session_path);
         self.terminal_bootstrap_owner_by_session
@@ -57138,17 +57215,15 @@ fn machine_health_attr_value(health: MachineHealth) -> &'static str {
 }
 fn machine_display_health(
     health: MachineHealth,
-    deploy_state: RemoteDeployState,
-    session_count: usize,
+    _deploy_state: RemoteDeployState,
+    _session_count: usize,
 ) -> MachineHealth {
-    if matches!(health, MachineHealth::Cached)
-        && matches!(deploy_state, RemoteDeployState::Ready)
-        && session_count > 0
-    {
-        MachineHealth::Healthy
-    } else {
-        health
-    }
+    // A successful deployment is not a reachability observation. Keeping the
+    // old promotion here made a cached machine render green while its session
+    // still needed the amber transport/ghost-frame state, producing two
+    // contradictory lights on one row. The daemon refresh owns reachability;
+    // this projection must preserve its verdict.
+    health
 }
 fn machine_indicator_color_value(health: MachineHealth) -> &'static str {
     match health {
@@ -62035,6 +62110,28 @@ fn describe_app_state_snapshot(
         "runtime_present": active_viewport_freshness.runtime_present,
         "terminal_foreground_active": active_viewport_freshness.terminal_foreground_active,
     });
+    let terminal_surface_statuses_debug = {
+        let mut statuses = snapshot
+            .terminal_surface_statuses
+            .iter()
+            .map(|(session_path, status)| {
+                json!({
+                    "session_path": session_path,
+                    "transport_degraded": status.transport_degraded,
+                    "ghost_frame": status.ghost_frame,
+                    "cached_input_bytes": status.cached_input_bytes,
+                    "needs_attention": status.needs_attention(),
+                    "reason": status.reason.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        statuses.sort_by(|left, right| {
+            left["session_path"]
+                .as_str()
+                .cmp(&right["session_path"].as_str())
+        });
+        statuses
+    };
     let remote_refresh_backoff = shell
         .remote_machine_refresh_retry_after_ms
         .iter()
@@ -62113,6 +62210,10 @@ fn describe_app_state_snapshot(
         // is derivable from the other without the active session path.
         "agent_presence": agent_presence_debug_json(&shell, &snapshot),
         "live_session_snapshot_debug": live_session_snapshot_debug,
+        // Terminal transport/render truth: a held frame and queued input are
+        // state, not guesses from the screenshot. Content is intentionally
+        // absent; this is safe to collect while an incident is live.
+        "terminal_surface_statuses": terminal_surface_statuses_debug,
         "runtime_truth": runtime_truth,
         "daemon_update_state": daemon_update_state,
         // User-settled call #7: the handover paint gate, so an agent can probe
@@ -63132,6 +63233,18 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
             // in the other direction. Separate question, separate field.
             let input_unanswered_ms = sidebar_row_session_for_icon(&snapshot, row)
                 .and_then(|session| session.input_unanswered_ms);
+            let terminal_surface_status = snapshot
+                .terminal_surface_statuses
+                .get(&row.full_path)
+                .or_else(|| {
+                    let normalized = normalize_live_session_path(&row.full_path);
+                    snapshot
+                        .terminal_surface_statuses
+                        .iter()
+                        .find_map(|(path, status)| {
+                            (normalize_live_session_path(path) == normalized).then_some(status)
+                        })
+                });
             let live_member = live_paths.contains(&row.full_path)
                 || live_paths.contains(&normalize_live_session_path(&row.full_path));
             let live_keep_alive = snapshot.live_sessions.iter().any(|session| {
@@ -63215,6 +63328,17 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "wedge_suspected": yggterm_core::input_unanswered_suggests_wedge(
                     input_unanswered_ms,
                 ),
+                "terminal_transport_degraded": terminal_surface_status
+                    .map(|status| status.transport_degraded)
+                    .unwrap_or(false),
+                "ghost_frame": terminal_surface_status
+                    .map(|status| status.ghost_frame)
+                    .unwrap_or(false),
+                "cached_input_bytes": terminal_surface_status
+                    .map(|status| status.cached_input_bytes)
+                    .unwrap_or(0),
+                "terminal_attention_reason": terminal_surface_status
+                    .map(|status| status.reason.clone()),
                 // Final CLI projection truth, after live-title enrichment. The
                 // title itself already appears above; these classifications let
                 // an audit find every broken CLI without parsing private text.
