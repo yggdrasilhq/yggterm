@@ -10332,6 +10332,7 @@ fn TerminalCanvas(
                                 ),
                             );
                         }
+                        }
                         TerminalWriteEvent::Completed {
                             data_bytes,
                             pending_bytes: write_pending_bytes,
