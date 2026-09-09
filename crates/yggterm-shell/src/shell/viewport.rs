@@ -7314,6 +7314,7 @@ fn TerminalCanvas(
                                             let materialize_claimed = claimed_session.clone();
                                             let materialize_target = web_surface_ssh_target.clone();
                                             spawn(async move {
+                                                let action = materialize_action;
                                                 materialize_declared_web_surface(
                                                     materialize_state,
                                                     materialize_trace,
@@ -7328,9 +7329,9 @@ fn TerminalCanvas(
                                                     // a running app after a GUI
                                                     // restart; only a real `open`
                                                     // is the app launching.
-                                                    web_surface_open_kind_for_action(&materialize_action),
+                                                    web_surface_open_kind_for_action(&action),
                                                     materialize_target,
-                                                    &materialize_action,
+                                                    &action,
                                                     Some(materialize_claimed.as_str()),
                                                     now_ms,
                                                 )

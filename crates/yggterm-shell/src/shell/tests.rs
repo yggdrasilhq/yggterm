@@ -24219,8 +24219,8 @@ console.log('ok');
         // definition moved. A scan comparing positions has to anchor on the
         // syntax of the thing it means.
         let ensure = source
-            .find("if let Err(error) = terminal_ensure_with_retry_async(")
-            .expect("the mount path still ensures");
+            .find("let result = terminal_ensure_with_retry_async(")
+            .expect("the mount path still schedules ensure");
         assert!(
             guard < ensure,
             "the guard must sit BEFORE the ensure — after it, every retry has \
@@ -65862,6 +65862,35 @@ mod terminal_loop_input_starvation_locks {
         );
     }
 
+    #[test]
+    fn remote_ensure_does_not_gate_the_terminal_event_loop() {
+        let source = include_str!("viewport.rs");
+        let ensure_spawn = source
+            .find("let (terminal_ensure_tx, mut terminal_ensure_rx)")
+            .expect("remote ensure channel must exist");
+        let select_at = source[ensure_spawn..]
+            .find("tokio::select! {")
+            .map(|offset| ensure_spawn + offset)
+            .expect("terminal event loop must still exist after ensure is scheduled");
+        let region = &source[ensure_spawn..select_at];
+        let ensure_call = region
+            .find("terminal_ensure_with_retry_async(")
+            .expect("ensure task must call the remote ensure operation");
+        let call_prefix = &region[..ensure_call];
+        assert!(
+            call_prefix.rfind("tokio::spawn(async move {").is_some(),
+            "ensure must complete through a spawned result channel, not an inline await"
+        );
+        assert!(
+            region.contains("terminal_ensure_tx.send(result)"),
+            "the loop needs an explicit ensure result edge"
+        );
+        assert!(
+            source.contains("if !terminal_ensure_completed"),
+            "read polling must wait for ensure without stopping JS input consumption"
+        );
+    }
+
     // The write-side twin of the lock above. The Input arm used to await the
     // keystroke's own daemon write inline (10s io timeout; runtime-lock waits
     // measured at 41.6s/68.8s), so one slow write held every later keystroke —
@@ -65902,7 +65931,7 @@ mod terminal_loop_input_starvation_locks {
         let writer_at = source
             .find("terminal_write_queue_rx.recv()")
             .expect("the ordered writer task must drain the write queue");
-        let writer_scope = &source[writer_at.saturating_sub(600)..writer_at + 2_400];
+        let writer_scope = &source[writer_at.saturating_sub(600)..writer_at + 5_000];
         assert!(
             writer_scope.contains("terminal_write_async("),
             "the writer task no longer performs the daemon write"
