@@ -875,14 +875,12 @@ struct YggtermUpdateReport {
 
 fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::InstallContext> {
     let extension = cfg!(target_os = "windows").then_some(".exe").unwrap_or("");
-    let mut candidates = vec![
-        paths.home.join(format!(".local/bin/yggterm{extension}")),
-        paths.home.join(format!(".yggterm/bin/yggterm{extension}")),
-    ];
+    let mut candidates = Vec::new();
     // Linux/macOS use a launcher in ~/.local/bin; Windows' bootstrap keeps the
     // executable in %LOCALAPPDATA%\Yggterm\versions instead. Inspect the
-    // versioned roots directly so `ynpm self-update` has the same answer on
-    // every platform and never falls back to a cwd-relative guess.
+    // canonical versioned root FIRST. A stale compatibility state file under
+    // ~/.yggterm used to win merely because its flat alias was the first
+    // candidate, even after ynpm had activated a newer direct generation.
     if let Ok(root) = yggterm_core::direct_install_root()
         && let Ok(entries) = fs::read_dir(root.join("versions"))
     {
@@ -894,19 +892,64 @@ fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::Instal
         candidates.extend(
             versions
                 .into_iter()
+                .rev()
                 .map(|version| version.join(format!("yggterm{extension}"))),
         );
     }
-    if let Ok(current) = std::env::current_exe() {
+
+    candidates.extend([
+        paths.home.join(format!(".local/bin/yggterm{extension}")),
+        paths.home.join(format!(".yggterm/bin/yggterm{extension}")),
+    ]);
+    if let Ok(current) = std::env::current_exe()
+        && current.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            matches!(name, "yggterm" | "yggterm.exe" | "yggterm-headless" | "yggterm-headless.exe")
+        })
+    {
         candidates.push(current);
     }
+
+    let mut best = None::<(SemVer, yggterm_core::InstallContext)>;
     for candidate in candidates {
-        if let Ok(context) = yggterm_core::detect_install_context(&candidate)
-            && context.channel == yggterm_core::InstallChannel::Direct
-            && context.managed_root.is_some()
+        let Ok(mut context) = yggterm_core::detect_install_context(&candidate) else {
+            continue;
+        };
+        if context.channel != yggterm_core::InstallChannel::Direct
+            || context.managed_root.is_none()
         {
-            return Ok(context);
+            continue;
         }
+        let observed = run_version(&candidate)
+            .ok()
+            .and_then(|answer| version_from_answer(&answer));
+        let version_text = observed.as_deref().unwrap_or(&context.current_version);
+        let Ok(version) = SemVer::parse(version_text) else {
+            continue;
+        };
+        // A flat alias may inherit a stale state file that is not its source
+        // root's active generation. Do not let that stale context outrank a
+        // canonical direct generation simply because the alias is runnable.
+        if let Some(root) = context.managed_root.as_ref()
+            && !root
+                .join("versions")
+                .join(version_text)
+                .join(format!("yggterm{extension}"))
+                .is_file()
+        {
+            continue;
+        }
+        if observed.as_deref() != Some(context.current_version.as_str()) {
+            context.current_version = version_text.to_string();
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(current, _)| SemVer::cmp_semver(&version, current).is_gt())
+        {
+            best = Some((version, context));
+        }
+    }
+    if let Some((_, context)) = best {
+        return Ok(context);
     }
     anyhow::bail!(
         "yggterm is not a direct ynpm-compatible install on this host; install it with the curl/PowerShell quickstart first"
