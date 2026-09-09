@@ -10,7 +10,6 @@ pub mod opencode;
 pub mod pi;
 pub mod qwen;
 
-use yggterm_core::cli_plane::CliInvocationShape;
 use crate::{SessionKind, shell_single_quote};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -26,14 +25,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use yggterm_core::agent_cli::{AgentCliDescriptor, CliInstall, CliUpdate, agent_cli_descriptor};
+use yggterm_core::cli_plane::CliInvocationShape;
 use yggterm_core::{
-    AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, append_trace_event,
-    resolve_yggterm_home,
+    AgentLaunchOptions, ENV_YGGTERM_HOME, PerfSpan, append_trace_event, resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
-const MANAGED_NPM_DIRNAME: &str = "npm";
-const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
+/// The only yggterm-owned package plane. `ynpm` stores both human-facing app
+/// links and agent-CLI links under this root; keeping the old `npm` prefix
+/// alive would make two package managers compete for the same fleet CLI.
+const MANAGED_NPM_DIRNAME: &str = "ynpm";
+const MANAGED_NPM_CACHE_DIRNAME: &str = "ynpm/cache";
 pub(crate) const EXPORTED_TERM_PROGRAM: &str = "vscode";
 pub(crate) const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -268,15 +270,15 @@ impl ManagedCliTool {
         self.descriptor().binary_name
     }
 
-    /// The npm package `npm i -g` may be handed for this tool, or `None` when
-    /// this CLI is not npm-provisionable AT ALL.
+    /// The npm package ynpm may install for this tool, or `None` when this CLI
+    /// is not npm-provisionable at all.
     ///
     /// ⛔ **`Uv`, `VendorScript` and `Manual` answer `None`, and the installer
     /// refuses them BY NAME.** The old table answered every tool with a package
     /// string, so a uv/vendor CLI reaching [`install_latest`] would have been
-    /// appended to one `npm install -g` line — and npm fails the WHOLE batch on
-    /// one unresolvable name, which would have taken codex and claude down with
-    /// it rather than skipping the one tool npm cannot serve.
+    /// handed to a per-package ynpm transaction. A uv/vendor CLI is never
+    /// smuggled into that transaction and can therefore not take its npm peers
+    /// down with it.
     pub(crate) fn npm_package(self) -> Option<&'static str> {
         // ✅ The `CodexLiteLlm` override that stood here from 2026-08-08 is
         // GONE, having done its job: it recorded that the filesystem said npm
@@ -425,13 +427,11 @@ impl ManagedCliPaths {
         let link = self.bin_dir.join(binary);
         let staged = self.bin_dir.join(format!(".{binary}.ygg-publish"));
         let _ = fs::remove_file(&staged);
-        std::os::unix::fs::symlink(&target, &staged).with_context(|| {
-            format!("staging the published symlink for {}", link.display())
-        })?;
+        std::os::unix::fs::symlink(&target, &staged)
+            .with_context(|| format!("staging the published symlink for {}", link.display()))?;
         // A legacy install left a real FILE here; `rename` replaces it just the
         // same, so the migration off the shared prefix needs no separate step.
-        fs::rename(&staged, &link)
-            .with_context(|| format!("publishing {}", link.display()))?;
+        fs::rename(&staged, &link).with_context(|| format!("publishing {}", link.display()))?;
         Ok(())
     }
 
@@ -872,9 +872,8 @@ fn extract_semver_like_version(line: &str) -> Option<&str> {
     line.split_whitespace().find(|token| {
         let mut parts = token.split('.');
         let ok = parts.clone().count() >= 3;
-        ok && parts.all(|part| {
-            !part.is_empty() && part.chars().next().is_some_and(|c| c.is_ascii_digit())
-        })
+        ok && parts
+            .all(|part| !part.is_empty() && part.chars().next().is_some_and(|c| c.is_ascii_digit()))
     })
 }
 
@@ -891,10 +890,7 @@ fn extract_semver_like_version(line: &str) -> Option<&str> {
 /// the SSOT for "what will actually run"; this is that clause enforced, and the
 /// owner's ask (2026-08-06) that a machine which cannot keep its CLIs current
 /// SAY SO in telemetry rather than go quietly stale.
-fn report_managed_cli_effective_version_drift(
-    home: &Path,
-    probes: &[(ManagedCliTool, ToolProbe)],
-) {
+fn report_managed_cli_effective_version_drift(home: &Path, probes: &[(ManagedCliTool, ToolProbe)]) {
     for (tool, probe) in probes {
         let binary_name = tool.binary_name();
         let managed_version = match (&probe.version, probe.source) {
@@ -961,7 +957,11 @@ fn record_managed_cli_probe_span(
             .collect::<Vec<_>>(),
     }));
     for (tool, probe) in probes {
-        let tool_perf = PerfSpan::start(home, "cli", &format!("refresh_managed_{}_probe", tool.binary_name()));
+        let tool_perf = PerfSpan::start(
+            home,
+            "cli",
+            &format!("refresh_managed_{}_probe", tool.binary_name()),
+        );
         tool_perf.finish(serde_json::json!({
             "phase": phase,
             "tool": tool.binary_name(),
@@ -971,7 +971,6 @@ fn record_managed_cli_probe_span(
         }));
     }
 }
-
 
 fn managed_cli_refresh_skip_remaining_ms(
     before: &[(ManagedCliTool, ToolProbe)],
@@ -1416,7 +1415,9 @@ pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
 #[cfg(test)]
 pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    ENV_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A SECOND mutex over the same env is the same thing as no mutex at all, and
@@ -1453,7 +1454,8 @@ fn the_terminal_identity_env_has_exactly_one_test_guard() {
                 // a rival guard. `env_test_guard`'s own ENV_TEST_LOCK is the one
                 // legitimate declaration, and it is matched by name below.
                 let declares_a_lock = line.contains("Mutex<()>") && line.contains("static ");
-                let names_the_env = line.contains("TERMINAL_IDENTITY") || line.contains("APPEARANCE");
+                let names_the_env =
+                    line.contains("TERMINAL_IDENTITY") || line.contains("APPEARANCE");
                 if declares_a_lock && names_the_env {
                     offenders.push(format!(
                         "{}:{} — {}",
@@ -1488,8 +1490,8 @@ fn the_terminal_identity_env_has_exactly_one_test_guard() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::env_test_guard;
+    use super::*;
 
     #[test]
     fn metadata_subprocess_timeout_never_waits_for_the_child_reaper() {
@@ -1528,7 +1530,10 @@ mod tests {
         // A second writer must NOT proceed into the install while the first
         // holds it — the whole defect was both writers proceeding.
         let refused = acquire_managed_cli_install_lock_waiting(&home, 200);
-        let message = format!("{:#}", refused.expect_err("a concurrent install must be refused"));
+        let message = format!(
+            "{:#}",
+            refused.expect_err("a concurrent install must be refused")
+        );
         assert!(
             message.contains("installing managed CLIs"),
             "the refusal must say a concurrent install is why, got: {message}"
@@ -2050,7 +2055,10 @@ mod tests {
             let port = listener.local_addr().expect("addr").port();
             drop(listener);
             let child = std::process::Command::new("python3")
-                .arg(env!("CARGO_MANIFEST_DIR").to_string() + "/../../scripts/mock-npm-registry/server.py")
+                .arg(
+                    env!("CARGO_MANIFEST_DIR").to_string()
+                        + "/../../scripts/mock-npm-registry/server.py",
+                )
                 .arg(root)
                 .arg(port.to_string())
                 .stdout(std::process::Stdio::null())
@@ -2069,11 +2077,21 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            MockRegistry { child, base, root: root.to_path_buf() }
+            MockRegistry {
+                child,
+                base,
+                root: root.to_path_buf(),
+            }
         }
 
         /// Lay down one version of one fixture package.
-        fn publish(&self, name: &str, version: &str, files: &[(&str, &[u8], u32)], manifest: serde_json::Value) {
+        fn publish(
+            &self,
+            name: &str,
+            version: &str,
+            files: &[(&str, &[u8], u32)],
+            manifest: serde_json::Value,
+        ) {
             let version_dir = self.root.join("packages").join(name).join(version);
             std::fs::create_dir_all(version_dir.join("files")).expect("version dir");
             for (rel, content, mode) in files {
@@ -2175,8 +2193,16 @@ mod tests {
             "mock-preinstall",
             "2.0.0",
             &[
-                ("payload/mock", b"#!/bin/sh\necho \"mock-pre 2.0.0\"\n", 0o755),
-                ("install.sh", b"#!/bin/sh\nmkdir -p bin && cp payload/mock bin/mock && chmod 755 bin/mock\n", 0o755),
+                (
+                    "payload/mock",
+                    b"#!/bin/sh\necho \"mock-pre 2.0.0\"\n",
+                    0o755,
+                ),
+                (
+                    "install.sh",
+                    b"#!/bin/sh\nmkdir -p bin && cp payload/mock bin/mock && chmod 755 bin/mock\n",
+                    0o755,
+                ),
             ],
             mock_manifest(
                 "mock",
@@ -2224,13 +2250,12 @@ mod tests {
             let bin = prefix.join("bin").join("mock");
             let mut version_command = std::process::Command::new(&bin);
             version_command.arg("--version");
-            match bounded_command_output(
-                &mut version_command,
-                MANAGED_CLI_VERSION_PROBE_TIMEOUT,
-            ) {
-                BoundedCommandOutput::Completed { stdout, success: true, .. } => {
-                    String::from_utf8_lossy(&stdout).trim().to_string()
-                }
+            match bounded_command_output(&mut version_command, MANAGED_CLI_VERSION_PROBE_TIMEOUT) {
+                BoundedCommandOutput::Completed {
+                    stdout,
+                    success: true,
+                    ..
+                } => String::from_utf8_lossy(&stdout).trim().to_string(),
                 other => panic!("installed {package} binary does not answer --version: {other:?}"),
             }
         };
@@ -2334,8 +2359,11 @@ mod tests {
 
         // The broken state: a text file, exactly what the vendor ships as the
         // placeholder shim.
-        std::fs::write(&shim, "echo \"Error: opencode-ai's postinstall script was not run.\"\n")
-            .expect("write shim");
+        std::fs::write(
+            &shim,
+            "echo \"Error: opencode-ai's postinstall script was not run.\"\n",
+        )
+        .expect("write shim");
         assert!(
             !direct_install_shim_is_healthy(prefix, "opencode-ai"),
             "the error shim must not satisfy the fast path"
@@ -2716,7 +2744,9 @@ mod tests {
             );
             assert_eq!(
                 provision_step_for(ManagedCliTool::Muse.descriptor(), present),
-                Some(ProvisionStep::VendorScript("https://dev.meta.ai/install.sh"))
+                Some(ProvisionStep::VendorScript(
+                    "https://dev.meta.ai/install.sh"
+                ))
             );
         }
     }
@@ -2816,7 +2846,6 @@ mod tests {
         );
     }
 
-
     /// ⭐ THE LIVE FALSIFIER, run against real npm and the real registry.
     ///
     /// `#[ignore]`d because it downloads: run it deliberately with
@@ -2892,7 +2921,6 @@ mod tests {
         );
     }
 
-
     /// ⛔ NO PROVISIONING STEP MAY STAGE IN `/tmp` — CHECKED FOR ALL FOUR
     /// METHODS, NOT JUST THE ONE THAT WAS CAUGHT.
     ///
@@ -2915,16 +2943,28 @@ mod tests {
         //    code. A string-keyed search finds the FIRST match, not the intended
         //    one; caught while writing this.
         for (method, marker) in [
-            ("\nfn install_via_uv(", "apply_provision_env(&mut command, paths)"),
-            ("\nfn install_via_vendor_script(", "apply_provision_env(&mut run, paths)"),
-            ("\nfn update_via_self_command(", "apply_provision_env(&mut command, paths)"),
+            (
+                "\nfn install_via_uv(",
+                "apply_provision_env(&mut command, paths)",
+            ),
+            (
+                "\nfn install_via_vendor_script(",
+                "apply_provision_env(&mut run, paths)",
+            ),
+            (
+                "\nfn update_via_self_command(",
+                "apply_provision_env(&mut command, paths)",
+            ),
             ("\nfn run_npm_install(", "\"TMPDIR\""),
         ] {
             let body = source
                 .split_once(method)
                 .unwrap_or_else(|| panic!("{method} is the owner of one provisioning method"))
                 .1;
-            let body = body.split_once("\nfn ").map(|(head, _)| head).unwrap_or(body);
+            let body = body
+                .split_once("\nfn ")
+                .map(|(head, _)| head)
+                .unwrap_or(body);
             assert!(
                 body.contains(marker),
                 "{method} does not route its temp directory to disk; on the \
@@ -2938,7 +2978,10 @@ mod tests {
             .split_once("\nfn apply_provision_env")
             .expect("the shared provisioning environment")
             .1;
-        let helper = helper.split_once("\nfn ").map(|(head, _)| head).unwrap_or(helper);
+        let helper = helper
+            .split_once("\nfn ")
+            .map(|(head, _)| head)
+            .unwrap_or(helper);
         assert!(
             helper.contains(".env(\"TMPDIR\", paths.staging_dir())"),
             "apply_provision_env must be what puts staging on disk"
@@ -2994,16 +3037,25 @@ mod tests {
         let kimi = provision_detail(&paths, ManagedCliTool::Kimi);
         assert!(kimi.contains("kimi-cli"), "{kimi}");
         assert!(kimi.contains("uv tool install --upgrade"), "{kimi}");
-        assert!(!kimi.contains("npm"), "a uv install must not name the npm prefix: {kimi}");
+        assert!(
+            !kimi.contains("npm"),
+            "a uv install must not name the npm prefix: {kimi}"
+        );
 
         // vendor: the URL that was executed.
         let muse = provision_detail(&paths, ManagedCliTool::Muse);
         assert!(muse.contains("https://dev.meta.ai/install.sh"), "{muse}");
-        assert!(!muse.contains("npm"), "a vendor install must not name the npm prefix: {muse}");
+        assert!(
+            !muse.contains("npm"),
+            "a vendor install must not name the npm prefix: {muse}"
+        );
 
         // npm: still names the prefix, because for npm that IS where it went.
         let codex = provision_detail(&paths, ManagedCliTool::Codex);
-        assert!(codex.contains(&paths.prefix.display().to_string()), "{codex}");
+        assert!(
+            codex.contains(&paths.prefix.display().to_string()),
+            "{codex}"
+        );
 
         // ⚠ `package_name` is the other half of the same lie: it called an
         // unfetchable CLI one "yggterm never provisions", which stopped being
@@ -3030,7 +3082,10 @@ mod tests {
         // The vendor installer is fetched to a stable, collision-free path.
         let stem = vendor_script_stem("https://dev.meta.ai/install.sh");
         assert_eq!(stem, "https---dev-meta-ai-install-sh");
-        assert!(!stem.contains('/'), "a URL stem must not create directories");
+        assert!(
+            !stem.contains('/'),
+            "a URL stem must not create directories"
+        );
         assert_ne!(
             vendor_script_stem("https://dev.meta.ai/install.sh"),
             vendor_script_stem("https://astral.sh/uv/install.sh"),
@@ -3060,7 +3115,10 @@ mod tests {
             cache_dir: tmp.join("cache"),
         };
         let probe = probe_tool_existence_only(&paths, ManagedCliTool::Codex);
-        assert!(probe.available, "present managed binary should be available");
+        assert!(
+            probe.available,
+            "present managed binary should be available"
+        );
         assert_eq!(probe.source, Some(ManagedCliBinarySource::Managed));
         assert_eq!(
             probe.version, None,
@@ -3424,6 +3482,23 @@ mod tests {
             shell_join_extra_args("-s danger-full-access --profile 'field test'")
         );
     }
+
+    #[test]
+    fn codex_yolo_preset_is_forwarded_as_the_visible_bypass_flag() {
+        let command = managed_cli_shell_command_configured(
+            SessionKind::Codex,
+            Some("/home/user/project"),
+            ManagedCliAction::Launch,
+            None,
+            &AgentLaunchOptions::default(),
+            Some("--dangerously-bypass-approvals-and-sandbox"),
+        )
+        .expect("codex launch command");
+        assert!(
+            command.contains("codex '--dangerously-bypass-approvals-and-sandbox'"),
+            "the exact Codex YOLO flag must reach the binary: {command}"
+        );
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3642,6 +3717,23 @@ fn npm_binary() -> Option<PathBuf> {
     resolve_binary_on_path("npm")
 }
 
+/// Resolve the package manager that owns the npm-backed CLI install. It is
+/// deliberately looked up independently of npm: a host may have Node/npm
+/// removed after ynpm was deployed, while the already-published generations
+/// remain perfectly runnable.
+fn ynpm_binary(paths: &ManagedCliPaths) -> Option<PathBuf> {
+    let user = user_local_bin_dir().map(|dir| dir.join("ynpm"));
+    [
+        user,
+        Some(paths.home.join("../.local/bin/ynpm")),
+        Some(paths.home.join("../.yggterm/bin/ynpm")),
+        resolve_binary_for_launch_parity("ynpm"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|path| path.is_file() || path.is_symlink())
+}
+
 /// `uv` is installed into `~/.local/bin`, which the daemon's own `PATH`
 /// routinely omits — so this must resolve with LAUNCH PARITY, exactly like the
 /// CLIs themselves. Resolving it off the daemon `PATH` alone reported "uv is
@@ -3661,7 +3753,7 @@ fn curl_binary() -> Option<PathBuf> {
 /// has one answer instead of one per call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProvisionStep {
-    /// Batched into a single `npm install -g` line with every other npm tool.
+    /// Installed as one isolated ynpm transaction for this npm tool.
     Npm,
     Uv(&'static str),
     VendorScript(&'static str),
@@ -3716,7 +3808,7 @@ fn provision_step_for(descriptor: &AgentCliDescriptor, present: bool) -> Option<
 /// `system_fallback` on a machine that could have installed it.
 fn provision_step_is_runnable(paths: &ManagedCliPaths, tool: ManagedCliTool) -> bool {
     match provision_step(paths, tool) {
-        Some(ProvisionStep::Npm) => npm_binary().is_some(),
+        Some(ProvisionStep::Npm) => ynpm_binary(paths).is_some(),
         Some(ProvisionStep::Uv(_)) => uv_binary().is_some(),
         Some(ProvisionStep::VendorScript(_)) => curl_binary().is_some(),
         Some(ProvisionStep::SelfUpdate(_)) => true,
@@ -3737,8 +3829,9 @@ fn provision_detail(paths: &ManagedCliPaths, tool: ManagedCliTool) -> String {
     let name = tool.display_name();
     match provision_step(paths, tool) {
         Some(ProvisionStep::Npm) => format!(
-            "Installed or refreshed a Yggterm-managed {name} toolchain under {}.",
-            paths.prefix.display()
+            "Installed or refreshed {name} through ynpm under {} (agent bin {}).",
+            paths.prefix.display(),
+            paths.bin_dir.display()
         ),
         Some(ProvisionStep::Uv(package)) => {
             format!("Installed or upgraded {name} with `uv tool install --upgrade {package}`.")
@@ -3760,7 +3853,7 @@ fn provision_detail(paths: &ManagedCliPaths, tool: ManagedCliTool) -> String {
 /// path cannot drift apart.
 ///
 /// ⛔ No prefix override: uv's default tool bin dir is `~/.local/bin`, which is
-/// user-local and already on the login PATH. Forcing it under `~/.yggterm/npm`
+/// user-local and already on the login PATH. Forcing it under `~/.yggterm/ynpm`
 /// would put a Python CLI inside the npm prefix and hide it from `uv tool list`.
 fn install_via_uv(paths: &ManagedCliPaths, package: &str) -> Result<()> {
     let uv = uv_binary().context(
@@ -3768,7 +3861,11 @@ fn install_via_uv(paths: &ManagedCliPaths, package: &str) -> Result<()> {
          install uv (https://astral.sh/uv) and the next refresh will pick it up",
     )?;
     let mut command = Command::new(uv);
-    command.arg("tool").arg("install").arg("--upgrade").arg(package);
+    command
+        .arg("tool")
+        .arg("install")
+        .arg("--upgrade")
+        .arg(package);
     apply_provision_env(&mut command, paths);
     run_provision_command(command, &format!("uv tool install {package}"))
 }
@@ -4170,19 +4267,16 @@ fn install_latest(
     background: bool,
 ) -> Result<()> {
     // ⛔ ONE WRITER PER MACHINE, across processes. Held for the WHOLE function
-    // rather than around the npm batch alone: uv and the vendor scripts install
+    // rather than around the npm transactions alone: uv and the vendor scripts install
     // into `~/.local/bin`, which every other lane also reads and writes, so the
     // resource being serialised is "this machine's managed toolchain", not "the
-    // npm prefix". See [`ManagedCliInstallLock`] for the measurement.
+    // ynpm prefix". See [`ManagedCliInstallLock`] for the measurement.
     let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
 
-    // ⛔ Each method runs SEPARATELY, and only the npm ones are batched. npm
-    // fails a whole `install -g` batch on one unresolvable name, so a uv or
-    // vendor CLI appended to that line would not install the wrong package — it
-    // would take every OTHER tool's refresh down with it and report the failure
-    // against all of them. A tool yggterm can neither install nor update is
-    // SKIPPED here (the probe that follows reports it `unavailable` by name);
-    // the by-name refusal a user reads lives at the launch site.
+    // ⛔ Each package gets its own ynpm transaction. The old implementation
+    // batched npm CLIs in one prefix, so one bad package or interrupted npm
+    // run could unlink every other CLI. ynpm owns per-package generations and
+    // publishes only after its runs-before-publish gate.
     let mut npm_tools: Vec<ManagedCliTool> = Vec::new();
     let mut per_tool: Vec<(ManagedCliTool, ProvisionStep)> = Vec::new();
     for tool in tools.iter().copied() {
@@ -4199,7 +4293,7 @@ fn install_latest(
     let mut failures: Vec<String> = Vec::new();
     for (tool, step) in per_tool {
         let outcome = match step {
-            ProvisionStep::Npm => unreachable!("npm tools are batched above"),
+            ProvisionStep::Npm => unreachable!("npm tools are dispatched above"),
             ProvisionStep::Uv(package) => install_via_uv(paths, package),
             ProvisionStep::VendorScript(url) => install_via_vendor_script(paths, url),
             ProvisionStep::SelfUpdate(argv) => update_via_self_command(paths, tool, argv),
@@ -4209,8 +4303,10 @@ fn install_latest(
         }
     }
 
-    if let Err(error) = install_npm_isolated(paths, &npm_tools, background) {
-        failures.push(error.to_string());
+    for tool in npm_tools {
+        if let Err(error) = install_via_ynpm(paths, tool, background) {
+            failures.push(format!("{}: {error}", tool.display_name()));
+        }
     }
 
     if failures.is_empty() {
@@ -4218,6 +4314,42 @@ fn install_latest(
     } else {
         anyhow::bail!("{}", failures.join("; "))
     }
+}
+
+/// Delegate one npm-backed CLI transaction to the standalone ynpm binary. The
+/// server remains the launch/integration owner; ynpm is the only package and
+/// generation owner. `background` is retained in the signature because the
+/// refresh caller's cadence still distinguishes incidental from scheduled
+/// work, but both modes use the same atomic ynpm install.
+fn install_via_ynpm(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+    _background: bool,
+) -> Result<()> {
+    let ynpm = ynpm_binary(paths).context("ynpm is required to manage npm-backed CLIs")?;
+    let package = tool
+        .npm_package()
+        .with_context(|| format!("{} is not an npm-backed CLI", tool.display_name()))?;
+    let tag = yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest");
+    let spec = format!("{package}@{tag}");
+    let mut command = Command::new(&ynpm);
+    command
+        .arg("install")
+        .arg("--dest")
+        .arg(&paths.bin_dir)
+        .arg(&spec)
+        .env("YNPM_DEST", &paths.bin_dir);
+    if let Some(user_home) = paths.home.parent() {
+        // ynpm's state root is derived from the OS home, while the daemon may
+        // be running with an explicit YGGTERM_HOME. Point both sides at the
+        // same yggterm home so a custom-home host does not install a healthy
+        // CLI into a second, invisible state tree.
+        command.env("YNPM_HOME", user_home);
+    }
+    if let Some(npm) = npm_binary() {
+        command.env("YNPM_NPM", npm);
+    }
+    run_provision_command(command, &format!("ynpm install {spec}"))
 }
 
 /// Install or refresh every npm-provisioned CLI — each in its OWN prefix, each
@@ -4250,8 +4382,12 @@ fn install_npm_isolated(
     }
     let npm = npm_binary().context("npm is required to manage agent CLI toolchains")?;
     paths.ensure_dirs()?;
-    fs::create_dir_all(paths.cli_root())
-        .with_context(|| format!("creating per-CLI prefix root {}", paths.cli_root().display()))?;
+    fs::create_dir_all(paths.cli_root()).with_context(|| {
+        format!(
+            "creating per-CLI prefix root {}",
+            paths.cli_root().display()
+        )
+    })?;
     // ⛔ Reap what the last install abandoned before making more. See
     //    `staging_dir` for why this is not the package's job to be trusted with.
     paths.sweep_staging();
@@ -4297,7 +4433,6 @@ fn install_npm_isolated(
         anyhow::bail!("{}", failures.join("; "))
     }
 }
-
 
 /// How often the shared npm cache is garbage-collected.
 ///
@@ -4644,7 +4779,9 @@ fn fetch_platform_optional_dependencies(
     };
     let platform = direct_platform_suffix();
     for (name, range) in optional {
-        let Some(range) = range.as_str() else { continue };
+        let Some(range) = range.as_str() else {
+            continue;
+        };
         if name.contains(platform) && !skip.contains(&name.as_str()) {
             let Some((dep_package, dep_version)) = exact_optional_dependency(name, range) else {
                 anyhow::bail!(
@@ -4715,10 +4852,7 @@ fn run_vendor_install_scripts(
     let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return Ok(());
     };
-    let Some(scripts) = manifest
-        .get("scripts")
-        .and_then(|value| value.as_object())
-    else {
+    let Some(scripts) = manifest.get("scripts").and_then(|value| value.as_object()) else {
         return Ok(());
     };
     for step in INSTALL_SCRIPT_ORDER {
@@ -4733,7 +4867,9 @@ fn run_vendor_install_scripts(
         command.current_dir(package_dir);
         apply_provision_env(&mut command, paths);
         match bounded_command_output(&mut command, Duration::from_secs(300)) {
-            BoundedCommandOutput::Completed { success, stderr, .. } => {
+            BoundedCommandOutput::Completed {
+                success, stderr, ..
+            } => {
                 // ⛔ BEST-EFFORT, AND WHY THE GATE OWNS THE VERDICT: a vendor
                 // script can fail for reasons that do not matter to the
                 // binary — measured live, grok's postinstall requires
@@ -4814,7 +4950,9 @@ fn staged_binary_runs(staged: &Path, binary: &str) -> std::result::Result<(), St
     let mut command = Command::new(&bin);
     command.arg("--version");
     match bounded_command_output(&mut command, MANAGED_CLI_VERSION_PROBE_TIMEOUT) {
-        BoundedCommandOutput::Completed { stderr, success, .. } => {
+        BoundedCommandOutput::Completed {
+            stderr, success, ..
+        } => {
             if success {
                 Ok(())
             } else {
@@ -4860,7 +4998,10 @@ fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
 fn native_tarball_url_for_codex(version: &str, platform: &str) -> String {
     // codex native is same package at version <base>-<platform>, e.g.
     // @openai/codex@0.149.1-linux-x64
-    format!("https://registry.npmjs.org/@openai/codex/-/codex-{}-{}.tgz", version, platform)
+    format!(
+        "https://registry.npmjs.org/@openai/codex/-/codex-{}-{}.tgz",
+        version, platform
+    )
 }
 
 fn fetch_and_extract_package(
@@ -4880,7 +5021,10 @@ fn fetch_and_extract_package(
         .output()
         .context("fetching tarball")?;
     if !fetch.status.success() {
-        anyhow::bail!("tarball fetch failed for {package}: {}", String::from_utf8_lossy(&fetch.stderr));
+        anyhow::bail!(
+            "tarball fetch failed for {package}: {}",
+            String::from_utf8_lossy(&fetch.stderr)
+        );
     }
     let extract_dir = staging.join(format!("extract-{}-{}", package.replace('/', "_"), version));
     let _ = std::fs::remove_dir_all(&extract_dir);
@@ -4893,20 +5037,31 @@ fn fetch_and_extract_package(
         .output()
         .context("extracting tarball")?;
     if !output.status.success() {
-        anyhow::bail!("tar extract failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let package_dir = extract_dir.join("package");
     let dest = prefix.join("lib").join("node_modules").join(package);
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::create_dir_all(dest.parent().unwrap()).context("creating node_modules")?;
-    std::fs::rename(&package_dir, &dest).or_else(|_| {
-        let status = std::process::Command::new("cp")
-            .arg("-a")
-            .arg(&package_dir)
-            .arg(&dest)
-            .status();
-        status.and_then(|s| if s.success() { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed")) })
-    }).context("moving package")?;
+    std::fs::rename(&package_dir, &dest)
+        .or_else(|_| {
+            let status = std::process::Command::new("cp")
+                .arg("-a")
+                .arg(&package_dir)
+                .arg(&dest)
+                .status();
+            status.and_then(|s| {
+                if s.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed"))
+                }
+            })
+        })
+        .context("moving package")?;
     let pkg_json = dest.join("package.json");
     if let Ok(raw) = std::fs::read_to_string(&pkg_json) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -4914,9 +5069,14 @@ fn fetch_and_extract_package(
                 let bin_dir = prefix.join("bin");
                 std::fs::create_dir_all(&bin_dir).context("creating bin")?;
                 let bins: Vec<(String, String)> = if let Some(map) = bin.as_object() {
-                    map.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()
+                    map.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                        .collect()
                 } else if let Some(s) = bin.as_str() {
-                    vec![(package.split('/').last().unwrap_or(package).to_string(), s.to_string())]
+                    vec![(
+                        package.split('/').last().unwrap_or(package).to_string(),
+                        s.to_string(),
+                    )]
                 } else {
                     vec![]
                 };
@@ -4925,10 +5085,14 @@ fn fetch_and_extract_package(
                     let dst = bin_dir.join(&name);
                     let _ = std::fs::remove_file(&dst);
                     #[cfg(unix)]
-                    std::os::unix::fs::symlink(&src, &dst).or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))?;
+                    std::os::unix::fs::symlink(&src, &dst)
+                        .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))?;
                     #[cfg(not(unix))]
                     std::fs::copy(&src, &dst).map(|_| ())?;
-                    let _ = std::process::Command::new("chmod").arg("+x").arg(&dst).status();
+                    let _ = std::process::Command::new("chmod")
+                        .arg("+x")
+                        .arg(&dst)
+                        .status();
                 }
             }
         }
@@ -4969,9 +5133,13 @@ fn run_direct_install(
         .output()
         .context("fetching latest manifest")?;
     if !meta_output.status.success() {
-        anyhow::bail!("registry fetch failed for {package}: {}", String::from_utf8_lossy(&meta_output.stderr));
+        anyhow::bail!(
+            "registry fetch failed for {package}: {}",
+            String::from_utf8_lossy(&meta_output.stderr)
+        );
     }
-    let meta: serde_json::Value = serde_json::from_slice(&meta_output.stdout).context("parsing manifest")?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(&meta_output.stdout).context("parsing manifest")?;
     let tarball: String = meta
         .get("dist")
         .and_then(|d: &serde_json::Value| d.get("tarball"))
@@ -4988,20 +5156,30 @@ fn run_direct_install(
     // Fast-path: already at latest version in this generation's dest — skip
     // download. The outer `install_one_npm_cli` already gates on TTL, but a
     // no-op download still costs 78MB + tar; version check avoids it.
-    let dest_check = prefix.join("lib").join("node_modules").join(package).join("package.json");
+    let dest_check = prefix
+        .join("lib")
+        .join("node_modules")
+        .join(package)
+        .join("package.json");
     if let Ok(raw) = std::fs::read_to_string(&dest_check) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
             if json.get("version").and_then(|v| v.as_str()) == Some(version.as_str()) {
                 // Also verify bin exists before skipping — a prior partial
                 // install could have correct version but missing bin.
-                let bin_ok = json.get("bin").map(|bin| {
-                    let bins: Vec<String> = if let Some(map) = bin.as_object() {
-                        map.keys().cloned().collect()
-                    } else if let Some(s) = bin.as_str() {
-                        vec![package.split('/').last().unwrap_or(package).to_string()]
-                    } else { vec![] };
-                    bins.iter().all(|name| prefix.join("bin").join(name).exists())
-                }).unwrap_or(true);
+                let bin_ok = json
+                    .get("bin")
+                    .map(|bin| {
+                        let bins: Vec<String> = if let Some(map) = bin.as_object() {
+                            map.keys().cloned().collect()
+                        } else if let Some(s) = bin.as_str() {
+                            vec![package.split('/').last().unwrap_or(package).to_string()]
+                        } else {
+                            vec![]
+                        };
+                        bins.iter()
+                            .all(|name| prefix.join("bin").join(name).exists())
+                    })
+                    .unwrap_or(true);
                 if bin_ok && direct_install_shim_is_healthy(prefix, package) {
                     return Ok(());
                 }
@@ -5010,10 +5188,7 @@ fn run_direct_install(
     }
     let tmp_tgz = staging.join(format!("{}-{}.tgz", package.replace('/', "_"), version));
     fetch_and_extract_package(&curl, &staging, prefix, package, &tarball, &version)?;
-    let package_dir = prefix
-        .join("lib")
-        .join("node_modules")
-        .join(package);
+    let package_dir = prefix.join("lib").join("node_modules").join(package);
     // Fetch the platform optional dependencies the package declares (claude's
     // native binary, opencode's platform binary, grok's) at their PINNED
     // versions — the general form of what per-CLI special cases used to do.
@@ -5034,7 +5209,14 @@ fn run_direct_install(
         let native_tarball = native_tarball_url_for_codex(&version, platform);
         let native_version = format!("{}-{}", version, platform);
         // Try fetch; 404 gracefully skipped — not all versions publish every platform
-        let _ = fetch_and_extract_package(&curl, &staging, prefix, native_pkg, &native_tarball, &native_version);
+        let _ = fetch_and_extract_package(
+            &curl,
+            &staging,
+            prefix,
+            native_pkg,
+            &native_tarball,
+            &native_version,
+        );
     }
     fetch_platform_optional_dependencies(&curl, &staging, prefix, package, &package_dir, &skip)?;
     // Run the vendor's own install scripts. Without them the finalize step
@@ -5336,39 +5518,35 @@ pub(crate) fn managed_cli_shell_command_configured(
                     yggterm_core::cli_plane::CliLaunchContractBreach::SesGuardDegrade,
                 );
                 (
-                    format!(
-                        "{prefix}{}{}",
-                        tool.binary_name(),
-                        extra_args
-                    ),
+                    format!("{prefix}{}{}", tool.binary_name(), extra_args),
                     shape,
                 )
             } else {
-            let prefix = if persistent { "exec " } else { "" };
-            let quoted = shell_single_quote(session_id);
-            let tokens = descriptor
-                .map(|descriptor| descriptor.resume_tokens(&quoted, has_cwd))
-                .unwrap_or_else(|| vec![quoted.clone()]);
-            (
-                format!(
-                    "{prefix}{}{}{}",
-                    tool.binary_name(),
-                    extra_args,
-                    join_invocation_tokens(&tokens)
-                ),
-                CliInvocationShape {
-                    action: "resume",
-                    selector: descriptor
-                        .map(|descriptor| descriptor.resume_selector_token())
-                        .unwrap_or_default(),
-                    carries_id: !session_id.trim().is_empty(),
-                    re_roots_with_cwd: descriptor
-                        .is_some_and(|descriptor| descriptor.resume_re_roots_with_cwd)
-                        && has_cwd,
-                    extra_arg_tokens: 0,
-                    persistent,
-                },
-            )
+                let prefix = if persistent { "exec " } else { "" };
+                let quoted = shell_single_quote(session_id);
+                let tokens = descriptor
+                    .map(|descriptor| descriptor.resume_tokens(&quoted, has_cwd))
+                    .unwrap_or_else(|| vec![quoted.clone()]);
+                (
+                    format!(
+                        "{prefix}{}{}{}",
+                        tool.binary_name(),
+                        extra_args,
+                        join_invocation_tokens(&tokens)
+                    ),
+                    CliInvocationShape {
+                        action: "resume",
+                        selector: descriptor
+                            .map(|descriptor| descriptor.resume_selector_token())
+                            .unwrap_or_default(),
+                        carries_id: !session_id.trim().is_empty(),
+                        re_roots_with_cwd: descriptor
+                            .is_some_and(|descriptor| descriptor.resume_re_roots_with_cwd)
+                            && has_cwd,
+                        extra_arg_tokens: 0,
+                        persistent,
+                    },
+                )
             }
         }
     };
@@ -5436,7 +5614,11 @@ pub(crate) fn composed_cli_extra_args_with(
         return Ok(shell_join_tokens(&configured));
     }
     let mut tokens = launch.strip_overridden(kind, &configured);
-    tokens.extend(launch.launch_tokens(kind).map_err(|message| anyhow!(message))?);
+    tokens.extend(
+        launch
+            .launch_tokens(kind)
+            .map_err(|message| anyhow!(message))?,
+    );
     Ok(shell_join_tokens(&tokens))
 }
 
@@ -5633,7 +5815,10 @@ fn login_shell_path_dirs() -> Vec<PathBuf> {
 /// `npm i -g` (EEXIST).
 pub(crate) fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
     resolve_binary_for_launch_parity_with(
-        ManagedCliPaths::resolve().ok().map(|paths| paths.bin_dir).as_deref(),
+        ManagedCliPaths::resolve()
+            .ok()
+            .map(|paths| paths.bin_dir)
+            .as_deref(),
         binary_name,
     )
 }
@@ -5734,8 +5919,9 @@ fn missing_binary_refusal_message(descriptor: &AgentCliDescriptor) -> String {
 /// the spawn cadence to <=1/min while actively switching.
 fn managed_cli_background_inflight()
 -> &'static std::sync::Mutex<std::collections::BTreeSet<&'static str>> {
-    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<&'static str>>> =
-        std::sync::OnceLock::new();
+    static INFLIGHT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
+    > = std::sync::OnceLock::new();
     INFLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
 }
 
@@ -6101,6 +6287,13 @@ pub(crate) fn remove_local_managed_cli_with_paths(
     {
         let live_executables = running_process_executable_paths();
         let slug_marker = format!("{}.gen", tool.descriptor().slug);
+        let ynpm_generation = tool.npm_package().map(|package| {
+            let key = package
+                .strip_prefix("@ygghq/")
+                .map(str::to_string)
+                .unwrap_or_else(|| package.trim_start_matches('@').replace('/', "__"));
+            paths.prefix.join("generations").join(key)
+        });
         let running_from: Option<PathBuf> = fs::read_dir(paths.cli_root())
             .into_iter()
             .flatten()
@@ -6116,7 +6309,12 @@ pub(crate) fn remove_local_managed_cli_with_paths(
             .or_else(|| {
                 live_executables
                     .iter()
-                    .find(|exe| **exe == paths.bin_dir.join(binary))
+                    .find(|exe| {
+                        **exe == paths.bin_dir.join(binary)
+                            || ynpm_generation
+                                .as_deref()
+                                .is_some_and(|root| exe.starts_with(root))
+                    })
                     .cloned()
             });
         if let Some(tree) = running_from {
@@ -6140,9 +6338,7 @@ pub(crate) fn remove_local_managed_cli_with_paths(
             run_provision_command(command, &format!("uv tool uninstall {package}"))?;
             format!("Uninstalled {package} with `uv tool uninstall`.")
         }
-        CliInstall::VendorScript(_) | CliInstall::Manual => {
-            remove_user_local_binary(paths, tool)?
-        }
+        CliInstall::VendorScript(_) | CliInstall::Manual => remove_user_local_binary(paths, tool)?,
     };
 
     let mut after = probe_tool(paths, tool);
@@ -6195,39 +6391,75 @@ pub(crate) fn remove_local_managed_cli_with_paths(
 /// managed bin dir plus every generation directory. Returns the detail line.
 fn remove_managed_npm_install(paths: &ManagedCliPaths, tool: ManagedCliTool) -> Result<String> {
     let binary = tool.binary_name();
-    let link = paths.bin_dir.join(binary);
-    match fs::symlink_metadata(&link) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || metadata.is_file() {
-                fs::remove_file(&link)
-                    .with_context(|| format!("removing published link {}", link.display()))?;
-            } else {
-                anyhow::bail!(
-                    "{} is a directory where the managed install publishes a binary; refusing to delete it",
-                    link.display()
-                );
+    let package = tool
+        .npm_package()
+        .with_context(|| format!("{} is not an npm-backed CLI", tool.display_name()))?;
+    // The production path delegates state ownership to ynpm. Test fixtures
+    // construct an isolated ManagedCliPaths rather than a full HOME-shaped
+    // ynpm world; keep their deletion local so a unit test can never invoke
+    // the real host's package manager.
+    let production_paths = resolve_yggterm_home()
+        .ok()
+        .is_some_and(|home| home == paths.home);
+    if production_paths {
+        let ynpm = ynpm_binary(paths).context("ynpm is required to remove managed CLIs")?;
+        let mut command = Command::new(&ynpm);
+        command
+            .arg("remove")
+            .arg(package)
+            .env("YNPM_DEST", &paths.bin_dir);
+        if let Some(user_home) = paths.home.parent() {
+            command.env("YNPM_HOME", user_home);
+        }
+        run_provision_command(command, &format!("ynpm remove {package}"))?;
+    } else {
+        let link = paths.bin_dir.join(binary);
+        if link.is_symlink() || link.is_file() {
+            fs::remove_file(&link)
+                .with_context(|| format!("removing test published link {}", link.display()))?;
+        }
+        let marker = format!("{}.gen", tool.descriptor().slug);
+        if let Ok(entries) = fs::read_dir(paths.cli_root()) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&marker))
+                {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
             }
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(anyhow!(error))
-                .with_context(|| format!("statting published link {}", link.display()));
-        }
     }
+
+    // Migration leaves the old prefix in place while existing PTYs drain. It
+    // is safe to reap only generations that no process still executes from.
+    let old_root = paths
+        .home
+        .parent()
+        .map(|home| home.join(".yggterm/npm"))
+        .unwrap_or_else(|| PathBuf::from(".yggterm/npm"));
+    let old_cli_root = old_root.join("cli");
     let marker = format!("{}.gen", tool.descriptor().slug);
-    if let Ok(entries) = fs::read_dir(paths.cli_root()) {
+    let live = running_process_executable_paths();
+    if let Ok(entries) = fs::read_dir(&old_cli_root) {
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if name.starts_with(&marker) {
+            if name.starts_with(&marker)
+                && !generation_is_executed_by_running_process(&entry.path(), &live)
+            {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
     }
+    let old_link = old_root.join("bin").join(binary);
+    if old_link.is_symlink() || old_link.is_file() {
+        let _ = fs::remove_file(&old_link);
+    }
     Ok(format!(
-        "Removed the Yggterm-managed {binary} install under {}.",
-        paths.cli_root().display()
+        "Removed the ynpm-managed {binary} install and drained legacy copies."
     ))
 }
 
@@ -6385,18 +6617,22 @@ pub(crate) fn refresh_local_managed_cli(
         install_attempted = true;
         let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
         let install_all_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_all_install");
-        // ⭐ EVERY tool goes in. `install_latest` partitions by method — only
-        // the npm ones share a batch — so a uv or vendor CLI can no longer poison
-        // codex and claude's refresh, and no longer has to be filtered out to
-        // protect them. The filter this replaces is exactly what made "yggterm
-        // updates all CLIs" false for three of the nine.
+        // ⭐ EVERY tool goes in. `install_latest` partitions by method and the
+        // npm arm runs one ynpm transaction per package, so a uv or vendor CLI
+        // can no longer poison Codex and Claude's refresh, and no longer has to
+        // be filtered out to protect them. The filter this replaces is exactly
+        // what made "yggterm updates all CLIs" false for three of the nine.
         let installable = tools
             .iter()
             .copied()
             .filter(|tool| provision_step_is_runnable(&paths, *tool))
             .collect::<Vec<_>>();
         for tool in &installable {
-            let tool_perf = PerfSpan::start(&paths.home, "cli", &format!("refresh_managed_{}_install", tool.binary_name()));
+            let tool_perf = PerfSpan::start(
+                &paths.home,
+                "cli",
+                &format!("refresh_managed_{}_install", tool.binary_name()),
+            );
             tool_perf.finish(serde_json::json!({
                 "background": background,
                 "tool": tool.binary_name(),
@@ -6524,7 +6760,11 @@ pub(crate) fn refresh_local_managed_cli(
         .collect::<Vec<_>>();
 
     for status in &statuses {
-        let tool_perf = PerfSpan::start(&paths.home, "cli", &format!("refresh_managed_{}", status.binary_name));
+        let tool_perf = PerfSpan::start(
+            &paths.home,
+            "cli",
+            &format!("refresh_managed_{}", status.binary_name),
+        );
         tool_perf.finish(serde_json::json!({
             "action": status.action.clone(),
             "available": status.available,
@@ -6532,7 +6772,6 @@ pub(crate) fn refresh_local_managed_cli(
             "version_after": status.version_after.clone(),
         }));
     }
-
 
     perf.finish(serde_json::json!({
         "background": background,

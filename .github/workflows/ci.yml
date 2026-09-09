@@ -66,8 +66,11 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Build release binary
-        run: cargo build --release -p yggterm --no-default-features
+      - name: Build release binaries
+        run: cargo build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
+
+      - name: Test ynpm
+        run: cargo test -p ynpm
 
       - name: Run focused regression tests
         run: |
@@ -226,14 +229,15 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Build release binary
+      - name: Build release binaries
         shell: bash
-        run: cargo build --release -p yggterm --no-default-features
+        run: cargo build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
 
       - name: Validate release binary
         shell: bash
         run: |
           test -f ./target/release/yggterm.exe
+          test -f ./target/release/ynpm.exe
 
       - name: Validate GUI subsystem
         shell: powershell

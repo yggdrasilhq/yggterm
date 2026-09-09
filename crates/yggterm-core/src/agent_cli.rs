@@ -231,8 +231,9 @@ pub enum OverriddenBy {
 /// second encoding of that boundary which can silently diverge from what the
 /// caller believed it asked for. Codex has no plan mode and no edits-only
 /// approval, so it declares neither and says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentPermissionMode {
     /// Whatever the CLI itself defaults to — emits NO tokens.
@@ -303,8 +304,7 @@ impl AgentPermissionMode {
 /// Empty is the norm: a launch that asks for nothing composes to byte-identical
 /// behaviour with the pre-flag path, which is what keeps every human door
 /// (titlebar +, KeyTips, start page) unchanged.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentLaunchOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1192,7 +1192,9 @@ impl AgentCliDescriptor {
             // line, and it is what the row's detail would otherwise have to be
             // computed from.
             if entry.detail.is_none()
-                && condensed.as_deref().is_some_and(|title| title != raw.trim())
+                && condensed
+                    .as_deref()
+                    .is_some_and(|title| title != raw.trim())
             {
                 entry.detail = Some(raw.trim().to_string());
             }
@@ -1265,7 +1267,8 @@ impl AgentCliDescriptor {
 
     /// The remote wrapper subcommand that asks whether a saved session exists.
     pub fn session_exists_subcommand(&self) -> Option<String> {
-        self.wrapper_slug.map(|slug| format!("{slug}-session-exists"))
+        self.wrapper_slug
+            .map(|slug| format!("{slug}-session-exists"))
     }
 
     /// The label the "New … Session" menu entries carry, derived from
@@ -1487,10 +1490,7 @@ impl AgentCliDescriptor {
         let Some(home) = self.cli_home_relative() else {
             return Vec::new();
         };
-        names
-            .iter()
-            .map(|name| format!("{home}/{name}"))
-            .collect()
+        names.iter().map(|name| format!("{home}/{name}")).collect()
     }
 
     /// The path fragments a containment test keys on, e.g. `/.codex/sessions/`.
@@ -1927,7 +1927,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             // not folded in here.
             PermissionPreset {
                 id: "bypass-all",
-                label: "Skip checks and prompts",
+                // This is the one Codex posture that paints its own YOLO
+                // warning. Keep that word in the modal so the visible TUI
+                // warning and the setting the user selected are unmistakably
+                // the same contract.
+                label: "YOLO: skip checks and prompts",
                 args: "--dangerously-bypass-approvals-and-sandbox",
                 explanation: "No sandbox and no confirmation prompts at all. \
                               --dangerously-bypass-hook-trust is a separate switch that also \
@@ -2228,7 +2232,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '\u{276f}',
-        composer_footer_hints: &["claude", "permissions", "shift+tab", "for agents", "ctrl", "esc"],
+        composer_footer_hints: &[
+            "claude",
+            "permissions",
+            "shift+tab",
+            "for agents",
+            "ctrl",
+            "esc",
+        ],
         // Measured on guihost 2026-08-07 by comparing three live rows in one
         // snapshot: a working row's footer reads
         // `⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 1 agent`,
@@ -2391,7 +2402,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         permission_modes: &[(AgentPermissionMode::Default, &[])],
         overridden_flags: &[
             ("--model", FlagArity::TakesValue, OverriddenBy::Model),
-            ("--approve", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--approve",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
             ("-a", FlagArity::Standalone, OverriddenBy::PermissionMode),
             (
                 "--no-approve",
@@ -2517,7 +2532,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         overridden_flags: &[
             ("--model", FlagArity::TakesValue, OverriddenBy::Model),
-            ("--auto", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--auto",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
         ],
         extra_args_slug: "opencode",
         // ⭐ opencode's permission model is a CONFIG FILE and the flag only
@@ -2634,7 +2653,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 FlagArity::TakesValue,
                 OverriddenBy::PermissionMode,
             ),
-            ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--yolo",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
             ("-y", FlagArity::Standalone, OverriddenBy::PermissionMode),
         ],
         extra_args_slug: "qwen-code",
@@ -2792,7 +2815,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         overridden_flags: &[
             ("--model", FlagArity::TakesValue, OverriddenBy::Model),
-            ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--yolo",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
             ("--yes", FlagArity::Standalone, OverriddenBy::PermissionMode),
             (
                 "--auto-approve",
@@ -2940,7 +2967,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         overridden_flags: &[
             ("--model", FlagArity::TakesValue, OverriddenBy::Model),
-            ("--yolo", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--yolo",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
             (
                 "--approval-mode",
                 FlagArity::TakesValue,
@@ -3090,7 +3121,10 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         permission_modes: &[
             (AgentPermissionMode::Default, &[]),
             (AgentPermissionMode::Plan, &["--mode", "plan"]),
-            (AgentPermissionMode::AcceptEdits, &["--mode", "accept-edits"]),
+            (
+                AgentPermissionMode::AcceptEdits,
+                &["--mode", "accept-edits"],
+            ),
             (
                 AgentPermissionMode::Bypass,
                 &["--dangerously-skip-permissions"],
@@ -3508,9 +3542,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         // The launch contract emits --model (and --resume); --model must be
         // listed here so a caller-pinned model is never double-spelled.
-        overridden_flags: &[
-            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
-        ],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
         extra_args_slug: "zcode-tui",
         // No presets, and honestly UNMEASURED rather than Measured-with-none:
         // the TUI takes no launch posture flags at all — permissions are owned
@@ -3602,7 +3634,10 @@ fn muse_title_from_session_jsonl(path: &Path) -> Option<String> {
             // for payload_type runtime.user_intent.accepted / materialized. Do not
             // stop at the first accepted envelope: a launch-purpose envelope can
             // be low-signal while the next accepted envelope is the real task.
-            let pt = value.get("payload_type").and_then(|v| v.as_str()).unwrap_or("");
+            let pt = value
+                .get("payload_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if pt == "runtime.user_intent.accepted" || pt == "runtime.user_intent.materialized" {
                 let model_texts = value
                     .get("payload")
@@ -3652,7 +3687,7 @@ fn usable_muse_prompt_title(text: &str) -> Option<String> {
     })?;
     (!crate::looks_like_generated_fallback_title(&condensed)
         && !crate::looks_like_low_signal_generated_copy(&condensed))
-        .then_some(condensed)
+    .then_some(condensed)
 }
 
 /// Codex keeps no title in its own transcript — the generated-copy store
@@ -3670,12 +3705,17 @@ fn read_codex_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            ).ok()?;
-            let mut stmt = conn.prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1").ok()?;
+            )
+            .ok()?;
+            let mut stmt = conn
+                .prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1")
+                .ok()?;
             let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
             let row = rows.next().ok()??;
             let title: Option<String> = row.get(0).ok();
-            title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+            title
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         } else {
             None
         }
@@ -3687,17 +3727,26 @@ fn read_codex_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     // corpus of hundreds of files, on an 8 s poll.
     let tail_context = crate::titles::extract_tail_context(path).ok();
     let title = db_title
-        .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
+        .filter(|t| {
+            !crate::looks_like_generated_fallback_title(t)
+                && !crate::looks_like_low_signal_generated_copy(t)
+        })
         .or_else(|| {
             tail_context
                 .as_deref()
                 .and_then(crate::titles::heuristic_title_from_context)
-                .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| {
+                    !crate::looks_like_generated_fallback_title(s)
+                        && !crate::looks_like_low_signal_generated_copy(s)
+                })
                 .filter(|s| !s.contains("/home/"))
         });
     let detail = tail_context
         .filter(|context| !context.trim().is_empty())
-        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c))
+        .filter(|c| {
+            !crate::looks_like_low_signal_generated_copy(c)
+                && !crate::looks_like_generated_fallback_title(c)
+        })
         .filter(|c| !c.contains("/home/.yggterm/clipboard"));
     Some(AgentStoreEntry {
         session_id,
@@ -3763,12 +3812,17 @@ fn read_pi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            ).ok()?;
-            let mut stmt = conn.prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1").ok()?;
+            )
+            .ok()?;
+            let mut stmt = conn
+                .prepare("SELECT title FROM session_titles WHERE session_id = ?1 LIMIT 1")
+                .ok()?;
             let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
             let row = rows.next().ok()??;
             let title: Option<String> = row.get(0).ok();
-            title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+            title
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         } else {
             None
         }
@@ -3780,17 +3834,26 @@ fn read_pi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     // corpus of hundreds of files, on an 8 s poll.
     let tail_context = crate::titles::extract_tail_context(path).ok();
     let title = db_title
-        .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
+        .filter(|t| {
+            !crate::looks_like_generated_fallback_title(t)
+                && !crate::looks_like_low_signal_generated_copy(t)
+        })
         .or_else(|| {
             tail_context
                 .as_deref()
                 .and_then(crate::titles::heuristic_title_from_context)
-                .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| {
+                    !crate::looks_like_generated_fallback_title(s)
+                        && !crate::looks_like_low_signal_generated_copy(s)
+                })
                 .filter(|s| !s.contains("/home/"))
         });
     let detail = tail_context
         .filter(|context| !context.trim().is_empty())
-        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c));
+        .filter(|c| {
+            !crate::looks_like_low_signal_generated_copy(c)
+                && !crate::looks_like_generated_fallback_title(c)
+        });
     Some(AgentStoreEntry {
         session_id,
         cwd,
@@ -3899,17 +3962,29 @@ fn read_qwen_custom_title_tail(path: &Path) -> Option<String> {
     for line in reader.lines().flatten() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
             if value.get("type").and_then(|v| v.as_str()) == Some("custom_title") {
-                if let Some(t) = value.get("title").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(t) = value
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     // Qwen re-appends same title near EOF; last wins.
                     last_title = Some(t.to_string());
-                } else if let Some(t) = value.get("customTitle").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                } else if let Some(t) = value
+                    .get("customTitle")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     last_title = Some(t.to_string());
                 }
             }
         }
     }
-    last_title
-        .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+    last_title.filter(|s| {
+        !crate::looks_like_generated_fallback_title(s)
+            && !crate::looks_like_low_signal_generated_copy(s)
+    })
 }
 
 /// `agy` — one flat JSON object per conversation.
@@ -3998,7 +4073,9 @@ fn read_zcode_tui_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             let title: Option<String> = row.get(1).ok();
             Some((
                 cwd.trim().to_string(),
-                title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+                title
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty()),
             ))
         })
         .unwrap_or_default();
@@ -4031,7 +4108,9 @@ fn read_zcode_tui_live_store_title(_path: &Path, session_id: &str) -> Option<Str
     let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
     let row = rows.next().ok()??;
     let title: Option<String> = row.get(0).ok();
-    title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+    title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 fn read_grok_build_store_entry(path: &Path) -> Option<AgentStoreEntry> {
@@ -4098,7 +4177,11 @@ pub fn clean_agy_prompt_first_line(raw: &str) -> Option<String> {
     let mut text = raw.trim();
     if let Some(idx) = text.find("<USER_REQUEST>") {
         let after = &text[idx + "<USER_REQUEST>".len()..];
-        text = after.split("</USER_REQUEST>").next().unwrap_or(after).trim();
+        text = after
+            .split("</USER_REQUEST>")
+            .next()
+            .unwrap_or(after)
+            .trim();
     }
     for line in text.lines() {
         let l = line.trim();
@@ -4180,7 +4263,6 @@ fn cached_session_title(session_id: &str) -> Option<String> {
         .filter(|s| !crate::looks_like_generated_fallback_title(s))
         .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
 }
-
 
 /// Find one file under `root` (bounded depth) whose FILE NAME ends with
 /// `suffix`. Read-dir only — no file is opened to match.
@@ -4452,9 +4534,9 @@ fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<Strin
     )
     .ok()?;
     for table in ["session_v2", "session"] {
-        let Ok(mut stmt) = conn.prepare(&format!(
-            "SELECT title FROM {table} WHERE id = ?1 LIMIT 1"
-        )) else {
+        let Ok(mut stmt) =
+            conn.prepare(&format!("SELECT title FROM {table} WHERE id = ?1 LIMIT 1"))
+        else {
             continue;
         };
         let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
@@ -4481,10 +4563,7 @@ fn read_pi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
         return None;
     }
     let descriptor = agent_cli_descriptor(SessionKind::Pi)?;
-    let sessions_root = descriptor
-        .store_roots_absolute(home)
-        .into_iter()
-        .next()?;
+    let sessions_root = descriptor.store_roots_absolute(home).into_iter().next()?;
     let session_file = find_file_by_suffix(&sessions_root, 2, &format!("{session_id}.jsonl"))?;
     let entry = read_pi_store_entry(&session_file)?;
     title_without_fallbacks(entry.title)
@@ -4498,10 +4577,7 @@ fn read_grok_live_store_title(home: &Path, session_id: &str) -> Option<String> {
         return None;
     }
     let descriptor = agent_cli_descriptor(SessionKind::GrokBuild)?;
-    let sessions_root = descriptor
-        .store_roots_absolute(home)
-        .into_iter()
-        .next()?;
+    let sessions_root = descriptor.store_roots_absolute(home).into_iter().next()?;
     // `.grok/sessions/<encoded-cwd>/<id>/summary.json` — the directory named
     // for the session sits one level below the glob root.
     let session_dir = find_dir_by_name(&sessions_root, 2, session_id)?;
@@ -5229,7 +5305,8 @@ const KIMI_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     choose: first_non_empty_candidate,
 };
 
-const QWEN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {    script: QWEN_REMOTE_TITLE_SCRIPT,
+const QWEN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: QWEN_REMOTE_TITLE_SCRIPT,
     // The title lives in the session's OWN chat file; Qwen keeps no shared index
     // beside it, so there is nothing to union in.
     locators: RemoteStoreLocators::StoreGlobs,
@@ -5481,7 +5558,7 @@ fn first_muse_title_candidate(candidates: &[String]) -> Option<String> {
         }?;
         (!crate::looks_like_generated_fallback_title(&condensed)
             && !crate::looks_like_low_signal_generated_copy(&condensed))
-            .then_some(condensed)
+        .then_some(condensed)
     })
 }
 
@@ -5608,7 +5685,6 @@ for session_id in ids:
         print(json.dumps({'session_id': session_id, 'candidates': found}, ensure_ascii=False))
 "#;
 
-
 fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
         // Layout: ~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript_full.jsonl
@@ -5674,7 +5750,8 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                 let reader = BufReader::new(file);
                 for line in reader.lines().flatten() {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if value.get("conversationId").and_then(|v| v.as_str()) == Some(&session_id) {
+                        if value.get("conversationId").and_then(|v| v.as_str()) == Some(&session_id)
+                        {
                             if cwd.is_none() {
                                 if let Some(ws) = value.get("workspace").and_then(|v| v.as_str()) {
                                     if !ws.trim().is_empty() {
@@ -5712,7 +5789,11 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                             if detail.is_none() {
                                 let prompt = if let Some(idx) = content.find("<USER_REQUEST>") {
                                     let after = &content[idx + "<USER_REQUEST>".len()..];
-                                    after.split("</USER_REQUEST>").next().unwrap_or(after).trim()
+                                    after
+                                        .split("</USER_REQUEST>")
+                                        .next()
+                                        .unwrap_or(after)
+                                        .trim()
                                 } else {
                                     content.trim()
                                 };
@@ -5745,7 +5826,8 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
 
         if title.is_none() {
             if let Some(d) = detail.as_deref() {
-                title = clean_agy_prompt_first_line(d).or_else(|| crate::best_effort_title_from_context(d));
+                title = clean_agy_prompt_first_line(d)
+                    .or_else(|| crate::best_effort_title_from_context(d));
             }
         }
 
@@ -5805,11 +5887,17 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
             }
             p = parent.parent();
         }
-        p.and_then(|d| d.file_name()).and_then(|n| n.to_str())?.to_string()
+        p.and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())?
+            .to_string()
     } else {
         path.file_stem()?.to_str()?.to_string()
     };
-    if session_id.is_empty() || session_id == "transcript" || session_id.ends_with("-shm") || session_id.ends_with("-wal") {
+    if session_id.is_empty()
+        || session_id == "transcript"
+        || session_id.ends_with("-shm")
+        || session_id.ends_with("-wal")
+    {
         return None;
     }
     let home = dirs::home_dir()?;
@@ -5845,18 +5933,27 @@ fn read_antigravity_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         }
     }
     let title = title
-        .filter(|t| !crate::looks_like_generated_fallback_title(t) && !crate::looks_like_low_signal_generated_copy(t))
+        .filter(|t| {
+            !crate::looks_like_generated_fallback_title(t)
+                && !crate::looks_like_low_signal_generated_copy(t)
+        })
         .or_else(|| {
             crate::titles::extract_tail_context(path)
                 .ok()
                 .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
-                .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| {
+                    !crate::looks_like_generated_fallback_title(s)
+                        && !crate::looks_like_low_signal_generated_copy(s)
+                })
                 .filter(|s| !s.contains("/home/"))
         });
     let detail = crate::titles::extract_tail_context(path)
         .ok()
         .filter(|context| !context.trim().is_empty())
-        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c));
+        .filter(|c| {
+            !crate::looks_like_low_signal_generated_copy(c)
+                && !crate::looks_like_generated_fallback_title(c)
+        });
     let cwd = cwd.unwrap_or_else(|| home.display().to_string());
     Some(AgentStoreEntry {
         session_id,
@@ -5978,10 +6075,12 @@ pub fn opencode_store_newest_session_for_directory(home: &Path, directory: &str)
         if present == 0 {
             continue;
         }
-        let viewed_col = if selects_viewed { ", time_viewed, time_archived" } else { ", time_archived" };
-        let sql = format!(
-            "SELECT id, time_updated{viewed_col} FROM {table} WHERE directory = ?1"
-        );
+        let viewed_col = if selects_viewed {
+            ", time_viewed, time_archived"
+        } else {
+            ", time_archived"
+        };
+        let sql = format!("SELECT id, time_updated{viewed_col} FROM {table} WHERE directory = ?1");
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
         };
@@ -6071,16 +6170,12 @@ pub fn agent_session_recency_ms(home: &Path, kind: SessionKind, session_id: &str
         return None;
     }
     match kind {
-        SessionKind::Codex => newest_jsonl_mtime_under(
-            &home.join(".codex").join("sessions"),
-            session_id,
-            4,
-        ),
-        SessionKind::ClaudeCode => newest_jsonl_mtime_under(
-            &home.join(".claude").join("projects"),
-            session_id,
-            2,
-        ),
+        SessionKind::Codex => {
+            newest_jsonl_mtime_under(&home.join(".codex").join("sessions"), session_id, 4)
+        }
+        SessionKind::ClaudeCode => {
+            newest_jsonl_mtime_under(&home.join(".claude").join("projects"), session_id, 2)
+        }
         SessionKind::OpenCode => opencode_store_row_recency_ms(home, session_id),
         _ => None,
     }
@@ -6109,7 +6204,10 @@ fn newest_jsonl_mtime_under(root: &Path, needle: &str, depth: u8) -> Option<i64>
             }
             continue;
         }
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if name.ends_with(".jsonl") && name.contains(needle) {
             if let Some(ms) = path_mtime_epoch_ms(&path) {
                 if newest.is_none_or(|known| ms > known) {
@@ -6144,7 +6242,11 @@ fn opencode_store_row_recency_ms(home: &Path, session_id: &str) -> Option<i64> {
         if present == 0 {
             continue;
         }
-        let viewed_col = if selects_viewed { ", time_viewed, time_archived" } else { ", time_archived" };
+        let viewed_col = if selects_viewed {
+            ", time_viewed, time_archived"
+        } else {
+            ", time_archived"
+        };
         let sql = format!("SELECT time_updated{viewed_col} FROM {table} WHERE id = ?1");
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
@@ -6194,7 +6296,8 @@ pub fn push_title_to_muse_store(home: &Path, session_id: &str, title: &str) -> O
         return None;
     }
     let conn = rusqlite::Connection::open(home.join(".local/share/muse/session-index.db")).ok()?;
-    conn.busy_timeout(std::time::Duration::from_millis(400)).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(400))
+        .ok()?;
     let updated = conn
         .execute(
             "UPDATE sessions SET title = ?2 WHERE session_id = ?1",
@@ -6232,7 +6335,10 @@ fn antigravity_store_index_holds_session(home: &Path, session_id: &str) -> Optio
         // Antigravity has never run here, so this host cannot testify at all.
         return None;
     }
-    if root.join("conversations").join(format!("{session_id}.db")).exists()
+    if root
+        .join("conversations")
+        .join(format!("{session_id}.db"))
+        .exists()
         || root.join("brain").join(session_id).exists()
     {
         return Some(true);
@@ -6259,12 +6365,7 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     }
     // Muse lays out `~/.local/share/muse/sessions/YYYY/MM/DD/<uuid>/session.jsonl`
     // so the session_id is the parent directory name, not the file stem.
-    let session_id = path
-        .parent()?
-        .file_name()?
-        .to_str()?
-        .trim()
-        .to_string();
+    let session_id = path.parent()?.file_name()?.to_str()?.trim().to_string();
     if session_id.is_empty() {
         return None;
     }
@@ -6304,9 +6405,7 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
                                 .filter(|v| *v > 0)
                                 .map(|v| (v / 1000) as u128)
                                 .unwrap_or_else(|| modified_epoch_ms_of(path));
-                            let cwd = ws
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty());
+                            let cwd = ws.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                             let title = title
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty() && s != &session_id)
@@ -6327,28 +6426,32 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         (None, None, modified_epoch_ms_of(path))
     };
     // Fallback cwd from route_facts if DB absent or empty.
-    let cwd = db_cwd.or_else(|| {
-        use std::io::{BufRead, BufReader};
-        let file = std::fs::File::open(path).ok()?;
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten().take(16) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                if value.get("payload_type").and_then(|v| v.as_str()) == Some("runtime.session.route_facts") {
-                    if let Some(cwd) = value
-                        .get("payload")
-                        .and_then(|p| p.get("record"))
-                        .and_then(|r| r.get("cwd"))
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
+    let cwd = db_cwd
+        .or_else(|| {
+            use std::io::{BufRead, BufReader};
+            let file = std::fs::File::open(path).ok()?;
+            let reader = BufReader::new(file);
+            for line in reader.lines().flatten().take(16) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if value.get("payload_type").and_then(|v| v.as_str())
+                        == Some("runtime.session.route_facts")
                     {
-                        return Some(cwd.to_string());
+                        if let Some(cwd) = value
+                            .get("payload")
+                            .and_then(|p| p.get("record"))
+                            .and_then(|r| r.get("cwd"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            return Some(cwd.to_string());
+                        }
                     }
                 }
             }
-        }
-        None
-    }).unwrap_or_else(|| home.display().to_string());
+            None
+        })
+        .unwrap_or_else(|| home.display().to_string());
 
     // If DB title is missing or looks generated, try Muse-native title
     // extraction before the Codex-shaped heuristic. Muse's JSONL is
@@ -6356,15 +6459,33 @@ fn read_muse_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     // not a Codex rollout — extract_tail_context would return empty and the
     // session would fall back to the short id (the `1230f99` bug).
     let muse_jsonl_title = if db_title.is_none() {
-        muse_title_from_session_jsonl(path)
-            .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+        muse_title_from_session_jsonl(path).filter(|s| {
+            !crate::looks_like_generated_fallback_title(s)
+                && !crate::looks_like_low_signal_generated_copy(s)
+        })
     } else {
         None
     };
-    let effective_title = db_title.clone().filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s)).or_else(|| muse_jsonl_title.clone()).or_else(|| {
-        crate::titles::extract_tail_context(path).ok().and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx)).filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
-    });
-    let effective_detail = db_title.clone().filter(|s| !crate::looks_like_low_signal_generated_copy(s)).or(muse_jsonl_title);
+    let effective_title = db_title
+        .clone()
+        .filter(|s| {
+            !crate::looks_like_generated_fallback_title(s)
+                && !crate::looks_like_low_signal_generated_copy(s)
+        })
+        .or_else(|| muse_jsonl_title.clone())
+        .or_else(|| {
+            crate::titles::extract_tail_context(path)
+                .ok()
+                .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
+                .filter(|s| {
+                    !crate::looks_like_generated_fallback_title(s)
+                        && !crate::looks_like_low_signal_generated_copy(s)
+                })
+        });
+    let effective_detail = db_title
+        .clone()
+        .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+        .or(muse_jsonl_title);
     Some(AgentStoreEntry {
         session_id,
         cwd,
@@ -6391,13 +6512,19 @@ fn read_claude_code_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         crate::titles::extract_tail_context(path)
             .ok()
             .and_then(|ctx| crate::titles::heuristic_title_from_context(&ctx))
-            .filter(|s| !crate::looks_like_generated_fallback_title(s) && !crate::looks_like_low_signal_generated_copy(s))
+            .filter(|s| {
+                !crate::looks_like_generated_fallback_title(s)
+                    && !crate::looks_like_low_signal_generated_copy(s)
+            })
             .filter(|s| !s.contains("/home/"))
     });
     let detail = crate::read_cc_session_context(path)
         .ok()
         .filter(|context| !context.trim().is_empty())
-        .filter(|c| !crate::looks_like_low_signal_generated_copy(c) && !crate::looks_like_generated_fallback_title(c))
+        .filter(|c| {
+            !crate::looks_like_low_signal_generated_copy(c)
+                && !crate::looks_like_generated_fallback_title(c)
+        })
         .filter(|c| !c.contains("/home/.yggterm/clipboard"));
     Some(AgentStoreEntry {
         session_id,
@@ -7054,7 +7181,12 @@ mod tests {
     fn every_agent_cli_has_a_session_metadata_label() {
         for descriptor in AGENT_CLIS {
             assert!(
-                descriptor.session_metadata_label.trim().split_whitespace().count() >= 2,
+                descriptor
+                    .session_metadata_label
+                    .trim()
+                    .split_whitespace()
+                    .count()
+                    >= 2,
                 "{}: a session metadata label must name the CLI and the fact",
                 descriptor.display_name
             );
@@ -7120,9 +7252,12 @@ mod tests {
                                  desktop host every few seconds forever";
         let condensed = condense_store_title(one_long_sentence).expect("a label");
         assert!(condensed.chars().count() <= STORE_TITLE_MAX_CHARS);
-        assert!(one_long_sentence.split_whitespace().collect::<Vec<_>>().starts_with(
-            &condensed.split_whitespace().collect::<Vec<_>>()[..]
-        ));
+        assert!(
+            one_long_sentence
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .starts_with(&condensed.split_whitespace().collect::<Vec<_>>()[..])
+        );
         assert_eq!(condense_store_title("   "), None);
     }
 
@@ -7254,7 +7389,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(options.launch_tokens(SessionKind::Codex).unwrap().is_empty());
+        assert!(
+            options
+                .launch_tokens(SessionKind::Codex)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ⛔ THE REFUSALS. A silently ignored flag is how the model-inheritance
@@ -7340,7 +7480,10 @@ mod tests {
             .expect_err("codex has no plan/accept-edits mode");
             assert!(error.contains(mode.name()), "{error}");
             assert!(error.contains("Codex"), "{error}");
-            assert!(error.contains("bypass"), "the refusal must name what it DOES have: {error}");
+            assert!(
+                error.contains("bypass"),
+                "the refusal must name what it DOES have: {error}"
+            );
         }
     }
 
@@ -7409,7 +7552,15 @@ mod tests {
 
     #[test]
     fn stripping_handles_inline_values_and_short_flags() {
-        let configured = args(&["--model=gpt-x", "-m", "gpt-y", "--sandbox", "read-only", "-C", "/tmp"]);
+        let configured = args(&[
+            "--model=gpt-x",
+            "-m",
+            "gpt-y",
+            "--sandbox",
+            "read-only",
+            "-C",
+            "/tmp",
+        ]);
         let options = AgentLaunchOptions {
             model: Some("claude-opus-5".to_string()),
             permission_mode: Some(AgentPermissionMode::Bypass),
@@ -7629,7 +7780,10 @@ mod tests {
         // case, and again inside a four-byte one.
         for filler in ['e', 'x'] {
             for tail in ["é", "🙂"] {
-                let prompt = format!("{}{tail} and the prompt continues", String::from(filler).repeat(119));
+                let prompt = format!(
+                    "{}{tail} and the prompt continues",
+                    String::from(filler).repeat(119)
+                );
                 let cleaned =
                     clean_agy_prompt_first_line(&prompt).expect("a plain prompt is a title");
                 assert!(
@@ -7673,7 +7827,8 @@ mod tests {
         write_qwen_fixture(&home, "chat-0007", session_id, "Port the CSV importer");
         let found = read_qwen_live_store_title(&home, session_id);
         let named_for_the_id = {
-            let other = std::env::temp_dir().join(format!("yggterm-qwen-live-{}", uuid::Uuid::new_v4()));
+            let other =
+                std::env::temp_dir().join(format!("yggterm-qwen-live-{}", uuid::Uuid::new_v4()));
             write_qwen_fixture(&other, session_id, session_id, "Port the CSV importer");
             let hit = read_qwen_live_store_title(&other, session_id);
             let _ = std::fs::remove_dir_all(&other);
@@ -7691,13 +7846,17 @@ mod tests {
              names its files anything else is titled by nothing"
         );
         assert_eq!(named_for_the_id, Some("Port the CSV importer".to_string()));
-        assert_eq!(miss, None, "an id with no chat file must miss, not borrow another row's title");
+        assert_eq!(
+            miss, None,
+            "an id with no chat file must miss, not borrow another row's title"
+        );
     }
 
     /// The ssh half of the same store, run the way the daemon runs it.
     #[test]
     fn a_remote_qwen_row_is_titled_by_its_probe_script() {
-        let home = std::env::temp_dir().join(format!("yggterm-qwen-probe-{}", uuid::Uuid::new_v4()));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-qwen-probe-{}", uuid::Uuid::new_v4()));
         let session_id = "b3d17e02-5c48-4a91-8f60-2d7c1a9e4b35";
         write_qwen_fixture(&home, "chat-0007", session_id, "Port the CSV importer");
 
@@ -7881,8 +8040,7 @@ mod tests {
 
     #[test]
     fn an_opencode_live_title_reads_the_v2_store_and_refuses_placeholders() {
-        let home =
-            std::env::temp_dir().join(format!("yggterm-oc-title-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("yggterm-oc-title-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
         let db = home.join(".local/share/opencode/opencode.db");
         let conn = rusqlite::Connection::open(&db).unwrap();
@@ -8529,7 +8687,8 @@ mod tests {
     /// falls back to a bare "Open" — that fallback is reserved for the rows
     /// that genuinely have no CLI.
     #[test]
-    fn the_open_verb_names_every_registered_cli() {        for descriptor in AGENT_CLIS {
+    fn the_open_verb_names_every_registered_cli() {
+        for descriptor in AGENT_CLIS {
             assert_eq!(
                 agent_cli_open_session_label(Some(descriptor.kind)),
                 format!("Open this {} Session", descriptor.display_name),
@@ -8606,9 +8765,7 @@ mod tests {
         for descriptor in AGENT_CLIS {
             let instruction = descriptor.install_instruction();
             let names_its_source = match descriptor.install {
-                CliInstall::Npm(package) | CliInstall::Uv(package) => {
-                    instruction.contains(package)
-                }
+                CliInstall::Npm(package) | CliInstall::Uv(package) => instruction.contains(package),
                 CliInstall::VendorScript(url) => instruction.contains(url),
                 CliInstall::Manual => instruction.contains(descriptor.binary_name),
             };
@@ -8776,11 +8933,9 @@ mod tests {
         assert!(!codex.store_path_is_session_file("/home/user/.codex/sessions/2026/notes.txt"));
         assert!(!codex.store_path_is_session_file("/home/user/.codex/sessions/2026/history.jsonl"));
         // Wrong CLI's store.
-        assert!(
-            !codex.store_path_is_session_file(
-                "/home/user/.codex-litellm/sessions/2026/rollout-abc.jsonl"
-            )
-        );
+        assert!(!codex.store_path_is_session_file(
+            "/home/user/.codex-litellm/sessions/2026/rollout-abc.jsonl"
+        ));
 
         let claude = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
         assert!(claude.store_path_is_session_file(
@@ -8873,7 +9028,8 @@ mod tests {
         );
         // Under a root but not a session file: located, not classified.
         assert_eq!(
-            agent_cli_for_store_path("/home/user/.codex/sessions/2026/history.jsonl").map(|d| d.kind),
+            agent_cli_for_store_path("/home/user/.codex/sessions/2026/history.jsonl")
+                .map(|d| d.kind),
             Some(SessionKind::Codex)
         );
         assert_eq!(
@@ -9005,7 +9161,10 @@ mod tests {
         // Real composer lines, captured 2026-08-22. Paths invented.
         for (kind, line) in [
             (SessionKind::Muse, "\u{27e9}"),
-            (SessionKind::Codex, "\u{203a} Run /review on my current changes"),
+            (
+                SessionKind::Codex,
+                "\u{203a} Run /review on my current changes",
+            ),
             (SessionKind::ClaudeCode, "\u{276f} Try \"write a test\""),
         ] {
             let d = agent_cli_descriptor(kind).expect("registered");
@@ -9023,12 +9182,12 @@ mod tests {
 
     #[test]
     fn the_fleet_transcript_table_matches_the_registry() {
-        let raw = include_str!(
-            "../../../.agents/skills/yggterm-agent-fleet/cli-stores.json"
-        );
+        let raw = include_str!("../../../.agents/skills/yggterm-agent-fleet/cli-stores.json");
         let table: serde_json::Value =
             serde_json::from_str(raw).expect("cli-stores.json is not valid JSON");
-        let clis = table["clis"].as_object().expect("cli-stores.json has no `clis` map");
+        let clis = table["clis"]
+            .as_object()
+            .expect("cli-stores.json has no `clis` map");
 
         for descriptor in AGENT_CLIS.iter() {
             let entry = clis.get(descriptor.slug).unwrap_or_else(|| {
@@ -9292,8 +9451,9 @@ mod tests {
         // The CLI's generic select list — menus and permission prompts — eats
         // typed text exactly the same way, so it is the same state.
         assert!(descriptor.screen_shows_question_picker("   (Use arrow keys)\n"));
-        assert!(descriptor
-            .screen_shows_question_picker("   (Use arrow keys to reveal more choices)\n"));
+        assert!(
+            descriptor.screen_shows_question_picker("   (Use arrow keys to reveal more choices)\n")
+        );
     }
 
     // The guard that keeps prose out: the needle alone is common English, so
@@ -9304,9 +9464,9 @@ mod tests {
         assert!(!descriptor.screen_shows_question_picker(
             "  I will use the arrow keys to navigate the file tree next.\n"
         ));
-        assert!(!descriptor.screen_shows_question_picker(
-            "  esc to interrupt · 12s · 340 tokens\n"
-        ));
+        assert!(
+            !descriptor.screen_shows_question_picker("  esc to interrupt · 12s · 340 tokens\n")
+        );
         assert!(!descriptor.screen_shows_question_picker(""));
     }
 
@@ -9317,9 +9477,11 @@ mod tests {
     fn an_unmeasured_cli_has_no_picker_phrases_and_never_arms() {
         let codex = agent_cli_descriptor(SessionKind::Codex).unwrap();
         assert!(codex.question_picker_screen_phrases.is_empty());
-        assert!(!codex.screen_shows_question_picker(
-            " Enter to select · ↑/↓ to navigate · Esc to cancel\n"
-        ));
+        assert!(
+            !codex.screen_shows_question_picker(
+                " Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            )
+        );
     }
 
     // ⭐ MEASURED from the same pty run as the picker screens. The composer is
@@ -9327,7 +9489,9 @@ mod tests {
     #[test]
     fn a_background_agent_hint_is_chrome_and_not_a_typed_draft() {
         let descriptor = agent_cli_descriptor(SessionKind::ClaudeCode).unwrap();
-        assert!(descriptor.screen_shows_background_agent_hint("\u{276f}   \u{b7} \u{2190} 1 agent\n"));
+        assert!(
+            descriptor.screen_shows_background_agent_hint("\u{276f}   \u{b7} \u{2190} 1 agent\n")
+        );
         assert!(descriptor.screen_shows_background_agent_hint(
             " \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} for agents\n"
         ));
@@ -9434,7 +9598,10 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("ygg-oc-idx-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
-        assert_eq!(opencode_store_index_holds_session(&empty, "ses_whatever00000000001"), None);
+        assert_eq!(
+            opencode_store_index_holds_session(&empty, "ses_whatever00000000001"),
+            None
+        );
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&empty);
     }
@@ -9554,7 +9721,10 @@ mod tests {
         let bare = std::env::temp_dir().join(format!("ygg-codex-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bare);
         std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(read_codex_live_store_title(&bare, "test-codex-thread-2"), None);
+        assert_eq!(
+            read_codex_live_store_title(&bare, "test-codex-thread-2"),
+            None
+        );
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bare);
     }
@@ -9696,7 +9866,10 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
                 let value: serde_json::Value = serde_json::from_str(line).expect("JSON lines");
-                let id = value["session_id"].as_str().expect("session_id").to_string();
+                let id = value["session_id"]
+                    .as_str()
+                    .expect("session_id")
+                    .to_string();
                 let candidates = value["candidates"]
                     .as_array()
                     .expect("candidates")
@@ -9779,9 +9952,7 @@ mod tests {
         let transcript = root.join("session.jsonl");
         let mut records = (0..80)
             .map(|sequence| {
-                format!(
-                    "{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n"
-                )
+                format!("{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n")
             })
             .collect::<String>();
         records.push_str(
@@ -9846,9 +10017,7 @@ mod tests {
         std::fs::create_dir_all(&session_dir).unwrap();
         let mut records = (0..80)
             .map(|sequence| {
-                format!(
-                    "{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n"
-                )
+                format!("{{\"sequence\":{sequence},\"payload_type\":\"runtime.lifecycle\"}}\n")
             })
             .collect::<String>();
         records.push_str(
@@ -9902,8 +10071,7 @@ mod tests {
     #[test]
     fn muse_remote_title_condenses_before_classifying_prompt_copy() {
         let candidates = vec![
-            "Please inspect the widget importer and continue tracing its dropped rows."
-                .to_string(),
+            "Please inspect the widget importer and continue tracing its dropped rows.".to_string(),
         ];
         let chosen = super::first_muse_title_candidate(&candidates)
             .expect("the raw prompt should condense to a usable title");
@@ -9930,7 +10098,6 @@ mod tests {
         assert_eq!(npm_dist_tag(SessionKind::OpenCode), Some("beta"));
     }
 }
-
 
 #[cfg(test)]
 /// ⛔ THE OWNER TITLING LAW (2026-09-05, CLOSED the same day by the owner's
@@ -9977,10 +10144,8 @@ mod newest_session_tests {
     }
 
     fn temp_home(tag: &str) -> std::path::PathBuf {
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-ocnewest-{tag}-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("yggterm-ocnewest-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("temp home");
         home
@@ -10040,7 +10205,8 @@ mod newest_session_tests {
         let home = temp_home("recency-codex");
         let dir = home.join(".codex/sessions/2026/09/06");
         std::fs::create_dir_all(&dir).expect("codex session tree");
-        let rollout = dir.join("rollout-2026-09-06T00-00-00-01a0709f-0345-7281-9967-9bef550cbaf1.jsonl");
+        let rollout =
+            dir.join("rollout-2026-09-06T00-00-00-01a0709f-0345-7281-9967-9bef550cbaf1.jsonl");
         std::fs::write(&rollout, b"{}").expect("rollout");
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -10069,8 +10235,12 @@ mod newest_session_tests {
         std::fs::create_dir_all(&dir).expect("cc projects tree");
         std::fs::write(dir.join("ses_cc000000000000000000001.jsonl"), b"{}").expect("cc jsonl");
         assert!(
-            agent_session_recency_ms(&home, SessionKind::ClaudeCode, "ses_cc000000000000000000001")
-                .is_some(),
+            agent_session_recency_ms(
+                &home,
+                SessionKind::ClaudeCode,
+                "ses_cc000000000000000000001"
+            )
+            .is_some(),
             "the CC session jsonl answers"
         );
         assert_eq!(
@@ -10149,7 +10319,11 @@ mod newest_session_tests {
         // The push closes the harmonization loop: what yggterm generates, the
         // CLI's own index carries.
         assert_eq!(
-            push_title_to_muse_store(&home, "ses_muse000000000000000000001", "Fintax Orchestrator Design"),
+            push_title_to_muse_store(
+                &home,
+                "ses_muse000000000000000000001",
+                "Fintax Orchestrator Design"
+            ),
             Some(true)
         );
         let conn = Connection::open(dir.join("session-index.db")).expect("re-open");
@@ -10168,7 +10342,10 @@ mod newest_session_tests {
             Some(false)
         );
         // An empty title is refused rather than written.
-        assert_eq!(push_title_to_muse_store(&home, "ses_muse000000000000000000001", "  "), None);
+        assert_eq!(
+            push_title_to_muse_store(&home, "ses_muse000000000000000000001", "  "),
+            None
+        );
     }
 
     #[test]

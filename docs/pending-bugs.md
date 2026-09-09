@@ -13626,6 +13626,16 @@ version of this buys little and the thorough version is not safe unattended.
 ⇒ **A deliberate one-off reclaim, not an automatic one.** Recorded here so the space is known about
 rather than discovered later as unexplained growth.
 
+### Correction — ynpm now owns the migration sweep (2026-09-09)
+
+The one-off conclusion above is superseded by the `ynpm` distribution plane.
+After the new generation is verified, `ynpm purge-legacy` removes the exact
+old yggterm npm generation/module trees and duplicate user-local package roots
+when `/proc` shows no live executable beneath them. A live legacy tree is
+reported and retained for a later sweep; unrelated user-local packages and
+system paths remain outside the operation. The historical measurement and its
+reasoning remain above, but the current operator contract is [`docs/ynpm.md`](ynpm.md).
+
 ⚠ **And the new layout costs disk, which should be said plainly rather than discovered.** One
 prefix per CLI means shared dependencies are no longer hoisted across CLIs. Measured on the desktop
 host after migration: **626 MB across seven per-CLI trees, against 522 MB for the one shared

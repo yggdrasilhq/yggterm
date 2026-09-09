@@ -4388,11 +4388,12 @@ pub struct ServerUiSnapshot {
 /// while a snapshot (which the GUI takes constantly) costs no `readdir`.
 const APP_REGISTRY_RESCAN_AFTER_MS: u64 = 5_000;
 
-/// The host's app registry, rescanned at most every `APP_REGISTRY_RESCAN_AFTER_MS`.
+/// The host's ynpm-owned app registry, rescanned at most every
+/// `APP_REGISTRY_RESCAN_AFTER_MS`.
 ///
-/// This is where the daemon **prunes** the manifests of apps whose binary is
-/// gone (see `yggterm_core::scan_app_registry`), so an uninstall cleans itself
-/// up as a side effect of the GUI simply being open.
+/// A missing executable is omitted from the live snapshot, but ownership and
+/// removal belong to ynpm. The daemon must not turn a read-only scan into an
+/// uninstall side effect; an explicit `ynpm remove` deletes the registration.
 fn cached_app_registry() -> Vec<AppManifest> {
     use std::sync::Mutex;
     use std::sync::OnceLock;
@@ -4411,9 +4412,9 @@ fn cached_app_registry() -> Vec<AppManifest> {
     let Ok(home) = yggterm_core::resolve_yggterm_home() else {
         return Vec::new();
     };
-    let (apps, pruned) = yggterm_core::scan_app_registry(&home);
-    if !pruned.is_empty() {
-        info!(pruned = ?pruned, "pruned app manifests whose binary no longer resolves");
+    let (apps, missing) = yggterm_core::scan_app_registry(&home);
+    if !missing.is_empty() {
+        info!(missing = ?missing, "ynpm app registrations whose binary is not currently resolvable");
     }
     *cache = (now_ms.max(1), apps.clone());
     apps
@@ -32102,15 +32103,15 @@ fn wait_acquire_remote_scan_lock(
 ///
 /// The SSH-invoked half of [`fetch_remote_machine_apps`]. It reads the SAME
 /// scanner the local registry uses ([`yggterm_core::scan_app_registry`]), so a
-/// manifest whose binary no longer resolves is pruned here exactly as it is at
-/// home — the remote answer can never claim an app the host cannot run.
+/// manifest whose binary no longer resolves is omitted here exactly as it is
+/// at home — the remote answer can never claim an app the host cannot run.
 ///
 /// One manifest per line rather than one JSON array: identical framing to
 /// `server remote scan`, and a single unparseable line costs one app instead of
 /// the whole registry.
 pub fn run_remote_apps() -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
-    let (apps, _pruned) = yggterm_core::scan_app_registry(&home);
+    let (apps, _missing) = yggterm_core::scan_app_registry(&home);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for app in apps {

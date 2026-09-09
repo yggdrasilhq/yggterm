@@ -287,8 +287,8 @@ mod tests {
     /// Sites in this crate still allowed to spell a store path by hand. The
     /// list should only ever shrink — each entry is a place a fourth agent CLI
     /// would have to be remembered.
-    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] = &[
-        yggterm_core::RecordedStoreLiteral {
+    const RECORDED_STORE_LITERALS: &[yggterm_core::RecordedStoreLiteral] =
+        &[yggterm_core::RecordedStoreLiteral {
             owner: "installed_gui_executable_for_version",
             recorded: "join(\".local\")",
             // Not an agent-CLI store at all: this is the version-convergence
@@ -297,8 +297,7 @@ mod tests {
             // location of yggterm's own install, and the registry is about agent
             // CLIs' transcript stores; there is nothing to ask there.
             reason: "install-root probe for the GUI binary, not a store layout",
-        },
-    ];
+        }];
 
     #[test]
     fn no_store_path_literal_outside_the_agent_cli_registry() {
@@ -336,7 +335,9 @@ mod tests {
             "/home/user/.claude/projects/-home-user-gh-yggterm/abc.jsonl"
         ));
         assert!(is_claude_code_session_path("remote-cc://dev/abc"));
-        assert!(!is_claude_code_session_path("/home/user/gh/yggterm/notes.jsonl"));
+        assert!(!is_claude_code_session_path(
+            "/home/user/gh/yggterm/notes.jsonl"
+        ));
         assert_eq!(
             codex_storage_root_for_path("/home/user/.codex/sessions/2026/rollout-a.jsonl"),
             Some("/home/user/.codex")
@@ -359,12 +360,13 @@ mod tests {
                 && s.agent
                 && matches!(
                     s.role,
-                    SchemeRole::RowIdentity
-                        | SchemeRole::RuntimeKey
-                        | SchemeRole::RowAndRuntimeKey
+                    SchemeRole::RowIdentity | SchemeRole::RuntimeKey | SchemeRole::RowAndRuntimeKey
                 )
         };
-        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES
+            .iter()
+            .filter(|s| in_scope(s))
+        {
             let line = format!("Error: terminal session not found: {}", scheme.example);
             let covered = terminal_line_internal_transport_error_index(&line).is_some();
             let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
@@ -381,7 +383,11 @@ mod tests {
         for hole in agent_scheme::predicate_holes_for(name) {
             let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
                 .expect("hole names a registered scheme");
-            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+            assert!(
+                in_scope(scheme),
+                "{name}'s hole row {} out of scope",
+                hole.scheme
+            );
         }
     }
 
@@ -392,9 +398,13 @@ mod tests {
         // Every current scheme that can name a LIVE session (agent rows,
         // agent runtime keys, shell rows) must promote into the hot sidebar.
         let in_scope = |s: &agent_scheme::SchemeDescriptor| {
-            !s.legacy && (s.agent || matches!(s.kind, Some(SessionKind::Shell | SessionKind::SshShell)))
+            !s.legacy
+                && (s.agent || matches!(s.kind, Some(SessionKind::Shell | SessionKind::SshShell)))
         };
-        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES
+            .iter()
+            .filter(|s| in_scope(s))
+        {
             let covered = is_hot_terminal_sidebar_path(scheme.example);
             let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
             assert!(
@@ -411,7 +421,11 @@ mod tests {
         for hole in agent_scheme::predicate_holes_for(name) {
             let scheme = agent_scheme::scheme_for_prefix(hole.scheme)
                 .expect("hole names a registered scheme");
-            assert!(in_scope(scheme), "{name}'s hole row {} out of scope", hole.scheme);
+            assert!(
+                in_scope(scheme),
+                "{name}'s hole row {} out of scope",
+                hole.scheme
+            );
         }
     }
 
@@ -446,9 +460,9 @@ mod tests {
             .as_array()
             .expect("violations array");
         assert!(
-            violations.iter().any(|v| v
-                .as_str()
-                .is_some_and(|s| s.contains("167×63")
+            violations
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("167×63")
                     && s.contains("167×81")
                     && s.contains("broken-bottom"))),
             "divergence must be flagged: {violations:?}"
@@ -502,12 +516,21 @@ mod tests {
         // rest. Each pane gives up half of SPLIT_GUTTER_PX at the seam so the
         // divider/focus ring have a strip no pane (or future webview) covers.
         let left = split_pane_rect_css(SplitAxis::SideBySide, 0.3, 0);
-        assert!(left.contains("width:calc(30.0000% - 3px)"), "left width: {left}");
+        assert!(
+            left.contains("width:calc(30.0000% - 3px)"),
+            "left width: {left}"
+        );
         assert!(left.contains("height:100%"), "left full height: {left}");
         assert!(left.contains("left:0"));
         let right = split_pane_rect_css(SplitAxis::SideBySide, 0.3, 1);
-        assert!(right.contains("width:calc(70.0000% - 3px)"), "right width: {right}");
-        assert!(right.contains("left:calc(30.0000% + 3px)"), "right offset: {right}");
+        assert!(
+            right.contains("width:calc(70.0000% - 3px)"),
+            "right width: {right}"
+        );
+        assert!(
+            right.contains("left:calc(30.0000% + 3px)"),
+            "right offset: {right}"
+        );
         // Stacked: pane 0 takes `ratio` of the HEIGHT, full width.
         let top = split_pane_rect_css(SplitAxis::Stacked, 0.3, 0);
         assert!(
@@ -552,12 +575,17 @@ mod tests {
         // The cwd-tree region is untouched: the `local` folder and its member row.
         assert!(rows.iter().any(|row| row.full_path == "local"));
         assert!(
-            rows.iter().filter(|row| row.full_path == "local://a").count() == 1,
+            rows.iter()
+                .filter(|row| row.full_path == "local://a")
+                .count()
+                == 1,
             "cwd-tree occurrence of local://a preserved, live one collapsed"
         );
         // No compound row appears in the cwd-tree region.
         assert_eq!(
-            rows.iter().filter(|row| row.full_path == "split://g1").count(),
+            rows.iter()
+                .filter(|row| row.full_path == "split://g1")
+                .count(),
             1
         );
     }
@@ -581,7 +609,10 @@ mod tests {
             prior_keep_alive: std::collections::BTreeMap::new(),
         };
         collapse_live_sessions_into_split_rows(&mut rows, std::slice::from_ref(&group));
-        assert!(rows.iter().all(|row| !row.full_path.starts_with("split://")));
+        assert!(
+            rows.iter()
+                .all(|row| !row.full_path.starts_with("split://"))
+        );
         assert!(rows.iter().any(|row| row.full_path == "local://a"));
     }
 
@@ -925,7 +956,10 @@ mod tests {
     #[test]
     fn web_surface_tab_labels_use_url_host() {
         assert_eq!(web_surface_tab_host_label(""), "New Tab");
-        assert_eq!(web_surface_tab_host_label("https://docs.rs/tokio"), "docs.rs");
+        assert_eq!(
+            web_surface_tab_host_label("https://docs.rs/tokio"),
+            "docs.rs"
+        );
         assert_eq!(
             web_surface_tab_host_label("http://user@host:8000/x"),
             "host:8000"
@@ -998,12 +1032,36 @@ mod tests {
         };
         let day0 = 1_609_459_200_000u64; // 2021-01-01 UTC
         let entries = vec![
-            WebHistoryEntry { ts_ms: day0 + 86_400_000 + 55_000_000, url: "https://github.com/yggdrasilhq/yggterm/pulls".into(), title: "Pull requests · yggdrasilhq/yggterm".into() },
-            WebHistoryEntry { ts_ms: day0 + 86_400_000 + 40_000_000, url: "https://news.ycombinator.com/".into(), title: "Hacker News".into() },
-            WebHistoryEntry { ts_ms: day0 + 86_400_000 + 20_000_000, url: "https://www.rust-lang.org/".into(), title: "Rust Programming Language".into() },
-            WebHistoryEntry { ts_ms: day0 + 70_000_000, url: "https://en.wikipedia.org/wiki/WebKit".into(), title: "WebKit - Wikipedia".into() },
-            WebHistoryEntry { ts_ms: day0 + 55_000_000, url: "https://developer.mozilla.org/en-US/docs/Web/CSS/color-scheme".into(), title: "color-scheme - CSS: Cascading Style Sheets | MDN".into() },
-            WebHistoryEntry { ts_ms: day0 + 30_000_000, url: "https://example.com/a?x=1&y=<b>".into(), title: "Escaping & <tags> test".into() },
+            WebHistoryEntry {
+                ts_ms: day0 + 86_400_000 + 55_000_000,
+                url: "https://github.com/yggdrasilhq/yggterm/pulls".into(),
+                title: "Pull requests · yggdrasilhq/yggterm".into(),
+            },
+            WebHistoryEntry {
+                ts_ms: day0 + 86_400_000 + 40_000_000,
+                url: "https://news.ycombinator.com/".into(),
+                title: "Hacker News".into(),
+            },
+            WebHistoryEntry {
+                ts_ms: day0 + 86_400_000 + 20_000_000,
+                url: "https://www.rust-lang.org/".into(),
+                title: "Rust Programming Language".into(),
+            },
+            WebHistoryEntry {
+                ts_ms: day0 + 70_000_000,
+                url: "https://en.wikipedia.org/wiki/WebKit".into(),
+                title: "WebKit - Wikipedia".into(),
+            },
+            WebHistoryEntry {
+                ts_ms: day0 + 55_000_000,
+                url: "https://developer.mozilla.org/en-US/docs/Web/CSS/color-scheme".into(),
+                title: "color-scheme - CSS: Cascading Style Sheets | MDN".into(),
+            },
+            WebHistoryEntry {
+                ts_ms: day0 + 30_000_000,
+                url: "https://example.com/a?x=1&y=<b>".into(),
+                title: "Escaping & <tags> test".into(),
+            },
         ];
         std::fs::write(&path, render_web_history_page(&entries)).expect("write dump");
         println!("wrote history page to {path}");
@@ -1129,7 +1187,10 @@ mod tests {
             "the app tab becomes the tab the user was reading, so no start page is stacked over the session"
         );
         assert_eq!(
-            plan.tabs.iter().map(|tab| tab.url.as_str()).collect::<Vec<_>>(),
+            plan.tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect::<Vec<_>>(),
             vec!["https://a.example/", "https://c.example/"],
             "the adopted tab is not ALSO reopened — a restored session comes back with exactly the tabs it had"
         );
@@ -1453,7 +1514,8 @@ mod tests {
         assert!(
             !product
                 .iter()
-                .any(|line| line.contains("fn both_rebuild_readers_still_wire_the_action_into_the_kind")),
+                .any(|line| line
+                    .contains("fn both_rebuild_readers_still_wire_the_action_into_the_kind")),
             "the scan is reading this test module, so every needle below would be \
              satisfied by the assertion that quotes it",
         );
@@ -1514,12 +1576,12 @@ mod tests {
             "a declare without a url cannot contradict the stored one"
         );
         assert!(
-            !shell
-                .sidebar_contribution_matches_declare("local://s", Some("http://127.0.0.1:2/")),
+            !shell.sidebar_contribution_matches_declare("local://s", Some("http://127.0.0.1:2/")),
             "a MOVED url means the stored endpoint is dead — the caller must re-create"
         );
         assert!(
-            !shell.sidebar_contribution_matches_declare("local://other", Some("http://127.0.0.1:1/")),
+            !shell
+                .sidebar_contribution_matches_declare("local://other", Some("http://127.0.0.1:1/")),
             "no stored contribution can never match"
         );
     }
@@ -1589,7 +1651,7 @@ mod tests {
                     forward_child: None,
                     history: Vec::new(),
                     history_index: 0,
-            engine_nav: None,
+                    engine_nav: None,
                     reload_nonce: 0,
                     profile: "default".to_string(),
                     folder: None,
@@ -1687,7 +1749,12 @@ mod tests {
         seed_web_surface(&mut shell, "local://ws");
         // The fixture seeds an app tab plus one filed tab; drop the filed one so
         // this starts at "declared, nothing opened yet".
-        shell.web_surfaces.get_mut("local://ws").unwrap().tabs.truncate(1);
+        shell
+            .web_surfaces
+            .get_mut("local://ws")
+            .unwrap()
+            .tabs
+            .truncate(1);
 
         assert!(
             !shell.web_surface_last_content_tab_closed("local://ws"),
@@ -1734,14 +1801,18 @@ mod tests {
                 ]
             }
         });
-        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        let outcome = shell
+            .drain_ping_commands(&reply)
+            .expect("a well-formed batch");
         assert_eq!(outcome.batch_id, "b1");
         assert!(outcome.should_ack);
         assert_eq!(outcome.delivered, 1);
         assert_eq!(shell.notifications.len(), 1);
         assert_eq!(shell.notifications[0].title, "Hi");
         // At-least-once delivery re-sends: the same id must NOT re-fire.
-        let again = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        let again = shell
+            .drain_ping_commands(&reply)
+            .expect("a well-formed batch");
         assert_eq!(again.delivered, 0);
         assert_eq!(shell.notifications.len(), 1);
     }
@@ -1758,7 +1829,9 @@ mod tests {
                 ]
             }
         });
-        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        let outcome = shell
+            .drain_ping_commands(&reply)
+            .expect("a well-formed batch");
         assert!(outcome.should_ack);
         assert_eq!(outcome.open_tabs.len(), 1);
         assert_eq!(outcome.open_tabs[0].session_path, "local://ws");
@@ -1784,11 +1857,16 @@ mod tests {
                 ]
             }
         });
-        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        let outcome = shell
+            .drain_ping_commands(&reply)
+            .expect("a well-formed batch");
         assert_eq!(outcome.open_tabs.len(), 1);
         let surface = shell.web_surfaces.get("local://ws").expect("surface");
         assert_eq!(surface.tabs.len(), 2);
-        assert_eq!(surface.active_tab, 0, "a background open leaves focus on the app tab");
+        assert_eq!(
+            surface.active_tab, 0,
+            "a background open leaves focus on the app tab"
+        );
     }
 
     #[test]
@@ -1802,7 +1880,9 @@ mod tests {
                 ]
             }
         });
-        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        let outcome = shell
+            .drain_ping_commands(&reply)
+            .expect("a well-formed batch");
         assert_eq!(outcome.dropped, 1);
         assert!(
             !outcome.should_ack,
@@ -1825,7 +1905,9 @@ mod tests {
                 ]
             }
         });
-        let outcome = shell.drain_ping_commands(&reply).expect("a well-formed batch");
+        let outcome = shell
+            .drain_ping_commands(&reply)
+            .expect("a well-formed batch");
         assert_eq!(outcome.dropped, 1);
         assert!(
             outcome.should_ack,
@@ -1840,7 +1922,11 @@ mod tests {
     #[test]
     fn a_reply_without_commands_drains_to_none() {
         let mut shell = routing_shell("local://ws", "env-1");
-        assert!(shell.drain_ping_commands(&json!({ "app_name": "ychrome" })).is_none());
+        assert!(
+            shell
+                .drain_ping_commands(&json!({ "app_name": "ychrome" }))
+                .is_none()
+        );
         assert!(
             shell
                 .drain_ping_commands(&json!({ "commands": { "entries": [] } }))
@@ -2218,7 +2304,10 @@ mod tests {
 
         // A remembered Metadata rail is a valid user choice and is preserved.
         plain.right_panel_restore_mode = RightPanelMode::Metadata;
-        assert_eq!(plain.revealed_right_panel_mode(1_000), RightPanelMode::Metadata);
+        assert_eq!(
+            plain.revealed_right_panel_mode(1_000),
+            RightPanelMode::Metadata
+        );
     }
 
     /// A RAIL IS CONTENT: its text selects, and the opt-out stays INLINE.
@@ -2334,13 +2423,11 @@ mod tests {
             .find("app_control_create_terminal_remote")
             .expect("the remote create arm");
         let block = &source[arm..];
-        let agent_arm = block
-            .find("requested_kind_for_task.is_agent()")
-            .expect(
-                "the remote create arm no longer decides agent kinds at all: every kind but \
+        let agent_arm = block.find("requested_kind_for_task.is_agent()").expect(
+            "the remote create arm no longer decides agent kinds at all: every kind but \
                  codex and claude-code would fall through to the ssh-shell arm and be born a \
                  plain shell while reporting success",
-            );
+        );
         let fallback = block
             .find("start_ssh_session_seated")
             .expect("the ssh-shell fallback");
@@ -2491,7 +2578,6 @@ mod tests {
         assert_eq!(shell.right_panel_mode_before_app_pane, None);
     }
 
-
     // The keyed document channel (Phase 3.1): each (session, view) owns its
     // schema/values/error/seq, so co-visible documents cannot clobber each
     // other — one session's fetch cannot invalidate another's in-flight
@@ -2516,8 +2602,20 @@ mod tests {
         // B's newer request must NOT invalidate A's in-flight reply.
         shell.document_pane_apply_schema(seq_a, "local://a", "doc", schema.clone());
         shell.document_pane_apply_schema(seq_b, "local://b", "doc", schema.clone());
-        assert!(shell.document_pane_channel("local://a").unwrap().schema.is_some());
-        assert!(shell.document_pane_channel("local://b").unwrap().schema.is_some());
+        assert!(
+            shell
+                .document_pane_channel("local://a")
+                .unwrap()
+                .schema
+                .is_some()
+        );
+        assert!(
+            shell
+                .document_pane_channel("local://b")
+                .unwrap()
+                .schema
+                .is_some()
+        );
 
         // Drafts stay with their session.
         shell.set_document_pane_value("local://a", "editor", "alpha".to_string());
@@ -2540,7 +2638,13 @@ mod tests {
             shell.document_pane_channel("local://a").is_none(),
             "replies never create a channel"
         );
-        assert!(shell.document_pane_channel("local://b").unwrap().schema.is_some());
+        assert!(
+            shell
+                .document_pane_channel("local://b")
+                .unwrap()
+                .schema
+                .is_some()
+        );
     }
 
     // The REAL "focus stolen, spam-click to type" bug: a terminal focus-reclaim
@@ -2556,7 +2660,10 @@ mod tests {
             "a document surface owns the keyboard while it owns the viewport"
         );
         let owners = ui_focus_owner_selectors_js();
-        assert!(owners.starts_with('[') && owners.ends_with(']'), "a JS array literal");
+        assert!(
+            owners.starts_with('[') && owners.ends_with(']'),
+            "a JS array literal"
+        );
         assert!(owners.contains("data-document-surface"));
 
         // Script 1: the reclaim fired on activation — the one that stole focus.
@@ -2574,7 +2681,8 @@ mod tests {
             "test",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        None);
+            None,
+        );
         assert!(
             host.contains("data-document-surface"),
             "the host input guard must honour the same focus owners"
@@ -2919,7 +3027,10 @@ mod tests {
         let body = HOST
             .split("pub fn find(")
             .nth(1)
-            .and_then(|rest| rest.split("\n    /// One cookie as the engine layer knows it.").next())
+            .and_then(|rest| {
+                rest.split("\n    /// One cookie as the engine layer knows it.")
+                    .next()
+            })
             .expect("the surface host must define `pub fn find(`");
         // The close path is the one that clears, so it is asserted FIRST and
         // inside the CLOSE branch: deleting `search_finish` from that branch
@@ -3018,8 +3129,7 @@ mod tests {
             "the key may only be consumed AFTER the rule says it is ours"
         );
         assert!(
-            claimer.contains("window.focused_widget()")
-                && claimer.contains("page_focused"),
+            claimer.contains("window.focused_widget()") && claimer.contains("page_focused"),
             "the `page_only` rows are answered from the toplevel's OWN focus \
              widget — that is the only honest reading of who holds the keyboard"
         );
@@ -3668,7 +3778,8 @@ JSON.stringify({{
                 exception.line_number()
             );
         }
-        let answer: Value = serde_json::from_str(&value.to_str()).expect("transaction answers JSON");
+        let answer: Value =
+            serde_json::from_str(&value.to_str()).expect("transaction answers JSON");
         assert_eq!(answer["target_kind"], "inner");
         assert_eq!(answer["materialized_kind"], "inner");
         assert_eq!(answer["restored"], true);
@@ -3712,15 +3823,14 @@ JSON.stringify({{
             "the toast must distinguish total success from save-only partial success"
         );
 
-        let outcome = |clipboard_error: Option<&str>, restore_error: Option<&str>| {
-            WebShotCaptureOutcome {
+        let outcome =
+            |clipboard_error: Option<&str>, restore_error: Option<&str>| WebShotCaptureOutcome {
                 path: "/home/user/.yggterm/screenshots/page-full-1.png".to_string(),
                 width: 1000,
                 height: 2400,
                 clipboard_error: clipboard_error.map(str::to_string),
                 restore_error: restore_error.map(str::to_string),
-            }
-        };
+            };
         let (tone, title, _) = web_shot_notification(&outcome(None, None));
         assert!(matches!(tone, NotificationTone::Success));
         assert_eq!(title, "Screenshot Saved and Copied");
@@ -3731,8 +3841,7 @@ JSON.stringify({{
         assert_eq!(title, "Screenshot Saved; Copy Failed");
         assert!(message.contains("clipboard unavailable"));
 
-        let (_, title, message) =
-            web_shot_notification(&outcome(None, Some("surface navigated")));
+        let (_, title, message) = web_shot_notification(&outcome(None, Some("surface navigated")));
         assert_eq!(title, "Screenshot Saved and Copied; Page Restore Failed");
         assert!(message.contains("surface navigated"));
 
@@ -4283,7 +4392,11 @@ JSON.stringify({{
 
         // With nobody in the field the verb DOES drive: a cold surface, and an
         // open-but-unfocused bar, are both the agent's to use.
-        assert!(shell.begin_agent_web_find("local://ws", Some("agent needle")).is_ok());
+        assert!(
+            shell
+                .begin_agent_web_find("local://ws", Some("agent needle"))
+                .is_ok()
+        );
         assert_eq!(query(&shell).as_deref(), Some("agent needle"));
         assert!(
             !shell.active_web_find_focused(),
@@ -4293,7 +4406,11 @@ JSON.stringify({{
             gate(&shell),
             "and because it holds nothing, the terminal beneath is typing-ready"
         );
-        assert!(shell.begin_agent_web_find("local://ws", Some("second needle")).is_ok());
+        assert!(
+            shell
+                .begin_agent_web_find("local://ws", Some("second needle"))
+                .is_ok()
+        );
         assert_eq!(query(&shell).as_deref(), Some("second needle"));
     }
 
@@ -4308,7 +4425,10 @@ JSON.stringify({{
         let verb = source
             .split("async fn web_surface_find_for(")
             .nth(1)
-            .and_then(|rest| rest.split("\n/// The find bar's focus ledger as JSON.").next())
+            .and_then(|rest| {
+                rest.split("\n/// The find bar's focus ledger as JSON.")
+                    .next()
+            })
             .expect("shell.rs must define `web_surface_find_for`");
         assert!(
             verb.contains("shell.begin_agent_web_find("),
@@ -4381,7 +4501,10 @@ JSON.stringify({{
         let borrow = source
             .split("fn focus_web_find_input() {")
             .nth(1)
-            .and_then(|rest| rest.split("\n/// Give the keyboard back to whoever lent it").next())
+            .and_then(|rest| {
+                rest.split("\n/// Give the keyboard back to whoever lent it")
+                    .next()
+            })
             .expect("shell.rs must define `focus_web_find_input`");
         assert!(
             borrow.contains("web_find::borrow_focus_for_bar()"),
@@ -4562,8 +4685,7 @@ JSON.stringify({{
     fn document_ribbon_defaults_absent_parses_declared_counts_as_change() {
         // Absent ⇒ empty: apps that never heard of the ribbon are unchanged.
         let plain: AppPaneSchema =
-            serde_json::from_value(json!({"title": "t", "widgets": []}))
-                .expect("schema parses");
+            serde_json::from_value(json!({"title": "t", "widgets": []})).expect("schema parses");
         assert!(plain.ribbon.is_empty(), "ribbon must default absent");
         // Declared toolbar + label parse into the region.
         let ribboned: AppPaneSchema = serde_json::from_value(json!({
@@ -4577,7 +4699,11 @@ JSON.stringify({{
             ],
         }))
         .expect("ribbon parses");
-        assert_eq!(ribboned.ribbon.len(), 2, "label + toolbar land in the region");
+        assert_eq!(
+            ribboned.ribbon.len(),
+            2,
+            "label + toolbar land in the region"
+        );
         // The noop mirror compares whole schemas: ribbon movement is work.
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://a"));
         let seq = shell.document_pane_next_request("local://a");
@@ -4626,11 +4752,7 @@ JSON.stringify({{
     fn both_pane_schema_fetch_sites_skip_the_write_when_nothing_changed() {
         let source = include_str!("state.rs");
         for (name, anchor, mirror) in [
-            (
-                "rail",
-                "schema fetch panicked",
-                "app_pane_fetch_is_noop",
-            ),
+            ("rail", "schema fetch panicked", "app_pane_fetch_is_noop"),
             (
                 "document",
                 "document schema fetch panicked",
@@ -4930,7 +5052,11 @@ JSON.stringify({{
         let type_at = src
             .find("fn web_surface_type_address(")
             .expect("the typing handler exists");
-        let type_fn = &src[type_at..src[type_at..].find("\n    fn ").map(|end| type_at + end).unwrap_or(type_at + 4_000)];
+        let type_fn = &src[type_at
+            ..src[type_at..]
+                .find("\n    fn ")
+                .map(|end| type_at + end)
+                .unwrap_or(type_at + 4_000)];
         assert!(
             !type_fn.contains("address_draft_revision"),
             "web_surface_type_address bumps the draft revision — the palette \
@@ -5135,7 +5261,8 @@ JSON.stringify({{
     fn describe_state_serves_a_cached_dom_snapshot() {
         let source = SHELL_SOURCE;
         assert!(
-            source.contains("capture_dom_debug_snapshot_cached_for(active_session_path.as_deref())"),
+            source
+                .contains("capture_dom_debug_snapshot_cached_for(active_session_path.as_deref())"),
             "describe_state went back to the raw DOM walk — every probe \
              re-freezes the web process's main thread (the terminal's typing) \
              for the walk's duration"
@@ -5258,7 +5385,11 @@ JSON.stringify({{
         // survives untouched.
         let seq = shell.document_pane_next_request("local://a");
         shell.document_pane_apply_schema(seq, "local://a", "doc", editor("hello world"));
-        assert_eq!(epoch(&shell), mounted, "a draft echo must not remount the editor");
+        assert_eq!(
+            epoch(&shell),
+            mounted,
+            "a draft echo must not remount the editor"
+        );
         assert_eq!(
             shell.document_pane_values_json("local://a")["editor"],
             serde_json::json!("hello world!!"),
@@ -5269,7 +5400,11 @@ JSON.stringify({{
         // remount, and the field adopts the app's value.
         let seq = shell.document_pane_next_request("local://a");
         shell.document_pane_apply_schema(seq, "local://a", "doc", editor("# a different note"));
-        assert_ne!(epoch(&shell), mounted, "new content the user never typed remounts");
+        assert_ne!(
+            epoch(&shell),
+            mounted,
+            "new content the user never typed remounts"
+        );
         assert_eq!(
             shell.document_pane_values_json("local://a")["editor"],
             serde_json::json!("# a different note"),
@@ -5330,7 +5465,10 @@ JSON.stringify({{
         let refetch = shell
             .apply_sidebar_ping("local://ws", None, None, None, None, None, stale_at + 100)
             .expect("existing contribution accepts a ping");
-        assert_eq!(shell.document_surface_stale, None, "answering IS proof of life");
+        assert_eq!(
+            shell.document_surface_stale, None,
+            "answering IS proof of life"
+        );
         assert!(
             !refetch.policy && !refetch.zoom && !refetch.appearance && !refetch.document,
             "omitted stamps read unchanged, never cleared"
@@ -5515,9 +5653,7 @@ JSON.stringify({{
             "the session whose contribution is already up never asks for the rail again"
         );
         assert!(
-            targets
-                .iter()
-                .all(|target| target.want_web),
+            targets.iter().all(|target| target.want_web),
             "…and neither row holds a web surface, so both still ask for that half"
         );
     }
@@ -5618,7 +5754,9 @@ JSON.stringify({{
     fn an_app_that_declares_after_the_first_ask_is_asked_again() {
         let shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
         let mut attempts = HashMap::new();
-        let token = restore_targets_at(&shell, 1_000, 8)[0].runtime_token.clone();
+        let token = restore_targets_at(&shell, 1_000, 8)[0]
+            .runtime_token
+            .clone();
         mark_app_surface_restore_attempted(&mut attempts, "local://alpha", token, 1_000);
         assert!(
             restore_targets_with(&shell, &attempts, 1_000 + 2_499, 8).is_empty(),
@@ -5640,7 +5778,9 @@ JSON.stringify({{
     #[test]
     fn the_re_ask_backs_off_to_a_one_minute_ceiling() {
         assert_eq!(
-            (1..=8).map(app_surface_restore_retry_ms).collect::<Vec<_>>(),
+            (1..=8)
+                .map(app_surface_restore_retry_ms)
+                .collect::<Vec<_>>(),
             vec![2_500, 5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000],
             "doubling from the tick interval, capped at a minute"
         );
@@ -6342,9 +6482,7 @@ JSON.stringify({{
             "a divider is drawn, never dispatched"
         );
         assert!(
-            context_menu_item_dispatches(
-                &RowMenuItem::new("delete", "Delete…", 'x').destructive()
-            ),
+            context_menu_item_dispatches(&RowMenuItem::new("delete", "Delete…", 'x').destructive()),
             "destructive is not disabled — the ✕ menu entry still runs"
         );
 
@@ -7350,8 +7488,16 @@ JSON.stringify({{
         // group, the folder's LABEL is on that head, and the second tab points
         // at it.
         let surface = &shell.web_surfaces["local://ws"];
-        let head = surface.tabs.iter().find(|tab| tab.url == "https://filed-a.example/").expect("head");
-        let member = surface.tabs.iter().find(|tab| tab.url == "https://filed-b.example/").expect("member");
+        let head = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.url == "https://filed-a.example/")
+            .expect("head");
+        let member = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.url == "https://filed-b.example/")
+            .expect("member");
         assert_eq!(
             head.custom_title.as_deref(),
             Some("Work"),
@@ -7403,14 +7549,26 @@ JSON.stringify({{
             ],
             "the group survives a restart with no folder left on disk to rescue it"
         );
-        let head = surface.tabs.iter().find(|tab| tab.url == "https://filed-a.example/").expect("head");
-        let member = surface.tabs.iter().find(|tab| tab.url == "https://filed-b.example/").expect("member");
+        let head = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.url == "https://filed-a.example/")
+            .expect("head");
+        let member = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.url == "https://filed-b.example/")
+            .expect("member");
         assert_eq!(
             member.group_head,
             Some(head.id),
             "the KEY was remapped onto THIS run's ids"
         );
-        assert_eq!(head.custom_title.as_deref(), Some("Work"), "and the label with it");
+        assert_eq!(
+            head.custom_title.as_deref(),
+            Some("Work"),
+            "and the label with it"
+        );
     }
 
     /// ⛔⛔ THE SECOND-LAUNCH LOSS, in the shape that is easy to miss: a folder
@@ -7937,9 +8095,11 @@ JSON.stringify({{
         assert_eq!(overlay.tabs.len(), 1);
         assert_eq!(overlay.active_tab_id, 0);
         shell.web_surface_close_tab("local://ws", 0);
-        assert!(shell
-            .web_surface_overlay_for_session("local://ws", 2_500)
-            .is_some());
+        assert!(
+            shell
+                .web_surface_overlay_for_session("local://ws", 2_500)
+                .is_some()
+        );
     }
 
     // A popup a page opened (middle-click, ctrl-click, target="_blank",
@@ -8031,10 +8191,7 @@ JSON.stringify({{
         );
         // What the drain calls: `raise = !background`, i.e. false for the gesture.
         let (tab_id, ssh_target) = shell
-            .open_command_tab(
-                "local://ws",
-                &WebTabOpenRequest::opened_by(0, true),
-            )
+            .open_command_tab("local://ws", &WebTabOpenRequest::opened_by(0, true))
             .expect("surface is live");
         let surface = &shell.web_surfaces["local://ws"];
         assert_eq!(surface.tabs.len(), 2);
@@ -8226,7 +8383,10 @@ JSON.stringify({{
             );
         }
         // Live-region rows have no cwd at all.
-        assert_eq!(group_launch_cwd_for("__live_sessions__", "x", |_| true), None);
+        assert_eq!(
+            group_launch_cwd_for("__live_sessions__", "x", |_| true),
+            None
+        );
     }
 
     fn keep_alive_test_row(full_path: &str, kind: BrowserRowKind) -> BrowserRow {
@@ -8264,7 +8424,10 @@ JSON.stringify({{
             .filter(|item| !item.separator)
             .map(|item| item.id.as_str())
             .collect();
-        assert_eq!(ids, vec!["viewport-copy", "viewport-paste", "viewport-select-all"]);
+        assert_eq!(
+            ids,
+            vec!["viewport-copy", "viewport-paste", "viewport-select-all"]
+        );
         assert!(ids.iter().all(|id| id.starts_with("viewport-")));
         assert!(
             !items
@@ -8295,7 +8458,10 @@ JSON.stringify({{
             !ids.contains(&"viewport-cut"),
             "the terminal is read-only — Cut is an editor action"
         );
-        assert!(doc.iter().all(|item| item.separator || item.id.starts_with("viewport-")));
+        assert!(
+            doc.iter()
+                .all(|item| item.separator || item.id.starts_with("viewport-"))
+        );
     }
 
     // tests below, which are handed their rows. Caught on the live host.
@@ -8374,8 +8540,8 @@ JSON.stringify({{
         let mut with_twins = rows.clone();
         with_twins.push(keep_alive_test_row("local://one", BrowserRowKind::Session));
         with_twins.push(keep_alive_test_row("local://two", BrowserRowKind::Session));
-        let plan = keep_alive_plan_for(&with_twins[2], &selected, &with_twins, |_| false)
-            .expect("plan");
+        let plan =
+            keep_alive_plan_for(&with_twins[2], &selected, &with_twins, |_| false).expect("plan");
         assert_eq!(
             plan.paths,
             vec!["local://one", "local://two", "ssh://box/three"],
@@ -8419,10 +8585,11 @@ JSON.stringify({{
         // ever writes to the live ones.
         let live = keep_alive_test_row("local://one", BrowserRowKind::Session);
         let rows = vec![group, live.clone(), saved];
-        let selected: HashSet<String> = ["__live_sessions__", "local://one", "workspace/saved-note"]
-            .into_iter()
-            .map(ToOwned::to_owned)
-            .collect();
+        let selected: HashSet<String> =
+            ["__live_sessions__", "local://one", "workspace/saved-note"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect();
         let plan = keep_alive_plan_for(&live, &selected, &rows, |_| false).expect("plan");
         assert_eq!(plan.paths, vec!["local://one"]);
     }
@@ -8554,11 +8721,7 @@ JSON.stringify({{
 
         set_sidebar_search_context(&machines, &live, &summaries);
         let after_first = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
-        assert_eq!(
-            after_first - before,
-            1,
-            "first call must rebuild once"
-        );
+        assert_eq!(after_first - before, 1, "first call must rebuild once");
 
         // Identical inputs → must skip (no rebuild).
         set_sidebar_search_context(&machines, &live, &summaries);
@@ -8749,7 +8912,10 @@ JSON.stringify({{
             value.contains(&current_version()),
             "this window's build must be readable with no daemon: {value}"
         );
-        assert!(value.contains("not answering"), "and it must say why: {value}");
+        assert!(
+            value.contains("not answering"),
+            "and it must say why: {value}"
+        );
     }
 
     #[test]
@@ -8757,14 +8923,21 @@ JSON.stringify({{
         let mut daemon = daemon_panel_status_for_test("2.10.3");
         let entries = client_metadata_entries(Some(&daemon));
         let value = &entries.first().expect("a Client row always renders").value;
-        assert!(value.contains("2.10.3"), "the disagreeing daemon is named: {value}");
+        assert!(
+            value.contains("2.10.3"),
+            "the disagreeing daemon is named: {value}"
+        );
         assert!(value.contains(&current_version()), "{value}");
 
         // Agreement reads clean — no scary mismatch text when there is no mismatch.
         daemon.version = current_version();
         let agreed = client_metadata_entries(Some(&daemon));
         let value = &agreed.first().expect("a Client row always renders").value;
-        assert_eq!(value, &current_version(), "agreement must be quiet: {value}");
+        assert_eq!(
+            value,
+            &current_version(),
+            "agreement must be quiet: {value}"
+        );
     }
 
     fn daemon_panel_status_for_test(version: &str) -> DaemonPanelStatus {
@@ -8925,7 +9098,10 @@ JSON.stringify({{
 
         // The observed spam pattern: idle (false), a ONE-poll true blip, idle.
         assert!(!step(&mut s, p, false, 2), "idle should not notify");
-        assert!(!step(&mut s, p, true, 2), "true never notifies (only idle can)");
+        assert!(
+            !step(&mut s, p, true, 2),
+            "true never notifies (only idle can)"
+        );
         assert!(
             !step(&mut s, p, false, 2),
             "a single-poll working blip must NOT fire finished"
@@ -8936,7 +9112,10 @@ JSON.stringify({{
         assert!(!step(&mut s, p, true, 2));
         assert!(!step(&mut s, p, true, 2));
         assert!(!step(&mut s, p, true, 2));
-        assert!(step(&mut s, p, false, 2), "confirmed work should fire on idle");
+        assert!(
+            step(&mut s, p, false, 2),
+            "confirmed work should fire on idle"
+        );
         assert!(
             !step(&mut s, p, false, 2),
             "already idle -> no repeat notification"
@@ -9029,9 +9208,18 @@ JSON.stringify({{
         let mut overrides = HashMap::new();
         overrides.insert("youtube.com".to_string(), 130.0f32);
         overrides.insert("music.youtube.com".to_string(), 90.0f32);
-        assert_eq!(zoom_override_for_host(&overrides, "music.youtube.com"), Some(90.0));
-        assert_eq!(zoom_override_for_host(&overrides, "www.youtube.com"), Some(130.0));
-        assert_eq!(zoom_override_for_host(&overrides, "YouTube.com:443"), Some(130.0));
+        assert_eq!(
+            zoom_override_for_host(&overrides, "music.youtube.com"),
+            Some(90.0)
+        );
+        assert_eq!(
+            zoom_override_for_host(&overrides, "www.youtube.com"),
+            Some(130.0)
+        );
+        assert_eq!(
+            zoom_override_for_host(&overrides, "YouTube.com:443"),
+            Some(130.0)
+        );
         assert_eq!(zoom_override_for_host(&overrides, "example.com"), None);
 
         let mut tld = HashMap::new();
@@ -9054,7 +9242,11 @@ JSON.stringify({{
         });
         let parsed = parse_web_surface_zoom(&value);
         assert_eq!(parsed.get("youtube.com"), Some(&130.0));
-        assert_eq!(parsed.get("b.com"), Some(&500.0), "clamped to the factor ceiling");
+        assert_eq!(
+            parsed.get("b.com"),
+            Some(&500.0),
+            "clamped to the factor ceiling"
+        );
         assert_eq!(parsed.get("c.com"), None);
         assert!(!parsed.keys().any(|k| k.is_empty()));
         assert_eq!(parse_web_surface_zoom(&json!({})).len(), 0);
@@ -10006,7 +10198,11 @@ JSON.stringify({{
         let decline = body
             .split("startup_daemon_hot_swap_reason_with_authorized_keys(")
             .nth(1)
-            .and_then(|suffix| suffix.split("return try_startup_stale_daemon_hot_swap").next())
+            .and_then(|suffix| {
+                suffix
+                    .split("return try_startup_stale_daemon_hot_swap")
+                    .next()
+            })
             .expect("the decline arm should be present");
         assert!(
             decline.contains("queue_startup_swap_intent("),
@@ -10077,10 +10273,7 @@ JSON.stringify({{
             "and it must eventually retry — a one-shot repair that failed is gone, not slow"
         );
         // A zero stamp is "never tried", not "tried at the epoch".
-        assert_eq!(
-            successor_spawn_verdict("3.0.130", &stale, 0, 10),
-            "spawn"
-        );
+        assert_eq!(successor_spawn_verdict("3.0.130", &stale, 0, 10), "spawn");
     }
 
     #[test]
@@ -10213,11 +10406,15 @@ JSON.stringify({{
             "the pairing must witness the buffer kind the ghost painted in"
         );
         assert!(
-            script.contains("buffer_transitions: Number((gateEntry && gateEntry.bufferTransitionCount) || 0)"),
+            script.contains(
+                "buffer_transitions: Number((gateEntry && gateEntry.bufferTransitionCount) || 0)"
+            ),
             "genuine-transition count rides the event"
         );
         assert!(
-            script.contains("visual_reason: String((gateEntry && gateEntry.lastVisualTransitionReason) || '')"),
+            script.contains(
+                "visual_reason: String((gateEntry && gateEntry.lastVisualTransitionReason) || '')"
+            ),
             "the last visual transition's reason rides the event"
         );
         assert!(
@@ -10260,7 +10457,8 @@ JSON.stringify({{
             "test",
             true,
             ("\x1b[5~", "\x1b[6~", 120),
-        None);
+            None,
+        );
         assert!(
             suppressed.contains("const suppressMouse = true;"),
             "suppressed script must carry the flag for the probe handler"
@@ -10655,8 +10853,15 @@ console.log('ok');
     #[test]
     fn pinned_grid_script_prepends_only_for_a_read_only_viewer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let unpinned =
-            terminal_eval_script_with_pinned_grid("yggterm-terminal-test", &theme, true, None, None, false, ("\x1b[A", "\x1b[B", 0));
+        let unpinned = terminal_eval_script_with_pinned_grid(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            None,
+            None,
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+        );
         assert!(
             !unpinned.contains("__yggtermShadowPinnedGrid ="),
             "the user's own GUI owns the PTY and must keep fitting to its window"
@@ -10722,14 +10927,14 @@ console.log('ok');
         // is unconditional by design (it spreads an empty object when the
         // global is absent), so the pre-existing default path is unchanged.
         let plain = terminal_eval_script_with_pinned_grid(
-                "yggterm-terminal-test",
-                &theme,
-                true,
-                None,
-                None,
-                false,
-                ("\x1b[A", "\x1b[B", 0),
-            );
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            None,
+            None,
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+        );
         // ⭐ [startpage-hijack-D sibling] The buffer-kind seed travels the same
         // way the birth grid does: a page global assigned before the script
         // body, read by the alternate-scroll wheel gate ONLY until the mount
@@ -10762,7 +10967,10 @@ console.log('ok');
             !plain.contains("window.__yggtermInitialGrid ="),
             "no birth grid, no assignment — the pre-existing default path is unchanged"
         );
-        assert_eq!(plain, terminal_eval_script("yggterm-terminal-test", &theme, true));
+        assert_eq!(
+            plain,
+            terminal_eval_script("yggterm-terminal-test", &theme, true)
+        );
 
         // And the provider itself must NOT gate on the shadow role: the whole
         // point is that the ACTIVE client's canvas is born at the real grid.
@@ -10993,7 +11201,9 @@ console.log('ok');
 
         // Provenance breadcrumbs: which wipe/open left the husk behind could NOT be
         // determined from the trace, so every mutation site records a stack.
-        assert!(script.contains("window.__yggtermRecordHostMutation = window.__yggtermRecordHostMutation ||"));
+        assert!(script.contains(
+            "window.__yggtermRecordHostMutation = window.__yggtermRecordHostMutation ||"
+        ));
         for site in [
             "site: 'mount_init_wipe'",
             "site: 'rebind_host_wipe'",
@@ -11454,7 +11664,9 @@ console.log('ok');
         // queries that attribute — so the focus target cannot drift from the DOM.
         let script = focus_settings_field_by_key_script(SETTINGS_FIRST_FIELD_KEY);
         assert!(
-            script.contains("document.querySelector('[data-settings-field-key=\"auto-hide-titlebar\"]')"),
+            script.contains(
+                "document.querySelector('[data-settings-field-key=\"auto-hide-titlebar\"]')"
+            ),
             "the keyboard-open focus script must target the panel's first control"
         );
     }
@@ -11519,9 +11731,11 @@ console.log('ok');
                 .contains("entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));")
         );
         assert!(script.contains("if (isActive && (activeSessionChanged || false)) {"));
-        assert!(script.contains(
-            "activeSessionChanged ? \"active_session_switch\" : \"window_foreground\""
-        ));
+        assert!(
+            script.contains(
+                "activeSessionChanged ? \"active_session_switch\" : \"window_foreground\""
+            )
+        );
         // XTERM-BUG: scrollback-lost-on-session-switch
         // See docs/xterm-bugs.md#scrollback-lost-on-session-switch
         // Activation repaint must NOT unconditionally call forcePromptFollow.
@@ -11713,9 +11927,10 @@ console.log('ok');
         // A visible document surface must stand the terminal down so its
         // focus-reclaim cascade cannot steal focus from the shell-DOM editor.
         assert!(script.contains("const documentSurfaceOwnsViewport = () => {"));
-        assert!(script.contains(
-            "String(host.getAttribute('data-document-surface-owns-viewport') || '')"
-        ));
+        assert!(
+            script
+                .contains("String(host.getAttribute('data-document-surface-owns-viewport') || '')")
+        );
         assert!(
             script.contains("if (documentSurfaceOwnsViewport()) {"),
             "hostOwnsActiveTerminalInput must yield to a covering document surface"
@@ -11856,7 +12071,9 @@ console.log('ok');
     #[test]
     fn the_cli_install_modal_owns_the_keys_when_it_is_the_only_one_up() {
         assert_eq!(
-            top_modal_of(false, false, false, true, false, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, true, false, false, false, false, false, false, false, false
+            ),
             Some(TopModal::CliInstall)
         );
         assert_eq!(TopModal::CliInstall.kind(), "cli-install");
@@ -11869,7 +12086,9 @@ console.log('ok');
     #[test]
     fn launch_flags_outranks_cli_install_when_both_are_flagged() {
         assert_eq!(
-            top_modal_of(false, false, true, true, false, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, true, true, false, false, false, false, false, false, false, false
+            ),
             Some(TopModal::LaunchFlags),
             "the deeper modal keeps the keys until it is dismissed"
         );
@@ -11939,7 +12158,11 @@ console.log('ok');
             .find(|row| row.slug != "codex")
             .expect("the registry has more than one CLI");
         assert!(
-            !missing.presence.is_present() && !matches!(missing.presence, yggterm_core::cli_install::CliPresence::Absent),
+            !missing.presence.is_present()
+                && !matches!(
+                    missing.presence,
+                    yggterm_core::cli_install::CliPresence::Absent
+                ),
             "a slug the report does not mention must stay Unknown, got {:?}",
             missing.presence
         );
@@ -11953,46 +12176,66 @@ console.log('ok');
     #[test]
     fn modal_precedence_is_topmost_first_and_has_a_single_owner() {
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, false, false, false, false, false, false, false, false
+            ),
             None
         );
         // Each flag alone names its own dialog, in paint order.
         assert_eq!(
-            top_modal_of(true, false, false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(
+                true, false, false, false, false, false, false, false, false, false, false, false
+            ),
             Some(TopModal::KeymapEditor)
         );
         assert_eq!(
-            top_modal_of(false, true, false, false, false, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, true, false, false, false, false, false, false, false, false, false, false
+            ),
             Some(TopModal::ThemeEditor)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, false, true, false, false, false, false, false, false
+            ),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, false, false, true, false, false, false, false, false
+            ),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, false, false, false, true, false, false, false, false
+            ),
             Some(TopModal::Delete)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, true, false, false, false),
+            top_modal_of(
+                false, false, false, false, false, false, false, false, true, false, false, false
+            ),
             Some(TopModal::CopyEdit)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, true, false, false),
+            top_modal_of(
+                false, false, false, false, false, false, false, false, false, true, false, false
+            ),
             Some(TopModal::ClassicTabsSwitch)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, false, false, true),
+            top_modal_of(
+                false, false, false, false, false, false, false, false, false, false, false, true
+            ),
             Some(TopModal::StripDropdown)
         );
         // Stacked: the topmost-rendered dialog wins the keyboard. The KeyTips
         // editor paints at z-index 500, above every dialog, so it wins outright.
         assert_eq!(
-            top_modal_of(true, true, true, false, false, true, true, true, true, true, false, true),
+            top_modal_of(
+                true, true, true, false, false, true, true, true, true, true, false, true
+            ),
             Some(TopModal::KeymapEditor)
         );
         // ⛔ A capture prompt outranks every dialog below the two editors. Both
@@ -12001,21 +12244,29 @@ console.log('ok');
         // keyboard reaches, or Escape would dismiss the wrong dialog and leave
         // the engine blocked on this one.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, true, true, true, true, true, false, true),
+            top_modal_of(
+                false, false, false, false, false, true, true, true, true, true, false, true
+            ),
             Some(TopModal::MediaCapture)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, true, true, true, true, false, true),
+            top_modal_of(
+                false, false, false, false, false, false, true, true, true, true, false, true
+            ),
             Some(TopModal::Fido2)
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, true, true, true, false, true),
+            top_modal_of(
+                false, false, false, false, false, false, false, true, true, true, false, true
+            ),
             Some(TopModal::Delete)
         );
         // …and a strip dropdown is the FLOOR of that list: a dialog raised while
         // one is open owns the screen over it, never the other way round.
         assert_eq!(
-            top_modal_of(false, false, false, false, false, false, false, false, false, true, false, true),
+            top_modal_of(
+                false, false, false, false, false, false, false, false, false, true, false, true
+            ),
             Some(TopModal::ClassicTabsSwitch)
         );
 
@@ -13155,7 +13406,9 @@ console.log('ok');
 
         // One owner, or the gesture path and the event path drift apart.
         assert_eq!(
-            script.matches("setScrollbackIntent('UserScrollback', 'selection_active')").count(),
+            script
+                .matches("setScrollbackIntent('UserScrollback', 'selection_active')")
+                .count(),
             1,
             "exactly ONE site may arm the selection pin"
         );
@@ -13323,12 +13576,10 @@ console.log('ok');
             .split("active_terminal_hosts: activeTerminalHosts")
             .next()
             .expect("some script assigns active_terminal_hosts");
-        let probe_at = feeding_builder
-            .rfind("cold_mount_veil_count:")
-            .expect(
-                "the builder that feeds active_terminal_hosts must carry the veil probe — \
+        let probe_at = feeding_builder.rfind("cold_mount_veil_count:").expect(
+            "the builder that feeds active_terminal_hosts must carry the veil probe — \
                  adding it to a sibling describe-state script leaves `app state` blind",
-            );
+        );
         // …and it must be the SAME object, i.e. after the last host-object start
         // preceding the assignment, not an earlier script entirely.
         let host_object_at = feeding_builder
@@ -13765,7 +14016,9 @@ console.log('ok');
 
         // Arriving content — scaffold to hydrated — IS a re-arm.
         let mut fresh = session.clone();
-        fresh.metadata.retain(|entry| entry.label != "Preview Hydration");
+        fresh
+            .metadata
+            .retain(|entry| entry.label != "Preview Hydration");
         let (_, unhydrated) = preview_latest_pin_request(&fresh);
         assert_ne!(
             unhydrated, after,
@@ -13934,7 +14187,14 @@ console.log('ok');
                 flatten(children, &mut marks);
             }
         }
-        for expected in ["strong", "emphasis", "strikethrough", "link", "code", "image"] {
+        for expected in [
+            "strong",
+            "emphasis",
+            "strikethrough",
+            "link",
+            "code",
+            "image",
+        ] {
             assert!(
                 marks.contains(&expected),
                 "the renderer the Web View uses must produce {expected}; got {marks:?}"
@@ -14044,7 +14304,9 @@ console.log('ok');
             let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
             session.session_path = "remote-cc://dev/91527c7b".to_string();
             session.preview.blocks = blocks;
-            session.metadata.retain(|entry| entry.label != "Preview Hydration");
+            session
+                .metadata
+                .retain(|entry| entry.label != "Preview Hydration");
             session.metadata.push(SessionMetadataEntry {
                 label: "Preview Hydration",
                 value: hydration.to_string(),
@@ -14242,7 +14504,9 @@ console.log('ok');
     fn a_pasted_image_path_renders_as_the_image_without_eating_its_sentence() {
         // The detector is the shared one, so a `.md` or a session URI is not an
         // image and an absolute `.png` is.
-        assert!(looks_like_image_path("/home/user/.yggterm/clipboard/shot.png"));
+        assert!(looks_like_image_path(
+            "/home/user/.yggterm/clipboard/shot.png"
+        ));
         assert!(looks_like_image_path("/tmp/a.JPEG"));
         assert!(!looks_like_image_path("/home/user/notes.md"));
         // ⚠ `looks_like_image_path` is EXTENSION-only — it says nothing about
@@ -14516,16 +14780,26 @@ console.log('ok');
     fn a_surface_holding_only_machine_work_says_it_has_nothing_to_read() {
         // The reported frame: work blocks, no answer. And a transcript with
         // nothing in it at all is still nothing to read.
-        assert!(preview_surface_has_nothing_to_read(false, true, false, false));
+        assert!(preview_surface_has_nothing_to_read(
+            false, true, false, false
+        ));
 
         // ⚠ Deliberately narrow. ONE prose block, or ANY rendered section, and
         // the notice stands down — it must never hide something worth reading.
-        assert!(!preview_surface_has_nothing_to_read(true, true, false, false));
-        assert!(!preview_surface_has_nothing_to_read(false, false, false, false));
+        assert!(!preview_surface_has_nothing_to_read(
+            true, true, false, false
+        ));
+        assert!(!preview_surface_has_nothing_to_read(
+            false, false, false, false
+        ));
         // And it never stacks on top of a placeholder that already owns the
         // page: three notices where one is due is its own kind of silence.
-        assert!(!preview_surface_has_nothing_to_read(false, true, true, false));
-        assert!(!preview_surface_has_nothing_to_read(false, true, false, true));
+        assert!(!preview_surface_has_nothing_to_read(
+            false, true, true, false
+        ));
+        assert!(!preview_surface_has_nothing_to_read(
+            false, true, false, true
+        ));
     }
 
     /// ⛔⛔ THE CALLER IS WHERE THIS BROKE, AND THE TEST ABOVE COULD NOT SEE IT.
@@ -14561,7 +14835,8 @@ console.log('ok');
         // cannot be substituted for a `bool`, and that is the whole reason these
         // predicates now take the answer rather than the collection.
         assert!(
-            !product.contains("preview_surface_has_nothing_to_read(\n                &grouped_runs"),
+            !product
+                .contains("preview_surface_has_nothing_to_read(\n                &grouped_runs"),
             "the nothing-to-read notice is being fed the virtual window again",
         );
 
@@ -14867,15 +15142,28 @@ console.log('ok');
             .into_iter()
             .map(|m| keys(&sidebar_panel_outer_style(edge, m, 300.0, 100.0)))
             .collect();
-            assert_eq!(outer[0], outer[1], "{edge:?} outer InFlow vs Collapsed keys");
-            assert_eq!(outer[1], outer[2], "{edge:?} outer Collapsed vs Revealed keys");
+            assert_eq!(
+                outer[0], outer[1],
+                "{edge:?} outer InFlow vs Collapsed keys"
+            );
+            assert_eq!(
+                outer[1], outer[2],
+                "{edge:?} outer Collapsed vs Revealed keys"
+            );
             let card: Vec<_> = [
                 SidebarPanelMode::InFlow,
                 SidebarPanelMode::Collapsed,
                 SidebarPanelMode::Revealed,
             ]
             .into_iter()
-            .map(|m| keys(&sidebar_panel_card_style(edge, m, 300.0, palette(UiTheme::ZedLight))))
+            .map(|m| {
+                keys(&sidebar_panel_card_style(
+                    edge,
+                    m,
+                    300.0,
+                    palette(UiTheme::ZedLight),
+                ))
+            })
             .collect();
             assert_eq!(card[0], card[1], "{edge:?} card InFlow vs Collapsed keys");
             assert_eq!(card[1], card[2], "{edge:?} card Collapsed vs Revealed keys");
@@ -14891,8 +15179,12 @@ console.log('ok');
         assert!(outer.contains("position:relative;"), "{outer}");
         assert!(outer.contains("flex:0 0 292px;"), "{outer}");
         assert!(outer.contains("width:292px;"), "{outer}");
-        let card =
-            sidebar_panel_card_style(SidebarEdge::Right, SidebarPanelMode::InFlow, 292.0, palette(UiTheme::ZedLight));
+        let card = sidebar_panel_card_style(
+            SidebarEdge::Right,
+            SidebarPanelMode::InFlow,
+            292.0,
+            palette(UiTheme::ZedLight),
+        );
         assert!(card.contains("position:relative;"), "{card}");
         assert!(card.contains("background-color:transparent;"), "{card}");
         assert!(card.contains("box-shadow:none;"), "{card}");
@@ -14916,8 +15208,12 @@ console.log('ok');
         // ★ THE user-reported regression: a REVEALED card must paint an opaque
         // panel or the terminal bleeds through. `palette.sidebar` is transparent,
         // so the card MUST supply the shell's opaque fill itself.
-        let revealed_card =
-            sidebar_panel_card_style(SidebarEdge::Left, SidebarPanelMode::Revealed, 300.0, palette(UiTheme::ZedLight));
+        let revealed_card = sidebar_panel_card_style(
+            SidebarEdge::Left,
+            SidebarPanelMode::Revealed,
+            300.0,
+            palette(UiTheme::ZedLight),
+        );
         assert!(
             revealed_card.contains("background-color:var(--yggterm-opaque-shell-fill"),
             "revealed card must paint an opaque fill: {revealed_card}"
@@ -14936,11 +15232,27 @@ console.log('ok');
     // never a border hairline (the titlebar's 2026-06-27 lesson).
     #[test]
     fn autohide_sidebar_revealed_card_is_an_inset_rounded_island() {
-        let left = sidebar_panel_card_style(SidebarEdge::Left, SidebarPanelMode::Revealed, 300.0, palette(UiTheme::ZedLight));
-        let right = sidebar_panel_card_style(SidebarEdge::Right, SidebarPanelMode::Revealed, 292.0, palette(UiTheme::ZedLight));
+        let left = sidebar_panel_card_style(
+            SidebarEdge::Left,
+            SidebarPanelMode::Revealed,
+            300.0,
+            palette(UiTheme::ZedLight),
+        );
+        let right = sidebar_panel_card_style(
+            SidebarEdge::Right,
+            SidebarPanelMode::Revealed,
+            292.0,
+            palette(UiTheme::ZedLight),
+        );
         // Inset by the overlay gap on top/bottom and pinned to its own side.
-        assert!(left.contains("top:10px; bottom:10px; left:10px; right:auto;"), "{left}");
-        assert!(right.contains("top:10px; bottom:10px; right:10px; left:auto;"), "{right}");
+        assert!(
+            left.contains("top:10px; bottom:10px; left:10px; right:auto;"),
+            "{left}"
+        );
+        assert!(
+            right.contains("top:10px; bottom:10px; right:10px; left:auto;"),
+            "{right}"
+        );
         assert!(left.contains("border-radius:10px;"), "{left}");
         // Soft ambient shadow, no border.
         assert!(left.contains("box-shadow:0 16px"), "{left}");
@@ -14954,12 +15266,28 @@ console.log('ok');
     // events), slid a touch toward its own edge for a slide+fade reveal.
     #[test]
     fn autohide_sidebar_collapsed_card_is_hidden_and_slid_off_its_edge() {
-        let left = sidebar_panel_card_style(SidebarEdge::Left, SidebarPanelMode::Collapsed, 300.0, palette(UiTheme::ZedLight));
-        let right = sidebar_panel_card_style(SidebarEdge::Right, SidebarPanelMode::Collapsed, 292.0, palette(UiTheme::ZedLight));
+        let left = sidebar_panel_card_style(
+            SidebarEdge::Left,
+            SidebarPanelMode::Collapsed,
+            300.0,
+            palette(UiTheme::ZedLight),
+        );
+        let right = sidebar_panel_card_style(
+            SidebarEdge::Right,
+            SidebarPanelMode::Collapsed,
+            292.0,
+            palette(UiTheme::ZedLight),
+        );
         assert!(left.contains("opacity:0;"), "{left}");
         assert!(left.contains("pointer-events:none;"), "{left}");
-        assert!(left.contains("transform:translateX(-22px);"), "left slides left: {left}");
-        assert!(right.contains("transform:translateX(22px);"), "right slides right: {right}");
+        assert!(
+            left.contains("transform:translateX(-22px);"),
+            "left slides left: {left}"
+        );
+        assert!(
+            right.contains("transform:translateX(22px);"),
+            "right slides right: {right}"
+        );
     }
     // Leaving an edge that never revealed must be a NO-OP: `linger` ALONE
     // satisfies `autohide_revealed`, so starting the grace on a mere crossing
@@ -14976,8 +15304,14 @@ console.log('ok');
             autohide_leave_action(false, true),
             AutoHideLeave::CancelStaleLinger
         );
-        assert_eq!(autohide_leave_action(true, false), AutoHideLeave::BeginLinger);
-        assert_eq!(autohide_leave_action(true, true), AutoHideLeave::BeginLinger);
+        assert_eq!(
+            autohide_leave_action(true, false),
+            AutoHideLeave::BeginLinger
+        );
+        assert_eq!(
+            autohide_leave_action(true, true),
+            AutoHideLeave::BeginLinger
+        );
     }
     // A sidebar that collapsed out from under an open context menu, a rename
     // field, a drag, or a resize drag would abort the very gesture that needed
@@ -15012,7 +15346,9 @@ console.log('ok');
     fn autohide_both_panels_pin_on_their_own_menu() {
         for slot in [ChromeSlot::Tree, ChromeSlot::Rail] {
             let pinned = match slot {
-                ChromeSlot::Tree => sidebar_autohide_pinned_flags(false, true, false, false, false, false),
+                ChromeSlot::Tree => {
+                    sidebar_autohide_pinned_flags(false, true, false, false, false, false)
+                }
                 ChromeSlot::Rail => rail_autohide_pinned_flags(false, true, false),
             };
             assert!(pinned, "{slot:?} does not pin on its own open menu");
@@ -15243,14 +15579,20 @@ console.log('ok');
         let a = "remote-session://dev/a";
         let b = "remote-session://dev/b";
         let c = "remote-session://dev/c";
-        let mut retained: HashSet<String> =
-            [a, b, c].iter().map(|s| s.to_string()).collect();
-        let mut epochs: HashMap<String, u64> =
-            [(a, 1u64), (b, 2), (c, 3)].iter().map(|(p, e)| (p.to_string(), *e)).collect();
+        let mut retained: HashSet<String> = [a, b, c].iter().map(|s| s.to_string()).collect();
+        let mut epochs: HashMap<String, u64> = [(a, 1u64), (b, 2), (c, 3)]
+            .iter()
+            .map(|(p, e)| (p.to_string(), *e))
+            .collect();
         let keep: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
 
         let epoch = retain_terminal_session_path_for_policy(
-            &mut retained, &mut epochs, a, true, Some(a), &keep,
+            &mut retained,
+            &mut epochs,
+            a,
+            true,
+            Some(a),
+            &keep,
         );
 
         assert_eq!(epoch, 1);
@@ -15266,17 +15608,27 @@ console.log('ok');
         let a = "remote-session://dev/a";
         let b = "remote-session://dev/b";
         let mut retained: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
-        let mut epochs: HashMap<String, u64> =
-            [(a, 1u64), (b, 5)].iter().map(|(p, e)| (p.to_string(), *e)).collect();
+        let mut epochs: HashMap<String, u64> = [(a, 1u64), (b, 5)]
+            .iter()
+            .map(|(p, e)| (p.to_string(), *e))
+            .collect();
         let keep: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
 
         let epoch = retain_terminal_session_path_for_policy(
-            &mut retained, &mut epochs, b, true, Some(a), &keep,
+            &mut retained,
+            &mut epochs,
+            b,
+            true,
+            Some(a),
+            &keep,
         );
 
         assert_eq!(epoch, 5, "kept session preserves its existing mount epoch");
         assert!(retained.contains(a));
-        assert!(retained.contains(b), "inactive keep-set member is preserved");
+        assert!(
+            retained.contains(b),
+            "inactive keep-set member is preserved"
+        );
     }
     #[test]
     fn premount_empty_keep_set_preserves_legacy_active_only_eviction() {
@@ -15285,11 +15637,18 @@ console.log('ok');
         let a = "remote-session://dev/a";
         let b = "remote-session://dev/b";
         let mut retained: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
-        let mut epochs: HashMap<String, u64> =
-            [(a, 1u64), (b, 2)].iter().map(|(p, e)| (p.to_string(), *e)).collect();
+        let mut epochs: HashMap<String, u64> = [(a, 1u64), (b, 2)]
+            .iter()
+            .map(|(p, e)| (p.to_string(), *e))
+            .collect();
 
         retain_terminal_session_path_for_policy(
-            &mut retained, &mut epochs, a, true, Some(a), &HashSet::new(),
+            &mut retained,
+            &mut epochs,
+            a,
+            true,
+            Some(a),
+            &HashSet::new(),
         );
 
         assert_eq!(retained.len(), 1);
@@ -15362,11 +15721,19 @@ console.log('ok');
         overrides.insert("music.youtube.com".to_string(), WebChromeAppearance::Light);
         // Exact beats parent beats default.
         assert_eq!(
-            web_chrome_appearance_for_host(WebChromeAppearance::Light, &overrides, "music.youtube.com"),
+            web_chrome_appearance_for_host(
+                WebChromeAppearance::Light,
+                &overrides,
+                "music.youtube.com"
+            ),
             WebChromeAppearance::Light
         );
         assert_eq!(
-            web_chrome_appearance_for_host(WebChromeAppearance::Light, &overrides, "www.youtube.com"),
+            web_chrome_appearance_for_host(
+                WebChromeAppearance::Light,
+                &overrides,
+                "www.youtube.com"
+            ),
             WebChromeAppearance::Dark
         );
         // No entry falls through to the default (either default).
@@ -15389,8 +15756,14 @@ console.log('ok');
 
     #[test]
     fn web_chrome_appearance_parse_and_default() {
-        assert_eq!(WebChromeAppearance::parse("light"), Some(WebChromeAppearance::Light));
-        assert_eq!(WebChromeAppearance::parse("DARK"), Some(WebChromeAppearance::Dark));
+        assert_eq!(
+            WebChromeAppearance::parse("light"),
+            Some(WebChromeAppearance::Light)
+        );
+        assert_eq!(
+            WebChromeAppearance::parse("DARK"),
+            Some(WebChromeAppearance::Dark)
+        );
         assert_eq!(WebChromeAppearance::parse("bogus"), None);
         assert_eq!(WebChromeAppearance::default(), WebChromeAppearance::Light);
     }
@@ -15593,8 +15966,14 @@ console.log('ok');
     fn a_resize_grip_moves_to_the_panels_inner_edge() {
         let on_left = sidebar_resize_handle_style(SidebarEdge::Left);
         let on_right = sidebar_resize_handle_style(SidebarEdge::Right);
-        assert!(on_left.contains("right:0;") && on_left.contains("left:auto;"), "{on_left}");
-        assert!(on_right.contains("left:0;") && on_right.contains("right:auto;"), "{on_right}");
+        assert!(
+            on_left.contains("right:0;") && on_left.contains("left:auto;"),
+            "{on_left}"
+        );
+        assert!(
+            on_right.contains("left:0;") && on_right.contains("right:auto;"),
+            "{on_right}"
+        );
         assert_eq!(
             style_property_keys(&on_left),
             style_property_keys(&on_right),
@@ -15613,8 +15992,14 @@ console.log('ok');
             titlebar_menu_anchor_style(SidebarEdge::Right, 110.0),
             "right:110px; left:auto;"
         );
-        assert_eq!(titlebar_attached_menu_radius(SidebarEdge::Left), "0 16px 16px 16px");
-        assert_eq!(titlebar_attached_menu_radius(SidebarEdge::Right), "16px 0 16px 16px");
+        assert_eq!(
+            titlebar_attached_menu_radius(SidebarEdge::Left),
+            "0 16px 16px 16px"
+        );
+        assert_eq!(
+            titlebar_attached_menu_radius(SidebarEdge::Right),
+            "16px 0 16px 16px"
+        );
     }
     /// The mirror reflects the ARRANGEMENT of titlebar controls, never the
     /// inside of a single control.
@@ -15623,8 +16008,14 @@ console.log('ok');
         let natural = titlebar_cluster_row_style(ChromeOrientation::natural(), 12, "");
         let mirrored = titlebar_cluster_row_style(ChromeOrientation::mirrored(), 12, "");
         assert!(natural.contains("flex-direction:row;"), "{natural}");
-        assert!(mirrored.contains("flex-direction:row-reverse;"), "{mirrored}");
-        assert_eq!(style_property_keys(&natural), style_property_keys(&mirrored));
+        assert!(
+            mirrored.contains("flex-direction:row-reverse;"),
+            "{mirrored}"
+        );
+        assert_eq!(
+            style_property_keys(&natural),
+            style_property_keys(&mirrored)
+        );
     }
     /// Both panels' resize drags widen when the pointer moves AWAY from the
     /// edge the panel is docked against — in both orientations, from one owner.
@@ -15775,7 +16166,9 @@ console.log('ok');
             "runtime CSS must target the xterm.js 6 .xterm-scrollable-element wrapper"
         );
         assert!(
-            script.contains("const scrollableElement = host.querySelector('.xterm-scrollable-element');"),
+            script.contains(
+                "const scrollableElement = host.querySelector('.xterm-scrollable-element');"
+            ),
             "stretchXtermRoot must look up the .xterm-scrollable-element"
         );
         assert!(
@@ -15826,10 +16219,7 @@ console.log('ok');
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         let open = "runtimeStyle.textContent = `";
-        let start = script
-            .find(open)
-            .expect("runtime style template present")
-            + open.len();
+        let start = script.find(open).expect("runtime style template present") + open.len();
         let body = &script[start..];
         let end = body
             .find("`;")
@@ -16007,7 +16397,8 @@ console.log('ok');
         );
         assert!(
             script.contains("const passiveFocusRecoveryState = () => {")
-                && script.contains("return bodyOwnsFocus ? 'recoverable' : 'foreign_active_element';")
+                && script
+                    .contains("return bodyOwnsFocus ? 'recoverable' : 'foreign_active_element';")
                 && script.contains("}, 3000);"),
             "passive focus recovery should classify (and report) its verdict on a 3s watchdog"
         );
@@ -16344,7 +16735,9 @@ console.log('ok');
         // the settle pass must not recurse (':settle' guard) nor yank a scrolled-back user
         // (UserScrollback guard). Reuses forcePromptFollow (viewport-only, no daemon re-read).
         assert!(
-            script.contains("followPromptForEntry(entry, `${String(reason || 'retained_replay')}:settle`)"),
+            script.contains(
+                "followPromptForEntry(entry, `${String(reason || 'retained_replay')}:settle`)"
+            ),
             "replay follow must schedule a settled re-follow to land at the final baseY"
         );
         assert!(
@@ -16619,7 +17012,9 @@ console.log('ok');
         // suppression window that swallowed a copy made in another, and the dedupe
         // compared text between sessions that share nothing.
         assert!(script.contains("Number(window.__yggtermOsc52Suppress[hostId] || 0)"));
-        assert!(script.contains("window.__yggtermOsc52LastCopy[hostId] = { text, atMs: osc52NowMs };"));
+        assert!(
+            script.contains("window.__yggtermOsc52LastCopy[hostId] = { text, atMs: osc52NowMs };")
+        );
         assert!(
             !script.contains("window.__yggtermOsc52SuppressUntilMs"),
             "the window-global suppression window is cross-talk between terminals and must stay gone"
@@ -16653,7 +17048,10 @@ console.log('ok');
             "return suppressOsc52('replay_window');",
             "return suppressOsc52('duplicate_c_and_p');",
         ] {
-            assert!(script.contains(reason), "every OSC 52 drop must report its reason: {reason}");
+            assert!(
+                script.contains(reason),
+                "every OSC 52 drop must report its reason: {reason}"
+            );
         }
         assert!(script.contains("kind: 'clipboard_suppressed',"));
         assert!(script.contains("gesture_age_ms: osc52GestureAtMs > 0"));
@@ -16661,7 +17059,9 @@ console.log('ok');
         // restore + reapply-after-reset) each arm the suppression window first; the
         // live-data write (term.write(payload, ...)) must NOT, or copy breaks entirely.
         assert_eq!(
-            script.matches("window.__yggtermArmOsc52Suppress(hostId, 400);").count(),
+            script
+                .matches("window.__yggtermArmOsc52Suppress(hostId, 400);")
+                .count(),
             2,
             "both mount-script buffer-restore writes must arm OSC 52 suppression (and only those)"
         );
@@ -16679,14 +17079,17 @@ console.log('ok');
             "the bulk arm must name replayed history (a replay, or the switch-in catch-up window)"
         );
         assert!(
-            script.contains("const osc52ReplayLike =")
-                && script.contains("if (osc52ReplayLike\n"),
+            script.contains("const osc52ReplayLike =") && script.contains("if (osc52ReplayLike\n"),
             "the bulk arm must be gated on the replay-like test, not merely reference it"
         );
         // ...and the switch-in stamp it reads is written on EVERY activation, before the
         // repaint dedupe — that stamp dates the attach, not the repaint.
-        let switch_script =
-            terminal_set_input_policy_script_for_active_session("local://osc52-test", true, true, false);
+        let switch_script = terminal_set_input_policy_script_for_active_session(
+            "local://osc52-test",
+            true,
+            true,
+            false,
+        );
         assert!(switch_script.contains("entry.lastActivationAtMs = now;"));
         // The reattach retained-replay script — the switch-back path that re-feeds the
         // buffered scrollback into the already-mounted terminal (which carries the OSC 52
@@ -16715,7 +17118,11 @@ console.log('ok');
         // selection mid-handshake, which is how a copy reports success and pastes
         // as the OLD content.
         let fingerprint = terminal_clipboard_write_fingerprint("local://a", "copy", "hello");
-        assert!(!terminal_clipboard_write_is_repeat(None, fingerprint, 1_000));
+        assert!(!terminal_clipboard_write_is_repeat(
+            None,
+            fingerprint,
+            1_000
+        ));
         assert!(terminal_clipboard_write_is_repeat(
             Some((fingerprint, 1_000)),
             fingerprint,
@@ -16816,10 +17223,13 @@ console.log('ok');
         assert!(script.contains("persistedScrollRestoreAbandonedReason"));
         // Guard 2: the snapshot restore path has no offset mover left.
         assert!(
-            !script.contains("forceXtermViewportY(targetViewportY, 'xterm_session_snapshot_restore')"),
+            !script
+                .contains("forceXtermViewportY(targetViewportY, 'xterm_session_snapshot_restore')"),
             "teardown snapshot restore must not re-apply a saved viewport offset"
         );
-        assert!(script.contains("scrollLiveCursorIntoView(false, 'xterm_session_snapshot_restore');"));
+        assert!(
+            script.contains("scrollLiveCursorIntoView(false, 'xterm_session_snapshot_restore');")
+        );
         // Guard 3: the follow-once executor exists and is intent-gated.
         assert!(script.contains("settle_follow_reassert"));
         assert!(script.contains("if (scrollbackIntent !== 'PromptFollow') { return; }"));
@@ -16857,7 +17267,9 @@ console.log('ok');
         assert!(script.contains(
             "window.__yggtermXtermSessionNonblankMax = window.__yggtermXtermSessionNonblankMax || {};"
         ));
-        assert!(script.contains("const collapsedPoisonFrame = nonblankLineCount <= 1 && priorNonblankMax >= 6;"));
+        assert!(script.contains(
+            "const collapsedPoisonFrame = nonblankLineCount <= 1 && priorNonblankMax >= 6;"
+        ));
         assert!(
             script.contains("window.__yggtermXtermSessionNonblankMax[sessionPath] = Math.max("),
             "capture must record the per-session nonblank max"
@@ -16867,7 +17279,9 @@ console.log('ok');
             "const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {"
         ));
         assert!(script.contains("return Number(nonblankLineCount) <= 1 && priorMax >= 6;"));
-        assert!(script.contains("if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {"));
+        assert!(script.contains(
+            "if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {"
+        ));
     }
 
     #[test]
@@ -16884,7 +17298,9 @@ console.log('ok');
         assert!(script.contains(
             "const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {"
         ));
-        assert!(script.contains("if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {"));
+        assert!(script.contains(
+            "if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {"
+        ));
     }
 
     #[test]
@@ -17738,7 +18154,8 @@ console.log('ok');
         );
         assert!(
             script.contains("pendingVisiblePaintForceFullRefreshSinceMs = 0;")
-                && script.split("recentFrameLikeWrite ? 'frame_like' : 'rate_limited'")
+                && script
+                    .split("recentFrameLikeWrite ? 'frame_like' : 'rate_limited'")
                     .nth(1)
                     .is_some_and(|after| {
                         let branch = after.split("emitPaint();").next().unwrap_or("");
@@ -17821,7 +18238,9 @@ console.log('ok');
             "active write-frame budget must not AND document.hasFocus() (Wayland false-negative for focused windows)"
         );
         assert!(
-            script.contains("if (terminalWindowFocused()) {\n                return true;\n            }"),
+            script.contains(
+                "if (terminalWindowFocused()) {\n                return true;\n            }"
+            ),
             "active write-frame budget must apply on the Wayland-reliable window-focus signal alone"
         );
         // Refocus must flush a stale idle-budget timer immediately (no 4s / tap
@@ -18199,7 +18618,10 @@ console.log('ok');
             action_title: String::new(),
             card: false,
         };
-        let label = AppPaneWidget::Label { text: "unlocked".into(), muted: true };
+        let label = AppPaneWidget::Label {
+            text: "unlocked".into(),
+            muted: true,
+        };
         assert_ne!(section.key(1, &epochs), label.key(1, &epochs));
 
         // Identity, not position: the same row keeps its key as the list moves.
@@ -18349,18 +18771,45 @@ console.log('ok');
         assert_eq!(schema.title, "Vault");
         assert_eq!(schema.widgets.len(), 11);
         // An omitted `action` is empty, not an error: a search box need not act.
-        assert!(matches!(&schema.widgets[3], AppPaneWidget::SearchBox { action, .. } if action.is_empty()));
+        assert!(
+            matches!(&schema.widgets[3], AppPaneWidget::SearchBox { action, .. } if action.is_empty())
+        );
         // A plain text-input is single-line; the notes field opts into multiline.
-        assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { multiline: false, .. }));
-        assert!(matches!(&schema.widgets[5], AppPaneWidget::TextInput { multiline: true, rows: 10, .. }));
+        assert!(matches!(
+            &schema.widgets[4],
+            AppPaneWidget::TextInput {
+                multiline: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &schema.widgets[5],
+            AppPaneWidget::TextInput {
+                multiline: true,
+                rows: 10,
+                ..
+            }
+        ));
         // A field submits on Enter only when it declares an action.
-        assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { action, .. } if action.is_empty()));
-        assert!(matches!(&schema.widgets[6], AppPaneWidget::TextInput { action, secret: true, .. } if action == "unlock"));
-        assert!(matches!(&schema.widgets[10], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
+        assert!(
+            matches!(&schema.widgets[4], AppPaneWidget::TextInput { action, .. } if action.is_empty())
+        );
+        assert!(
+            matches!(&schema.widgets[6], AppPaneWidget::TextInput { action, secret: true, .. } if action == "unlock")
+        );
+        assert!(
+            matches!(&schema.widgets[10], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1)
+        );
         // Word wrap is ON unless the app declares it off (user spec 2026-07-18:
         // "word-wrap ON default") — an app that never heard of the field gets
         // the wrapping editor.
-        assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { word_wrap: true, .. }));
+        assert!(matches!(
+            &schema.widgets[4],
+            AppPaneWidget::TextInput {
+                word_wrap: true,
+                ..
+            }
+        ));
         // A schema with no footer is the common case and must parse to empty.
         assert!(schema.footer.is_empty());
         // Both identity fields are OPTIONAL: an app that never heard of them
@@ -18489,7 +18938,11 @@ console.log('ok');
         .expect("schema parses");
         assert!(matches!(
             &schema.widgets[0],
-            AppPaneWidget::TextInput { word_wrap: false, line_numbers: true, .. }
+            AppPaneWidget::TextInput {
+                word_wrap: false,
+                line_numbers: true,
+                ..
+            }
         ));
         assert_eq!(schema.footer.len(), 2);
         assert!(matches!(&schema.footer[0], AppPaneWidget::Label { .. }));
@@ -18515,9 +18968,7 @@ console.log('ok');
     // the search box mid-search.
     #[test]
     fn app_pane_value_epoch_bumps_only_on_a_pushed_value() {
-        let widget = |value: &str| {
-            json!({"kind": "text-input", "id": "password", "value": value, "secret": true})
-        };
+        let widget = |value: &str| json!({"kind": "text-input", "id": "password", "value": value, "secret": true});
         let schema = |value: &str| -> AppPaneSchema {
             serde_json::from_value(json!({"widgets": [widget(value)]})).expect("schema parses")
         };
@@ -18633,11 +19084,7 @@ console.log('ok');
                 .iter()
                 .map(|band| (band.indices.clone(), band.card))
                 .collect::<Vec<_>>(),
-            vec![
-                (vec![0], false),
-                (vec![1, 2, 3], true),
-                (vec![4, 5], false),
-            ],
+            vec![(vec![0], false), (vec![1, 2, 3], true), (vec![4, 5], false),],
         );
         // Every widget, exactly once, in draw order.
         let flat: Vec<usize> = bands.iter().flat_map(|band| band.indices.clone()).collect();
@@ -18759,7 +19206,10 @@ console.log('ok');
         );
         assert_eq!(shell.app_pane_values["query"], "gh");
         let posted = shell.app_pane_values_json().to_string();
-        assert!(!posted.contains("hunter2"), "secret leaked into an action POST");
+        assert!(
+            !posted.contains("hunter2"),
+            "secret leaked into an action POST"
+        );
     }
 
     /// An app-raised modal is a first-class member of the ONE precedence list.
@@ -18773,28 +19223,38 @@ console.log('ok');
     #[test]
     fn an_app_raised_modal_sits_with_the_rail_raised_editors() {
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, true, false, false, false, false, false, false, false
+            ),
             Some(TopModal::AppPaneModal)
         );
         assert_eq!(TopModal::AppPaneModal.kind(), "app-pane-modal");
         assert_eq!(TopModal::AppPaneModal.scope_label(), "Options");
         // It is drawn ABOVE a page-raised prompt, so it keeps the keys over one.
         assert_eq!(
-            top_modal_of(false, false, false, false, true, true, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, true, true, false, false, false, false, false, false
+            ),
             Some(TopModal::AppPaneModal),
             "a prompt painted under the dialog must not be what Escape answers"
         );
         assert_eq!(
-            top_modal_of(false, false, false, false, true, false, true, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, false, true, false, true, false, false, false, false, false
+            ),
             Some(TopModal::AppPaneModal)
         );
         // …and the two editors it shares a z-index with still outrank it.
         assert_eq!(
-            top_modal_of(false, false, false, true, true, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, false, true, true, false, false, false, false, false, false, false
+            ),
             Some(TopModal::CliInstall)
         );
         assert_eq!(
-            top_modal_of(false, false, true, false, true, false, false, false, false, false, false, false),
+            top_modal_of(
+                false, false, true, false, true, false, false, false, false, false, false, false
+            ),
             Some(TopModal::LaunchFlags)
         );
     }
@@ -18899,10 +19359,18 @@ console.log('ok');
             .expect("modal spec parses"),
         );
         shell.set_app_pane_value("token", "hunter2".to_string());
-        assert!(shell.app_pane_action_values_json().to_string().contains("hunter2"));
+        assert!(
+            shell
+                .app_pane_action_values_json()
+                .to_string()
+                .contains("hunter2")
+        );
         shell.close_app_pane_modal();
         assert!(
-            !shell.app_pane_action_values_json().to_string().contains("hunter2"),
+            !shell
+                .app_pane_action_values_json()
+                .to_string()
+                .contains("hunter2"),
             "a dismissed dialog's secret survived into the next action's POST"
         );
 
@@ -18928,12 +19396,27 @@ console.log('ok');
                 {"kind": "text-input", "id": "note", "value": "one"},
             ],
         });
-        shell.open_app_pane_modal("settings", serde_json::from_value(spec.clone()).expect("parses"));
-        let first = shell.app_pane_modal.as_ref().expect("up").pane.value_epochs.clone();
+        shell.open_app_pane_modal(
+            "settings",
+            serde_json::from_value(spec.clone()).expect("parses"),
+        );
+        let first = shell
+            .app_pane_modal
+            .as_ref()
+            .expect("up")
+            .pane
+            .value_epochs
+            .clone();
 
         // Re-declare the SAME values: an echo, which must leave both alone.
         shell.open_app_pane_modal("settings", serde_json::from_value(spec).expect("parses"));
-        let echoed = shell.app_pane_modal.as_ref().expect("up").pane.value_epochs.clone();
+        let echoed = shell
+            .app_pane_modal
+            .as_ref()
+            .expect("up")
+            .pane
+            .value_epochs
+            .clone();
         assert_eq!(echoed["query"], first["query"]);
         assert_eq!(echoed["note"], first["note"]);
 
@@ -18948,8 +19431,17 @@ console.log('ok');
             }))
             .expect("parses"),
         );
-        let pushed = shell.app_pane_modal.as_ref().expect("up").pane.value_epochs.clone();
-        assert_eq!(pushed["query"], first["query"], "an untouched field remounted");
+        let pushed = shell
+            .app_pane_modal
+            .as_ref()
+            .expect("up")
+            .pane
+            .value_epochs
+            .clone();
+        assert_eq!(
+            pushed["query"], first["query"],
+            "an untouched field remounted"
+        );
         assert_eq!(pushed["note"], first["note"] + 1);
     }
 
@@ -18983,7 +19475,9 @@ console.log('ok');
             .find("fn AppPaneModalOverlay(")
             .expect("the modal overlay is mounted");
         let body = &source[overlay..];
-        let end = body.find("\n}\n").expect("the overlay has a column-0 close");
+        let end = body
+            .find("\n}\n")
+            .expect("the overlay has a column-0 close");
         let body = &body[..end];
         assert!(
             body.contains("AppPaneRailBody {") && body.contains("modal: true,"),
@@ -18999,7 +19493,7 @@ console.log('ok');
                 icon: "🔑".to_string(),
                 title: "Vault".to_string(),
                 placement: PanePlacement::Rail,
-                }],
+            }],
             None,
             None,
             None,
@@ -19102,7 +19596,10 @@ console.log('ok');
 
         // A further real edit bumps again and must re-arm.
         let saved = redeclare_with_document(&mut shell, session, "v3", 18_000);
-        assert!(saved.document_rail, "a later stamp bump must re-arm the rail refetch");
+        assert!(
+            saved.document_rail,
+            "a later stamp bump must re-arm the rail refetch"
+        );
     }
 
     // The arm that actually carries bug #5. yedit is a THIN CLIENT: `yedit <file>`
@@ -19122,16 +19619,38 @@ console.log('ok');
 
         // Idle heartbeats: the stamp has not moved, so the rail must not churn.
         let idle = shell
-            .apply_sidebar_ping(session, None, None, None, None, Some("64:false".into()), 5_000)
+            .apply_sidebar_ping(
+                session,
+                None,
+                None,
+                None,
+                None,
+                Some("64:false".into()),
+                5_000,
+            )
             .expect("a ping for a held contribution reports refetches");
-        assert!(!idle.document_rail, "an unchanged ping stamp churned the rail");
+        assert!(
+            !idle.document_rail,
+            "an unchanged ping stamp churned the rail"
+        );
 
         // The user opens another document: yedit bumps the stamp, and the ONLY
         // signal the GUI gets is this ping.
         let opened = shell
-            .apply_sidebar_ping(session, None, None, None, None, Some("66:false".into()), 9_000)
+            .apply_sidebar_ping(
+                session,
+                None,
+                None,
+                None,
+                None,
+                Some("66:false".into()),
+                9_000,
+            )
             .expect("a ping for a held contribution reports refetches");
-        assert!(opened.document, "the viewport refetches on a ping stamp bump");
+        assert!(
+            opened.document,
+            "the viewport refetches on a ping stamp bump"
+        );
         assert!(
             opened.document_rail,
             "bug #5: a ping-only stamp bump must refetch the documents rail — \
@@ -19141,9 +19660,20 @@ console.log('ok');
         // And it is an EDGE, not a level: the next heartbeat carries the same
         // stamp and must leave the rail (and its typed search box) alone.
         let settled = shell
-            .apply_sidebar_ping(session, None, None, None, None, Some("66:false".into()), 13_000)
+            .apply_sidebar_ping(
+                session,
+                None,
+                None,
+                None,
+                None,
+                Some("66:false".into()),
+                13_000,
+            )
             .expect("a ping for a held contribution reports refetches");
-        assert!(!settled.document_rail, "the rail refetched twice for one document change");
+        assert!(
+            !settled.document_rail,
+            "the rail refetched twice for one document change"
+        );
     }
 
     fn declare_with_policy(
@@ -19170,10 +19700,10 @@ console.log('ok');
                 None,
                 now_ms,
                 Some((
-                "http://127.0.0.1:1".to_string(),
-                "http://127.0.0.1:1".to_string(),
-                None,
-            )),
+                    "http://127.0.0.1:1".to_string(),
+                    "http://127.0.0.1:1".to_string(),
+                    None,
+                )),
             )
             .policy
     }
@@ -19203,9 +19733,8 @@ console.log('ok');
             let (mut stream, _) = listener.accept().expect("the GUI connects");
             let mut raw = vec![0u8; 4096];
             let read = stream.read(&mut raw).unwrap_or(0);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-            );
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
             String::from_utf8_lossy(&raw[..read]).into_owned()
         });
         let url = format!("http://127.0.0.1:{port}/action");
@@ -19247,7 +19776,10 @@ console.log('ok');
         let url = format!("http://127.0.0.1:{port}/pane/settings");
         let error = control_request(&url, None, Some("tok")).expect_err("a 403 is an error");
         handle.join().expect("the fake app answered");
-        assert!(error.contains("403"), "the status still names itself: {error}");
+        assert!(
+            error.contains("403"),
+            "the status still names itself: {error}"
+        );
         assert!(
             error.contains("predates the control-token gate"),
             "the app's own remedy must survive to the caller: {error}"
@@ -19282,7 +19814,10 @@ console.log('ok');
             "an unbounded body must not reach a pane: {} chars",
             error.chars().count()
         );
-        assert!(error.ends_with('\u{2026}'), "truncation must be visible: {error}");
+        assert!(
+            error.ends_with('\u{2026}'),
+            "truncation must be visible: {error}"
+        );
     }
 
     #[test]
@@ -19291,7 +19826,10 @@ console.log('ok');
             Some(json!({"pane": "settings", "action": "reload-surface"})),
             Some("tok-abc123"),
         );
-        assert!(replied.is_ok(), "the request must still complete: {replied:?}");
+        assert!(
+            replied.is_ok(),
+            "the request must still complete: {replied:?}"
+        );
         assert!(
             wire.contains("X-Ychrome-Control: tok-abc123\r\n"),
             "the pane's POST must carry the declared token, got:\n{wire}"
@@ -19427,14 +19965,14 @@ console.log('ok');
         for field in fields {
             // `action` rides as an ES shorthand, so accept either form.
             assert!(
-                forwarder.contains(&format!("{field}:")) || forwarder.contains(&format!("{field},")),
+                forwarder.contains(&format!("{field}:"))
+                    || forwarder.contains(&format!("{field},")),
                 "the JS OSC forwarder drops `{field}`: a field added to the Rust wire type must be \
                  copied across here too, or every live declare arrives with it null — which is \
                  exactly how the control token was lost"
             );
         }
     }
-
 
     /// THE CALL-SITE RULE, held where it is easiest to break: every request the
     /// GUI makes to an APP's control endpoint presents that app's declared
@@ -19526,7 +20064,12 @@ console.log('ok');
                 icon: "A".into(),
                 binary: "/bin/sh".into(),
                 verbs: vec![
-                    AppVerb { id: "new".into(), label: "New Alpha".into(), args: vec![], ..Default::default() },
+                    AppVerb {
+                        id: "new".into(),
+                        label: "New Alpha".into(),
+                        args: vec![],
+                        ..Default::default()
+                    },
                     AppVerb {
                         id: "incognito".into(),
                         label: "New Alpha (Incognito)".into(),
@@ -19541,14 +20084,28 @@ console.log('ok');
                 label: "Beta".into(),
                 icon: String::new(),
                 binary: "/bin/sh".into(),
-                verbs: vec![AppVerb { id: "new".into(), label: "New Beta".into(), args: vec![], ..Default::default() }],
+                verbs: vec![AppVerb {
+                    id: "new".into(),
+                    label: "New Beta".into(),
+                    args: vec![],
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
         ];
         let entries = app_launcher_entries(&apps);
-        let labels: Vec<&str> = entries.iter().map(|(_, verb)| verb.label.as_str()).collect();
-        assert_eq!(labels, vec!["New Alpha", "New Alpha (Incognito)", "New Beta"]);
-        assert_eq!(entries[1].0.command_for(&entries[1].1), "/bin/sh --profile temp");
+        let labels: Vec<&str> = entries
+            .iter()
+            .map(|(_, verb)| verb.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["New Alpha", "New Alpha (Incognito)", "New Beta"]
+        );
+        assert_eq!(
+            entries[1].0.command_for(&entries[1].1),
+            "/bin/sh --profile temp"
+        );
     }
 
     // An empty registry contributes nothing anywhere — and since the hardcoded
@@ -19622,7 +20179,12 @@ console.log('ok');
     #[test]
     fn the_policy_gate_hands_out_a_handle_and_never_copies_the_ruleset() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
-        assert!(declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000));
+        assert!(declare_with_policy(
+            &mut shell,
+            "local://p",
+            Some("v1"),
+            1_000
+        ));
         shell.apply_sidebar_policy(
             "local://p",
             "v1",
@@ -19659,7 +20221,12 @@ console.log('ok');
     #[test]
     fn a_declared_policy_gates_the_surface_until_it_lands() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
-        assert!(declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000));
+        assert!(declare_with_policy(
+            &mut shell,
+            "local://p",
+            Some("v1"),
+            1_000
+        ));
         assert_eq!(
             shell.web_surface_policy_gate("local://p"),
             SurfacePolicyGate::Pending
@@ -19784,7 +20351,8 @@ console.log('ok');
                 "userscripts_v2": [{ "body": "b", "world": world }],
             }));
             assert_eq!(
-                policy.effective_userscripts()[0].isolated_world, isolated,
+                policy.effective_userscripts()[0].isolated_world,
+                isolated,
                 "world {world:?} resolved to the wrong side of the boundary"
             );
         }
@@ -19967,7 +20535,12 @@ console.log('ok');
         );
 
         // A new stamp is a fresh chance: the app may have fixed itself.
-        assert!(declare_with_policy(&mut shell, "local://p", Some("v2"), 10_000));
+        assert!(declare_with_policy(
+            &mut shell,
+            "local://p",
+            Some("v2"),
+            10_000
+        ));
         assert_eq!(
             shell.web_surface_policy_gate("local://p"),
             SurfacePolicyGate::Pending
@@ -20152,7 +20725,8 @@ console.log('ok');
         assert!(!SurfacePolicyGate::Absent.defers_surface_create());
         assert!(!SurfacePolicyGate::Abandoned.defers_surface_create());
         assert!(
-            !SurfacePolicyGate::Ready(Arc::new(WebSurfacePolicy::default())).defers_surface_create()
+            !SurfacePolicyGate::Ready(Arc::new(WebSurfacePolicy::default()))
+                .defers_surface_create()
         );
     }
 
@@ -20186,7 +20760,9 @@ console.log('ok');
             SurfacePolicyGate::Abandoned
         );
         assert_eq!(
-            shell.rearm_abandoned_sidebar_policy_fetch("local://p").as_deref(),
+            shell
+                .rearm_abandoned_sidebar_policy_fetch("local://p")
+                .as_deref(),
             Some("v1"),
             "an abandoned fetch was not re-armed"
         );
@@ -20228,7 +20804,10 @@ console.log('ok');
         );
         // Active session does NOT offer it (switched to a non-app session, or the
         // app died) → the user's remembered view, not a blank rail.
-        assert_eq!(shell.effective_right_panel_mode(false, current_millis()), RightPanelMode::Metadata);
+        assert_eq!(
+            shell.effective_right_panel_mode(false, current_millis()),
+            RightPanelMode::Metadata
+        );
         // The underlying mode is untouched — switching back re-reveals the pane.
         assert_eq!(
             shell.right_panel_mode,
@@ -20393,7 +20972,11 @@ console.log('ok');
             "2. cogs: panels + research"
         );
         assert_eq!(
-            compose_outline_prefix(Some("2. cogs:"), "Initialize cogs panels research lobe", false),
+            compose_outline_prefix(
+                Some("2. cogs:"),
+                "Initialize cogs panels research lobe",
+                false
+            ),
             "2. cogs: Initialize cogs panels research lobe"
         );
 
@@ -20403,8 +20986,14 @@ console.log('ok');
         assert_eq!(compose_outline_prefix(Some("2. cogs:"), &once, false), once);
 
         // No prefix set is the untouched case: the label is the CLI's, whole.
-        assert_eq!(compose_outline_prefix(None, "Some CC Title", false), "Some CC Title");
-        assert_eq!(compose_outline_prefix(Some("   "), "Some CC Title", false), "Some CC Title");
+        assert_eq!(
+            compose_outline_prefix(None, "Some CC Title", false),
+            "Some CC Title"
+        );
+        assert_eq!(
+            compose_outline_prefix(Some("   "), "Some CC Title", false),
+            "Some CC Title"
+        );
     }
 
     /// A CHILDLESS top-level seat wears the chapter dot; a seat with members
@@ -20469,7 +21058,10 @@ console.log('ok');
         // And the live derivation that answers `heads_a_group`.
         let seats = ["6".to_string(), "6.1".to_string(), "4".to_string()];
         let all = || seats.iter().map(String::as_str);
-        assert!(yggterm_core::session_outline::outline_prefix_heads_a_group("6", all()));
+        assert!(yggterm_core::session_outline::outline_prefix_heads_a_group(
+            "6",
+            all()
+        ));
         assert!(!yggterm_core::session_outline::outline_prefix_heads_a_group("4", all()));
         assert!(!yggterm_core::session_outline::outline_prefix_heads_a_group("6.1", all()));
     }
@@ -20595,7 +21187,8 @@ console.log('ok');
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(
-            script.contains("const attachTerminalSurfaceToHost = (targetHost, site, allowOpen) => {"),
+            script
+                .contains("const attachTerminalSurfaceToHost = (targetHost, site, allowOpen) => {"),
             "restoring the surface into a host must have exactly one owner"
         );
         for call in [
@@ -20609,7 +21202,10 @@ console.log('ok');
         }
         for (wipe_site, restore_site) in [
             ("site: 'rebind_host_wipe'", "'rebind_host_attach'"),
-            ("site: 'rebuild_blank_host_wipe'", "'rebuild_blank_host_attach'"),
+            (
+                "site: 'rebuild_blank_host_wipe'",
+                "'rebuild_blank_host_attach'",
+            ),
         ] {
             let wipe = script.find(wipe_site).expect("wipe breadcrumb present");
             let restore = script.find(restore_site).expect("restore present");
@@ -20634,7 +21230,10 @@ console.log('ok');
         let owner_end = script
             .find("const rebindCurrentHost = (reason, reopen) => {")
             .expect("the owner's body ends before rebindCurrentHost");
-        assert!(owner_start < owner_end, "the owner precedes rebindCurrentHost");
+        assert!(
+            owner_start < owner_end,
+            "the owner precedes rebindCurrentHost"
+        );
         let opens: Vec<usize> = script
             .match_indices("term.open(targetHost);")
             .map(|(at, _)| at)
@@ -20673,7 +21272,9 @@ console.log('ok');
             "\"is this a real surface or a husk?\" must have exactly one owner"
         );
         assert!(
-            script.contains("const existingIsHusk = Boolean(existing) && !terminalSurfaceIsComplete(existing);"),
+            script.contains(
+                "const existingIsHusk = Boolean(existing) && !terminalSurfaceIsComplete(existing);"
+            ),
             "the surface owner must classify term.element before trusting it"
         );
         assert!(
@@ -20869,8 +21470,16 @@ console.log('ok');
             None, None, true, false
         ));
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            false,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
         assert!(script.contains("const canvasRendererEnabled = false;"));
         assert!(script.contains("let webglAddonAvailable = Boolean(window.WebglAddon"));
         assert!(script.contains("if (canvasRendererEnabled && webglAddonAvailable"));
@@ -20953,10 +21562,26 @@ console.log('ok');
     #[test]
     fn terminal_eval_script_runtime_gates_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let disabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
-        let enabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
+        let disabled = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            false,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
+        let enabled = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
         assert!(disabled.contains("const canvasRendererEnabled = false;"));
         assert!(enabled.contains("const canvasRendererEnabled = true;"));
         assert!(enabled.contains(
@@ -20971,8 +21596,16 @@ console.log('ok');
         // be gated OFF so it never hides the WebGL canvas. The apply function and its
         // call sites still exist but early-return; full code removal is a follow-up.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
         assert!(script.contains("const softwareCanvasLayerOptimizationAllowed = () => false;"));
         assert!(script.contains("applySoftwareCanvasLayerOptimization('initial_mount');"));
     }
@@ -20980,8 +21613,16 @@ console.log('ok');
     #[test]
     fn terminal_eval_script_keeps_codex_prompt_and_cursor_xterm_owned() {
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
-        let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
         assert!(!script.contains(".yggterm-canvas-input-line-overlay"));
         assert!(!script.contains(".yggterm-canvas-cursor-overlay"));
         assert!(!script.contains("overlay.className = 'yggterm-canvas-input-line-overlay'"));
@@ -21020,7 +21661,8 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        None);
+            None,
+        );
         assert!(script.contains("pattern: 'glyph_gap_rows'"));
         assert!(
             script.contains("detectAndHealGlyphGapRows(reason)"),
@@ -21064,7 +21706,8 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        None);
+            None,
+        );
         assert!(
             script.contains("term.unicode.activeVersion = '11';"),
             "the terminal must activate the corrected width table"
@@ -21113,7 +21756,8 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        None);
+            None,
+        );
         assert!(script.contains("window.__yggtermRafGapMonitor"));
         assert!(script.contains("pattern: 'stale_atlas_paint'"));
         assert!(
@@ -21164,7 +21808,10 @@ console.log('ok');
         let gap_tick = script
             .split("const rafGapTick = () => {")
             .nth(1)
-            .and_then(|body| body.split("window.requestAnimationFrame(rafGapTick);").next())
+            .and_then(|body| {
+                body.split("window.requestAnimationFrame(rafGapTick);")
+                    .next()
+            })
             .expect("the rAF gap monitor tick should be present");
         assert!(
             gap_tick.contains("clearTextureAtlas"),
@@ -21242,19 +21889,29 @@ console.log('ok');
             "test_reason",
             false,
             ("\x1b[A", "\x1b[B", 0),
-        None);
+            None,
+        );
         assert!(script.contains("&& hostIsActive"));
         assert!(script.contains("'canvas_blank_with_buffer_text_background'"));
-        assert!(script.contains(
-            "const hostActiveAttr = host.getAttribute('data-active-session-host');"
-        ));
+        assert!(
+            script
+                .contains("const hostActiveAttr = host.getAttribute('data-active-session-host');")
+        );
     }
 
     #[test]
     fn terminal_eval_script_can_opt_into_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason", false, ("\x1b[A", "\x1b[B", 0), None);
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
         assert!(script.contains("const canvasRendererEnabled = true;"));
     }
 
@@ -21488,7 +22145,9 @@ console.log('ok');
         }
         // The exemption must come BEFORE the suppression, or the native menu is
         // cancelled before anyone asks who owns the area.
-        let exempt_at = script.find("ownsNativeMenu(event.target)").expect("exemption");
+        let exempt_at = script
+            .find("ownsNativeMenu(event.target)")
+            .expect("exemption");
         let suppress_at = script.find("event.preventDefault()").expect("suppression");
         assert!(exempt_at < suppress_at);
         assert!(
@@ -21508,7 +22167,8 @@ console.log('ok');
         assert!(script.contains("data-document-surface-owns-viewport"));
         assert!(script.contains("data-web-surface-owns-viewport"));
         assert!(
-            script.contains("[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker]"),
+            script
+                .contains("[data-document-surface], [data-ws-overlay], [data-yggterm-web-picker]"),
             "the target-side check must cover document, web overlay and picker"
         );
         // The guard has to run INSIDE the shared funnel, before the opener — both
@@ -21896,7 +22556,9 @@ console.log('ok');
             "kind": "markdown", "id": "body", "source": "# hi"
         }))
         .expect("markdown widget deserializes");
-        assert!(matches!(&widget, AppPaneWidget::Markdown { id, source, .. } if id == "body" && source == "# hi"));
+        assert!(
+            matches!(&widget, AppPaneWidget::Markdown { id, source, .. } if id == "body" && source == "# hi")
+        );
         assert_eq!(widget.key(3, &HashMap::new()), "markdown-body");
         assert!(widget.declared_value().is_none());
 
@@ -22965,12 +23627,18 @@ console.log('ok');
             window.1 - margin
         );
         // And it must still be given the room that IS there, not clipped to nothing.
-        assert!(low.max_height > 900.0, "max_height {} is uselessly small", low.max_height);
+        assert!(
+            low.max_height > 900.0,
+            "max_height {} is uselessly small",
+            low.max_height
+        );
 
         // Flipped to a bottom anchor, the menu grows UP and must clear the
         // titlebar floor the top branch clamps to.
         let high = context_menu_placement((1800.0, 1150.0), window, (224.0, 420.0), None);
-        let bottom = high.bottom.expect("a menu with no room below anchors by its bottom");
+        let bottom = high
+            .bottom
+            .expect("a menu with no room below anchors by its bottom");
         assert!(
             window.1 - bottom - high.max_height >= 44.0,
             "an upward menu must not run under the titlebar"
@@ -22993,7 +23661,10 @@ console.log('ok');
             !style.contains("100vh"),
             "a viewport-relative cap cannot know where the menu was anchored:\n{style}"
         );
-        assert!(style.contains("overflow-y:auto"), "the overflow must scroll:\n{style}");
+        assert!(
+            style.contains("overflow-y:auto"),
+            "the overflow must scroll:\n{style}"
+        );
     }
 
     #[test]
@@ -23220,8 +23891,14 @@ console.log('ok');
             !media.contains("animation:"),
             "a dot must never own an animation: {media}"
         );
-        assert!(media.contains("#22c55e"), "a lit dot is the vocabulary's green");
-        assert_eq!(keys(&media), keys(&web_tab_activity_dot_style(false, false)));
+        assert!(
+            media.contains("#22c55e"),
+            "a lit dot is the vocabulary's green"
+        );
+        assert_eq!(
+            keys(&media),
+            keys(&web_tab_activity_dot_style(false, false))
+        );
         // Either cause lights it, and a tab that is both loading AND playing is
         // lit once, not twice.
         assert_eq!(web_tab_activity_dot_style(true, false), media);
@@ -24009,20 +24686,23 @@ console.log('ok');
 
         let survivor =
             yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&member));
-        let snapshot_without_the_head = |sessions: Vec<yggterm_server::SnapshotSessionView>| ServerUiSnapshot {
-            active_session_path: None,
-            active_session: None,
-            active_view_mode: WorkspaceViewMode::Terminal,
-            remote_machines: Vec::new(),
-            ssh_targets: Vec::new(),
-            live_sessions: sessions,
-            apps: Vec::new(),
-        };
+        let snapshot_without_the_head =
+            |sessions: Vec<yggterm_server::SnapshotSessionView>| ServerUiSnapshot {
+                active_session_path: None,
+                active_session: None,
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: sessions,
+                apps: Vec::new(),
+            };
 
         // ⛔ NOTHING LIVE AT ALL — a handover, not a departure. Any number of
         // these must decide nothing, or three quiet snapshots would wipe an
         // arrangement built over weeks.
-        shell.server.apply_snapshot(snapshot_without_the_head(Vec::new()));
+        shell
+            .server
+            .apply_snapshot(snapshot_without_the_head(Vec::new()));
         for _ in 0..6 {
             shell.prune_departed_row_arrangement();
         }
@@ -24086,8 +24766,7 @@ console.log('ok');
             live_sessions: sessions,
             apps: Vec::new(),
         };
-        let head_row =
-            yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&head));
+        let head_row = yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&head));
         let member_row =
             yggterm_server::snapshot_session_view_for_ui(test_live_shell_session(&member));
 
@@ -24315,8 +24994,12 @@ console.log('ok');
         let member_b = "remote-cc://buildbox/11111111-2222-4333-8444-eeeeeeeeee02";
         let dead_head = "remote-cc://buildbox/11111111-2222-4333-8444-eeeeeeeeeeff";
         let mut arrangement = yggterm_core::row_set_outline::RowArrangement::default();
-        arrangement.attach(dead_head, member_a, None).expect("attach a");
-        arrangement.attach(dead_head, member_b, None).expect("attach b");
+        arrangement
+            .attach(dead_head, member_a, None)
+            .expect("attach a");
+        arrangement
+            .attach(dead_head, member_b, None)
+            .expect("attach b");
         let rows = live_rows_for_seats(
             &[(member_a, ""), (member_b, "")],
             &HashSet::new(),
@@ -24476,21 +25159,35 @@ console.log('ok');
                 .collect::<Vec<_>>()
         };
         let on_head = ids(&head, RowSetMenuRole::Head);
-        assert!(on_head.iter().any(|id| id == "ungroup-row-set"), "{on_head:?}");
-        assert!(!on_head.iter().any(|id| id == "leave-row-set"), "{on_head:?}");
+        assert!(
+            on_head.iter().any(|id| id == "ungroup-row-set"),
+            "{on_head:?}"
+        );
+        assert!(
+            !on_head.iter().any(|id| id == "leave-row-set"),
+            "{on_head:?}"
+        );
 
         head.descendant_sessions = 1;
         head.depth = 2;
         let on_member = ids(&head, RowSetMenuRole::Member);
-        assert!(on_member.iter().any(|id| id == "leave-row-set"), "{on_member:?}");
-        assert!(!on_member.iter().any(|id| id == "ungroup-row-set"), "{on_member:?}");
+        assert!(
+            on_member.iter().any(|id| id == "leave-row-set"),
+            "{on_member:?}"
+        );
+        assert!(
+            !on_member.iter().any(|id| id == "ungroup-row-set"),
+            "{on_member:?}"
+        );
 
         // ⛔ A row in no set is offered neither. The cwd tree nests rows by
         // FOLDER, and naming a group there describes a structure that surface
         // does not have.
         let loose = ids(&head, RowSetMenuRole::None);
         assert!(
-            !loose.iter().any(|id| id == "leave-row-set" || id == "ungroup-row-set"),
+            !loose
+                .iter()
+                .any(|id| id == "leave-row-set" || id == "ungroup-row-set"),
             "{loose:?}"
         );
     }
@@ -24940,7 +25637,9 @@ console.log('ok');
         next.outline_prefix = Some("7.0".to_string());
         let live_sessions = vec![head.clone(), rice.clone(), next.clone()];
         let mut arrangement = yggterm_core::row_set_outline::RowArrangement::default();
-        arrangement.attach(path_head, path_rice, None).expect("attach rice");
+        arrangement
+            .attach(path_head, path_rice, None)
+            .expect("attach rice");
         let mut expanded = HashSet::new();
         expanded.insert("__live_sessions__".to_string());
         let rows = {
@@ -24957,13 +25656,24 @@ console.log('ok');
             )
         };
         // Find rice and next_top rows
-        let rice_row = rows.iter().find(|r| r.full_path == path_rice).expect("rice row");
+        let rice_row = rows
+            .iter()
+            .find(|r| r.full_path == path_rice)
+            .expect("rice row");
         assert_eq!(rice_row.depth, 2, "rice should be depth2 inside head");
-        let next_row = rows.iter().find(|r| r.full_path == path_next_top).expect("next row");
+        let next_row = rows
+            .iter()
+            .find(|r| r.full_path == path_next_top)
+            .expect("next row");
         assert_eq!(next_row.depth, 1, "next_top should be depth1");
         // Resolve Before next_top as outside move (head None)
-        let target = resolve_drag_drop_target(&rows, &[path_rice.to_string()], next_row, DragDropPlacement::Before)
-            .expect("Before next_top should be valid live drop");
+        let target = resolve_drag_drop_target(
+            &rows,
+            &[path_rice.to_string()],
+            next_row,
+            DragDropPlacement::Before,
+        )
+        .expect("Before next_top should be valid live drop");
         assert_eq!(target.path, path_next_top);
         assert_eq!(target.placement, DragDropPlacement::Before);
         // apply_row_set_drop should detach rice to top level
@@ -24975,16 +25685,31 @@ console.log('ok');
             active_view_mode: WorkspaceViewMode::Terminal,
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
-            live_sessions: live_sessions.iter().cloned().map(snapshot_session_view_for_ui).collect(),
+            live_sessions: live_sessions
+                .iter()
+                .cloned()
+                .map(snapshot_session_view_for_ui)
+                .collect(),
         });
         // inject arrangement
         shell.row_arrangement = arrangement.clone();
         let applied = apply_row_set_drop(&mut shell, &target, &[path_rice.to_string()]);
         assert!(applied, "detach before next_top should change arrangement");
-        assert_eq!(shell.row_set_effective_parent(path_rice), None, "rice should be detached to top");
+        assert_eq!(
+            shell.row_set_effective_parent(path_rice),
+            None,
+            "rice should be detached to top"
+        );
         // Flat order: rice last member before next_top => remaining == current => live reorder None
-        let reordered = live_session_reordered_paths_for_drop(&live_sessions, &[path_rice.to_string()], &target);
-        assert!(reordered.is_none(), "flat order is noop for last-member case – arrangement-only move");
+        let reordered = live_session_reordered_paths_for_drop(
+            &live_sessions,
+            &[path_rice.to_string()],
+            &target,
+        );
+        assert!(
+            reordered.is_none(),
+            "flat order is noop for last-member case – arrangement-only move"
+        );
         // queue_drop must still handle arrangement_without_reorder (the fix)
         // Simulate queue_drop's early return for arrangement_without_reorder: it should clear drag.
         // Here we just verify that arrangement_without_reorder would be considered handled.
@@ -25369,8 +26094,8 @@ console.log('ok');
             serde_json::from_slice(&bytes).expect("published record must be complete JSON");
         assert_eq!(record.pid, std::process::id());
         // Nothing may be left mid-stage after a successful publish.
-        let staging_dir = client_instances_dir(&settings_path, &endpoint)
-            .join(CLIENT_INSTANCE_STAGING_DIR);
+        let staging_dir =
+            client_instances_dir(&settings_path, &endpoint).join(CLIENT_INSTANCE_STAGING_DIR);
         let staged: Vec<_> = fs::read_dir(&staging_dir)
             .expect("staging dir exists")
             .flatten()
@@ -25854,8 +26579,14 @@ console.log('ok');
     fn local_folder_rename_refuses_escapes_and_foreign_rows() {
         let row = folder_row("/home/user/gh/folder-99");
         // `..` and outside-home targets must never move a folder row.
-        assert_eq!(local_workspace_rename_target(&row, "/home/user", "../../etc"), None);
-        assert_eq!(local_workspace_rename_target(&row, "/home/user", "/etc/cron.d"), None);
+        assert_eq!(
+            local_workspace_rename_target(&row, "/home/user", "../../etc"),
+            None
+        );
+        assert_eq!(
+            local_workspace_rename_target(&row, "/home/user", "/etc/cron.d"),
+            None
+        );
         // A no-op label (target == current path) falls back to title-only.
         let named = folder_row("/home/user/gh/thunderbird-cli");
         assert_eq!(
@@ -25864,11 +26595,17 @@ console.log('ok');
         );
         // Remote/synthetic namespaces belong to the remote arm.
         let remote = folder_row("__remote_folder__/dev/home/user/gh");
-        assert_eq!(local_workspace_rename_target(&remote, "/home/user", "x"), None);
+        assert_eq!(
+            local_workspace_rename_target(&remote, "/home/user", "x"),
+            None
+        );
         // Non-folder rows never move.
         let mut separator = folder_row("/home/user/gh/folder-99");
         separator.group_kind = Some(WorkspaceGroupKind::Separator);
-        assert_eq!(local_workspace_rename_target(&separator, "/home/user", "x"), None);
+        assert_eq!(
+            local_workspace_rename_target(&separator, "/home/user", "x"),
+            None
+        );
     }
     #[test]
     fn new_separator_virtual_path_sorts_after_regular_children() {
@@ -27118,7 +27855,10 @@ console.log('ok');
                 .count(),
             2
         );
-        assert_eq!(rows[6].full_path, "local://019cf672-8d68-70a1-bd8b-68487c4fc63d");
+        assert_eq!(
+            rows[6].full_path,
+            "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
+        );
         assert_eq!(
             rows[6].depth, 4,
             "the cwd-tree copy hangs under /home/user/gh"
@@ -27592,8 +28332,16 @@ console.log('ok');
             }],
             &[],
             &[
-                make_live(samplenotes_path, "samplenotes", "/home/user/git/samplenotes"),
-                make_live(samplescripts_path, "erome systemd", "/home/user/git/samplescripts"),
+                make_live(
+                    samplenotes_path,
+                    "samplenotes",
+                    "/home/user/git/samplenotes",
+                ),
+                make_live(
+                    samplescripts_path,
+                    "erome systemd",
+                    "/home/user/git/samplescripts",
+                ),
             ],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -27616,7 +28364,8 @@ console.log('ok');
                 .map(|row| row.full_path.as_str())
                 .collect::<Vec<_>>()
         };
-        let samplenotes_descendants = descendant_paths("__remote_folder__/dev/home/user/git/samplenotes");
+        let samplenotes_descendants =
+            descendant_paths("__remote_folder__/dev/home/user/git/samplenotes");
         let samplescripts_descendants =
             descendant_paths("__remote_folder__/dev/home/user/git/samplescripts");
 
@@ -27625,7 +28374,9 @@ console.log('ok');
         assert!(samplescripts_descendants.contains(&samplescripts_path));
         assert!(!samplescripts_descendants.contains(&samplenotes_path));
         assert_eq!(
-            rows.iter().filter(|row| row.full_path == samplenotes_path).count(),
+            rows.iter()
+                .filter(|row| row.full_path == samplenotes_path)
+                .count(),
             2
         );
         assert_eq!(
@@ -27916,24 +28667,25 @@ console.log('ok');
         assert_eq!(label, "Stabilize daemon resume path");
     }
     fn copy_scan_test_machine() -> RemoteMachineSnapshot {
-        let session = |id: &str, cached_summary: Option<&str>, context: &str| RemoteScannedSession {
-            kind: None,
-            session_path: format!("remote-session://guihost/{id}"),
-            session_id: id.to_string(),
-            cwd: format!("/home/user/{id}"),
-            started_at: "2026-04-01T00:00:00Z".to_string(),
-            modified_epoch: 1,
-            event_count: 1,
-            user_message_count: 1,
-            assistant_message_count: 1,
-            title_hint: format!("/home/user/{id}"),
-            recent_context: context.to_string(),
-            cached_precis: None,
-            cached_summary: cached_summary.map(ToOwned::to_owned),
-            live_runtime: false,
-            title_is_explicit: false,
-            storage_path: format!("/home/user/.codex/sessions/{id}.jsonl"),
-        };
+        let session =
+            |id: &str, cached_summary: Option<&str>, context: &str| RemoteScannedSession {
+                kind: None,
+                session_path: format!("remote-session://guihost/{id}"),
+                session_id: id.to_string(),
+                cwd: format!("/home/user/{id}"),
+                started_at: "2026-04-01T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 1,
+                title_hint: format!("/home/user/{id}"),
+                recent_context: context.to_string(),
+                cached_precis: None,
+                cached_summary: cached_summary.map(ToOwned::to_owned),
+                live_runtime: false,
+                title_is_explicit: false,
+                storage_path: format!("/home/user/.codex/sessions/{id}.jsonl"),
+            };
         RemoteMachineSnapshot {
             cli_presence: Vec::new(),
             apps: Vec::new(),
@@ -28009,8 +28761,7 @@ console.log('ok');
     #[test]
     fn hydrating_a_copy_job_keeps_a_context_the_target_already_had() {
         let machine = copy_scan_test_machine();
-        let mut target = remote_copy_targets_for_machines(std::slice::from_ref(&machine))
-            .remove(0);
+        let mut target = remote_copy_targets_for_machines(std::slice::from_ref(&machine)).remove(0);
         // Live-session targets carry a preview context that is NOT in the
         // scanned record; clobbering it here would throw away the only copy.
         target.remote_context = Some("live preview context".to_string());
@@ -28165,7 +28916,8 @@ console.log('ok');
         let opens = yggterm_core::session_title_store_open_count() - opens_before;
 
         assert_eq!(
-            opens, 0,
+            opens,
+            0,
             "{} targets must reuse the one open resolver; each store wrapper opens a \
              fresh sqlite connection AND re-runs the schema batch",
             targets.len()
@@ -29209,8 +29961,7 @@ console.log('ok');
             title_is_explicit: false,
             storage_path: String::new(),
         };
-        let short_ids =
-            HashMap::from([(session.session_path.clone(), "0000000".to_string())]);
+        let short_ids = HashMap::from([(session.session_path.clone(), "0000000".to_string())]);
 
         let label = remote_scanned_session_label_with_saved_title(&session, &short_ids, None);
         // ⭐ AND IT NAMES THE MACHINE, off the row's OWN path. This read
@@ -29639,12 +30390,10 @@ console.log('ok');
                     summary: vec![],
                     blocks: vec![],
                 },
-                metadata: vec![
-                    SessionMetadataEntry {
-                        label: "Cwd",
-                        value: "/home/user/proj".to_string(),
-                    },
-                ],
+                metadata: vec![SessionMetadataEntry {
+                    label: "Cwd",
+                    value: "/home/user/proj".to_string(),
+                }],
                 terminal_process_id: None,
                 terminal_foreground_active: None,
                 terminal_window_id: None,
@@ -30736,7 +31485,10 @@ console.log('ok');
                  "accelerators": { "insert.terminal": "Ctrl+Shift+Y" } }"#,
         );
         assert_eq!(config.keytip_override("sidebar.toggle"), Some('z'));
-        assert_eq!(config.pinned().get("insert.menu/n/ychrome").copied(), Some(2));
+        assert_eq!(
+            config.pinned().get("insert.menu/n/ychrome").copied(),
+            Some(2)
+        );
         assert_eq!(
             config.accel_override("insert.terminal").map(Chord::display),
             Some("Ctrl+Shift+Y".to_string())
@@ -30929,7 +31681,11 @@ console.log('ok');
 
         // ⚠ And the chord that MOVED says so out loud: `Edit Summary` was
         // re-hinted off `s`, so `ALT,E,S` can never silently mean two things.
-        assert!(items.iter().any(|item| item.id == "edit-summary" && item.hint == Some('y')));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.id == "edit-summary" && item.hint == Some('y'))
+        );
     }
 
     /// The mouse sees ONE page; the keyboard sees the whole tree.
@@ -30952,8 +31708,10 @@ console.log('ok');
             child_page.first().is_some_and(|item| item.label == "Back"),
             "a submenu page leads with the way out"
         );
-        assert!(child_page.iter().any(|item| item.id
-            == format!("{OPEN_SESSION_MENU_ID}/{NEW_AGENT_MENU_PREFIX}claude-code")));
+        assert!(
+            child_page.iter().any(|item| item.id
+                == format!("{OPEN_SESSION_MENU_ID}/{NEW_AGENT_MENU_PREFIX}claude-code"))
+        );
 
         // Back turns to the root; an opener turns to its page. Nothing else in
         // the menu leaves it open.
@@ -31013,6 +31771,7 @@ console.log('ok');
                 row_spawn: true,
             }],
             keytip: String::new(),
+            context_menu: None,
         };
         let remote_only = AppManifest {
             name: "yggdrasil-maker".to_string(),
@@ -31027,6 +31786,7 @@ console.log('ok');
                 row_spawn: true,
             }],
             keytip: String::new(),
+            context_menu: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             apps: vec![local_only],
@@ -31071,7 +31831,10 @@ console.log('ok');
 
         let offered = app_registry_for_row(&shell, &row);
         assert_eq!(
-            offered.iter().map(|app| app.name.as_str()).collect::<Vec<_>>(),
+            offered
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["yggdrasil-maker"],
             "a row on dev must offer dev's apps, never the GUI host's"
         );
@@ -31082,7 +31845,10 @@ console.log('ok');
 
         match terminal_launch_context_for_row(&shell, &row) {
             TerminalLaunchContext::Remote { ssh_target, .. } => {
-                assert_eq!(ssh_target, "dev", "the launch must run on the row's machine");
+                assert_eq!(
+                    ssh_target, "dev",
+                    "the launch must run on the row's machine"
+                );
             }
             other => panic!("expected a remote launch context, got {other:?}"),
         }
@@ -31184,7 +31950,10 @@ console.log('ok');
         // Jump mode starts on the ACTIVE session…
         shell.begin_session_jump();
         assert_eq!(shell.alt_jump_path.as_deref(), Some("local://two"));
-        assert_eq!(shell.session_jump_status().map(|(i, n, _)| (i, n)), Some((2, 2)));
+        assert_eq!(
+            shell.session_jump_status().map(|(i, n, _)| (i, n)),
+            Some((2, 2))
+        );
         // …steps and wraps at the ends…
         assert_eq!(
             shell.navigate_session_jump(1, false).as_deref(),
@@ -31209,10 +31978,16 @@ console.log('ok');
         let keymap = keymap_from_keytip_config(&parse_keytip_config(
             r#"{ "version": 1, "bindings": { "notifications.toggle": "j" } }"#,
         ));
-        assert_eq!(keymap.keytip_for(ShellCommand::ToggleNotifications), Some('j'));
+        assert_eq!(
+            keymap.keytip_for(ShellCommand::ToggleNotifications),
+            Some('j')
+        );
         // …a malformed doc falls back to the preset, never panics.
         let junk = keymap_from_keytip_config(&parse_keytip_config("not json at all"));
-        assert_eq!(junk.keytip_for(ShellCommand::ToggleNotifications), Some('l'));
+        assert_eq!(
+            junk.keytip_for(ShellCommand::ToggleNotifications),
+            Some('l')
+        );
         // …and an unknown command id is dropped by the letters view.
         let unknown = keymap_from_keytip_config(&parse_keytip_config(
             r#"{ "bindings": { "no.such.command": "q" } }"#,
@@ -31623,8 +32398,7 @@ console.log('ok');
         // code re-armed to that move-reported neighbour, hijacking the drag source
         // (the 9/10 wrong-element symptom). A move over a neighbour must never
         // re-arm or start the drag on that neighbour.
-        let mut shell =
-            ShellState::new(test_shell_bootstrap_with_active_session("local://drag-a"));
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://drag-a"));
         let row_a = test_sidebar_row("local://drag-a");
         let row_b = test_sidebar_row("local://drag-b");
 
@@ -31749,11 +32523,15 @@ console.log('ok');
             Some(">_")
         );
         assert_eq!(
-            tree_icon_kind(&test_sidebar_row("/home/user/.codex/sessions/example.jsonl")),
+            tree_icon_kind(&test_sidebar_row(
+                "/home/user/.codex/sessions/example.jsonl"
+            )),
             "session"
         );
         assert_eq!(
-            tree_icon_glyph(&test_sidebar_row("/home/user/.codex/sessions/example.jsonl")),
+            tree_icon_glyph(&test_sidebar_row(
+                "/home/user/.codex/sessions/example.jsonl"
+            )),
             Some(">_")
         );
     }
@@ -32285,12 +33063,8 @@ console.log('ok');
         // An agent's drive lease and its re-materialization claim, exactly as
         // `web ensure` leaves them.
         for path in [session_path, survivor] {
-            shell
-                .web_surfaces
-                .get_mut(path)
-                .expect("seeded")
-                .tabs[0]
-                .lease_until_ms = Some(9_999_999);
+            shell.web_surfaces.get_mut(path).expect("seeded").tabs[0].lease_until_ms =
+                Some(9_999_999);
             shell
                 .web_surface_headless_wanted
                 .insert(path.to_string(), 9_999_999);
@@ -32496,11 +33270,8 @@ console.log('ok');
         seed_web_surface(&mut shell, session_path);
         let row = test_sidebar_row(session_path);
 
-        let (effective, adjustment) = app_control_open_mode_for_row(
-            &shell,
-            &row,
-            WorkspaceViewMode::Rendered,
-        );
+        let (effective, adjustment) =
+            app_control_open_mode_for_row(&shell, &row, WorkspaceViewMode::Rendered);
 
         assert_eq!(effective, WorkspaceViewMode::Terminal);
         assert_eq!(
@@ -32516,11 +33287,8 @@ console.log('ok');
         let mut row = test_sidebar_row(session_path);
         row.session_kind = Some(SessionKind::Codex);
 
-        let (effective, adjustment) = app_control_open_mode_for_row(
-            &shell,
-            &row,
-            WorkspaceViewMode::Rendered,
-        );
+        let (effective, adjustment) =
+            app_control_open_mode_for_row(&shell, &row, WorkspaceViewMode::Rendered);
 
         assert_eq!(effective, WorkspaceViewMode::Rendered);
         assert_eq!(adjustment, None);
@@ -35257,9 +36025,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(
             surface.get("problem").and_then(Value::as_str),
-            Some(
-                "active terminal host shows: saved Codex session no longer on remote machine"
-            )
+            Some("active terminal host shows: saved Codex session no longer on remote machine")
         );
     }
 
@@ -35656,7 +36422,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(surface.get("problem"), Some(&Value::Null));
         assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
         assert_eq!(
-            surface.get("foreground_input_ready").and_then(Value::as_bool),
+            surface
+                .get("foreground_input_ready")
+                .and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -35692,7 +36460,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             Some("active visible terminal is using the background write budget")
         );
         assert_eq!(
-            surface.get("foreground_input_ready").and_then(Value::as_bool),
+            surface
+                .get("foreground_input_ready")
+                .and_then(Value::as_bool),
             Some(true)
         );
 
@@ -35726,7 +36496,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             Some("active visible terminal write budget is too slow")
         );
         assert_eq!(
-            surface.get("foreground_input_ready").and_then(Value::as_bool),
+            surface
+                .get("foreground_input_ready")
+                .and_then(Value::as_bool),
             Some(true)
         );
 
@@ -37012,11 +37784,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // A remount still separates, as it always did.
         assert_ne!(
             bootstrap_skip_dedup_key("existing-lease-skip", identity, 11),
-            bootstrap_skip_dedup_key(
-                "existing-lease-skip",
-                "host:epoch-2:gen-1:activation-0",
-                11
-            ),
+            bootstrap_skip_dedup_key("existing-lease-skip", "host:epoch-2:gen-1:activation-0", 11),
         );
         // The two branches never share a cell.
         assert_ne!(
@@ -37056,7 +37824,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.bump_terminal_mount_epoch_for_session(session_path);
         // Ready once in this host's life, then superseded by a fresh attempt
         // that will never observe anything.
-        shell.terminal_sessions_reached_ready
+        shell
+            .terminal_sessions_reached_ready
             .insert(session_path.to_string());
         shell.begin_terminal_open_attempt(session_path, "req-open", 1, "hot_open_row");
         shell.terminal_resume_ready_paths.remove(session_path);
@@ -37092,7 +37861,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // Running the real tick anyway must change nothing observable — that is
         // what earns the right to skip it.
         let ready_before = shell.terminal_resume_ready_paths.clone();
-        assert_eq!(shell.tick_input_gate_deadline_for_candidate(None, now), None);
+        assert_eq!(
+            shell.tick_input_gate_deadline_for_candidate(None, now),
+            None
+        );
         assert!(shell.input_gate_denied_since_ms.is_empty());
         assert!(shell.input_gate_stuck_reported.is_empty());
         assert_eq!(
@@ -37136,7 +37908,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = shell_with_a_live_host_behind_a_shut_gate(focused);
         // Open the focused row's gate: the tick's only job for it is to remove
         // its own entries, and it has none.
-        shell.terminal_resume_ready_paths.insert(focused.to_string());
+        shell
+            .terminal_resume_ready_paths
+            .insert(focused.to_string());
         assert!(!shell.remote_resume_input_gate_is_shut(focused));
         shell.input_gate_denied_since_ms.clear();
         shell.input_gate_stuck_reported.clear();
@@ -37162,7 +37936,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(shell.input_gate_stuck_reported, reported_before);
 
         // The candidate's OWN clock is still work, and so is the clear-all arm.
-        shell.input_gate_denied_since_ms.insert(focused.to_string(), 1);
+        shell
+            .input_gate_denied_since_ms
+            .insert(focused.to_string(), 1);
         assert!(
             !shell.input_gate_deadline_tick_is_inert(),
             "the focused row's own clock must still be removed"
@@ -37236,7 +38012,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = shell_with_a_live_host_behind_a_shut_gate(session_path);
         // The client's memory of `ready` is what is missing — not the PTY.
         shell.terminal_sessions_reached_ready.remove(session_path);
-        shell.terminal_attach_in_flight.insert(session_path.to_string());
+        shell
+            .terminal_attach_in_flight
+            .insert(session_path.to_string());
         let now = 900_000_u64;
 
         assert!(
@@ -37255,10 +38033,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "first tick arms the clock"
         );
         assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + 1
-            ),
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now + 1),
             Some(session_path.to_string()),
             "2026-08-16: immediate restore — PTY live, no 60s wait"
         );
@@ -37307,10 +38082,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
         assert!(shell.remote_resume_input_gate_is_shut(session_path));
         assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + 1
-            ),
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now + 1),
             Some(session_path.to_string()),
             "2026-08-16: immediate restore — no 5s wait"
         );
@@ -37339,10 +38111,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "first tick arms"
         );
         assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + 1
-            ),
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now + 1),
             Some(session_path.to_string()),
             "2026-08-16: cold+live PTY now restores — no 60s wait"
         );
@@ -37365,10 +38134,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "first tick arms"
         );
         assert_eq!(
-            shell.tick_input_gate_deadline_for_candidate(
-                Some(session_path.to_string()),
-                now + 1
-            ),
+            shell.tick_input_gate_deadline_for_candidate(Some(session_path.to_string()), now + 1),
             Some(session_path.to_string()),
             "2026-08-16: immediate restore — attach_in_flight no longer waits 45s"
         );
@@ -37561,7 +38327,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // The re-assert 600ms later, attach still in flight: reuse, no bump.
         let (epoch, reused, settled) =
             shell.resolve_active_open_mount_epoch(active_session_path, 1_600);
-        assert!(reused, "a settling first attach must be revealed, not remounted");
+        assert!(
+            reused,
+            "a settling first attach must be revealed, not remounted"
+        );
         assert!(!settled);
         assert_eq!(epoch, first_epoch, "no epoch bump while the attach settles");
         // Once the attempt ages past its recovery budget without ready, a
@@ -37601,7 +38370,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // First cold remount bumps the epoch (a genuine first reveal always mounts).
         let (_, reused_first, settled_first) =
             shell.resolve_active_open_mount_epoch(active_session_path, 1_000);
-        assert!(!reused_first && !settled_first, "first cold remount must bump");
+        assert!(
+            !reused_first && !settled_first,
+            "first cold remount must bump"
+        );
         let epoch_after_first = *shell
             .terminal_mount_epochs
             .get(active_session_path)
@@ -37627,7 +38399,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let (settled_epoch, reused, settled) =
             shell.resolve_active_open_mount_epoch(active_session_path, now);
         assert!(settled, "a futile streak must settle instead of remounting");
-        assert!(!reused, "settling reuses the host but is not a genuine live reveal");
+        assert!(
+            !reused,
+            "settling reuses the host but is not a genuine live reveal"
+        );
         assert_eq!(
             settled_epoch, epoch_before_settle,
             "settling reuses the existing epoch — no remount, no re-seed"
@@ -37658,16 +38433,21 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         now += 1_000;
         let (_, reused_live, settled_live) =
             shell.resolve_active_open_mount_epoch(active_session_path, now);
-        assert!(reused_live && !settled_live, "live host reused, streak cleared");
+        assert!(
+            reused_live && !settled_live,
+            "live host reused, streak cleared"
+        );
         assert!(
             !shell
                 .terminal_cold_remount_count
                 .contains_key(active_session_path),
             "streak count cleared when the session becomes retained-live"
         );
-        assert!(!shell
-            .terminal_cold_remount_since_ms
-            .contains_key(active_session_path));
+        assert!(
+            !shell
+                .terminal_cold_remount_since_ms
+                .contains_key(active_session_path)
+        );
     }
     #[test]
     fn retained_host_with_ready_history_is_hot_reusable_on_switch_back() {
@@ -37690,7 +38470,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // Simulate the hidden-host state: not in resume-ready set, and the
         // attempt now carries an empty-surface problem so has_ready_attempt is
         // false. ready_history (ready_at_ms) is sticky and remains.
-        shell.terminal_resume_ready_paths.remove(active_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .remove(active_session_path);
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
             attempt.observations = 1;
             attempt.last_observed_ready = false;
@@ -37729,7 +38511,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "request:rg", 1, "test");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
-        shell.terminal_resume_ready_paths.remove(active_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .remove(active_session_path);
         // Stale spurious recovering attempt from a prior switch's watchdog race.
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
             attempt.state = TerminalOpenAttemptState::Recovering;
@@ -38355,7 +39139,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .split("OffLoopTerminalRpcResult::ResizeApplied { cols, rows } => {")
             .nth(1)
             .and_then(|suffix| {
-                suffix.split("OffLoopTerminalRpcResult::ResizeFailed").next()
+                suffix
+                    .split("OffLoopTerminalRpcResult::ResizeFailed")
+                    .next()
             })
             .expect("resize success apply arm present");
         assert!(
@@ -38524,14 +39310,20 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "recovery {round} within the budget must run"
             );
         }
-        make_stale(&mut shell, u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 1);
+        make_stale(
+            &mut shell,
+            u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 1,
+        );
         assert!(
             !shell.recover_startup_terminal_restore(active_session_path, current_millis()),
             "recovery past the futile cap must be suppressed"
         );
         // Ready proves recovery isn't futile — the budget re-opens.
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
-        make_stale(&mut shell, u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 2);
+        make_stale(
+            &mut shell,
+            u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 2,
+        );
         assert!(
             shell.recover_startup_terminal_restore(active_session_path, current_millis()),
             "reaching Ready must reset the futile-recovery streak"
@@ -39459,8 +40251,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.settings.system_notifications = false;
         shell.settings.notification_sound = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        let attempt_id =
-            shell.begin_terminal_open_attempt(attempted, "req-stale", 3, "open_row");
+        let attempt_id = shell.begin_terminal_open_attempt(attempted, "req-stale", 3, "open_row");
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
             attempt.started_at_ms = current_millis().saturating_sub(1_233_000);
         }
@@ -39649,8 +40440,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             shell.begin_terminal_open_attempt(active_session_path, "req-active", 8, "open_row");
 
         assert!(
-            !shell
-                .cancel_terminal_open_attempt_for_inactive_session(active_session_path, "too eager"),
+            !shell.cancel_terminal_open_attempt_for_inactive_session(
+                active_session_path,
+                "too eager"
+            ),
             "the session being revealed right now is not an abandoned one"
         );
         let attempt = shell
@@ -39737,11 +40530,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
 
         // The inactive-skip cancel fires while another session is active.
-        let cancelled = shell
-            .cancel_terminal_open_attempt_for_inactive_session(
-                session_path,
-                "the reveal was cancelled: this session stopped being the active terminal",
-            );
+        let cancelled = shell.cancel_terminal_open_attempt_for_inactive_session(
+            session_path,
+            "the reveal was cancelled: this session stopped being the active terminal",
+        );
         assert!(
             !cancelled,
             "a live host must not be discarded as 'stopped before its host could mount'"
@@ -39791,9 +40583,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
         shell.bump_terminal_mount_epoch_for_session(session_path);
-        shell.terminal_attach_in_flight.insert(session_path.to_string());
-        let attempt_id =
-            shell.begin_terminal_open_attempt(session_path, "req-watchdog", 7, "retained_fault_recovery");
+        shell
+            .terminal_attach_in_flight
+            .insert(session_path.to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            session_path,
+            "req-watchdog",
+            7,
+            "retained_fault_recovery",
+        );
         // The mount succeeded and the daemon forward streamed meaningful
         // output; fast-ready stays ineligible (no runtime manifest, not
         // prompt-like) — reproducing the measured Pending-with-live-output
@@ -39852,9 +40650,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
         shell.bump_terminal_mount_epoch_for_session(session_path);
-        shell.terminal_attach_in_flight.insert(session_path.to_string());
-        let attempt_id =
-            shell.begin_terminal_open_attempt(session_path, "req-stuck", 8, "retained_fault_recovery");
+        shell
+            .terminal_attach_in_flight
+            .insert(session_path.to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            session_path,
+            "req-stuck",
+            8,
+            "retained_fault_recovery",
+        );
         let started = shell
             .terminal_open_attempts
             .get(&attempt_id)
@@ -39866,10 +40670,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .expect("attempt")
             .started_at_ms = started.saturating_sub(3_600_000);
 
-        let rearm = shell.rearm_stale_retained_fault_recovery(
-            session_path,
-            started + 3_600_000,
-        );
+        let rearm = shell.rearm_stale_retained_fault_recovery(session_path, started + 3_600_000);
         assert!(
             rearm,
             "a stuck attempt with no output still needs the watchdog remount"
@@ -40963,12 +41764,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
         // Arm as HOT.
-        let attempt_id =
-            shell.begin_terminal_open_attempt(session_path, "req-hot", 1, "open_row");
+        let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-hot", 1, "open_row");
         // Force the (session, tier) entry without depending on daemon snapshot.
-        shell
-            .switch_arm_ms_by_session
-            .insert(session_path.to_string(), (current_millis(), SessionWarmthTier::Hot));
+        shell.switch_arm_ms_by_session.insert(
+            session_path.to_string(),
+            (current_millis(), SessionWarmthTier::Hot),
+        );
         // Surface mounted so the attempt is in a meaningful in-flight state.
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
             attempt.state = TerminalOpenAttemptState::Recovering;
@@ -41001,8 +41802,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let session_path = "remote-session://dev/cold-noisy";
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
-        let attempt_id =
-            shell.begin_terminal_open_attempt(session_path, "req-cold", 1, "open_row");
+        let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-cold", 1, "open_row");
         shell.switch_arm_ms_by_session.insert(
             session_path.to_string(),
             (current_millis(), SessionWarmthTier::Cold),
@@ -42071,8 +42871,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // ready: the wedged-resume shape (dev 2026-07-20) where re-clicks
         // logged existing_lease_skip forever.
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
-            attempt.started_at_ms = current_millis()
-                .saturating_sub(TERMINAL_BOOTSTRAP_STALE_ATTACH_RECLAIM_MS + 1_000);
+            attempt.started_at_ms =
+                current_millis().saturating_sub(TERMINAL_BOOTSTRAP_STALE_ATTACH_RECLAIM_MS + 1_000);
             assert!(attempt.ready_at_ms.is_none());
         } else {
             panic!("attempt not recorded");
@@ -43076,11 +43876,23 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(no_title_backoff_ms(1), BACKGROUND_COPY_RETRY_MS * 2); // 10m
         assert_eq!(no_title_backoff_ms(2), BACKGROUND_COPY_RETRY_MS * 4); // 20m
         assert_eq!(no_title_backoff_ms(3), BACKGROUND_COPY_RETRY_MS * 8); // 40m
-        assert_eq!(no_title_backoff_ms(4), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS); // 80m cap
+        assert_eq!(
+            no_title_backoff_ms(4),
+            BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS
+        ); // 80m cap
         // Beyond the cap it stays capped (and never overflows on a huge streak).
-        assert_eq!(no_title_backoff_ms(5), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
-        assert_eq!(no_title_backoff_ms(99), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
-        assert_eq!(no_title_backoff_ms(u32::MAX), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
+        assert_eq!(
+            no_title_backoff_ms(5),
+            BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS
+        );
+        assert_eq!(
+            no_title_backoff_ms(99),
+            BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS
+        );
+        assert_eq!(
+            no_title_backoff_ms(u32::MAX),
+            BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS
+        );
         // The cap is a real reduction vs the flat retry: >= 16x the base interval.
         assert!(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS >= BACKGROUND_COPY_RETRY_MS * 16);
     }
@@ -43095,9 +43907,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.next_live_session_snapshot_after_ms = 0;
         assert!(!live_session_snapshot_retarget_would_fire(&shell, now));
         let before = shell.background_live_session_snapshot_skipped_noop_count;
-        assert!(!retarget_stale_live_session_snapshot_due_if_interval_relaxed(
-            &mut shell, now
-        ));
+        assert!(!retarget_stale_live_session_snapshot_due_if_interval_relaxed(&mut shell, now));
         assert_eq!(
             shell.background_live_session_snapshot_skipped_noop_count, before,
             "predicate false must mean no mutation"
@@ -43108,7 +43918,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // SSOT invariant: retarget fires (and mutates) IFF the predicate was true.
         let predicted = live_session_snapshot_retarget_would_fire(&shell, now);
         let fired = retarget_stale_live_session_snapshot_due_if_interval_relaxed(&mut shell, now);
-        assert_eq!(predicted, fired, "retarget must agree with its peek predicate");
+        assert_eq!(
+            predicted, fired,
+            "retarget must agree with its peek predicate"
+        );
     }
     #[test]
     fn background_copy_snapshot_nudge_preserves_existing_cooldown() {
@@ -43195,7 +44008,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         for kind in [SessionKind::Shell, SessionKind::SshShell] {
             let session = test_managed_conversation_session(kind);
             let provider = conversation_provider_model_for_session(&session);
-            assert_eq!(provider.kind, "none", "{kind:?} must not invent a transcript");
+            assert_eq!(
+                provider.kind, "none",
+                "{kind:?} must not invent a transcript"
+            );
             assert!(provider.read_only);
             assert!(!provider.can_send);
             assert!(
@@ -43558,7 +44374,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         snapshot
     }
 
-    pub(super) fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
+    pub(super) fn test_shell_bootstrap_with_active_session(
+        active_session_path: &str,
+    ) -> ShellBootstrap {
         let active_tree = SessionNode {
             kind: SessionNodeKind::CodexSession,
             name: "test".to_string(),
@@ -44342,8 +45160,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             session_cwd: Some("/home/user".to_string()),
             session_kind: None,
         };
-        let mut expanded_paths =
-            HashSet::from(["local".to_string(), "/".to_string(), "/home/user".to_string()]);
+        let mut expanded_paths = HashSet::from([
+            "local".to_string(),
+            "/".to_string(),
+            "/home/user".to_string(),
+        ]);
 
         assert!(stored_codex_transcript_row_is_visible(
             &row,
@@ -44907,8 +45728,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut start_page_shell = ShellState::new(test_shell_bootstrap_with_start_page());
         start_page_shell.needs_initial_server_sync = false;
         assert_eq!(
-            start_page_shell
-                .daemon_active_desync_push_target(&snapshot),
+            start_page_shell.daemon_active_desync_push_target(&snapshot),
             None
         );
     }
@@ -46258,8 +47078,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .rows
                 .iter()
                 .find(|row| {
-                    normalize_live_session_path(&row.full_path)
-                        == normalize_live_session_path(path)
+                    normalize_live_session_path(&row.full_path) == normalize_live_session_path(path)
                 })
                 .unwrap_or_else(|| panic!("row for {path}"))
         };
@@ -46286,8 +47105,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
         // DESIGN.md: amber, and STEADY — blink means working, and this row is
         // the one thing certainly not working.
-        let amber =
-            live_session_status_dot_style_with_attention(palette(UiTheme::ZedDark), false, false, true);
+        let amber = live_session_status_dot_style_with_attention(
+            palette(UiTheme::ZedDark),
+            false,
+            false,
+            true,
+        );
         assert!(amber.contains("#f59e0b"), "attention dot must be amber");
         let blinking = status_dot_blink_opacity_css(true);
         assert!(
@@ -46465,7 +47288,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .iter()
                 .filter(|row| row.kind == BrowserRowKind::Group)
                 .count();
-            assert!(group_rows > 0, "the remote-cc session must produce a group row");
+            assert!(
+                group_rows > 0,
+                "the remote-cc session must produce a group row"
+            );
             let any_group_busy = snapshot
                 .rows
                 .iter()
@@ -46489,9 +47315,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         local_root.expanded = false;
         snapshot.rows = vec![local_root.clone()];
 
-        let mut agent = test_live_shell_session(
-            "local://52317975-9c66-40ef-8028-901b6415250e",
-        );
+        let mut agent = test_live_shell_session("local://52317975-9c66-40ef-8028-901b6415250e");
         agent.id = "52317975-9c66-40ef-8028-901b6415250e".to_string();
         agent.kind = SessionKind::ClaudeCode;
         agent.host_label = "claude-code".to_string();
@@ -46655,8 +47479,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             let kind = descriptor.kind;
             for (working, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
                 let path = "remote-session://example-host/working-arm";
-                let mut shell =
-                    ShellState::new(test_shell_bootstrap_with_active_session(path));
+                let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(path));
                 let mut session = test_live_shell_session(path);
                 session.id = "working-arm".to_string();
                 session.kind = kind;
@@ -46691,12 +47514,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     .expect("live session row");
                 let busy = sidebar_row_busy_state(&snapshot, row);
                 assert_eq!(
-                    busy.visible,
-                    expected,
+                    busy.visible, expected,
                     "{:?} with working={working:?} rendered {:?}: an agent row's \
                      dot is the daemon's flag, never a screen heuristic",
-                    kind,
-                    busy.reason,
+                    kind, busy.reason,
                 );
                 if expected {
                     assert_eq!(
@@ -49290,7 +50111,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // NEGATIVE 2 — the caller opted in, knowing it fires N submits.
         assert!(!app_control_send_refuses_multiline(true, true, brief));
         // NEGATIVE 3 — the ordinary single-line drive, with and without Enter.
-        assert!(!app_control_send_refuses_multiline(true, false, "/status\r"));
+        assert!(!app_control_send_refuses_multiline(
+            true,
+            false,
+            "/status\r"
+        ));
         assert!(!app_control_send_refuses_multiline(true, false, "/status"));
         assert!(!app_control_send_refuses_multiline(true, false, "\r"));
         // A bare interrupt carries no line break and must still reach a busy agent.
@@ -49784,8 +50609,18 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut snapshot = shell.snapshot();
         snapshot.selected_row = None;
         snapshot.rows = vec![
-            test_browser_session_row(&older_path, "older work", "dev", Some("/home/user/gh/widgets")),
-            test_browser_session_row(&newer_path, "newer work", "dev", Some("/home/user/gh/widgets")),
+            test_browser_session_row(
+                &older_path,
+                "older work",
+                "dev",
+                Some("/home/user/gh/widgets"),
+            ),
+            test_browser_session_row(
+                &newer_path,
+                "newer work",
+                "dev",
+                Some("/home/user/gh/widgets"),
+            ),
         ];
 
         let paths = start_page_recent_rows(&snapshot)
@@ -49852,7 +50687,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         snapshot.rows = vec![
             test_browser_session_row(app_path, "New Ychrome", "local", Some("/home/user")),
             {
-                let mut row = test_browser_session_row(shell_path, "widgets", "local", Some("/home/user"));
+                let mut row =
+                    test_browser_session_row(shell_path, "widgets", "local", Some("/home/user"));
                 row.session_kind = Some(SessionKind::Codex);
                 row
             },
@@ -49891,7 +50727,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         }
         // A kind with no CLI keeps the accent — the solid brand fill is what
         // says "this is an agent session".
-        assert_eq!(session_kind_primary_bg(SessionKind::Shell, "#123456"), "#123456");
+        assert_eq!(
+            session_kind_primary_bg(SessionKind::Shell, "#123456"),
+            "#123456"
+        );
     }
 
     #[test]
@@ -50029,7 +50868,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     remote_binary_expr: None,
                     remote_deploy_state: RemoteDeployState::Ready,
                     health: RemoteMachineHealth::Healthy,
-                    sessions: vec![remote_session("oc", "newer-oc", "/home/user/gh/yggterm", 50)],
+                    sessions: vec![remote_session(
+                        "oc",
+                        "newer-oc",
+                        "/home/user/gh/yggterm",
+                        50,
+                    )],
                 },
             ],
             ssh_targets: Vec::new(),
@@ -50146,7 +50990,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     remote_binary_expr: None,
                     remote_deploy_state: RemoteDeployState::Ready,
                     health: RemoteMachineHealth::Healthy,
-                    sessions: vec![remote_session("practice", "practice-home", "/home/user", 60)],
+                    sessions: vec![remote_session(
+                        "practice",
+                        "practice-home",
+                        "/home/user",
+                        60,
+                    )],
                 },
             ],
             ssh_targets: Vec::new(),
@@ -51096,13 +51945,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             shell.has_job_notification(&notification_key),
             "the job notification exists: a finish now has something to clear"
         );
-        shell.finish_job_notification(
-            &notification_key,
-            NotificationTone::Info,
-            "",
-            "",
-            false,
-        );
+        shell.finish_job_notification(&notification_key, NotificationTone::Info, "", "", false);
         assert!(
             !shell.has_job_notification(&notification_key),
             "cleared — and the twin sees the same emptiness the retain left"
@@ -51566,21 +52409,6 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn effective_install_context_uses_pending_update_version_for_rechecks() {
-        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
-        shell.pending_update_restart = Some(PendingUpdateRestart {
-            version: "2.1.9".to_string(),
-            executable: PathBuf::from("/tmp/yggterm-2.1.9"),
-        });
-        let context = shell.effective_install_context_for_update_check();
-        assert_eq!(context.current_version, "2.1.9");
-        assert_eq!(
-            context.preferred_executable.as_deref(),
-            Some(Path::new("/tmp/yggterm-2.1.9"))
-        );
-    }
-
-    #[test]
     fn pending_restart_from_active_install_state_detects_external_direct_update() {
         let root = std::env::temp_dir().join(format!(
             "yggterm-active-install-restart-{}",
@@ -51670,34 +52498,19 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn apply_update_install_progress_sets_progress_toast_and_cta() {
-        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
-        let progress = ReleaseUpdateInstallProgress {
-            stage: ReleaseUpdateInstallStage::Downloading,
-            percent: 78,
-            detail: "Downloading release archive".to_string(),
-        };
-        apply_update_install_progress(&mut shell, "2.1.9", &progress);
-        assert!(matches!(
-            shell.update_workflow,
-            UpdateWorkflowState::Installing {
-                ref version,
-                stage: ReleaseUpdateInstallStage::Downloading,
-                percent: 78,
-                ..
-            } if version == "2.1.9"
-        ));
-        let cta = shell.update_call_to_action();
-        assert_eq!(cta.mode, "updating");
-        assert_eq!(cta.progress_percent, Some(78));
-        let toast = shell
-            .notifications
-            .iter()
-            .find(|notification| notification.job_key.as_deref() == Some(SELF_UPDATE_JOB_KEY))
-            .expect("expected self-update progress toast");
-        assert_eq!(toast.title, "Updating Yggterm");
-        assert_eq!(toast.progress, Some(0.78));
-        assert!(toast.persistent);
+    fn update_workflow_delegates_release_ownership_to_ynpm() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shell/state.rs"))
+                .expect("read shell source");
+        assert!(source.contains("run_ynpm_self_update"));
+        assert!(
+            source.contains("self-update"),
+            "the shell invokes the ynpm verb"
+        );
+        let retired_gui_updater = ["install_release_update_with_", "progress"].concat();
+        let retired_progress_state = ["UpdateWorkflowState::", "Installing"].concat();
+        assert!(!source.contains(&retired_gui_updater));
+        assert!(!source.contains(&retired_progress_state));
     }
 
     #[test]
@@ -52331,13 +53144,6 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         ));
     }
 
-
-
-
-
-
-
-
     #[test]
     fn app_control_terminal_input_preserves_remote_session_write_path() {
         let remote_path = "remote-session://dev/abc123";
@@ -52385,8 +53191,6 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
 
-
-
     #[test]
     fn active_recovery_snapshot_probe_is_disabled_for_xterm_fidelity() {
         assert!(!active_remote_recovery_snapshot_probe_should_start(
@@ -52424,8 +53228,6 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_recovery_snapshot_probe_key(mount_identity, Some("terminal-open-2"))
         );
     }
-
-
 
     #[test]
     fn remote_retained_surface_fault_invalidates_empty_and_idle_hosts() {
@@ -53381,8 +54183,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     /// frame even when it handles the whole frame correctly.
     #[test]
     fn batch_terminal_chunks_is_a_faithful_pipe_across_chunk_splits() {
-        let raw =
-            "\x1b[?2026h\x1b[H\x1b[32m+ added line\x1b[0m\r\n\x1b[31m- removed\x1b[0m\r\n\x1b[?2026l";
+        let raw = "\x1b[?2026h\x1b[H\x1b[32m+ added line\x1b[0m\r\n\x1b[31m- removed\x1b[0m\r\n\x1b[?2026l";
         for split in 1..raw.len() {
             if !raw.is_char_boundary(split) {
                 continue;
@@ -53856,7 +54657,10 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert_eq!(terminal_input_aware_write_frame_ms(8, active, true), 8);
         // NOT typing → the animation throttle is preserved (spinner coalescing).
         assert_eq!(terminal_input_aware_write_frame_ms(500, active, false), 500);
-        assert_eq!(terminal_input_aware_write_frame_ms(1_000, active, false), 1_000);
+        assert_eq!(
+            terminal_input_aware_write_frame_ms(1_000, active, false),
+            1_000
+        );
     }
     #[test]
     fn terminal_write_bridge_passes_through_partial_frames_for_native_xterm_2026() {
@@ -54245,7 +55049,14 @@ Shared connection to 192.0.2.14 closed.\r\n";
         let now = 10_000_u64;
         // No contribution at all: the apply pass would bail — no write owed.
         assert!(!shell.sidebar_ping_would_change_reactive_state(
-            "local://a", None, None, None, None, None, &empty_reply, now
+            "local://a",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &empty_reply,
+            now
         ));
         shell.upsert_sidebar_contribution(
             "local://a",
@@ -54264,7 +55075,14 @@ Shared connection to 192.0.2.14 closed.\r\n";
         // commands, nothing to refetch (all stamps empty ⇒ no budgets armed).
         assert!(
             !shell.sidebar_ping_would_change_reactive_state(
-                "local://a", None, None, None, None, None, &empty_reply, now
+                "local://a",
+                None,
+                None,
+                None,
+                None,
+                None,
+                &empty_reply,
+                now
             ),
             "a changed-nothing ping must not cost a root render"
         );
@@ -54280,10 +55098,16 @@ Shared connection to 192.0.2.14 closed.\r\n";
             now
         ));
         // A command batch.
-        let with_commands =
-            serde_json::json!({"commands": {"batch_id": "b1", "entries": []}});
+        let with_commands = serde_json::json!({"commands": {"batch_id": "b1", "entries": []}});
         assert!(shell.sidebar_ping_would_change_reactive_state(
-            "local://a", None, None, None, None, None, &with_commands, now
+            "local://a",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &with_commands,
+            now
         ));
         // A due refetch with UNCHANGED stamps: give the contribution a policy
         // stamp whose fetch has not landed — the retry must still dispatch.
@@ -54302,7 +55126,14 @@ Shared connection to 192.0.2.14 closed.\r\n";
         );
         assert!(
             shell.sidebar_ping_would_change_reactive_state(
-                "local://a", None, None, None, None, None, &empty_reply, now
+                "local://a",
+                None,
+                None,
+                None,
+                None,
+                None,
+                &empty_reply,
+                now
             ),
             "an unfetched policy's retry budget must still take the write path"
         );
@@ -54820,7 +55651,6 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert_eq!(remote_resume_overlay_excerpt(&session), None);
     }
 
-
     // XTERM-BUG: cwd-tree-expand-bypass (Bug2) — a live local agent session must not be
     // injected into the cwd tree under a COLLAPSED parent group (it bypasses the
     // stored-row expansion filter). Hidden under a collapsed group, shown under expanded.
@@ -54896,14 +55726,16 @@ Shared connection to 192.0.2.14 closed.\r\n";
         let collapsed = vec![grp("local", 0, true), grp("/home/user", 1, false)];
         let out = inject_cc_sessions_into_stored_rows(&collapsed, &sessions, &index);
         assert!(
-            !out.iter().any(|r| r.session_id.as_deref() == Some("abc123")),
+            !out.iter()
+                .any(|r| r.session_id.as_deref() == Some("abc123")),
             "live session must NOT be injected under a collapsed /home/user"
         );
 
         let expanded = vec![grp("local", 0, true), grp("/home/user", 1, true)];
         let out2 = inject_cc_sessions_into_stored_rows(&expanded, &sessions, &index);
         assert!(
-            out2.iter().any(|r| r.session_id.as_deref() == Some("abc123")),
+            out2.iter()
+                .any(|r| r.session_id.as_deref() == Some("abc123")),
             "live session MUST be injected under an expanded /home/user"
         );
     }
@@ -54989,7 +55821,8 @@ Shared connection to 192.0.2.14 closed.\r\n";
     fn live_rows_in_a_cwd_group_order_by_recency_then_live_sessions_order() {
         let one = live_local_session_fixture("one", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "/w");
         let two = live_local_session_fixture("two", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "/w");
-        let three = live_local_session_fixture("three", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "/w");
+        let three =
+            live_local_session_fixture("three", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "/w");
         let sessions: Vec<&ManagedSessionView> = vec![&one, &two, &three];
         let stored = vec![cwd_group_fixture("local", 0), cwd_group_fixture("/w", 1)];
 
@@ -55012,8 +55845,11 @@ Shared connection to 192.0.2.14 closed.\r\n";
         // With real epochs, recency wins outright — including over the uuid
         // order, which this fixture deliberately points somewhere else.
         let mut scanned = RemoteSessionIndex::default();
-        scanned.last_used_epoch_by_session_id =
-            HashMap::from([("one".into(), 200), ("two".into(), 100), ("three".into(), 300)]);
+        scanned.last_used_epoch_by_session_id = HashMap::from([
+            ("one".into(), 200),
+            ("two".into(), 100),
+            ("three".into(), 300),
+        ]);
         assert_eq!(
             injected_ids(&scanned),
             vec!["three", "one", "two"],
@@ -55369,7 +56205,9 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert!(terminal_chunk_is_daemon_launch_seed(
             "Terminal surface: embedded xterm.js"
         ));
-        assert!(terminal_chunk_is_daemon_launch_seed("Runtime owner: yggterm daemon"));
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Runtime owner: yggterm daemon"
+        ));
         assert!(terminal_chunk_is_daemon_launch_seed(
             "Transport bridge: stdio attach to daemon PTY"
         ));
@@ -55389,8 +56227,12 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert!(!terminal_chunk_is_daemon_launch_seed(
             "• wezterm is installed and available"
         ));
-        assert!(!terminal_chunk_is_daemon_launch_seed("› Explain this codebase"));
-        assert!(!terminal_chunk_is_daemon_launch_seed("$ cargo build --workspace"));
+        assert!(!terminal_chunk_is_daemon_launch_seed(
+            "› Explain this codebase"
+        ));
+        assert!(!terminal_chunk_is_daemon_launch_seed(
+            "$ cargo build --workspace"
+        ));
         assert!(!terminal_chunk_is_daemon_launch_seed(
             "Deploy state ready: pushing to production"
         ));
@@ -56424,7 +57266,12 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-    fn tab(id: u64, label: &str, group_head: Option<u64>, active: bool) -> WebSurfaceOverlayTabView {
+    fn tab(
+        id: u64,
+        label: &str,
+        group_head: Option<u64>,
+        active: bool,
+    ) -> WebSurfaceOverlayTabView {
         WebSurfaceOverlayTabView {
             // The rail fixture builds SILENT tabs; the media cases say so
             // explicitly, so a row that blinks in a layout assertion is a bug
@@ -56434,8 +57281,7 @@ mod webtabs_menu_switcher_locks {
             // A user tab always holds a saved page; the app-tab cases that care
             // build the view themselves and say so.
             holds_saved_page: id != WEB_TAB_APP_TAB_ID,
-            app_home_url: (id == WEB_TAB_APP_TAB_ID)
-                .then(|| "http://127.0.0.1:7717/".to_string()),
+            app_home_url: (id == WEB_TAB_APP_TAB_ID).then(|| "http://127.0.0.1:7717/".to_string()),
             label: label.to_string(),
             is_app_tab: id == WEB_TAB_APP_TAB_ID,
             effective_url: format!("https://example.com/{id}"),
@@ -56490,6 +57336,11 @@ mod webtabs_menu_switcher_locks {
                 })
                 .collect(),
             keytip: String::new(),
+            context_menu: Some(yggterm_core::AppContextMenu {
+                enabled: true,
+                contexts: vec!["workspace".to_string()],
+                verbs: Vec::new(),
+            }),
         }
     }
 
@@ -56511,7 +57362,7 @@ mod webtabs_menu_switcher_locks {
             ),
         ];
 
-        let rows: Vec<String> = app_row_spawn_entries(&apps)
+        let rows: Vec<String> = app_context_menu_entries(&apps, "workspace")
             .into_iter()
             .map(|(_, verb)| verb.label)
             .collect();
@@ -56533,11 +57384,11 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(everywhere.len(), 4);
     }
 
-    /// ⛔ AN OPT-OUT, NEVER AN OPT-IN. Every manifest written before the field
-    /// existed keeps every verb it had — an opt-in would have emptied every row
-    /// menu in the fleet at once, silently.
+    /// ⛔ AN OPT-IN. A manifest written before package context-menu metadata
+    /// existed remains usable in the titlebar/start-page launcher, but it does
+    /// not silently appear in every row menu.
     #[test]
-    fn a_manifest_written_before_the_flag_keeps_all_its_verbs() {
+    fn a_manifest_without_package_context_menu_metadata_is_not_in_row_menu() {
         let manifest: AppManifest = serde_json::from_str(
             r#"{"name":"browser","label":"Browser","binary":"/opt/browser/bin/browser",
                 "verbs":[{"id":"new","label":"New Browser"}]}"#,
@@ -56547,7 +57398,7 @@ mod webtabs_menu_switcher_locks {
             manifest.verbs[0].row_spawn,
             "a verb that says nothing is a row spawn"
         );
-        assert_eq!(app_row_spawn_entries(&[manifest]).len(), 1);
+        assert!(app_context_menu_entries(&[manifest.clone()], "workspace").is_empty());
 
         // ⛔ …and a verb built in CODE agrees with the same verb read from
         // disk. A derived `Default` would make this false, so the one built in
@@ -56564,7 +57415,7 @@ mod webtabs_menu_switcher_locks {
             "monitor",
             &[("open", "Fleet overview", false)],
         )];
-        assert!(app_row_spawn_entries(&apps).is_empty());
+        assert!(app_context_menu_entries(&apps, "workspace").is_empty());
         assert!(libyggterm_app_menu_items(&apps, false).is_empty());
         assert!(
             !app_launcher_entries(&apps).is_empty(),
@@ -57458,8 +58309,7 @@ mod webtabs_menu_switcher_locks {
         let tree = rail_tree_of(&shell);
         shell.end_web_tab_row_drag(&tree);
         assert_eq!(
-            shell.web_surfaces["local://ws"].tabs[0].id,
-            WEB_TAB_APP_TAB_ID,
+            shell.web_surfaces["local://ws"].tabs[0].id, WEB_TAB_APP_TAB_ID,
             "…and it still does after the drop"
         );
     }
@@ -57477,7 +58327,10 @@ mod webtabs_menu_switcher_locks {
         shell.arm_web_tab_row_drag("tab:0".to_string(), "ychrome".to_string(), (0.0, 0.0));
         assert!(shell.row_drag.is_none(), "the app tab is not a drag source");
         assert_eq!(group_head_of(&shell, WEB_TAB_APP_TAB_ID), None);
-        assert_eq!(shell.web_surfaces["local://ws"].tabs[0].id, WEB_TAB_APP_TAB_ID);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].tabs[0].id,
+            WEB_TAB_APP_TAB_ID
+        );
     }
 
     /// Renamable tab rows — the second half of the report. A user-given name
@@ -57500,7 +58353,10 @@ mod webtabs_menu_switcher_locks {
             .expect("the tab")
             .title = Some("Example Domain".to_string());
 
-        let overlay = shell.snapshot().active_web_surface_overlay.expect("overlay");
+        let overlay = shell
+            .snapshot()
+            .active_web_surface_overlay
+            .expect("overlay");
         assert_eq!(
             overlay
                 .tabs
@@ -57518,7 +58374,10 @@ mod webtabs_menu_switcher_locks {
         shell.web_tab_commit_rename("local://ws");
         // (the state layer permits it; the RENDER withholds the gesture — see
         // `the_rail_draws_every_row_with_the_shared_engine` for that half.)
-        assert!(shell.web_tab_rename.is_none(), "a commit always clears the field");
+        assert!(
+            shell.web_tab_rename.is_none(),
+            "a commit always clears the field"
+        );
     }
 
     /// A rename opens on the row's CURRENT name, SELECTED — the first keystroke
@@ -57995,7 +58854,9 @@ mod webtabs_menu_switcher_locks {
         assert!(items.contains("web_tab_group_close_targets(&scope, tab_id)"));
         let apply = function_body(&product, "fn apply_web_tab_menu_action(");
         assert_eq!(
-            apply.matches("web_tab_menu_close_plan(&scope, action)").count(),
+            apply
+                .matches("web_tab_menu_close_plan(&scope, action)")
+                .count(),
             2,
             "both close arms take the plan, and nothing else:\n{apply}"
         );
@@ -58015,7 +58876,10 @@ mod webtabs_menu_switcher_locks {
         );
         // An id no row owns resolves to nothing, rather than to the nearest
         // verb that happens to parse.
-        assert_eq!(web_tab_menu_action(&WebTabMenuTarget::Tab(7), "webtab-nonsense"), None);
+        assert_eq!(
+            web_tab_menu_action(&WebTabMenuTarget::Tab(7), "webtab-nonsense"),
+            None
+        );
 
         let tabs = vec![
             tab(0, "app", None, false),
@@ -58069,10 +58933,8 @@ mod webtabs_menu_switcher_locks {
             .map(|tab| tab.id)
             .collect();
         assert!(
-            !shell.apply_web_tab_menu_action(
-                "local://ws",
-                &WebTabMenuAction::SplitWithActiveTab(2)
-            ),
+            !shell
+                .apply_web_tab_menu_action("local://ws", &WebTabMenuAction::SplitWithActiveTab(2)),
             "a split is not the shell's to run alone — it opens a pane"
         );
         assert_eq!(
@@ -58254,7 +59116,10 @@ mod webtabs_menu_switcher_locks {
 
         let surface = &shell.web_surfaces["local://ws"];
         assert!(
-            surface.tabs.iter().all(|tab| tab.profile == LOCK_FIXTURE_PROFILE),
+            surface
+                .tabs
+                .iter()
+                .all(|tab| tab.profile == LOCK_FIXTURE_PROFILE),
             "every tab of one surface shares one identity"
         );
         assert_eq!(
@@ -58405,21 +59270,13 @@ mod webtabs_menu_switcher_locks {
     fn both_badges_open_the_same_menu_and_differ_only_in_where_it_anchors() {
         let mut shell = shell_with_surface(&[("https://a/", None)]);
 
-        shell.open_web_profile_switcher(
-            "local://ws",
-            WebSurfaceChromeAnchor::Rail,
-            (300.0, 40.0),
-        );
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Rail, (300.0, 40.0));
         let rail = shell
             .snapshot()
             .web_profile_switcher
             .expect("the rail badge opened the dropdown");
 
-        shell.open_web_profile_switcher(
-            "local://ws",
-            WebSurfaceChromeAnchor::Strip,
-            (820.0, 90.0),
-        );
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Strip, (820.0, 90.0));
         let strip = shell
             .snapshot()
             .web_profile_switcher
@@ -58722,7 +59579,8 @@ mod webtabs_menu_switcher_locks {
         // could only invent an empty container — the folder model coming back
         // through the menu.
         assert!(
-            !ids.iter().any(|id| id.contains("new-folder") || id.contains("new-group")),
+            !ids.iter()
+                .any(|id| id.contains("new-folder") || id.contains("new-group")),
             "{ids:?}"
         );
         // A row that heads NOTHING is not a destination: there is no group to
@@ -58736,9 +59594,7 @@ mod webtabs_menu_switcher_locks {
             .find(|item| item.id == "webtab-move-root")
             .expect("Root is a destination on the page");
         assert!(
-            home.disabled
-                && home.label == "Root"
-                && home.reason.as_deref() == Some("already here"),
+            home.disabled && home.label == "Root" && home.reason.as_deref() == Some("already here"),
             "the LABEL is the destination's name; the reason is the tooltip's: {home:?}"
         );
         // The page never carries a tab verb — a submenu that still offered
@@ -58749,7 +59605,11 @@ mod webtabs_menu_switcher_locks {
             "{ids:?}"
         );
         assert_eq!(
-            web_tab_menu_title(&tabs, &WebTabMenuTarget::Tab(1), WebTabMenuPage::MoveToGroup),
+            web_tab_menu_title(
+                &tabs,
+                &WebTabMenuTarget::Tab(1),
+                WebTabMenuPage::MoveToGroup
+            ),
             "Move to group",
             "the heading says which page you are on"
         );
@@ -58766,9 +59626,7 @@ mod webtabs_menu_switcher_locks {
             .find(|item| item.id == "webtab-move:2")
             .expect("its own group is listed");
         assert!(
-            home.disabled
-                && home.label == "Work"
-                && home.reason.as_deref() == Some("already here"),
+            home.disabled && home.label == "Work" && home.reason.as_deref() == Some("already here"),
             "{home:?}"
         );
 
@@ -58777,7 +59635,10 @@ mod webtabs_menu_switcher_locks {
         // draw walk.
         let head_page = move_page_items(&tabs, &WebTabMenuTarget::Tab(2));
         let head_ids: Vec<&str> = head_page.iter().map(|item| item.id.as_str()).collect();
-        assert!(!head_ids.contains(&"webtab-move:2"), "not itself: {head_ids:?}");
+        assert!(
+            !head_ids.contains(&"webtab-move:2"),
+            "not itself: {head_ids:?}"
+        );
         assert!(
             head_ids.contains(&"webtab-move:4"),
             "…but an unrelated group is a real destination: {head_ids:?}"
@@ -58823,7 +59684,6 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-
     // ======================================================================
     // THE MENU'S UX. The user's report was "the right click context menu in
     // the ychrome vertical cwdtree can use some lot of UX polish."
@@ -58834,7 +59694,13 @@ mod webtabs_menu_switcher_locks {
     fn menu_shape(items: &[RowMenuItem]) -> Vec<&str> {
         items
             .iter()
-            .map(|item| if item.separator { "--" } else { item.id.as_str() })
+            .map(|item| {
+                if item.separator {
+                    "--"
+                } else {
+                    item.id.as_str()
+                }
+            })
             .collect()
     }
 
@@ -58881,14 +59747,19 @@ mod webtabs_menu_switcher_locks {
             .position(|item| item.destructive)
             .expect("the menu has destructive verbs");
         assert!(
-            items[first_destructive..].iter().all(|item| item.destructive),
+            items[first_destructive..]
+                .iter()
+                .all(|item| item.destructive),
             "a non-destructive verb must not sit below a destructive one — that \
              is the whole reason the group is last"
         );
         // Every live entry keeps an accelerator, so the ALT layer can reach
         // every verb the mouse can (`build_keytip_scopes` declares exactly the
         // non-disabled ones).
-        for item in items.iter().filter(|item| !item.separator && !item.disabled) {
+        for item in items
+            .iter()
+            .filter(|item| !item.separator && !item.disabled)
+        {
             assert!(item.hint.is_some(), "{} has no accelerator", item.id);
         }
         // …and no two live entries want the same letter, or the §5 ladder has to
@@ -59008,8 +59879,7 @@ mod webtabs_menu_switcher_locks {
             before + 1,
         );
         assert_eq!(
-            shell.web_surfaces["local://ws"].tabs[2].reload_nonce,
-            0,
+            shell.web_surfaces["local://ws"].tabs[2].reload_nonce, 0,
             "…and only at that row"
         );
     }
@@ -59020,13 +59890,8 @@ mod webtabs_menu_switcher_locks {
     #[test]
     fn close_tabs_below_is_scoped_to_the_row_it_was_raised_on() {
         // Rows 2 and 4 sit inside the group headed by row 1.
-        let scope: Vec<WebTabScopeRow> = vec![
-            (0, None),
-            (1, None),
-            (2, Some(1)),
-            (3, None),
-            (4, Some(1)),
-        ];
+        let scope: Vec<WebTabScopeRow> =
+            vec![(0, None), (1, None), (2, Some(1)), (3, None), (4, Some(1))];
         assert_eq!(
             web_tab_close_below_targets(&scope, 1),
             vec![3],
@@ -59106,17 +59971,12 @@ mod webtabs_menu_switcher_locks {
         );
         // The menu says so, in the same words.
         let tabs = vec![tab(0, "app", None, false), tab(1, "kept", None, true)];
-        let label = web_tab_menu_items(
-            &tabs,
-            1,
-            &WebTabMenuTarget::Tab(1),
-            WebTabMenuPage::Root,
-            2,
-        )
-        .into_iter()
-        .find(|item| item.id == "webtab-reopen")
-        .map(|item| item.label)
-        .expect("the verb is drawn");
+        let label =
+            web_tab_menu_items(&tabs, 1, &WebTabMenuTarget::Tab(1), WebTabMenuPage::Root, 2)
+                .into_iter()
+                .find(|item| item.id == "webtab-reopen")
+                .map(|item| item.label)
+                .expect("the verb is drawn");
         assert_eq!(label, "Reopen 2 closed tabs");
 
         let reopened = shell.web_surface_reopen_closed_tabs("local://ws");
@@ -59125,7 +59985,12 @@ mod webtabs_menu_switcher_locks {
         let urls: Vec<&str> = surface.tabs.iter().map(|tab| tab.url.as_str()).collect();
         assert_eq!(
             urls,
-            vec!["https://app.example/", "https://a/", "https://b/", "https://c/"],
+            vec![
+                "https://app.example/",
+                "https://a/",
+                "https://b/",
+                "https://c/"
+            ],
             "back in the slots they were closed from, not appended"
         );
         assert!(
@@ -59141,9 +60006,11 @@ mod webtabs_menu_switcher_locks {
             shell.web_surfaces["local://ws"].closed_tabs.is_empty(),
             "the entry is spent"
         );
-        assert!(shell
-            .web_surface_reopen_closed_tabs("local://ws")
-            .is_empty());
+        assert!(
+            shell
+                .web_surface_reopen_closed_tabs("local://ws")
+                .is_empty()
+        );
     }
 
     /// A blank tab has nothing to reopen, and the stack is BOUNDED — an
@@ -59324,7 +60191,6 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
-
     /// A LABEL IS THE COMMAND'S NAME. Never our justification for dimming it.
     ///
     /// The reason used to be appended to the label, and the user's screenshot is
@@ -59452,7 +60318,11 @@ mod webtabs_menu_switcher_locks {
         // A PAGE label is not a repeat — no row on screen says which page you
         // walked into.
         assert_eq!(
-            web_tab_menu_title(&tabs, &WebTabMenuTarget::Tab(1), WebTabMenuPage::MoveToGroup),
+            web_tab_menu_title(
+                &tabs,
+                &WebTabMenuTarget::Tab(1),
+                WebTabMenuPage::MoveToGroup
+            ),
             "Move to group",
         );
         // Nor is a SURFACE's name: the terminal canvas has no labelled row.
@@ -59464,13 +60334,18 @@ mod webtabs_menu_switcher_locks {
         let snapshot = function_body(&product, "fn snapshot(");
         assert!(
             snapshot.contains("format!(\"{selected_count} selected items\")")
-                && snapshot.contains("} else {\n                    String::new()\n                };"),
+                && snapshot
+                    .contains("} else {\n                    String::new()\n                };"),
             "the tree's single-row menu must carry no heading",
         );
         // A contributed pane's rows are rows too.
         assert!(
-            handler_body(&product, "if let Some(menu) = snapshot.app_pane_context_menu", "menu_title:")
-                .contains("String::new()"),
+            handler_body(
+                &product,
+                "if let Some(menu) = snapshot.app_pane_context_menu",
+                "menu_title:"
+            )
+            .contains("String::new()"),
         );
         // …and the overlay actually SKIPS an empty one rather than drawing a
         // blank band of padding where the heading used to be.
@@ -59532,8 +60407,7 @@ mod webtabs_menu_switcher_locks {
 
     #[test]
     fn duplicate_opens_a_second_tab_on_the_same_url_in_the_same_group() {
-        let mut shell =
-            shell_with_surface(&[("https://head/", None), ("https://a/", Some(1))]);
+        let mut shell = shell_with_surface(&[("https://head/", None), ("https://a/", Some(1))]);
         let new_id = shell
             .web_surface_duplicate_tab("local://ws", 2)
             .expect("the tab was duplicated");
@@ -59628,7 +60502,12 @@ mod webtabs_menu_switcher_locks {
         tab
     }
 
-    fn folder_era_folder(id: &str, name: &str, parent: Option<&str>, collapsed: bool) -> WebTabFolder {
+    fn folder_era_folder(
+        id: &str,
+        name: &str,
+        parent: Option<&str>,
+        collapsed: bool,
+    ) -> WebTabFolder {
         WebTabFolder {
             id: id.to_string(),
             name: name.to_string(),
@@ -59668,11 +60547,11 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(
             group_shape(&tabs),
             vec![
-                (0, None),       // the app tab, always root
-                (1, None),       // Work's head — its folder was at root
-                (2, Some(1)),    // …and Work's other members point at it
-                (4, Some(1)),    // Deep's HEAD joins the OUTSIDE group, Work
-                (5, Some(4)),    // …and Deep's member points at Deep's head
+                (0, None),    // the app tab, always root
+                (1, None),    // Work's head — its folder was at root
+                (2, Some(1)), // …and Work's other members point at it
+                (4, Some(1)), // Deep's HEAD joins the OUTSIDE group, Work
+                (5, Some(4)), // …and Deep's member points at Deep's head
                 (3, Some(1)),
             ],
             "the nesting survives as nesting, and every group is contiguous"
@@ -60134,8 +61013,14 @@ mod webtabs_menu_switcher_locks {
             WebTabOrigin::Opener(0),
             WebTabOrigin::Opener(3),
             WebTabOrigin::Opener(404),
-            WebTabOrigin::Restore { index: 0, group_head: None },
-            WebTabOrigin::Restore { index: 99, group_head: Some(1) },
+            WebTabOrigin::Restore {
+                index: 0,
+                group_head: None,
+            },
+            WebTabOrigin::Restore {
+                index: 99,
+                group_head: Some(1),
+            },
         ] {
             assert!(
                 web_tab_placement(&rows, &origin).index >= 1,
@@ -60158,7 +61043,11 @@ mod webtabs_menu_switcher_locks {
 
         // From a MEMBER: the same group, and the ordinary upward cascade.
         let from_member = web_tab_placement(&rows, &WebTabOrigin::Opener(2));
-        assert_eq!(from_member.group_head, Some(1), "beside its opener, not outside");
+        assert_eq!(
+            from_member.group_head,
+            Some(1),
+            "beside its opener, not outside"
+        );
 
         // From the HEAD: INSIDE the group it heads — the folder header's "+"
         // semantics, on the row that replaced it.
@@ -60173,7 +61062,10 @@ mod webtabs_menu_switcher_locks {
         // From a LOOSE tab: no group is invented. Browsing must not silently
         // create organization the user did not ask for.
         let rows = vec![placement_row(0, None, None), placement_row(1, None, None)];
-        assert_eq!(web_tab_placement(&rows, &WebTabOrigin::Opener(1)).group_head, None);
+        assert_eq!(
+            web_tab_placement(&rows, &WebTabOrigin::Opener(1)).group_head,
+            None
+        );
     }
 
     /// The direction is a PRODUCT decision that differs per app, so it is locked
@@ -60373,9 +61265,9 @@ mod webtabs_menu_switcher_locks {
         assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::opened_by(
             1, false
         )));
-        assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::duplicate_of(
-            1
-        )));
+        assert!(!web_tab_opens_typing_ready(
+            &WebTabOpenRequest::duplicate_of(1)
+        ));
         // An agent's `open_tab` carries a URL, so it never steals the keyboard
         // even when it raises.
         assert!(!web_tab_opens_typing_ready(&WebTabOpenRequest::command(
@@ -60741,11 +61633,7 @@ mod webtabs_menu_switcher_locks {
             "the rail badge must not name an identity the surface has not chosen"
         );
         assert_eq!(snapshot.web_surface_profiles.get("local://ws"), None);
-        picking.open_web_profile_switcher(
-            "local://ws",
-            WebSurfaceChromeAnchor::Rail,
-            (0.0, 0.0),
-        );
+        picking.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Rail, (0.0, 0.0));
         assert!(
             picking.snapshot().web_profile_switcher.is_none(),
             "an undecided surface has nothing to switch FROM"
@@ -60808,10 +61696,7 @@ mod webtabs_menu_switcher_locks {
         // On a surface the rule says nothing about: badge yes, chip no — one
         // identity, one stated difference.
         let mut shell = shell_with_surface(&[("https://a/", None)]);
-        retarget_in_place(
-            &mut shell,
-            yggterm_core::web_profile::WEB_PROFILE_DEFAULT,
-        );
+        retarget_in_place(&mut shell, yggterm_core::web_profile::WEB_PROFILE_DEFAULT);
         let snapshot = shell.snapshot();
         assert_eq!(
             snapshot.active_web_surface_profile.as_deref(),
@@ -60827,7 +61712,10 @@ mod webtabs_menu_switcher_locks {
             Some(LOCK_FIXTURE_PROFILE),
         );
         assert_eq!(
-            snapshot.web_surface_profiles.get("local://ws").map(String::as_str),
+            snapshot
+                .web_surface_profiles
+                .get("local://ws")
+                .map(String::as_str),
             Some(LOCK_FIXTURE_PROFILE),
             "a chosen identity is worth a chip, and it is the SAME string"
         );
@@ -60985,7 +61873,12 @@ mod webtabs_menu_switcher_locks {
         // A rail with room gets the full design width from the same owner, and
         // an unbanded menu is unchanged.
         assert_eq!(
-            context_menu_width(Some(rail_context_menu_band(SidebarEdge::Right, window.0, 400.0, 1.0))),
+            context_menu_width(Some(rail_context_menu_band(
+                SidebarEdge::Right,
+                window.0,
+                400.0,
+                1.0
+            ))),
             CONTEXT_MENU_WIDTH_PX,
         );
         assert_eq!(context_menu_width(None), CONTEXT_MENU_WIDTH_PX);
@@ -61201,10 +62094,8 @@ mod webtabs_menu_switcher_locks {
 
         // 4. And the origin it names really does mean "above the active tab,
         //    cascading, without moving the front".
-        let mut shell = shell_with_surface(&[
-            ("https://a.example/", None),
-            ("https://b.example/", None),
-        ]);
+        let mut shell =
+            shell_with_surface(&[("https://a.example/", None), ("https://b.example/", None)]);
         let active = shell.web_surfaces["local://ws"].tabs[1].id;
         shell.web_surface_select_tab("local://ws", active, WebTabSelect::User);
         let index_of = |shell: &ShellState, id: u64| {
@@ -61548,10 +62439,7 @@ mod webtabs_menu_switcher_locks {
         // The state half: the apply arm must REFUSE to handle it (returning
         // false hands it to the dispatch), while the duplicate itself works.
         assert!(
-            !shell.apply_web_tab_menu_action(
-                "local://ws",
-                &WebTabMenuAction::DuplicateTab(source)
-            ),
+            !shell.apply_web_tab_menu_action("local://ws", &WebTabMenuAction::DuplicateTab(source)),
             "a duplicate needs the Signal to resolve its URL, so the state-only \
              path must hand it on rather than half-finish it"
         );
@@ -61646,7 +62534,8 @@ mod webtabs_menu_switcher_locks {
                 (None, None) => panic!("a menu must anchor from one edge or the other"),
             }
         };
-        let placement = context_menu_placement((143.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(band));
+        let placement =
+            context_menu_placement((143.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(band));
         let width = context_menu_width(Some(band));
         let left = box_left(placement, 1920.0, width);
         assert!(
@@ -61659,8 +62548,12 @@ mod webtabs_menu_switcher_locks {
         // as wide on screen, so the band must halve with it.
         let zoomed = sidebar_context_menu_band(SidebarEdge::Left, 1920.0, 270.0, 0.5);
         assert_eq!(zoomed.right, 135.0, "the band follows the tree ON SCREEN");
-        let zoomed_placement =
-            context_menu_placement((100.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), Some(zoomed));
+        let zoomed_placement = context_menu_placement(
+            (100.0, 300.0),
+            (1920.0, 1080.0),
+            (224.0, 420.0),
+            Some(zoomed),
+        );
         let zoomed_width = context_menu_width(Some(zoomed));
         let zoomed_left = box_left(zoomed_placement, 1920.0, zoomed_width);
         assert!(
@@ -61669,7 +62562,8 @@ mod webtabs_menu_switcher_locks {
         );
         // The negative: over a TERMINAL there is no band and the menu is free to
         // open at the click, spilling over DOM it can legitimately paint on.
-        let unbanded = context_menu_placement((143.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), None);
+        let unbanded =
+            context_menu_placement((143.0, 300.0), (1920.0, 1080.0), (224.0, 420.0), None);
         assert_eq!(
             unbanded.left,
             Some(143.0),
@@ -61695,7 +62589,9 @@ mod webtabs_menu_switcher_locks {
                 "sidebar_panel_card_style(",
                 "sidebar_resize_handle_style(",
             ] {
-                let Some(at) = line.find(helper) else { continue };
+                let Some(at) = line.find(helper) else {
+                    continue;
+                };
                 // The definitions themselves take `edge` as a parameter.
                 if line.trim_start().starts_with("fn ") {
                     continue;
@@ -61719,7 +62615,8 @@ mod webtabs_menu_switcher_locks {
         assert_eq!(
             product
                 .iter()
-                .filter(|line| line.contains("let chrome_orientation = snapshot.settings.chrome_orientation"))
+                .filter(|line| line
+                    .contains("let chrome_orientation = snapshot.settings.chrome_orientation"))
                 .count(),
             1,
             "the workspace render must resolve the mirror exactly once"
@@ -61838,11 +62735,7 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_surface(&[("https://a/", None), ("https://b/", Some(1))]);
         assert!(!shell.has_modal_over_viewport());
 
-        shell.open_web_profile_switcher(
-            "local://ws",
-            WebSurfaceChromeAnchor::Strip,
-            (820.0, 90.0),
-        );
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Strip, (820.0, 90.0));
         assert!(
             shell.has_modal_over_viewport(),
             "a strip-anchored dropdown must stash the page, or it is invisible \
@@ -61869,11 +62762,7 @@ mod webtabs_menu_switcher_locks {
         assert!(!shell.has_modal_over_viewport());
 
         // RAIL anchors: no stash.
-        shell.open_web_profile_switcher(
-            "local://ws",
-            WebSurfaceChromeAnchor::Rail,
-            (1500.0, 40.0),
-        );
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Rail, (1500.0, 40.0));
         assert!(
             !shell.has_modal_over_viewport(),
             "a RAIL dropdown is placed inside DOM chrome; stashing it would flash \
@@ -62119,7 +63008,10 @@ mod webtabs_menu_switcher_locks {
         let mut shell = shell_with_filed_tab();
         shell.toggle_web_tab_overflow();
         shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Rail, (1500.0, 40.0));
-        assert!(shell.has_modal_over_viewport(), "the strip dropdown is the modal");
+        assert!(
+            shell.has_modal_over_viewport(),
+            "the strip dropdown is the modal"
+        );
 
         shell.close_strip_anchored_dropdowns();
         assert!(
@@ -62134,11 +63026,7 @@ mod webtabs_menu_switcher_locks {
 
         // The strip anchor, by contrast, is exactly what this closer is for.
         let mut shell = shell_with_filed_tab();
-        shell.open_web_profile_switcher(
-            "local://ws",
-            WebSurfaceChromeAnchor::Strip,
-            (820.0, 90.0),
-        );
+        shell.open_web_profile_switcher("local://ws", WebSurfaceChromeAnchor::Strip, (820.0, 90.0));
         shell.close_strip_anchored_dropdowns();
         assert!(shell.web_profile_switcher.is_none());
         assert!(!shell.has_modal_over_viewport());
@@ -62224,11 +63112,19 @@ mod webtabs_menu_switcher_locks {
 
         // 100% is the identity, so nothing about the default host moved…
         assert_eq!(
-            rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, ui_zoom_factor(14.0)),
+            rail_context_menu_band(
+                SidebarEdge::Right,
+                window.0,
+                rail_width,
+                ui_zoom_factor(14.0)
+            ),
             unzoomed,
         );
         // …and a nonsense zoom cannot mint a zero-width band.
-        assert_eq!(rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 0.0), unzoomed);
+        assert_eq!(
+            rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, 0.0),
+            unzoomed
+        );
         assert_eq!(
             rail_context_menu_band(SidebarEdge::Right, window.0, rail_width, f64::NAN),
             unzoomed
@@ -62236,7 +63132,8 @@ mod webtabs_menu_switcher_locks {
         // The narrowest rail at the lowest zoom still holds a real menu: 240 ×
         // 0.5 = 120 on screen, 96 after the margins, which is where the floor is
         // set — so the floor never bites and the box never crosses the band.
-        let narrowest = rail_context_menu_band(SidebarEdge::Right, window.0, RAIL_MIN_WIDTH as f64, zoom);
+        let narrowest =
+            rail_context_menu_band(SidebarEdge::Right, window.0, RAIL_MIN_WIDTH as f64, zoom);
         let narrow_width = context_menu_width(Some(narrowest));
         assert_eq!(narrow_width, CONTEXT_MENU_MIN_BAND_WIDTH_PX);
         let (left, right) = drawn_x(
@@ -62310,7 +63207,8 @@ mod webtabs_menu_switcher_locks {
         // The consequence: on a scale-2 host a click at the CSS right edge still
         // flips to a right anchor and still lands inside the rail.
         let window = window_css_size((2560.0, 1600.0), 2.0);
-        let band = rail_context_menu_band(SidebarEdge::Right, window.0, SIDE_RAIL_WIDTH as f64, 1.0);
+        let band =
+            rail_context_menu_band(SidebarEdge::Right, window.0, SIDE_RAIL_WIDTH as f64, 1.0);
         let width = context_menu_width(Some(band));
         let placement = context_menu_placement(
             (window.0 - 8.0, 700.0),
@@ -62332,7 +63230,12 @@ mod webtabs_menu_switcher_locks {
             (window.0 - 8.0, 700.0),
             (2560.0, 1600.0),
             (width, CONTEXT_MENU_HEIGHT_PX),
-            Some(rail_context_menu_band(SidebarEdge::Right, 2560.0, SIDE_RAIL_WIDTH as f64, 1.0)),
+            Some(rail_context_menu_band(
+                SidebarEdge::Right,
+                2560.0,
+                SIDE_RAIL_WIDTH as f64,
+                1.0,
+            )),
         );
         assert!(
             unconverted.left.expect("no flip happened") > window.0,
@@ -62543,7 +63446,6 @@ mod webtabs_menu_switcher_locks {
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
 }
-
 
 /// ⚠ MENU DISMISSAL LOCKS — "context menus must die properly".
 ///
@@ -62859,7 +63761,10 @@ mod menu_dismissal_locks {
             top_menu_of(true, true, true, true),
             Some(ShellMenu::WebProfile)
         );
-        assert_eq!(top_menu_of(false, true, true, true), Some(ShellMenu::WebTab));
+        assert_eq!(
+            top_menu_of(false, true, true, true),
+            Some(ShellMenu::WebTab)
+        );
         assert_eq!(top_menu_of(false, false, true, true), Some(ShellMenu::Row));
         assert_eq!(
             top_menu_of(false, false, false, true),
@@ -63011,7 +63916,9 @@ mod menu_dismissal_locks {
         let product = product_source();
         let bridge = function_body(&product, "fn keytip_apply_bridge_message(");
         assert!(
-            bridge.contains("if let Some(chord) = msg.get(\"chord\").and_then(|value| value.as_str())"),
+            bridge.contains(
+                "if let Some(chord) = msg.get(\"chord\").and_then(|value| value.as_str())"
+            ),
             "the dispatcher must handle the chord message it is sent:\n{bridge}"
         );
         assert!(
@@ -63300,9 +64207,9 @@ mod menu_dismissal_locks {
             "the anchor: the wire enum still carries the OPEN event"
         );
         assert!(
-            !protocol_product
-                .iter()
-                .any(|line| line.contains("ContextMenuClose") || line.contains("context_menu_close")),
+            !protocol_product.iter().any(
+                |line| line.contains("ContextMenuClose") || line.contains("context_menu_close")
+            ),
             "…including the wire enum it was decoded through"
         );
     }
@@ -63317,10 +64224,8 @@ mod menu_dismissal_locks {
     /// page. Drop the emptiness gate in the snapshot and this goes red.
     #[test]
     fn an_empty_web_tab_menu_renders_nothing_at_all() {
-        let mut shell = super::webtabs_menu_switcher_locks::shell_with_surface(&[(
-            "https://a/",
-            None,
-        )]);
+        let mut shell =
+            super::webtabs_menu_switcher_locks::shell_with_surface(&[("https://a/", None)]);
         shell.open_web_tab_context_menu(
             "local://ws",
             WebTabMenuTarget::Tab(1),
@@ -64093,8 +64998,11 @@ mod keytips_inversion_locks {
     #[test]
     fn derived_letters_come_from_the_one_ladder_and_exclude_registry_letters() {
         let tree = build_keytip_tree(&KeymapConfig::default(), &[], &[]);
-        let root_tips: std::collections::BTreeSet<String> =
-            tree.tips_at("").expect("root resolves").into_iter().collect();
+        let root_tips: std::collections::BTreeSet<String> = tree
+            .tips_at("")
+            .expect("root resolves")
+            .into_iter()
+            .collect();
         assert!(
             root_tips.contains("b"),
             "fixture sanity: sidebar.toggle's 'b' is a root registry letter"
@@ -64108,21 +65016,31 @@ mod keytips_inversion_locks {
         let first = derive_keytips_for_elements(&root_claimed, &elements);
         let second = derive_keytips_for_elements(&root_claimed, &elements);
         assert_eq!(first, second, "invariant 1: same input, same letters");
-        assert_eq!(first.len(), 3, "every element gets a letter while the pool lasts");
+        assert_eq!(
+            first.len(),
+            3,
+            "every element gets a letter while the pool lasts"
+        );
         let mut seen = std::collections::BTreeSet::new();
         for (id, tip) in &first {
             assert!(
                 !root_tips.contains(tip),
                 "derived tip `{tip}` for {id} shadows a declared root letter"
             );
-            assert!(seen.insert(tip.clone()), "derived tip `{tip}` assigned twice");
+            assert!(
+                seen.insert(tip.clone()),
+                "derived tip `{tip}` assigned twice"
+            );
         }
         // The ladder's title step, observable: "Brightness" wants 'b', the
         // registry owns 'b' (sidebar.toggle), so it falls to the NEXT title
         // letter — 'r' (free at root forever: reserved letters are barred to
         // shell chrome by invariant 4, and derivation may use them).
         assert_eq!(first[0].0, "d0");
-        assert_eq!(first[0].1, "r", "Brightness: b taken -> next title letter r");
+        assert_eq!(
+            first[0].1, "r",
+            "Brightness: b taken -> next title letter r"
+        );
         // Same-title collision inside the derivation, isolated from the live
         // registry: no claimed letters, two identical labels — the second
         // claimant ladders past the first's letter instead of colliding.
@@ -64142,10 +65060,14 @@ mod keytips_inversion_locks {
         // An unresolvable chord prefix derives nothing rather than guessing a
         // scope — the claimed set has ONE owner (`apply_derived_keytips`) and it
         // refuses when the tree cannot answer.
-        assert!(tree.tips_at("zz").is_none(), "fixture sanity: 'zz' is not a path");
+        assert!(
+            tree.tips_at("zz").is_none(),
+            "fixture sanity: 'zz' is not a path"
+        );
         let apply = function_body(&product_source(), "fn apply_derived_keytips(");
         assert!(
-            apply.contains("tips_at(&shell.alt_overlay_sequence)") && apply.contains("None => return"),
+            apply.contains("tips_at(&shell.alt_overlay_sequence)")
+                && apply.contains("None => return"),
             "an unresolvable scope must derive nothing rather than guess:\n{apply}"
         );
     }
@@ -64285,8 +65207,9 @@ mod keytips_inversion_locks {
             "the surface tick runs the one walk in derive mode"
         );
         assert!(
-            ALT_TAP_LISTENER_JS_TEMPLATE
-                .contains("window.__yggtermAltTapSend({ derive: report.derive, scope: report.scope });"),
+            ALT_TAP_LISTENER_JS_TEMPLATE.contains(
+                "window.__yggtermAltTapSend({ derive: report.derive, scope: report.scope });"
+            ),
             "the report rides the SAME sender as every other bridge message"
         );
         let product = product_source();
@@ -64301,8 +65224,7 @@ mod keytips_inversion_locks {
         );
         let apply = function_body(&product, "fn apply_derived_keytips(");
         assert!(
-            apply.contains("derive_keytips_for_elements(")
-                && apply.contains("data-keytip-tip"),
+            apply.contains("derive_keytips_for_elements(") && apply.contains("data-keytip-tip"),
             "the applier assigns through the seam and stamps the painter's attribute:\n{apply}"
         );
         let seam = function_body(&product, "fn derive_keytips_for_elements(");
@@ -64432,7 +65354,10 @@ mod keytips_inversion_locks {
         let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://active");
         let mut shell = ShellState::new(bootstrap);
         shell.activate_alt_overlay();
-        assert_eq!(shell.alt_overlay_modal_scope, None, "no dialog, no modal scope");
+        assert_eq!(
+            shell.alt_overlay_modal_scope, None,
+            "no dialog, no modal scope"
+        );
         shell.descend_alt_overlay_into_modal("delete");
         assert!(shell.alt_overlay_active);
         assert_eq!(shell.alt_overlay_modal_scope.as_deref(), Some("delete"));
@@ -64452,7 +65377,10 @@ mod keytips_inversion_locks {
     #[test]
     fn every_dialog_declares_one_keyboard_mode_and_forms_take_the_focus() {
         // The mode is a column of the one table, not a list somewhere else.
-        assert_eq!(TopModal::ThemeEditor.keyboard_mode(), ModalKeyboardMode::Form);
+        assert_eq!(
+            TopModal::ThemeEditor.keyboard_mode(),
+            ModalKeyboardMode::Form
+        );
         assert_eq!(TopModal::CopyEdit.keyboard_mode(), ModalKeyboardMode::Form);
         assert_eq!(
             TopModal::KeymapEditor.keyboard_mode(),
@@ -64536,16 +65464,20 @@ mod keytips_inversion_locks {
             "a form dialog must take the keyboard from the tick that can see it"
         );
         assert!(
-            ALT_TAP_LISTENER_JS_TEMPLATE.contains("if (active && root.contains(active)) { return; }"),
+            ALT_TAP_LISTENER_JS_TEMPLATE
+                .contains("if (active && root.contains(active)) { return; }"),
             "…and must not steal focus back from a control inside the dialog"
         );
         assert!(
-            ALT_TAP_LISTENER_JS_TEMPLATE.contains("root.querySelector('[data-yggterm-modal-autofocus]')")
+            ALT_TAP_LISTENER_JS_TEMPLATE
+                .contains("root.querySelector('[data-yggterm-modal-autofocus]')")
                 && ALT_TAP_LISTENER_JS_TEMPLATE.contains("__yggtermFormTabbables"),
             "the head is the dialog's declared one, else the first stop in the ONE focus order"
         );
         assert!(
-            !product.iter().any(|line| line.contains("fn focus_form_dialog(")),
+            !product
+                .iter()
+                .any(|line| line.contains("fn focus_form_dialog(")),
             "the Rust focus helper is gone — one owner, the bridge"
         );
         // Clause 2: the trap. Tab inside a dialog never leaves it.
@@ -64565,7 +65497,9 @@ mod keytips_inversion_locks {
         // UP, so a dialog's ALT layer never eats its own Tab/arrows. Two call
         // sites, one owner.
         assert_eq!(
-            ALT_TAP_LISTENER_JS_TEMPLATE.matches("dialogFocusStep(").count(),
+            ALT_TAP_LISTENER_JS_TEMPLATE
+                .matches("dialogFocusStep(")
+                .count(),
             3,
             "one definition and BOTH entry points (badges up, badges down)"
         );
@@ -64574,7 +65508,8 @@ mod keytips_inversion_locks {
         // it.
         assert!(
             ALT_TAP_LISTENER_JS_TEMPLATE.contains("markKeynavFocus(root)")
-                && FORM_DIALOG_FOCUS_CSS.contains("[data-yggterm-modal-root][data-keynav=\"1\"] :focus")
+                && FORM_DIALOG_FOCUS_CSS
+                    .contains("[data-yggterm-modal-root][data-keynav=\"1\"] :focus")
                 && FORM_DIALOG_FOCUS_CSS.contains("!important"),
             "the focus indicator must survive programmatic focus AND inline outline:none"
         );
@@ -64589,7 +65524,9 @@ mod keytips_inversion_locks {
             );
         }
         assert!(
-            product.iter().any(|line| line.contains("\"data-keynav-item\": \"stop-{index}\"")),
+            product
+                .iter()
+                .any(|line| line.contains("\"data-keynav-item\": \"stop-{index}\"")),
             "a group's items must be marked, or arrows have nothing to walk"
         );
         // Clause 5: the ring exists and is scoped to dialogs, per DESIGN.md.
@@ -64633,8 +65570,12 @@ mod keytips_inversion_locks {
         ] {
             let at = product
                 .iter()
-                .position(|line| line.contains(&format!("\"data-yggterm-start-action\": \"{action}\"")))
-                .unwrap_or_else(|| panic!("the `{action}` card button moved — move this lock with it"));
+                .position(|line| {
+                    line.contains(&format!("\"data-yggterm-start-action\": \"{action}\""))
+                })
+                .unwrap_or_else(|| {
+                    panic!("the `{action}` card button moved — move this lock with it")
+                });
             assert!(
                 product[at + 1].contains("\"data-keytip-exempt\": \"list-item\""),
                 "`{action}` is a per-row affordance of an unbounded list (§8) and must \
@@ -64652,7 +65593,9 @@ mod keytips_inversion_locks {
         let product = product_source();
         let owner = function_body(&product, "fn keytip_declared_badges_active(");
         assert!(
-            owner.contains("snapshot.alt_overlay_active && snapshot.alt_overlay_modal_scope.is_none()"),
+            owner.contains(
+                "snapshot.alt_overlay_active && snapshot.alt_overlay_modal_scope.is_none()"
+            ),
             "declared badges paint only when the layer is up AND no dialog owns it:\n{owner}"
         );
         // Every declared-badge reader goes through that owner — the attr helper
@@ -64967,7 +65910,9 @@ mod media_capture_locks {
         let product = product_source();
         let body = function_body(&product, "fn resolve_media_capture_dialog(");
         let resolve_at = body
-            .find("desktop.resolve_web_surface_media_permission(dialog.request_id, answer.allows());")
+            .find(
+                "desktop.resolve_web_surface_media_permission(dialog.request_id, answer.allows());",
+            )
             .expect("the dialog no longer answers the parked engine request at all");
         let persist_at = body
             .find("let url = app_media_permission_url(&control_url);")
@@ -65266,7 +66211,10 @@ mod media_capture_locks {
             MediaCaptureAnswer::from_wire("block"),
             Some(MediaCaptureAnswer::BlockSite),
         );
-        assert_eq!(MediaCaptureAnswer::from_wire(" allow "), Some(MediaCaptureAnswer::Allow));
+        assert_eq!(
+            MediaCaptureAnswer::from_wire(" allow "),
+            Some(MediaCaptureAnswer::Allow)
+        );
         for word in ["", "yes", "ok", "grant", "allow-always", "DENY"] {
             assert_eq!(
                 MediaCaptureAnswer::from_wire(word),
@@ -65292,7 +66240,10 @@ mod media_capture_locks {
             "if self.settings.system_notifications {",
             "if self.settings.notification_sound && !options.silent {",
         ] {
-            assert!(body.contains(needle), "the notification fan-out lost `{needle}`");
+            assert!(
+                body.contains(needle),
+                "the notification fan-out lost `{needle}`"
+            );
         }
         // ⛔ `silent` may only SUPPRESS. There must be no path that turns sound ON
         // for a user who turned it off.
@@ -65428,9 +66379,18 @@ mod media_capture_locks {
         );
         let joined = product.join("\n");
         for (call, source) in [
-            ("MediaCaptureAnswer::DenyOnce,\n                    \"keyboard_dismiss\",", "Escape"),
-            ("answer,\n                                    \"dialog_click\",", "the dialog buttons"),
-            ("parsed,\n                            \"app_control\",", "the control plane"),
+            (
+                "MediaCaptureAnswer::DenyOnce,\n                    \"keyboard_dismiss\",",
+                "Escape",
+            ),
+            (
+                "answer,\n                                    \"dialog_click\",",
+                "the dialog buttons",
+            ),
+            (
+                "parsed,\n                            \"app_control\",",
+                "the control plane",
+            ),
         ] {
             assert!(
                 joined.contains(call),
@@ -65468,9 +66428,9 @@ mod resume_gate_wiring_locks {
     }
 
     fn slice_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        let from = source
-            .find(start)
-            .unwrap_or_else(|| panic!("anchor `{start}` is gone — the wiring it names was removed"));
+        let from = source.find(start).unwrap_or_else(|| {
+            panic!("anchor `{start}` is gone — the wiring it names was removed")
+        });
         let rest = &source[from..];
         let to = rest
             .find(end)
@@ -65826,9 +66786,9 @@ mod terminal_loop_input_starvation_locks {
         let spawn_at = start_branch
             .find("tokio::spawn(")
             .expect("the read-poll branch must dispatch the read onto its own task");
-        let read_at = start_branch.find("terminal_read_async(").expect(
-            "the read-poll branch must still perform the daemon read",
-        );
+        let read_at = start_branch
+            .find("terminal_read_async(")
+            .expect("the read-poll branch must still perform the daemon read");
         assert!(
             spawn_at < read_at,
             "terminal_read_async must sit INSIDE the spawned task. Awaiting it \
@@ -66109,7 +67069,9 @@ mod preview_refresh_render_loop_locks {
              written, so the branch re-enters on every pass"
         );
         assert!(
-            !source.contains("set_signal_if_changed(last_preview_refresh_marker, None);\n        } else {"),
+            !source.contains(
+                "set_signal_if_changed(last_preview_refresh_marker, None);\n        } else {"
+            ),
             "the no-target preview branch erases its marker again. That is half \
              of the 43.9/s render loop: a stored `None` can never equal an \
              incoming `Some`, so the guard above it is inert"
@@ -66121,7 +67083,9 @@ mod preview_refresh_render_loop_locks {
     fn the_preview_scheduler_is_asked_before_the_state_is_marked_dirty() {
         let source = scanned();
         let takers = source.matches("state.with_mut_counted(|shell| {\n                    shell.record_preview_issue_telemetry").count();
-        let guards = source.matches("can_schedule_remote_preview_sync(&shell, &session.session_path)").count();
+        let guards = source
+            .matches("can_schedule_remote_preview_sync(&shell, &session.session_path)")
+            .count();
         assert_eq!(
             takers, 2,
             "the preview-refresh effect's mutable-borrow sites changed shape; \
@@ -66147,7 +67111,9 @@ mod preview_refresh_render_loop_locks {
                 .find("fn can_schedule_remote_preview_sync(")
                 .expect("the precheck is gone — the locks above now guard nothing");
             let rest = &source[from..];
-            let to = rest.find("\nfn ").expect("the precheck has no following item");
+            let to = rest
+                .find("\nfn ")
+                .expect("the precheck has no following item");
             &rest[..to]
         };
         assert!(
@@ -66178,55 +67144,55 @@ mod live_md_edit_tests {
 
     #[test]
     fn live_line_kind_reads_the_complete_forms_only() {
-    use super::*;
-    // `#` alone is NOT a heading — the space is what completes the form,
-    // which is the user's `#` + space reveal moment.
-    assert_eq!(live_line_kind("#"), (LiveLineKind::Text, 0));
-    assert_eq!(live_line_kind("# "), (LiveLineKind::Heading, 2));
-    assert_eq!(live_line_kind("### Title"), (LiveLineKind::Heading, 4));
-    assert_eq!(live_line_kind("####No space"), (LiveLineKind::Text, 0));
-    assert_eq!(live_line_kind("#七个字"), (LiveLineKind::Text, 0)); // no space after hashes
-    assert_eq!(live_line_kind("- item"), (LiveLineKind::Bullet, 2));
-    assert_eq!(live_line_kind("1. ordered"), (LiveLineKind::Ordered, 3));
-    assert_eq!(live_line_kind("- [ ] open"), (LiveLineKind::Task, 6));
-    assert_eq!(live_line_kind("- [x] done"), (LiveLineKind::Task, 6));
-    assert_eq!(live_line_kind("> quoted"), (LiveLineKind::Quote, 1));
-    assert_eq!(live_line_kind("plain text"), (LiveLineKind::Text, 0));
-    // Indented forms still classify; the prefix length carries the indent.
-    assert_eq!(live_line_kind("  - nested"), (LiveLineKind::Bullet, 4));
-    assert_eq!(live_line_kind(""), (LiveLineKind::Text, 0));
+        use super::*;
+        // `#` alone is NOT a heading — the space is what completes the form,
+        // which is the user's `#` + space reveal moment.
+        assert_eq!(live_line_kind("#"), (LiveLineKind::Text, 0));
+        assert_eq!(live_line_kind("# "), (LiveLineKind::Heading, 2));
+        assert_eq!(live_line_kind("### Title"), (LiveLineKind::Heading, 4));
+        assert_eq!(live_line_kind("####No space"), (LiveLineKind::Text, 0));
+        assert_eq!(live_line_kind("#七个字"), (LiveLineKind::Text, 0)); // no space after hashes
+        assert_eq!(live_line_kind("- item"), (LiveLineKind::Bullet, 2));
+        assert_eq!(live_line_kind("1. ordered"), (LiveLineKind::Ordered, 3));
+        assert_eq!(live_line_kind("- [ ] open"), (LiveLineKind::Task, 6));
+        assert_eq!(live_line_kind("- [x] done"), (LiveLineKind::Task, 6));
+        assert_eq!(live_line_kind("> quoted"), (LiveLineKind::Quote, 1));
+        assert_eq!(live_line_kind("plain text"), (LiveLineKind::Text, 0));
+        // Indented forms still classify; the prefix length carries the indent.
+        assert_eq!(live_line_kind("  - nested"), (LiveLineKind::Bullet, 4));
+        assert_eq!(live_line_kind(""), (LiveLineKind::Text, 0));
     }
 
     #[test]
     fn live_inline_segments_toggle_and_keep_markers() {
-    use super::*;
-    let segs = live_inline_segments("a **bold** b");
-    assert_eq!(
-        segs,
-        vec![
-            LiveSeg::Plain("a ".into()),
-            LiveSeg::Marker("**".into()),
-            LiveSeg::Strong("bold".into()),
-            LiveSeg::Marker("**".into()),
-            LiveSeg::Plain(" b".into()),
-        ]
-    );
-    // Code spans: the backticks are markers, the body is Code.
-    let segs = live_inline_segments("x `y` z");
-    assert!(matches!(segs[1], LiveSeg::Marker(ref m) if m == "`"));
-    assert!(matches!(segs[2], LiveSeg::Code(ref t) if t == "y"));
-    // Emphasis with `_`.
-    let segs = live_inline_segments("_soft_");
-    assert!(matches!(segs[1], LiveSeg::Em(ref t) if t == "soft"));
+        use super::*;
+        let segs = live_inline_segments("a **bold** b");
+        assert_eq!(
+            segs,
+            vec![
+                LiveSeg::Plain("a ".into()),
+                LiveSeg::Marker("**".into()),
+                LiveSeg::Strong("bold".into()),
+                LiveSeg::Marker("**".into()),
+                LiveSeg::Plain(" b".into()),
+            ]
+        );
+        // Code spans: the backticks are markers, the body is Code.
+        let segs = live_inline_segments("x `y` z");
+        assert!(matches!(segs[1], LiveSeg::Marker(ref m) if m == "`"));
+        assert!(matches!(segs[2], LiveSeg::Code(ref t) if t == "y"));
+        // Emphasis with `_`.
+        let segs = live_inline_segments("_soft_");
+        assert!(matches!(segs[1], LiveSeg::Em(ref t) if t == "soft"));
     }
 
     #[test]
     fn live_line_has_open_form_refuses_unclosed_markers() {
-    use super::*;
-    assert!(!live_line_has_open_form("**closed**"));
-    assert!(live_line_has_open_form("**still open"));
-    assert!(live_line_has_open_form("a `tick"));
-    assert!(!live_line_has_open_form("no markers at all"));
+        use super::*;
+        assert!(!live_line_has_open_form("**closed**"));
+        assert!(live_line_has_open_form("**still open"));
+        assert!(live_line_has_open_form("a `tick"));
+        assert!(!live_line_has_open_form("no markers at all"));
     }
 }
 
@@ -66343,7 +67309,14 @@ mod web_surface_immersion_locks {
             .map(|(index, _)| index + 1)
             .collect();
         for idx in leaked.iter().take(6) {
-            println!("LEAK idx={} line={:?}", idx + 1, source.lines().nth(*idx).map(|l| l.chars().take(80).collect::<String>()));
+            println!(
+                "LEAK idx={} line={:?}",
+                idx + 1,
+                source
+                    .lines()
+                    .nth(*idx)
+                    .map(|l| l.chars().take(80).collect::<String>())
+            );
         }
         assert!(
             leaked.is_empty(),
@@ -66527,7 +67500,12 @@ mod web_surface_immersion_locks {
         // decides", not "always dark".
         assert_eq!(web_surface_seam_css(Some("#ffffff")), "#ffffff");
         // Nothing said yet, or something this cannot honestly reproduce.
-        for unsaid in [None, Some("oklch(0.2 0 0)"), Some("rebeccapurple"), Some("")] {
+        for unsaid in [
+            None,
+            Some("oklch(0.2 0 0)"),
+            Some("rebeccapurple"),
+            Some(""),
+        ] {
             let (r, g, b) = web_surface_seam_rgb(unsaid);
             assert_eq!(
                 (r, g, b),
@@ -66621,7 +67599,11 @@ mod web_surface_immersion_locks {
             for junk in ["bottom", "", "TOP", "player"] {
                 for auto_hide_titlebar in [false, true] {
                     assert_eq!(
-                        web_surface_edge_motion_reveal_target(junk, auto_hide_titlebar, orientation),
+                        web_surface_edge_motion_reveal_target(
+                            junk,
+                            auto_hide_titlebar,
+                            orientation
+                        ),
                         None,
                         "an edge name this shell cannot place ({junk:?}) must reveal NOTHING — \
                          flashing the titlebar for it is chrome the user never went near"
@@ -66865,7 +67847,12 @@ mod web_surface_immersion_locks {
         }
         // The eval SAMPLES, it does not decide: the page rect is reported raw
         // in every posture — a revealed titlebar must NOT clamp it here.
-        for scenario in ["collapsed", "revealed_hover", "revealed_pinned", "under_glass"] {
+        for scenario in [
+            "collapsed",
+            "revealed_hover",
+            "revealed_pinned",
+            "under_glass",
+        ] {
             assert_eq!(
                 results[scenario]["pages"]["ws"],
                 json!([0, 0, 1920, 1080]),
@@ -66886,15 +67873,19 @@ mod web_surface_immersion_locks {
     fn the_geometry_eval_keeps_its_revealed_gate() {
         let js = WEB_SURFACE_GEOMETRY_EVAL_JS;
         assert!(
-            js.contains(
-                "if (el.getAttribute(revealedAttr) !== revealedValue) { return [0, 0]; }"
-            ),
+            js.contains("if (el.getAttribute(revealedAttr) !== revealedValue) { return [0, 0]; }"),
             "the sampler's revealed-gate is gone — collapsed chrome (the 6px hover sensors) \
              would claim a permanent strip between every page and the window"
         );
         // The clamp must never come back in any spelling: the eval reports raw
         // rects and Rust decides.
-        for forbidden in ["clampBox", "clampTop", "clampLeft", "clampRight", "Math.min("] {
+        for forbidden in [
+            "clampBox",
+            "clampTop",
+            "clampLeft",
+            "clampRight",
+            "Math.min(",
+        ] {
             assert!(
                 !js.contains(forbidden),
                 "the geometry eval grew a clamp again ({forbidden}) — placement is \
@@ -67095,7 +68086,10 @@ mod web_surface_immersion_locks {
         // The gate: distraction-free OR a page on the whole screen. Every piece
         // of shell chrome reads THIS, so neither reason can be honoured by one
         // surface and forgotten by another.
-        assert!(!shell_chrome_hidden(false, false), "idle shell paints chrome");
+        assert!(
+            !shell_chrome_hidden(false, false),
+            "idle shell paints chrome"
+        );
         assert!(
             shell_chrome_hidden(true, false),
             "distraction-free must still hide chrome"
@@ -67216,7 +68210,10 @@ mod web_surface_immersion_locks {
         // distraction-free ALONE. `if fullscreen {` is still legal exactly once
         // — nowhere, now that the exit strip reads its own predicate — and
         // `if !fullscreen {` not at all.
-        for forbidden in ["if !fullscreen {", "if fullscreen {\n                    div {"] {
+        for forbidden in [
+            "if !fullscreen {",
+            "if fullscreen {\n                    div {",
+        ] {
             assert!(
                 !scanned.contains(forbidden),
                 "a chrome surface went back to the distraction-free-only gate \
@@ -67266,7 +68263,11 @@ mod web_surface_immersion_locks {
 
         let body = scanned
             .split_once("fn DocumentSurfaceBody(")
-            .map(|(_, rest)| rest.split_once("\n}\n").map(|(body, _)| body).unwrap_or(rest))
+            .map(|(_, rest)| {
+                rest.split_once("\n}\n")
+                    .map(|(body, _)| body)
+                    .unwrap_or(rest)
+            })
             .expect("DocumentSurfaceBody is gone from this file");
         for variant in variants {
             assert!(
@@ -67294,7 +68295,11 @@ mod web_surface_immersion_locks {
 
     /// A machine-index fixture with one scanned session whose shape matches what
     /// `remote_scanned_session_from_durable` serves on the wire.
-    fn ssot_scanned_session(path: &str, kind: Option<SessionKind>) -> yggterm_server::RemoteScannedSession {    yggterm_server::RemoteScannedSession {
+    fn ssot_scanned_session(
+        path: &str,
+        kind: Option<SessionKind>,
+    ) -> yggterm_server::RemoteScannedSession {
+        yggterm_server::RemoteScannedSession {
             session_path: path.to_string(),
             session_id: "ses_probe0000000000000000000".to_string(),
             cwd: "/home/user/gh/probe".to_string(),
@@ -67314,7 +68319,9 @@ mod web_surface_immersion_locks {
         }
     }
 
-    fn ssot_machine_with(sessions: Vec<yggterm_server::RemoteScannedSession>) -> yggterm_server::RemoteMachineSnapshot {
+    fn ssot_machine_with(
+        sessions: Vec<yggterm_server::RemoteScannedSession>,
+    ) -> yggterm_server::RemoteMachineSnapshot {
         yggterm_server::RemoteMachineSnapshot {
             machine_key: "probehost".to_string(),
             label: "probehost".to_string(),
@@ -67340,7 +68347,11 @@ mod web_surface_immersion_locks {
             Some(SessionKind::OpenCode),
         )]);
         let scanned = &machine.sessions[0];
-        let row = crate::shell::browser_row_for_remote_scanned_session(&machine, scanned, &HashMap::new());
+        let row = crate::shell::browser_row_for_remote_scanned_session(
+            &machine,
+            scanned,
+            &HashMap::new(),
+        );
         assert_eq!(
             row.session_kind,
             Some(SessionKind::OpenCode),
@@ -67370,8 +68381,7 @@ mod web_surface_immersion_locks {
             entry("UUID", "11111111-2222-4333-8444-555555555555"),
             entry("Tab Session Id", "ses_probe0000000000000001"),
         ];
-        let (label, value) =
-            metadata_session_identity(&session).expect("an identity line exists");
+        let (label, value) = metadata_session_identity(&session).expect("an identity line exists");
         assert_eq!(
             label, "OpenCode Session",
             "the label is the REGISTRY's session_metadata_label, not a hand match"
@@ -67384,10 +68394,7 @@ mod web_surface_immersion_locks {
         // And the dynamicity entries surface what the row is tied to RIGHT
         // NOW: the viewed session on an anchor, the mirrored session on a tab.
         let mut anchor = minimal_opencode_row();
-        anchor.metadata = vec![entry(
-            "Viewing Tab Session Id",
-            "ses_probe0000000000000001",
-        )];
+        anchor.metadata = vec![entry("Viewing Tab Session Id", "ses_probe0000000000000001")];
         assert_eq!(
             metadata_dynamicity_entries(&anchor),
             vec![("Viewing session", "ses_probe0000000000000001".to_string())],
@@ -67413,10 +68420,7 @@ mod web_surface_immersion_locks {
         let mut diverged = minimal_opencode_row();
         diverged.metadata = vec![
             entry("UUID", "d4090efe-4e12-42d9-938d-66f61801d2e7"),
-            entry(
-                "Viewing Tab Session Id",
-                "ses_f9cdde2f5ffep2W0tBiWE7qb3a",
-            ),
+            entry("Viewing Tab Session Id", "ses_f9cdde2f5ffep2W0tBiWE7qb3a"),
         ];
         let diagnostic = metadata_live_diagnostic(&diverged);
         assert_eq!(diagnostic.len(), 1);
@@ -67427,7 +68431,9 @@ mod web_surface_immersion_locks {
             diagnostic[0].value
         );
         assert!(
-            diagnostic[0].value.contains("ses_f9cdde2f5ffep2W0tBiWE7qb3a"),
+            diagnostic[0]
+                .value
+                .contains("ses_f9cdde2f5ffep2W0tBiWE7qb3a"),
             "the verdict must name the session the human is looking at"
         );
 
@@ -67435,10 +68441,7 @@ mod web_surface_immersion_locks {
         let mut synced = minimal_opencode_row();
         synced.metadata = vec![
             entry("OpenCode Session", "ses_probe0000000000000001"),
-            entry(
-                "Viewing Tab Session Id",
-                "ses_probe0000000000000001",
-            ),
+            entry("Viewing Tab Session Id", "ses_probe0000000000000001"),
         ];
         let diagnostic = metadata_live_diagnostic(&synced);
         assert_eq!(diagnostic.len(), 1);
@@ -67564,7 +68567,8 @@ mod web_surface_immersion_locks {
         let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new());
         assert_eq!(row.session_kind, Some(SessionKind::OpenCode));
 
-        scanned.session_path = "remote-mystery://probehost/ses_probe0000000000000000000".to_string();
+        scanned.session_path =
+            "remote-mystery://probehost/ses_probe0000000000000000000".to_string();
         scanned.kind = None;
         let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new());
         assert_ne!(
@@ -67616,8 +68620,15 @@ mod web_surface_immersion_locks {
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview { older_available: false, summary: vec![], blocks: vec![] },
-            metadata: vec![SessionMetadataEntry { label: "Cwd", value: "/home/user/proj/yggterm".to_string() }],
+            preview: yggterm_server::SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/user/proj/yggterm".to_string(),
+            }],
             terminal_process_id: None,
             terminal_foreground_active: None,
             terminal_window_id: None,
@@ -67656,10 +68667,19 @@ mod web_surface_immersion_locks {
             session_cwd: Some("/home/user/proj/yggterm".to_string()),
             session_kind: None,
         }];
-        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new(), &BTreeMap::new());
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         eprintln!("REPRO label = {:?}", rows[0].label);
         eprintln!("REPRO session_title = {:?}", rows[0].session_title);
-        assert_eq!(rows[0].label, "New dev OpenCode", "the birth title must replace the preserved lie");
+        assert_eq!(
+            rows[0].label, "New dev OpenCode",
+            "the birth title must replace the preserved lie"
+        );
     }
 
     /// XTERM-BUG: terminal-edge-unpaintable — the full-bleed locks. The

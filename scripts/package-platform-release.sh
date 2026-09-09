@@ -12,10 +12,14 @@ mkdir -p "$DIST_DIR"
 
 BIN_NAME="yggterm"
 HEADLESS_BIN_NAME="yggterm-headless"
+YNPM_BIN_NAME="ynpm"
+YNPX_BIN_NAME="ynpx"
 case "$TARGET_LABEL" in
   windows-*)
     BIN_NAME="yggterm.exe"
     HEADLESS_BIN_NAME="yggterm-headless.exe"
+    YNPM_BIN_NAME="ynpm.exe"
+    YNPX_BIN_NAME="ynpx.exe"
     ;;
 esac
 
@@ -43,14 +47,18 @@ elif [[ -n "$TARGET_TRIPLE" && "$TARGET_TRIPLE" != "$HOST_TRIPLE" ]] && command 
 else
   BUILD_CMD+=("build")
 fi
-BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless --no-default-features)
+BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features)
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
+YNPM_BIN_PATH="${ROOT_DIR}/target/release/${YNPM_BIN_NAME}"
+YNPX_BIN_PATH="$YNPM_BIN_PATH"
 WEBVIEW2_LOADER_PATH=""
 if [[ -n "$TARGET_TRIPLE" ]]; then
   BUILD_CMD+=(--target "$TARGET_TRIPLE")
   BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${BIN_NAME}"
   HEADLESS_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${HEADLESS_BIN_NAME}"
+  YNPM_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${YNPM_BIN_NAME}"
+  YNPX_BIN_PATH="$YNPM_BIN_PATH"
 fi
 
 find_webview2_loader() {
@@ -129,6 +137,8 @@ maybe_refresh_release_codex_cli() {
 build_macos_release_bundle() {
   local gui_binary_path="$1"
   local headless_binary_path="$2"
+  local ynpm_binary_path="$3"
+  local ynpx_binary_path="$4"
   local app_path="${DIST_DIR}/Yggterm.app"
   local contents_path="${app_path}/Contents"
   local macos_path="${contents_path}/MacOS"
@@ -146,6 +156,10 @@ build_macos_release_bundle() {
     cp "$headless_binary_path" "${macos_path}/yggterm-headless"
     chmod 0755 "${macos_path}/yggterm-headless" || true
   fi
+  cp "$ynpm_binary_path" "${macos_path}/ynpm"
+  chmod 0755 "${macos_path}/ynpm" || true
+  cp "$ynpx_binary_path" "${macos_path}/ynpx"
+  chmod 0755 "${macos_path}/ynpx" || true
 
   if [[ -f "$icon_png" ]]; then
     cp "$icon_png" "${resources_path}/yggterm.png"
@@ -228,6 +242,14 @@ case "$HEADLESS_BIN_NAME" in
     ;;
 esac
 cp "$HEADLESS_BIN_PATH" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
+YNPM_OUT_BASENAME="ynpm-${TARGET_LABEL}"
+YNPX_OUT_BASENAME="ynpx-${TARGET_LABEL}"
+if [[ "$TARGET_LABEL" == windows-* ]]; then
+  YNPM_OUT_BASENAME="${YNPM_OUT_BASENAME}.exe"
+  YNPX_OUT_BASENAME="${YNPX_OUT_BASENAME}.exe"
+fi
+cp "$YNPM_BIN_PATH" "${DIST_DIR}/${YNPM_OUT_BASENAME}"
+cp "$YNPX_BIN_PATH" "${DIST_DIR}/${YNPX_OUT_BASENAME}"
 
 WEBVIEW2_OUT_BASENAME=""
 if [[ "$TARGET_LABEL" == windows-* ]]; then
@@ -256,6 +278,8 @@ checksum_file() {
 
 checksum_file "${DIST_DIR}/${OUT_BASENAME}" "${DIST_DIR}/${OUT_BASENAME}.sha256"
 checksum_file "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}.sha256"
+checksum_file "${DIST_DIR}/${YNPM_OUT_BASENAME}" "${DIST_DIR}/${YNPM_OUT_BASENAME}.sha256"
+checksum_file "${DIST_DIR}/${YNPX_OUT_BASENAME}" "${DIST_DIR}/${YNPX_OUT_BASENAME}.sha256"
 if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
   checksum_file "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}" "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}.sha256"
 fi
@@ -265,6 +289,10 @@ TAR_CONTENTS=(
   "${OUT_BASENAME}.sha256"
   "${HEADLESS_OUT_BASENAME}"
   "${HEADLESS_OUT_BASENAME}.sha256"
+  "${YNPM_OUT_BASENAME}"
+  "${YNPM_OUT_BASENAME}.sha256"
+  "${YNPX_OUT_BASENAME}"
+  "${YNPX_OUT_BASENAME}.sha256"
 )
 if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
   TAR_CONTENTS+=(
@@ -280,7 +308,9 @@ checksum_file "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${DIST_DIR}/yggterm-
 if [[ "$TARGET_LABEL" == macos-* ]]; then
   build_macos_release_bundle \
     "${DIST_DIR}/${OUT_BASENAME}" \
-    "${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
+    "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" \
+    "${DIST_DIR}/${YNPM_OUT_BASENAME}" \
+    "${DIST_DIR}/${YNPX_OUT_BASENAME}"
 fi
 
 if [[ "$TARGET_LABEL" == windows-* ]]; then
@@ -290,6 +320,8 @@ if [[ "$TARGET_LABEL" == windows-* ]]; then
     "$WINDOWS_ZIP_PATH" \
     "${DIST_DIR}/${OUT_BASENAME}" \
     "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" \
+    "${DIST_DIR}/${YNPM_OUT_BASENAME}" \
+    "${DIST_DIR}/${YNPX_OUT_BASENAME}" \
     "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
   checksum_file "$WINDOWS_ZIP_PATH" "${WINDOWS_ZIP_PATH}.sha256"
   echo "Release zip: ${WINDOWS_ZIP_PATH}"
@@ -297,6 +329,8 @@ fi
 
 echo "Release binary: ${DIST_DIR}/${OUT_BASENAME}"
 echo "Release headless binary: ${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
+echo "Release package manager: ${DIST_DIR}/${YNPM_OUT_BASENAME}"
+echo "Release package launcher: ${DIST_DIR}/${YNPX_OUT_BASENAME}"
 if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
   echo "Release WebView2 loader: ${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
 fi

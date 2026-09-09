@@ -638,8 +638,9 @@ background installs require `YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL=1`; normal
 background refresh keeps using the available managed or PATH binary until an
 explicit foreground ensure/refresh path is used. Explicit local terminal launch
 is such a foreground path: before launching or resuming a local Codex session,
-Yggterm must run the managed CLI ensure path so a stale `~/.yggterm/npm/bin/codex`
-does not show Codex's own interactive update prompt inside xterm.
+Yggterm must run the managed CLI ensure path so a stale
+`~/.yggterm/ynpm/bin/codex` does not show Codex's own interactive update prompt
+inside xterm.
 
 In 2.2.45, retained replay gained an explicit unsafe-skip state for resize
 recovery. A large cursor-addressed retained snapshot is not safe to replay into

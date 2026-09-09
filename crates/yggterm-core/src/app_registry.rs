@@ -6,7 +6,8 @@
 //! and `::AppSidebar` were deleted for. A libyggterm app is not a special case
 //! the shell knows about; it is an entry in a registry the shell reads.
 //!
-//! An app writes a manifest to **its own host**, on any run:
+//! ynpm writes a normalized manifest to **the app's host** when its package is
+//! installed or upgraded:
 //!
 //! ```text
 //! ~/.yggterm/apps/<name>.json
@@ -15,10 +16,9 @@
 //!   "verbs": [ { "id": "new", "label": "New Ychrome", "args": [] } ] }
 //! ```
 //!
-//! The host's daemon scans that directory, **validates that `binary` still
-//! resolves, and prunes the manifests of apps that no longer exist**. That is
-//! the whole cleanup story: uninstalling an app removes it from every menu on
-//! the next scan, and the GUI keeps no registry of its own.
+//! The host's daemon scans that directory and validates that `binary` still
+//! resolves. A missing binary is omitted from the live menu, but the daemon
+//! does not delete the registration; `ynpm remove` owns package cleanup.
 //!
 //! Because the manifest lives on the host the app runs on, the menus are
 //! naturally per-host: ychrome installed on `dev` but not `guihost` means "New
@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The directory an app writes its manifest into, under the host's yggterm home.
+/// The directory ynpm writes normalized app manifests into, under the host's
+/// yggterm home.
 pub const APP_REGISTRY_DIRNAME: &str = "apps";
 
 /// One thing an app can launch. `args` are passed to `binary` verbatim; the cwd
@@ -94,6 +95,66 @@ impl Default for AppVerb {
     }
 }
 
+/// Where an installed app wants a launcher entry. This is package metadata,
+/// not app runtime state: ynpm writes it when the package is installed and
+/// removes it when the package is removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppContextMenu {
+    /// `false` keeps an app in the titlebar/start page while excluding it from
+    /// row context menus. This is how a dashboard can be launchable without
+    /// pretending it is useful for every selected file/folder.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Context names understood by yggterm, currently `workspace` and
+    /// `session`. Empty means every context, which is useful for a small app
+    /// whose one verb is meaningful everywhere.
+    #[serde(default)]
+    pub contexts: Vec<String>,
+    /// Verb ids to expose. Empty means all verbs whose `row_spawn` is true.
+    #[serde(default)]
+    pub verbs: Vec<String>,
+}
+
+impl AppContextMenu {
+    pub fn allows(&self, context: &str, verb_id: &str) -> bool {
+        self.enabled
+            && (self.contexts.is_empty() || self.contexts.iter().any(|item| item == context))
+            && (self.verbs.is_empty() || self.verbs.iter().any(|item| item == verb_id))
+    }
+}
+
+/// The stable `package.json.yggterm` extension understood by ynpm. Keeping
+/// this typed at the platform boundary prevents each app and the package
+/// manager from inventing slightly different JSON for the same launcher.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YggtermPackageMetadata {
+    #[serde(default)]
+    pub app: Option<YggtermAppMetadata>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YggtermAppMetadata {
+    /// Stable app/manifest name. Defaults to the package basename when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Package-relative executable bin name. If absent, ynpm uses the first
+    /// declared bin in sorted order.
+    #[serde(default)]
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub keytip: String,
+    #[serde(default)]
+    pub verbs: Vec<AppVerb>,
+    /// Accept both the JSON spelling used by this project and the usual npm
+    /// camel-case spelling, while serializing the documented snake-case form.
+    #[serde(default, alias = "contextMenu")]
+    pub context_menu: Option<AppContextMenu>,
+}
+
 /// One installed libyggterm app, as its manifest declares it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppManifest {
@@ -116,6 +177,12 @@ pub struct AppManifest {
     /// (spec §10). Same rules as [`AppVerb::keytip`]. Empty/absent = ladder.
     #[serde(default)]
     pub keytip: String,
+    /// Package-declared row context-menu policy. `None` is deliberately not
+    /// treated as enabled: old runtime-written manifests may still provide
+    /// titlebar/start-page entries, but only an ynpm package declaration earns
+    /// a row context-menu slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_menu: Option<AppContextMenu>,
 }
 
 impl AppManifest {
@@ -137,6 +204,12 @@ impl AppManifest {
             command.push_str(&shell_quote(arg));
         }
         command
+    }
+
+    pub fn context_menu_allows(&self, context: &str, verb_id: &str) -> bool {
+        self.context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.allows(context, verb_id))
     }
 
     /// A manifest the shell will act on: a usable key, a usable binary, and at
@@ -204,22 +277,24 @@ fn binary_resolves(binary: &str) -> bool {
     }
 }
 
-/// Read the host's app registry, dropping (and DELETING) any manifest whose
-/// binary no longer resolves.
+/// Read the host's ynpm-owned app registry. A missing binary is not deleted
+/// here: package ownership belongs to ynpm, not a daemon scan or an app's
+/// first run. The missing entry is simply omitted from menus until ynpm repairs
+/// or removes the package.
 ///
-/// The prune is the uninstall story: `apt purge ychrome` leaves a manifest
-/// behind, and the next scan removes it, so no menu ever offers to launch a
-/// binary that is gone. Deterministic order (sorted by name) — menus must not
-/// reshuffle between scans.
+/// `ynpm remove` is the uninstall story; a package manager action removes its
+/// registration, while a missing binary is only reported here. Deterministic
+/// order (sorted by name) — menus must not reshuffle between scans.
 ///
-/// Returns `(live apps, pruned names)`.
+/// Returns `(live apps, unresolvable names)`; the second list is diagnostic
+/// compatibility for callers and no longer authorizes file deletion.
 pub fn scan_app_registry(yggterm_home: &Path) -> (Vec<AppManifest>, Vec<String>) {
     let dir = app_registry_dir(yggterm_home);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return (Vec::new(), Vec::new());
     };
     let mut apps = Vec::new();
-    let mut pruned = Vec::new();
+    let mut missing = Vec::new();
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
@@ -238,22 +313,22 @@ pub fn scan_app_registry(yggterm_home: &Path) -> (Vec<AppManifest>, Vec<String>)
         let Some(manifest) = manifest else {
             // A malformed or mislabelled manifest is IGNORED, never deleted: it
             // may be a newer yggterm's format, and destroying another version's
-            // file is not ours to do. Only a resolved-away binary is pruned.
+            // file is not ours to do.
             continue;
         };
         if binary_resolves(&manifest.binary) {
             apps.push(manifest);
         } else {
-            let _ = std::fs::remove_file(&path);
-            pruned.push(manifest.name);
+            missing.push(manifest.name);
         }
     }
-    (apps, pruned)
+    (apps, missing)
 }
 
-/// Write (or refresh) this app's manifest on this host. Apps call this on every
-/// run: it is idempotent, and re-running an app after an upgrade is what fixes a
-/// manifest whose `binary` path moved.
+/// Write (or refresh) this app's manifest on this host. `ynpm` is the package
+/// owner and the normal caller; this helper remains the small file writer used
+/// by ynpm and compatibility tooling. An app process must not call it on
+/// startup: runtime use is not installation evidence.
 pub fn write_app_manifest(yggterm_home: &Path, manifest: &AppManifest) -> anyhow::Result<()> {
     anyhow::ensure!(
         is_plain_name(&manifest.name),
@@ -299,24 +374,25 @@ mod tests {
         let home = tempdir("live");
         // Any executable on this host will do; the scan only checks resolvability.
         write_app_manifest(&home, &manifest("ychrome", "/bin/sh")).unwrap();
-        let (apps, pruned) = scan_app_registry(&home);
+        let (apps, missing) = scan_app_registry(&home);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "ychrome");
-        assert!(pruned.is_empty());
+        assert!(missing.is_empty());
         assert!(home.join("apps/ychrome.json").is_file());
     }
 
-    // THE cleanup story: purge the app, and its menu entries leave with it.
+    // ynpm owns cleanup: a missing binary disappears from menus, but the scan
+    // does not delete the package's registration file.
     #[test]
-    fn a_manifest_whose_binary_vanished_is_pruned_from_disk() {
+    fn a_manifest_whose_binary_vanished_is_hidden_but_not_deleted_by_the_scan() {
         let home = tempdir("prune");
         write_app_manifest(&home, &manifest("ghost", "/nonexistent/ghost-binary")).unwrap();
-        let (apps, pruned) = scan_app_registry(&home);
+        let (apps, missing) = scan_app_registry(&home);
         assert!(apps.is_empty(), "offered a menu entry for a missing binary");
-        assert_eq!(pruned, vec!["ghost".to_string()]);
+        assert_eq!(missing, vec!["ghost".to_string()]);
         assert!(
-            !home.join("apps/ghost.json").exists(),
-            "the stale manifest survived the scan"
+            home.join("apps/ghost.json").exists(),
+            "the scan must not own package removal"
         );
     }
 
@@ -327,9 +403,9 @@ mod tests {
         let data = home.join("not-a-program");
         std::fs::write(&data, "text").unwrap();
         write_app_manifest(&home, &manifest("fake", data.to_str().unwrap())).unwrap();
-        let (apps, pruned) = scan_app_registry(&home);
+        let (apps, missing) = scan_app_registry(&home);
         assert!(apps.is_empty());
-        assert_eq!(pruned, vec!["fake".to_string()]);
+        assert_eq!(missing, vec!["fake".to_string()]);
     }
 
     // A relative binary would be resolved against a PATH a non-interactive ssh
@@ -353,10 +429,10 @@ mod tests {
             serde_json::to_string(&evil).unwrap(),
         )
         .unwrap();
-        let (apps, pruned) = scan_app_registry(&home);
+        let (apps, missing) = scan_app_registry(&home);
         assert!(apps.is_empty(), "a mislabelled manifest was honoured");
         // Ignored, NOT deleted: it is not ours to destroy.
-        assert!(pruned.is_empty());
+        assert!(missing.is_empty());
         assert!(home.join("apps/evil.json").is_file());
     }
 
@@ -419,5 +495,19 @@ mod tests {
     fn a_quote_in_an_argument_cannot_break_out() {
         let quoted = shell_quote("it's");
         assert_eq!(quoted, r"'it'\''s'");
+    }
+
+    #[test]
+    fn context_menu_requires_package_opt_in_and_honours_context_and_verb_filters() {
+        let mut app = manifest("example", "/bin/sh");
+        assert!(!app.context_menu_allows("workspace", "new"));
+        app.context_menu = Some(AppContextMenu {
+            enabled: true,
+            contexts: vec!["session".to_string()],
+            verbs: vec!["new".to_string()],
+        });
+        assert!(app.context_menu_allows("session", "new"));
+        assert!(!app.context_menu_allows("workspace", "new"));
+        assert!(!app.context_menu_allows("session", "other"));
     }
 }

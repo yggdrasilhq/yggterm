@@ -19,14 +19,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use yggterm_core::{
-    ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
-    SessionNodeKind, SessionStore, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind,
-    append_trace_event, check_for_update, current_version, detect_install_context,
-    install_release_update, refresh_desktop_integration,
+    ENV_YGGTERM_DIRECT_INSTALL_ROOT,
+    ENV_YGGTERM_HOME,
+    InstallContext,
+    PerfSpan,
+    SessionNode,
+    SessionNodeKind,
+    SessionStore,
+    WorkspaceDocumentKind,
+    WorkspaceGroupKind,
+    append_trace_event,
     // THE one owner of the MemTotal question — the family bounds in
     // `yggterm_core::cgroup_family` read the same number this file's scope and
     // WebKit derivations use, so one host cannot produce two answers.
     cgroup_family::read_mem_total_kb,
+    current_version,
+    detect_install_context,
+    refresh_desktop_integration,
 };
 use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::server_cli::{cli_server_endpoint, ensure_local_server_ready_for_cli};
@@ -34,21 +43,19 @@ use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
     PersistedDaemonState, ProbeTerminalViewportInputMode, ScreenshotPostProcess, SessionKind,
     WorkspaceViewMode, YggtermServer, active_client_instance_records,
-    control_endpoint_for_runtime_key, default_endpoint,
+    app_control_focus_window_took_focus, control_endpoint_for_runtime_key, default_endpoint,
     detect_ghostty_host, ensure_local_daemon_running, focus_live_with_view,
     local_headless_companion_executable_from_current, open_remote_session_with_view,
-    open_stored_session_with_view, ping, reorder_live_sessions_scoped,
-    resolve_client_daemon_endpoint, row_order_ledger_report, run_app_control_background_window,
-    run_app_control_close_window, run_app_control_close_window_preserving_sessions,
-    run_app_control_create_terminal_with_tenancy, run_app_control_describe_rows,
-    run_app_control_reorder_sessions,
-    run_app_control_describe_state,
+    open_stored_session_with_view, parse_trace_limit, parse_trace_poll_ms, ping, remove_session,
+    reorder_live_sessions_scoped, resolve_client_daemon_endpoint, row_order_ledger_report,
+    run_app_control_app_pane_action, run_app_control_background_window,
+    run_app_control_check_terminal_input, run_app_control_close_window,
+    run_app_control_close_window_preserving_sessions, run_app_control_create_terminal_with_tenancy,
+    run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_dom_eval, run_app_control_drag,
-    app_control_focus_window_took_focus, run_app_control_dump_state,
-    run_app_control_focus_window,
-    run_app_control_grid, run_app_control_key, run_app_control_list_clients,
-    run_app_control_memory_profile,
-    run_app_control_move_window_by, run_app_control_launch_app, run_app_control_open_path,
+    run_app_control_dump_state, run_app_control_focus_window, run_app_control_grid,
+    run_app_control_key, run_app_control_launch_app, run_app_control_list_clients,
+    run_app_control_memory_profile, run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
     run_app_control_pointer, run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
@@ -56,26 +63,23 @@ use yggterm_server::{
     run_app_control_probe_terminal_viewport_select, run_app_control_read_terminal_buffer,
     run_app_control_reclaim_terminal_focus, run_app_control_redraw_terminal,
     run_app_control_remove_session, run_app_control_rename_session,
-    run_app_control_reset_theme_editor, run_app_control_resize_window,
-    run_app_control_restart_pending_update, run_app_control_restart_session,
-    run_app_control_scroll_preview, run_app_control_scroll_right_panel,
-    run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
-    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_force_foreground, run_app_control_set_fullscreen,
+    run_app_control_reorder_sessions, run_app_control_reset_theme_editor,
+    run_app_control_resize_window, run_app_control_restart_pending_update,
+    run_app_control_restart_session, run_app_control_scroll_preview,
+    run_app_control_scroll_right_panel, run_app_control_scroll_terminal_viewport,
+    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
+    run_app_control_set_clipboard_text, run_app_control_set_force_foreground,
+    run_app_control_set_fullscreen, run_app_control_set_launch_flags,
     run_app_control_set_main_zoom, run_app_control_set_maximized,
-    run_app_control_app_pane_action, run_app_control_set_preview_layout,
-    run_app_control_set_right_panel_mode,
+    run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
-    run_app_control_set_launch_flags, run_app_control_set_session_keep_alive,
-    run_app_control_set_theme_editor_open,
+    run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
-    run_app_control_start_action, run_app_control_check_terminal_input, run_app_control_submit_terminal_prompt,
-    run_app_control_trigger_update_check, run_attach, run_daemon,
-    run_screenrecord_capture, run_screenshot_capture, run_screenshot_capture_with_post_process,
-    parse_trace_limit, parse_trace_poll_ms,
-    remove_session,
-    run_trace_bundle, run_trace_follow, run_trace_tail, run_trace_transitions, shutdown, snapshot,
+    run_app_control_start_action, run_app_control_submit_terminal_prompt,
+    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
+    run_trace_follow, run_trace_tail, run_trace_transitions, shutdown, snapshot,
     start_local_session, status, terminal_history, terminal_resize, terminal_restart,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, try_run_remote_server_command,
 };
@@ -422,9 +426,7 @@ fn invocation_runs_a_shell(args: &[String]) -> bool {
 fn allocator_reexec_required(args: &[String]) -> bool {
     // The daemon is long-lived without running a shell — exact argv, because
     // `server` as a first token is otherwise the one-shot family.
-    if args.len() == 2
-        && args[0] == "server"
-        && (args[1] == "daemon" || args[1] == "daemon-bridge")
+    if args.len() == 2 && args[0] == "server" && (args[1] == "daemon" || args[1] == "daemon-bridge")
     {
         return true;
     }
@@ -953,7 +955,6 @@ fn print_server_help() {
     );
 }
 
-
 fn print_server_sessions_help() {
     println!(
         "usage:
@@ -1013,8 +1014,6 @@ fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Re
     }
     Ok(())
 }
-
-
 
 fn main() -> Result<()> {
     // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
@@ -1096,7 +1095,10 @@ fn main() -> Result<()> {
     // is a Markdown file in the profile's own jar.
     // `snapshot` is matched at the TOP level only — `server snapshot` is the
     // daemon's own verb and must keep meaning that.
-    if args.first().is_some_and(|arg| arg == "collection" || arg == "snapshot") {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "collection" || arg == "snapshot")
+    {
         return yggterm_server::run_web_collection_cli(&args);
     }
     if args.len() >= 2 && args[0] == "server" && args[1] == "collection" {
@@ -3132,13 +3134,12 @@ fn configure_linux_webkit_compositing() {
     // Set only when nobody has answered: an explicit rank is a deliberate act
     // (a bisect, a broken driver) and this is not the layer that overrules it.
     if std::env::var_os("GST_PLUGIN_FEATURE_RANK").is_none()
-        && let Some(rank) =
-            yggterm_core::presentation_policy::sanctioned(
-                yggterm_core::presentation_policy::PresentationTarget::LinuxWayland,
-            )
-            .iter()
-            .find(|var| var.name == "GST_PLUGIN_FEATURE_RANK")
-            .and_then(|var| var.value)
+        && let Some(rank) = yggterm_core::presentation_policy::sanctioned(
+            yggterm_core::presentation_policy::PresentationTarget::LinuxWayland,
+        )
+        .iter()
+        .find(|var| var.name == "GST_PLUGIN_FEATURE_RANK")
+        .and_then(|var| var.value)
     {
         unsafe { std::env::set_var("GST_PLUGIN_FEATURE_RANK", rank) };
     }
@@ -3495,7 +3496,13 @@ fn scope_note(message: &str) {
 /// Every failure is ignored: the sweep must never delay or block a launch.
 fn gc_stale_gui_scopes() {
     let Ok(listing) = Command::new("systemctl")
-        .args(["--user", "list-units", "yggterm-gui-*.scope", "--no-legend", "--all"])
+        .args([
+            "--user",
+            "list-units",
+            "yggterm-gui-*.scope",
+            "--no-legend",
+            "--all",
+        ])
         .output()
     else {
         return;
@@ -3518,7 +3525,9 @@ fn gc_stale_gui_scopes() {
         ) else {
             continue;
         };
-        let state = String::from_utf8_lossy(&state_out.stdout).trim().to_string();
+        let state = String::from_utf8_lossy(&state_out.stdout)
+            .trim()
+            .to_string();
         let cgroup = String::from_utf8_lossy(&cg_out.stdout).trim().to_string();
         if !scope_is_stale(&state, &cgroup) {
             continue;
@@ -4694,19 +4703,7 @@ fn run_install_cli(context: &InstallContext) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(context)?);
             Ok(())
         }
-        [command] if command == "self-update" => {
-            if context.update_policy != UpdatePolicy::Auto {
-                println!("self-update disabled for this install channel");
-                return Ok(());
-            }
-            if let Some(update) = check_for_update(context)? {
-                let next = install_release_update(context, &update)?;
-                println!("installed {} at {}", update.version, next.display());
-            } else {
-                println!("already up to date");
-            }
-            Ok(())
-        }
+        [command] if command == "self-update" => run_ynpm_self_update(context),
         _ => {
             eprintln!(
                 "usage:\n  yggterm install integrate\n  yggterm install state\n  yggterm install self-update"
@@ -4714,6 +4711,55 @@ fn run_install_cli(context: &InstallContext) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Compatibility entry point for the old `yggterm install self-update` CLI.
+/// Release-channel policy and installation now live in ynpm, including the
+/// four-product atomic generation (yggterm, headless, ynpm, ynpx). Keeping
+/// this alias prevents older desktop launchers from silently reviving the
+/// retired GUI-owned updater.
+fn run_ynpm_self_update(context: &InstallContext) -> Result<()> {
+    let extension = cfg!(target_os = "windows").then_some(".exe").unwrap_or("");
+    let mut candidates = Vec::new();
+    if let Some(preferred) = context.preferred_executable.as_ref()
+        && let Some(parent) = preferred.parent()
+    {
+        candidates.push(parent.join(format!("ynpm{extension}")));
+    }
+    if let Ok(yggterm_home) = yggterm_core::resolve_yggterm_home() {
+        let home = yggterm_home
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(yggterm_home);
+        candidates.push(home.join(format!(".local/bin/ynpm{extension}")));
+        candidates.push(home.join(format!(".yggterm/bin/ynpm{extension}")));
+    }
+    if cfg!(target_os = "windows")
+        && let Ok(root) = yggterm_core::direct_install_root()
+    {
+        candidates.push(root.join("bin").join(format!("ynpm{extension}")));
+    }
+    let executable = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("ynpm{extension}")));
+    let mut command = Command::new(&executable);
+    command.arg("self-update");
+    if let Ok(yggterm_home) = yggterm_core::resolve_yggterm_home()
+        && let Some(home) = yggterm_home.parent()
+    {
+        command.env("YNPM_HOME", home);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("running {} self-update", executable.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "{} self-update exited with status {status}",
+            executable.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_document_cli(store: &SessionStore, args: &[String]) -> Result<()> {
@@ -4989,8 +5035,14 @@ mod tests {
             "state filtering belongs to scope_is_stale, not the parser"
         );
         // Only ACTIVE scopes are candidates: failed/dead ones systemd reaps itself.
-        assert!(scope_is_stale("active", "/user.slice/app.slice/yggterm-gui-1.scope"));
-        assert!(!scope_is_stale("failed", "/user.slice/app.slice/yggterm-gui-1.scope"));
+        assert!(scope_is_stale(
+            "active",
+            "/user.slice/app.slice/yggterm-gui-1.scope"
+        ));
+        assert!(!scope_is_stale(
+            "failed",
+            "/user.slice/app.slice/yggterm-gui-1.scope"
+        ));
         assert!(!scope_is_stale("active", ""), "no cgroup path, no verdict");
         // A cgroup path that does not exist holds no process: stale.
         assert!(scope_is_stale("active", "/no/such/cgroup-here"));
@@ -5009,7 +5061,10 @@ mod tests {
             "a pid in a CHILD cgroup (gui/web/helpers) keeps the scope alive"
         );
         std::fs::write(nested.join("cgroup.procs"), "").expect("drained child");
-        assert!(!cgroup_has_live_procs(&base, 0), "an empty tree is the stale scope");
+        assert!(
+            !cgroup_has_live_procs(&base, 0),
+            "an empty tree is the stale scope"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5229,7 +5284,9 @@ mod tests {
             // The idiom that WAS the bug: a bare positional parse with a silent
             // fallback, which reads `--limit` as a line count and returns 200.
             assert!(
-                !product.contains(".and_then(|value| value.parse::<usize>().ok())\n            .unwrap_or(200)"),
+                !product.contains(
+                    ".and_then(|value| value.parse::<usize>().ok())\n            .unwrap_or(200)"
+                ),
                 "{binary} still parses a trace limit positionally with a silent \
                  default — that idiom IS the defect: it reads the literal \
                  \"--limit\" as a count, fails, and returns 200 for every request"
@@ -5262,8 +5319,10 @@ mod tests {
 
         // Two different requests must not collapse to the same answer — the
         // property that a silent default breaks.
-        let fifty = super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "50"]), 200);
-        let many = super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "2000"]), 200);
+        let fifty =
+            super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "50"]), 200);
+        let many =
+            super::parse_trace_limit(&argv(&["server", "trace", "tail", "--limit", "2000"]), 200);
         assert_ne!(
             fifty.ok(),
             many.ok(),
@@ -5278,7 +5337,8 @@ mod tests {
         );
         // An unrelated flag is not a malformed count.
         assert_eq!(
-            super::parse_trace_limit(&argv(&["server", "trace", "bundle", "--screenshot"]), 200).ok(),
+            super::parse_trace_limit(&argv(&["server", "trace", "bundle", "--screenshot"]), 200)
+                .ok(),
             Some(200)
         );
         // ⛔ Garbage must be REFUSED, never defaulted: a wrong count that looks
@@ -5296,8 +5356,11 @@ mod tests {
         // ⛔ And the poll interval must not swallow the limit's value:
         // `follow --limit 500` polled every 500 ms under the old positional read.
         assert_eq!(
-            super::parse_trace_poll_ms(&argv(&["server", "trace", "follow", "--limit", "500"]), 500)
-                .ok(),
+            super::parse_trace_poll_ms(
+                &argv(&["server", "trace", "follow", "--limit", "500"]),
+                500
+            )
+            .ok(),
             Some(500),
             "the default, NOT the limit's value read as a poll interval"
         );
@@ -5342,7 +5405,10 @@ mod tests {
                 "the probe must ask for {property}, or it cannot discover a \
                  refusal of it"
             );
-            assert!(real.contains(&property), "the real scope must ask for {property}");
+            assert!(
+                real.contains(&property),
+                "the real scope must ask for {property}"
+            );
         }
 
         assert!(
@@ -5351,8 +5417,9 @@ mod tests {
              the scope, not starting the app"
         );
         assert!(
-            !probe.iter().any(|arg| arg.contains("yggterm")
-                && arg.starts_with('/')),
+            !probe
+                .iter()
+                .any(|arg| arg.contains("yggterm") && arg.starts_with('/')),
             "the probe must never launch the GUI binary: a probe that starts a \
              second GUI is worse than no probe"
         );
@@ -5411,7 +5478,10 @@ mod tests {
                 "ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD",
                 "policy.conservative",
             ),
-            ("ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD", "policy.strict"),
+            (
+                "ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD",
+                "policy.strict",
+            ),
         ] {
             assert!(
                 body.contains(env_name) && body.contains(from),
@@ -5424,12 +5494,12 @@ mod tests {
     use super::superseded_client_termination_signal;
     use super::{
         BuiltinCliCommand, FILE_DESCRIPTOR_SOFT_LIMIT_TARGET, LinuxWindowProfileInput,
-        SignalClientScope, app_control_launch_state_timeout_ms,
+        SignalClientScope, allocator_reexec_required, app_control_launch_state_timeout_ms,
         app_control_state_settled_for_launch, classify_builtin_cli_command,
         client_process_runs_a_deleted_binary, compatible_signal_client_count,
-        linux_window_profile_from_input,
+        invocation_runs_a_shell, linux_window_profile_from_input,
         main_should_retire_superseded_clients_before_shell, raised_file_descriptor_soft_limit,
-        allocator_reexec_required, invocation_runs_a_shell, record_matches_executable, server_app_subcommand_owns_its_help,
+        record_matches_executable, server_app_subcommand_owns_its_help,
         server_app_wants_generic_help, should_handoff_to_preferred_executable,
         should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
@@ -6095,8 +6165,7 @@ mod tests {
                                                 // and SIGSEGVs on a host with no working
                                                 // hardware GL.
                                                 assert_eq!(
-                                                    armed,
-                                                    policy.hardware_gl,
+                                                    armed, policy.hardware_gl,
                                                     "with no user opinion, under-glass arms on \
                                              a hardware-GL host and demotes on software GL \
                                              ({context})"
@@ -6342,14 +6411,8 @@ mod tests {
                 "the remote verb dispatcher (server remote resume-codex & family)",
                 "try_run_remote_server_command(&args)",
             ),
-            (
-                "the terminal-resize dispatch arm",
-                "args[2] == \"resize\"",
-            ),
-            (
-                "the terminal-write dispatch arm",
-                "args[2] == \"write\"",
-            ),
+            ("the terminal-resize dispatch arm", "args[2] == \"resize\""),
+            ("the terminal-write dispatch arm", "args[2] == \"write\""),
         ] {
             let site = source
                 .find(needle)
@@ -6380,7 +6443,10 @@ mod tests {
     #[test]
     fn the_allocator_reexec_targets_long_lived_invocations() {
         assert!(invocation_runs_a_shell(&[]), "bare argv is the GUI launch");
-        assert!(invocation_runs_a_shell(&["--agent".to_string(), "row".to_string()]));
+        assert!(invocation_runs_a_shell(&[
+            "--agent".to_string(),
+            "row".to_string()
+        ]));
         assert!(!invocation_runs_a_shell(&[
             "server".to_string(),
             "app".to_string(),
@@ -6392,7 +6458,10 @@ mod tests {
             "resume-codex".to_string(),
             "id".to_string()
         ]));
-        assert!(!invocation_runs_a_shell(&["automation".to_string(), "list".to_string()]));
+        assert!(!invocation_runs_a_shell(&[
+            "automation".to_string(),
+            "list".to_string()
+        ]));
         assert!(
             allocator_reexec_required(&[]),
             "the GUI keeps the arena cap from birth"
@@ -6522,8 +6591,12 @@ mod tests {
         ];
         for args in &spellings {
             assert_eq!(
-                yggterm_server::app_control_cli::app_control_payload_arg(args, 3, "script for server app dom-eval")
-                    .expect("the script resolves wherever the flags sit"),
+                yggterm_server::app_control_cli::app_control_payload_arg(
+                    args,
+                    3,
+                    "script for server app dom-eval"
+                )
+                .expect("the script resolves wherever the flags sit"),
                 script,
                 "{args:?} must resolve the same script as its sibling spellings"
             );
@@ -6544,22 +6617,54 @@ mod tests {
         for (start, args, expected) in [
             (
                 4,
-                payload_argv(&["server", "app", "media", "answer", "--request", "7", "allow"]),
+                payload_argv(&[
+                    "server",
+                    "app",
+                    "media",
+                    "answer",
+                    "--request",
+                    "7",
+                    "allow",
+                ]),
                 "allow",
             ),
             (
                 4,
-                payload_argv(&["server", "app", "media", "answer", "allow", "--request", "7"]),
+                payload_argv(&[
+                    "server",
+                    "app",
+                    "media",
+                    "answer",
+                    "allow",
+                    "--request",
+                    "7",
+                ]),
                 "allow",
             ),
             (
                 4,
-                payload_argv(&["server", "app", "command", "invoke", "--pid", "42", "help.open"]),
+                payload_argv(&[
+                    "server",
+                    "app",
+                    "command",
+                    "invoke",
+                    "--pid",
+                    "42",
+                    "help.open",
+                ]),
                 "help.open",
             ),
             (
                 4,
-                payload_argv(&["server", "app", "command", "invoke", "help.open", "--pid", "42"]),
+                payload_argv(&[
+                    "server",
+                    "app",
+                    "command",
+                    "invoke",
+                    "help.open",
+                    "--pid",
+                    "42",
+                ]),
                 "help.open",
             ),
         ] {
@@ -6577,9 +6682,8 @@ mod tests {
     /// the defect this whole reader exists to close.
     #[test]
     fn a_server_app_payload_that_looks_like_a_flag_is_refused_not_acted_on() {
-        let error =
-            super::refuse_flag_shaped_payload("--client", "script for server app dom-eval")
-                .expect_err("a flag is not a script");
+        let error = super::refuse_flag_shaped_payload("--client", "script for server app dom-eval")
+            .expect_err("a flag is not a script");
         let message = format!("{error}");
         assert!(
             message.contains("--client") && message.contains("refusing"),
@@ -6588,8 +6692,12 @@ mod tests {
         // And through argv, with the script left out entirely: the arm must
         // still refuse rather than reach for whatever sits at the fixed index.
         let args = payload_argv(&["server", "app", "dom-eval", "--client", "shadow"]);
-        let error = yggterm_server::app_control_cli::app_control_payload_arg(&args, 3, "script for server app dom-eval")
-            .expect_err("a bare flag is not a script");
+        let error = yggterm_server::app_control_cli::app_control_payload_arg(
+            &args,
+            3,
+            "script for server app dom-eval",
+        )
+        .expect_err("a bare flag is not a script");
         let message = format!("{error}");
         assert!(
             message.contains("--client"),
@@ -6600,8 +6708,12 @@ mod tests {
         assert!(
             format!(
                 "{}",
-                yggterm_server::app_control_cli::app_control_payload_arg(&bare, 3, "script for server app dom-eval")
-                    .expect_err("no script at all")
+                yggterm_server::app_control_cli::app_control_payload_arg(
+                    &bare,
+                    3,
+                    "script for server app dom-eval"
+                )
+                .expect_err("no script at all")
             )
             .contains("missing script for server app dom-eval")
         );
@@ -7246,7 +7358,12 @@ mod tests {
 
     use crate::select_focus_handoff_target;
 
-    fn handoff_record(pid: u32, started_at_ms: u128, role: Option<&str>, exe: &str) -> ClientInstanceRecord {
+    fn handoff_record(
+        pid: u32,
+        started_at_ms: u128,
+        role: Option<&str>,
+        exe: &str,
+    ) -> ClientInstanceRecord {
         ClientInstanceRecord {
             pid,
             started_at_ms,
@@ -7287,7 +7404,12 @@ mod tests {
 
         // And with ONLY a shadow registered there is no handoff target at all,
         // so the fresh process must go on to open its own window.
-        let shadow_only = vec![handoff_record(11, 900, Some("shadow"), "/opt/example-app/bin/example-gui")];
+        let shadow_only = vec![handoff_record(
+            11,
+            900,
+            Some("shadow"),
+            "/opt/example-app/bin/example-gui",
+        )];
         assert_eq!(select_focus_handoff_target(&shadow_only, exe), None);
     }
 
@@ -7296,7 +7418,12 @@ mod tests {
         // Reading `None` as a shadow would break handoff for every client that
         // predates the role field — the opposite failure, equally real.
         let exe = std::path::Path::new("/opt/example-app/bin/example-gui");
-        let records = vec![handoff_record(12, 100, None, "/opt/example-app/bin/example-gui")];
+        let records = vec![handoff_record(
+            12,
+            100,
+            None,
+            "/opt/example-app/bin/example-gui",
+        )];
         assert_eq!(select_focus_handoff_target(&records, exe), Some(12));
     }
 

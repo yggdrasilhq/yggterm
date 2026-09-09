@@ -1,8 +1,7 @@
 use crate::app_capture::{
     background_app_window, capture_compositor_app_surface, capture_visible_app_surface,
-    describe_window, focus_app_window,
-    move_app_window_by, overlay_terminal_canvas_onto_snapshot, record_visible_app_surface,
-    resize_app_window,
+    describe_window, focus_app_window, move_app_window_by, overlay_terminal_canvas_onto_snapshot,
+    record_visible_app_surface, resize_app_window,
 };
 use crate::handover_gate::{
     HandoverPaintGate, HandoverPaintTransition, handover_observation_from_parts,
@@ -32,24 +31,22 @@ use crate::session_copy_policy::{
     title_needs_generation_from_visible_titles,
 };
 use crate::terminal_observe::{
-    RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
-    describe_terminal_open_attempt, read_memory_pressure_snapshot,
-    describe_viewport_snapshot, preview_text_looks_like_loading_placeholder,
+    AgentRowActivity, RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
+    describe_terminal_open_attempt, describe_viewport_snapshot,
+    preview_text_looks_like_loading_placeholder, read_memory_pressure_snapshot,
     strip_terminal_control_sequences, terminal_bootstrap_activation_epoch,
-    terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_is_claude_prompt_surface,
-    terminal_chunk_has_codex_prompt_output,
+    terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_agent_activity,
+    terminal_chunk_has_agent_composer_row, terminal_chunk_has_codex_prompt_output,
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
-    terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-    AgentRowActivity, terminal_chunk_agent_activity,
-    terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_agent_composer_row,
-    terminal_chunk_is_generic_codex_idle,
+    terminal_chunk_is_claude_prompt_surface, terminal_chunk_is_codex_interactive_setup_prompt,
+    terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_resume_instruction,
+    terminal_chunk_is_codex_session_not_on_remote, terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
-    terminal_chunk_is_codex_session_not_on_remote, terminal_chunk_is_transcript_browser,
-    terminal_chunk_is_transport_error, terminal_line_is_internal_transport_error,
-    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
-    terminal_tail_excerpt,
+    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
+    terminal_line_is_internal_transport_error, terminal_open_attempt_failure_reason_from_viewport,
+    terminal_open_attempt_state_label, terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -60,12 +57,11 @@ use crate::terminal_protocol::{
 };
 use crate::terminal_retained_replay_policy::{
     RETAINED_EMPTY_XTERM_SURFACE_PROBLEM, RetainedRehydrateMode,
-    blank_host_snapshot_replay_from_read_should_start,
-    blank_host_snapshot_replay_should_start, daemon_retained_snapshot_replay_identity_key,
-    daemon_retained_snapshot_replay_should_start, retained_ready_remote_host_rehydrate_mode,
-    retained_ever_ready_host_should_pin_bootstrap_epoch, retained_rehydrate_allow_screen_fallback,
-    retained_rehydrate_identity_key, retained_rehydrate_seed_retry_delay_ms,
-    retained_remote_host_should_rehydrate,
+    blank_host_snapshot_replay_from_read_should_start, blank_host_snapshot_replay_should_start,
+    daemon_retained_snapshot_replay_identity_key, daemon_retained_snapshot_replay_should_start,
+    retained_ever_ready_host_should_pin_bootstrap_epoch, retained_ready_remote_host_rehydrate_mode,
+    retained_rehydrate_allow_screen_fallback, retained_rehydrate_identity_key,
+    retained_rehydrate_seed_retry_delay_ms, retained_remote_host_should_rehydrate,
 };
 use crate::terminal_themes::{
     default_terminal_theme_name, terminal_theme_by_name, terminal_theme_names_for_mode,
@@ -106,7 +102,11 @@ pub(crate) enum SessionWarmthTier {
     /// has to spin up before we get any content. Today's slow path.
     Cold,
 }
-use anyhow::{Context, Result, anyhow};
+use crate::command_registry::{self, Keymap, ShellCommand, spec_for_id};
+use crate::keytip::{
+    self, Chord, ChordResolution, KeyTipDecl, KeyTipTree, KeymapConfig, ScopeId as KtScope, Target,
+};
+use anyhow::{Context, Result, anyhow, bail};
 use arboard::{Clipboard as NativeClipboard, ImageData as NativeClipboardImageData};
 #[cfg(target_os = "linux")]
 use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
@@ -157,7 +157,7 @@ use tao::platform::unix::{EventLoopBuilderExtUnix, WindowExtUnix};
 use tao::platform::windows::WindowBuilderExtWindows;
 use tao::window::ResizeDirection;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -166,73 +166,54 @@ use yggterm_core::agent_scheme;
 use yggterm_core::notification_audio;
 use yggterm_core::{
     AgentLaunchOptions, AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow,
-    BrowserRowKind, InstallContext, PerfSpan,
-    ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
-    SessionStore, SessionSummaryTimelineEntry, SessionTitleResolver, SplitAxis, SplitGroup,
-    SplitMember,
-    SplitMemberView, TerminalTelemetryEvent,
-    WorkspaceDocumentInput,
-    WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_foreign_trace_batch,
-    append_perf_event, append_trace_event,
-    best_effort_title_from_context, check_for_update, current_version, detect_install_context,
-    generation_context_from_messages, install_mode_summary, install_release_update_with_progress,
-    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
-    read_codex_session_identity_fields, read_codex_transcript_messages_limited,
-    resolve_yggterm_home, save_settings_file, spawn_terminal_telemetry_event,
-    terminal_telemetry_db_path, unique_session_short_ids_for_pairs, update_command_hint,
-};
-use crate::command_registry::{self, Keymap, ShellCommand, spec_for_id};
-use crate::keytip::{
-    self, Chord, ChordResolution, KeyTipDecl, KeyTipTree, KeymapConfig, ScopeId as KtScope, Target,
+    BrowserRowKind, InstallContext, PerfSpan, SessionBrowserState, SessionNode, SessionStore,
+    SessionSummaryTimelineEntry, SessionTitleResolver, SplitAxis, SplitGroup, SplitMember,
+    SplitMemberView, TerminalTelemetryEvent, WorkspaceDocumentInput, WorkspaceDocumentKind,
+    WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_foreign_trace_batch, append_perf_event,
+    append_trace_event, best_effort_title_from_context, current_version, detect_install_context,
+    generation_context_from_messages, install_mode_summary, looks_like_generated_fallback_title,
+    looks_like_low_signal_generated_copy, read_codex_session_identity_fields,
+    read_codex_transcript_messages_limited, resolve_yggterm_home, save_settings_file,
+    spawn_terminal_telemetry_event, terminal_telemetry_db_path, unique_session_short_ids_for_pairs,
 };
 use yggterm_platform::{DockRect, configure_background_service_command, send_user_notification};
 #[cfg(unix)]
 use yggterm_server::local_daemon_socket_should_be_removed_for_spawn;
 use yggterm_server::{
-    ActivationOrigin,
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlGridCommand,
-    AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
+    ActivationOrigin, AppControlCommand, AppControlDragCommand, AppControlDragPlacement,
+    AppControlGridCommand, AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
-    ScreenshotTarget,
-    ManagedSessionView, PersistedDaemonState, PreviewBlockKind, PreviewTone,
-    ProbeTerminalViewportInputMode,
-    RemoteDeployState, RemoteMachineHealth, RemoteMachineRef, RemoteMachineSnapshot,
-    RemoteScannedSession,
-    RowSeatRequest, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
-    SessionMetadataEntry, RemoteRuntimeAfterRemoval, SessionPreviewBlock,
-    SessionRemovalEvidence, SessionRenderedSection, SessionSource,
-    SessionTeardownProcess, SnapshotSessionView,
-    SshConnectTarget, TerminalBackend, TerminalLaunchPhase, VaultFieldSource, WebCookieDirection,
-    WebElementRef, WebFillMechanism, WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs,
-    WebSurfaceWaitUntil, WorkspaceViewMode,
+    ManagedCliRefreshMode, ManagedSessionView, PersistedDaemonState, PreviewBlockKind, PreviewTone,
+    ProbeTerminalViewportInputMode, RemoteDeployState, RemoteMachineHealth, RemoteMachineRef,
+    RemoteMachineSnapshot, RemoteRuntimeAfterRemoval, RemoteScannedSession, RowSeatRequest,
+    ScreenshotTarget, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
+    SessionMetadataEntry, SessionPreviewBlock, SessionRemovalEvidence, SessionRenderedSection,
+    SessionSource, SessionTeardownProcess, SnapshotSessionView, SshConnectTarget, TerminalBackend,
+    TerminalLaunchPhase, VaultFieldSource, WebCookieDirection, WebElementRef, WebFillMechanism,
+    WebFrameRef, WebSurfaceDoAction, WebSurfaceReadAs, WebSurfaceWaitUntil, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, agent_plane_session_title, app_control_pending_render_needed_for_worker,
-    app_control_requests_pending_for_worker, cleanup_legacy_daemons,
-    complete_app_control_request, connect_ssh_custom, enqueue_app_control_request,
-    fetch_remote_generation_context, focus_live_with_view, hot_restart, hot_restart_detailed,
-    ManagedCliRefreshMode, local_app_verb_launch_command,
+    app_control_requests_pending_for_worker, cleanup_legacy_daemons, complete_app_control_request,
+    connect_ssh_custom, enqueue_app_control_request, fetch_remote_generation_context,
+    focus_live_with_view, hot_restart, hot_restart_detailed, local_app_verb_launch_command,
     local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_local_managed_cli_now, refresh_managed_cli,
-    refresh_preview_with_history, refresh_remote_machine, remove_managed_cli, remove_session,
-    remove_ssh_target,
-    request_terminal_launch, request_terminal_launch_for_path,
-    set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
-    shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
-    stage_remote_clipboard_png, start_command_session_placed,
-    start_command_session_with_terminal_appearance,
+    refresh_preview_with_history, refresh_remote_machine, remote_agent_row_runtime_after_removal,
+    remove_managed_cli, remove_session, remove_ssh_target, request_terminal_launch,
+    request_terminal_launch_for_path, set_all_preview_blocks_folded, set_session_keep_alive,
+    set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
+    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
+    start_command_session_placed, start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance, start_local_session_placed,
-    start_remote_agent_session_placed, start_remote_agent_session_seated, start_ssh_session_placed, status,
-    take_next_app_control_request,
-    terminal_ensure, terminal_read, terminal_resize, terminal_resize_repaint,
-    terminal_restart_with_size,
-    terminal_retained_snapshot, terminal_snapshot, terminal_write,
-    toggle_preview_block as daemon_toggle_preview_block,
+    start_remote_agent_session_placed, start_remote_agent_session_seated, start_ssh_session_placed,
+    status, take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize,
+    terminal_resize_repaint, terminal_restart_with_size, terminal_retained_snapshot,
+    terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
-    remote_agent_row_runtime_after_removal, verify_session_removal,
-    wait_for_app_control_response,
+    verify_session_removal, wait_for_app_control_response,
 };
 // The conversation surface is a SHARED component set (`yggui::conversation`),
 // not shell-local markup: the same design language has to hold for this Web
@@ -255,25 +236,21 @@ use yggui::command_palette::{
     YGGUI_COMMAND_PALETTE_CSS, palette_index_after,
 };
 use yggui::pill_toolbar::{PILL_TOOLBAR_CSS, PillStep, PillToolbar, PillToolbarPalette};
-use yggui::split_button::{
-    SPLIT_BUTTON_CSS, SplitButton, SplitButtonItem, SplitButtonPalette,
-};
+use yggui::split_button::{SPLIT_BUTTON_CSS, SplitButton, SplitButtonItem, SplitButtonPalette};
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
     HoveredChromeControl as HoveredControl, MOTION_EMPHASIZED_DECELERATE, MOTION_ENTER_DURATION_MS,
     ROW_DRAG_CLICK_SUPPRESS_MS, RailHeader, RailScrollBody, RailSectionTitle, RowDragGesture,
-    RowDropTarget, RowTreeDrop, RowTreeRow,
-    SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastAnchor,
-    ToastCard, ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone,
-    ToastViewport,
+    RowDropTarget, RowTreeDrop, RowTreeRow, SideRailReveal, SideRailShell, THEME_EDITOR_SWATCHES,
+    TOAST_CSS, TitlebarChrome, ToastAnchor, ToastCard, ToastItem as ToastNotification,
+    ToastPalette, ToastTone as NotificationTone, ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
     WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, canonical_tree_leaf_name,
     chrome_material_tint, clamp_theme_spec, default_theme_editor_spec, dominant_accent,
     drag_threshold_reached, emphasized_enter_transition, emphasized_exit_transition,
-    gradient_background_repeat_css,
-    gradient_background_size_css, gradient_css, join_tree_child_path, live_blur_gradient_css,
-    material_blur_radius_px, preview_surface_css, resolve_drag_drop_target as resolve_tree_drag_drop_target,
-    resolve_tree_drop_placement,
+    gradient_background_repeat_css, gradient_background_size_css, gradient_css,
+    join_tree_child_path, live_blur_gradient_css, material_blur_radius_px, preview_surface_css,
+    resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
     search_field_shell_style, search_input_style, shell_tint, standard_accelerate_transition,
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
     valid_drop_target as valid_tree_drop_target,
@@ -792,11 +769,24 @@ fn record_terminal_forward_sample(trace_home: &std::path::Path, bytes: usize, no
     let last = LAST_REPORT_MS.load(AtomicOrdering::Relaxed);
     if now_ms.saturating_sub(last) >= 60_000
         && LAST_REPORT_MS
-            .compare_exchange(last, now_ms, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .compare_exchange(
+                last,
+                now_ms,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
             .is_ok()
     {
-        let window_ms = if last == 0 { 0 } else { now_ms.saturating_sub(last) };
-        let secs = if window_ms > 0 { window_ms as f64 / 1000.0 } else { 1.0 };
+        let window_ms = if last == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(last)
+        };
+        let secs = if window_ms > 0 {
+            window_ms as f64 / 1000.0
+        } else {
+            1.0
+        };
         append_trace_event(
             trace_home,
             "ui",
@@ -1254,7 +1244,11 @@ fn text_field_css(palette: Palette) -> String {
         // hairline and the focus ring already carry the accent, so the fill does
         // not have to — a field is white paper, and the ring is what says it is
         // yours. Hover and focus stay white and let the ring do the talking.
-        ("#ffffff".to_string(), "#ffffff".to_string(), "#ffffff".to_string())
+        (
+            "#ffffff".to_string(),
+            "#ffffff".to_string(),
+            "#ffffff".to_string(),
+        )
     };
     let (hairline, hairline_hover) = if dark {
         (
@@ -1475,7 +1469,11 @@ fn media_presentation_witness(category: &str, name: &str, presented: Option<u64>
 mod app_surface_batch_tests {
     use super::*;
 
-    fn session(path: &str, owner_remote: bool, records: Vec<AppDeclareRecordShape>) -> yggterm_server::TerminalAppDeclareSession {
+    fn session(
+        path: &str,
+        owner_remote: bool,
+        records: Vec<AppDeclareRecordShape>,
+    ) -> yggterm_server::TerminalAppDeclareSession {
         yggterm_server::TerminalAppDeclareSession {
             session_path: path.to_string(),
             records,
@@ -1508,7 +1506,11 @@ mod app_surface_batch_tests {
     fn the_batch_decides_absence_locally_and_spends_asks_only_where_it_must() {
         let batch = AppSurfaceRestoreBatch::from_sessions(vec![
             session("local://plain", false, vec![]),
-            session("local://ychrome", false, vec![record("web-surface", "open")]),
+            session(
+                "local://ychrome",
+                false,
+                vec![record("web-surface", "open")],
+            ),
             session("remote-cc://dev/x", true, vec![]),
         ]);
         // A plain shell: both halves decided locally — no round trip at all.
@@ -1538,16 +1540,14 @@ mod app_surface_batch_tests {
         // corpse and `stale_detected` fired with no arm behind it. A record
         // that is not LIVE is not up: the row stays a candidate, want_web
         // is set, and the corpse flag routes the tick to the reload arm.
-        let row = |path: &str, has_web: bool, live: bool, active: bool| {
-            AppSurfaceRestoreRow {
-                session_path: path.to_string(),
-                ssh_target: None,
-                runtime_token: None,
-                has_contribution: true,
-                has_web_surface: has_web,
-                web_surface_live: live,
-                active,
-            }
+        let row = |path: &str, has_web: bool, live: bool, active: bool| AppSurfaceRestoreRow {
+            session_path: path.to_string(),
+            ssh_target: None,
+            runtime_token: None,
+            has_contribution: true,
+            has_web_surface: has_web,
+            web_surface_live: live,
+            active,
         };
         let rows = vec![
             row("local://live", true, true, false),
@@ -1605,17 +1605,41 @@ mod media_playback_gate_tests {
 
     #[test]
     fn only_presented_playback_windows_are_a_media_witness() {
-        assert!(media_presentation_witness("media", "playback_window", Some(300)));
-        assert!(media_presentation_witness("media", "playback_window", Some(1)));
+        assert!(media_presentation_witness(
+            "media",
+            "playback_window",
+            Some(300)
+        ));
+        assert!(media_presentation_witness(
+            "media",
+            "playback_window",
+            Some(1)
+        ));
         // Blind window: the callback never fired — null is "cannot see", never
         // a zero, and it must not hold the gate hot.
-        assert!(!media_presentation_witness("media", "playback_window", None));
+        assert!(!media_presentation_witness(
+            "media",
+            "playback_window",
+            None
+        ));
         // A paused element arms no window; zero presented frames is not playback.
-        assert!(!media_presentation_witness("media", "playback_window", Some(0)));
+        assert!(!media_presentation_witness(
+            "media",
+            "playback_window",
+            Some(0)
+        ));
         // Other media records are events, not presentation cadence.
         assert!(!media_presentation_witness("media", "stall", Some(1)));
-        assert!(!media_presentation_witness("media", "quality_change", Some(1)));
-        assert!(!media_presentation_witness("ui", "playback_window", Some(1)));
+        assert!(!media_presentation_witness(
+            "media",
+            "quality_change",
+            Some(1)
+        ));
+        assert!(!media_presentation_witness(
+            "ui",
+            "playback_window",
+            Some(1)
+        ));
     }
 
     #[test]
@@ -1835,6 +1859,7 @@ const VIEWPORT_HISTORY_LIMIT: usize = 24;
 const DOCK_PULSE_ACTIVE_MS: u64 = 350;
 const DOCK_PULSE_IDLE_MS: u64 = 5_000;
 const SELF_UPDATE_JOB_KEY: &str = "self-update";
+const SELF_UPDATE_NOTIFICATION_SETTLE_MS: u64 = 600;
 const UPDATE_RESTART_STALE_AFTER_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 const TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX: f64 = 6.0;
 /// The hover sensor a hidden sidebar leaves on its window edge, mirroring the
@@ -2058,12 +2083,6 @@ pub struct PendingUpdateRestart {
 enum UpdateWorkflowState {
     Idle,
     Checking,
-    Installing {
-        version: String,
-        stage: ReleaseUpdateInstallStage,
-        percent: u8,
-        detail: String,
-    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpdateCallToAction {
@@ -2334,11 +2353,9 @@ fn migrate_web_tab_folders_into_row_groups(
     // list first.
     let mut head_of_folder: HashMap<String, u64> = HashMap::new();
     for folder in folders {
-        let first = tabs
-            .iter()
-            .find(|tab| {
-                Some(tab.id) != app_tab_id && tab.folder.as_deref() == Some(folder.id.as_str())
-            });
+        let first = tabs.iter().find(|tab| {
+            Some(tab.id) != app_tab_id && tab.folder.as_deref() == Some(folder.id.as_str())
+        });
         match first {
             Some(tab) => {
                 head_of_folder.insert(folder.id.clone(), tab.id);
@@ -2964,7 +2981,12 @@ fn web_tab_group_descends_from(tabs: &[WebSurfaceTab], candidate: u64, ancestor:
     for _ in 0..tabs.len() {
         match cursor {
             Some(id) if id == ancestor => return true,
-            Some(id) => cursor = tabs.iter().find(|tab| tab.id == id).and_then(|tab| tab.group_head),
+            Some(id) => {
+                cursor = tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| tab.group_head)
+            }
             None => return false,
         }
     }
@@ -2993,7 +3015,12 @@ fn web_tab_descends_from(rows: &[WebTabPlacementRow], index: usize, ancestor: u6
     for _ in 0..rows.len() {
         match opener {
             Some(id) if id == ancestor => return true,
-            Some(id) => opener = rows.iter().find(|row| row.id == id).and_then(|row| row.opener),
+            Some(id) => {
+                opener = rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .and_then(|row| row.opener)
+            }
             None => return false,
         }
     }
@@ -4475,7 +4502,11 @@ fn app_pane_field_action_bar_style(multiline: bool) -> String {
         "position:absolute; right:5px; top:{}; transform:{}; display:flex; align-items:center; \
          gap:1px; z-index:1;",
         if multiline { "6px" } else { "50%" },
-        if multiline { "none" } else { "translateY(-50%)" },
+        if multiline {
+            "none"
+        } else {
+            "translateY(-50%)"
+        },
     )
 }
 
@@ -5200,11 +5231,14 @@ fn app_pane_adopt_values(
         // now holds a different buffer remounts even when the two buffers read
         // identically. One rule, every channel.
         let buffer_changed = previous_value_keys.get(&id) != declared_value_keys.get(&id);
-        let unchanged =
-            !buffer_changed && shown.get(&id).is_some_and(|shown| *shown == declared);
+        let unchanged = !buffer_changed && shown.get(&id).is_some_and(|shown| *shown == declared);
         value_epochs.insert(
             id.clone(),
-            if unchanged { epoch } else { epoch.wrapping_add(1) },
+            if unchanged {
+                epoch
+            } else {
+                epoch.wrapping_add(1)
+            },
         );
         // A revealed secret reaches the DOM and stops there — see
         // [`AppPaneWidget::value_is_display_only`].
@@ -5256,7 +5290,12 @@ mod app_pane_reorder_tests {
     /// The real gesture: press, then travel past the threshold. Every drag the
     /// user can perform goes through both steps, so every test does too.
     fn drag_row(shell: &mut ShellState, pane_id: &str, row_id: &str) {
-        shell.arm_app_pane_row_drag(pane_id.to_string(), row_id.to_string(), row_id.to_string(), (0.0, 0.0));
+        shell.arm_app_pane_row_drag(
+            pane_id.to_string(),
+            row_id.to_string(),
+            row_id.to_string(),
+            (0.0, 0.0),
+        );
         assert!(
             shell.maybe_begin_app_pane_row_drag((0.0, DRAG_BEGIN_THRESHOLD_PX)),
             "the pointer travelled past the threshold"
@@ -5754,7 +5793,10 @@ mod app_pane_reorder_tests {
         // This lock was REWRITTEN to the new contract rather than deleted —
         // weakening it would let the chip come back by accident.
         let anchor = session_row_actions_anchor_style(6);
-        assert!(anchor.contains("flex:0 0 auto;"), "an in-flow cell: {anchor}");
+        assert!(
+            anchor.contains("flex:0 0 auto;"),
+            "an in-flow cell: {anchor}"
+        );
         for banned in ["width:0px;", "position:relative;", "margin-left:-"] {
             assert!(
                 !anchor.contains(banned),
@@ -5787,9 +5829,20 @@ mod app_pane_reorder_tests {
         // the VERBS, which put the row's own title underneath it; it survives
         // here, narrowed to exactly the rules it was ever about.
         let css = session_row_reveal_css();
-        assert!(css.contains("display:none;"), "at rest the verbs cost NO width: {css}");
-        assert!(css.contains("display:inline-flex;"), "revealed they take space: {css}");
-        for banned in ["backdrop-filter", "linear-gradient", "color-mix", "background"] {
+        assert!(
+            css.contains("display:none;"),
+            "at rest the verbs cost NO width: {css}"
+        );
+        assert!(
+            css.contains("display:inline-flex;"),
+            "revealed they take space: {css}"
+        );
+        for banned in [
+            "backdrop-filter",
+            "linear-gradient",
+            "color-mix",
+            "background",
+        ] {
             assert!(
                 !css.contains(banned),
                 "`{banned}` is the frosted chip coming back: {css}"
@@ -5822,7 +5875,6 @@ mod app_pane_reorder_tests {
         );
     }
 
-
     /// ★ ONE REVEAL RULE, THREE TRIGGERS, ONE INJECTION SITE.
     ///
     /// DESIGN.md "Session-style rows" declared this when the slot was named:
@@ -5845,7 +5897,10 @@ mod app_pane_reorder_tests {
             .expect("the at-rest rule is present");
         assert!(at_rest.contains("display:none;"), "at rest: {at_rest}");
         assert!(at_rest.contains("opacity:0;"), "at rest: {at_rest}");
-        assert!(at_rest.contains("pointer-events:none;"), "at rest: {at_rest}");
+        assert!(
+            at_rest.contains("pointer-events:none;"),
+            "at rest: {at_rest}"
+        );
         // THREE triggers. Mouse-only would strand the ALT/KeyTip layer.
         for trigger in [
             "[data-session-row]:hover [data-session-row-actions]",
@@ -5869,7 +5924,9 @@ mod app_pane_reorder_tests {
         let product = product_source();
         // ONE injection, and it is at the shell root — not once per rail.
         assert_eq!(
-            product.matches("style { \"{session_row_hover_css}\" }").count(),
+            product
+                .matches("style { \"{session_row_hover_css}\" }")
+                .count(),
             1,
             "the reveal rule is declared once for the whole window; a second \
              injection site is how the tab rail came to have none"
@@ -5877,7 +5934,9 @@ mod app_pane_reorder_tests {
         // The cwdtree wears the shared marks, so it inherits that one rule
         // instead of keeping a private copy of it.
         assert!(
-            product.contains("\"data-session-row-selected\": if selected { \"true\" } else { \"false\" },"),
+            product.contains(
+                "\"data-session-row-selected\": if selected { \"true\" } else { \"false\" },"
+            ),
             "SidebarRow must publish its selection in the shared vocabulary"
         );
         // …and its own stylesheet keeps ONLY the burn tint.
@@ -5920,15 +5979,33 @@ mod app_pane_reorder_tests {
     fn a_leaf_row_has_two_bands_and_a_group_row_has_three() {
         // A leaf has no inside: every offset is one of the two edges.
         for y in [0.0, 5.0, 13.9, 14.1, 27.0] {
-            assert_ne!(row_drop_placement_for_offset(y, false), DragDropPlacement::Into);
+            assert_ne!(
+                row_drop_placement_for_offset(y, false),
+                DragDropPlacement::Into
+            );
         }
-        assert_eq!(row_drop_placement_for_offset(2.0, false), DragDropPlacement::Before);
-        assert_eq!(row_drop_placement_for_offset(20.0, false), DragDropPlacement::After);
+        assert_eq!(
+            row_drop_placement_for_offset(2.0, false),
+            DragDropPlacement::Before
+        );
+        assert_eq!(
+            row_drop_placement_for_offset(20.0, false),
+            DragDropPlacement::After
+        );
         // A group keeps a narrow edge band at each end and files everything in
         // between — DESIGN.md's before / inside / after snap zones.
-        assert_eq!(row_drop_placement_for_offset(2.0, true), DragDropPlacement::Before);
-        assert_eq!(row_drop_placement_for_offset(14.0, true), DragDropPlacement::Into);
-        assert_eq!(row_drop_placement_for_offset(26.0, true), DragDropPlacement::After);
+        assert_eq!(
+            row_drop_placement_for_offset(2.0, true),
+            DragDropPlacement::Before
+        );
+        assert_eq!(
+            row_drop_placement_for_offset(14.0, true),
+            DragDropPlacement::Into
+        );
+        assert_eq!(
+            row_drop_placement_for_offset(26.0, true),
+            DragDropPlacement::After
+        );
     }
 
     // ==================================================================
@@ -5964,7 +6041,11 @@ mod app_pane_reorder_tests {
             2,
             "the state's field and the render snapshot's copy of it — no third"
         );
-        for banned in ["AppPaneRowDrag", "WebTabRowDrag", "app_pane_row_drop_target:"] {
+        for banned in [
+            "AppPaneRowDrag",
+            "WebTabRowDrag",
+            "app_pane_row_drop_target:",
+        ] {
             assert!(
                 !state.contains(banned),
                 "the per-surface drag state is back: {banned}"
@@ -5997,14 +6078,16 @@ mod app_pane_reorder_tests {
         let row = &pane_render[start..];
         let row = &row[..row.find("AppPaneWidget::Markdown").expect("row arm end")];
         assert!(
-            row.contains("let row_label = title.clone();")
-                && row.contains("row_label.clone(),"),
+            row.contains("let row_label = title.clone();") && row.contains("row_label.clone(),"),
             "a contributed row's title must reach the shared ghost:\n{row}"
         );
         // The root tracks the pointer, so the card does not freeze at the edge
         // of the list that owns the gesture.
         shell.track_row_drag_pointer((400.0, 320.0));
-        assert_eq!(shell.row_drag.as_ref().expect("gesture").pointer, (400.0, 320.0));
+        assert_eq!(
+            shell.row_drag.as_ref().expect("gesture").pointer,
+            (400.0, 320.0)
+        );
 
         let source = product_source();
         let root = source
@@ -6126,8 +6209,22 @@ mod app_pane_reorder_tests {
         if let Some(drag) = shell.row_drag.as_mut() {
             drag.target = None;
             let arrived = current_millis().saturating_sub(ROW_DRAG_SPRING_MS + 1);
-            drag.hover("notes", "other", "Other", DragDropPlacement::After, false, arrived);
-            drag.hover("notes", "f1", "Work", DragDropPlacement::Into, true, arrived);
+            drag.hover(
+                "notes",
+                "other",
+                "Other",
+                DragDropPlacement::After,
+                false,
+                arrived,
+            );
+            drag.hover(
+                "notes",
+                "f1",
+                "Work",
+                DragDropPlacement::Into,
+                true,
+                arrived,
+            );
         }
         assert_eq!(
             shell.hover_app_pane_row_drop_group(
@@ -6330,7 +6427,10 @@ fn app_pane_row_tree(widgets: &[AppPaneWidget]) -> Vec<RowTreeRow> {
     let mut rows = Vec::new();
     for widget in widgets {
         let AppPaneWidget::ListRow {
-            id, depth, expanded, ..
+            id,
+            depth,
+            expanded,
+            ..
         } = widget
         else {
             continue;
@@ -6938,14 +7038,15 @@ fn navigate_web_surface_tab(
         // Peeked before any mutation: with nothing to reuse there is nothing to
         // write, and a `with_mut` on that path would dirty the shell for a render
         // that changes nothing.
-        let reuse_socks =
-            match state.with(|shell| shell.web_surface_egress_reuse_for(&session_path, tab_id, remote)) {
-                WebSurfaceEgressReuse::Resolve => false,
-                WebSurfaceEgressReuse::Own => true,
-                WebSurfaceEgressReuse::Adopt(donor_id) => state.with_mut_counted(|shell| {
-                    shell.adopt_web_surface_session_socks(&session_path, tab_id, donor_id)
-                }),
-            };
+        let reuse_socks = match state
+            .with(|shell| shell.web_surface_egress_reuse_for(&session_path, tab_id, remote))
+        {
+            WebSurfaceEgressReuse::Resolve => false,
+            WebSurfaceEgressReuse::Own => true,
+            WebSurfaceEgressReuse::Adopt(donor_id) => state.with_mut_counted(|shell| {
+                shell.adopt_web_surface_session_socks(&session_path, tab_id, donor_id)
+            }),
+        };
         if reuse_socks {
             // SOCKS passes the real URL unchanged, so effective_url == url and
             // socks_port stays put: the reconciler NAVIGATES the live webview
@@ -7524,9 +7625,8 @@ const WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS: u64 = 2_000;
 /// Is the stranded-surface sweep due? Pure so the cadence is a decision a test
 /// can drive rather than a subtraction buried in the loop.
 fn web_surface_stranded_sweep_due(last_sweep_ms: Option<u64>, now_ms: u64) -> bool {
-    last_sweep_ms.is_none_or(|last| {
-        now_ms.saturating_sub(last) >= WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS
-    })
+    last_sweep_ms
+        .is_none_or(|last| now_ms.saturating_sub(last) >= WEB_SURFACE_STRANDED_SWEEP_INTERVAL_MS)
 }
 
 /// The sessions this client is holding at least one webview for, sorted and
@@ -7653,7 +7753,6 @@ fn web_surface_recent_reaps(key: &(String, u64), now_ms: u64) -> u32 {
         .unwrap_or(0)
 }
 
-
 /// THE destroy clock for one backgrounded surface, or `None` for "no clock".
 ///
 /// `configured_hold_ms` is the user's EXPLICIT knob out of
@@ -7698,7 +7797,9 @@ fn web_surface_background_hold_ms_for(
     {
         return None;
     }
-    Some(configured_hold_ms.unwrap_or(WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS.saturating_mul(1000)))
+    Some(
+        configured_hold_ms.unwrap_or(WEB_SURFACE_DEFAULT_BACKGROUND_HOLD_SECS.saturating_mul(1000)),
+    )
 }
 
 /// The default for BOTH holds below. One number, because a backgrounded SESSION
@@ -9630,7 +9731,13 @@ mod web_surface_reclaim_locks {
             (
                 "live::atm-a".to_string(),
                 5,
-                vec![(5, "https://example.invalid/a".to_string(), 0, None, "default".to_string())],
+                vec![(
+                    5,
+                    "https://example.invalid/a".to_string(),
+                    0,
+                    None,
+                    "default".to_string(),
+                )],
                 SurfacePolicyGate::Absent,
             ),
             (
@@ -9649,7 +9756,8 @@ mod web_surface_reclaim_locks {
         assert_eq!(active.get("live::atm-b").copied(), Some(2));
         assert_eq!(active.len(), 2, "one entry per desired surface: {active:?}");
         assert_eq!(
-            active.get("live::atm-missing"), None,
+            active.get("live::atm-missing"),
+            None,
             "a session with no desired surface has no answer, and the domain must \
              yield no candidates for it rather than guess",
         );
@@ -9672,8 +9780,14 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             candidates,
             vec![
-                (("live::atm-a".to_string(), 0), WebSurfaceBackgroundReason::Tab),
-                (("live::atm-a".to_string(), 9), WebSurfaceBackgroundReason::Tab),
+                (
+                    ("live::atm-a".to_string(), 0),
+                    WebSurfaceBackgroundReason::Tab
+                ),
+                (
+                    ("live::atm-a".to_string(), 9),
+                    WebSurfaceBackgroundReason::Tab
+                ),
             ],
             "the exemption followed something other than the surface's active \
              tab — the tab the user is reading is in the reclaim domain and its \
@@ -9695,8 +9809,8 @@ mod web_surface_reclaim_locks {
         let mut applied = tabs_applied(
             session,
             &[
-                (0, 100, None),          // on screen
-                (1, 101, Some(1_000)),   // off screen for 399 s
+                (0, 100, None),        // on screen
+                (1, 101, Some(1_000)), // off screen for 399 s
                 (2, 102, Some(1_000)),
             ],
         );
@@ -9918,9 +10032,18 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             domain,
             vec![
-                ((session.to_string(), 0), WebSurfaceBackgroundReason::Session),
-                ((session.to_string(), 1), WebSurfaceBackgroundReason::Session),
-                ((session.to_string(), 3), WebSurfaceBackgroundReason::Session),
+                (
+                    (session.to_string(), 0),
+                    WebSurfaceBackgroundReason::Session
+                ),
+                (
+                    (session.to_string(), 1),
+                    WebSurfaceBackgroundReason::Session
+                ),
+                (
+                    (session.to_string(), 3),
+                    WebSurfaceBackgroundReason::Session
+                ),
             ],
             "the tab exemptions must not narrow the SESSION domain — a pinned tab \
              of a backgrounded session is off screen like every other surface it \
@@ -10092,11 +10215,7 @@ mod web_surface_reclaim_locks {
         // knob resolves to wherever a clock applies at all.
         for posture in [ReclaimPosture::Tight, ReclaimPosture::Pressured] {
             assert_eq!(
-                web_surface_background_hold_ms_for(
-                    None,
-                    posture,
-                    WEB_SURFACE_THRASH_REOPEN_LIMIT
-                ),
+                web_surface_background_hold_ms_for(None, posture, WEB_SURFACE_THRASH_REOPEN_LIMIT),
                 Some(TEN_MINUTES_MS),
                 "the hold's default changed; the docs and the CHANGELOG say ten \
                  minutes, and a shorter one trades the user's page state"
@@ -10187,10 +10306,8 @@ mod web_surface_reclaim_locks {
              own way is a second answer to where the knob lives",
         );
         assert!(
-            product
-                .iter()
-                .any(|line| line.trim()
-                    == "std::fs::read_to_string(home.join(\"web-surface.json\")).ok()"),
+            product.iter().any(|line| line.trim()
+                == "std::fs::read_to_string(home.join(\"web-surface.json\")).ok()"),
             "the one config reader is no longer reading ~/.yggterm/web-surface.json",
         );
     }
@@ -10259,8 +10376,7 @@ mod web_surface_reclaim_locks {
                     *tab_id,
                     active_tab,
                 );
-            let Some(rect) =
-                web_surface_tab_create_rect(want_visible, place_rect, headless_wanted)
+            let Some(rect) = web_surface_tab_create_rect(want_visible, place_rect, headless_wanted)
             else {
                 continue;
             };
@@ -10377,7 +10493,11 @@ mod web_surface_reclaim_locks {
         let moved = format!("{}?moved=1", url_for(1));
         let mut tabs = tabs;
         tabs[1] = (1, moved.clone());
-        assert_ne!(moved, url_for(1), "the fixture must actually move the model");
+        assert_ne!(
+            moved,
+            url_for(1),
+            "the fixture must actually move the model"
+        );
 
         // The user clicks tab 1.
         let mut host = FakeHost::default();
@@ -10572,7 +10692,8 @@ mod web_surface_reclaim_locks {
         let start = product
             .iter()
             .position(|line| {
-                line.trim() == "if web_surface_stranded_sweep_due(last_stranded_sweep_ms, now_sweep_ms) {"
+                line.trim()
+                    == "if web_surface_stranded_sweep_due(last_stranded_sweep_ms, now_sweep_ms) {"
             })
             .expect(
                 "the reconcile loop no longer sweeps stranded surfaces — a row closed on \
@@ -10766,8 +10887,12 @@ mod web_surface_reclaim_locks {
             for active_tab in 0..4_u64 {
                 for pinned in [false, true] {
                     let pinned_rect = pinned.then_some(PANE_RECT);
-                    let placed =
-                        web_surface_tab_place_rect(pinned_rect, Some(PAGE_RECT), tab_id, active_tab);
+                    let placed = web_surface_tab_place_rect(
+                        pinned_rect,
+                        Some(PAGE_RECT),
+                        tab_id,
+                        active_tab,
+                    );
                     assert_eq!(
                         placed.is_some(),
                         web_surface_tab_on_screen(pinned, tab_id, active_tab),
@@ -10823,7 +10948,11 @@ mod web_surface_reclaim_locks {
         // Tabs 2, 3 and 4 have NO webview: never visited, or reclaimed.
 
         let rows = web_surface_tab_report(500_000, &desired, &handles);
-        assert_eq!(rows.len(), 5, "every DESIRED tab must appear, webview or not");
+        assert_eq!(
+            rows.len(),
+            5,
+            "every DESIRED tab must appear, webview or not"
+        );
         assert_eq!(rows[0].state, WebSurfaceTabState::Visible);
         assert!(rows[0].active_tab);
         assert_eq!(rows[1].state, WebSurfaceTabState::Stashed);
@@ -11331,8 +11460,11 @@ impl WebTabStore {
     /// store speaks `folder`, a current one speaks `group`, and a store written
     /// across an interrupted migration can hold a little of each.
     fn reconcile(&mut self) {
-        let folders: std::collections::HashSet<&str> =
-            self.folders.iter().map(|folder| folder.id.as_str()).collect();
+        let folders: std::collections::HashSet<&str> = self
+            .folders
+            .iter()
+            .map(|folder| folder.id.as_str())
+            .collect();
         let heads: std::collections::HashSet<&str> = self
             .tabs
             .iter()
@@ -11353,9 +11485,7 @@ impl WebTabStore {
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, tab)| {
-                tab.group.as_deref().is_some_and(|key| !heads.contains(key))
-            })
+            .filter(|(_, tab)| tab.group.as_deref().is_some_and(|key| !heads.contains(key)))
             .map(|(index, _)| index)
             .collect();
         for index in stranded_folders {
@@ -11696,7 +11826,8 @@ fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
     };
     let raw = std::fs::read_to_string(&path).ok()?;
     // Aggregate by url: count + most recent timestamp + title.
-    let mut agg: std::collections::HashMap<String, (usize, u64, String)> = std::collections::HashMap::new();
+    let mut agg: std::collections::HashMap<String, (usize, u64, String)> =
+        std::collections::HashMap::new();
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -11704,7 +11835,11 @@ fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
         let Some(url) = value.get("url").and_then(Value::as_str) else {
             continue;
         };
-        let title = value.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let ts = value.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
         let e = agg.entry(url.to_string()).or_insert((0, 0, title.clone()));
         e.0 += 1;
@@ -11752,7 +11887,9 @@ fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
             {
                 // Host-prefix bonus + word-boundary bonus, like Chromium's AutocompleteMatch.
                 let mut bonus = 0.0;
-                if candidate.to_lowercase().starts_with(&typed_lc) && candidate.contains('/') == false {
+                if candidate.to_lowercase().starts_with(&typed_lc)
+                    && candidate.contains('/') == false
+                {
                     bonus += 2.0;
                 }
                 // Exact host or prefix of host gets extra.
@@ -11788,7 +11925,8 @@ fn web_surface_history_suggestions(
         return Vec::new();
     };
     // Aggregate frecency as above, then score each url/title.
-    let mut agg: std::collections::HashMap<String, (usize, u64, String)> = std::collections::HashMap::new();
+    let mut agg: std::collections::HashMap<String, (usize, u64, String)> =
+        std::collections::HashMap::new();
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -11796,7 +11934,11 @@ fn web_surface_history_suggestions(
         let Some(url) = value.get("url").and_then(Value::as_str) else {
             continue;
         };
-        let title = value.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let ts = value.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
         let e = agg.entry(url.to_string()).or_insert((0, 0, title.clone()));
         e.0 += 1;
@@ -11822,7 +11964,9 @@ fn web_surface_history_suggestions(
         if stripped.starts_with(&query_lc) || no_www.starts_with(&query_lc) {
             base += 10.0;
             matched = true;
-        } else if url_lc.contains(&format!("/{}", query_lc)) || url_lc.contains(&format!(".{}", query_lc)) {
+        } else if url_lc.contains(&format!("/{}", query_lc))
+            || url_lc.contains(&format!(".{}", query_lc))
+        {
             base += 7.0;
             matched = true;
         } else if url_lc.contains(&query_lc) {
@@ -11930,7 +12074,11 @@ fn render_web_history_page(entries: &[WebHistoryEntry]) -> String {
         if current_day.as_deref() != Some(day.as_str()) {
             rows.push_str(&format!(
                 "<h2 class=\"day\">{}</h2>",
-                if entry.ts_ms == 0 { "Earlier".to_string() } else { html_escape(&day) }
+                if entry.ts_ms == 0 {
+                    "Earlier".to_string()
+                } else {
+                    html_escape(&day)
+                }
             ));
             current_day = Some(day);
         }
@@ -11955,7 +12103,9 @@ fn render_web_history_page(entries: &[WebHistoryEntry]) -> String {
         ));
     }
     if entries.is_empty() {
-        rows.push_str("<p class=\"empty\">No history yet. Pages you visit in this profile appear here.</p>");
+        rows.push_str(
+            "<p class=\"empty\">No history yet. Pages you visit in this profile appear here.</p>",
+        );
     }
     // Inline CSS + a tiny filter script; nothing external so it loads as data:.
     format!(
@@ -12178,9 +12328,8 @@ static WEB_SURFACE_CONTEXT_COUNT: std::sync::atomic::AtomicUsize =
 /// Runtime WebKit facts published by the GTK-main-thread reconciler for the
 /// off-thread render probe. A mutex is intentional: these fields describe one
 /// observation and must not be torn across reconcile ticks.
-static WEB_SURFACE_RUNTIME_COUNTS: std::sync::OnceLock<
-    std::sync::Mutex<WebSurfaceRuntimeCounts>,
-> = std::sync::OnceLock::new();
+static WEB_SURFACE_RUNTIME_COUNTS: std::sync::OnceLock<std::sync::Mutex<WebSurfaceRuntimeCounts>> =
+    std::sync::OnceLock::new();
 
 /// Counts from the reconciler's own publication — never recomputed from
 /// `ShellState`, which does not know what was actually realized.
@@ -12320,8 +12469,7 @@ fn web_surface_tab_report(
 /// a tab is "using" are not attributable to the tab. What IS attributable is the
 /// pair (`views`, `contexts`) plus the process-level RSS the render probe
 /// samples; anything finer would be invented.
-const WEB_SURFACE_PER_TAB_RSS_NOTE: &str =
-    "unattributable: WebKitGTK pools web processes per WebContext, so bytes cannot be \
+const WEB_SURFACE_PER_TAB_RSS_NOTE: &str = "unattributable: WebKitGTK pools web processes per WebContext, so bytes cannot be \
      split per tab; use views + contexts with the render probe's process RSS";
 
 fn web_surface_tab_report_json(
@@ -12445,8 +12593,7 @@ fn describe_web_surface_tabs(
 /// Monotonic, process-wide, never reused. Global rather than per-(session,tab)
 /// so a generation identifies an incarnation on its own — a stale handle can
 /// never collide with a live one from a different key.
-static WEB_SURFACE_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static WEB_SURFACE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn next_web_surface_generation() -> u64 {
     WEB_SURFACE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -12481,7 +12628,9 @@ static WEB_SURFACE_NATIVE_IDS: std::sync::OnceLock<
 #[cfg(test)]
 fn lock_web_surface_globals_for_test() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 /// THE END OF A RECONCILE TICK, whichever way the tick ends: sweep the engines
 /// nobody holds any more, then publish the surface set and the post-sweep
@@ -12506,12 +12655,11 @@ fn web_surface_tick_settled(
     applied: &HashMap<(String, u64), AppliedWebSurface>,
 ) {
     desktop.prune_web_surface_contexts();
-    let runtime_counts = web_surface_runtime_counts(applied.values().map(|entry| {
-        (
-            entry.visible,
-            desktop.web_surface_liveness(entry.native_id),
-        )
-    }));
+    let runtime_counts = web_surface_runtime_counts(
+        applied
+            .values()
+            .map(|entry| (entry.visible, desktop.web_surface_liveness(entry.native_id))),
+    );
     if let Ok(mut published) = WEB_SURFACE_RUNTIME_COUNTS
         .get_or_init(Default::default)
         .lock()
@@ -12566,7 +12714,11 @@ fn web_surface_tab_place_rect(
     tab_id: u64,
     active_tab: u64,
 ) -> Option<(i32, i32, i32, i32)> {
-    pinned_rect.or(if tab_id == active_tab { page_rect } else { None })
+    pinned_rect.or(if tab_id == active_tab {
+        page_rect
+    } else {
+        None
+    })
 }
 
 /// Does this tab get a webview THIS tick, and at what rect?
@@ -12739,9 +12891,7 @@ fn under_glass_paint_holes_css(holes: &[(i32, i32, i32, i32)]) -> Option<String>
     if subpaths.is_empty() {
         return None;
     }
-    Some(format!(
-        "path(evenodd, \"M0 0H32767V32767H0Z{subpaths}\")"
-    ))
+    Some(format!("path(evenodd, \"M0 0H32767V32767H0Z{subpaths}\")"))
 }
 
 /// ONE auto-hide chrome edge's claim on the viewport, as sampled from the DOM.
@@ -13399,9 +13549,10 @@ mod web_surface_download_locks {
     /// already the uniquified one, so this is literally what is on disk.
     #[test]
     fn a_completed_download_names_the_file_and_where_it_landed() {
-        let (tone, title, message) = web_surface_download_toast(&event(
-            dioxus_desktop::SurfaceDownloadPhase::Completed { bytes: 2048 },
-        ));
+        let (tone, title, message) =
+            web_surface_download_toast(&event(dioxus_desktop::SurfaceDownloadPhase::Completed {
+                bytes: 2048,
+            }));
         assert_eq!(tone, NotificationTone::Success);
         assert_eq!(title, "Download Complete");
         assert!(
@@ -13569,8 +13720,10 @@ async fn web_surface_native_reconcile_loop(
                     let endpoint = state.read().bootstrap.server_endpoint.clone();
                     let check =
                         web_ensure_closed_session_check(endpoint, &trace_home, &session_path).await;
-                    if !web_ensure_refuses_closed_session(&check.runtime, check.row_close_remembered)
-                    {
+                    if !web_ensure_refuses_closed_session(
+                        &check.runtime,
+                        check.row_close_remembered,
+                    ) {
                         continue;
                     }
                     // ONE owner of "this session's surfaces go away" — the same
@@ -13644,9 +13797,7 @@ async fn web_surface_native_reconcile_loop(
         {
             let page_fullscreen = fullscreen_native_id.is_some_and(|native_id| {
                 applied.values().any(|entry| {
-                    entry.native_id == native_id
-                        && entry.visible
-                        && entry.stashed_at_ms.is_none()
+                    entry.native_id == native_id && entry.visible && entry.stashed_at_ms.is_none()
                 })
             });
             if state.peek().page_fullscreen != page_fullscreen {
@@ -13895,9 +14046,7 @@ async fn web_surface_native_reconcile_loop(
             surface_policies
                 .get(session_path)
                 .and_then(|policy| policy.as_ref())
-                .and_then(|policy| {
-                    policy.user_agent_for_host(&web_surface_tab_host_label(url))
-                })
+                .and_then(|policy| policy.user_agent_for_host(&web_surface_tab_host_label(url)))
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -14112,11 +14261,14 @@ async fn web_surface_native_reconcile_loop(
                 // exists. Edge discipline as everywhere else: only a real
                 // answer is written through, so a miss costs the lookup alone.
                 {
-                    let model_icon_missing = state.peek().web_surfaces
+                    let model_icon_missing = state
+                        .peek()
+                        .web_surfaces
                         .get(&session_path)
                         .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
                         .is_some_and(|tab| tab.favicon_png.is_none() && !tab.url.is_empty());
-                    if model_icon_missing && favicon_disk_lookups < 32
+                    if model_icon_missing
+                        && favicon_disk_lookups < 32
                         && let Some(png) = desktop.web_surface_favicon_for_uri(&effective_url)
                     {
                         favicon_disk_lookups += 1;
@@ -14143,12 +14295,7 @@ async fn web_surface_native_reconcile_loop(
                     active_tab,
                 )
                 .map(|raw| {
-                    web_surface_place_page_rect(
-                        raw,
-                        viewport_size,
-                        chrome_claims,
-                        tab_fullscreen,
-                    )
+                    web_surface_place_page_rect(raw, viewport_size, chrome_claims, tab_fullscreen)
                 });
                 // Visibility is gated on ShellState's active-visible authority in
                 // addition to the (starvable) DOM rect: a stale rect returned for
@@ -14431,13 +14578,11 @@ async fn web_surface_native_reconcile_loop(
                             }
                             let mut writable = state;
                             let record = writable.with_mut(|shell| {
-                                let Some(surface) =
-                                    shell.web_surfaces.get_mut(key.0.as_str())
+                                let Some(surface) = shell.web_surfaces.get_mut(key.0.as_str())
                                 else {
                                     return false;
                                 };
-                                let Some(tab) =
-                                    surface.tabs.iter_mut().find(|tab| tab.id == key.1)
+                                let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == key.1)
                                 else {
                                     return false;
                                 };
@@ -14482,7 +14627,11 @@ async fn web_surface_native_reconcile_loop(
                             // title-settled poll below fill it in. Suggestions
                             // dedupe by url, keeping the titled row.
                             if record && url_changed {
-                                let fresh_title = if title_changed { page_title.as_str() } else { "" };
+                                let fresh_title = if title_changed {
+                                    page_title.as_str()
+                                } else {
+                                    ""
+                                };
                                 append_web_surface_history(&entry.profile, &page_url, fresh_title);
                             } else if record && title_changed {
                                 append_web_surface_history(&entry.profile, &page_url, &page_title);
@@ -14527,10 +14676,8 @@ async fn web_surface_native_reconcile_loop(
                     // the reload a user performs when a site refuses to render.
                     let want_identity = surface_user_agent(&key.0, &entry.page_url);
                     if entry.user_agent != want_identity {
-                        desktop.set_web_surface_user_agent(
-                            entry.native_id,
-                            want_identity.as_deref(),
-                        );
+                        desktop
+                            .set_web_surface_user_agent(entry.native_id, want_identity.as_deref());
                         entry.user_agent = want_identity;
                     }
                 } else {
@@ -14665,11 +14812,7 @@ async fn web_surface_native_reconcile_loop(
                                 // last raw `with_mut` in the crate, i.e. the one
                                 // write the storm autopsy could not see.
                                 writable_state.with_mut_counted(|shell| {
-                                    shell.push_notification(
-                                        NotificationTone::Warning,
-                                        title,
-                                        body,
-                                    );
+                                    shell.push_notification(NotificationTone::Warning, title, body);
                                 });
                             }
                             if writable { Some(jar.clone()) } else { None }
@@ -14696,9 +14839,7 @@ async fn web_surface_native_reconcile_loop(
                             // header, so the very first request is the one a
                             // UA-gating site scores, and applying it afterwards
                             // would be one load too late.
-                            policy.user_agent_for_host(&web_surface_tab_host_label(
-                                &effective_url,
-                            )),
+                            policy.user_agent_for_host(&web_surface_tab_host_label(&effective_url)),
                         ),
                         _ => (Vec::new(), None, None),
                     };
@@ -15341,9 +15482,7 @@ async fn web_surface_native_reconcile_loop(
                     .map(|(key, _)| key.clone())
             });
             let (session_path, tab_id) = match owner {
-                Some((session_path, tab_id)) => {
-                    (Value::String(session_path), Value::from(tab_id))
-                }
+                Some((session_path, tab_id)) => (Value::String(session_path), Value::from(tab_id)),
                 None => (Value::Null, Value::Null),
             };
             let bytes = match &event.phase {
@@ -15854,7 +15993,6 @@ struct DeclaredWebSurfaceOpen {
     claimed_session: Option<String>,
 }
 
-
 /// Why a retained declare could not become a surface.
 ///
 /// N4: "no declared web surface" was ONE string covering five different facts,
@@ -15965,28 +16103,23 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
     // `TerminalAppDeclares`, so it writes nothing and the proxy surfaces
     // `parsing daemon response: ""`. Swallowed, that read exactly like "this app
     // never declared": no rail, no error, nothing in the trace to look at.
-    let declares = match terminal_app_declares_async(
-        endpoint,
-        session_path.to_string(),
-        &trace_home,
-    )
-    .await
-    {
-        Ok((records, _running)) => records,
-        Err(error) => {
-            append_trace_event(
-                &trace_home,
-                "ui",
-                "app_declare",
-                "daemon_declare_unavailable",
-                json!({
-                    "session_path": session_path,
-                    "error": error.to_string(),
-                }),
-            );
-            return false;
-        }
-    };
+    let declares =
+        match terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home).await {
+            Ok((records, _running)) => records,
+            Err(error) => {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "app_declare",
+                    "daemon_declare_unavailable",
+                    json!({
+                        "session_path": session_path,
+                        "error": error.to_string(),
+                    }),
+                );
+                return false;
+            }
+        };
     let now_ms = current_millis();
     let Some(record) = declares
         .into_iter()
@@ -16077,11 +16210,13 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
     };
     let (probe_url, probe_target) = (control_url.clone(), ssh_target.clone());
     let reachable = task::spawn_blocking(move || {
-        let (effective, forward) = resolve_control_endpoint_url(&probe_url, probe_target.as_deref());
+        let (effective, forward) =
+            resolve_control_endpoint_url(&probe_url, probe_target.as_deref());
         // Liveness only, before any contribution exists — so there is no
         // declared token yet, and none is needed: `/ping`'s stamps are open.
         let alive =
-            control_ping_request(&build_control_ping_url(&effective, None, None, false), None).is_ok();
+            control_ping_request(&build_control_ping_url(&effective, None, None, false), None)
+                .is_ok();
         // The probe's own forward is dropped here; the rebuild opens the one it
         // keeps. Leaving this one alive would leak an `ssh -L` per probe.
         drop(forward);
@@ -16549,9 +16684,7 @@ fn web_ensure_policy_gate_step(
     rearmed_already: bool,
 ) -> WebEnsurePolicyGateStep {
     match gate {
-        SurfacePolicyGate::Ready(_) | SurfacePolicyGate::Absent => {
-            WebEnsurePolicyGateStep::Proceed
-        }
+        SurfacePolicyGate::Ready(_) | SurfacePolicyGate::Absent => WebEnsurePolicyGateStep::Proceed,
         _ if deadline_passed => WebEnsurePolicyGateStep::Refuse,
         SurfacePolicyGate::Abandoned if !rearmed_already => WebEnsurePolicyGateStep::RearmFetch,
         SurfacePolicyGate::Abandoned | SurfacePolicyGate::Pending => WebEnsurePolicyGateStep::Wait,
@@ -16582,16 +16715,11 @@ async fn web_ensure_await_policy_gate(
             WebEnsurePolicyGateStep::Proceed => return Ok(gate.label()),
             WebEnsurePolicyGateStep::RearmFetch => {
                 rearmed_already = true;
-                if let Some(version) = state
-                    .with_mut(|shell| shell.rearm_abandoned_sidebar_policy_fetch(session_path))
+                if let Some(version) =
+                    state.with_mut(|shell| shell.rearm_abandoned_sidebar_policy_fetch(session_path))
                 {
-                    app_policy_fetch(
-                        state,
-                        session_path.to_string(),
-                        version,
-                        trace_home.clone(),
-                    )
-                    .await;
+                    app_policy_fetch(state, session_path.to_string(), version, trace_home.clone())
+                        .await;
                 }
             }
             WebEnsurePolicyGateStep::Wait => {
@@ -17067,35 +17195,33 @@ async fn rebuild_web_surface_from_daemon_declare(
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     // Same distinction as the sidebar twin above: a fetch that FAILED is not an
     // app that never declared. See `daemon_declare_unavailable` there.
-    let declares = match terminal_app_declares_async(
-        endpoint,
-        session_path.to_string(),
-        &trace_home,
-    )
-    .await
-    {
-        Ok((records, _running)) => records,
-        Err(error) => {
-            append_trace_event(
-                &trace_home,
-                "ui",
-                "app_declare",
-                "daemon_declare_unavailable",
-                json!({
-                    "session_path": session_path,
-                    "verb": "web-surface",
-                    "error": error.to_string(),
-                }),
-            );
-            return DeclareRebuild::FetchFailed {
-                error: error.to_string(),
-            };
-        }
-    };
+    let declares =
+        match terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home).await {
+            Ok((records, _running)) => records,
+            Err(error) => {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "app_declare",
+                    "daemon_declare_unavailable",
+                    json!({
+                        "session_path": session_path,
+                        "verb": "web-surface",
+                        "error": error.to_string(),
+                    }),
+                );
+                return DeclareRebuild::FetchFailed {
+                    error: error.to_string(),
+                };
+            }
+        };
     let now_ms = current_millis();
     // Each step answers a DIFFERENT question, so each gets its own answer
     // rather than folding into one `None`.
-    let Some(record) = declares.into_iter().find(|record| record.verb == "web-surface") else {
+    let Some(record) = declares
+        .into_iter()
+        .find(|record| record.verb == "web-surface")
+    else {
         return DeclareRebuild::NoDeclare;
     };
     let age_ms = now_ms.saturating_sub(record.at_ms);
@@ -17169,8 +17295,7 @@ async fn rebuild_web_surface_from_daemon_declare(
             }),
         );
         state.with_mut_counted(|shell| {
-            shell
-                .upsert_web_surface_picker(session_path, effective_control, forward_child, now_ms);
+            shell.upsert_web_surface_picker(session_path, effective_control, forward_child, now_ms);
         });
         return DeclareRebuild::Rebuilt;
     }
@@ -17338,7 +17463,8 @@ fn web_omnibox_palette_items(
         }
         _ => format!("Search for \"{trimmed}\""),
     };
-    let mut items = vec![CommandPaletteItem::new(WEB_OMNIBOX_PALETTE_GO_ID, go_label).hint("Enter")];
+    let mut items =
+        vec![CommandPaletteItem::new(WEB_OMNIBOX_PALETTE_GO_ID, go_label).hint("Enter")];
     items.extend(suggestions.iter().map(|(url, title)| {
         // The TITLE leads and the URL is the quieter half — a history row the
         // user recognizes by its page name, not by its query string. A row with
@@ -19592,7 +19718,9 @@ fn terminal_open_external_url(url: &str) -> bool {
     let trimmed = url.trim();
     let valid = (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
         && trimmed.len() <= 4096
-        && !trimmed.chars().any(|ch| ch.is_whitespace() || ch.is_control());
+        && !trimmed
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control());
     if !valid {
         return false;
     }
@@ -19729,7 +19857,10 @@ fn titlebar_surface_switch(snapshot: &RenderSnapshot) -> TitlebarSurfaceSwitch {
         .as_deref()
         .and_then(|path| snapshot.document_surfaces.get(path))
     {
-        let custom = surface.schema.as_ref().and_then(|s| s.schema.titlebar_switch.clone());
+        let custom = surface
+            .schema
+            .as_ref()
+            .and_then(|s| s.schema.titlebar_switch.clone());
         if let Some(c) = &custom {
             if c.segments.is_empty() {
                 return TitlebarSurfaceSwitch::None;
@@ -20034,9 +20165,17 @@ fn conversation_provider_model_for_session(
     }
     if provider_hint_lower.contains("samplenotes") {
         return if conversation_provider_send_enabled(session) {
-            ConversationProviderModel::interactive("samplenotes-webapp-api", "SAMPLENOTES Webapp", "SAMPLENOTES API")
+            ConversationProviderModel::interactive(
+                "samplenotes-webapp-api",
+                "SAMPLENOTES Webapp",
+                "SAMPLENOTES API",
+            )
         } else {
-            ConversationProviderModel::read_only("samplenotes-webapp-api", "SAMPLENOTES Webapp", "SAMPLENOTES API")
+            ConversationProviderModel::read_only(
+                "samplenotes-webapp-api",
+                "SAMPLENOTES Webapp",
+                "SAMPLENOTES API",
+            )
         };
     }
     // An agent CLI's transcript reader is named from its descriptor. The three
@@ -20247,8 +20386,12 @@ impl ShellState {
         // ([[campaign-split-view-groups]] persistence restore).
         let restored_split_groups = settings.split_groups.clone();
         let restored_row_arrangement = settings.row_arrangement.clone();
-        let mut browser =
-            SessionBrowserState::new(bootstrap.browser_tree.clone().prune_store_container_leaves());
+        let mut browser = SessionBrowserState::new(
+            bootstrap
+                .browser_tree
+                .clone()
+                .prune_store_container_leaves(),
+        );
         // A persisted user collapse outranks a stale expanded entry for the
         // same synthetic path (the two can disagree when an auto-reveal
         // expanded a machine after the user collapsed it).
@@ -20588,14 +20731,6 @@ impl ShellState {
     fn restart_update_overdue(&self) -> bool {
         current_millis().saturating_sub(self.launched_at_ms) >= UPDATE_RESTART_STALE_AFTER_MS
     }
-    fn effective_install_context_for_update_check(&self) -> InstallContext {
-        let mut context = self.bootstrap.install_context.clone();
-        if let Some(update) = self.pending_update_restart.as_ref() {
-            context.current_version = update.version.clone();
-            context.preferred_executable = Some(update.executable.clone());
-        }
-        context
-    }
     /// ⛔ The ONLY way `latest_runtime_status` is written. Every status the
     /// client learns must pass through here, because learning the daemon's
     /// status IS the moment the handover predicate can change — a second
@@ -20670,7 +20805,10 @@ impl ShellState {
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            let p = PathBuf::from(home).join(".local").join("bin").join("yggterm");
+            let p = PathBuf::from(home)
+                .join(".local")
+                .join("bin")
+                .join("yggterm");
             if p.is_file() && candidates.is_empty() {
                 if let Ok(out) = std::process::Command::new(&p).arg("--version").output() {
                     if let Ok(s) = String::from_utf8(out.stdout) {
@@ -20738,7 +20876,8 @@ impl ShellState {
             return None;
         }
         if !Self::is_version_newer(&daemon_version, &own_version) {
-            if self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version) {
+            if self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version)
+            {
                 self.version_convergence_last_seen_daemon_version = Some(daemon_version.clone());
                 if let Ok(home) = resolve_yggterm_home() {
                     append_trace_event(
@@ -20756,7 +20895,8 @@ impl ShellState {
             }
             return None;
         }
-        let is_new_daemon = self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version);
+        let is_new_daemon =
+            self.version_convergence_last_seen_daemon_version.as_deref() != Some(&daemon_version);
         if is_new_daemon {
             self.version_convergence_last_seen_daemon_version = Some(daemon_version.clone());
             if let Ok(home) = resolve_yggterm_home() {
@@ -20777,7 +20917,9 @@ impl ShellState {
         let candidate_exe = match self.installed_gui_executable_for_version(&daemon_version) {
             Some(p) => p,
             None => {
-                if self.version_convergence_last_notified_missing.as_deref() != Some(&daemon_version) {
+                if self.version_convergence_last_notified_missing.as_deref()
+                    != Some(&daemon_version)
+                {
                     self.version_convergence_last_notified_missing = Some(daemon_version.clone());
                     let msg = format!(
                         "Version {} is running on the daemon (pid {}) but no matching GUI binary was found on disk (looked in versions/{}/yggterm). Install the matching yggterm binary to converge.",
@@ -20808,7 +20950,9 @@ impl ShellState {
         };
         if let Some(declared) = yggterm_core::install_path_declared_version(&candidate_exe) {
             if declared != daemon_version {
-                if self.version_convergence_last_notified_missing.as_deref() != Some(&daemon_version) {
+                if self.version_convergence_last_notified_missing.as_deref()
+                    != Some(&daemon_version)
+                {
                     self.version_convergence_last_notified_missing = Some(daemon_version.clone());
                     let msg = format!(
                         "Binary at {} declares version {} but daemon is {}, refusing mismatch.",
@@ -20816,7 +20960,11 @@ impl ShellState {
                         declared,
                         daemon_version
                     );
-                    self.push_notification(NotificationTone::Warning, "Version Mismatch", msg.clone());
+                    self.push_notification(
+                        NotificationTone::Warning,
+                        "Version Mismatch",
+                        msg.clone(),
+                    );
                     if let Ok(home) = resolve_yggterm_home() {
                         append_trace_event(
                             &home,
@@ -20887,7 +21035,6 @@ impl ShellState {
             executable: candidate_exe,
         })
     }
-
 
     /// Runtime keys of every terminal this client currently has a mounted host
     /// for — what it is actually painting, and therefore what a handover is
@@ -21053,15 +21200,6 @@ impl ShellState {
                 label: "Checking for updates".to_string(),
                 progress_percent: None,
                 detail: "Contacting the release channel".to_string(),
-                disabled: true,
-            },
-            UpdateWorkflowState::Installing {
-                percent, detail, ..
-            } => UpdateCallToAction {
-                mode: "updating",
-                label: "Updating".to_string(),
-                progress_percent: Some(*percent),
-                detail: detail.clone(),
                 disabled: true,
             },
             UpdateWorkflowState::Idle => {
@@ -21550,55 +21688,53 @@ impl ShellState {
         // and the KeyTip tree's `rowmenu` scope declares it, so the mouse menu and
         // the ALT layer cannot disagree about what the menu holds.
         let selected_tree_paths: Vec<String> = self.selected_tree_paths.iter().cloned().collect();
-        let (row_menu_items, row_menu_title) = match (
-            self.context_menu_surface,
-            context_menu_row.as_ref(),
-        ) {
-            // A viewport surface's menu (terminal Copy/Paste) — its items are
-            // surface-scoped, not the row's session actions.
-            (Some(kind), Some(_)) => (viewport_menu_items(kind), viewport_menu_title(kind)),
-            (_, Some(row)) => {
-                let drag_paths = if selected_tree_paths.is_empty() {
-                    selected_row
-                        .as_ref()
-                        .filter(|selected| is_tree_drag_source_row(selected))
-                        .map(|selected| vec![selected.full_path.clone()])
-                        .unwrap_or_default()
-                } else {
-                    selected_tree_paths.clone()
-                };
-                let split_members =
-                    split_group_member_labels(&self.split_groups, &live_sessions, row);
-                let split_candidates =
-                    split_candidate_paths_for(row, &selected_tree_paths, &self.split_groups);
-                let items = row_menu_items(
-                    row,
-                    // The apps of the machine THIS ROW lives on, not the GUI
-                    // host's — see [`app_registry_for_row`].
-                    &app_registry_for_row(self, row),
-                    keep_alive_plan.as_ref(),
-                    &split_members,
-                    split_candidates.len(),
-                    valid_drop_target(&drag_paths, row),
-                    saved_ssh_target_machine_key(row, self.server.ssh_targets()).is_some(),
-                    self.row_set_menu_role(row),
-                );
-                let selected_count = drag_paths.len().max(1);
-                // A heading only when it says something the row does not. A
-                // MULTI-selection does: the menu acts on three things and no
-                // single row shows that. One row's own label does not — the row
-                // is directly above the menu, highlighted, saying it already.
-                let title = if selected_count > 1
-                    && drag_paths.iter().any(|path| path == &row.full_path)
-                {
-                    format!("{selected_count} selected items")
-                } else {
-                    String::new()
-                };
-                (items, title)
-            }
-            (_, None) => (Vec::new(), String::new()),
-        };
+        let (row_menu_items, row_menu_title) =
+            match (self.context_menu_surface, context_menu_row.as_ref()) {
+                // A viewport surface's menu (terminal Copy/Paste) — its items are
+                // surface-scoped, not the row's session actions.
+                (Some(kind), Some(_)) => (viewport_menu_items(kind), viewport_menu_title(kind)),
+                (_, Some(row)) => {
+                    let drag_paths = if selected_tree_paths.is_empty() {
+                        selected_row
+                            .as_ref()
+                            .filter(|selected| is_tree_drag_source_row(selected))
+                            .map(|selected| vec![selected.full_path.clone()])
+                            .unwrap_or_default()
+                    } else {
+                        selected_tree_paths.clone()
+                    };
+                    let split_members =
+                        split_group_member_labels(&self.split_groups, &live_sessions, row);
+                    let split_candidates =
+                        split_candidate_paths_for(row, &selected_tree_paths, &self.split_groups);
+                    let items = row_menu_items(
+                        row,
+                        // The apps of the machine THIS ROW lives on, not the GUI
+                        // host's — see [`app_registry_for_row`].
+                        &app_registry_for_row(self, row),
+                        keep_alive_plan.as_ref(),
+                        &split_members,
+                        split_candidates.len(),
+                        valid_drop_target(&drag_paths, row),
+                        saved_ssh_target_machine_key(row, self.server.ssh_targets()).is_some(),
+                        self.row_set_menu_role(row),
+                    );
+                    let selected_count = drag_paths.len().max(1);
+                    // A heading only when it says something the row does not. A
+                    // MULTI-selection does: the menu acts on three things and no
+                    // single row shows that. One row's own label does not — the row
+                    // is directly above the menu, highlighted, saying it already.
+                    let title = if selected_count > 1
+                        && drag_paths.iter().any(|path| path == &row.full_path)
+                    {
+                        format!("{selected_count} selected items")
+                    } else {
+                        String::new()
+                    };
+                    (items, title)
+                }
+                (_, None) => (Vec::new(), String::new()),
+            };
         // The "here" row's path — what `ALT,E` acts on, so the row menu's KeyTip
         // badge can be painted ON that row instead of on some proxy in the chrome.
         // Mirrors [`here_row`] exactly (selected row, else the active session), but
@@ -21638,16 +21774,13 @@ impl ShellState {
             palette: palette,
             // Kind from the ROW the sidebar already resolved — available in the
             // window where the live-session record is not populated yet.
-            active_session_kind: self
-                .server
-                .active_session_path()
-                .and_then(|path| {
-                    self.browser
-                        .rows()
-                        .iter()
-                        .find(|row| row.full_path == path)
-                        .and_then(|row| row.session_kind)
-                }),
+            active_session_kind: self.server.active_session_path().and_then(|path| {
+                self.browser
+                    .rows()
+                    .iter()
+                    .find(|row| row.full_path == path)
+                    .and_then(|row| row.session_kind)
+            }),
             search_query: self.search_query.clone(),
             search_value_epoch: self.search_value_epoch,
             search_active,
@@ -21767,8 +21900,7 @@ impl ShellState {
             // Keying by session is what keeps a background yedit's document
             // from painting over the session the user is looking at.
             document_surfaces: {
-                let mut co_visible: Vec<String> =
-                    active_session_path.iter().cloned().collect();
+                let mut co_visible: Vec<String> = active_session_path.iter().cloned().collect();
                 if let Some(group) = self.active_split_group() {
                     for member in group.member_sessions() {
                         if !co_visible.iter().any(|path| path == member) {
@@ -22129,7 +22261,8 @@ impl ShellState {
             None => WebTabStore::default(),
         };
         let restore = self.settings.web_surface_restore_tabs;
-        let plan = plan_web_tab_restore(store.tabs_to_open(restore, open), restore, start_page, open);
+        let plan =
+            plan_web_tab_restore(store.tabs_to_open(restore, open), restore, start_page, open);
         if let Some(saved) = &plan.adopt {
             app_tab.url = saved.url.clone();
             // The egress the caller resolved was for the START PAGE, and this is
@@ -22147,7 +22280,9 @@ impl ShellState {
                 app_tab.history_index = 0;
             } else {
                 app_tab.history = saved.history.clone();
-                app_tab.history_index = saved.history_index.min(saved.history.len().saturating_sub(1));
+                app_tab.history_index = saved
+                    .history_index
+                    .min(saved.history.len().saturating_sub(1));
                 // Adopted history must point at the adopted url; if the saved index
                 // drifted (old store), clamp to the adopted entry.
                 if app_tab.history.get(app_tab.history_index) != Some(&saved.url) {
@@ -22162,10 +22297,7 @@ impl ShellState {
         // Tab ids follow the plan's order, so the tab to land on is its index + 1
         // (the app tab is id 0, and is the fallback: a session saved with the app
         // tab in front, or a restore that is off, has nowhere else to return to).
-        let restore_active_tab = plan
-            .land_on
-            .map(|index| index as u64 + 1)
-            .unwrap_or(0);
+        let restore_active_tab = plan.land_on.map(|index| index as u64 + 1).unwrap_or(0);
         // Resolve the store's durable keys back to THIS run's tab ids. Ids
         // follow the plan's order (the app tab is 0, the first restored tab is
         // 1), so the map can be built before the rows are, and a member whose
@@ -22176,7 +22308,10 @@ impl ShellState {
             .iter()
             .enumerate()
             .filter_map(|(index, saved)| {
-                saved.group_key.as_deref().map(|key| (key, index as u64 + 1))
+                saved
+                    .group_key
+                    .as_deref()
+                    .map(|key| (key, index as u64 + 1))
             })
             .collect();
         let mut tabs = vec![app_tab];
@@ -22200,9 +22335,11 @@ impl ShellState {
                 history_index: if saved.history.is_empty() {
                     0
                 } else {
-                    saved.history_index.min(saved.history.len().saturating_sub(1))
+                    saved
+                        .history_index
+                        .min(saved.history.len().saturating_sub(1))
                 },
-            engine_nav: None,
+                engine_nav: None,
                 reload_nonce: 0,
                 profile: profile.clone(),
                 // Carried only so the migration below can consume it; cleared
@@ -22861,7 +22998,10 @@ impl ShellState {
             ..Default::default()
         };
         for entry in entries {
-            let id = entry.get("id").and_then(|value| value.as_str()).unwrap_or("");
+            let id = entry
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             if id.is_empty() {
                 // Malformed: nothing to dedup on, permanent drop, still ack-able.
                 outcome.dropped += 1;
@@ -22870,7 +23010,10 @@ impl ShellState {
             if self.command_id_already_drained(id) {
                 continue;
             }
-            let kind = entry.get("kind").and_then(|value| value.as_str()).unwrap_or("");
+            let kind = entry
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
             let target_path = entry
                 .get("session")
                 .and_then(|value| value.as_str())
@@ -22887,7 +23030,8 @@ impl ShellState {
                         .and_then(|value| value.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let tone = command_toast_tone(entry.get("tone").and_then(|value| value.as_str()));
+                    let tone =
+                        command_toast_tone(entry.get("tone").and_then(|value| value.as_str()));
                     self.push_notification(tone, title, body);
                     self.remember_drained_command_id(id);
                     outcome.delivered += 1;
@@ -22980,14 +23124,14 @@ impl ShellState {
             return None;
         };
         // Only the app's RAIL pane tracks the document set.
-        let declares_rail_pane = self
-            .sidebar_contributions
-            .get(session_path)
-            .is_some_and(|contribution| {
-                contribution.panes.iter().any(|pane| {
-                    pane.placement == PanePlacement::Rail && pane.id == open_pane.pane
-                })
-            });
+        let declares_rail_pane =
+            self.sidebar_contributions
+                .get(session_path)
+                .is_some_and(|contribution| {
+                    contribution.panes.iter().any(|pane| {
+                        pane.placement == PanePlacement::Rail && pane.id == open_pane.pane
+                    })
+                });
         if !declares_rail_pane {
             return None;
         }
@@ -23346,65 +23490,67 @@ impl ShellState {
             _ => false,
         };
         if !clock_matches {
-            self.sidebar_reads_live_since =
-                active_visible_path.clone().map(|path| (path, now_ms));
+            self.sidebar_reads_live_since = active_visible_path.clone().map(|path| (path, now_ms));
         }
         let reads_since = self
             .sidebar_reads_live_since
             .as_ref()
             .map(|(_, since)| *since)
             .unwrap_or(now_ms);
-        self.sidebar_contributions.retain(|session_path, contribution| {
-            let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
-            if !reads_live {
-                return true;
-            }
-            let effective_last_seen = contribution
-                .last_seen_ms
-                .max(sidebar_ping_liveness_ms(session_path))
-                .max(reads_since);
-            let age_ms = now_ms.saturating_sub(effective_last_seen);
-            let live = age_ms <= SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS;
-            if !live {
-                yggterm_core::perf::ytrace_emit_event(
-                    "sidebar",
-                    "liveness",
-                    "swept",
-                    json!({
-                        "session_path": session_path,
-                        "last_seen_ms": contribution.last_seen_ms,
-                        "effective_last_seen": effective_last_seen,
-                        "now_ms": now_ms,
-                        "age_ms": age_ms,
-                        "threshold_ms": SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS,
-                    }),
-                );
-                kill_control_forward(contribution);
-            }
-            if !live {
-                // Expired like a close: a future instance re-earns its rail
-                // auto-open, and the dead app's document channels go with it
-                // (a late reply must find nothing to write into).
-                self.document_rail_auto_opened.remove(session_path);
-                self.document_panes
-                    .retain(|(session, _), _| session != session_path);
-            }
-            live
-        });
+        self.sidebar_contributions
+            .retain(|session_path, contribution| {
+                let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
+                if !reads_live {
+                    return true;
+                }
+                let effective_last_seen = contribution
+                    .last_seen_ms
+                    .max(sidebar_ping_liveness_ms(session_path))
+                    .max(reads_since);
+                let age_ms = now_ms.saturating_sub(effective_last_seen);
+                let live = age_ms <= SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS;
+                if !live {
+                    yggterm_core::perf::ytrace_emit_event(
+                        "sidebar",
+                        "liveness",
+                        "swept",
+                        json!({
+                            "session_path": session_path,
+                            "last_seen_ms": contribution.last_seen_ms,
+                            "effective_last_seen": effective_last_seen,
+                            "now_ms": now_ms,
+                            "age_ms": age_ms,
+                            "threshold_ms": SIDEBAR_CONTRIBUTION_EXPIRE_AFTER_MS,
+                        }),
+                    );
+                    kill_control_forward(contribution);
+                }
+                if !live {
+                    // Expired like a close: a future instance re-earns its rail
+                    // auto-open, and the dead app's document channels go with it
+                    // (a late reply must find nothing to write into).
+                    self.document_rail_auto_opened.remove(session_path);
+                    self.document_panes
+                        .retain(|(session, _), _| session != session_path);
+                }
+                live
+            });
         // The not-responding overlay marker: the active-visible session whose
         // contribution SURVIVED the retain but is past the stale window. One
         // owner (this sweep) and one clearer (a declare arriving), so the
         // overlay can never disagree with the sweep about staleness.
         prune_sidebar_ping_liveness(&self.sidebar_contributions);
         self.document_surface_stale = active_visible_path.filter(|path| {
-            self.sidebar_contributions.get(path).is_some_and(|contribution| {
-                now_ms.saturating_sub(
-                    contribution
-                        .last_seen_ms
-                        .max(sidebar_ping_liveness_ms(path))
-                        .max(reads_since),
-                ) > WEB_SURFACE_STALE_AFTER_MS
-            })
+            self.sidebar_contributions
+                .get(path)
+                .is_some_and(|contribution| {
+                    now_ms.saturating_sub(
+                        contribution
+                            .last_seen_ms
+                            .max(sidebar_ping_liveness_ms(path))
+                            .max(reads_since),
+                    ) > WEB_SURFACE_STALE_AFTER_MS
+                })
         });
         // An expiry above may have taken the last declaration of the pane that
         // holds the rail — end that tenancy here rather than leaving the slot
@@ -23424,8 +23570,7 @@ impl ShellState {
         };
         if !clock_matches {
             // A clock reset only matters if there is anything it could judge.
-            return !self.sidebar_contributions.is_empty()
-                || self.document_surface_stale.is_some();
+            return !self.sidebar_contributions.is_empty() || self.document_surface_stale.is_some();
         }
         let reads_since = self
             .sidebar_reads_live_since
@@ -23520,14 +23665,10 @@ impl ShellState {
         let group = self.active_split_group()?;
         let focused = focused_pane_index(group, self.server.active_session_path())?;
         match group.members.get(focused) {
-            Some(member)
-                if member.session == session_path =>
-            {
-                match member.view {
-                    SplitMemberView::Web { tab } => Some(tab),
-                    _ => None,
-                }
-            }
+            Some(member) if member.session == session_path => match member.view {
+                SplitMemberView::Web { tab } => Some(tab),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -23605,39 +23746,35 @@ impl ShellState {
     /// probes that judge one row (input policy, viewport render).
     fn web_surface_record_live(&self, session_path: &str, now_ms: u64) -> bool {
         let reads_since = self.session_reads_since(session_path, now_ms);
-        self.web_surfaces
-            .get(session_path)
-            .is_some_and(|surface| {
-                now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
-                    <= WEB_SURFACE_STALE_AFTER_MS
-            })
+        self.web_surfaces.get(session_path).is_some_and(|surface| {
+            now_ms.saturating_sub(surface.last_seen_ms.max(reads_since))
+                <= WEB_SURFACE_STALE_AFTER_MS
+        })
     }
     /// Cheap liveness probe (no view construction) for the input policy.
     fn has_live_web_surface(&self, session_path: &str, now_ms: u64) -> bool {
         let reads_since = self.session_reads_since(session_path, now_ms);
-        self.web_surfaces
-            .get(session_path)
-            .is_some_and(|surface| {
-                let age_ms = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since));
-                let live = age_ms <= WEB_SURFACE_STALE_AFTER_MS;
-                if !live && reads_since > 0 && should_emit_stale_detected(session_path, now_ms) {
-                    yggterm_core::perf::ytrace_emit_event(
-                        "web_surface",
-                        "liveness",
-                        "stale_detected",
-                        json!({
-                            "session_path": session_path,
-                            "last_seen_ms": surface.last_seen_ms,
-                            "reads_since": reads_since,
-                            "now_ms": now_ms,
-                            "age_ms": age_ms,
-                            "threshold_ms": WEB_SURFACE_STALE_AFTER_MS,
-                            "probe": "has_live_web_surface",
-                        }),
-                    );
-                }
-                live
-            })
+        self.web_surfaces.get(session_path).is_some_and(|surface| {
+            let age_ms = now_ms.saturating_sub(surface.last_seen_ms.max(reads_since));
+            let live = age_ms <= WEB_SURFACE_STALE_AFTER_MS;
+            if !live && reads_since > 0 && should_emit_stale_detected(session_path, now_ms) {
+                yggterm_core::perf::ytrace_emit_event(
+                    "web_surface",
+                    "liveness",
+                    "stale_detected",
+                    json!({
+                        "session_path": session_path,
+                        "last_seen_ms": surface.last_seen_ms,
+                        "reads_since": reads_since,
+                        "now_ms": now_ms,
+                        "age_ms": age_ms,
+                        "threshold_ms": WEB_SURFACE_STALE_AFTER_MS,
+                        "probe": "has_live_web_surface",
+                    }),
+                );
+            }
+            live
+        })
     }
     /// True while a modal that must sit OVER the viewport is open. In LEGACY
     /// stacking a native web surface draws above ALL DOM, so any such modal is
@@ -23682,9 +23819,7 @@ impl ShellState {
                 self.web_profile_switcher
                     .as_ref()
                     .map(|switcher| switcher.anchor),
-                self.web_tab_context_menu
-                    .as_ref()
-                    .map(|menu| menu.anchor),
+                self.web_tab_context_menu.as_ref().map(|menu| menu.anchor),
             ),
         )
     }
@@ -23958,10 +24093,7 @@ impl ShellState {
                 // channel carried the request.
                 candidates.iter().copied().find(|id| *id == receiving_tab)
             })
-            .or_else(|| {
-                (candidates.len() == 1)
-                    .then(|| candidates[0])
-            })?;
+            .or_else(|| (candidates.len() == 1).then(|| candidates[0]))?;
         self.web_surface_close_tab(session_path, target);
         self.persist_web_tabs(session_path, WebTabSave::TreeEdit);
         Some(target)
@@ -24001,9 +24133,7 @@ impl ShellState {
                     .tabs
                     .iter()
                     .find(|tab| tab.id == tab_id)
-                    .is_some_and(|tab| {
-                        web_tab_is_saved(tab.id, &tab.url, &surface.osc_url)
-                    });
+                    .is_some_and(|tab| web_tab_is_saved(tab.id, &tab.url, &surface.osc_url));
                 if !holds_page {
                     return;
                 }
@@ -24299,11 +24429,7 @@ impl ShellState {
         query: &str,
         count: u32,
     ) -> Option<(u32, u32)> {
-        let find = self
-            .web_surfaces
-            .get_mut(session_path)?
-            .find
-            .as_mut()?;
+        let find = self.web_surfaces.get_mut(session_path)?.find.as_mut()?;
         find.apply_engine_count(step, query, count);
         Some((find.position, find.match_count))
     }
@@ -24364,18 +24490,16 @@ impl ShellState {
         // genuine insertion beyond it may auto-complete; a deletion (backspace
         // over the selected tail, or shortening) must NOT re-complete — Chrome's
         // first backspace clears the inline completion.
-        let prev_typed_len = surface.address_typed_len.unwrap_or_else(|| {
-            surface.address_draft.as_deref().map(str::len).unwrap_or(0)
-        });
+        let prev_typed_len = surface
+            .address_typed_len
+            .unwrap_or_else(|| surface.address_draft.as_deref().map(str::len).unwrap_or(0));
         let is_insertion = value.len() > prev_typed_len;
         let profile = surface
             .tabs
             .first()
             .map(|tab| tab.profile.clone())
             .unwrap_or_else(|| "default".to_string());
-        if is_insertion
-            && let Some(completion) = web_surface_inline_completion(&profile, &value)
-        {
+        if is_insertion && let Some(completion) = web_surface_inline_completion(&profile, &value) {
             let typed_len = value.len();
             let completed_len = completion.len();
             surface.address_draft = Some(completion.clone());
@@ -24442,7 +24566,9 @@ impl ShellState {
             tab.url = url.clone();
             tab.effective_url = effective_url;
             tab.socks_port = socks_port;
-            tab.forward_child = orphaned_forward.take().map(|child| Arc::new(Mutex::new(child)));
+            tab.forward_child = orphaned_forward
+                .take()
+                .map(|child| Arc::new(Mutex::new(child)));
             match history_index {
                 Some(index) if index < tab.history.len() => tab.history_index = index,
                 _ => {
@@ -24608,11 +24734,7 @@ impl ShellState {
                 id: tab.id,
                 label: web_surface_tab_label(tab, index),
                 is_app_tab: index == 0,
-                holds_saved_page: web_tab_is_saved(
-                    tab.id,
-                    &tab.effective_url,
-                    &surface.osc_url,
-                ),
+                holds_saved_page: web_tab_is_saved(tab.id, &tab.effective_url, &surface.osc_url),
                 app_home_url: (index == 0).then(|| surface.osc_url.clone()),
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
@@ -24650,12 +24772,14 @@ impl ShellState {
         // The dropdown matches what the USER TYPED, not the inline-completed
         // draft: when a completion is active `address_draft` holds the full
         // completed URL, so slice back to `address_typed_len` for the query.
-        let suggestion_query = surface.address_draft.as_deref().map(|draft| {
-            match surface.address_typed_len {
-                Some(len) if len <= draft.len() && draft.is_char_boundary(len) => &draft[..len],
-                _ => draft,
-            }
-        });
+        let suggestion_query =
+            surface
+                .address_draft
+                .as_deref()
+                .map(|draft| match surface.address_typed_len {
+                    Some(len) if len <= draft.len() && draft.is_char_boundary(len) => &draft[..len],
+                    _ => draft,
+                });
         let address_suggestions = suggestion_query
             .map(|query| web_surface_history_suggestions(&active.profile, query, 6))
             .unwrap_or_default();
@@ -24848,8 +24972,7 @@ impl ShellState {
             && self.active_web_surface().is_some_and(|surface| {
                 // A surface still in its profile picker draws no tab strip: its
                 // viewport is the GUI-native chooser.
-                surface.picker.is_none()
-                    && surface.tabs.iter().any(|tab| tab.group_head.is_some())
+                surface.picker.is_none() && surface.tabs.iter().any(|tab| tab.group_head.is_some())
             })
     }
     /// THE reader of "is the group-overflow dropdown open". One owner, because
@@ -24879,9 +25002,8 @@ impl ShellState {
         // raises it. A strip-anchored one is a stash member, so it must be
         // reachable by the strip-scoped closer — otherwise Escape would report
         // the strip dropdown as the top modal and then close nothing.
-        let tab_menu_is_strip_anchored = anchored_on_strip(
-            self.web_tab_context_menu.as_ref().map(|menu| menu.anchor),
-        );
+        let tab_menu_is_strip_anchored =
+            anchored_on_strip(self.web_tab_context_menu.as_ref().map(|menu| menu.anchor));
         self.close_web_tab_overflow();
         if switcher_is_strip_anchored {
             self.close_web_profile_switcher();
@@ -25173,12 +25295,7 @@ impl ShellState {
     }
     /// File a tab into a group, or back to the root with `None`. The app tab
     /// cannot be filed: it is the app's, and it is gone when the app is.
-    fn web_tab_move_to_group(
-        &mut self,
-        session_path: &str,
-        tab_id: u64,
-        head: Option<u64>,
-    ) {
+    fn web_tab_move_to_group(&mut self, session_path: &str, tab_id: u64, head: Option<u64>) {
         if tab_id == WEB_TAB_APP_TAB_ID {
             let holds_page = self
                 .web_surfaces
@@ -25249,12 +25366,7 @@ impl ShellState {
                 return;
             }
         }
-        self.arm_row_drag(
-            WEB_TAB_RAIL_DRAG_SCOPE.to_string(),
-            row_id,
-            label,
-            pointer,
-        );
+        self.arm_row_drag(WEB_TAB_RAIL_DRAG_SCOPE.to_string(), row_id, label, pointer);
     }
 
     fn maybe_begin_web_tab_row_drag(&mut self, pointer: (f64, f64)) -> bool {
@@ -25323,7 +25435,6 @@ impl ShellState {
         self.apply_web_tab_row_drop(&session, &drag.row_id, drop);
     }
 
-
     fn web_tab_row_is_dragging(&self, row_id: &str) -> bool {
         self.row_drag
             .as_ref()
@@ -25377,8 +25488,7 @@ impl ShellState {
         }
         let rank = |row_id: &str| drop.order.iter().position(|id| id == row_id);
         surface.tabs.sort_by_key(|tab| {
-            if tab.id == WEB_TAB_APP_TAB_ID
-                && !web_tab_is_saved(tab.id, &tab.url, &surface.osc_url)
+            if tab.id == WEB_TAB_APP_TAB_ID && !web_tab_is_saved(tab.id, &tab.url, &surface.osc_url)
             {
                 return 0;
             }
@@ -26091,8 +26201,7 @@ impl ShellState {
             .app_pane_schema
             .as_ref()
             .filter(|state| state.pane_id == pane_id);
-        let (value_epochs, values) =
-            app_pane_adopt_values(&schema, mounted, &self.app_pane_values);
+        let (value_epochs, values) = app_pane_adopt_values(&schema, mounted, &self.app_pane_values);
         self.app_pane_values = values;
         self.app_pane_error = None;
         self.app_pane_schema = Some(AppPaneSchemaState {
@@ -26495,7 +26604,17 @@ impl ShellState {
                 .web_surfaces
                 .get(session_path)
                 .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
-                .is_some_and(|tab| web_tab_is_saved(tab.id, &tab.url, &self.web_surfaces.get(session_path).map(|s| s.osc_url.clone()).unwrap_or_default()));
+                .is_some_and(|tab| {
+                    web_tab_is_saved(
+                        tab.id,
+                        &tab.url,
+                        &self
+                            .web_surfaces
+                            .get(session_path)
+                            .map(|s| s.osc_url.clone())
+                            .unwrap_or_default(),
+                    )
+                });
             if !holds_page {
                 return None;
             }
@@ -26585,10 +26704,7 @@ impl ShellState {
                 self.web_surface_reload_tab(session_path, *tab_id);
             }
             WebTabMenuAction::NewTabInGroup(head) => {
-                self.web_surface_open_tab(
-                    session_path,
-                    &WebTabOpenRequest::blank_in_group(*head),
-                );
+                self.web_surface_open_tab(session_path, &WebTabOpenRequest::blank_in_group(*head));
             }
             WebTabMenuAction::DisbandGroup(head) => {
                 // Removing ORGANIZATION, never content: the group goes and its
@@ -26626,9 +26742,7 @@ impl ShellState {
                 self.web_tab_move_to_group(session_path, *tab_id, *head);
             }
             WebTabMenuAction::RenameRow(row) => self.web_tab_begin_rename(&web_tab_row_id(row)),
-            WebTabMenuAction::ToggleGroup(head) => {
-                self.web_tab_toggle_group(session_path, *head)
-            }
+            WebTabMenuAction::ToggleGroup(head) => self.web_tab_toggle_group(session_path, *head),
             // Not this shell's to run: a split opens a PANE, which needs the
             // signal and a spawn. The dispatcher takes it from here.
             WebTabMenuAction::SplitWithActiveTab(_) => return false,
@@ -26811,7 +26925,6 @@ impl ShellState {
     fn maybe_begin_app_pane_row_drag(&mut self, pointer: (f64, f64)) -> bool {
         self.maybe_begin_row_drag(pointer)
     }
-
 
     #[cfg(test)]
     /// Hover `row_id` at `placement` while a drag is live. Ignored unless the
@@ -26998,12 +27111,20 @@ impl ShellState {
             let undisturbed = !buffer_changed && (matches_live_draft || is_echo_of_sent);
             value_epochs.insert(
                 id.clone(),
-                if undisturbed { epoch } else { epoch.wrapping_add(1) },
+                if undisturbed {
+                    epoch
+                } else {
+                    epoch.wrapping_add(1)
+                },
             );
             // Keep the user's live draft when the app is only echoing; adopt the
             // declared value when it is genuinely new content.
             let kept = if undisturbed {
-                channel.values.get(&id).cloned().unwrap_or_else(|| declared.clone())
+                channel
+                    .values
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| declared.clone())
             } else {
                 declared.clone()
             };
@@ -27025,7 +27146,11 @@ impl ShellState {
                 .unwrap_or(true);
             value_epochs.insert(
                 "palette".to_string(),
-                if changed { epoch.wrapping_add(1) } else { epoch },
+                if changed {
+                    epoch.wrapping_add(1)
+                } else {
+                    epoch
+                },
             );
         }
         channel.values = values;
@@ -27193,7 +27318,11 @@ impl ShellState {
             let Some((id, declared)) = widget.declared_value() else {
                 continue;
             };
-            if channel.values.get(&id).is_some_and(|shown| *shown != declared) {
+            if channel
+                .values
+                .get(&id)
+                .is_some_and(|shown| *shown != declared)
+            {
                 dirty = true;
             }
         }
@@ -27497,7 +27626,6 @@ impl ShellState {
             .map(|session| session.launch_command.clone())?;
         (current == failure.launch_command).then_some(failure)
     }
-
 
     fn maybe_finish_terminal_surface_request_for_session(&mut self, session_path: &str) {
         if self.terminal_attach_in_flight.contains(session_path) {
@@ -28023,7 +28151,9 @@ impl ShellState {
                     .ok()
                     .and_then(|s| {
                         s.lines().find(|l| l.starts_with("VmSwap:")).and_then(|l| {
-                            l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+                            l.split_whitespace()
+                                .nth(1)
+                                .and_then(|v| v.parse::<u64>().ok())
                         })
                     })
                     .unwrap_or(0)
@@ -28071,42 +28201,42 @@ impl ShellState {
                 && self.server.active_session_path() == Some(session_path);
             if still_watching {
                 let seconds = notify_total_ms as f64 / 1000.0;
-            // ⛔ THE 2026-08-10 INVERSION HAD A BLIND SPOT, measured 2026-08-20:
-            // PSI `full` is machine-wide (every non-idle task stalled at once),
-            // so it reads ~0 while the ONE process the user is watching pays
-            // seconds of swap-in for its own paged-out memory. A machine that
-            // was under pressure earlier leaves GiBs of swap RESIDUE; free RAM
-            // is plentiful, reclaim is quiet, and the first reveal that touches
-            // cold pages still crawls. On the live host: 5.7 GiB residue,
-            // "Memory is not the cause: 9022 MB available" on an 81.8 s reveal.
-            // The discriminator that sees it is the app's OWN swap residency,
-            // read at notify time (self + direct children — the web process
-            // holds the canvas).
-            let notify_own_swap_mb = own_process_tree_swap_mb();
-            let detail = if notify_reclaim_pressured {
-                // The honest predicate agrees: memory really is the problem.
-                format!(
-                    "The machine is short of memory ({} MB of {} MB available), so freeing RAM should help.",
-                    notify_mem_available_mb, notify_mem_total_mb,
-                )
-            } else if notify_own_swap_mb >= 64 {
-                format!(
-                    "Free RAM is plentiful ({} MB of {} MB available) but this app holds {} MB in swap — residue from an earlier memory crunch. Pages come back lazily, and a reveal that touches them pays the swap-in once.",
-                    notify_mem_available_mb, notify_mem_total_mb, notify_own_swap_mb,
-                )
-            } else {
-                // Say what was ruled out, so the next person does not re-chase it.
-                match notify_psi_full_pct {
-                    Some(psi) => format!(
-                        "Memory is not the cause: {} MB of {} MB available, {} MB of this app in swap, and the kernel stalled on reclaim {:.2}% of the time.",
-                        notify_mem_available_mb, notify_mem_total_mb, notify_own_swap_mb, psi,
-                    ),
-                    None => format!(
-                        "Memory does not look like the cause: {} MB of {} MB available.",
+                // ⛔ THE 2026-08-10 INVERSION HAD A BLIND SPOT, measured 2026-08-20:
+                // PSI `full` is machine-wide (every non-idle task stalled at once),
+                // so it reads ~0 while the ONE process the user is watching pays
+                // seconds of swap-in for its own paged-out memory. A machine that
+                // was under pressure earlier leaves GiBs of swap RESIDUE; free RAM
+                // is plentiful, reclaim is quiet, and the first reveal that touches
+                // cold pages still crawls. On the live host: 5.7 GiB residue,
+                // "Memory is not the cause: 9022 MB available" on an 81.8 s reveal.
+                // The discriminator that sees it is the app's OWN swap residency,
+                // read at notify time (self + direct children — the web process
+                // holds the canvas).
+                let notify_own_swap_mb = own_process_tree_swap_mb();
+                let detail = if notify_reclaim_pressured {
+                    // The honest predicate agrees: memory really is the problem.
+                    format!(
+                        "The machine is short of memory ({} MB of {} MB available), so freeing RAM should help.",
                         notify_mem_available_mb, notify_mem_total_mb,
-                    ),
-                }
-            };
+                    )
+                } else if notify_own_swap_mb >= 64 {
+                    format!(
+                        "Free RAM is plentiful ({} MB of {} MB available) but this app holds {} MB in swap — residue from an earlier memory crunch. Pages come back lazily, and a reveal that touches them pays the swap-in once.",
+                        notify_mem_available_mb, notify_mem_total_mb, notify_own_swap_mb,
+                    )
+                } else {
+                    // Say what was ruled out, so the next person does not re-chase it.
+                    match notify_psi_full_pct {
+                        Some(psi) => format!(
+                            "Memory is not the cause: {} MB of {} MB available, {} MB of this app in swap, and the kernel stalled on reclaim {:.2}% of the time.",
+                            notify_mem_available_mb, notify_mem_total_mb, notify_own_swap_mb, psi,
+                        ),
+                        None => format!(
+                            "Memory does not look like the cause: {} MB of {} MB available.",
+                            notify_mem_available_mb, notify_mem_total_mb,
+                        ),
+                    }
+                };
                 self.push_notification(
                     NotificationTone::Info,
                     "Slow terminal reveal",
@@ -28208,7 +28338,9 @@ impl ShellState {
         } else if attempt.surface_mounted_at_ms.is_some() {
             (
                 0.5,
-                format!("Re-resuming on {host_label} — waiting for the session to start ({elapsed})."),
+                format!(
+                    "Re-resuming on {host_label} — waiting for the session to start ({elapsed})."
+                ),
             )
         } else {
             (0.2, format!("Mounting the terminal surface ({elapsed})."))
@@ -28259,7 +28391,11 @@ impl ShellState {
             job_key,
             tone,
             title,
-            message: if owns_message { stage } else { existing_message },
+            message: if owns_message {
+                stage
+            } else {
+                existing_message
+            },
             fraction: fraction.clamp(0.0, 1.0),
             session_path,
         })
@@ -28709,9 +28845,8 @@ impl ShellState {
             // (issue #16). A fresh remount registers a new attempt with an
             // empty last_surface_problem, so re-entering a dead session
             // re-fires exactly once per attempt — no per-poll flicker.
-            let was_codex_dead = surface_problem_is_codex_session_gone(
-                attempt.last_surface_problem.as_deref(),
-            );
+            let was_codex_dead =
+                surface_problem_is_codex_session_gone(attempt.last_surface_problem.as_deref());
             let now_codex_dead = surface_problem_is_codex_session_gone(surface_problem.as_deref());
             if now_codex_dead && !was_codex_dead {
                 fire_dead_session_toast_for = Some(attempt.session_path.clone());
@@ -29395,7 +29530,10 @@ impl ShellState {
     ///
     /// ⚠ Both arms require the session NOT to be the active terminal. A user
     /// staring at a terminal that never came up must still be told.
-    fn terminal_resume_timeout_should_stand_down(&self, session_path: &str) -> Option<&'static str> {
+    fn terminal_resume_timeout_should_stand_down(
+        &self,
+        session_path: &str,
+    ) -> Option<&'static str> {
         if self.server.active_view_mode() == WorkspaceViewMode::Terminal
             && self.server.active_session_path() == Some(session_path)
         {
@@ -29721,10 +29859,7 @@ impl ShellState {
     /// the held session only when the daemon says null, the GUI holds a view,
     /// and that view is still a live row in the incoming snapshot. Pure, so a
     /// test can pin the decision without a daemon on the wire.
-    fn daemon_active_desync_push_target(
-        &self,
-        snapshot: &ServerUiSnapshot,
-    ) -> Option<String> {
+    fn daemon_active_desync_push_target(&self, snapshot: &ServerUiSnapshot) -> Option<String> {
         if snapshot.active_session_path.is_some() {
             return None;
         }
@@ -29803,9 +29938,7 @@ impl ShellState {
     }
 
     fn last_known_terminal_buffer_kind(&self, session_path: &str) -> Option<String> {
-        self.terminal_last_buffer_kinds
-            .get(session_path)
-            .cloned()
+        self.terminal_last_buffer_kinds.get(session_path).cloned()
     }
 
     /// The buffer-kind seed a fresh mount opens with: the DAEMON's fullscreen
@@ -31044,8 +31177,7 @@ impl ShellState {
             .terminal_open_attempts
             .values()
             .filter(|attempt| {
-                attempt.session_path == session_path
-                    && attempt.source == "retained_fault_recovery"
+                attempt.session_path == session_path && attempt.source == "retained_fault_recovery"
             })
             .count();
         rfr_attempts >= FUTILE_ATTEMPT_THRESHOLD
@@ -31156,7 +31288,8 @@ impl ShellState {
         }
         for path in &candidates {
             self.hot_warming_in_flight.insert(path.clone());
-            self.last_hot_warm_attempt_at_ms.insert(path.clone(), now_ms);
+            self.last_hot_warm_attempt_at_ms
+                .insert(path.clone(), now_ms);
         }
         candidates
     }
@@ -31253,14 +31386,15 @@ impl ShellState {
         // normally on the next tick. Genuine non-empty faults (transport errors,
         // identity mismatch, etc.) are unaffected — only the empty-surface reason
         // is graced. See [[followups-switch-hotness-update-friction]].
-        let benign_reveal_empty_fault = fault_reason
-            == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
+        let benign_reveal_empty_fault = fault_reason == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
             && self.terminal_session_in_reveal_grace(session_path)
             && self.terminal_session_was_ever_ready(session_path)
             && self.daemon_owns_session_runtime(session_path);
         if benign_reveal_empty_fault {
             let suppression_key = format!("{session_path}:reveal_grace");
-            if self.last_retained_fault_invalidation_suppression_key.as_deref()
+            if self
+                .last_retained_fault_invalidation_suppression_key
+                .as_deref()
                 != Some(suppression_key.as_str())
             {
                 self.last_retained_fault_invalidation_suppression_key = Some(suppression_key);
@@ -31944,8 +32078,7 @@ impl ShellState {
             }
         }
         if !should_rearm && !exhausted_budget {
-            if saw_live_host_output
-                && self.terminal_session_host_id(active_session_path).is_some()
+            if saw_live_host_output && self.terminal_session_host_id(active_session_path).is_some()
             {
                 self.mark_terminal_open_attempt_ready_for_session(
                     active_session_path,
@@ -32196,10 +32329,7 @@ impl ShellState {
         let members = self.row_arrangement.sets.dissolve(head_path);
         // Anything the SEATS put under this head is dissolved too — otherwise
         // half the set survives the gesture and the other half does not.
-        let seat_members: Vec<String> = self
-            .sidebar_row_sets_now()
-            .members_of(head_path)
-            .to_vec();
+        let seat_members: Vec<String> = self.sidebar_row_sets_now().members_of(head_path).to_vec();
         for member in members.iter().chain(seat_members.iter()) {
             match grandparent.as_deref() {
                 Some(parent) => {
@@ -33173,10 +33303,7 @@ impl ShellState {
         } else {
             format!("zoom {} -> {} with no active session", before, after)
         };
-        self.last_action = format!(
-            "{label} {}%",
-            zoom_percent(after, main_zoom_base(target))
-        );
+        self.last_action = format!("{label} {}%", zoom_percent(after, main_zoom_base(target)));
     }
     fn set_main_zoom_percent(&mut self, percent: i32) {
         let active_snapshot = self.snapshot();
@@ -33418,7 +33545,10 @@ impl ShellState {
         self.local_cli_presence.is_none()
     }
 
-    fn adopt_local_cli_presence(&mut self, presence: Vec<yggterm_core::cli_install::CliPresenceReport>) {
+    fn adopt_local_cli_presence(
+        &mut self,
+        presence: Vec<yggterm_core::cli_install::CliPresenceReport>,
+    ) {
         self.local_cli_presence = Some(presence);
     }
 
@@ -33451,7 +33581,11 @@ impl ShellState {
     /// the override map means wanted — the recommend-every-CLI default — so
     /// the map only ever carries explicit departures.
     fn cli_install_wanted(&self, slug: &str) -> bool {
-        *self.settings.agent_cli_install_wanted.get(slug).unwrap_or(&true)
+        *self
+            .settings
+            .agent_cli_install_wanted
+            .get(slug)
+            .unwrap_or(&true)
     }
 
     /// Whether the user wants `slug` installed on `machine_key`. Same default
@@ -35088,8 +35222,7 @@ impl ShellState {
             return;
         };
         if !letter.is_ascii_alphanumeric() {
-            self.keymap_editor_error =
-                Some("KeyTips must be a letter or digit.".to_string());
+            self.keymap_editor_error = Some("KeyTips must be a letter or digit.".to_string());
             return;
         }
         if spec.parent.is_none() && command_registry::reserved_letter(letter) {
@@ -35117,7 +35250,8 @@ impl ShellState {
         // only when it differs from the default — then re-derive the legacy view.
         self.keytip_config.clear_keytip(command_id);
         if spec.default_keytip != Some(letter) {
-            self.keytip_config.set_keytip(command_id.to_string(), letter);
+            self.keytip_config
+                .set_keytip(command_id.to_string(), letter);
         }
         self.keymap = keymap_from_keytip_config(&self.keytip_config);
         self.keymap_editor_error = None;
@@ -35138,8 +35272,7 @@ impl ShellState {
             return;
         }
         let Some(chord) = Chord::parse(spec) else {
-            self.keymap_editor_error =
-                Some(format!("‘{spec}’ is not a chord. Try Ctrl+Shift+T."));
+            self.keymap_editor_error = Some(format!("‘{spec}’ is not a chord. Try Ctrl+Shift+T."));
             return;
         };
         if !chord.is_pty_safe() {
@@ -35521,7 +35654,8 @@ fn terminal_resume_notification_job_key(session_path: &str) -> String {
 /// edge-triggered toast in the viewport observer and `terminal_session_codex_no_longer_on_remote`
 /// classify against this so the detection can never drift between callsites.
 fn surface_problem_is_codex_session_gone(surface_problem: Option<&str>) -> bool {
-    surface_problem.is_some_and(|problem| problem.contains("Codex session no longer on remote machine"))
+    surface_problem
+        .is_some_and(|problem| problem.contains("Codex session no longer on remote machine"))
 }
 /// The single "blank xterm" classification string, matched exactly the way the
 /// recovery deciders (`startup_terminal_restore_should_recover`,
@@ -36009,8 +36143,7 @@ fn retained_fault_reason_can_wait_for_ready_settle(reason: Option<&str>) -> bool
 fn retained_fault_recovery_rearm_after_ms(attempt: &TerminalOpenAttempt) -> u64 {
     let empty_surface = attempt.last_surface_problem.as_deref()
         == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM)
-        || attempt.last_observed_reason.as_deref()
-            == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM);
+        || attempt.last_observed_reason.as_deref() == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM);
     if empty_surface && attempt.observations > 0 && attempt.surface_mounted_at_ms.is_some() {
         RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS
     } else {
@@ -37724,38 +37857,38 @@ async fn sidebar_endpoint_ping_tick(
 ) {
     let targets: Vec<(String, String, Option<String>, Option<String>, String, bool)> =
         state.with(|shell| {
-        let active = shell.sidebar_reads_live_path();
-        let mut targets = Vec::new();
-        if let Some(active) = active.as_ref()
-            && let Some(contribution) = shell.sidebar_contributions.get(active)
-        {
-            targets.push((
-                active.clone(),
-                contribution.control_url.clone(),
-                contribution.env_id.clone(),
-                contribution.acked_command_batch.clone(),
-                contribution.control_token.clone(),
-                shell.web_surface_last_content_tab_closed(active),
-            ));
-        }
-        // The background sweep: every 4th tick, ping the other live
-        // contributions too. Off the active path this is the ONLY carrier of a
-        // background app's stamp moves and queued commands.
-        if tick.is_multiple_of(4) {
-            for (session_path, contribution) in shell.sidebar_contributions.iter() {
-                if Some(session_path) == active.as_ref() {
-                    continue;
-                }
+            let active = shell.sidebar_reads_live_path();
+            let mut targets = Vec::new();
+            if let Some(active) = active.as_ref()
+                && let Some(contribution) = shell.sidebar_contributions.get(active)
+            {
                 targets.push((
-                    session_path.clone(),
+                    active.clone(),
                     contribution.control_url.clone(),
                     contribution.env_id.clone(),
                     contribution.acked_command_batch.clone(),
                     contribution.control_token.clone(),
-                    shell.web_surface_last_content_tab_closed(session_path),
+                    shell.web_surface_last_content_tab_closed(active),
                 ));
             }
-        }
+            // The background sweep: every 4th tick, ping the other live
+            // contributions too. Off the active path this is the ONLY carrier of a
+            // background app's stamp moves and queued commands.
+            if tick.is_multiple_of(4) {
+                for (session_path, contribution) in shell.sidebar_contributions.iter() {
+                    if Some(session_path) == active.as_ref() {
+                        continue;
+                    }
+                    targets.push((
+                        session_path.clone(),
+                        contribution.control_url.clone(),
+                        contribution.env_id.clone(),
+                        contribution.acked_command_batch.clone(),
+                        contribution.control_token.clone(),
+                        shell.web_surface_last_content_tab_closed(session_path),
+                    ));
+                }
+            }
             targets
         });
     for (session_path, control_url, env_id, ack_batch, control_token, last_tab_closed) in targets {
@@ -37798,10 +37931,9 @@ async fn ping_and_apply_contribution(
         ack_batch.as_deref(),
         last_tab_closed,
     );
-    let Ok(Ok(reply)) = task::spawn_blocking(move || {
-        control_ping_request(&ping_url, Some(control_token.as_str()))
-    })
-    .await
+    let Ok(Ok(reply)) =
+        task::spawn_blocking(move || control_ping_request(&ping_url, Some(control_token.as_str())))
+            .await
     else {
         return;
     };
@@ -37866,17 +37998,23 @@ async fn ping_and_apply_contribution(
     };
     // Same dispatch as the declare arm: a stamp that moved refetches what it
     // stamps. Only stamps the reply itself carried can have moved.
-    if refetch.policy && let Some(version) = policy_version {
+    if refetch.policy
+        && let Some(version) = policy_version
+    {
         let trace_home = trace_home.clone();
         let session = session_path.clone();
         spawn(app_policy_fetch(state, session, version, trace_home));
     }
-    if refetch.zoom && let Some(version) = zoom_version {
+    if refetch.zoom
+        && let Some(version) = zoom_version
+    {
         let trace_home = trace_home.clone();
         let session = session_path.clone();
         spawn(app_zoom_fetch(state, session, version, trace_home));
     }
-    if refetch.appearance && let Some(version) = appearance_version {
+    if refetch.appearance
+        && let Some(version) = appearance_version
+    {
         let trace_home = trace_home.clone();
         let session = session_path.clone();
         spawn(app_appearance_fetch(state, session, version, trace_home));
@@ -37912,7 +38050,8 @@ async fn ping_and_apply_contribution(
                 None,
             );
             if tab.raise
-                && let Some(row) = state.with(|shell| resolve_app_control_row(shell, &tab.session_path))
+                && let Some(row) =
+                    state.with(|shell| resolve_app_control_row(shell, &tab.session_path))
             {
                 state.with_mut_counted(|shell| shell.prepare_app_control_foreground_open());
                 spawn_open_session_row(
@@ -38028,7 +38167,6 @@ fn app_surface_restore_retry_ms(asks: u32) -> u64 {
         .min(APP_SURFACE_RESTORE_RETRY_CEILING_MS)
 }
 
-
 /// Whether `next` names a runtime the ledger has never been asked about, by
 /// the measured rule of 2026-09-08: only a SOME-to-different-SOME move is a
 /// new runtime.
@@ -38101,9 +38239,7 @@ fn app_surface_restore_targets(
 ) -> Vec<AppSurfaceRestoreTarget> {
     let mut candidates: Vec<&AppSurfaceRestoreRow> = rows
         .iter()
-        .filter(|row| {
-            !row.has_contribution || !row.has_web_surface || !row.web_surface_live
-        })
+        .filter(|row| !row.has_contribution || !row.has_web_surface || !row.web_surface_live)
         .filter(|row| match attempted.get(&row.session_path) {
             None => true,
             Some(attempt) => {
@@ -38152,13 +38288,11 @@ impl ShellState {
                     .web_surfaces
                     .get(&session.session_path)
                     .is_some_and(|surface| !surface.tabs.is_empty()),
-                web_surface_live: self
-                    .web_surface_record_live(&session.session_path, now_ms),
+                web_surface_live: self.web_surface_record_live(&session.session_path, now_ms),
                 active: active.as_deref() == Some(session.session_path.as_str()),
             })
             .collect()
     }
-
 }
 
 thread_local! {
@@ -38178,9 +38312,7 @@ fn note_sidebar_ping_liveness(session_path: &str, now_ms: u64) {
     });
 }
 fn sidebar_ping_liveness_ms(session_path: &str) -> u64 {
-    SIDEBAR_PING_LIVENESS_MS.with(|table| {
-        table.borrow().get(session_path).copied().unwrap_or(0)
-    })
+    SIDEBAR_PING_LIVENESS_MS.with(|table| table.borrow().get(session_path).copied().unwrap_or(0))
 }
 /// Drop side-table entries whose contribution is gone — called by the sweep
 /// after its retain, so the table cannot outgrow the contribution set.
@@ -38209,13 +38341,14 @@ fn mark_app_surface_restore_attempted(
     runtime_token: Option<String>,
     now_ms: u64,
 ) {
-    let entry = attempts
-        .entry(session_path.to_string())
-        .or_insert_with(|| AppSurfaceRestoreAttempt {
-            runtime_token: runtime_token.clone(),
-            asks: 0,
-            last_at_ms: now_ms,
-        });
+    let entry =
+        attempts
+            .entry(session_path.to_string())
+            .or_insert_with(|| AppSurfaceRestoreAttempt {
+                runtime_token: runtime_token.clone(),
+                asks: 0,
+                last_at_ms: now_ms,
+            });
     if runtime_token_is_new_runtime(&entry.runtime_token, &runtime_token) {
         *entry = AppSurfaceRestoreAttempt {
             runtime_token,
@@ -38241,9 +38374,7 @@ struct AppSurfaceRestoreBatch {
     owner_remote: HashSet<String>,
 }
 impl AppSurfaceRestoreBatch {
-    fn from_sessions(
-        sessions: Vec<yggterm_server::TerminalAppDeclareSession>,
-    ) -> Self {
+    fn from_sessions(sessions: Vec<yggterm_server::TerminalAppDeclareSession>) -> Self {
         let mut batch = Self::default();
         for session in sessions {
             if session.owner_remote {
@@ -38269,7 +38400,10 @@ impl AppSurfaceRestoreBatch {
             );
         }
         match self.by_session.get(&target.session_path) {
-            None => (Self::absent(target.want_rail), Self::absent(target.want_web)),
+            None => (
+                Self::absent(target.want_rail),
+                Self::absent(target.want_web),
+            ),
             Some(records) => (
                 Self::verdict(
                     target.want_rail,
@@ -38646,8 +38780,7 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                 {
                     let new_acks_late = acks_late.saturating_sub(last_webview_acks_late);
                     let new_bypasses = gate_bypasses.saturating_sub(last_webview_gate_bypasses);
-                    let new_resyncs =
-                        resync_requests.saturating_sub(last_webview_resync_requests);
+                    let new_resyncs = resync_requests.saturating_sub(last_webview_resync_requests);
                     yggterm_core::perf::ytrace_provider().incident(
                         "ui",
                         "webview",
@@ -38713,7 +38846,11 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
             // Endpoint-ping liveness rides the same tick (Phase 2): fire and
             // forget — the ping task owns its own short timeout. Phase 5 folds
             // the command drain + background stamp sweep into the same tick.
-            spawn(sidebar_endpoint_ping_tick(state, trace_home.clone(), ping_tick));
+            spawn(sidebar_endpoint_ping_tick(
+                state,
+                trace_home.clone(),
+                ping_tick,
+            ));
             // Debounced GUI→app draft sync (Phase 4): a settled dirty draft
             // POSTs `draft` to its app, so the buffer reaches the daemon's
             // sqlite row — the crash story — without waiting for a Save.
@@ -38771,12 +38908,11 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                     // finds nothing to do on the overwhelming majority of its
                     // 2.5s ticks. Taking the read path when the flags already
                     // match removes that idle re-render entirely.
-                    let would_change = safe_shell_read(state, "working_flags_would_change", |shell| {
-                        shell
-                            .server
-                            .live_session_working_flags_would_change(&flags)
-                    })
-                    .unwrap_or(true);
+                    let would_change =
+                        safe_shell_read(state, "working_flags_would_change", |shell| {
+                            shell.server.live_session_working_flags_would_change(&flags)
+                        })
+                        .unwrap_or(true);
                     if would_change {
                         let _ = safe_shell_mut(state, "working_flags_apply", |shell| {
                             shell.apply_working_flags_poll(&flags)
@@ -39106,9 +39242,8 @@ fn spawn_browser_tree_refresh(
     // so a refresh suppressed for being already in flight still dirtied the
     // whole signal and re-rendered the root. No await sits between this read
     // and the write below, so the two cannot disagree.
-    let already_in_flight = state.with(|shell| {
-        shell.browser_tree_loading_in_flight || shell.browser_tree_refresh_in_flight
-    });
+    let already_in_flight = state
+        .with(|shell| shell.browser_tree_loading_in_flight || shell.browser_tree_refresh_in_flight);
     if already_in_flight {
         return;
     }
@@ -39170,8 +39305,7 @@ fn spawn_browser_tree_refresh(
                         return;
                     }
                     if let Some(fp) = fingerprint {
-                        LAST_APPLIED_BROWSER_TREE_FINGERPRINT
-                            .store(fp, Ordering::Relaxed);
+                        LAST_APPLIED_BROWSER_TREE_FINGERPRINT.store(fp, Ordering::Relaxed);
                     }
                     BROWSER_TREE_REFRESH_UNCHANGED_STREAK.store(0, Ordering::Relaxed);
                     restore_browser_tree_preserving_sidebar_view(
@@ -39457,7 +39591,10 @@ fn record_gui_restart_and_check_loop(now_ms: u128) -> RestartCadenceVerdict {
         let mut kept: Vec<String> = prior
             .lines()
             .filter(|l| {
-                let ts = l.split_whitespace().nth(1).and_then(|t| t.parse::<u128>().ok());
+                let ts = l
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|t| t.parse::<u128>().ok());
                 match (l.starts_with("trip "), ts) {
                     (true, Some(ts)) => {
                         now_ms.saturating_sub(ts) < 2 * GUI_RESTART_CADENCE_TRIP_COOLDOWN_MS
@@ -39473,10 +39610,7 @@ fn record_gui_restart_and_check_loop(now_ms: u128) -> RestartCadenceVerdict {
         let _ = std::fs::write(&path, kept.join("\n") + "\n");
         return RestartCadenceVerdict::Allowed;
     }
-    let _ = std::fs::write(
-        &path,
-        format!("{}trip {now_ms}\n", prior),
-    );
+    let _ = std::fs::write(&path, format!("{}trip {now_ms}\n", prior));
     RestartCadenceVerdict::NewlyTripped
 }
 
@@ -39749,10 +39883,9 @@ fn split_web_tab_into_pane(
     axis: SplitAxis,
 ) -> Option<String> {
     let tab_exists = state.with(|shell| {
-        shell
-            .web_surfaces
-            .get(session_path)
-            .is_some_and(|surface| surface.picker.is_none() && surface.tabs.iter().any(|t| t.id == tab))
+        shell.web_surfaces.get(session_path).is_some_and(|surface| {
+            surface.picker.is_none() && surface.tabs.iter().any(|t| t.id == tab)
+        })
     });
     if !tab_exists {
         return None;
@@ -39780,7 +39913,10 @@ fn axis_label(axis: SplitAxis) -> &'static str {
 /// Parse an app-control / menu axis token into a [`SplitAxis`]. Defaults to
 /// side-by-side (left | right) — the sketch's primary arrangement.
 fn parse_split_axis(raw: Option<&str>) -> SplitAxis {
-    match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("stacked") | Some("vertical") | Some("v") | Some("top-bottom") | Some("rows") => {
             SplitAxis::Stacked
         }
@@ -39825,7 +39961,9 @@ fn agent_presence_debug_json(shell: &ShellState, snapshot: &RenderSnapshot) -> V
 }
 
 fn split_groups_debug_json(shell: &ShellState) -> Value {
-    let active = shell.active_split_group().map(|group| group.group_id.clone());
+    let active = shell
+        .active_split_group()
+        .map(|group| group.group_id.clone());
     json!({
         "active_group_id": active,
         "groups": shell
@@ -39889,7 +40027,8 @@ fn focused_pane_index(group: &SplitGroup, active_session: Option<&str>) -> Optio
         .map(|(index, _)| index);
     let first = seats.next()?;
     let mut rest = std::iter::once(first).chain(seats);
-    rest.find(|index| *index == group.active_pane).or(Some(first))
+    rest.find(|index| *index == group.active_pane)
+        .or(Some(first))
 }
 
 /// Focus a pane by INDEX: remember it as the group's `active_pane` and make
@@ -40304,18 +40443,10 @@ fn spawn_close_force_exit_watchdog() {
         std::process::exit(0);
     });
 }
-#[derive(Debug, Clone)]
-enum UpdateWorkflowEvent {
-    InstallProgress {
-        version: String,
-        progress: ReleaseUpdateInstallProgress,
-    },
-}
-
 #[derive(Debug)]
 enum UpdateWorkflowOutcome {
-    NoUpdate,
-    NotifyOnlyAvailable { version: String, suffix: String },
+    NoUpdate { detail: String },
+    Unsupported { detail: String },
     Installed(PendingUpdateRestart),
 }
 
@@ -40325,16 +40456,78 @@ enum UpdateWorkflowTrigger {
     Manual,
 }
 
-fn update_available_suffix_for_context(context: &InstallContext) -> String {
-    let hint = update_command_hint(context.channel);
-    if hint.is_empty() {
-        context
-            .manager_hint
-            .clone()
-            .unwrap_or_else(|| "Use your package manager to update Yggterm.".to_string())
-    } else {
-        format!("Run `{hint}` to update.")
+/// The GUI is a consumer of the package manager, never a second release
+/// updater. Keep this wire shape deliberately small: `ynpm self-update
+/// --json` is the authoritative update/install/release-channel decision, and
+/// the shell only owns the user-facing notification and graceful restart.
+#[derive(Debug, Deserialize)]
+struct YnpmSelfUpdateReport {
+    status: String,
+    #[allow(dead_code)]
+    current_version: String,
+    version: Option<String>,
+    executable: Option<String>,
+    detail: String,
+}
+
+fn ynpm_executable_for_update() -> PathBuf {
+    let extension = cfg!(target_os = "windows").then_some(".exe").unwrap_or("");
+    if let Ok(yggterm_home) = resolve_yggterm_home() {
+        let home = yggterm_home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(yggterm_home);
+        for candidate in [
+            home.join(format!(".local/bin/ynpm{extension}")),
+            home.join(format!(".yggterm/bin/ynpm{extension}")),
+        ] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
     }
+    if cfg!(target_os = "windows")
+        && let Ok(root) = yggterm_core::direct_install_root()
+    {
+        let candidate = root.join("bin").join(format!("ynpm{extension}"));
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(format!("ynpm{extension}"))
+}
+
+fn run_ynpm_self_update() -> Result<YnpmSelfUpdateReport> {
+    let yggterm_home = resolve_yggterm_home()?;
+    let ynpm_home = yggterm_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| yggterm_home.clone());
+    let executable = ynpm_executable_for_update();
+    let output = Command::new(&executable)
+        .args(["self-update", "--json"])
+        // `ynpm` stores its manager state under `$YNPM_HOME/.yggterm/ynpm`.
+        // Passing the parent explicitly keeps a custom YGGTERM_HOME and the
+        // GUI on the same state root on every platform.
+        .env("YNPM_HOME", &ynpm_home)
+        .output()
+        .with_context(|| format!("running {} self-update", executable.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} self-update failed ({}): {}",
+            executable.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parsing JSON from {} self-update: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        )
+    })
 }
 
 fn pending_restart_from_active_install_state(current_exe: &Path) -> Option<PendingUpdateRestart> {
@@ -40377,174 +40570,135 @@ fn pending_restart_from_active_install_state_for_current_exe() -> Option<Pending
     pending_restart_from_active_install_state(&current_exe)
 }
 
-fn apply_update_install_progress(
-    shell: &mut ShellState,
-    version: &str,
-    progress: &ReleaseUpdateInstallProgress,
-) {
-    shell.update_workflow = UpdateWorkflowState::Installing {
-        version: version.to_string(),
-        stage: progress.stage,
-        percent: progress.percent,
-        detail: progress.detail.clone(),
-    };
-    shell.last_action = format!(
-        "updating yggterm {}% · {}",
-        progress.percent, progress.detail
-    );
-    shell.upsert_job_notification(
-        SELF_UPDATE_JOB_KEY,
-        NotificationTone::Info,
-        "Updating Yggterm",
-        format!("{} · {}%", progress.detail, progress.percent),
-        Some(progress.percent as f32 / 100.0),
-        false,
-        // App-wide, not a session.
-        None,
-    );
-}
-
 fn spawn_update_workflow(mut state: Signal<ShellState>, trigger: UpdateWorkflowTrigger) {
     if !matches!(state.read().update_workflow, UpdateWorkflowState::Idle) {
         return;
     }
-    let install_context = state.read().effective_install_context_for_update_check();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
-    let perf_name = match (install_context.update_policy, trigger) {
-        (yggterm_core::UpdatePolicy::Auto, UpdateWorkflowTrigger::Startup) => "auto_update_install",
-        (yggterm_core::UpdatePolicy::NotifyOnly, UpdateWorkflowTrigger::Startup) => {
-            "notify_only_update_check"
-        }
-        (yggterm_core::UpdatePolicy::Auto, UpdateWorkflowTrigger::Manual) => {
-            "manual_update_install"
-        }
-        (yggterm_core::UpdatePolicy::NotifyOnly, UpdateWorkflowTrigger::Manual) => {
-            "manual_update_check"
-        }
+    let perf_name = match trigger {
+        UpdateWorkflowTrigger::Startup => "auto_update_install",
+        UpdateWorkflowTrigger::Manual => "manual_update_install",
     };
     state.with_mut_counted(|shell| {
         shell.update_workflow = UpdateWorkflowState::Checking;
-        shell.last_action = "checking for updates".to_string();
+        shell.last_action = "checking for yggterm updates".to_string();
         shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
     });
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "startup", perf_name);
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<UpdateWorkflowEvent>();
-        let mut worker = Box::pin(task::spawn_blocking(
-            move || -> Result<UpdateWorkflowOutcome> {
-                if let Some(update) = pending_restart_from_active_install_state_for_current_exe() {
-                    return Ok(UpdateWorkflowOutcome::Installed(update));
+        let result = task::spawn_blocking(move || -> Result<UpdateWorkflowOutcome> {
+            if let Some(update) = pending_restart_from_active_install_state_for_current_exe() {
+                return Ok(UpdateWorkflowOutcome::Installed(update));
+            }
+            let report = run_ynpm_self_update()?;
+            match report.status.as_str() {
+                "updated" => {
+                    let version = report
+                        .version
+                        .context("ynpm reported an update without a target version")?;
+                    let executable = report
+                        .executable
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_file())
+                        .context("ynpm reported an update without a runnable executable")?;
+                    Ok(UpdateWorkflowOutcome::Installed(PendingUpdateRestart {
+                        version,
+                        executable,
+                    }))
                 }
-                let Some(update) = check_for_update(&install_context)? else {
-                    return Ok(UpdateWorkflowOutcome::NoUpdate);
-                };
-                if install_context.update_policy == yggterm_core::UpdatePolicy::NotifyOnly {
-                    return Ok(UpdateWorkflowOutcome::NotifyOnlyAvailable {
-                        version: update.version,
-                        suffix: update_available_suffix_for_context(&install_context),
-                    });
-                }
-                let version = update.version.clone();
-                let next_exe =
-                    install_release_update_with_progress(&install_context, &update, |progress| {
-                        let _ = event_tx.send(UpdateWorkflowEvent::InstallProgress {
-                            version: version.clone(),
-                            progress,
-                        });
-                    })?;
-                Ok(UpdateWorkflowOutcome::Installed(PendingUpdateRestart {
-                    version: update.version,
-                    executable: next_exe,
-                }))
-            },
-        ));
-        let mut worker_result: Option<
-            std::result::Result<
-                std::result::Result<UpdateWorkflowOutcome, anyhow::Error>,
-                task::JoinError,
-            >,
-        > = None;
-        loop {
-            tokio::select! {
-                maybe_event = event_rx.recv() => {
-                    match maybe_event {
-                        Some(UpdateWorkflowEvent::InstallProgress { version, progress }) => {
-                            state.with_mut_counted(|shell| {
-                                apply_update_install_progress(shell, &version, &progress);
-                            });
-                        }
-                        None => {
-                            if let Some(result) = worker_result.take() {
-                                let installed = matches!(result, Ok(Ok(UpdateWorkflowOutcome::Installed(_))));
-                                perf.finish(json!({ "installed": installed }));
-                                state.with_mut_counted(|shell| {
-                                    shell.update_workflow = UpdateWorkflowState::Idle;
-                                    match result {
-                                        Ok(Ok(UpdateWorkflowOutcome::Installed(update))) => {
-                                            shell.pending_update_restart = Some(update.clone());
-                                            shell.last_action = format!("updated to {}", update.version);
-                                            shell.finish_job_notification(
-                                                SELF_UPDATE_JOB_KEY,
-                                                NotificationTone::Success,
-                                                "Updated Yggterm",
-                                                format!(
-                                                    "Updated to version {}. Restart when you are ready.",
-                                                    update.version
-                                                ),
-                                                true,
-                                            );
-                                        }
-                                        Ok(Ok(UpdateWorkflowOutcome::NotifyOnlyAvailable { version, suffix })) => {
-                                            shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
-                                            shell.last_action = format!("update available: {version}");
-                                            shell.push_notification(
-                                                NotificationTone::Warning,
-                                                "Update Available",
-                                                format!("Yggterm {version} is available. {suffix}"),
-                                            );
-                                        }
-                                        Ok(Ok(UpdateWorkflowOutcome::NoUpdate)) => {
-                                            shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
-                                            shell.last_action = "yggterm is up to date".to_string();
-                                            if trigger == UpdateWorkflowTrigger::Manual {
-                                                shell.push_notification(
-                                                    NotificationTone::Info,
-                                                    "Up to Date",
-                                                    "Yggterm is already on the latest available version.".to_string(),
-                                                );
-                                            }
-                                        }
-                                        Ok(Err(error)) => {
-                                            warn!(error=%error, "update workflow failed");
-                                            shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
-                                            shell.last_action = format!("update failed: {error}");
-                                            shell.push_notification(
-                                                NotificationTone::Error,
-                                                "Update Failed",
-                                                error.to_string(),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            warn!(error=%error, "update task failed");
-                                            shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
-                                            shell.last_action = format!("update task failed: {error}");
-                                            shell.push_notification(
-                                                NotificationTone::Error,
-                                                "Update Failed",
-                                                error.to_string(),
-                                            );
-                                        }
-                                    }
-                                });
-                                break;
-                            }
-                        }
+                "current" => Ok(UpdateWorkflowOutcome::NoUpdate {
+                    detail: report.detail,
+                }),
+                "offline" => Ok(UpdateWorkflowOutcome::NoUpdate {
+                    detail: report.detail,
+                }),
+                "unsupported" => Ok(UpdateWorkflowOutcome::Unsupported {
+                    detail: report.detail,
+                }),
+                status => bail!("ynpm returned unknown self-update status {status:?}"),
+            }
+        })
+        .await;
+        let installed = matches!(&result, Ok(Ok(UpdateWorkflowOutcome::Installed(_))));
+        perf.finish(json!({ "installed": installed, "manager": "ynpm" }));
+        let mut auto_restart = false;
+        state.with_mut_counted(|shell| {
+            shell.update_workflow = UpdateWorkflowState::Idle;
+            match result {
+                Ok(Ok(UpdateWorkflowOutcome::Installed(update))) => {
+                    shell.pending_update_restart = Some(update.clone());
+                    shell.last_action = format!("updated to {}", update.version);
+                    if trigger == UpdateWorkflowTrigger::Startup {
+                        shell.finish_job_notification(
+                            SELF_UPDATE_JOB_KEY,
+                            NotificationTone::Success,
+                            "Updated Yggterm",
+                            format!(
+                                "Updated to version {}. Restarting while sessions stay alive.",
+                                update.version
+                            ),
+                            true,
+                        );
+                        auto_restart = true;
+                    } else {
+                        shell.finish_job_notification(
+                            SELF_UPDATE_JOB_KEY,
+                            NotificationTone::Success,
+                            "Updated Yggterm",
+                            format!(
+                                "Updated to version {}. Restart when you are ready.",
+                                update.version
+                            ),
+                            true,
+                        );
                     }
                 }
-                result = &mut worker, if worker_result.is_none() => {
-                    worker_result = Some(result);
+                Ok(Ok(UpdateWorkflowOutcome::NoUpdate { detail })) => {
+                    shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
+                    shell.last_action = "yggterm is up to date".to_string();
+                    if trigger == UpdateWorkflowTrigger::Manual {
+                        shell.push_notification(NotificationTone::Info, "Up to Date", detail);
+                    }
+                }
+                Ok(Ok(UpdateWorkflowOutcome::Unsupported { detail })) => {
+                    shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
+                    shell.last_action = format!("yggterm update unavailable: {detail}");
+                    if trigger == UpdateWorkflowTrigger::Manual {
+                        shell.push_notification(
+                            NotificationTone::Warning,
+                            "Update Unavailable",
+                            detail,
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    warn!(error=%error, "ynpm update workflow failed");
+                    shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
+                    shell.last_action = format!("update failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Update Failed",
+                        error.to_string(),
+                    );
+                }
+                Err(error) => {
+                    warn!(error=%error, "ynpm update task failed");
+                    shell.clear_job_notification(SELF_UPDATE_JOB_KEY);
+                    shell.last_action = format!("update task failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Update Failed",
+                        error.to_string(),
+                    );
                 }
             }
+        });
+        if auto_restart {
+            // Give the success toast one paint opportunity before closing the
+            // GUI. The daemon owns the PTYs, so this short settle window does
+            // not pause or end any user session.
+            sleep(Duration::from_millis(SELF_UPDATE_NOTIFICATION_SETTLE_MS)).await;
+            restart_into_pending_update(state);
         }
     });
 }
@@ -41157,8 +41311,7 @@ fn queue_startup_swap_intent(
         last_attempt_ms: None,
         last_outcome: Some(format!(
             "startup reconcile declined while the {} daemon owned {} runtime(s) it could not all account for",
-            runtime_status.server_version,
-            runtime_status.owned_terminal_session_count,
+            runtime_status.server_version, runtime_status.owned_terminal_session_count,
         )),
         // §2: only a relay hand-off declares a boundary. A producer recording an
         // intent is not a quiet point, and saying so here would spend the very
@@ -41767,10 +41920,7 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
     // upgrade/handoff is driven by the startup reconcile + hot-restart paths,
     // not by this read/write ensure. [[bug-class-old-daemon-never-retires]]
     if let Ok(runtime_status) = status(endpoint)
-        && startup_daemon_should_preserve_stale_runtime(
-            &runtime_status,
-            current_version().as_str(),
-        )
+        && startup_daemon_should_preserve_stale_runtime(&runtime_status, current_version().as_str())
     {
         note_recent_daemon_start(endpoint);
         trace_daemon_step(
@@ -42492,9 +42642,7 @@ fn allocator_trim_can_run(shell: &ShellState) -> bool {
 /// inside what was described as a pure refactor. It is spelled out here rather than
 /// left to drift.
 #[cfg(target_os = "linux")]
-fn allocator_trim_sample_is_actionable(
-    memory: &yggterm_core::render_probe::ProcMemory,
-) -> bool {
+fn allocator_trim_sample_is_actionable(memory: &yggterm_core::render_probe::ProcMemory) -> bool {
     memory.source.knows_pss_and_anonymous() && memory.rss_kb >= ALLOCATOR_TRIM_RSS_THRESHOLD_KB
 }
 
@@ -42747,11 +42895,8 @@ fn mark_terminal_input_hot_and_schedule_snapshot(
 ) {
     let now_ms = current_millis();
     mark_terminal_input_hot(now_ms);
-    let needs_reactive_update = terminal_input_needs_reactive_snapshot_update(
-        &state.peek(),
-        show_busy_hint,
-        now_ms,
-    );
+    let needs_reactive_update =
+        terminal_input_needs_reactive_snapshot_update(&state.peek(), show_busy_hint, now_ms);
     if needs_reactive_update {
         let _ = safe_shell_mut(
             state,
@@ -43049,9 +43194,8 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                                 terminal_input_hot_until_ms()
                                     .saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS)
                             } else {
-                                now_apply_ms.saturating_add(
-                                    LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
-                                )
+                                now_apply_ms
+                                    .saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS)
                             };
                             if media_defer {
                                 shell.background_live_session_snapshot_skipped_media_hot_count =
@@ -43380,8 +43524,11 @@ fn run_cli_install_apply_job(
     decision: CliInstallApplyDecision,
 ) -> CliInstallApplyOutcome {
     let presence_before = yggterm_server::local_cli_presence_now();
-    let present =
-        |slug: &str| presence_before.iter().any(|row| row.slug == slug && row.present);
+    let present = |slug: &str| {
+        presence_before
+            .iter()
+            .any(|row| row.slug == slug && row.present)
+    };
     let mut lines: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for (slug, wanted) in decision.local {
@@ -43400,8 +43547,12 @@ fn run_cli_install_apply_job(
     let mut machines_needing_install_refresh: Vec<String> = Vec::new();
     for machine in decision.remote {
         let mut touched = false;
-        let present_on =
-            |slug: &str| machine.presence.iter().any(|row| row.slug == slug && row.present);
+        let present_on = |slug: &str| {
+            machine
+                .presence
+                .iter()
+                .any(|row| row.slug == slug && row.present)
+        };
         for (slug, wanted) in machine.wanted {
             if wanted && !present_on(&slug) {
                 // Installs on a machine ride that machine's refresh sweep —
@@ -43411,11 +43562,7 @@ fn run_cli_install_apply_job(
                 break;
             }
             if !wanted && present_on(&slug) {
-                match yggterm_server::remove_managed_cli(
-                    &endpoint,
-                    &machine.machine_key,
-                    &slug,
-                ) {
+                match yggterm_server::remove_managed_cli(&endpoint, &machine.machine_key, &slug) {
                     Ok(message) => {
                         lines.push(format!(
                             "{slug} on {}: {message}",
@@ -43425,10 +43572,7 @@ fn run_cli_install_apply_job(
                         touched = true;
                     }
                     Err(error) => {
-                        failures.push(format!(
-                            "{slug} on {}: {error}",
-                            machine.machine_key
-                        ))
+                        failures.push(format!("{slug} on {}: {error}", machine.machine_key))
                     }
                 }
             }
@@ -43478,21 +43622,12 @@ fn spawn_cli_install_apply(state: Signal<ShellState>) {
                 .server
                 .remote_machines()
                 .iter()
-                .map(|machine| {
-                    (
-                        machine.machine_key.clone(),
-                        machine.cli_presence.clone(),
-                    )
-                })
+                .map(|machine| (machine.machine_key.clone(), machine.cli_presence.clone()))
                 .collect();
-        (
-            shell.begin_cli_install_apply(&remote_presence),
-            endpoint,
-        )
+        (shell.begin_cli_install_apply(&remote_presence), endpoint)
     })
     .ok()
-    .and_then(|(decision, endpoint)| decision.map(|decision| (decision, endpoint)))
-    else {
+    .and_then(|(decision, endpoint)| decision.map(|decision| (decision, endpoint))) else {
         return;
     };
     spawn(async move {
@@ -43904,32 +44039,23 @@ fn app_launcher_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
     // is its own bug.
     let mut seen = std::collections::HashSet::new();
     apps.iter()
-        .flat_map(|app| app.verbs.iter().map(move |verb| (app.clone(), verb.clone())))
+        .flat_map(|app| {
+            app.verbs
+                .iter()
+                .map(move |verb| (app.clone(), verb.clone()))
+        })
         .filter(|(app, verb)| seen.insert((app.name.clone(), verb.id.clone())))
         .collect()
 }
-/// The launcher entries a ROW MENU may offer: the ones whose verbs are session
-/// ROWS.
-///
-/// ⭐ The row menu spawns a session and puts a row in the sidebar for it. That
-/// is right for "New Ychrome" and wrong for a terminal-invoked dashboard or a
-/// fleet booter — the user gets a row for something that was never a session,
-/// which is what the owner asked to have removed.
-///
-/// ⛔ The APP decides, through [`AppVerb::row_spawn`]. yggterm cannot: the verbs
-/// to leave out live in other apps' manifests, so the only alternative was to
-/// hardcode another app's name, which is the anti-pattern the libyggterm
-/// contract exists to prevent.
-///
-/// ⚠ ONLY the row menu asks this. The titlebar `+` and the start page keep
-/// calling [`app_launcher_entries`], because "open my dashboard" is a reasonable
-/// thing to offer there and a meaningless thing to spawn a row for. A filter
-/// applied to the shared owner instead would have removed those verbs from every
-/// surface at once, which is a different (and unasked-for) change.
-fn app_row_spawn_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
+/// The row context menu is narrower than the titlebar/start-page launcher.
+/// Package metadata must explicitly opt an app into it; runtime app usage is
+/// not a registration event, and a missing binary is not a daemon-owned delete
+/// operation. `context` is `workspace` for folders/documents and `session` for
+/// a live session's cwd.
+fn app_context_menu_entries(apps: &[AppManifest], context: &str) -> Vec<(AppManifest, AppVerb)> {
     app_launcher_entries(apps)
         .into_iter()
-        .filter(|(_, verb)| verb.row_spawn)
+        .filter(|(app, verb)| verb.row_spawn && app.context_menu_allows(context, &verb.id))
         .collect()
 }
 /// Launch a libyggterm app's verb: open a terminal session wherever the user
@@ -44217,11 +44343,7 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
 /// and why the mount-churn entry has been unable to say whether the active row
 /// changes by itself. The door stays shared; the caller now has to say who
 /// knocked.
-fn spawn_open_session_row(
-    state: Signal<ShellState>,
-    row: BrowserRow,
-    origin: ActivationOrigin,
-) {
+fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow, origin: ActivationOrigin) {
     let prefer_terminal =
         state.with(|shell| preferred_open_mode_for_row(shell, &row) == WorkspaceViewMode::Terminal);
     spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2, origin);
@@ -44545,9 +44667,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
     let prefer_terminal = prefer_terminal && state.with(|shell| row_supports_terminal(shell, &row));
     let mut retained_live_terminal = false;
     let staged_remote_preview_session = (!prefer_terminal)
-        .then(|| {
-            session_preview_syncs_from_remote(&row.full_path).then(|| row.full_path.clone())
-        })
+        .then(|| session_preview_syncs_from_remote(&row.full_path).then(|| row.full_path.clone()))
         .flatten();
     if prefer_terminal && state.with(|shell| session_is_hot_terminal_row(shell, &row)) {
         state.with_mut_counted(|shell| {
@@ -45197,7 +45317,8 @@ pub(crate) fn prefer_daemon_buffer_seed(
     client_record
 }
 
-fn remember_session_title_override(shell: &mut ShellState, session_path: &str, title: &str) {    let trimmed = title.trim();
+fn remember_session_title_override(shell: &mut ShellState, session_path: &str, title: &str) {
+    let trimmed = title.trim();
     if trimmed.is_empty() {
         shell.session_title_overrides.remove(session_path);
         return;
@@ -45730,9 +45851,11 @@ fn record_agent_pointer(
 ) {
     let now = current_millis();
     state.with_mut_counted(|shell| {
-        let session = session_path
-            .or_else(|| shell.server.active_session_path().map(ToOwned::to_owned));
-        shell.agent_presence.record(agent, session, x, y, action, now);
+        let session =
+            session_path.or_else(|| shell.server.active_session_path().map(ToOwned::to_owned));
+        shell
+            .agent_presence
+            .record(agent, session, x, y, action, now);
     });
 }
 
@@ -47165,11 +47288,7 @@ fn modal_key_hints(top: TopModal) -> &'static [(&'static str, &'static str)] {
         // the primary one — and guessing would fire an app action the user did
         // not aim at. A form's own primary button is one Tab away.
         TopModal::AppPaneModal => &[("Tab", "move"), ("Esc", "close")],
-        TopModal::CopyEdit => &[
-            ("Tab", "move"),
-            ("Enter", "save"),
-            ("Esc", "cancel"),
-        ],
+        TopModal::CopyEdit => &[("Tab", "move"), ("Enter", "save"), ("Esc", "cancel")],
         // The KeyTips editor is a GRID and stays in Command mode: a letter is
         // random access where Tab would be 34 presses. Enter belongs to the
         // rebind field it is typed in, so it is not advertised.
@@ -47616,8 +47735,15 @@ fn live_terminal_generation_context(
     endpoint: &ServerEndpoint,
     session_path: &str,
 ) -> Option<String> {
-    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq, _runtime_spawn_id, ..) =
-        terminal_snapshot(endpoint, session_path).ok()?;
+    let (
+        snapshot,
+        _running,
+        _runtime_output_seen,
+        _post_resize_output_seen,
+        _last_resize_seq,
+        _runtime_spawn_id,
+        ..,
+    ) = terminal_snapshot(endpoint, session_path).ok()?;
     let stripped = strip_terminal_control_sequences(&snapshot)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
@@ -48100,14 +48226,20 @@ fn schedule_active_title_retry_after_failure(state: Signal<ShellState>, session_
     // write, and each no-op pending-set insert dirtied the signal into one
     // more full render). A tick is already armed and the deadline stands, so
     // re-stamping it is pure signal churn: one full render to change nothing.
-    let armed = safe_shell_read(state, "active_title_retry_after_failure_precheck", |shell| {
-        shell.server.active_session_path() == Some(session_path.as_str())
-            && shell
-                .title_autogen_retry_after_ms
-                .get(session_path.as_str())
-                .is_some_and(|retry_after_ms| *retry_after_ms > current_millis())
-            && shell.title_autogen_retry_pending.contains(session_path.as_str())
-    })
+    let armed = safe_shell_read(
+        state,
+        "active_title_retry_after_failure_precheck",
+        |shell| {
+            shell.server.active_session_path() == Some(session_path.as_str())
+                && shell
+                    .title_autogen_retry_after_ms
+                    .get(session_path.as_str())
+                    .is_some_and(|retry_after_ms| *retry_after_ms > current_millis())
+                && shell
+                    .title_autogen_retry_pending
+                    .contains(session_path.as_str())
+        },
+    )
     .unwrap_or(false);
     if armed {
         return;
@@ -48137,11 +48269,16 @@ fn schedule_active_title_autogen_retry_tick(
     // signal even when the insert is a no-op, and this function runs inside a
     // whole-state-subscribed effect — an unguarded insert is a render that
     // re-runs the effect that schedules the next insert, at CPU speed.
-    let already_pending =
-        safe_shell_read(state, "active_title_autogen_retry_schedule_precheck", |shell| {
-            shell.title_autogen_retry_pending.contains(session_path.as_str())
-        })
-        .unwrap_or(false);
+    let already_pending = safe_shell_read(
+        state,
+        "active_title_autogen_retry_schedule_precheck",
+        |shell| {
+            shell
+                .title_autogen_retry_pending
+                .contains(session_path.as_str())
+        },
+    )
+    .unwrap_or(false);
     if already_pending {
         return;
     }
@@ -48389,9 +48526,7 @@ fn spawn_preview_payload_sync(
         let outcome = run_dedicated_interactive_request_io(
             "remote_preview_sync",
             trace_home.as_path(),
-            move || {
-                refresh_preview_with_history(&endpoint, &path_for_task, true, expand_history)
-            },
+            move || refresh_preview_with_history(&endpoint, &path_for_task, true, expand_history),
         )
         .await;
         let retry_session_path = session_path.clone();
@@ -48403,54 +48538,54 @@ fn spawn_preview_payload_sync(
                 shell.preview_history_expanding = None;
             }
             match outcome {
-            Ok(result) => {
-                if !shell.surface_request_is_current(&request_id) {
-                    return;
+                Ok(result) => {
+                    if !shell.surface_request_is_current(&request_id) {
+                        return;
+                    }
+                    shell.remote_preview_failures.remove(&session_path);
+                    shell.record_preview_issue_telemetry(reason);
+                    shell.apply_daemon_snapshot_result_for(&request_id, Ok(result));
                 }
-                shell.remote_preview_failures.remove(&session_path);
-                shell.record_preview_issue_telemetry(reason);
-                shell.apply_daemon_snapshot_result_for(&request_id, Ok(result));
-            }
-            Err(error) => {
-                if !shell.surface_request_is_current(&request_id) {
-                    return;
-                }
-                shell.finish_busy_request_for(&request_id);
-                warn!(path=%session_path, error=%error, "failed to refresh remote preview");
-                let now = current_millis();
-                let retry_count = shell
-                    .remote_preview_failures
-                    .get(&session_path)
-                    .map(|failure| failure.retry_count.saturating_add(1))
-                    .unwrap_or(1);
-                let first_failed_at_ms = shell
-                    .remote_preview_failures
-                    .get(&session_path)
-                    .map(|failure| failure.first_failed_at_ms)
-                    .unwrap_or(now);
-                let backoff_ms = remote_preview_retry_backoff_ms(retry_count);
-                let retry_after_ms = now.saturating_add(backoff_ms);
-                let message = summarize_preview_refresh_error(&error.to_string());
-                shell.remote_preview_failures.insert(
-                    session_path.clone(),
-                    PreviewSyncFailure {
-                        message: message.clone(),
-                        retry_count,
-                        first_failed_at_ms,
-                    },
-                );
-                shell
-                    .remote_preview_sync_after_ms
-                    .insert(session_path.clone(), retry_after_ms);
-                shell.last_action = format!("preview refresh failed: {message}");
-                if retry_count <= 4 {
-                    schedule_remote_preview_retry_tick(
-                        state,
-                        retry_session_path.clone(),
-                        backoff_ms,
+                Err(error) => {
+                    if !shell.surface_request_is_current(&request_id) {
+                        return;
+                    }
+                    shell.finish_busy_request_for(&request_id);
+                    warn!(path=%session_path, error=%error, "failed to refresh remote preview");
+                    let now = current_millis();
+                    let retry_count = shell
+                        .remote_preview_failures
+                        .get(&session_path)
+                        .map(|failure| failure.retry_count.saturating_add(1))
+                        .unwrap_or(1);
+                    let first_failed_at_ms = shell
+                        .remote_preview_failures
+                        .get(&session_path)
+                        .map(|failure| failure.first_failed_at_ms)
+                        .unwrap_or(now);
+                    let backoff_ms = remote_preview_retry_backoff_ms(retry_count);
+                    let retry_after_ms = now.saturating_add(backoff_ms);
+                    let message = summarize_preview_refresh_error(&error.to_string());
+                    shell.remote_preview_failures.insert(
+                        session_path.clone(),
+                        PreviewSyncFailure {
+                            message: message.clone(),
+                            retry_count,
+                            first_failed_at_ms,
+                        },
                     );
+                    shell
+                        .remote_preview_sync_after_ms
+                        .insert(session_path.clone(), retry_after_ms);
+                    shell.last_action = format!("preview refresh failed: {message}");
+                    if retry_count <= 4 {
+                        schedule_remote_preview_retry_tick(
+                            state,
+                            retry_session_path.clone(),
+                            backoff_ms,
+                        );
+                    }
                 }
-            }
             }
         });
     });
@@ -48990,8 +49125,7 @@ fn active_session_summary_timeline(
         .unwrap_or_default()
         .into_iter()
         .filter(|entry| {
-            !entry.summary.trim().is_empty()
-                && !memoized_low_signal_generated_copy(&entry.summary)
+            !entry.summary.trim().is_empty() && !memoized_low_signal_generated_copy(&entry.summary)
         })
         .collect::<Vec<_>>();
     if timeline.is_empty()
@@ -49543,7 +49677,12 @@ fn panel_menu_open(snapshot: &RenderSnapshot, slot: ChromeSlot) -> bool {
         // A contributed pane's row menu (yedit's Rename / Close). Contributed
         // panes are rail-only, so there is no anchor to ask about.
         snapshot.app_pane_context_menu.is_some(),
-        anchored_on_rail(snapshot.web_tab_context_menu.as_ref().map(|menu| menu.anchor)),
+        anchored_on_rail(
+            snapshot
+                .web_tab_context_menu
+                .as_ref()
+                .map(|menu| menu.anchor),
+        ),
         anchored_on_rail(
             snapshot
                 .web_profile_switcher
@@ -49574,12 +49713,7 @@ fn sidebar_autohide_pinned_flags(
     resizing: bool,
     dragging: bool,
 ) -> bool {
-    alt_overlay_active
-        || context_menu_open
-        || renaming
-        || pending_delete
-        || resizing
-        || dragging
+    alt_overlay_active || context_menu_open || renaming || pending_delete || resizing || dragging
 }
 /// Hold the overlay metadata/settings rail open while a modal it launched owns
 /// the screen, or while a menu one of its rows raised is up. Focus inside the
@@ -50001,7 +50135,11 @@ fn sidebar_panel_card_style(
         shadow,
         if revealed || !floating { "1" } else { "0" },
         translate,
-        if revealed || !floating { "auto" } else { "none" },
+        if revealed || !floating {
+            "auto"
+        } else {
+            "none"
+        },
         ms = MOTION_ENTER_DURATION_MS,
         ease = MOTION_EMPHASIZED_DECELERATE,
     )
@@ -50350,7 +50488,11 @@ fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
     // only nudges the resting color a touch stronger.
     let dark = palette_is_dark(palette);
     let color = if dark {
-        if selected { "rgba(221,232,243,0.92)" } else { "rgba(221,232,243,0.74)" }
+        if selected {
+            "rgba(221,232,243,0.92)"
+        } else {
+            "rgba(221,232,243,0.74)"
+        }
     } else if selected {
         "rgba(34,44,60,0.92)"
     } else {
@@ -51055,9 +51197,7 @@ fn preview_block_is_scaffold_only(block: &SessionPreviewBlock) -> bool {
 /// blocks and this returned 966, and clicking the 542nd visible row folded the
 /// daemon's 531st. With two blocks that drift was invisible; with a timeline of
 /// tool calls it is the whole affordance. The identity travels WITH the row.
-fn visible_preview_block_rows(
-    session: &ManagedSessionView,
-) -> Vec<(usize, SessionPreviewBlock)> {
+fn visible_preview_block_rows(session: &ManagedSessionView) -> Vec<(usize, SessionPreviewBlock)> {
     if preview_should_hide_stale_placeholder_content(session) {
         return Vec::new();
     }
@@ -51150,13 +51290,7 @@ fn visible_preview_block_rows(
     {
         // The everything-was-filtered escape hatch shows the raw list, so here
         // the two index spaces coincide by construction.
-        visible = session
-            .preview
-            .blocks
-            .iter()
-            .cloned()
-            .enumerate()
-            .collect();
+        visible = session.preview.blocks.iter().cloned().enumerate().collect();
     }
     if let Ok(mut cache) = preview_block_cache().lock() {
         cache.entries.insert(key, visible.clone());
@@ -52576,7 +52710,10 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         let chord = Chord {
             ctrl: accel.get("ctrl").and_then(|v| v.as_bool()).unwrap_or(false),
             alt: accel.get("alt").and_then(|v| v.as_bool()).unwrap_or(false),
-            shift: accel.get("shift").and_then(|v| v.as_bool()).unwrap_or(false),
+            shift: accel
+                .get("shift")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             meta: accel.get("meta").and_then(|v| v.as_bool()).unwrap_or(false),
             key: accel
                 .get("key")
@@ -52830,7 +52967,11 @@ fn apply_derived_keytips(
         let claimed = if shell.alt_overlay_modal_scope.is_some() {
             Vec::new()
         } else {
-            match shell.snapshot().keytip_tree.tips_at(&shell.alt_overlay_sequence) {
+            match shell
+                .snapshot()
+                .keytip_tree
+                .tips_at(&shell.alt_overlay_sequence)
+            {
                 Some(tips) => tips,
                 // Not a resolvable scope: derive nothing rather than guess an
                 // exclusion set.
@@ -53071,10 +53212,7 @@ fn build_keytip_scopes(
     }
     // "New Claude Code" is a first-class agent launch (not in the enum registry
     // yet) but belongs in the New… scope between session and terminal.
-    if let Some(pos) = insert
-        .iter()
-        .position(|decl| decl.key == "insert.terminal")
-    {
+    if let Some(pos) = insert.iter().position(|decl| decl.key == "insert.terminal") {
         insert.insert(
             pos,
             KeyTipDecl::shell("insert.claude", "New Claude Code", 'c', Target::Run),
@@ -53508,11 +53646,7 @@ fn follow_chord_into_modal(mut state: Signal<ShellState>) {
 fn feed_alt_derived_char(mut state: Signal<ShellState>, ch: char) {
     let (next, resolution) = {
         let shell = state.read();
-        let next = format!(
-            "{}{}",
-            shell.alt_derived_sequence,
-            ch.to_ascii_lowercase()
-        );
+        let next = format!("{}{}", shell.alt_derived_sequence, ch.to_ascii_lowercase());
         let resolution = keytip::resolve_derived(&shell.alt_derived_tips, &next);
         (next, resolution)
     };
@@ -54061,16 +54195,12 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
     // 2026-09-03): this guard runs on paths a whole-state-subscribed effect
     // reaches per render, and `with_mut` dirties the signal even when the
     // answer is "already in flight" — one render per call to change nothing.
-    let already_in_flight = safe_shell_read(
-        state,
-        "copy_hydration_in_flight_precheck",
-        |shell| {
-            shell
-                .active_copy_hydration_in_flight
-                .contains(&session_path)
-                || shell.store_copy_hydrated_session_ids.contains(&session_id)
-        },
-    )
+    let already_in_flight = safe_shell_read(state, "copy_hydration_in_flight_precheck", |shell| {
+        shell
+            .active_copy_hydration_in_flight
+            .contains(&session_path)
+            || shell.store_copy_hydrated_session_ids.contains(&session_id)
+    })
     .unwrap_or(false);
     let already_in_flight = if already_in_flight {
         true
@@ -55956,7 +56086,10 @@ fn push_live_session_rows(
     // row the flat list used to draw.
     let mut sessions_at_path: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, path) in row_paths.iter().enumerate() {
-        sessions_at_path.entry(path.as_str()).or_default().push(index);
+        sessions_at_path
+            .entry(path.as_str())
+            .or_default()
+            .push(index);
     }
     for (path, nesting) in row_sets.visible_rows(row_paths.iter().map(String::as_str)) {
         for index in sessions_at_path.get(path.as_str()).into_iter().flatten() {
@@ -56130,8 +56263,7 @@ fn collapse_live_sessions_into_split_rows(rows: &mut Vec<BrowserRow>, groups: &[
             continue;
         }
         let first = member_positions[0];
-        let compound =
-            split_compound_row(group, rows[first].depth, rows[first].host_label.clone());
+        let compound = split_compound_row(group, rows[first].depth, rows[first].host_label.clone());
         compound_at.insert(first, compound);
         for idx in member_positions {
             drop_indices.insert(idx);
@@ -56659,7 +56791,9 @@ fn session_cwd_phrase(session: &ManagedSessionView, cwd: &str) -> String {
     if metadata_value(session, "Cwd Warning").trim().is_empty() {
         format!("rooted at {cwd}")
     } else {
-        format!("NOT in {cwd} — that directory does not exist on this machine, so it started elsewhere")
+        format!(
+            "NOT in {cwd} — that directory does not exist on this machine, so it started elsewhere"
+        )
     }
 }
 
@@ -56792,18 +56926,18 @@ fn enrich_sidebar_rows_with_live_titles(
             && !title_looks_like_abbreviated_shell_label(direct_title)
         {
             title_by_path.insert(session.session_path.clone(), direct_title.to_string());
-            if matches!(session.source, SessionSource::LiveSsh | SessionSource::LiveLocal) {
+            if matches!(
+                session.source,
+                SessionSource::LiveSsh | SessionSource::LiveLocal
+            ) {
                 remote_live_direct_title_paths.insert(session.session_path.clone());
             }
             continue;
         }
         if let Some(cwd) = session_cwd
-            && let Some(title) = humanized_terminal_title(
-                session.kind,
-                &cwd,
-                Some(&session.host_label),
-            )
-            .or_else(|| (!cwd.trim().is_empty()).then(|| cwd.clone()))
+            && let Some(title) =
+                humanized_terminal_title(session.kind, &cwd, Some(&session.host_label))
+                    .or_else(|| (!cwd.trim().is_empty()).then(|| cwd.clone()))
         {
             // ⛔ THE KIND-AWARE FALLBACK (owner SSOT law, 2026-09-02): when the
             // direct title is low-signal, the fallback is composed for the
@@ -56947,10 +57081,9 @@ fn enrich_sidebar_rows_with_live_titles(
     if !outline_by_path.is_empty() {
         let seats = live_session_seats(live_sessions);
         for row in rows.iter_mut() {
-            if let Some(prefix) = outline_by_path
-                .get(row.full_path.as_str())
-                .or_else(|| outline_by_path.get(normalize_live_session_path(&row.full_path).as_str()))
-            {
+            if let Some(prefix) = outline_by_path.get(row.full_path.as_str()).or_else(|| {
+                outline_by_path.get(normalize_live_session_path(&row.full_path).as_str())
+            }) {
                 let heads_a_group = yggterm_core::session_outline::outline_prefix_heads_a_group(
                     prefix,
                     seats.iter().map(String::as_str),
@@ -57099,10 +57232,8 @@ fn remote_scanned_session_from_live(
     // bulk scan path: a rail describes one selected session, not a store.
     let counted = (!storage_path.trim().is_empty())
         .then(|| {
-            yggterm_core::count_agent_transcript_messages_cached(Path::new(
-                storage_path.trim(),
-            ))
-            .ok()
+            yggterm_core::count_agent_transcript_messages_cached(Path::new(storage_path.trim()))
+                .ok()
         })
         .flatten();
     let preview_user = session
@@ -57128,7 +57259,9 @@ fn remote_scanned_session_from_live(
         cwd,
         started_at,
         modified_epoch: 0,
-        event_count: counted.map(|c| c.total).unwrap_or_else(|| session.preview.blocks.len()),
+        event_count: counted
+            .map(|c| c.total)
+            .unwrap_or_else(|| session.preview.blocks.len()),
         user_message_count,
         assistant_message_count,
         title_hint: session.title.clone(),
@@ -58045,7 +58178,11 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     .find(|machine| machine.machine_key == machine_key)
                     .filter(|_| !session_id.trim().is_empty())
                     .map(|machine| {
-                        (machine.ssh_target.clone(), machine.prefix.clone(), session_id.clone())
+                        (
+                            machine.ssh_target.clone(),
+                            machine.prefix.clone(),
+                            session_id.clone(),
+                        )
                     })
             }
             None => None,
@@ -58081,7 +58218,11 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     .find(|machine| machine.machine_key == machine_key)
                     .filter(|_| !session_id.trim().is_empty())
                     .map(|machine| {
-                        (machine.ssh_target.clone(), machine.prefix.clone(), session_id.clone())
+                        (
+                            machine.ssh_target.clone(),
+                            machine.prefix.clone(),
+                            session_id.clone(),
+                        )
                     })
             }
             None => None,
@@ -58224,8 +58365,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                             }
                         }
                     }
-                    let is_claude_code = row_for_task.session_kind
-                        == Some(SessionKind::ClaudeCode)
+                    let is_claude_code = row_for_task.session_kind == Some(SessionKind::ClaudeCode)
                         || is_claude_code_session_path(&row_for_task.full_path);
                     let cc_jsonl_written = if let Some((ssh_target, prefix, session_id)) =
                         remote_cc_rename_for_task.as_ref()
@@ -58613,13 +58753,9 @@ fn apply_row_set_drop(
             // Members before the target, excluding dragged rows, determine
             // where the batch lands — same rule `drag_tree` uses for
             // `TopOfGroup`/`AfterPath`.
-            let filtered: Vec<&String> = members
-                .iter()
-                .filter(|m| !drag_set.contains(*m))
-                .collect();
-            filtered
-                .iter()
-                .position(|m| *m == &target_path)
+            let filtered: Vec<&String> =
+                members.iter().filter(|m| !drag_set.contains(*m)).collect();
+            filtered.iter().position(|m| *m == &target_path)
         }
         (Some(head_path), DragDropPlacement::After) => {
             let members = shell.row_arrangement.sets.members_of(head_path);
@@ -58627,10 +58763,8 @@ fn apply_row_set_drop(
                 .iter()
                 .map(|p| normalize_live_session_path(p))
                 .collect();
-            let filtered: Vec<&String> = members
-                .iter()
-                .filter(|m| !drag_set.contains(*m))
-                .collect();
+            let filtered: Vec<&String> =
+                members.iter().filter(|m| !drag_set.contains(*m)).collect();
             filtered
                 .iter()
                 .position(|m| *m == &target_path)
@@ -60443,7 +60577,15 @@ fn context_menu_surface_style(
     format!(
         "position:absolute; {}; box-sizing:border-box; min-width:{}px; max-width:{}px; max-height:{}px; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain; padding:6px; border-radius:10px; \
          background:{}; box-shadow:{}; color:{}; backdrop-filter:{}; -webkit-backdrop-filter:{};",
-        placement_style, min_width, max_width, max_height.round().max(0.0), background, shadow, palette.text, backdrop_filter, backdrop_filter
+        placement_style,
+        min_width,
+        max_width,
+        max_height.round().max(0.0),
+        background,
+        shadow,
+        palette.text,
+        backdrop_filter,
+        backdrop_filter
     )
 }
 /// Does this virtual path end in a leaf the tree GENERATED rather than a real
@@ -60593,10 +60735,7 @@ fn local_workspace_rename_target(
     }
     let path = row.full_path.as_str();
     let home = home.trim_end_matches('/');
-    if home.is_empty()
-        || path.trim_start_matches('/').starts_with("__")
-        || !path.starts_with('/')
-    {
+    if home.is_empty() || path.trim_start_matches('/').starts_with("__") || !path.starts_with('/') {
         return None;
     }
     let parent = if path == "/workspace" || path.starts_with("/workspace/") {
@@ -61250,8 +61389,8 @@ fn app_registry_for_launch_anchor(
     if let Some(row) = selected_row {
         return app_registry_for_row(shell, row);
     }
-    if let Some(machine) = active_session_path
-        .and_then(|path| remote_machine_for_session_path(&shell.server, path))
+    if let Some(machine) =
+        active_session_path.and_then(|path| remote_machine_for_session_path(&shell.server, path))
     {
         return machine.apps.clone();
     }
@@ -62047,13 +62186,10 @@ fn describe_app_state_snapshot(
             let sidebar_sample = session_sample_text_for_sidebar_icon(session);
             let sample_shows_working =
                 terminal_chunk_has_agent_working_status_for_sidebar_icon(&sidebar_sample);
-            let optimistic_busy = snapshot
-                .optimistic_busy_paths
-                .iter()
-                .any(|path| {
-                    normalize_live_session_path(path)
-                        == normalize_live_session_path(&session.session_path)
-                });
+            let optimistic_busy = snapshot.optimistic_busy_paths.iter().any(|path| {
+                normalize_live_session_path(path)
+                    == normalize_live_session_path(&session.session_path)
+            });
             let sample_tail = strip_terminal_control_sequences(&sidebar_sample)
                 .chars()
                 .rev()
@@ -62972,7 +63108,8 @@ fn append_viewport_session_contract_violations(
                 hosts
                     .iter()
                     .find(|host| {
-                        host.get("session_path").and_then(Value::as_str) == Some(active_path.as_str())
+                        host.get("session_path").and_then(Value::as_str)
+                            == Some(active_path.as_str())
                     })
                     .or_else(|| {
                         hosts
@@ -63098,7 +63235,8 @@ thread_local! {
 /// How many full builds ran — the counter the memoization lock reads, and a
 /// probe-rate diagnostic in its own right (builds should track state churn,
 /// not probe count).
-static APP_ROWS_RESPONSE_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static APP_ROWS_RESPONSE_BUILDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn describe_app_rows_snapshot_cached(state: &Signal<ShellState>) -> Value {
     use std::sync::atomic::Ordering;
@@ -63109,7 +63247,8 @@ fn describe_app_rows_snapshot_cached(state: &Signal<ShellState>) -> Value {
         cache
             .as_ref()
             .filter(|(cached_epoch, cached_at, _)| {
-                *cached_epoch == epoch && now.saturating_sub(*cached_at) < APP_ROWS_RESPONSE_CACHE_TTL_MS
+                *cached_epoch == epoch
+                    && now.saturating_sub(*cached_at) < APP_ROWS_RESPONSE_CACHE_TTL_MS
             })
             .map(|(_, _, value)| value.clone())
     });
@@ -70604,9 +70743,10 @@ async fn app_pane_fetch_schema(
         url = format!("{url}?{}", query.join("&"));
     }
     let fetch_started = std::time::Instant::now();
-    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
-        .await
-        .unwrap_or_else(|error| Err(format!("schema fetch panicked: {error}")));
+    let fetched =
+        task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("schema fetch panicked: {error}")));
     let fetched_ok = fetched.is_ok();
     let fetched_bytes = fetched
         .as_ref()
@@ -70672,9 +70812,10 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
     let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_pane_schema_url(&control_url, &pane_id);
     let fetch_started = std::time::Instant::now();
-    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
-        .await
-        .unwrap_or_else(|error| Err(format!("document schema fetch panicked: {error}")));
+    let fetched =
+        task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("document schema fetch panicked: {error}")));
     let fetched_ok = fetched.is_ok();
     let fetched_bytes = fetched
         .as_ref()
@@ -70689,8 +70830,7 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
             // Same render-drumbeat guard as the rail channel above: an
             // identical document re-declaration must not dirty the signal.
             let noop = state.with(|shell| {
-                shell
-                    .document_pane_fetch_is_noop(seq, &session_path, &pane_id, &schema)
+                shell.document_pane_fetch_is_noop(seq, &session_path, &pane_id, &schema)
             });
             if !noop {
                 state.with_mut_counted(|shell| {
@@ -70698,9 +70838,8 @@ async fn document_pane_fetch_schema(mut state: Signal<ShellState>, session_path:
                 });
             }
         }
-        Err(error) => {
-            state.with_mut_counted(|shell| shell.document_pane_apply_error(seq, &session_path, error))
-        }
+        Err(error) => state
+            .with_mut_counted(|shell| shell.document_pane_apply_error(seq, &session_path, error)),
     }
     // The document channel's twin of the rail fetch probe.
     append_trace_event(
@@ -70804,7 +70943,12 @@ async fn document_pane_run_action(
         // instead of at the next ping-discovered version edge. The rail arm
         // of the refetch contract, served from the document channel (the
         // two-arm law: the reply flag works no matter which pane posted).
-        spawn(app_pane_fetch_schema(state, session_path.clone(), rail_pane, seq));
+        spawn(app_pane_fetch_schema(
+            state,
+            session_path.clone(),
+            rail_pane,
+            seq,
+        ));
     }
 }
 
@@ -70880,9 +71024,10 @@ async fn app_policy_fetch(
     };
     let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_policy_url(&control_url);
-    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
-        .await
-        .unwrap_or_else(|error| Err(format!("policy fetch panicked: {error}")));
+    let fetched =
+        task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("policy fetch panicked: {error}")));
     match fetched.and_then(|value| {
         serde_json::from_value::<WebSurfacePolicy>(value)
             .map_err(|error| format!("policy is malformed: {error}"))
@@ -70964,9 +71109,10 @@ async fn app_zoom_fetch(
     };
     let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_zoom_url(&control_url);
-    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
-        .await
-        .unwrap_or_else(|error| Err(format!("zoom fetch panicked: {error}")));
+    let fetched =
+        task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("zoom fetch panicked: {error}")));
     match fetched {
         Ok(value) => {
             let overrides = parse_web_surface_zoom(&value);
@@ -70981,11 +71127,13 @@ async fn app_zoom_fetch(
                     "sites": overrides.len(),
                 }),
             );
-            state.with_mut_counted(|shell| shell.apply_sidebar_zoom(&session_path, &zoom_version, overrides));
+            state.with_mut_counted(|shell| {
+                shell.apply_sidebar_zoom(&session_path, &zoom_version, overrides)
+            });
         }
         Err(error) => {
-            let exhausted =
-                state.with_mut_counted(|shell| shell.fail_sidebar_zoom(&session_path, &zoom_version));
+            let exhausted = state
+                .with_mut_counted(|shell| shell.fail_sidebar_zoom(&session_path, &zoom_version));
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -71017,9 +71165,10 @@ async fn app_appearance_fetch(
     };
     let control_token = state.peek().sidebar_control_token(&session_path);
     let url = app_appearance_url(&control_url);
-    let fetched = task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
-        .await
-        .unwrap_or_else(|error| Err(format!("appearance fetch panicked: {error}")));
+    let fetched =
+        task::spawn_blocking(move || control_request(&url, None, control_token.as_deref()))
+            .await
+            .unwrap_or_else(|error| Err(format!("appearance fetch panicked: {error}")));
     match fetched {
         Ok(value) => {
             let (default, overrides) = parse_web_surface_appearance(&value);
@@ -71036,12 +71185,18 @@ async fn app_appearance_fetch(
                 }),
             );
             state.with_mut_counted(|shell| {
-                shell.apply_sidebar_appearance(&session_path, &appearance_version, default, overrides)
+                shell.apply_sidebar_appearance(
+                    &session_path,
+                    &appearance_version,
+                    default,
+                    overrides,
+                )
             });
         }
         Err(error) => {
-            let exhausted = state
-                .with_mut(|shell| shell.fail_sidebar_appearance(&session_path, &appearance_version));
+            let exhausted = state.with_mut(|shell| {
+                shell.fail_sidebar_appearance(&session_path, &appearance_version)
+            });
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -71119,7 +71274,12 @@ fn app_media_permission_url(control_url: &str) -> String {
 }
 
 /// The same route with the question attached: this origin, these devices.
-fn app_media_permission_query_url(control_url: &str, origin: &str, audio: bool, video: bool) -> String {
+fn app_media_permission_query_url(
+    control_url: &str,
+    origin: &str,
+    audio: bool,
+    video: bool,
+) -> String {
     format!(
         "{}?origin={}&audio={}&video={}",
         app_media_permission_url(control_url),
@@ -71712,7 +71872,11 @@ async fn app_pane_run_action_with_order(
         // adblock ruleset, its userscripts). Drop the policy we hold FIRST: the
         // reconciler's gate then makes the recreate wait for the new one, so the
         // surface cannot come back under the rules the user just turned off.
-        let session = state.peek().server.active_session_path().map(str::to_string);
+        let session = state
+            .peek()
+            .server
+            .active_session_path()
+            .map(str::to_string);
         let Some(session) = session else {
             return;
         };
@@ -71746,7 +71910,11 @@ async fn app_pane_run_action_with_order(
     if reply.refetch_document {
         // The rail action changed the document; repaint the viewport now
         // rather than a heartbeat later.
-        let session = state.peek().server.active_session_path().map(str::to_string);
+        let session = state
+            .peek()
+            .server
+            .active_session_path()
+            .map(str::to_string);
         if let Some(session) = session {
             let seq = state.with_mut_counted(|shell| shell.document_pane_next_request(&session));
             spawn(document_pane_fetch_schema(state, session, seq));
@@ -71756,7 +71924,11 @@ async fn app_pane_run_action_with_order(
         // The document also moved rail rows; repaint the shelf now rather
         // than a ping-edge later. Same active-session guard the declare/ping
         // rail arm enforces.
-        let session = state.peek().server.active_session_path().map(str::to_string);
+        let session = state
+            .peek()
+            .server
+            .active_session_path()
+            .map(str::to_string);
         if let Some(session) = session {
             if let Some((pane_id, seq)) =
                 state.with_mut_counted(|shell| shell.document_rail_pane_to_refetch(&session))
@@ -71769,7 +71941,11 @@ async fn app_pane_run_action_with_order(
         // A per-site zoom action wants its change on the live page NOW, not at
         // the next declare. Re-read `/zoom` under the current stamp; the
         // reconciler applies it to the surface on its next tick.
-        let session = state.peek().server.active_session_path().map(str::to_string);
+        let session = state
+            .peek()
+            .server
+            .active_session_path()
+            .map(str::to_string);
         if let Some(session) = session {
             // Force the next fetch: the stamp has not moved yet (the ~4s declare
             // will catch up), so clear `zoom_loaded` to make the refetch land.
@@ -71791,7 +71967,11 @@ async fn app_pane_run_action_with_order(
         // `/appearance` under the current stamp; the render picks up the new
         // colours as soon as the map lands (the stamp has not moved yet — the
         // ~4s declare will catch up — so clear `appearance_loaded` to force it).
-        let session = state.peek().server.active_session_path().map(str::to_string);
+        let session = state
+            .peek()
+            .server
+            .active_session_path()
+            .map(str::to_string);
         if let Some(session) = session {
             let version = state.with_mut_counted(|shell| {
                 if let Some(contribution) = shell.sidebar_contributions.get_mut(&session) {
@@ -71830,8 +72010,7 @@ async fn web_surface_eval_for(
         None => script,
     };
     let framed = frame.is_some();
-    let (tx, rx) =
-        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -71962,8 +72141,7 @@ async fn web_do_eval_with_timeout(
     script: &str,
     budget: Duration,
 ) -> Result<Value, String> {
-    let (tx, rx) =
-        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     desktop.eval_web_surface(native_id, script, move |outcome| {
         let _ = tx.send(outcome);
     })?;
@@ -71981,7 +72159,9 @@ async fn web_do_eval_with_timeout(
             let reason = eval_failure_reason(failure.kind, true);
             Err(format!("{reason}: {}", failure.message))
         }
-        Ok(Err(_)) => Err("webview_unreachable: eval callback dropped (surface destroyed mid-verb?)".to_string()),
+        Ok(Err(_)) => Err(
+            "webview_unreachable: eval callback dropped (surface destroyed mid-verb?)".to_string(),
+        ),
         Err(_) => Err(format!(
             "webview_unreachable: eval timed out ({}s)",
             budget.as_secs()
@@ -72881,14 +73061,16 @@ fn segmented_expectation(expected: &str, boxes: usize) -> Vec<String> {
     (0..boxes)
         .map(|index| {
             if index + 1 == boxes {
-                chars.get(index..).map(|rest| rest.iter().collect()).unwrap_or_default()
+                chars
+                    .get(index..)
+                    .map(|rest| rest.iter().collect())
+                    .unwrap_or_default()
             } else {
                 chars.get(index).map(|c| c.to_string()).unwrap_or_default()
             }
         })
         .collect()
 }
-
 
 /// What one PINNED box holds, as far as emptiness is concerned. Lengths and
 /// booleans only — no page value crosses back out (F4).
@@ -73441,11 +73623,7 @@ fn web_do_key_name_to_keyval(name: &str) -> Option<u32> {
 /// `0x0100_0000` Unicode plane above it).
 fn web_do_char_to_keyval(c: char) -> u32 {
     let cp = c as u32;
-    if cp <= 0xff {
-        cp
-    } else {
-        0x0100_0000 + cp
-    }
+    if cp <= 0xff { cp } else { 0x0100_0000 + cp }
 }
 
 /// GDK modifier bitmask from mod names (`ctrl`/`shift`/`alt`/`meta`).
@@ -73455,7 +73633,7 @@ fn web_do_mods_to_state(mods: &[String]) -> u32 {
         state |= match m.to_ascii_lowercase().as_str() {
             "shift" => 0x1,                          // GDK_SHIFT_MASK
             "ctrl" | "control" => 0x4,               // GDK_CONTROL_MASK
-            "alt" | "mod1" => 0x8,                    // GDK_MOD1_MASK
+            "alt" | "mod1" => 0x8,                   // GDK_MOD1_MASK
             "meta" | "super" | "win" => 0x0400_0000, // GDK_SUPER_MASK
             _ => 0,
         };
@@ -73534,7 +73712,10 @@ enum WebDoDelivery {
     Unknown,
 }
 
-fn web_do_delivery_from_readback(armed_doc: Option<&str>, readback: Option<&Value>) -> WebDoDelivery {
+fn web_do_delivery_from_readback(
+    armed_doc: Option<&str>,
+    readback: Option<&Value>,
+) -> WebDoDelivery {
     let Some(readback) = readback else {
         return WebDoDelivery::Unknown;
     };
@@ -73712,7 +73893,9 @@ static AGENT_INPUT_ARBITER: std::sync::Mutex<
 
 fn agent_input_arbiter_lock()
 -> impl std::ops::DerefMut<Target = crate::agent_input_arbiter::AgentInputArbiter> {
-    struct Guard(std::sync::MutexGuard<'static, Option<crate::agent_input_arbiter::AgentInputArbiter>>);
+    struct Guard(
+        std::sync::MutexGuard<'static, Option<crate::agent_input_arbiter::AgentInputArbiter>>,
+    );
     impl std::ops::Deref for Guard {
         type Target = crate::agent_input_arbiter::AgentInputArbiter;
         fn deref(&self) -> &Self::Target {
@@ -73999,9 +74182,7 @@ async fn web_do_perform(
                     )
                     .await;
                     match hit {
-                        Ok(info)
-                            if info.get("ok").and_then(Value::as_bool).unwrap_or(false) =>
-                        {
+                        Ok(info) if info.get("ok").and_then(Value::as_bool).unwrap_or(false) => {
                             desktop
                                 .inject_web_surface_click(
                                     native_id,
@@ -74075,7 +74256,11 @@ async fn web_do_perform(
                 Err(reason) => Err(reason),
             }
         }
-        WebSurfaceDoAction::Key { key, mods, selector } => match web_do_key_name_to_keyval(key) {
+        WebSurfaceDoAction::Key {
+            key,
+            mods,
+            selector,
+        } => match web_do_key_name_to_keyval(key) {
             Some(keyval) => {
                 // Editing/navigation keys need a focused DOM element (the widget
                 // grab alone has no target). Focus the selector first when given.
@@ -74357,7 +74542,10 @@ fn web_do_apply_delivery(detail: &mut Value, delivery: WebDoDelivery) {
             obj.insert("delivered".to_string(), Value::Bool(false));
         }
         WebDoDelivery::Unknown => {
-            obj.insert("delivered".to_string(), Value::String("unknown".to_string()));
+            obj.insert(
+                "delivered".to_string(),
+                Value::String("unknown".to_string()),
+            );
         }
     }
 }
@@ -74575,11 +74763,18 @@ async fn web_surface_do_for(
     expected_generation: Option<u64>,
     new_batch: bool,
 ) -> Value {
-    let (session, handle) =
-        match web_do_open_lane(state, desktop, session_path, expected_generation, new_batch).await {
-            Ok(resolved) => resolved,
-            Err(refusal) => return refusal,
-        };
+    let (session, handle) = match web_do_open_lane(
+        state,
+        desktop,
+        session_path,
+        expected_generation,
+        new_batch,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(refusal) => return refusal,
+    };
     let native_id = handle.native_id;
     // Arm, inject, read the recorder back — one action.
     let (result, delivery) = web_do_execute_one(desktop, native_id, action).await;
@@ -74942,7 +75137,10 @@ mod web_do_verb_tests {
             segmented_expectation("292244", 6),
             vec!["2", "9", "2", "2", "4", "4"]
         );
-        assert_eq!(segmented_expectation("292244", 4), vec!["2", "9", "2", "244"]);
+        assert_eq!(
+            segmented_expectation("292244", 4),
+            vec!["2", "9", "2", "244"]
+        );
         // One box means the whole string, so `--selector x` and
         // `--selector-set x` ask the same question.
         assert_eq!(segmented_expectation("292244", 1), vec!["292244"]);
@@ -75040,7 +75238,10 @@ mod web_do_verb_tests {
         // …and the human is still heard after all that throughput.
         note_seat_input(native_id);
         let seat_input = take_seat_input_count(native_id);
-        assert_eq!(seat_input, 1, "a real gesture after 20 injections must count");
+        assert_eq!(
+            seat_input, 1,
+            "a real gesture after 20 injections must count"
+        );
         assert_eq!(
             web_do_gate(
                 seat_input,
@@ -75429,10 +75630,7 @@ mod web_do_verb_tests {
             }
         }
         let mut published: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
-        published.insert(
-            ("web://publish-shown".to_string(), 0),
-            applied(8_101, true),
-        );
+        published.insert(("web://publish-shown".to_string(), 0), applied(8_101, true));
         published.insert(
             ("web://publish-never-shown".to_string(), 0),
             applied(8_102, false),
@@ -75721,8 +75919,8 @@ mod web_do_verb_tests {
     fn keystrokes_between_two_verbs_reach_the_gate_instead_of_the_agents_ledger() {
         use crate::agent_input_arbiter::{AgentBatch, AgentInputArbiter, SurfaceKey};
         use dioxus_desktop::{
-            grant_injection_credits_at, note_seat_input_at, take_seat_input_count,
-            INJECTION_CREDIT_TTL_MS,
+            INJECTION_CREDIT_TTL_MS, grant_injection_credits_at, note_seat_input_at,
+            take_seat_input_count,
         };
 
         let native_id = 91_005;
@@ -76067,7 +76265,10 @@ mod web_do_verb_tests {
             wait_poll_outcome(&Ok(json!(300.0)), Some(500)),
             WaitStep::NotYet { eval_error: false }
         );
-        assert_eq!(wait_poll_outcome(&Ok(json!(500.0)), Some(500)), WaitStep::Met);
+        assert_eq!(
+            wait_poll_outcome(&Ok(json!(500.0)), Some(500)),
+            WaitStep::Met
+        );
         // A non-numeric answer to an idle probe is not-yet, never "met".
         assert_eq!(
             wait_poll_outcome(&Ok(json!(true)), Some(500)),
@@ -76149,13 +76350,22 @@ mod web_do_verb_tests {
             WaitProbe::Settled { ms: 800, .. }
         ));
         // `idle` and the page half of `settled` share ONE mutation observer.
-        let (WaitProbe::Page { script: idle, .. }, WaitProbe::Settled { script: settled, .. }) = (
+        let (
+            WaitProbe::Page { script: idle, .. },
+            WaitProbe::Settled {
+                script: settled, ..
+            },
+        ) = (
             web_wait_probe(&WebSurfaceWaitUntil::Idle { ms: 300 }).unwrap(),
             web_wait_probe(&WebSurfaceWaitUntil::Settled { ms: 300 }).unwrap(),
-        ) else {
+        )
+        else {
             panic!("unexpected probe shapes");
         };
-        assert_eq!(idle, settled, "two mutation clocks would answer differently");
+        assert_eq!(
+            idle, settled,
+            "two mutation clocks would answer differently"
+        );
     }
 
     // C2: the band arithmetic, testable with no image. Remainder columns go to
@@ -76242,8 +76452,14 @@ mod web_do_verb_tests {
         // across runs.
         assert_eq!(domains, vec![".gov.in", "forms.example.gov"]);
         let rendered = serde_json::to_string(&domains).unwrap();
-        assert!(!rendered.contains("q7v2n8m4k1"), "a value reached the report");
-        assert!(!rendered.contains("PHPSESSID"), "a cookie name reached the report");
+        assert!(
+            !rendered.contains("q7v2n8m4k1"),
+            "a value reached the report"
+        );
+        assert!(
+            !rendered.contains("PHPSESSID"),
+            "a cookie name reached the report"
+        );
     }
 
     // C8 THE LOCK: one string used to cover two completely different problems.
@@ -76265,7 +76481,10 @@ mod web_do_verb_tests {
             "js_result_unsupported"
         );
         // A live page that threw is a script bug; a dead one is not.
-        assert_eq!(eval_failure_reason(Kind::ScriptException, true), "js_exception");
+        assert_eq!(
+            eval_failure_reason(Kind::ScriptException, true),
+            "js_exception"
+        );
         assert_eq!(
             eval_failure_reason(Kind::ScriptException, false),
             "webview_unreachable"
@@ -76274,10 +76493,7 @@ mod web_do_verb_tests {
             eval_failure_reason(Kind::InvalidParameter, true),
             "js_invalid_parameter"
         );
-        assert_eq!(
-            eval_failure_reason(Kind::EngineError, true),
-            "engine_error"
-        );
+        assert_eq!(eval_failure_reason(Kind::EngineError, true), "engine_error");
         assert_eq!(
             eval_failure_reason(Kind::EngineError, false),
             "webview_unreachable"
@@ -76300,8 +76516,10 @@ mod web_do_verb_tests {
         );
         // A refused scheme names the scheme.
         assert_eq!(
-            declared_web_surface_open_or_refusal(&json!({"url": "file:///home/user/.ssh/id_ed25519"}))
-                .err(),
+            declared_web_surface_open_or_refusal(
+                &json!({"url": "file:///home/user/.ssh/id_ed25519"})
+            )
+            .err(),
             Some(DeclaredOpenRefusal::SchemeRefused("file".into()))
         );
         assert_eq!(
@@ -76603,7 +76821,9 @@ mod web_do_verb_tests {
     fn an_await_poll_has_three_answers_and_never_invents_a_result() {
         // Settled, resolved.
         assert_eq!(
-            web_await_poll_outcome(&Ok(json!({"missing": false, "done": true, "ok": true, "value": 200}))),
+            web_await_poll_outcome(&Ok(
+                json!({"missing": false, "done": true, "ok": true, "value": 200})
+            )),
             AwaitStep::Settled {
                 ok: true,
                 value: json!(200),
@@ -76788,8 +77008,12 @@ mod web_do_verb_tests {
                 .expect_err("an occluded/moved target must refuse");
         assert!(err.starts_with("target_moved"), "{err}");
 
-        let err = web_do_resolved_from_info(&target, &json!({"found": false, "phase": "post_scroll"}), None)
-            .expect_err("no match must refuse");
+        let err = web_do_resolved_from_info(
+            &target,
+            &json!({"found": false, "phase": "post_scroll"}),
+            None,
+        )
+        .expect_err("no match must refuse");
         assert!(err.contains("no element matches css:#otp"), "{err}");
     }
 
@@ -77070,7 +77294,8 @@ mod web_do_verb_tests {
         // no geometry at all, and every rect it reads belongs to the shared
         // liveness predicate, which spends it on a boolean and nothing else.
         assert!(
-            scroll.contains("return{found:true,isConnected:connected,scrollTopBefore:top,match:m};"),
+            scroll
+                .contains("return{found:true,isConnected:connected,scrollTopBefore:top,match:m};"),
             "phase A's payload must stay geometry-free — any rect in it would be \
              pre-scroll: {scroll}"
         );
@@ -77389,7 +77614,10 @@ mod web_do_verb_tests {
             hidden: 6,
         });
 
-        let css = web_do_match_refusal(&WebElementRef::Css("button[type=submit]".into()), only_hidden);
+        let css = web_do_match_refusal(
+            &WebElementRef::Css("button[type=submit]".into()),
+            only_hidden,
+        );
         assert!(css.starts_with("no_hittable_match"), "{css}");
         assert!(css.contains('6'), "the drop count is the evidence: {css}");
 
@@ -77486,7 +77714,10 @@ mod web_do_verb_tests {
         );
 
         // One spelling per mode, shared by the trace line and the notice.
-        assert_eq!(Mode::NoJarLockHeldElsewhere.as_str(), "no_jar_lock_held_elsewhere");
+        assert_eq!(
+            Mode::NoJarLockHeldElsewhere.as_str(),
+            "no_jar_lock_held_elsewhere"
+        );
         assert_eq!(Mode::Persistent.as_str(), "persistent");
         assert_eq!(Mode::EphemeralByRequest.as_str(), "ephemeral_by_request");
     }
@@ -77695,7 +77926,10 @@ mod web_do_verb_tests {
             web_do_delivery_from_readback(armed, Some(&json!({"present": false}))),
             WebDoDelivery::Unknown
         );
-        assert_eq!(web_do_delivery_from_readback(armed, None), WebDoDelivery::Unknown);
+        assert_eq!(
+            web_do_delivery_from_readback(armed, None),
+            WebDoDelivery::Unknown
+        );
         assert_eq!(
             web_do_delivery_from_readback(
                 None,
@@ -77816,14 +78050,25 @@ mod web_do_verb_tests {
             false
         ));
         // Zero hold still honors a live lease.
-        assert!(!web_surface_reap_due(2_000, None, Some(0), Some(9_000), false));
+        assert!(!web_surface_reap_due(
+            2_000,
+            None,
+            Some(0),
+            Some(9_000),
+            false
+        ));
         assert!(web_surface_reap_due(2_000, None, Some(0), None, false));
         // NO hold at all — a comfortable machine — never reaps, whatever the
         // clocks say. This is the branch the destroy-on-a-wall-clock bug had no
         // way to express.
-        assert!(!web_surface_reap_due(999_999_000, stashed, None, None, false));
+        assert!(!web_surface_reap_due(
+            999_999_000,
+            stashed,
+            None,
+            None,
+            false
+        ));
     }
-
 
     /// The refcount that makes sharing safe. With one tunnel serving N tabs,
     /// closing ANY tab used to kill it — severing egress for every sibling still
@@ -77980,8 +78225,10 @@ mod web_do_verb_tests {
     fn observed_event_types_cover_every_verb() {
         // Each verb must name the events that prove IT arrived — a key verb
         // watching for mouse events would observe nothing and read as dropped.
-        assert!(web_do_observed_event_types(&WebSurfaceDoAction::Move { x: 0.0, y: 0.0 })
-            .contains(&"mousemove"));
+        assert!(
+            web_do_observed_event_types(&WebSurfaceDoAction::Move { x: 0.0, y: 0.0 })
+                .contains(&"mousemove")
+        );
         assert!(
             web_do_observed_event_types(&WebSurfaceDoAction::Key {
                 key: "Backspace".to_string(),
@@ -78064,7 +78311,11 @@ mod web_do_verb_tests {
             // the same raw-IIFE contract `web eval` uses (no bare `return`).
             assert!(s.starts_with("(function(){"), "{:?} not an IIFE", m);
             assert!(s.contains("return"), "{:?} has no return", m);
-            assert!(scripts.insert(s), "{:?} shares a script with another mode", m);
+            assert!(
+                scripts.insert(s),
+                "{:?} shares a script with another mode",
+                m
+            );
             // Non-empty, distinct wire name.
             assert!(!web_read_mode_name(m).is_empty());
         }
@@ -78272,8 +78523,7 @@ fn web_read_mode_name(mode: WebSurfaceReadAs) -> &'static str {
 /// `settled`. ONE observer: a second `MutationObserver` under a different
 /// window key would answer a slightly different question every time the page
 /// re-ran one of the two scripts.
-const WEB_WAIT_IDLE_JS: &str =
-    "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
+const WEB_WAIT_IDLE_JS: &str = "(function(){if(!window.__yggIdle){window.__yggIdle={last:Date.now()};\
      var o=new MutationObserver(function(){window.__yggIdle.last=Date.now();});\
      o.observe(document.documentElement,{childList:true,subtree:true,attributes:true,characterData:true});\
      window.__yggIdle.obs=o;}return Date.now()-window.__yggIdle.last;})()";
@@ -78314,7 +78564,9 @@ fn web_wait_probe(until: &WebSurfaceWaitUntil) -> Result<WaitProbe, String> {
         WebSurfaceWaitUntil::Selector { css, visible } => {
             let sel = serde_json::to_string(css).unwrap_or_else(|_| "\"\"".to_string());
             page(if *visible {
-                format!("(function(){{var e=document.querySelector({sel});if(!e)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}})()")
+                format!(
+                    "(function(){{var e=document.querySelector({sel});if(!e)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}})()"
+                )
             } else {
                 format!("(function(){{return !!document.querySelector({sel});}})()")
             })
@@ -78331,8 +78583,7 @@ fn web_wait_probe(until: &WebSurfaceWaitUntil) -> Result<WaitProbe, String> {
             // Compiled ONCE, before the loop, and refused up front — a bad
             // pattern is a caller error, not something to rediscover on every
             // 100 ms tick and report as a timeout.
-            pattern: regex::Regex::new(pattern)
-                .map_err(|error| format!("bad_regex: {error}"))?,
+            pattern: regex::Regex::new(pattern).map_err(|error| format!("bad_regex: {error}"))?,
         },
         WebSurfaceWaitUntil::Settled { ms } => WaitProbe::Settled {
             script: WEB_WAIT_IDLE_JS.to_string(),
@@ -78363,7 +78614,10 @@ fn wait_poll_outcome(eval: &Result<Value, String>, idle_threshold_ms: Option<u64
     match eval {
         Ok(value) => {
             let met = match idle_threshold_ms {
-                Some(ms) => value.as_f64().map(|idle| idle >= ms as f64).unwrap_or(false),
+                Some(ms) => value
+                    .as_f64()
+                    .map(|idle| idle >= ms as f64)
+                    .unwrap_or(false),
                 None => value.as_bool().unwrap_or(false),
             };
             if met {
@@ -78588,7 +78842,11 @@ impl AwaitEnd {
 #[derive(Debug, Clone, PartialEq)]
 enum AwaitStep {
     /// The promise settled.
-    Settled { ok: bool, value: Value, error: Option<String> },
+    Settled {
+        ok: bool,
+        value: Value,
+        error: Option<String>,
+    },
     /// Not yet. A poll EVAL FAILURE lands here too: a navigation mid-await must
     /// not abort the wait, same rule as `web wait`.
     Pending,
@@ -78603,7 +78861,11 @@ fn web_await_poll_outcome(poll: &Result<Value, String>) -> AwaitStep {
     let Ok(info) = poll else {
         return AwaitStep::Pending;
     };
-    if info.get("missing").and_then(Value::as_bool).unwrap_or(false) {
+    if info
+        .get("missing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return AwaitStep::DocumentReplaced;
     }
     if !info.get("done").and_then(Value::as_bool).unwrap_or(false) {
@@ -78640,8 +78902,8 @@ async fn web_surface_await_for(
         "ygg-{}",
         WEB_AWAIT_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    if let Err(reason) = web_do_eval(desktop, native_id, &web_await_kickoff_script(&rid, script))
-        .await
+    if let Err(reason) =
+        web_do_eval(desktop, native_id, &web_await_kickoff_script(&rid, script)).await
     {
         return json!({
             "accepted": false,
@@ -79081,7 +79343,9 @@ async fn web_surface_capture_element_for(
         .await
     {
         Ok(info) => info,
-        Err(reason) => return json!({ "accepted": false, "session_path": session, "reason": reason }),
+        Err(reason) => {
+            return json!({ "accepted": false, "session_path": session, "reason": reason });
+        }
     };
     if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         let mut refusal = json!({
@@ -79155,8 +79419,8 @@ async fn web_surface_capture_element_for(
                 .zip(split_rgba_bands(&rgba, w, h, &plan))
                 .enumerate()
             {
-                let encoded = encode_rgba_png(band.1, h, &pixels)
-                    .map_err(|error| error.to_string())?;
+                let encoded =
+                    encode_rgba_png(band.1, h, &pixels).map_err(|error| error.to_string())?;
                 let band_path = path.with_file_name(format!(
                     "{}-{}.png",
                     path.file_stem().unwrap_or_default().to_string_lossy(),
@@ -79205,14 +79469,18 @@ async fn web_surface_liveness_probe(
     desktop: &dioxus::desktop::DesktopContext,
     session_path: &str,
 ) -> Value {
-    let handle = state.peek().web_surfaces.get(session_path).and_then(|surface| {
-        let active = surface.active_tab;
-        surface
-            .tabs
-            .iter()
-            .find(|tab| tab.id == active)
-            .and_then(|tab| web_surface_handle_for(session_path, tab.id))
-    });
+    let handle = state
+        .peek()
+        .web_surfaces
+        .get(session_path)
+        .and_then(|surface| {
+            let active = surface.active_tab;
+            surface
+                .tabs
+                .iter()
+                .find(|tab| tab.id == active)
+                .and_then(|tab| web_surface_handle_for(session_path, tab.id))
+        });
     let tabs = state
         .peek()
         .web_surfaces
@@ -79235,14 +79503,9 @@ async fn web_surface_liveness_probe(
     let liveness = desktop.web_surface_liveness(handle.native_id);
     // The round trip. A 2s budget: this is a health check, and a content
     // process that needs longer than that to answer `1` is not healthy.
-    let eval_ok = web_do_eval_with_timeout(
-        desktop,
-        handle.native_id,
-        "1",
-        Duration::from_secs(2),
-    )
-    .await
-    .is_ok();
+    let eval_ok = web_do_eval_with_timeout(desktop, handle.native_id, "1", Duration::from_secs(2))
+        .await
+        .is_ok();
     json!({
         "tabs": tabs,
         "handle": true,
@@ -79324,9 +79587,11 @@ async fn web_surface_cookies_for(
                 .collect();
             let requested = records.len();
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<usize, String>>();
-            if let Err(reason) = desktop.import_web_surface_cookies(native_id, records, move |outcome| {
-                let _ = tx.send(outcome);
-            }) {
+            if let Err(reason) =
+                desktop.import_web_surface_cookies(native_id, records, move |outcome| {
+                    let _ = tx.send(outcome);
+                })
+            {
                 return json!({ "accepted": false, "session_path": session, "reason": reason });
             }
             let added = match tokio::time::timeout(Duration::from_secs(20), rx).await {
@@ -79381,8 +79646,9 @@ async fn web_surface_cookies_for(
             })
         }
         WebCookieDirection::Export => {
-            let (tx, rx) =
-                tokio::sync::oneshot::channel::<Result<Vec<dioxus::desktop::CookieRecord>, String>>();
+            let (tx, rx) = tokio::sync::oneshot::channel::<
+                Result<Vec<dioxus::desktop::CookieRecord>, String>,
+            >();
             if let Err(reason) = desktop.export_web_surface_cookies(native_id, move |outcome| {
                 let _ = tx.send(outcome);
             }) {
@@ -79521,7 +79787,9 @@ async fn web_surface_screenshot_for(
     let capture = match start {
         Ok(()) => match tokio::time::timeout(Duration::from_secs(20), rx).await {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err("snapshot callback dropped (surface destroyed mid-capture?)".to_string()),
+            Ok(Err(_)) => {
+                Err("snapshot callback dropped (surface destroyed mid-capture?)".to_string())
+            }
             Err(_) => Err("snapshot timed out (20s)".to_string()),
         },
         Err(reason) => Err(reason),
@@ -79619,7 +79887,8 @@ async fn run_web_find_step(
         Err(_) => return Err("engine did not report a match count within 10s".to_string()),
     };
     let mut writable = state;
-    let folded = writable.with_mut(|shell| shell.apply_web_find_count(&session, step, &query, count));
+    let folded =
+        writable.with_mut(|shell| shell.apply_web_find_count(&session, step, &query, count));
     let (position, match_count) = folded.unwrap_or((0, count));
     Ok((session, position, match_count))
 }
@@ -79646,8 +79915,13 @@ async fn close_web_find_everywhere(
     if let Some(origin) = lender {
         restore_focus_after_web_find(state, &desktop, session_path, origin);
     }
-    let engine =
-        run_web_find_step(state, desktop, Some(session_path), web_find::FindStep::Close).await;
+    let engine = run_web_find_step(
+        state,
+        desktop,
+        Some(session_path),
+        web_find::FindStep::Close,
+    )
+    .await;
     WebFindCloseOutcome {
         engine,
         tore_down_a_bar,
@@ -79825,9 +80099,14 @@ fn vault_cli_output(args: &[&str]) -> Result<String, String> {
         if stderr.contains("vault locked") || stderr.contains("no agent") {
             return Err("vault locked: run `ychrome-vault unlock` in a terminal first".to_string());
         }
-        return Err(format!("ychrome-vault {}: {stderr}", args.first().unwrap_or(&"")));
+        return Err(format!(
+            "ychrome-vault {}: {stderr}",
+            args.first().unwrap_or(&"")
+        ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 /// How long a vault-agent round trip may take before yggterm gives up. The
@@ -79953,7 +80232,6 @@ fn vault_entries() -> Result<Vec<VaultEntryMeta>, String> {
     vault_entries_from_json(&vault_cli_output(&["list", "--json"])?)
 }
 
-
 /// `[{name, username, folder, ...}]` — the secret-free item shape both `list
 /// --json` and `suggest` emit.
 fn vault_entries_from_json(json: &str) -> Result<Vec<VaultEntryMeta>, String> {
@@ -79963,8 +80241,16 @@ fn vault_entries_from_json(json: &str) -> Result<Vec<VaultEntryMeta>, String> {
         .into_iter()
         .map(|item| VaultEntryMeta {
             name: item["name"].as_str().unwrap_or_default().trim().to_string(),
-            user: item["username"].as_str().unwrap_or_default().trim().to_string(),
-            folder: item["folder"].as_str().unwrap_or_default().trim().to_string(),
+            user: item["username"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            folder: item["folder"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
             has_totp: item["has_totp"].as_bool().unwrap_or(false),
         })
         .filter(|entry| !entry.name.is_empty())
@@ -80125,7 +80411,7 @@ async fn web_surface_totp_for(
     let (entry_name, code) = match resolved {
         Ok(resolved) => resolved,
         Err(reason) => {
-            return json!({ "accepted": false, "session_path": session, "reason": reason })
+            return json!({ "accepted": false, "session_path": session, "reason": reason });
         }
     };
     // Clipboard as the escape hatch (some 2FA screens defeat scripted fills).
@@ -80148,8 +80434,7 @@ async fn web_surface_totp_for(
         false
     };
     let script = web_surface_totp_script(&code, &format!("yggterm · code for {entry_name}"));
-    let (tx, rx) =
-        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -80175,14 +80460,14 @@ async fn web_surface_totp_for(
                 "accepted": false,
                 "session_path": session,
                 "reason": "totp callback dropped (surface destroyed mid-fill?)",
-            })
+            });
         }
         Err(_) => {
             return json!({
                 "accepted": false,
                 "session_path": session,
                 "reason": "totp fill timed out (10s)",
-            })
+            });
         }
     };
     // No OTP field is NOT a failure when the code reached the clipboard —
@@ -80705,12 +80990,11 @@ async fn web_surface_fill_for(
     {
         Ok(credential) => credential,
         Err(reason) => {
-            return json!({ "accepted": false, "session_path": session, "reason": reason })
+            return json!({ "accepted": false, "session_path": session, "reason": reason });
         }
     };
     let script = web_surface_fill_script(&host, &credential);
-    let (tx, rx) =
-        tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, dioxus::desktop::EvalFailure>>();
     if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
         let _ = tx.send(outcome);
     }) {
@@ -82160,16 +82444,17 @@ async fn reconcile_terminal_from_daemon_for(
     trace_home: &Path,
 ) -> Value {
     let snapshot = terminal_snapshot_async(endpoint, session_path.to_string(), trace_home).await;
-    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id, ..) = match snapshot {
-        Ok(value) => value,
-        Err(error) => {
-            return json!({
-                "accepted": false,
-                "reason": format!("daemon_snapshot_failed: {error}"),
-                "session_path": session_path,
-            });
-        }
-    };
+    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id, ..) =
+        match snapshot {
+            Ok(value) => value,
+            Err(error) => {
+                return json!({
+                    "accepted": false,
+                    "reason": format!("daemon_snapshot_failed: {error}"),
+                    "session_path": session_path,
+                });
+            }
+        };
     if screen.trim().is_empty() {
         return json!({
             "accepted": false,
@@ -82945,9 +83230,7 @@ async fn process_pending_app_control_requests(
     // per-session delivery by design. The request is COMPLETED here (the
     // caller is waiting on the response file) and the trace names the route.
     if let AppControlCommand::SubmitTerminalPrompt {
-        session_path,
-        data,
-        ..
+        session_path, data, ..
     } = &request.command
     {
         if let Some(ses_id) = yggterm_core::opencode_service::tab_session_id(session_path) {
@@ -82956,8 +83239,7 @@ async fn process_pending_app_control_requests(
             let user_home = std::path::PathBuf::from(
                 std::env::var("HOME").unwrap_or_else(|_| home.display().to_string()),
             );
-            let delivered =
-                yggterm_core::opencode_service::send_prompt(&user_home, ses_id, data);
+            let delivered = yggterm_core::opencode_service::send_prompt(&user_home, ses_id, data);
             let response = AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -83013,8 +83295,8 @@ async fn process_pending_app_control_requests(
         // live"); sub-second precision buys nothing, so only write when the
         // stored deadline is more than a second behind the new one.
         let target_ms = current_millis() + BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS;
-        let needs_advance = state
-            .with(|shell| shell.background_refresh_after_ms + 1_000 < target_ms);
+        let needs_advance =
+            state.with(|shell| shell.background_refresh_after_ms + 1_000 < target_ms);
         if needs_advance {
             let _ = safe_shell_mut(state, "app_control_defer_background_refresh", |shell| {
                 shell.background_refresh_after_ms =
@@ -88282,13 +88564,9 @@ fn reassert_client_instance_registration(settings_path: &Path) -> bool {
     let linux_desktop_app_id_value = Some(linux_desktop_app_id());
     #[cfg(not(target_os = "linux"))]
     let linux_desktop_app_id_value: Option<String> = None;
-    let record = build_client_instance_record(
-        pid,
-        started_at_ms,
-        linux_desktop_app_id_value.as_deref(),
-    );
-    let republished =
-        publish_client_instance_record(dir, &registration.path, &record).is_ok();
+    let record =
+        build_client_instance_record(pid, started_at_ms, linux_desktop_app_id_value.as_deref());
+    let republished = publish_client_instance_record(dir, &registration.path, &record).is_ok();
     append_trace_event(
         &perf_home_dir(settings_path),
         "client",

@@ -324,7 +324,8 @@ echo "deploy-fleet: lease held by $HOLDER"
 
 GUI="$FROM/yggterm"
 HL="$FROM/yggterm-headless"
-for f in "$GUI" "$HL"; do
+YNPM="$FROM/ynpm"
+for f in "$GUI" "$HL" "$YNPM"; do
   [ -x "$f" ] || { echo "⛔ missing build product: $f" >&2; exit 1; }
 done
 
@@ -333,19 +334,21 @@ done
 # ever be checked with a single number.
 GUI_V=$("$GUI" --version 2>/dev/null)
 HL_V=$("$HL" --version 2>/dev/null)
-[ "$GUI_V" = "$HL_V" ] || {
-  echo "⛔ REFUSING: the two binaries disagree — yggterm=$GUI_V yggterm-headless=$HL_V" >&2
-  echo "   Build both from the same tree in one command." >&2
+[ "$GUI_V" = "$HL_V" ] && [ "$GUI_V" = "$("$YNPM" --version 2>/dev/null)" ] || {
+  YNPM_V=$("$YNPM" --version 2>/dev/null || echo unknown)
+  echo "⛔ REFUSING: workspace binaries disagree — yggterm=$GUI_V yggterm-headless=$HL_V ynpm=$YNPM_V" >&2
+  echo "   Build all three from the same tree in one command." >&2
   exit 1; }
 VERSION="$GUI_V"
 echo "deploy-fleet: $VERSION ($BUILD_COMMIT) from $FROM → $HOSTS"
 
 GUI_SUM=$(md5sum "$GUI" | awk '{print $1}')
 HL_SUM=$(md5sum "$HL" | awk '{print $1}')
+YNPM_SUM=$(md5sum "$YNPM" | awk '{print $1}')
 
-# The six copies, and which build product belongs in each. `~/.local/bin` is the
+# The eight canonical copies, and which build product belongs in each. `~/.local/bin` is the
 # GUI's home; `~/.yggterm/bin` is the install root the daemon actually runs from
-# AND the path remote sessions invoke. All four are real, so all four are written.
+# AND the path remote sessions invoke. All eight are real, so all eight are written.
 #
 # ⛔⛔ AND THE MANAGED-VERSIONS PAIR IS NOT OPTIONAL — ITS ABSENCE DEADLOCKED THE
 # GUI UPDATE RESTART. The GUI's convergence finder (`installed_gui_executable_for_version`)
@@ -362,8 +365,12 @@ HL_SUM=$(md5sum "$HL" | awk '{print $1}')
 declare -A COPY=(
   ["\$HOME/.local/bin/yggterm"]="GUI"
   ["\$HOME/.local/bin/yggterm-headless"]="HL"
+  ["\$HOME/.local/bin/ynpm"]="YNPM"
+  ["\$HOME/.local/bin/ynpx"]="YNPM"
   ["\$HOME/.yggterm/bin/yggterm"]="GUI"
   ["\$HOME/.yggterm/bin/yggterm-headless"]="HL"
+  ["\$HOME/.yggterm/bin/ynpm"]="YNPM"
+  ["\$HOME/.yggterm/bin/ynpx"]="YNPM"
   ["\$HOME/.yggterm/versions/$VERSION/yggterm"]="GUI"
   ["\$HOME/.yggterm/versions/$VERSION/yggterm-headless"]="HL"
 )
@@ -490,16 +497,17 @@ push_one() {  # host, local_file, remote_path, expected_md5
 discover_copies() {  # host  → prints "abs_path KIND" per line
   run_on "$1" '''for d in "$HOME/.local/bin" "$HOME/.yggterm/bin" "$HOME/.cargo/bin" \
                         "$HOME/bin" "$HOME/.bun/bin" "$HOME/go/bin"; do
-                   for n in yggterm yggterm-headless; do
+                   for n in yggterm yggterm-headless ynpm ynpx; do
                      [ -f "$d/$n" ] && echo "$d/$n"
                    done
                  done
-                 for n in yggterm yggterm-headless; do
+                 for n in yggterm yggterm-headless ynpm ynpx; do
                    p=$(command -v "$n" 2>/dev/null) && [ -f "$p" ] && echo "$p"
                  done' 2>/dev/null | sort -u | while read -r path; do
     [ -n "$path" ] || continue
     case "$(basename "$path")" in
       yggterm-headless) echo "$path HL" ;;
+      ynpm|ynpx)       echo "$path YNPM" ;;
       yggterm)          echo "$path GUI" ;;
     esac
   done
@@ -512,7 +520,7 @@ for host in $HOSTS; do classify_host "$host"; done
 # as a partial deploy; one named refusal reads as what it is.
 for host in $HOSTS; do
   [ "${HOST_UNREACHABLE[$host]:-0}" = 1 ] || continue
-  echo "  ⛔ $host: cannot be reached over ssh, so its six copies are SKIPPED, not failed." >&2
+  echo "  ⛔ $host: cannot be reached over ssh, so its eight copies are SKIPPED, not failed." >&2
   echo "     If this is the machine you are standing on, its fleet alias and its" >&2
   echo "     kernel hostname ($(hostname -s)) differ and nothing local can bridge them." >&2
   echo "     Fix it for good with:  export YGG_FLEET_SELF=$host" >&2
@@ -565,7 +573,7 @@ EOF
     fi
   fi
 
-  # The canonical four are written whether or not they exist yet; anything else
+  # The canonical eight are written whether or not they exist yet; anything else
   # this host already carries is written because it exists. Union, deduped by
   # the resolved path so a symlinked root is not written twice.
   declare -A DEST_KIND=()
@@ -579,7 +587,12 @@ EOF
   done < <(discover_copies "$host")
 
   for dest in "${!DEST_KIND[@]}"; do
-    if [ "${DEST_KIND[$dest]}" = "GUI" ]; then src="$GUI"; want="$GUI_SUM"; else src="$HL"; want="$HL_SUM"; fi
+    case "${DEST_KIND[$dest]}" in
+      GUI)  src="$GUI";  want="$GUI_SUM" ;;
+      HL)   src="$HL";   want="$HL_SUM" ;;
+      YNPM) src="$YNPM"; want="$YNPM_SUM" ;;
+      *) echo "  ⛔ $host: unknown deployment kind ${DEST_KIND[$dest]} for $dest" >&2; FAILED=1; continue ;;
+    esac
     if [ "$DRY" = 1 ]; then
       printf "  · %-14s %s ← %s%s\n" "$host" "$dest" "$(basename "$src")" \
         "$(is_self "$host" && echo "  (this machine — no ssh)")"

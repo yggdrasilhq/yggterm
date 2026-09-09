@@ -90,7 +90,8 @@ vendor's own reference, binary not installed here · `unmeasured` = neither.
 |---|---|---|
 | Ask each time | `-a untrusted -s read-only` | Runs only trusted commands (`ls`, `cat`, `sed`) unasked and escalates everything else; the filesystem is read-only. |
 | Sandboxed | `-a on-request -s workspace-write` | The model decides when to ask; writes are confined to the workspace. |
-| **Skip checks** (default) | `-s danger-full-access` | No sandbox: model-generated commands run against the whole machine. `--dangerously-bypass-approvals-and-sandbox` additionally skips every confirmation prompt. |
+| **Sandbox off** (default) | `-s danger-full-access` | No sandbox: model-generated commands run against the whole machine, but Codex still asks for approvals. |
+| **YOLO: skip checks and prompts** | `--dangerously-bypass-approvals-and-sandbox` | No sandbox and no confirmation prompts. Codex paints its own YOLO warning; this is the exact posture a user must select when they want that warning. |
 
 Approval policies in this build: `untrusted`, `on-request`, `never` — ⚠ there is
 no `on-failure` and **no `--full-auto`**; do not offer either. Provenance:

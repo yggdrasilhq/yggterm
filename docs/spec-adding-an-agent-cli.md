@@ -192,13 +192,13 @@ Almost all of this is now free. What is genuinely per-CLI:
 PATH parity. **Every method is RUN**, per the owner's 2026-08-08 ruling
 (`settled-calls.md`): `Uv` runs `uv tool install --upgrade`, a `VendorScript` is
 fetched over pinned HTTPS and executed with `HOME` intact, no privilege
-escalation and stdin closed, and `Npm` goes through the generation layout below.
+escalation and stdin closed, and `Npm` delegates to `ynpm`.
 
 ⛔ **The methods never share a command line**, and **neither do two npm CLIs**.
 npm fails a whole `install -g` batch on one unresolvable name, so a uv package
 appended to that line would take every other CLI's refresh down with it.
 
-#### ⛔⛔ ONE PREFIX PER npm CLI, PUBLISHED ONLY AFTER IT RUNS
+#### ⛔⛔ ONE ynpm TRANSACTION PER npm CLI, PUBLISHED ONLY AFTER IT RUNS
 
 *Superseded doctrine, stated so it is not silently reinstated: until 2026-08-20
 every npm CLI was batched into a single `npm install -g --force <all packages>`.*
@@ -212,29 +212,34 @@ the set — and `--force` is what made the window open on every pass rather than
 only on change, because it rewrites the whole tree and relinks every bin even
 against an already-current install.
 
-So an npm CLI is provisioned as:
+So an npm CLI is provisioned by `ynpm` as:
 
-1. **A fresh generation directory**, `~/.yggterm/npm/cli/<slug>.gen<N+1>`, never
+1. **A fresh package generation**, `~/.yggterm/ynpm/generations/<package-key>/<version>`, never
    the live tree. It starts empty, so it cannot inherit damage from a previous
    partial run — which is what turned one bad install into an unrecoverable loop.
-2. **`npm install -g` into it, without `--force`**, with the shared cache so
+2. **npm install into it, without `--force`**, with the shared ynpm cache and
    nothing is re-downloaded, and `TMPDIR` on disk (see below).
-3. **Verification**: the staged tree must actually contain the binary. npm exits
-   0 having installed a package whose `bin` never materialised, and a broken CLI
-   that reports success is worse than a failure.
-4. **Publish by atomic `rename`** of a symlink onto `bin/<binary>`. Never
-   remove-then-symlink: the second form has a window in which the binary does not
-   exist, which is the whole defect. Superseded generations are then reaped.
+3. **Verification**: every declared bin must actually run `--version`. npm can
+   exit 0 after leaving a vendor error shim, and a broken CLI that reports
+   success is worse than a failure. ynpm enables only the package's own
+   lifecycle scripts so finalizers such as OpenCode's can materialise the
+   native binary.
+4. **Publish by atomic rename** of a symlink onto the selected ynpm bin
+   destination. Never remove-then-symlink. Superseded generations are reaped
+   only when no live process or helper executes from them.
 
 ⇒ **An install that dies before step 4 is unobservable**: the old binary keeps
 working, and the next pass starts from a clean directory.
 
 ⛔ **No provisioning method may stage in `/tmp`.** It is a tmpfs on the desktop
 host, so a staged payload is RAM the kernel can swap but never reclaim. All four
-methods go through `apply_provision_env`, which is the ONE owner of that policy —
-it is a shared helper precisely because the previous per-callsite fix covered npm
-and left `uv`, the vendor script and the self-updater leaking for six more days.
+methods use a shared disk-staging policy (`ynpm` owns the npm arm and
+`apply_provision_env` owns the remaining server adapters), because the previous
+per-callsite fix covered npm and left `uv`, the vendor script and the self-updater
+leaking for six more days.
 `npm_config_tmp` is NOT a knob: npm 11 answers `Unknown env config "tmp"`.
+`ynpm` is now the only production package/generation owner for npm-backed CLIs;
+the server must not recreate a second `~/.yggterm/npm` prefix.
 
 ⭐ **The shared npm cache is bounded, not emptied.** `npm cache verify` is npm's
 own GC — it keeps what the index references and drops orphans — and runs at most
