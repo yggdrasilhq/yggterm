@@ -1433,7 +1433,7 @@ fn install_one_at(
         }
         let answer = run_version(&bin_path)
             .with_context(|| format!("verifying {bin} ({}) before install", bin_path.display()))?;
-        if !version_answer_matches(&answer, &platform_version) {
+        if !version_answer_matches_identity(&answer, &platform_version) {
             bail!(
                 "REFUSED: {pkg}@{version}'s binary '{bin}' answered --version with {:?}, \
                  which does not name the package version {platform_version:?}. This is the \
@@ -2007,7 +2007,7 @@ fn install_dev_bins(
         let answer = run_version(path)
             .with_context(|| format!("verifying dev binary '{name}' at {}", path.display()))?;
         if let Some(expected) = expected_version
-            && !version_answer_matches(&answer, expected)
+            && !version_answer_matches_identity(&answer, expected)
         {
             bail!(
                 "REFUSED: dev binary '{name}' answered --version with {:?}, which does not name checkout version {expected:?}",
@@ -2951,7 +2951,7 @@ fn bridge_generation_to_destination(
         }
         let answer = run_version(&source)
             .with_context(|| format!("verifying {source:?} before destination bridge"))?;
-        if !version_answer_matches(&answer, &entry.current) {
+        if !version_answer_matches_identity(&answer, &entry.current) {
             return Ok(false);
         }
     }
@@ -3273,7 +3273,7 @@ fn verb_export(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
                 record.package
             )
         })?;
-        if !version_answer_matches(&answer, &record.version) {
+        if !version_answer_matches_identity(&answer, &record.version) {
             bail!(
                 "REFUSED: {} answers {:?}, not its recorded version {}",
                 executable.display(),
@@ -3425,7 +3425,7 @@ fn local_yggterm_production_archive(
         set_executable(&path)?;
         let answer = run_version(&path)
             .with_context(|| format!("verifying local yggterm product {name}"))?;
-        if !version_answer_matches(&answer, &context.current_version) {
+        if !version_answer_matches_identity(&answer, &context.current_version) {
             bail!(
                 "local yggterm product {name} answered {:?}, not {}",
                 answer.trim(),
@@ -3568,7 +3568,7 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         let path = staging.join(format!("{name}{extension}"));
         let answer = run_version(&path)
             .with_context(|| format!("verifying imported yggterm product {name}"))?;
-        if !version_answer_matches(&answer, version) {
+        if !version_answer_matches_identity(&answer, version) {
             bail!(
                 "REFUSED: imported yggterm product {name} answered {:?}, not {version}",
                 answer.trim()
