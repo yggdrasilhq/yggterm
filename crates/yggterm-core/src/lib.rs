@@ -1,12 +1,12 @@
-pub mod agent_presence;
 pub mod agent_cli;
+pub mod agent_presence;
 pub mod agent_scheme;
 pub mod app_registry;
 /// `New {Machine} {Thing}` — the birth-title convention, in ONE place because
 /// it was in two and an app spawn silently missed the builder.
 pub mod birth_title;
-pub mod opencode_service;
 mod browser;
+pub mod opencode_service;
 // Bringing a decade of history OUT of the browsers that hold it: Chromium's
 // `History`/`Bookmarks` and Firefox's `places.sqlite`, in-process through
 // rusqlite. Three traps live here — the 1601 epoch, the locked live database,
@@ -15,8 +15,8 @@ mod browser;
 pub mod browser_import;
 pub mod cgroup_family;
 pub mod cli_args;
-pub mod cli_plane;
 pub mod cli_install;
+pub mod cli_plane;
 pub mod click_grid;
 pub mod gl_probe;
 mod icon;
@@ -27,8 +27,8 @@ pub mod memory_profile;
 /// THE notification tune — one owner for both the webview script and the
 /// native CLI player, so two players can never drift into two chimes.
 pub mod notification_audio;
-pub mod startpage;
 pub mod perf;
+pub mod startpage;
 pub mod ui_block;
 // THE SANCTIONED PRESENTATION DEFAULTS, per platform — the one table that says
 // what this product runs as on each display stack, and the law that agents may
@@ -51,13 +51,8 @@ pub mod web_collection_store;
 // same questions; a second reader is how they would come to disagree. Its one
 // invariant is that lines are in VISIT ORDER — every reader walks the file
 // backwards — which is why the browser import merges rather than appends.
-pub mod web_history;
 pub mod render_probe;
 mod retention;
-/// Never let GLib autolaunch a private D-Bus session bus — the 4.5 GB leak of
-/// 2026-07-30.
-pub mod session_bus;
-mod session_kind;
 /// HOW ROWS ARE ARRANGED — the containment relation behind collapsible sets of
 /// live rows. Knows nothing about seats; see `row_set_outline` for the bridge.
 pub mod row_set;
@@ -69,6 +64,10 @@ pub mod row_set_outline;
 /// compared as integers per dotted segment. One owner for the sort key, so a
 /// verb can never report an order the sidebar does not draw.
 pub mod screen_state;
+/// Never let GLib autolaunch a private D-Bus session bus — the 4.5 GB leak of
+/// 2026-07-30.
+pub mod session_bus;
+mod session_kind;
 pub mod session_outline;
 mod telemetry;
 /// How a text payload reaches a terminal composer — and why an agent CLI needs
@@ -78,6 +77,7 @@ mod titles;
 mod trace;
 pub mod trace_contract;
 mod transcript;
+pub mod web_history;
 pub mod web_profile;
 mod workspace;
 
@@ -109,28 +109,26 @@ pub use agent_scheme::{
     session_kind_for_path,
 };
 pub use app_registry::{
-    APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,
-    write_app_manifest,
-};
-pub use cli_args::{
-    cli_flag_value, cli_payload_arg, cli_positional_args, refuse_flag_shaped_payload,
+    APP_REGISTRY_DIRNAME, AppContextMenu, AppManifest, AppVerb, YggtermAppMetadata,
+    YggtermPackageMetadata, app_registry_dir, scan_app_registry, write_app_manifest,
 };
 pub use browser::{
     BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState,
     unique_session_short_ids_for_pairs,
+};
+pub use cli_args::{
+    cli_flag_value, cli_payload_arg, cli_positional_args, refuse_flag_shaped_payload,
 };
 pub use icon::{
     AppIconAssets, LinuxInstalledIconSet, YGGTERM_ICON_ASSETS, install_linux_icon_assets,
 };
 pub use install::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_ENABLE_NATIVE_IME, InstallChannel, InstallContext,
-    ReleaseUpdate,
-    ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, UpdatePolicy, YGGTERM_DESKTOP_APP_ID,
-    check_for_update, current_asset_label, current_version, detect_install_context,
-    direct_install_root, handoff_target_is_not_a_downgrade, handoff_target_is_usable,
-    install_mode_summary, install_path_declared_version, install_release_update,
-    install_release_update_with_progress, promote_direct_install_active_version,
-    refresh_desktop_integration, update_command_hint, write_direct_install_state,
+    ReleaseUpdate, UpdatePolicy, YGGTERM_DESKTOP_APP_ID, check_for_update, current_asset_label,
+    current_version, detect_install_context, direct_install_root,
+    handoff_target_is_not_a_downgrade, handoff_target_is_usable, install_mode_summary,
+    install_path_declared_version, promote_direct_install_active_version,
+    refresh_desktop_integration, write_direct_install_state,
 };
 pub use perf::{
     PERF_INCIDENT_FILENAME, PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PerfGuard,
@@ -154,27 +152,26 @@ pub use titles::{
     AGENT_PLANE_TITLE_PREFIX, LIVE_SUMMARY_REFRESH_HORIZON, SessionSummaryTimelineEntry,
     SessionTitleResolver, SessionTitleStore, best_effort_context_from_session_path,
     best_effort_precis_from_context, best_effort_summary_from_context,
-    best_effort_title_from_context, clear_copy_generation_pause,
-    copy_generation_is_paused, copy_generation_pause_remaining_ms, error_is_endpoint_refusal,
-    is_agent_plane_composed_title, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, request_generated_short_name,
-    session_title_store_open_count,
+    best_effort_title_from_context, clear_copy_generation_pause, copy_generation_is_paused,
+    copy_generation_pause_remaining_ms, error_is_endpoint_refusal, is_agent_plane_composed_title,
+    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    request_generated_short_name, session_title_store_open_count,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_foreign_trace_batch,
-    append_tagged_trace_event, append_trace_event, event_trace_path, follow_trace_lines, read_trace_tail,
+    append_tagged_trace_event, append_trace_event, event_trace_path, follow_trace_lines,
+    read_trace_tail,
 };
 pub use trace_contract::{
     ForeignRecordFault, ForeignTraceRecord, MAX_FOREIGN_BATCH_RECORDS, MAX_FOREIGN_PAYLOAD_BYTES,
     TraceClock, TraceKind, TraceLayer, ValidatedForeignRecord, validate_foreign_record,
 };
 pub use transcript::{
-    TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptRole, TranscriptTail,
-    TranscriptToolCall, TranscriptViewMessage, TranscriptWriter,
-    TranscriptMessageCounts, count_agent_transcript_messages,
-    count_agent_transcript_messages_cached, generation_context_from_messages,
-    message_lines_from_payload,
-    newest_transcript_writer, newest_transcript_writer_in_tail, read_agent_transcript_entries,
+    TranscriptEntry, TranscriptEntryKind, TranscriptMessage, TranscriptMessageCounts,
+    TranscriptRole, TranscriptTail, TranscriptToolCall, TranscriptViewMessage, TranscriptWriter,
+    count_agent_transcript_messages, count_agent_transcript_messages_cached,
+    generation_context_from_messages, message_lines_from_payload, newest_transcript_writer,
+    newest_transcript_writer_in_tail, read_agent_transcript_entries,
     read_agent_transcript_entries_tail_limited, read_agent_transcript_messages,
     read_agent_transcript_messages_limited, read_agent_transcript_messages_tail_limited,
     read_claude_code_transcript_entries, read_claude_code_transcript_messages,
@@ -251,8 +248,8 @@ impl SessionNode {
             .children
             .into_iter()
             .filter_map(|child| {
-                let is_session_leaf = child.kind == SessionNodeKind::CodexSession
-                    && child.children.is_empty();
+                let is_session_leaf =
+                    child.kind == SessionNodeKind::CodexSession && child.children.is_empty();
                 let child_path = child.path.display().to_string();
                 let is_store_container =
                     crate::agent_cli::AgentCliDescriptor::path_is_durable_store_container(
@@ -1068,34 +1065,57 @@ impl SessionStore {
         )
     }
 
-
-    #[deprecated(note="precis removed, use summary")]
-    pub fn resolve_precis_for_session_path(&self, _session_path: &str) -> anyhow::Result<Option<String>> {
+    #[deprecated(note = "precis removed, use summary")]
+    pub fn resolve_precis_for_session_path(
+        &self,
+        _session_path: &str,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
-    #[deprecated(note="precis removed")]
-    pub fn resolve_precis_for_session_id(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
+    #[deprecated(note = "precis removed")]
+    pub fn resolve_precis_for_session_id(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
-    #[deprecated(note="precis removed")]
-    pub fn precis_needs_refresh_for_session_id(&self, _session_id: &str, _source_updated_at: time::OffsetDateTime) -> anyhow::Result<bool> {
+    #[deprecated(note = "precis removed")]
+    pub fn precis_needs_refresh_for_session_id(
+        &self,
+        _session_id: &str,
+        _source_updated_at: time::OffsetDateTime,
+    ) -> anyhow::Result<bool> {
         Ok(false)
     }
 
-    #[deprecated(note="precis removed")]
-    pub fn generate_precis_for_session_path(&self, _settings: &crate::AppSettings, _session_path: &str, _force: bool) -> anyhow::Result<Option<String>> {
+    #[deprecated(note = "precis removed")]
+    pub fn generate_precis_for_session_path(
+        &self,
+        _settings: &crate::AppSettings,
+        _session_path: &str,
+        _force: bool,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
-    #[deprecated(note="precis removed")]
-    pub fn generate_precis_for_context(&self, _settings: &crate::AppSettings, _session_id: &str, _cwd: &str, _context: &str, _force: bool) -> anyhow::Result<Option<String>> {
+    #[deprecated(note = "precis removed")]
+    pub fn generate_precis_for_context(
+        &self,
+        _settings: &crate::AppSettings,
+        _session_id: &str,
+        _cwd: &str,
+        _context: &str,
+        _force: bool,
+    ) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
-    #[deprecated(note="precis removed, use summary")]
-    pub fn precis_generated(&self) -> usize { 0 }
+    #[deprecated(note = "precis removed, use summary")]
+    pub fn precis_generated(&self) -> usize {
+        0
+    }
 
     pub fn generate_summary_for_session_path(
         &self,
@@ -1370,8 +1390,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             serde_json::from_value(value.clone()).context("failed to parse interface_llm_model")?;
     }
     let explicit_map: Option<BTreeMap<String, String>> = match object.get("agent_cli_extra_args") {
-        Some(value) => Some(serde_json::from_value(value.clone())
-            .context("failed to parse agent_cli_extra_args")?),
+        Some(value) => Some(
+            serde_json::from_value(value.clone())
+                .context("failed to parse agent_cli_extra_args")?,
+        ),
         None => None,
     };
     if let Some(map) = explicit_map.as_ref() {
@@ -1393,10 +1415,14 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         }
         if let Some(map) = explicit_map.as_ref() {
             if !map.contains_key(slug) {
-                settings.agent_cli_extra_args.insert(slug.to_string(), legacy);
+                settings
+                    .agent_cli_extra_args
+                    .insert(slug.to_string(), legacy);
             }
         } else {
-            settings.agent_cli_extra_args.insert(slug.to_string(), legacy);
+            settings
+                .agent_cli_extra_args
+                .insert(slug.to_string(), legacy);
         }
     }
     if let Some(value) = object.get("default_agent_profile") {
@@ -1436,8 +1462,8 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             .context("failed to parse collapsed_synthetic_paths")?;
     }
     if let Some(value) = object.get("row_arrangement") {
-        settings.row_arrangement = serde_json::from_value(value.clone())
-            .context("failed to parse row_arrangement")?;
+        settings.row_arrangement =
+            serde_json::from_value(value.clone()).context("failed to parse row_arrangement")?;
     }
     if let Some(value) = object.get("split_groups") {
         settings.split_groups = serde_json::from_value::<Vec<SplitGroup>>(value.clone())
@@ -1476,7 +1502,10 @@ pub fn default_agent_cli_extra_args() -> BTreeMap<String, String> {
     for descriptor in agent_cli::AGENT_CLIS {
         if descriptor.owns_its_extra_args_box() {
             if let Some(preset) = descriptor.default_permission_preset() {
-                map.insert(descriptor.extra_args_slug.to_string(), preset.args.to_string());
+                map.insert(
+                    descriptor.extra_args_slug.to_string(),
+                    preset.args.to_string(),
+                );
             }
         }
     }
@@ -1714,8 +1743,17 @@ fn composer_row_is_chrome(row: &str) -> bool {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                '\u{2500}' | '\u{2501}' | '\u{2502}' | '\u{256d}' | '\u{256e}' | '\u{2570}'
-                    | '\u{256f}' | '-' | '=' | '_' | ' '
+                '\u{2500}'
+                    | '\u{2501}'
+                    | '\u{2502}'
+                    | '\u{256d}'
+                    | '\u{256e}'
+                    | '\u{2570}'
+                    | '\u{256f}'
+                    | '-'
+                    | '='
+                    | '_'
+                    | ' '
             )
         })
         .is_empty()
@@ -2326,8 +2364,7 @@ fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionN
     // working — and this one is deliberately invalidated wholesale whenever a
     // title is written, so a run of misses is a real signal about the
     // generation chore, not noise.
-    let (memo_hits, memo_misses, memo_rows) =
-        crate::startpage::take_durable_scan_memo_counts();
+    let (memo_hits, memo_misses, memo_rows) = crate::startpage::take_durable_scan_memo_counts();
     perf.annotate(serde_json::json!({
         "total_sessions": total_sessions,
         "cwd_buckets": bucket_count,
@@ -2490,16 +2527,15 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
         return Vec::new();
     };
     let mut sessions = scan_local_agent_cli_sessions(descriptor);
-    let seen_ids: std::collections::HashSet<String> = sessions
-        .iter()
-        .map(|s| s.session_id.clone())
-        .collect();
+    let seen_ids: std::collections::HashSet<String> =
+        sessions.iter().map(|s| s.session_id.clone()).collect();
 
     let roots = descriptor.store_roots_absolute(&home);
     let conv_dir = roots.into_iter().next();
-    let db_path = conv_dir
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("conversation_summaries.db")));
+    let db_path = conv_dir.as_ref().and_then(|p| {
+        p.parent()
+            .map(|parent| parent.join("conversation_summaries.db"))
+    });
 
     if let Some(db_path) = db_path.filter(|p| p.exists()) {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -2589,9 +2625,10 @@ pub fn scan_local_antigravity_sessions() -> Vec<LocalAgentSessionSummary> {
 pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<Option<String>> {
     let descriptor = agent_cli_descriptor(SessionKind::Antigravity);
     let conv_dir = descriptor.and_then(|d| d.store_roots_absolute(home).into_iter().next());
-    let db_path = conv_dir
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("conversation_summaries.db")));
+    let db_path = conv_dir.as_ref().and_then(|p| {
+        p.parent()
+            .map(|parent| parent.join("conversation_summaries.db"))
+    });
 
     if let Some(db_path) = db_path.filter(|p| p.exists()) {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -2600,9 +2637,9 @@ pub fn read_antigravity_session_title(home: &Path, session_id: &str) -> Result<O
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT title FROM conversation_summaries WHERE conversation_id = ?1;",
-            ) {
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT title FROM conversation_summaries WHERE conversation_id = ?1;")
+            {
                 if let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) {
                     if let Ok(Some(row)) = rows.next() {
                         let title: String = row.get(0).unwrap_or_default();
@@ -2623,9 +2660,10 @@ pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
     let home = dirs::home_dir()?;
     let descriptor = agent_cli_descriptor(SessionKind::Antigravity);
     let conv_dir = descriptor.and_then(|d| d.store_roots_absolute(&home).into_iter().next());
-    let db_path = conv_dir
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("conversation_summaries.db")));
+    let db_path = conv_dir.as_ref().and_then(|p| {
+        p.parent()
+            .map(|parent| parent.join("conversation_summaries.db"))
+    });
 
     if let Some(db_path) = db_path.filter(|p| p.exists()) {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -2674,7 +2712,9 @@ pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
 
     if let Some(desc) = descriptor {
         for root in desc.store_roots_absolute(&home) {
-            let candidate = root.join(session_id).join(".system_generated/logs/transcript.jsonl");
+            let candidate = root
+                .join(session_id)
+                .join(".system_generated/logs/transcript.jsonl");
             if candidate.exists() {
                 if let Some(entry) = desc.store_entry(&candidate) {
                     if !entry.cwd.trim().is_empty() {
@@ -2692,11 +2732,7 @@ pub fn local_antigravity_session_cwd(session_id: &str) -> Option<String> {
 ///
 /// This writes directly to Antigravity's own SQLite store so both yggterm and the
 /// Antigravity CLI see the custom renamed title.
-pub fn update_antigravity_session_title(
-    home: &Path,
-    session_id: &str,
-    title: &str,
-) -> Result<()> {
+pub fn update_antigravity_session_title(home: &Path, session_id: &str, title: &str) -> Result<()> {
     let title = title.trim();
     if title.is_empty() {
         anyhow::bail!("refusing to write an empty Antigravity title");
@@ -2709,10 +2745,17 @@ pub fn update_antigravity_session_title(
         .map(|p| p.join("conversation_summaries.db"))
         .unwrap_or_else(|| conv_dir.join("conversation_summaries.db"));
     if !db_path.exists() {
-        anyhow::bail!("antigravity conversation summaries db not found at {}", db_path.display());
+        anyhow::bail!(
+            "antigravity conversation summaries db not found at {}",
+            db_path.display()
+        );
     }
-    let conn = rusqlite::Connection::open(&db_path)
-        .with_context(|| format!("failed to open antigravity summaries db for writing at {}", db_path.display()))?;
+    let conn = rusqlite::Connection::open(&db_path).with_context(|| {
+        format!(
+            "failed to open antigravity summaries db for writing at {}",
+            db_path.display()
+        )
+    })?;
     let updated = conn.execute(
         "UPDATE conversation_summaries SET title = ?1 WHERE conversation_id = ?2;",
         rusqlite::params![title, session_id],
@@ -2830,9 +2873,7 @@ pub fn local_subagent_transcript_dir(session_jsonl: &Path) -> Option<PathBuf> {
 /// 30-minute deadline `docs/spec-hot-restart-relay-gate.md` §5 sets. A daemon
 /// reading only the parent would have called that session idle and cold-killed
 /// it, stranding every delegate.
-pub fn newest_subagent_transcript(
-    session_jsonl: &Path,
-) -> Option<(PathBuf, std::time::Duration)> {
+pub fn newest_subagent_transcript(session_jsonl: &Path) -> Option<(PathBuf, std::time::Duration)> {
     let dir = local_subagent_transcript_dir(session_jsonl)?;
     let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in fs::read_dir(dir).ok()?.flatten() {
@@ -2854,7 +2895,10 @@ pub fn newest_subagent_transcript(
     let (path, modified) = newest?;
     // A future mtime (clock skew, or a write landing this instant) is maximally
     // fresh, not unreadable.
-    Some((path, modified.elapsed().unwrap_or(std::time::Duration::ZERO)))
+    Some((
+        path,
+        modified.elapsed().unwrap_or(std::time::Duration::ZERO),
+    ))
 }
 
 /// `local_cc_session_jsonl_path` against an explicit projects dir — the seam the
@@ -2935,7 +2979,12 @@ pub fn append_cc_session_custom_title(
         .create(false)
         .append(true)
         .open(jsonl_path)
-        .with_context(|| format!("failed to open cc session for rename {}", jsonl_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to open cc session for rename {}",
+                jsonl_path.display()
+            )
+        })?;
     file.write_all(payload.as_bytes())
         .with_context(|| format!("failed to append cc rename to {}", jsonl_path.display()))?;
     Ok(())
@@ -3568,7 +3617,10 @@ mod tests {
     #[test]
     fn the_composer_is_a_row_and_a_delivered_message_is_not_one() {
         let rows = |lines: &[&str]| {
-            lines.iter().map(|line| (*line).to_string()).collect::<Vec<_>>()
+            lines
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>()
         };
         let border = "\u{2500}".repeat(48);
         let footer = "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} 1 agent";
@@ -3599,7 +3651,10 @@ mod tests {
             &border,
             &footer,
         ]);
-        assert_eq!(super::composer_row_holds_text(Some(SessionKind::OpenCode), &wrapped), Some(true));
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &wrapped),
+            Some(true)
+        );
 
         // ⛔ NO COMPOSER IS NOT AN EMPTY COMPOSER. One may be typed into and the
         // other may not, and answering `false` for both is how a watchdog types
@@ -3609,13 +3664,27 @@ mod tests {
             "  Ran 1 shell command",
             "  ...still going",
         ]);
-        assert_eq!(super::composer_row_holds_text(Some(SessionKind::OpenCode), &mid_output), None);
-        assert_eq!(super::composer_row_holds_text(Some(SessionKind::OpenCode), &[]), None);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &mid_output),
+            None
+        );
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &[]),
+            None
+        );
 
         // Codex draws a different glyph, and the reader must not be tuned to one
         // CLI's marker.
-        let codex = rows(&["  earlier output", "\u{203a} write the brief", "", "  gpt-5.5 xhigh"]);
-        assert_eq!(super::composer_row_holds_text(Some(SessionKind::Codex), &codex), Some(true));
+        let codex = rows(&[
+            "  earlier output",
+            "\u{203a} write the brief",
+            "",
+            "  gpt-5.5 xhigh",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Codex), &codex),
+            Some(true)
+        );
     }
 
     /// ⛔ [11.66] THE MARKER IS THE SESSION'S OWN. The match was KIND-AGNOSTIC:
@@ -3628,7 +3697,10 @@ mod tests {
     #[test]
     fn a_foreign_marker_line_is_not_this_sessions_draft() {
         let rows = |lines: &[&str]| {
-            lines.iter().map(|line| (*line).to_string()).collect::<Vec<_>>()
+            lines
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>()
         };
         // The measured codex bootstrapping-failure screen (wrapped error tail
         // + the hints footer). Codex's own marker `›` appears NOWHERE.
@@ -3667,9 +3739,12 @@ mod tests {
             } else if seg.contains('{') || seg.contains(',') {
                 return None;
             } else if seg.contains('*') {
-                let cleaned: String =
-                    seg.chars().filter(|c| *c != '*' && *c != '{').collect();
-                parts.push(if cleaned.is_empty() { "a".to_string() } else { cleaned });
+                let cleaned: String = seg.chars().filter(|c| *c != '*' && *c != '{').collect();
+                parts.push(if cleaned.is_empty() {
+                    "a".to_string()
+                } else {
+                    cleaned
+                });
             } else {
                 parts.push(seg.to_string());
             }
@@ -3681,10 +3756,7 @@ mod tests {
     fn transcript_rescue_gate_accepts_a_declared_session_file_from_every_cli() {
         // The gate demands a REAL file (the codex wrapper always has), so the
         // registry-derived fixtures are materialized under a temp home.
-        let home = std::env::temp_dir().join(format!(
-            "yggterm-rescue-gate-{}",
-            std::process::id()
-        ));
+        let home = std::env::temp_dir().join(format!("yggterm-rescue-gate-{}", std::process::id()));
         std::fs::create_dir_all(&home).expect("temp home");
         let mut covered = 0usize;
         for descriptor in agent_cli::AGENT_CLIS {
@@ -3709,10 +3781,7 @@ mod tests {
             );
             covered += 1;
         }
-        assert!(
-            covered >= 6,
-            "the gate must cover the CLIs of the fleet"
-        );
+        assert!(covered >= 6, "the gate must cover the CLIs of the fleet");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -3734,7 +3803,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ygg-test-agy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let descriptor = agent_cli_descriptor(SessionKind::Antigravity).unwrap();
-        let conv_dir = descriptor.store_roots_absolute(&dir).into_iter().next().unwrap();
+        let conv_dir = descriptor
+            .store_roots_absolute(&dir)
+            .into_iter()
+            .next()
+            .unwrap();
         std::fs::create_dir_all(&conv_dir).unwrap();
         let db_path = conv_dir.parent().unwrap().join("conversation_summaries.db");
 
@@ -3750,7 +3823,8 @@ mod tests {
                 step_count INTEGER NOT NULL DEFAULT 0,
                 killed NUMERIC NOT NULL DEFAULT 0
             );",
-        ).unwrap();
+        )
+        .unwrap();
 
         let session_id = "test-session-uuid-1234";
         conn.execute(
@@ -3810,11 +3884,8 @@ mod tests {
     /// from the session not existing. The transcript records the true cwd — read it.
     #[test]
     fn local_cc_session_cwd_comes_from_the_transcript_not_the_row() {
-        let root = std::env::temp_dir().join(format!(
-            "yggterm-cc-cwd-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("yggterm-cc-cwd-{}-{}", std::process::id(), line!()));
         let projects = root.join("projects");
         // CC encodes the cwd into the project dir name; the transcript states it exactly.
         let project = projects.join("-home-user-gh-yggterm");
@@ -3859,11 +3930,8 @@ mod tests {
     /// healed folder read "0 conversations".
     #[test]
     fn cc_session_cwd_follows_cd_rehoming_not_the_first_record() {
-        let root = std::env::temp_dir().join(format!(
-            "yggterm-cc-cd-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("yggterm-cc-cd-{}-{}", std::process::id(), line!()));
         let projects = root.join("projects");
         let project = projects.join("-home-user-git-exam-prep-notes");
         fs::create_dir_all(&project).expect("create project dir");
@@ -3971,7 +4039,10 @@ mod tests {
             cc_project_dir_encoding("/home/user/git/exam-prep-notes"),
             "-home-user-git-exam-prep-notes"
         );
-        assert_eq!(cc_project_dir_encoding("/home/user/gh/x.y_z"), "-home-user-gh-x-y-z");
+        assert_eq!(
+            cc_project_dir_encoding("/home/user/gh/x.y_z"),
+            "-home-user-gh-x-y-z"
+        );
     }
 
     // The settings file has a hand-written writer AND a hand-written parser, so a
@@ -4222,7 +4293,10 @@ mod tests {
         let second = input_line_after(first.draft, &first.line, b"the ");
         let third = input_line_after(second.draft, &second.line, b"row");
         assert_eq!(third.line_text(), "boot the row");
-        assert_eq!(third.line_text(), input_line_after(false, &[], b"boot the row").line_text());
+        assert_eq!(
+            third.line_text(),
+            input_line_after(false, &[], b"boot the row").line_text()
+        );
     }
 
     // Inside a paste a newline is content, so the line keeps it — the same rule
@@ -4315,7 +4389,10 @@ mod tests {
     #[test]
     fn input_draft_ignores_escape_sequences() {
         // Arrow keys, F-keys, and bare cursor moves carry no typed text.
-        assert!(!input_line_has_unsent_draft_after(false, b"\x1b[A\x1b[B\x1b[C\x1b[D"));
+        assert!(!input_line_has_unsent_draft_after(
+            false,
+            b"\x1b[A\x1b[B\x1b[C\x1b[D"
+        ));
         assert!(!input_line_has_unsent_draft_after(false, b"\x1bOP\x1bOQ"));
         // Alt-key (ESC + letter) is not a draft.
         assert!(!input_line_has_unsent_draft_after(false, b"\x1bb"));
@@ -4368,9 +4445,7 @@ mod tests {
     #[test]
     fn agent_working_is_false_when_idle_or_completed() {
         // Completion summary must not read as active work.
-        assert!(!screen_text_shows_agent_working(
-            "• Worked for 42s\n› "
-        ));
+        assert!(!screen_text_shows_agent_working("• Worked for 42s\n› "));
         // Plain idle shell prompt.
         assert!(!screen_text_shows_agent_working("user@host:~$ "));
         assert!(!screen_text_shows_agent_working(""));
@@ -4423,7 +4498,10 @@ mod tests {
             "{\"type\":\"ai-title\",\"aiTitle\":\"Before\",\"sessionId\":\"abc\"}\n",
         )
         .unwrap();
-        assert_eq!(read_cc_session_title(&path).unwrap().as_deref(), Some("Before"));
+        assert_eq!(
+            read_cc_session_title(&path).unwrap().as_deref(),
+            Some("Before")
+        );
         // A yggterm rename writes a custom-title; the reader must now return it.
         append_cc_session_custom_title(&path, "abc", "Renamed By Yggterm").unwrap();
         assert_eq!(
@@ -4482,8 +4560,10 @@ mod tests {
         original.notification_sound = true;
         original.terminal_telemetry_enabled = false;
         original.selected_browser_path = Some("__remote_machine__/dev".to_string());
-        original.expanded_browser_paths =
-            vec!["__remote_machine__/dev".to_string(), "/home/user".to_string()];
+        original.expanded_browser_paths = vec![
+            "__remote_machine__/dev".to_string(),
+            "/home/user".to_string(),
+        ];
 
         let json = serialize_settings_value(&original);
         let round_tripped = parse_settings_value(&json).expect("parse settings");
@@ -4762,8 +4842,14 @@ mod tests {
         let parsed = parse_settings_value(&serde_json::json!({ "show_tree": true }))
             .expect("settings should parse");
         assert!(!parsed.chrome_orientation.is_mirrored());
-        assert_eq!(parsed.chrome_orientation.edge(ChromeSlot::Tree), SidebarEdge::Left);
-        assert_eq!(parsed.chrome_orientation.edge(ChromeSlot::Rail), SidebarEdge::Right);
+        assert_eq!(
+            parsed.chrome_orientation.edge(ChromeSlot::Tree),
+            SidebarEdge::Left
+        );
+        assert_eq!(
+            parsed.chrome_orientation.edge(ChromeSlot::Rail),
+            SidebarEdge::Right
+        );
     }
 
     #[test]
@@ -4777,7 +4863,10 @@ mod tests {
         );
         let parsed = parse_settings_value(&encoded).expect("settings should parse");
         assert_eq!(parsed.chrome_orientation, ChromeOrientation::mirrored());
-        assert_eq!(parsed.chrome_orientation.edge(ChromeSlot::Tree), SidebarEdge::Right);
+        assert_eq!(
+            parsed.chrome_orientation.edge(ChromeSlot::Tree),
+            SidebarEdge::Right
+        );
     }
 
     #[test]
@@ -5090,10 +5179,7 @@ mod store_container_identity_tests {
             .find(|c| c.name == "store dir")
             .expect("a store DIR group recurses, not pruned");
         assert_eq!(store_dir.children.len(), 1, "its inner group survives");
-        assert!(
-            names.contains(&"proj"),
-            "unrelated groups survive"
-        );
+        assert!(names.contains(&"proj"), "unrelated groups survive");
         assert_eq!(pruned.children.len(), 2, "exactly the stale leaf went away");
     }
 }

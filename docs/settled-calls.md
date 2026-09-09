@@ -399,7 +399,7 @@ referencing codex-litellm as codex-anything from now on. The name is locked but
 the repo and binary is still called codex-litellm."*
 ⇒ **`codex-anything` is the name in every surface a human reads** — UI labels,
 docs, specs, commit messages, this file. **`codex-litellm` survives only as an
-identifier**: the repo, the binary at `~/.yggterm/npm/bin/codex-litellm`, the
+identifier**: the repo, the binary at `~/.yggterm/ynpm/bin/codex-litellm`, the
 provider key in `~/.codex/config.toml` (`[model_providers.litellm]`), and any
 path or package name. ⛔ Do not rename the binary to chase the label, and do not
 let the label leak back into an identifier — that is how one thing becomes two.
@@ -412,7 +412,7 @@ surface.
 
 ⚠ It is a `--kind` value today (`codex, codex-litellm, claude-code, pi,
 opencode, qwen-code, kimi, muse, antigravity`) and has its own provisioned
-binary at `~/.yggterm/npm/bin/codex-litellm` on every host. Removing it from the
+binary at `~/.yggterm/ynpm/bin/codex-litellm` on every host. Removing it from the
 kind list without removing the capability is the work; it is filed in
 [`pending-bugs.md`](pending-bugs.md).
 

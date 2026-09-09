@@ -1223,6 +1223,58 @@ the next build. Do **not** re-subscribe — the subscription stays, the watcher
 re-merges the new `tip` on the next dirty check. Only `unsubscribe` when the
 work is done or the lane has landed on `main` (then `ygg-ci` auto-removes it).
 
+## 3d. ynpm — the executable distribution plane
+
+`ynpm` is the base fleet verb for distributing executable packages: integrated
+agent CLIs, TUIs, libyggterm apps, and future yggdrasil tools. The recognized
+fleet is localhost plus the machines in yggterm's permanent SSH roster. Read
+the complete contract in `docs/ynpm.md` and the focused operator skill in
+`.agents/skills/ynpm/SKILL.md`.
+
+```sh
+ynpm list                                      # every integrated CLI + app manifest
+ynpm sync --integrated                         # npm-backed CLI convergence
+ynpm sync-fleet --hosts machine-a,machine-b --integrated
+ynpm doctor                                    # platform/path/tool preflight
+ynpm dev --build '<cmd>' --bin tool=dist/tool /home/user/gh/tool
+ynpx @scope/tool --flag value                 # update online, cached launch offline
+```
+
+The server owns PTYs and launch composition. `ynpm` owns package identity,
+download/cache, lifecycle finalization, `--version` gates, generations,
+atomic publication, rollback, and fleet import. An agent must not hand-assemble
+`npm install -g` batches, `scp` copies, or a second CLI generation store when
+ynpm can do the job. `sync-fleet` makes one verified local generation and
+imports it to named hosts, so the release is downloaded once.
+
+Development is intentionally first-class: build a checkout, gate its binaries,
+publish a dev generation, and optionally import that exact build across the
+fleet. A watched production release takes over only when it is newer than the
+dev build or has the same version with a different known production fingerprint;
+unknown registry state preserves the dev build. `ynpx` uses the same verified
+package path, tries the newest version every time, and falls back to the last
+verified generation only for an unavailable network. Yggterm itself follows
+the same path: `ynpm self-update` owns the four-product release generation and
+`sync-fleet` transfers that verified production generation once to each named
+host. New libyggterm apps should put their launcher and context-menu policy in
+`package.json.yggterm.app`; their processes do not register themselves at
+runtime.
+
+`ynpm list` is the recognition instrument, not just state-file output. It reads
+the compiled `AGENT_CLIS` registry and `~/.yggterm/apps/*.json`, and reports
+legacy-managed, user-local, system, and unavailable sources explicitly. The
+OpenCode v2 identity is `@opencode-ai/cli@beta` / `opencode2`; never substitute
+the abandoned `opencode-ai@beta` line. Legacy cleanup follows the liveness law:
+publish and verify ynpm first, then remove only exact old paths no live process
+or helper executes from.
+
+With `--integrated`, `sync-fleet` first asks the named peers for their highest
+verified production generation and reuses an ahead-of-registry peer archive;
+only when no peer can satisfy the package does it fetch upstream. `export` is
+the internal metadata/archive protocol behind that step. Omit `--dest` for an
+integrated CLI dev build so it lands in the server's `~/.yggterm/ynpm/bin`;
+older user-local dev states are bridged there during integrated sync.
+
 ## 4. Correspondence — any session can reach any other
 
 A row is an address. That is the whole mechanism, and it needs no new protocol:

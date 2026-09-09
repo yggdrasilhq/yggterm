@@ -24,6 +24,20 @@ package = {
         f"@ygghq/{name}-{platform}": version for platform in platforms
     },
     "scripts": {"postinstall": "node ./finalize.mjs"},
+    "yggterm": {
+        "app": {
+            "name": name,
+            "label": name,
+            "icon": "",
+            "binary": bin_,
+            "verbs": [{"id": "open", "label": f"Open {name}", "args": [], "row_spawn": True}],
+            "context_menu": {
+                "enabled": False,
+                "contexts": ["workspace", "session"],
+                "verbs": ["open"],
+            },
+        }
+    },
     "repository": {
         "type": "git",
         "url": f"git+https://github.com/yggdrasilhq/{name}.git",

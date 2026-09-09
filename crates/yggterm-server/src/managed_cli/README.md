@@ -3,7 +3,9 @@
 `codex_cli.rs` was a misnomer: it held the launch, provision, terminal-identity,
 and refresh logic for **all** eleven CLIs. This directory is the split.
 
-- `mod.rs` — common: `ManagedCliTool`, `ManagedCliAction`, provision, refresh, identity.
+- `mod.rs` — common: `ManagedCliTool`, `ManagedCliAction`, launch composition,
+  identity, and the refresh adapter. npm-backed provisioning delegates to the
+  standalone `ynpm` binary; this module must not create a second npm prefix.
 - `codex.rs` / `claude.rs` — Codex / Claude Code specific: `--session-id` birth, sqlite/poll rebind, re-root.
 - `pi.rs` — Pi: `--session` birth==resume, no permission gate.
 - `opencode.rs` — OpenCode: RPC-minted sessions, `--auto` bypass, SQLite store gap.
@@ -18,9 +20,15 @@ its **store** shape (`session_store_globs`, `store_scan_gap`). The registry
 (`yggterm-core/src/agent_cli.rs:AGENT_CLIS`) is the SSOT; this directory's
 per-CLI modules are the launch-side owners that read it.
 
-Phase 1 is a pure rename (`codex_cli` → `managed_cli` shim); per-CLI extraction
-is incremental as restore/PTY/viewport nuances are fixed (e.g. Muse/AGY
-keep-alive restore, webview Rendered scaffold).
+Phase 1 was a pure rename (`codex_cli` → `managed_cli` shim). Per-CLI
+extraction remains incremental as restore/PTY/viewport nuances are fixed (for
+example Muse/AGY keep-alive restore and the webview Rendered scaffold).
+
+Distribution ownership is intentionally outside this module: use
+`docs/ynpm.md` and `.agents/skills/ynpm/SKILL.md` for package installation,
+dev generations, fleet import, rollback, and legacy cleanup. The descriptor
+registry is still the SSOT for package names, binary names, launch flags, and
+non-npm source adapters.
 
 ⚠ **THE PER-CLI FILES ARE STILL FIVE-LINE PLACEHOLDERS.** The bullets above
 describe what each file is *intended* to own, not what it holds today — every one

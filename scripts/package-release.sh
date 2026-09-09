@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 BIN_PATH="${ROOT_DIR}/target/release/yggterm"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/yggterm-headless"
+YNPM_BIN_PATH="${ROOT_DIR}/target/release/ynpm"
+YNPX_BIN_PATH="${ROOT_DIR}/target/release/ynpm"
 TARGET_LABEL="${1:-linux-x86_64}"
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.0}"
 CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
@@ -49,25 +51,35 @@ maybe_refresh_release_codex_cli() {
 }
 
 pushd "$ROOT_DIR" >/dev/null
-"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --no-default-features
+"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
 popd >/dev/null
 maybe_refresh_release_codex_cli
 
 cp "$BIN_PATH" "$DIST_DIR/yggterm-${TARGET_LABEL}"
 cp "$HEADLESS_BIN_PATH" "$DIST_DIR/yggterm-headless-${TARGET_LABEL}"
+cp "$YNPM_BIN_PATH" "$DIST_DIR/ynpm-${TARGET_LABEL}"
+cp "$YNPX_BIN_PATH" "$DIST_DIR/ynpx-${TARGET_LABEL}"
 checksum_file "$DIST_DIR/yggterm-${TARGET_LABEL}" "$DIST_DIR/yggterm-${TARGET_LABEL}.sha256"
 checksum_file "$DIST_DIR/yggterm-headless-${TARGET_LABEL}" "$DIST_DIR/yggterm-headless-${TARGET_LABEL}.sha256"
+checksum_file "$DIST_DIR/ynpm-${TARGET_LABEL}" "$DIST_DIR/ynpm-${TARGET_LABEL}.sha256"
+checksum_file "$DIST_DIR/ynpx-${TARGET_LABEL}" "$DIST_DIR/ynpx-${TARGET_LABEL}.sha256"
 
 tar -C "$DIST_DIR" -czf "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz" \
   "yggterm-${TARGET_LABEL}" \
   "yggterm-${TARGET_LABEL}.sha256" \
   "yggterm-headless-${TARGET_LABEL}" \
-  "yggterm-headless-${TARGET_LABEL}.sha256"
+  "yggterm-headless-${TARGET_LABEL}.sha256" \
+  "ynpm-${TARGET_LABEL}" \
+  "ynpm-${TARGET_LABEL}.sha256" \
+  "ynpx-${TARGET_LABEL}" \
+  "ynpx-${TARGET_LABEL}.sha256"
 
 checksum_file "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz" "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz.sha256"
 
 echo "Release binary: $DIST_DIR/yggterm-${TARGET_LABEL}"
 echo "Release headless binary: $DIST_DIR/yggterm-headless-${TARGET_LABEL}"
+echo "Release package manager: $DIST_DIR/ynpm-${TARGET_LABEL}"
+echo "Release package launcher: $DIST_DIR/ynpx-${TARGET_LABEL}"
 echo "Release archive: $DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz"
 echo "Checksums generated in dist/."
 

@@ -14,9 +14,13 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.ps1 | iex
 ```
 
-Yggterm installs into a managed user-space location, wires up desktop integration, and keeps itself current on launch when it owns that install root.
+Yggterm installs into a managed user-space location, wires up desktop
+integration, and ships `ynpm`/`ynpx` beside the GUI. `ynpm` owns release
+updates, package generations, and fleet distribution.
 
-Rerun the same one-liner any time to force a manual update of a direct install.
+Run `ynpm self-update` to force a direct-install update, or
+`ynpm sync-fleet --hosts machine-a,machine-b --integrated` to distribute the
+verified generations to named yggterm hosts.
 
 Hot update is a session-preservation contract. When an updated client finds a running daemon that still owns live PTYs, the new daemon should come up without killing those runtimes; the old daemon remains a preserved terminal owner and the updated daemon routes terminal I/O through it until the session naturally ends or can be moved safely. If that fault-tolerant handoff cannot be proven, update completion is deferred. Losing the PTY session is a failed update, not a hot update.
 
@@ -25,8 +29,8 @@ Direct installs also expose `yggterm-headless`, the panic-management CLI for ter
 Useful daemon-control scenarios:
 
 ```bash
-yggterm-headless server monitor --scenario panic-report --expect-path "live::<session>" --jsonl-out /tmp/yggterm-incident.jsonl
-yggterm-headless server monitor --scenario panic-report --iterations 30 --interval-ms 1000 --jsonl-out /tmp/yggterm-watch.jsonl
+yggterm-headless server monitor --scenario panic-report --expect-path "live::<session>" --jsonl-out ~/.yggterm/scratchpad/yggterm-incident.jsonl
+yggterm-headless server monitor --scenario panic-report --iterations 30 --interval-ms 1000 --jsonl-out ~/.yggterm/scratchpad/yggterm-watch.jsonl
 yggterm-headless server monitor --scenario server-list
 yggterm-headless server monitor --scenario hot-restart --all --timeout-ms 30000
 yggterm-headless server monitor --scenario wait-session --expect-path "live::<session>" --timeout-ms 30000
@@ -41,9 +45,9 @@ yggterm server app state --timeout-ms 5000
 yggterm server app rows --timeout-ms 5000
 yggterm server app focus --timeout-ms 5000
 yggterm server app open "remote-session://dev/<session-id>" --view terminal --timeout-ms 8000
-yggterm server app screenshot /tmp/yggterm-shot.png --timeout-ms 10000
-yggterm server app screenrecord /tmp/yggterm-shot.mov --duration-sec 12 --timeout-ms 25000
-yggterm server screenshot app /tmp/yggterm-shot.png
+yggterm server app screenshot ~/.yggterm/scratchpad/yggterm-shot.png --timeout-ms 10000
+yggterm server app screenrecord ~/.yggterm/scratchpad/yggterm-shot.mov --duration-sec 12 --timeout-ms 25000
+yggterm server screenshot app ~/.yggterm/scratchpad/yggterm-shot.png
 yggterm-headless server trace tail 200
 yggterm-headless server trace follow 200 500
 yggterm-headless server trace bundle 200 --screenshot > yggterm-trace.json
@@ -153,9 +157,12 @@ What it does:
 - installs it into a managed user-space root
 - creates desktop integration for direct installs
 - refreshes integration when assets change
-- self-updates on launch when a newer direct-release build is available
-- installs updates in the background and prompts you to restart when you choose
-- reruns of the install one-liner act as an explicit manual updater for direct installs
+- `ynpm self-update` checks the direct release channel and installs the complete
+  `yggterm`/`yggterm-headless`/`ynpm`/`ynpx` generation atomically
+- startup delegates the update transaction to ynpm, then shows the notification
+  and performs the session-preserving restart
+- dev builds may be installed with `ynpm dev` and distributed to the fleet;
+  production takes over only when it is newer or has same-version release polish
 
 Package-managed installs behave differently on purpose:
 
@@ -186,7 +193,7 @@ That means the current app already supports:
 - lightweight papers stored in `~/.yggterm/workspace.db`
 - executable terminal recipes as an intermediate step toward richer terminal automation
 - generated session titles through a configured LiteLLM endpoint
-- direct install with self-update and package-manager-aware notify-only mode
+- direct install with ynpm-owned self-update and package-manager-aware mode
 - SSH-side Yggterm commands for remote session scanning, generated-copy persistence, and clipboard image staging
 
 ## Separately Tracked Embeddable Surfaces
@@ -432,4 +439,3 @@ Copyright 2026 Avikalpa Kundu <avi@gour.top>.
 the licence text for the third-party code vendored under `vendor/` and
 `third_party/`, which keeps its own terms. `THIRD-PARTY-NOTICES.md` and
 `docs/DEPENDENCY-LICENCES.md` say what that is and what it obliges.
-

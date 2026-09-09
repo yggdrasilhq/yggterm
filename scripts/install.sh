@@ -6,7 +6,9 @@ set -eu
 
 REPO="${YGGTERM_REPO:-yggdrasilhq/yggterm}"
 LATEST_URL="https://github.com/${REPO}/releases/latest"
-TMP_DIR="$(mktemp -d)"
+INSTALL_SCRATCH_ROOT="${YGGTERM_INSTALL_SCRATCH:-${HOME}/.yggterm/scratchpad/ynpm}"
+mkdir -p "${INSTALL_SCRATCH_ROOT}"
+TMP_DIR="$(mktemp -d "${INSTALL_SCRATCH_ROOT}/install-XXXXXX")"
 
 log() {
   printf '[yggterm-install] %s\n' "$*" >&2
@@ -32,18 +34,6 @@ need_cmd curl
 need_cmd tar
 need_cmd uname
 need_cmd sed
-
-prune_old_versions() {
-  keep_version="$1"
-  [ -n "${keep_version}" ] || return 0
-  versions_dir="${install_root}/versions"
-  [ -d "${versions_dir}" ] || return 0
-  for candidate in "${versions_dir}"/*; do
-    [ -d "${candidate}" ] || continue
-    [ "$(basename "${candidate}")" = "${keep_version}" ] && continue
-    rm -rf "${candidate}" || true
-  done
-}
 
 write_launcher_wrapper() {
   bin_dir="${HOME}/.local/bin"
@@ -127,6 +117,20 @@ EOF
   chmod 0755 "${launcher_path}" || true
 }
 
+publish_aux_link() {
+  # ynpm and ynpx are the same executable; the basename is their argv0
+  # contract, so keep both links pointed at the versioned release binary.
+  name="$1"
+  target="$2"
+  bin_dir="${HOME}/.local/bin"
+  launcher_path="${bin_dir}/${name}"
+  staged="${launcher_path}.ynpm-publish.$$"
+  mkdir -p "${bin_dir}"
+  rm -f "${staged}"
+  ln -s "${target}" "${staged}"
+  mv -f "${staged}" "${launcher_path}"
+}
+
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -178,6 +182,13 @@ if [ -f "${state_path}" ]; then
   )"
 fi
 
+# After bootstrap, ynpm owns all later release updates and keeps the complete
+# rollback history. The installer remains the no-dependency bootstrap only.
+if [ -n "${current_version}" ] && [ -x "${install_root}/versions/${current_version}/ynpm" ]; then
+  YGGTERM_DIRECT_INSTALL_ROOT="${install_root}" \
+    exec "${install_root}/versions/${current_version}/ynpm" self-update
+fi
+
 if [ -n "${current_version}" ] && [ "${current_version}" = "${release_version}" ]; then
   log "yggterm ${release_version} is already installed"
   current_binary="$(
@@ -186,11 +197,16 @@ if [ -n "${current_version}" ] && [ "${current_version}" = "${release_version}" 
   if [ -n "${current_binary}" ] && [ -x "${current_binary}" ]; then
     installed_binary="${current_binary}"
     installed_headless_binary="$(dirname "${current_binary}")/yggterm-headless"
+    installed_ynpm="${install_root}/versions/${current_version}/ynpm"
+    installed_ynpx="${install_root}/versions/${current_version}/ynpx"
     write_launcher_wrapper
     write_headless_wrapper
+    if [ -x "${installed_ynpm}" ] && [ -x "${installed_ynpx}" ]; then
+      publish_aux_link ynpm "${installed_ynpm}"
+      publish_aux_link ynpx "${installed_ynpx}"
+    fi
     log "refreshing desktop integration"
     "${current_binary}" install integrate >/dev/null 2>&1 || true
-    prune_old_versions "${current_version}"
     log "binary: ${current_binary}"
   fi
   exit 0
@@ -232,17 +248,24 @@ case "${target_label}" in
   installed_headless_binary="${version_dir}/yggterm-headless.exe"
   ;;
   *)
-  binary_name="yggterm-${target_label}"
-  headless_binary_name="yggterm-headless-${target_label}"
-  installed_binary="${version_dir}/yggterm"
-  installed_headless_binary="${version_dir}/yggterm-headless"
-  ;;
+    binary_name="yggterm-${target_label}"
+    headless_binary_name="yggterm-headless-${target_label}"
+    ynpm_binary_name="ynpm-${target_label}"
+    ynpx_binary_name="ynpx-${target_label}"
+    installed_binary="${version_dir}/yggterm"
+    installed_headless_binary="${version_dir}/yggterm-headless"
+    installed_ynpm="${version_dir}/ynpm"
+    installed_ynpx="${version_dir}/ynpx"
+    ;;
 esac
 
 cp "${TMP_DIR}/${binary_name}" "${installed_binary}"
 cp "${TMP_DIR}/${headless_binary_name}" "${installed_headless_binary}"
+cp "${TMP_DIR}/${ynpm_binary_name}" "${installed_ynpm}"
+cp "${TMP_DIR}/${ynpx_binary_name}" "${installed_ynpx}"
 chmod 0755 "${installed_binary}" || true
 chmod 0755 "${installed_headless_binary}" || true
+chmod 0755 "${installed_ynpm}" "${installed_ynpx}" || true
 
 cat > "${install_root}/install-state.json" <<JSON
 {
@@ -257,14 +280,15 @@ JSON
 
 write_launcher_wrapper
 write_headless_wrapper
+publish_aux_link ynpm "${installed_ynpm}"
+publish_aux_link ynpx "${installed_ynpx}"
 
 log "refreshing desktop integration"
 "${installed_binary}" install integrate >/dev/null 2>&1 || true
-prune_old_versions "${release_version}"
 
 log "installed yggterm ${release_version}"
 log "binary: ${installed_binary}"
-log "rerun this same install command any time to update manually"
+log "future updates are owned by ynpm; run 'ynpm self-update'"
 bin_dir="${HOME}/.local/bin"
 case ":${PATH:-}:" in
   *":${bin_dir}:"*) ;;

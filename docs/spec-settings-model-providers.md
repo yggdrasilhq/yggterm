@@ -27,7 +27,7 @@ Codex backend      [ Codex ]——————[ Anything ]
 
 | mechanism | evidence on this fleet |
 |---|---|
-| a **separate binary** | `~/.yggterm/npm/bin/codex-litellm → ../lib/node_modules/@avikalpa/codex` — a private fork, provisioned on every host |
+| a **separate binary** | `~/.yggterm/ynpm/bin/codex-litellm → ../generations/avikalpa__codex-litellm/...` — a private fork, provisioned through ynpm on every host |
 | a **provider key in codex's own config** | `~/.codex/config.toml` carries `[model_providers.litellm]` and a top-level `model_provider` |
 
 ⇒ **Pick ONE and write down why.** If the fork exists only to preset a provider,

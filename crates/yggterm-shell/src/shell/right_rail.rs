@@ -7954,15 +7954,17 @@ fn agent_session_menu_items(here: bool) -> Vec<RowMenuItem> {
 /// `new-session` / `new-claude-code` — four ids for one verb.
 const NEW_AGENT_MENU_PREFIX: &str = "new-agent:";
 
-/// Verbs CONTRIBUTED by the libyggterm apps on this row's host.
+/// Verbs CONTRIBUTED by ynpm-installed libyggterm apps on this row's host.
 ///
-/// Same registry as the titlebar `+` menu and the start page — a purged app
-/// leaves all three at once. The manifest's `keytip` is the requested letter
-/// (libyggterm-surfaces spec §10). yggterm contributes NO app-specific chrome
-/// of its own here; the list is whatever the host's `~/.yggterm/apps/*.json`
-/// manifests declare.
+/// The titlebar `+` menu and start page may still offer every installed app,
+/// but a row context-menu slot exists only when the package's `yggterm.app`
+/// metadata opts into this context. The normalized manifest's `keytip` is the
+/// requested letter (libyggterm-surfaces spec §10). yggterm contributes NO
+/// app-specific chrome of its own here; the list is package metadata resolved
+/// for the host the row lives on.
 fn libyggterm_app_menu_items(apps: &[AppManifest], here: bool) -> Vec<RowMenuItem> {
-    app_row_spawn_entries(apps)
+    let context = if here { "session" } else { "workspace" };
+    app_context_menu_entries(apps, context)
         .into_iter()
         .map(|(app, verb)| {
             let label = if here {
@@ -8148,7 +8150,7 @@ fn row_menu_items(
             RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session", 's')
                 .submenu(agent_session_menu_items(false)),
         );
-        if !app_row_spawn_entries(apps).is_empty() {
+        if !app_context_menu_entries(apps, "workspace").is_empty() {
             items.push(
                 RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App", 'b')
                     .submenu(libyggterm_app_menu_items(apps, false)),
@@ -8190,7 +8192,7 @@ fn row_menu_items(
                 RowMenuItem::new(OPEN_SESSION_MENU_ID, "Open Session Here", 's')
                     .submenu(agent_session_menu_items(true)),
             );
-            if !app_row_spawn_entries(apps).is_empty() {
+            if !app_context_menu_entries(apps, "session").is_empty() {
                 items.push(
                     RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App Here", 'b')
                         .submenu(libyggterm_app_menu_items(apps, true)),

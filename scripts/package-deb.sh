@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 BIN_PATH="${ROOT_DIR}/target/release/yggterm"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/yggterm-headless"
+YNPM_BIN_PATH="${ROOT_DIR}/target/release/ynpm"
 DEB_REVISION="${DEB_REVISION:-1}"
 ARCH="$(dpkg-architecture -qDEB_HOST_ARCH)"
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.0}"
@@ -31,7 +32,7 @@ checksum_file() {
 }
 
 pushd "$ROOT_DIR" >/dev/null
-"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --no-default-features
+"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
 popd >/dev/null
 
 rm -rf "$STAGE_DIR"
@@ -43,6 +44,7 @@ mkdir -p \
 
 install -m 0755 "$BIN_PATH" "$STAGE_DIR/usr/lib/yggterm/yggterm-bin"
 install -m 0755 "$HEADLESS_BIN_PATH" "$STAGE_DIR/usr/lib/yggterm/yggterm-headless-bin"
+install -m 0755 "$YNPM_BIN_PATH" "$STAGE_DIR/usr/lib/yggterm/ynpm-bin"
 cat > "$STAGE_DIR/usr/bin/yggterm" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -75,6 +77,8 @@ fi
 exec /usr/lib/yggterm/yggterm-headless-bin "$@"
 WRAPPER
 chmod 0755 "$STAGE_DIR/usr/bin/yggterm-headless"
+ln -s /usr/lib/yggterm/ynpm-bin "$STAGE_DIR/usr/bin/ynpm"
+ln -s /usr/lib/yggterm/ynpm-bin "$STAGE_DIR/usr/bin/ynpx"
 install -m 0644 "$ROOT_DIR/debian/copyright" "$STAGE_DIR/usr/share/doc/${PKG_NAME}/copyright"
 gzip -c "$ROOT_DIR/debian/changelog" > "$STAGE_DIR/usr/share/doc/${PKG_NAME}/changelog.Debian.gz"
 

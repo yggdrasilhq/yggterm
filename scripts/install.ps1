@@ -6,25 +6,6 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-function Prune-OldVersions {
-  param(
-    [string]$Root,
-    [string]$KeepVersion
-  )
-  if ([string]::IsNullOrWhiteSpace($KeepVersion)) {
-    return
-  }
-  $versionsRoot = Join-Path $Root "versions"
-  if (-not (Test-Path $versionsRoot)) {
-    return
-  }
-  Get-ChildItem -Path $versionsRoot -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -ne $KeepVersion } |
-    ForEach-Object {
-      Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
 $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
 $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "yggterm-installer" }
 
@@ -44,8 +25,30 @@ if (-not $archiveAsset) {
 }
 
 $version = $release.tag_name.TrimStart("v")
-$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("yggterm-install-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $tempDir | Out-Null
+$statePath = Join-Path $InstallRoot "install-state.json"
+if (Test-Path $statePath) {
+  $existingState = Get-Content $statePath -Raw | ConvertFrom-Json
+  $existingVersion = $existingState.active_version
+  if ($existingVersion) {
+    $existingYnpm = Join-Path $InstallRoot "versions\$existingVersion\ynpm.exe"
+    if (Test-Path $existingYnpm) {
+      $env:YGGTERM_DIRECT_INSTALL_ROOT = $InstallRoot
+      & $existingYnpm self-update
+      if ($LASTEXITCODE -ne 0) {
+        throw "ynpm self-update exited with status $LASTEXITCODE"
+      }
+      exit 0
+    }
+  }
+}
+$scratchRoot = if ($env:YGGTERM_INSTALL_SCRATCH) {
+  $env:YGGTERM_INSTALL_SCRATCH
+} else {
+  Join-Path $env:USERPROFILE ".yggterm\scratchpad\ynpm"
+}
+$tempDir = Join-Path $scratchRoot ("install-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $scratchRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
 try {
   $archivePath = Join-Path $tempDir "yggterm.tar.gz"
@@ -66,15 +69,21 @@ try {
 
   $sourceExe = Join-Path $tempDir "yggterm-$targetLabel.exe"
   $sourceHeadlessExe = Join-Path $tempDir "yggterm-headless-$targetLabel.exe"
+  $sourceYnpmExe = Join-Path $tempDir "ynpm-$targetLabel.exe"
+  $sourceYnpxExe = Join-Path $tempDir "ynpx-$targetLabel.exe"
   $sourceWebView2Loader = Join-Path $tempDir "WebView2Loader-$targetLabel.dll"
   if (-not (Test-Path $sourceWebView2Loader)) {
     $sourceWebView2Loader = Join-Path $tempDir "WebView2Loader.dll"
   }
   $installedExe = Join-Path $versionDir "yggterm.exe"
   $installedHeadlessExe = Join-Path $versionDir "yggterm-headless.exe"
+  $installedYnpmExe = Join-Path $versionDir "ynpm.exe"
+  $installedYnpxExe = Join-Path $versionDir "ynpx.exe"
   $installedWebView2Loader = Join-Path $versionDir "WebView2Loader.dll"
   Copy-Item $sourceExe $installedExe -Force
   Copy-Item $sourceHeadlessExe $installedHeadlessExe -Force
+  Copy-Item $sourceYnpmExe $installedYnpmExe -Force
+  Copy-Item $sourceYnpxExe $installedYnpxExe -Force
   if (Test-Path $sourceWebView2Loader) {
     Copy-Item $sourceWebView2Loader $installedWebView2Loader -Force
   } else {
@@ -92,8 +101,19 @@ try {
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText((Join-Path $InstallRoot "install-state.json"), $state, $utf8NoBom)
 
+  $commandDir = Join-Path $InstallRoot "bin"
+  New-Item -ItemType Directory -Path $commandDir -Force | Out-Null
+  Copy-Item $installedYnpmExe (Join-Path $commandDir "ynpm.exe") -Force
+  Copy-Item $installedYnpxExe (Join-Path $commandDir "ynpx.exe") -Force
+  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $pathParts = @()
+  if ($userPath) { $pathParts = $userPath -split ";" | Where-Object { $_ } }
+  if ($pathParts -notcontains $commandDir) {
+    [Environment]::SetEnvironmentVariable("Path", (($pathParts + $commandDir) -join ";"), "User")
+  }
+  $env:Path = "$commandDir;$env:Path"
+
   & $installedExe install integrate | Out-Null
-  Prune-OldVersions -Root $InstallRoot -KeepVersion $version
 
   Write-Host "installed yggterm $version"
   Write-Host "binary: $installedExe"

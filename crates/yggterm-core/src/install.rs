@@ -4,9 +4,7 @@ use crate::install_linux_icon_assets;
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -118,23 +116,6 @@ pub struct ReleaseUpdate {
     pub checksum_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReleaseUpdateInstallStage {
-    Downloading,
-    Verifying,
-    Extracting,
-    Integrating,
-    Finalizing,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseUpdateInstallProgress {
-    pub stage: ReleaseUpdateInstallStage,
-    pub percent: u8,
-    pub detail: String,
-}
-
 pub fn current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
@@ -233,7 +214,10 @@ pub fn handoff_target_is_usable(
 
 #[cfg(test)]
 mod handoff_target_tests {
-    use super::{find_direct_install_state_scoped, handoff_target_is_usable, install_path_declared_version, write_direct_install_state};
+    use super::{
+        find_direct_install_state_scoped, handoff_target_is_usable, install_path_declared_version,
+        write_direct_install_state,
+    };
     use std::path::Path;
 
     /// THE FLEET SHAPE, LOCKED: the state file lives in the yggterm HOME while
@@ -272,8 +256,8 @@ mod handoff_target_tests {
             via_ancestors_only.is_none(),
             "control: no ancestor of {exe:?} may carry install-state"
         );
-        let found =
-            find_direct_install_state_scoped(&exe, Some(&yggterm_home)).expect("probe with fallback");
+        let found = find_direct_install_state_scoped(&exe, Some(&yggterm_home))
+            .expect("probe with fallback");
         let Some((root, state)) = found else {
             panic!("the finder must fall back to the yggterm home");
         };
@@ -555,10 +539,7 @@ fn find_direct_install_state(
     executable_path: &Path,
 ) -> Result<Option<(PathBuf, DirectInstallState)>> {
     let home_fallback = crate::resolve_yggterm_home().ok();
-    find_direct_install_state_scoped(
-        executable_path,
-        home_fallback.as_deref(),
-    )
+    find_direct_install_state_scoped(executable_path, home_fallback.as_deref())
 }
 
 /// The finder proper, with the yggterm-home fallback passed explicitly so
@@ -653,6 +634,11 @@ fn load_direct_install_state(root: &Path) -> Result<Option<DirectInstallState>> 
 }
 
 pub fn direct_install_root() -> Result<PathBuf> {
+    if let Some(value) =
+        std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT).filter(|value| !value.is_empty())
+    {
+        return Ok(crate::expand_tilde(PathBuf::from(value)));
+    }
     #[cfg(target_os = "windows")]
     {
         return Ok(dirs::data_local_dir()
@@ -1243,194 +1229,6 @@ pub fn check_for_update(context: &InstallContext) -> Result<Option<ReleaseUpdate
     }))
 }
 
-pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) -> Result<PathBuf> {
-    install_release_update_with_progress(context, update, |_| {})
-}
-
-pub fn install_release_update_with_progress<F>(
-    context: &InstallContext,
-    update: &ReleaseUpdate,
-    mut on_progress: F,
-) -> Result<PathBuf>
-where
-    F: FnMut(ReleaseUpdateInstallProgress),
-{
-    if context.channel != InstallChannel::Direct {
-        anyhow::bail!("self-update is only available for direct installs");
-    }
-    let root = context
-        .managed_root
-        .as_ref()
-        .context("missing direct install root")?;
-    let versions_dir = root.join("versions");
-    let version_dir = versions_dir.join(&update.version);
-    fs::create_dir_all(&version_dir)
-        .with_context(|| format!("failed to create version dir {}", version_dir.display()))?;
-
-    let archive = download_release_archive_with_progress(&update.archive_url, &mut on_progress)?;
-
-    if let Some(checksum_url) = &update.checksum_url {
-        on_progress(ReleaseUpdateInstallProgress {
-            stage: ReleaseUpdateInstallStage::Verifying,
-            percent: 88,
-            detail: "Verifying archive checksum".to_string(),
-        });
-        verify_archive_checksum(&archive, checksum_url)?;
-    }
-
-    let binary_name = if cfg!(target_os = "windows") {
-        format!("yggterm-{}.exe", context.asset_label)
-    } else {
-        format!("yggterm-{}", context.asset_label)
-    };
-    let headless_name = if cfg!(target_os = "windows") {
-        format!("yggterm-headless-{}.exe", context.asset_label)
-    } else {
-        format!("yggterm-headless-{}", context.asset_label)
-    };
-    let binary_path = version_dir.join(if cfg!(target_os = "windows") {
-        "yggterm.exe"
-    } else {
-        "yggterm"
-    });
-    let headless_path = version_dir.join(if cfg!(target_os = "windows") {
-        "yggterm-headless.exe"
-    } else {
-        "yggterm-headless"
-    });
-    on_progress(ReleaseUpdateInstallProgress {
-        stage: ReleaseUpdateInstallStage::Extracting,
-        percent: 92,
-        detail: "Extracting Yggterm".to_string(),
-    });
-    extract_binary_from_archive(&archive, &binary_name, &binary_path)?;
-    on_progress(ReleaseUpdateInstallProgress {
-        stage: ReleaseUpdateInstallStage::Extracting,
-        percent: 95,
-        detail: "Extracting headless helper".to_string(),
-    });
-    extract_binary_from_archive(&archive, &headless_name, &headless_path)?;
-    write_direct_install_state(
-        root,
-        &context.repo,
-        &context.asset_label,
-        &update.version,
-        &binary_path,
-    )?;
-
-    let updated_context = InstallContext {
-        channel: InstallChannel::Direct,
-        update_policy: UpdatePolicy::Auto,
-        repo: context.repo.clone(),
-        asset_label: context.asset_label.clone(),
-        current_version: update.version.clone(),
-        executable_path: binary_path.clone(),
-        preferred_executable: Some(binary_path.clone()),
-        managed_root: Some(root.clone()),
-        manager_hint: context.manager_hint.clone(),
-    };
-    on_progress(ReleaseUpdateInstallProgress {
-        stage: ReleaseUpdateInstallStage::Integrating,
-        percent: 99,
-        detail: "Refreshing desktop integration".to_string(),
-    });
-    let child_integrate_error = run_install_integrate_with_binary(&binary_path, root).err();
-    let local_integrate_error = refresh_desktop_integration(&updated_context).err();
-    if let (Some(child_error), Some(local_error)) = (child_integrate_error, local_integrate_error) {
-        anyhow::bail!(
-            "failed to refresh desktop integration after update: child integrate failed: {child_error}; local integrate failed: {local_error}"
-        );
-    }
-    on_progress(ReleaseUpdateInstallProgress {
-        stage: ReleaseUpdateInstallStage::Finalizing,
-        percent: 100,
-        detail: format!("Installed Yggterm {}", update.version),
-    });
-    Ok(binary_path)
-}
-
-fn download_release_archive_with_progress<F>(
-    archive_url: &str,
-    on_progress: &mut F,
-) -> Result<Vec<u8>>
-where
-    F: FnMut(ReleaseUpdateInstallProgress),
-{
-    on_progress(ReleaseUpdateInstallProgress {
-        stage: ReleaseUpdateInstallStage::Downloading,
-        percent: 4,
-        detail: "Connecting to release download".to_string(),
-    });
-    let mut response = release_client()?
-        .get(archive_url)
-        .send()
-        .context("failed to download release archive")?
-        .error_for_status()
-        .context("failed to fetch release archive")?;
-    let total_bytes = response.content_length();
-    let capacity = total_bytes
-        .and_then(|len| usize::try_from(len).ok())
-        .unwrap_or_default();
-    let mut archive = Vec::with_capacity(capacity);
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut downloaded = 0_u64;
-    let mut last_percent = 4_u8;
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .context("failed to read release archive bytes")?;
-        if read == 0 {
-            break;
-        }
-        archive.extend_from_slice(&buffer[..read]);
-        downloaded = downloaded.saturating_add(read as u64);
-        let next_percent = total_bytes
-            .filter(|total| *total > 0)
-            .map(|total| {
-                let span = downloaded.saturating_mul(80) / total;
-                4_u8.saturating_add(span.min(80) as u8)
-            })
-            .unwrap_or(12);
-        if next_percent > last_percent {
-            last_percent = next_percent;
-            on_progress(ReleaseUpdateInstallProgress {
-                stage: ReleaseUpdateInstallStage::Downloading,
-                percent: next_percent,
-                detail: "Downloading release archive".to_string(),
-            });
-        }
-    }
-    if last_percent < 84 {
-        on_progress(ReleaseUpdateInstallProgress {
-            stage: ReleaseUpdateInstallStage::Downloading,
-            percent: 84,
-            detail: "Download complete".to_string(),
-        });
-    }
-    Ok(archive)
-}
-
-fn run_install_integrate_with_binary(binary_path: &Path, root: &Path) -> Result<()> {
-    let status = std::process::Command::new(binary_path)
-        .arg("install")
-        .arg("integrate")
-        .env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to launch {} install integrate",
-                binary_path.display()
-            )
-        })?;
-    if !status.success() {
-        anyhow::bail!(
-            "{} install integrate exited with status {status}",
-            binary_path.display()
-        );
-    }
-    Ok(())
-}
-
 pub fn install_mode_summary(context: &InstallContext) -> String {
     match context.update_policy {
         UpdatePolicy::Auto => format!("Direct install · updates automatically on launch"),
@@ -1438,18 +1236,6 @@ pub fn install_mode_summary(context: &InstallContext) -> String {
             .manager_hint
             .clone()
             .unwrap_or_else(|| "Notify only".to_string()),
-    }
-}
-
-pub fn update_command_hint(channel: InstallChannel) -> &'static str {
-    match channel {
-        InstallChannel::Homebrew => "brew upgrade yggterm",
-        InstallChannel::Winget => "winget upgrade yggterm",
-        InstallChannel::Scoop => "scoop update yggterm",
-        InstallChannel::Flatpak => "flatpak update",
-        InstallChannel::Snap => "snap refresh yggterm",
-        InstallChannel::Deb => "sudo apt upgrade yggterm",
-        InstallChannel::Direct | InstallChannel::Unknown => "",
     }
 }
 
@@ -1467,70 +1253,6 @@ fn release_client() -> Result<Client> {
         .user_agent(format!("yggterm/{}", current_version()))
         .build()
         .context("failed to construct release client")
-}
-
-fn verify_archive_checksum(archive: &[u8], checksum_url: &str) -> Result<()> {
-    let checksum_text = release_client()?
-        .get(checksum_url)
-        .send()
-        .context("failed to download archive checksum")?
-        .error_for_status()
-        .context("failed to fetch archive checksum")?
-        .text()
-        .context("failed to read archive checksum")?;
-    let expected = checksum_text
-        .split_whitespace()
-        .next()
-        .context("missing checksum value")?;
-    let actual = hex_lower(&Sha256::digest(archive));
-    if expected != actual {
-        anyhow::bail!("release checksum mismatch");
-    }
-    Ok(())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn extract_binary_from_archive(
-    archive_bytes: &[u8],
-    entry_name: &str,
-    out_path: &Path,
-) -> Result<()> {
-    let cursor = Cursor::new(archive_bytes);
-    let decoder = flate2::read::GzDecoder::new(cursor);
-    let mut archive = tar::Archive::new(decoder);
-    let mut found = false;
-    for entry in archive
-        .entries()
-        .context("failed to iterate release archive")?
-    {
-        let mut entry = entry.context("failed to read release archive entry")?;
-        let path = entry.path().context("failed to read archive entry path")?;
-        if path.as_ref() == Path::new(entry_name) {
-            let mut bytes = Vec::new();
-            entry
-                .read_to_end(&mut bytes)
-                .context("failed to extract archive entry")?;
-            fs::write(out_path, bytes)
-                .with_context(|| format!("failed to write {}", out_path.display()))?;
-            #[cfg(unix)]
-            set_unix_executable(out_path)?;
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        anyhow::bail!("failed to locate {entry_name} in release archive");
-    }
-    Ok(())
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2115,7 +1837,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_desktop_entry_uses_theme_icon_and_canonical_wm_class() {
-        let desktop = linux_desktop_entry_contents(Path::new("/home/user/.local/bin/yggterm"), false);
+        let desktop =
+            linux_desktop_entry_contents(Path::new("/home/user/.local/bin/yggterm"), false);
         // Exec launches the supervisor (so a segfaulting window comes back);
         // TryExec must stay a bare path, which is what the spec says it is.
         assert!(desktop.contains("Exec=/home/user/.local/bin/yggterm --supervise\n"));

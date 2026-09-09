@@ -34,6 +34,7 @@ printf '  "bin": { "%s": "bin/%s" },\n' "$bin" "$bin"
 printf '  "files": ["bin/", "finalize.mjs"],\n'
 printf '  "optionalDependencies": { %s },\n' "$opts"
 printf '  "scripts": { "postinstall": "node ./finalize.mjs" },\n'
+printf '  "yggterm": { "app": { "name": "%s", "label": "%s", "icon": "", "binary": "%s", "verbs": [{ "id": "open", "label": "Open %s", "args": [], "row_spawn": true }], "context_menu": { "enabled": false, "contexts": ["workspace", "session"], "verbs": ["open"] } } },\n' "$pkgname" "$pkgname" "$bin" "$pkgname"
 printf '  "repository": { "type": "git", "url": "git+https://github.com/yggdrasilhq/%s.git" },\n' "$pkgname"
 printf '  "license": "GPL-3.0-or-later",\n  "publishConfig": { "access": "public", "provenance": true }\n}\n'
 } > "$repo/package.json"
