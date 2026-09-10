@@ -3473,7 +3473,14 @@ pub struct ServerRuntimeStatus {
     pub same_version_handoff_cooldown_remaining_ms: Option<u64>,
 }
 
-/// A session is working right now (`esc to interrupt` on its screen).
+/// A session is working right now, by ITS OWN CLI's notion of working.
+///
+/// ⚖ Owner 2026-09-10: *"only non-working daemons are auto updated"*, so this
+/// predicate is the whole difference between an update that waits for a turn
+/// and an update that eats one. It is per-CLI by law — the sidebar dot and
+/// this gate must never disagree (`ScreenWorkingPhrase`'s doc says exactly
+/// that) — and for a plain shell it is the foreground job, never a screen
+/// scrape.
 pub const HOT_RESTART_BLOCKER_WORKING: &str = "working";
 /// A session was active inside the idle window, so a swap could still eat a turn.
 pub const HOT_RESTART_BLOCKER_RECENTLY_ACTIVE: &str = "recently_active";
@@ -3498,11 +3505,27 @@ pub const HOT_RESTART_BLOCKER_ORCHESTRATING: &str = "orchestrating";
 /// Derived from the kind rather than carried as its own field: a second
 /// encoding of one fact is how the gate and the deadline would come to disagree
 /// about which sessions may be interrupted, and disagreeing here costs a
-/// delegate fleet. §5's deadline is unbuilt; this is the predicate it must read.
+/// delegate fleet.
+///
+/// ⚖ **Amended 2026-09-10 (owner ruling): WORKING joined the exempt set.** The
+/// 30-minute rule was written when the alternative to forcing was a host stuck
+/// on a stale build; the owner's model removes that alternative — *"in case of
+/// running sessions like these we should connect to the old daemon. Only
+/// non-working daemons are auto updated and reattached to the GUI."* A daemon
+/// holding a working turn is not stale-in-waiting, it is the SERVING daemon:
+/// its clients attach to it, its update waits, and the §13 stale-held
+/// notification (24 h) is what keeps the wait honest instead of silent.
+/// Interrupting the turn to reclaim the build is the exact breakage this file
+/// exists to abolish — the `continue` repair prices a lost turn, it does not
+/// un-break an interrupted user session (measured 2026-09-10: the morning's
+/// forced-path churn left both dev codex rows at the twin-writer
+/// "open in another app" screen, where no `continue` helps).
 pub fn hot_restart_blocker_is_deadline_exempt(kind: &str) -> bool {
     matches!(
         kind,
-        HOT_RESTART_BLOCKER_ORCHESTRATING | HOT_RESTART_BLOCKER_NOT_RESTORABLE
+        HOT_RESTART_BLOCKER_WORKING
+            | HOT_RESTART_BLOCKER_ORCHESTRATING
+            | HOT_RESTART_BLOCKER_NOT_RESTORABLE
     )
 }
 
@@ -3530,6 +3553,60 @@ pub enum HotRestartDeadlineVerdict {
     /// sessions the shutdown is about to interrupt — and therefore exactly the
     /// sessions owed a `continue`.
     Force { interrupted: Vec<String> },
+}
+
+/// §3's WORKING signal for one session, resolved the way the owner's model
+/// demands (2026-09-10) — **per CLI, and never a cross-CLI screen union**.
+///
+/// Why the union matcher is wrong here even though it exists: it ORs every
+/// registered CLI's phrases across a screen belonging to ONE session, so a
+/// shell whose editor shows this source file, an agent idling at a prompt that
+/// mentions another CLI's footer, or a completion trace from a sibling CLI all
+/// read as "a turn is in flight" — and with WORKING now deadline-exempt
+/// (⚖ 2026-09-10), each false positive is a daemon that never updates and a
+/// §13 notification the user cannot act on. The kind is in hand at every
+/// caller; this fn makes it impossible to forget that.
+///
+/// - **agent kind** → THAT CLI's `screen_shows_working` on its own screen.
+///   A kind whose descriptor is missing (cannot happen while the registry is
+///   total; the compiler cannot prove it) falls back to the union — adds
+///   safety, removes nothing.
+/// - **plain shell** → the foreground-job signal. ⚖ owner: *"plain shells
+///   having no fg/bg process running in them"* are the updateable class; the
+///   screen text of a shell is prose it happened to print and must never arm
+///   a working state. A background job is deliberately NOT included here:
+///   bg jobs survive a preserving handoff (the PTY fd moves with them), so
+///   they are protected by the handoff-integrity law, not by this gate —
+///   counting them would pin the daemon for as long as a `make -j` lingers.
+/// - **app row** (a Shell whose launch verb is a local app — ychrome) →
+///   `None`. An app row is RUNNING, not working (measured 2026-08-09: *"on
+///   restart all my ychromes keep on blinking"* — one long-lived foreground
+///   process per launcher shell, hours old, truthful and useless as a work
+///   signal).
+/// - anything else (Document, unknown) → `None`: their safety lives in
+///   `session_kind_state_survives_pty_loss` / the not-restorable blocker,
+///   not in what their screen happens to say.
+///
+/// `None` = "no opinion" (unreadable screen, unmeasurable shell) — the gate's
+/// fail-open bias then leans on the output-idle arm, which is the one signal
+/// that cannot lie about a streaming turn.
+fn hot_restart_gate_working_signal(
+    kind: Option<SessionKind>,
+    key_is_app_row: bool,
+    screen: Option<&str>,
+    foreground_active: Option<bool>,
+) -> Option<bool> {
+    match kind {
+        Some(kind) if kind.is_agent() => {
+            let screen = screen?;
+            Some(match yggterm_core::agent_cli::agent_cli_descriptor(kind) {
+                Some(descriptor) => descriptor.screen_shows_working(screen),
+                None => yggterm_core::screen_text_shows_agent_working(screen),
+            })
+        }
+        Some(SessionKind::Shell) if !key_is_app_row => foreground_active,
+        _ => None,
+    }
 }
 
 /// Apply §5's deadline to a blocked cold retire.
@@ -6257,8 +6334,12 @@ impl DaemonRuntime {
     /// - [`HOT_RESTART_BLOCKER_NOT_RESTORABLE`] — the session's state IS its PTY
     ///   ([`session_kind_state_survives_pty_loss`]), so destroying it is lossy no
     ///   matter how long we wait. **Permanent**, and it outranks the override.
-    /// - [`HOT_RESTART_BLOCKER_WORKING`] — a positive signal (`esc to interrupt`,
-    ///   via the shared [`yggterm_core::screen_text_shows_agent_working`] SSOT).
+    /// - [`HOT_RESTART_BLOCKER_WORKING`] — a positive signal, per CLI: the
+    ///   session's OWN descriptor phrases on its screen, or a foreground job
+    ///   for a plain shell. Never the cross-CLI union — see
+    ///   [`hot_restart_gate_working_signal`]. Deadline-exempt since the
+    ///   2026-09-10 ruling: a working turn is served by its old daemon, not
+    ///   interrupted.
     /// - [`HOT_RESTART_BLOCKER_RECENTLY_ACTIVE`] — the absence test, kept only
     ///   for restorable sessions, where 300 s of true silence really is evidence
     ///   that no turn is in flight (THE QUIET-GATE LAW: a working agent turn is
@@ -6283,13 +6364,25 @@ impl DaemonRuntime {
     ) -> Vec<HotRestartBlocker> {
         let overridden = hot_update_idle_gate_overridden();
         let threshold_ms = hot_update_idle_threshold_ms();
+        // The APP-row exemption for the shell working signal below: one lookup
+        // per gate call, not per key. See `hot_restart_gate_working_signal`.
+        let app_row_paths: std::collections::HashSet<String> = self
+            .server
+            .live_session_views()
+            .iter()
+            .filter(|view| {
+                view.kind == SessionKind::Shell
+                    && crate::launch_command_is_local_app_verb(&view.launch_command)
+            })
+            .map(|view| view.session_path.clone())
+            .collect();
         let mut blockers = Vec::new();
         for key in owned_runtime_keys {
             let runtime_path = self.terminal_runtime_key_for_path(key);
-            // Restorability first: it is the only answer that does not depend on
-            // what the session happened to be doing this instant, and it is the
-            // only one the override may not clear.
-            if !self
+            // Resolved ONCE per key: the restorable predicate and the WORKING
+            // signal must answer about the SAME kind, and resolving it twice
+            // is how the two answers drift apart.
+            let session_kind = self
                 .server
                 .live_session_kind(key)
                 // ⛔ A key with NO LIVE ROW is not the same as a row whose kind is
@@ -6309,7 +6402,11 @@ impl DaemonRuntime {
                 // previously could not — a scheme the registry does not know
                 // still falls through to the conservative refusal below, which is
                 // the case that bias was actually written for.
-                .or_else(|| yggterm_core::agent_scheme::session_kind_for_path(key))
+                .or_else(|| yggterm_core::agent_scheme::session_kind_for_path(key));
+            // Restorability first: it is the only answer that does not depend on
+            // what the session happened to be doing this instant, and it is the
+            // only one the override may not clear.
+            if !session_kind
                 .map(session_kind_state_survives_pty_loss)
                 // A key whose kind we cannot read AT ALL is not provably
                 // restorable, and the safety bias on a PTY-destroying decision is
@@ -6350,9 +6447,23 @@ impl DaemonRuntime {
             if overridden {
                 continue;
             }
-            if let Some(screen) = self.terminals.session_screen_snapshot(&runtime_path)
-                && yggterm_core::screen_text_shows_agent_working(&screen)
-            {
+            // ⚖ 2026-09-10: the WORKING signal is PER-KIND (see
+            // `hot_restart_gate_working_signal`). The kind-agnostic union this
+            // site used to call matched ANY CLI's phrases against ANY session's
+            // screen — an agent idle at its own prompt reading a sibling CLI's
+            // footer, a shell whose screen quoted this source file — each a
+            // phantom WORKING blocker, and each one a daemon that never
+            // converges ([[finding-stale-daemon-trap]] is exactly that shape).
+            let working = hot_restart_gate_working_signal(
+                session_kind,
+                app_row_paths.contains(key) || app_row_paths.contains(&runtime_path),
+                self.terminals
+                    .session_screen_snapshot(&runtime_path)
+                    .as_deref(),
+                self.terminals
+                    .session_foreground_process_active(&runtime_path),
+            );
+            if working == Some(true) {
                 blockers.push(HotRestartBlocker {
                     session_key: key.clone(),
                     kind: HOT_RESTART_BLOCKER_WORKING.to_string(),
@@ -22153,6 +22264,14 @@ fn spawn_disk_binary_version_poll(
         // the trace: every 15th poll ≈ 5 minutes. Not silence — a stale daemon must
         // stay mineable — just not one identical line every 20 seconds forever.
         const SETTLED_DEFERRAL_HEARTBEAT_EVERY_N_POLLS: u32 = 15;
+        // ⚖ §13 (owner, 2026-09-10): a daemon held back from an update must
+        // TELL the user after a day, naming the rows that hold it — *"so that
+        // user understands what yggterm understands"*. With WORKING now
+        // deadline-exempt a held daemon is legitimate and possibly long-lived,
+        // and a legitimate wait that stays silent is indistinguishable from the
+        // stale-daemon trap. Repeat daily while the hold persists.
+        const STALE_HELD_NOTIFY_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+        let mut deferred_held_notified_at_ms: u64 = 0;
         let mut no_successor_polls: u32 = 0;
         let mut stale_sweep_countdown = STALE_SWEEP_EVERY_N_POLLS;
         // Deferral bookkeeping: the reason we last WROTE, how many polls we have
@@ -22520,7 +22639,7 @@ fn spawn_disk_binary_version_poll(
                 let owned = rt.terminals.session_keys();
                 rt.hot_update_idle_gate_block_reason(&owned)
             };
-            if let Some(reason) = block_reason {
+            if let Some(reason) = block_reason.clone() {
                 // PROBE hot_update_deferred: the ONLY durable record of why a daemon is
                 // still running an old build. Without it a stale daemon is invisible
                 // after the fact — guihost ran 2.10.3 for 19h44m with 2.10.13 on disk and
@@ -22578,6 +22697,55 @@ fn spawn_disk_binary_version_poll(
                 let settled = !blockers.is_empty()
                     && blockers.iter().all(|blocker| blocker.permanent);
                 deferred_polls = deferred_polls.saturating_add(1);
+                // ⚖ §13 (owner, 2026-09-10): after a day of being held back,
+                // SAY SO — once per day while the hold persists, naming the
+                // session rows that hold the update, so the user sees what
+                // yggterm sees and can clear a row (or ignore the notice
+                // knowing it is a working turn, not a wedge). Best-effort on
+                // purpose: a host with no notifier still gets the trace event,
+                // and a failed notification must never disturb the poll.
+                {
+                    let held_ms = deferred_polls.saturating_mul(POLL_INTERVAL_MS);
+                    let since_notified =
+                        held_ms.saturating_sub(deferred_held_notified_at_ms);
+                    if held_ms >= STALE_HELD_NOTIFY_AFTER_MS
+                        && since_notified >= STALE_HELD_NOTIFY_AFTER_MS
+                    {
+                        deferred_held_notified_at_ms = held_ms;
+                        let held_by: Vec<String> = blockers
+                            .iter()
+                            .map(|blocker| {
+                                format!("{} ({})", blocker.session_key, blocker.kind)
+                            })
+                            .collect();
+                        let detail = format!(
+                            "yggterm {} update held {}h by {} session(s): {}",
+                            SERVER_PROTOCOL_VERSION,
+                            held_ms / 3_600_000,
+                            held_by.len(),
+                            held_by.join(", "),
+                        );
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "stale_daemon_update_held_24h",
+                            serde_json::json!({
+                                "held_ms": held_ms,
+                                "current_version": SERVER_PROTOCOL_VERSION,
+                                "current_pid": std::process::id(),
+                                "reason": reason,
+                                "held_by": held_by,
+                                "settled": settled,
+                            }),
+                        );
+                        #[cfg(not(test))]
+                        let _ = yggterm_platform::send_user_notification(
+                            "Yggterm update waiting",
+                            &detail,
+                        );
+                    }
+                }
                 // Every poll while ANY blocker is clearable — that is the case the
                 // probe was written for, and a daemon inching toward a swap is worth
                 // over-logging. When every blocker is PERMANENT the next thousand
@@ -22651,6 +22819,14 @@ fn spawn_disk_binary_version_poll(
                 deferred_reason_last = Some(reason);
                 continue;
                 }
+            } else {
+                // The gate cleared — the hold is over. The §13 24-hour clock
+                // restarts from zero on the NEXT hold instead of inheriting
+                // this one's age, and the reason bookkeeping starts fresh so
+                // the next hold's first event is written as a change.
+                deferred_polls = 0;
+                deferred_held_notified_at_ms = 0;
+                deferred_reason_last = None;
             }
             // B4: make it loud if this cold shutdown would strand rows a
             // reachable successor does not cover (observation only).
@@ -28369,9 +28545,10 @@ mod tests {
         HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING,
         HOT_RESTART_FORCED_SWAP_DEADLINE_MS, HotRestartBlocker, HotRestartDeadlineVerdict,
         hot_restart_block_reason_summary, hot_restart_blocker_is_deadline_exempt,
-        ServerRequest, ShadowAccess, gate_screen_tail, hot_restart_blockers_actionable_first,
-        hot_restart_deadline_verdict, hot_update_handoff_would_refuse_binary, role_gate,
-        DAEMON_REQUEST_IO_TIMEOUT_MS, PEER_TRIAGE_PROBE_BUDGET_MS,
+        hot_restart_gate_working_signal, ServerRequest, ShadowAccess, gate_screen_tail,
+        hot_restart_blockers_actionable_first, hot_restart_deadline_verdict,
+        hot_update_handoff_would_refuse_binary, role_gate, DAEMON_REQUEST_IO_TIMEOUT_MS,
+        PEER_TRIAGE_PROBE_BUDGET_MS,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
     #[cfg(unix)]
@@ -30033,11 +30210,12 @@ mod tests {
         );
     }
 
-    // The predicate §5's unbuilt deadline must read. Getting this wrong in the
-    // permissive direction strands a delegate fleet; getting it wrong in the
-    // strict direction is what the 30-minute rule exists to end.
+    // The predicate §5's deadline reads. ⚖ Amended 2026-09-10: WORKING is
+    // exempt — the old assertion here ("a working turn is exactly what the
+    // deadline is allowed to interrupt") is precisely the behaviour the owner's
+    // old-daemon-serves ruling retires, and its test died with it.
     #[test]
-    fn only_the_two_unwaitable_kinds_are_exempt_from_the_thirty_minute_deadline() {
+    fn only_the_unwaitable_kinds_are_exempt_from_the_thirty_minute_deadline() {
         assert!(hot_restart_blocker_is_deadline_exempt(
             HOT_RESTART_BLOCKER_ORCHESTRATING
         ));
@@ -30045,17 +30223,108 @@ mod tests {
             HOT_RESTART_BLOCKER_NOT_RESTORABLE
         ));
         assert!(
-            !hot_restart_blocker_is_deadline_exempt(HOT_RESTART_BLOCKER_WORKING),
-            "a working turn is exactly what the deadline is allowed to interrupt \
-             — it is repaired by the `continue` injection"
+            hot_restart_blocker_is_deadline_exempt(HOT_RESTART_BLOCKER_WORKING),
+            "⚖ owner 2026-09-10: a working turn is never auto-interrupted — the \
+             old daemon keeps serving it and the update waits (§13 notification \
+             keeps the wait honest)"
         );
         assert!(!hot_restart_blocker_is_deadline_exempt(
             HOT_RESTART_BLOCKER_RECENTLY_ACTIVE
         ));
     }
 
+    // ⚖ 2026-09-10: the WORKING signal is per-kind. Each test here is a
+    // contamination shape the old kind-agnostic union misclassified.
+    #[test]
+    fn the_gate_working_signal_answers_per_cli_not_by_union() {
+        // A Claude row showing ITS OWN footer: working, by its own matcher.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ClaudeCode),
+                false,
+                Some("esc to interrupt · ctrl+b background"),
+                Some(false),
+            ),
+            Some(true)
+        );
+        // The SAME screen text on a shell must say nothing: a shell is judged
+        // by its foreground job, never by an agent footer it happened to print
+        // (or by an editor showing this source file).
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::Shell),
+                false,
+                Some("esc to interrupt · ctrl+b background"),
+                Some(false),
+            ),
+            Some(false)
+        );
+        // A Claude row whose screen carries a DIFFERENT CLI's working needle
+        // (qwen's `esc to cancel` — also common prose in permission prompts):
+        // its own matcher says no, and the union must not overrule it.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ClaudeCode),
+                false,
+                Some("esc to cancel"),
+                Some(false),
+            ),
+            Some(false)
+        );
+        // An unreadable screen yields no opinion even for an agent.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ClaudeCode),
+                false,
+                None,
+                Some(false),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_gate_working_signal_reads_a_shell_by_its_foreground_job() {
+        // A silent foreground job (`sleep 300`, a build writing to a file) is
+        // the one shell working state no output-based signal can see.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::Shell),
+                false,
+                Some("user@host:~$ "),
+                Some(true),
+            ),
+            Some(true)
+        );
+        // An idle shell at its prompt: non-working — the updateable class.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::Shell),
+                false,
+                Some("user@host:~$ "),
+                Some(false),
+            ),
+            Some(false)
+        );
+        // An APP row (ychrome) is RUNNING, not working: its foreground
+        // process lives for hours and must never pin the gate.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::Shell),
+                true,
+                Some("ychrome: web surface open"),
+                Some(true),
+            ),
+            None
+        );
+    }
+
     /// §5, the ruling itself: at 30 minutes the wait ends, and the sessions it
-    /// ends on are named so they can be repaired.
+    /// ends on are named so they can be repaired. ⚖ Amended 2026-09-10: a
+    /// WORKING blocker is now exempt, so a mix containing one holds the swap
+    /// open past the deadline instead of forcing — the force arm survives only
+    /// for clearable (recently-active) sets, which by construction have just
+    /// gone quiet.
     #[test]
     fn the_deadline_forces_the_swap_and_names_who_it_interrupts() {
         let blockers = vec![
@@ -30069,8 +30338,26 @@ mod tests {
         );
         assert_eq!(
             hot_restart_deadline_verdict(&blockers, HOT_RESTART_FORCED_SWAP_DEADLINE_MS),
+            HotRestartDeadlineVerdict::ExemptBlocker {
+                kind: HOT_RESTART_BLOCKER_WORKING.to_string(),
+                session_key: "local://a".to_string(),
+            },
+            "⚖ owner 2026-09-10: a working session outlives the deadline — the \
+             old daemon keeps serving it; nothing is interrupted, so there is \
+             no interrupted list to build"
+        );
+        // The force arm itself stays provable on an all-clearable set: only a
+        // deadline-stale RECENTLY_ACTIVE blocker (quiet again after the forced
+        // wait) can still reach it.
+        let interruptible = vec![blocker(
+            "local://b",
+            HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
+            Some(0),
+        )];
+        assert_eq!(
+            hot_restart_deadline_verdict(&interruptible, HOT_RESTART_FORCED_SWAP_DEADLINE_MS),
             HotRestartDeadlineVerdict::Force {
-                interrupted: vec!["local://a".to_string(), "local://b".to_string()],
+                interrupted: vec!["local://b".to_string()],
             },
             "the interrupted list is produced HERE — after the swap every one of \
              these sessions looks idle and the list cannot be rebuilt"
@@ -30082,15 +30369,22 @@ mod tests {
     /// A cold shutdown kills every PTY this daemon owns, so there is no version
     /// of "interrupt the working one but spare the shell beside it". Getting
     /// this wrong strands a delegate fleet or destroys a plain shell — the two
-    /// outcomes the exemption exists to prevent.
+    /// outcomes the exemption exists to prevent. ⚖ 2026-09-10: WORKING joined
+    /// the exempt kinds, so the clearable blocker beside the exempt one is a
+    /// recently-active session, not a working one.
     #[test]
     fn one_exempt_blocker_holds_the_deadline_open_forever() {
         for exempt_kind in [
+            HOT_RESTART_BLOCKER_WORKING,
             HOT_RESTART_BLOCKER_ORCHESTRATING,
             HOT_RESTART_BLOCKER_NOT_RESTORABLE,
         ] {
             let blockers = vec![
-                blocker("local://working", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+                blocker(
+                    "local://clearable",
+                    HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
+                    Some(0),
+                ),
                 blocker("local://exempt", exempt_kind, Some(0)),
             ];
             assert_eq!(

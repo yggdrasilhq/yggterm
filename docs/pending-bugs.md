@@ -18,6 +18,7 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+
 ## ⛔ [11.57] A REMOTE RUNTIME LOST TO A DAEMON HANDOVER IS UNOWNABLE FOREVER — THE RESIZE RE-QUEUE BURNS ITS RETRIES AGAINST A CORPSE AND THE ROW COMPOSTS ITS SCREEN
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

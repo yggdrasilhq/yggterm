@@ -65,7 +65,7 @@ states, and only one of them blocks:
 |---|---|---|
 | **IDLE** | no turn in flight | no |
 | **BLOCKED-ON-HUMAN** | stopped at a question, a permission prompt, or any dialog awaiting the owner | **no — owner-ruled** |
-| **WORKING** | a turn is genuinely in flight | yes, up to the deadline (§5) |
+| **WORKING** | a turn is genuinely in flight | yes — **and past the deadline too, since the 2026-09-10 ruling (§5)** |
 | **ORCHESTRATING** | a turn in flight that is itself running sub-agents | yes, **without deadline** (§6) |
 
 **BLOCKED-ON-HUMAN is not working, and this is the owner's explicit call:**
@@ -74,6 +74,35 @@ restarted and considered not working."* A session waiting on a human may wait
 forever; treating that as activity is how a gate written against silence
 inverts into a gate that never opens. ⚠ The old gate scored these as busy,
 because a question prompt is *output*, and output bumps the clock.
+
+### §3.1 What "working" means, per CLI (2026-09-10)
+
+⚖ Owner: *"only non-working daemons are auto updated and reattached to the
+GUI."* The whole model therefore leans on ONE predicate, and the ruling on what
+it may read is strict:
+
+- **An agent session is working only by ITS OWN CLI's phrases** — the
+  descriptor's `working_screen_phrases` matched against that session's screen,
+  never the union across every registered CLI. The union is the shape that made
+  the indicator "buggy for all CLIs except codex, claude, and plain shells":
+  one CLI's completion trace, or prose on an unrelated row's screen, armed
+  another CLI's work signal. The sidebar dot and this gate consume the same
+  per-CLI matcher and must never disagree.
+- **A plain shell is working iff a foreground job of its own is running** —
+  the PTY's foreground process group. A shell's screen text is prose it
+  happened to print and must never arm a working state. A background job is
+  deliberately not part of this predicate: bg jobs survive a preserving
+  handoff (the PTY fd moves with them), so they are protected by the
+  handoff-integrity law, not by the gate.
+- **An app row (a Shell whose launch verb is a local app — e.g. a ychrome
+  launcher) is RUNNING, not working**, by design: its one long-lived
+  foreground process would otherwise pin every update forever.
+- **The phrase table is DATA and goes stale silently.** It is audited against
+  the live CLIs — drive each CLI in a PTY, read its working screen through
+  `server gate-screen`, and fix the needle — not argued from memory. The
+  audit is standing campaign work (pending-bugs [11.93]); a CLI whose working
+  footer the table misses reads IDLE mid-turn, which is the dangerous
+  direction: the update fires into a live turn.
 
 ## 4. Queue, do not poll
 
@@ -108,6 +137,35 @@ path where nothing has swapped and the host stays stale. Under a preserving
 handoff the successor is already serving every row, so what remains is ownership
 tidiness — never worth interrupting a live turn for, and interrupting for it
 would be the bare timeout the old prohibition was written about.
+
+### §5.1 Amended 2026-09-10 (owner ruling): WORKING is exempt — the old daemon serves
+
+⚖ Owner: *"In case of running sessions like these we should connect to the old
+daemon. Only non-working daemons are auto updated and reattached to the GUI."*
+
+The 30-minute force was written for a world where the only alternative to
+forcing was a host stuck on a stale build. That world is gone: **version
+coexistence is legitimate** — a daemon holding a working turn is not
+stale-in-waiting, it is the SERVING daemon for the sessions it holds, and its
+clients keep attaching to it. From today:
+
+- `WORKING` joins `ORCHESTRATING` and `NOT_RESTORABLE` as deadline-exempt. The
+  automatic update path never interrupts a mid-turn session; the update lands
+  when the daemon goes quiet.
+- The force arm itself remains for the one set it can still honestly fire on:
+  deadline-stale `recently_active` blockers — a session quiet before the wait
+  began and still quiet at its end. The `continue` repair travels with it,
+  unchanged, for that case and for the user-initiated hot-restart verb, where
+  a human pressed the button that may interrupt.
+- **What keeps a legitimate wait honest is §13**: after a day held back, the
+  daemon tells the user which rows hold it. A wait that cannot be interrupted
+  must at least be visible.
+
+Measured the morning of the ruling, on the GUI host and on dev: a same-version
+newer-build rotation released only 2 of 4 owned sessions, left the predecessor
+unreachable by name holding 9 PTY masters, and both dev codex rows ended at
+the twin-writer *"open in another app"* screen — a state no `continue`
+repairs. That is the cost this amendment retires.
 
 ## 6. The exemption: a session running sub-agents is waited for
 
@@ -218,3 +276,85 @@ same-version newer build arms a handover exactly as a version bump does.
 Under this spec a "stale daemon" is: older version, OR same version with
 different (newer) build bytes on disk. The bidirectional convergence spec
 carries the same rule for the client side.
+
+## 11. The update model — old daemons serve, quiet daemons update (2026-09-10)
+
+⚖ Owner, verbatim: *"One daemon or the client is updated. Then the client is
+auto updated no issues. But only non-working daemons are auto updated and
+reattached to the GUI. This includes plain shells having no fg/bg process
+running in them."*
+
+The laws this adds on top of §3/§5:
+
+1. **The client never gates the daemon.** A GUI/CLI version skew is ordinary
+   and self-healing — the client updates itself and reconnects. Nothing in
+   the update path may break a running session because a CLIENT is behind.
+2. **A daemon with any working session is not auto-updated.** It keeps
+   serving; its clients attach to IT (the preserved-owner path is the
+   mechanism; §9's observability contract is what keeps that attach honest).
+   When the last turn ends and the idle window passes, the normal arms take
+   over: preserving handoff if a successor exists, cold retire otherwise.
+3. **A plain shell with no fg/bg process is the updateable case, and it is
+   moved, not killed** — by full-fidelity snapshot (§12) when a successor
+   cannot simply inherit the PTY, and by the fd handoff when it can.
+4. **"The daemon the row is on" is the user-visible truth.** The daemon rail
+   and the census must keep naming which process serves which row — including
+   a predecessor that is draining — so "connect to the old daemon" is
+   something the user can SEE, not a private arrangement.
+
+## 12. The plain-shell snapshot law — full color, not just text (2026-09-10)
+
+A plain shell's state IS its PTY (§`session_kind_state_survives_pty_loss`),
+which is why shells pinned cold retires forever as permanent blockers and
+why "very stale daemons kept running" was a standing fear. The owner's model
+makes shells movable:
+
+- **On a swap, a quiet shell's terminal state is captured as a FRAME SNAPSHOT
+  in full color fidelity** — the same fidelity as any frame snapshotting: SGR
+  attributes, 24-bit color, cursor position, alternate screen state — never a
+  stripped plain-text transcript. The daemon's own vt100 screen model is the
+  source of truth (it watches the PTY from birth and already holds the
+  rendered grid with attributes).
+- **After the update, the snapshot is PASTED back** into the fresh PTY before
+  the row is revealed, so the user's scrollback-visible screen, colors and
+  prompt position survive the swap. The entire scrollback history moves with
+  the same mechanism.
+- A shell with a foreground job is NOT snapshot-moved — it is working (§3.1),
+  so its daemon simply waits (§11.2). The snapshot path exists for the quiet
+  shell, replacing its old standing as an unmovable blocker.
+- Fidelity bar: a user staring at a shell row across an update must not be
+  able to tell it swapped — colors, formatting and cursor position included.
+  The falsifier is exactly that: drive a shell that paints colored output,
+  swap the daemon under it, compare the frame before and after.
+
+## 13. The stale-held notification — a wait you cannot see is a wedge (2026-09-10)
+
+With WORKING deadline-exempt (§5.1), a daemon can be legitimately held from
+an update for a long time — and the fleet has already lived the version of
+this that goes wrong (a 2.10.3 daemon serving beside a 2.10.13 build for
+19h44m, invisible; an eighteen-daemon stack, the oldest 20.6 days). The
+owner's ruling: *"notify the user after 1 day of stale daemon being hold
+back, by which session row, so that user understands what yggterm
+understands."*
+
+- **After 24 hours of continuous deferral, the daemon raises a desktop
+  notification naming the holding session rows and their blocker kinds** —
+  `stale_daemon_update_held_24h` in the trace, best-effort `notify-send` on
+  the host. It repeats once per day while the hold persists.
+- **When the hold clears, the clock resets** — a fresh hold counts from zero,
+  so the notification says what is true NOW, not what was true last week.
+- The census and the daemon rail keep carrying the same answer synchronously:
+  a reader must be able to go from the notification to the row to the remedy
+  without grepping a trace.
+
+### §13.1 Named remainder — the lingering PREDECESSOR owes the same notice
+
+The notification above arms on the cold-retire deferral (the daemon that
+cannot retire). The other stale-daemon shape is the HANDOFF PREDECESSOR that
+drained nothing and lingers serving its rows — measured 2026-09-10 09:19 on
+the GUI host: a predecessor unreachable by name still holding 9 PTY masters
+while the successor owned the canonical socket. A predecessor that still
+owns rows 24 h after its handoff owes the user the identical notification
+(same trace name, `role: predecessor`), and its retirement plane's
+verdicts ([11.67] family) should cite it. NOT YET BUILT — filed here so the
+next session lands it with the same falsifier discipline.
