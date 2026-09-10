@@ -73,7 +73,11 @@ or SSH request is not the effect proof; run `ynpm list` and `ynpm check` on the
 target. A same-version archive still replaces changed four-product bytes by
 atomic rename, allowing release-only polish to reach an existing generation;
 the syncing manager is reasserted to both `ynpm` and `ynpx` aliases after the
-import. `export` is the machine-readable peer protocol; it refuses dev trees.
+import. Dev fleet pushes bootstrap from the manager process executing the
+transaction before falling back to canonical aliases; the integrated CLI
+destination is last because it can hold an older yggterm dev manager after a
+production handback. `export` is the machine-readable peer protocol; it refuses
+dev trees.
 
 Run `ynpm doctor` on a new host before a fleet sync. It resolves
 `HOME`/`USERPROFILE`, expands `~`, reports absolute manager/destination/scratch
@@ -85,6 +89,10 @@ The three non-npm integrated sources (uv, vendor installer, and manual/self
 updater) stay visible in the inventory with their source. Do not relabel them
 as npm packages or delete system-owned files to make the inventory look
 uniform.
+
+If a package identity changes while its `yggterm.app.name` stays the same,
+`ynpm remove` deletes only the stale generation. It preserves the shared
+published binary and app registration until no remaining package owns them.
 
 ## Dev-first workflow
 

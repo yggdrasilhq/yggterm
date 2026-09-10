@@ -284,6 +284,12 @@ updates its own state and publication links; transfer archives are removed
 after the import. A remote host with no ynpm is bootstrapped with the invoking
 binary by an atomic replacement.
 
+Fleet dev pushes bootstrap peers from the manager process that is executing
+the transaction, then fall back to the canonical user-local aliases. The
+integrated CLI destination is last: it can contain an older yggterm dev
+manager after a production handback and must never downgrade the manager
+used to write package metadata.
+
 `export --metadata` is the small peer protocol used for that discovery;
 `export --archive` adds a verified production generation to the metadata
 response. It refuses dev generations and re-runs every bin's version gate, so
@@ -295,6 +301,11 @@ decision.
 The remote import repeats the runs-before-publish gate. A transport success is
 not the proof: each host must report the imported package, and a later
 `ynpm list`/`ynpm check` is the state read-back.
+
+When package identities change but retain an app name, `ynpm remove` removes
+only the stale package generation and preserves the app registration and
+published binary while another package still owns them. The registration is
+removed only when its final owning package is removed.
 
 ## Source transports
 
