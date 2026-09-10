@@ -29,7 +29,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 DEFAULT_MEMORY_ROOT = Path(os.environ.get("YGGTERM_MEMORY_ROOT", Path.home() / ".yggterm" / "memory"))
 ARCHIVE_ROOT = Path.home() / ".yggterm" / "memory-archive"
@@ -101,15 +101,27 @@ def validate_namespace(namespace: str) -> str:
 
 
 def validate_door_filename(filename: str) -> str:
-    """Return a single Markdown filename that cannot escape its namespace."""
+    """Return a namespace-relative door path that cannot escape its namespace.
+
+    A door is usually a single Markdown filename. Doors that live in a
+    namespace subdirectory (e.g. ``campaign-cli-integration/codex.md``, the
+    per-CLI doors of the 3.3.0 integration campaign) name that subpath —
+    the journal, watermarks and sync all key doors by this string, so a
+    subpath door is a first-class door everywhere a flat one is. Every
+    path segment must be a plain, non-hidden filename: no absolute paths,
+    no ``..``, no backslashes, no control characters.
+    """
     if not isinstance(filename, str) or not filename:
         raise ValueError("memory door filename must not be empty")
-    if filename in {".", ".."} or Path(filename).name != filename:
-        raise ValueError(f"memory door must be a filename, not a path: {filename!r}")
-    if any(char in filename for char in ("/", "\\", "\x00")):
+    if "\\" in filename or "\x00" in filename:
         raise ValueError(f"invalid character in memory door filename: {filename!r}")
     if any(ord(char) < 32 for char in filename):
         raise ValueError(f"invalid control character in memory door filename: {filename!r}")
+    segments = filename.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise ValueError(
+            f"memory door must be a relative path under its namespace: {filename!r}"
+        )
     return filename
 
 
@@ -355,7 +367,9 @@ def backup_native_file(root: Path, harness: str, namespace: str, path: Path) -> 
     if not path.is_file():
         return
     digest = file_sha256(path)
-    target = root.parent / "memory-backups" / harness / namespace / path.name / f"{digest}.md"
+    # Subpath doors keep their directory prefix in the backup path so two
+    # sub/sub.md and sub2/sub.md cannot evict each other's safety copies.
+    target = root.parent / "memory-backups" / harness / namespace / path.parent.name / path.name / f"{digest}.md"
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
@@ -1669,20 +1683,21 @@ def materialize_store(root: Path, namespaces: set[str] | None = None) -> dict:
     for (namespace, filename), records in groups.items():
         if namespaces is not None and namespace not in namespaces:
             continue
-        if filename == "MEMORY.md":
+        if filename == "MEMORY.md" or filename.endswith("/MEMORY.md"):
             # Namespace indexes are per-host hand-curated state. Index-line
             # edits carry no journal events, so materializing a journaled
             # MEMORY.md head silently rewound every hand-appended line
             # (fleet-wide 2026-08-22..09-09 defect, reintroduced by the
             # 09-09 deploy that predated this fix). Old heads stay in the
-            # store; they are simply never materialized again.
+            # store; they are simply never materialized again. The guard
+            # covers subdirectory doors too (e.g. sub/MEMORY.md).
             continue
         heads = causal_heads_for(root, namespace, filename, records)
         if not heads:
             continue
 
         live = get_namespace_dir(root, namespace) / filename
-        conflict_dir = root / "conflicts" / namespace / filename
+        conflict_dir = root / "conflicts" / namespace / filename.replace("/", "__")
         if conflict_dir.exists():
             shutil.rmtree(conflict_dir)
 
@@ -1915,11 +1930,14 @@ def cmd_ack(args):
             watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             # Record current hashes of all doors in ns matching this harness
             ns_dir = get_namespace_dir(root, ns)
-            for fpath in ns_dir.glob("*.md"):
+            for fpath in sorted(ns_dir.rglob("*.md")):
+                if not fpath.is_file():
+                    continue
+                fname_key = fpath.relative_to(ns_dir).as_posix()
                 content = fpath.read_text(encoding="utf-8")
                 _, _, target_h = extract_metadata_and_summary(content, fpath.name)
                 if matches_target_harness(target_h, harness):
-                    ns_map[fpath.name] = file_sha256(fpath)
+                    ns_map[fname_key] = file_sha256(fpath)
             save_watermark(root, watermark)
             if args.json:
                 print(json.dumps({"status": "ok", "acked": "all", "seq": latest_seq}))
@@ -1965,11 +1983,19 @@ def cmd_publish(args):
     lock = _flock_open(root / ".ygg-memory.lock")
     try:
         ns_dir = get_namespace_dir(root, ns)
-        dest_filename = source_path.name
+        # The door name is the source basename unless --dest names a
+        # namespace-relative subpath (e.g. campaign-cli-integration/codex.md).
+        # Journal, watermark and index all key on this string, so a subpath
+        # door is a first-class door everywhere a flat one is.
+        if getattr(args, "dest", None) and args.dest.strip():
+            dest_filename = validate_door_filename(args.dest.strip())
+        else:
+            dest_filename = source_path.name
         dest_path = ns_dir / dest_filename
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         content = source_path.read_text(encoding="utf-8")
-        kind, summary, extracted_target = extract_metadata_and_summary(content, dest_filename)
+        kind, summary, extracted_target = extract_metadata_and_summary(content, Path(dest_filename).name)
 
         if args.summary:
             summary = args.summary.strip()
@@ -2010,7 +2036,8 @@ def cmd_publish(args):
         try:
             memory_index = ns_dir / "MEMORY.md"
             hook = (summary or kind or "door").replace("\n", " ").strip() or "door"
-            index_line = f"- [{dest_filename}]({dest_filename}) — {hook}"
+            door_label = Path(dest_filename).name
+            index_line = f"- [{door_label}]({dest_filename}) — {hook}"
             if memory_index.exists():
                 idx_content = memory_index.read_text(encoding="utf-8")
                 if f"]({dest_filename})" not in idx_content:
@@ -2081,6 +2108,35 @@ def cmd_resolve(args):
         _flock_close(lock)
 
 
+def _relative_md_names(directory: Path, exclude=None) -> set[str]:
+    """Namespace-relative names of every Markdown file under ``directory``.
+
+    Subpath names are what make subdirectory doors syncable: the three-way
+    sync keys every door by this string, and ``local_dir / name`` /
+    ``ns_dir / name`` resolve it on either side.
+    """
+    if not directory.is_dir():
+        return set()
+    names = set()
+    for path in directory.rglob("*.md"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(directory).as_posix()
+        if exclude and exclude(relative):
+            continue
+        names.add(relative)
+    return names
+
+
+def _is_native_pinned_door(relative: str) -> bool:
+    """The native ``pinned/yggterm/`` subtree is the global namespace's
+    delivery shelf, owned by the fleet-door projection — never project-door
+    sync, or every sync would ingest the shared global doors into every
+    project namespace."""
+    parts = PurePosixPath(relative).parts
+    return len(parts) >= 2 and parts[0] == "pinned" and parts[1] == "yggterm"
+
+
 def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir: Path) -> tuple:
     """Three-way sync one project-memory directory without mtime arbitration."""
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -2101,11 +2157,9 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
         backend_identities[ns] = backend_identity
     sync_state = watermark.setdefault("sync_state", {}).setdefault(ns, {})
     version_state = watermark.setdefault("sync_versions", {}).setdefault(ns, {})
-    names = {
-        path.name for path in local_dir.glob("*.md")
-    } | {
-        path.name for path in ns_dir.glob("*.md")
-    } | set(sync_state)
+    names = _relative_md_names(
+        local_dir, exclude=_is_native_pinned_door
+    ) | _relative_md_names(ns_dir) | set(sync_state)
 
     for fname in sorted(names):
         local = local_dir / fname
@@ -2135,13 +2189,14 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
             nonlocal in_count, del_count
             if local_exists:
                 content = local.read_text(encoding="utf-8")
-                kind, summary, native_target = extract_metadata_and_summary(content, fname)
+                kind, summary, native_target = extract_metadata_and_summary(content, Path(fname).name)
+                hub.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(local, hub)
                 action = "upsert"
                 in_count += 1
             else:
                 previous = hub.read_text(encoding="utf-8") if hub_exists else ""
-                kind, summary, native_target = extract_metadata_and_summary(previous, fname)
+                kind, summary, native_target = extract_metadata_and_summary(previous, Path(fname).name)
                 if hub.exists():
                     hub.unlink()
                 action = "delete"
@@ -2182,6 +2237,7 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
             if not local.is_file() or file_sha256(local) != hub_digest:
                 if local.is_file():
                     backup_native_file(root, harness, ns, local)
+                local.parent.mkdir(parents=True, exist_ok=True)
                 temp = local.with_suffix(local.suffix + ".tmp")
                 shutil.copyfile(hub, temp)
                 temp.replace(local)
@@ -2708,7 +2764,7 @@ def main():
 
     # get
     p_get = subparsers.add_parser("get", parents=[common_parser], help="Retrieve body of a specific memory door")
-    p_get.add_argument("--file", required=True, help="Memory filename (e.g. finding-pty-grid-ssot.md)")
+    p_get.add_argument("--file", required=True, help="Memory door path relative to the namespace (e.g. finding-pty-grid-ssot.md or campaign-cli-integration/codex.md)")
     p_get.add_argument("--lines", type=int, default=None, help="Show only the first N lines (a loud slice marker goes to stderr)")
     p_get.add_argument("--grep", default=None, help="Show only lines matching this regex (a loud slice marker goes to stderr)")
 
@@ -2720,6 +2776,7 @@ def main():
     # publish
     p_pub = subparsers.add_parser("publish", parents=[common_parser], help="Publish a local file into unified memory")
     p_pub.add_argument("--file", required=True, help="Source markdown file to publish")
+    p_pub.add_argument("--dest", default=None, help="Door path relative to the namespace; may include subdirectories (e.g. campaign-cli-integration/codex.md). Defaults to the source basename.")
     p_pub.add_argument("--kind", default=None, help="Kind (finding, campaign, spec, feedback, steer)")
     p_pub.add_argument("--summary", default=None, help="One-line summary description")
     p_pub.add_argument("--target-harness", "--scope", dest="target_harness", default=None, help="Target harness scope ('all' or specific: gemini, claude, grok, codex)")

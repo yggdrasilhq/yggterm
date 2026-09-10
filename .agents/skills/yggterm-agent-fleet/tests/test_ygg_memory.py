@@ -337,6 +337,108 @@ Never wait on human if clear directive exists.
         check("muse sync of unknown namespace created no dirs",
               sorted(p.name for p in muse_projects.iterdir()) == before)
 
+        # 12. Subpath doors — the campaign-cli-integration/<cli>.md shape
+        # (dream ACK-9cdea1ec3a / ACK-2dc9a05503): publish --dest, get, ack,
+        # and the three-way sync must treat a subpath door exactly like a
+        # flat one, while pinned/yggterm stays OUT of project-door sync.
+        check("validator accepts subpath door",
+              mod.validate_door_filename("campaign-cli-integration/codex.md")
+              == "campaign-cli-integration/codex.md")
+        for bad in ("../escape.md", "/abs.md", "a\\b.md", "sub//x.md",
+                    "sub/./x.md", "sub/../x.md", "sub/", "./x.md", ".."):
+            try:
+                mod.validate_door_filename(bad)
+                check(f"validator rejects {bad!r}", False)
+            except ValueError:
+                check(f"validator rejects {bad!r}", True)
+
+        sub_door_src = tmp_root / "codex-door.md"
+        sub_door_src.write_text("""---
+name: campaign-cli-integration-codex
+description: "Per-CLI door for codex (11.6.1) — measured reattach facts."
+metadata:
+  type: campaign
+---
+
+# codex — integration door
+""", encoding="utf-8")
+        args_pub.dest = "campaign-cli-integration/codex.md"
+        args_pub.file = str(sub_door_src)
+        args_pub.root = str(root)
+        args_pub.ns = ns
+        args_pub.harness = "claude"
+        args_pub.json = True
+        mod.cmd_publish(args_pub)
+        sub_door = ns_dir / "campaign-cli-integration" / "codex.md"
+        check("publish --dest wrote subdirectory door", sub_door.exists())
+        all_entries = mod.read_journal_entries(root, after_seq=0, namespace=ns)
+        check("journal keys the subpath door by its subpath",
+              any(e.get("file") == "campaign-cli-integration/codex.md" for e in all_entries))
+        check("namespace index links the subpath",
+              "](campaign-cli-integration/codex.md)" in mem_index.read_text(encoding="utf-8"))
+        republish_markers = mem_index.read_text(encoding="utf-8").count(
+            "](campaign-cli-integration/codex.md)")
+        mod.cmd_publish(args_pub)
+        check("publish --dest is idempotent in the index",
+              mem_index.read_text(encoding="utf-8").count(
+                  "](campaign-cli-integration/codex.md)") == republish_markers)
+
+        class ArgsGet:
+            pass
+
+        args_get = ArgsGet()
+        args_get.root = str(root)
+        args_get.ns = ns
+        args_get.file = "campaign-cli-integration/codex.md"
+        args_get.grep = None
+        args_get.lines = None
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.cmd_get(args_get)
+        check("get --file reads a subpath door", "integration door" in buf.getvalue())
+
+        # The hub subpath door must reach the native store as a subpath file.
+        mod.cmd_sync_harness(args_sync)
+        check("harness sync delivered subpath door to claude dir",
+              (claude_dir / "campaign-cli-integration" / "codex.md").exists())
+
+        # A native subpath file must ingest into the hub as a subpath door.
+        native_sub = claude_dir / "notes" / "lane-note.md"
+        native_sub.parent.mkdir(parents=True, exist_ok=True)
+        native_sub.write_text("# lane note\n", encoding="utf-8")
+        mod.cmd_sync_harness(args_sync)
+        check("harness sync ingested native subpath file to hub",
+              (ns_dir / "notes" / "lane-note.md").exists())
+
+        # ack --all must record subpath keys, not skip them.
+        class ArgsAck:
+            pass
+
+        args_ack = ArgsAck()
+        args_ack.root = str(root)
+        args_ack.harness = "claude"
+        args_ack.ns = ns
+        args_ack.all = True
+        args_ack.files = None
+        args_ack.json = True
+        mod.cmd_ack(args_ack)
+        wm_claude = mod.load_watermark(root, "claude")
+        check("ack --all recorded the subpath door",
+              wm_claude.get("namespaces", {}).get(ns, {}).get(
+                  "campaign-cli-integration/codex.md") is not None)
+
+        # The native pinned/yggterm shelf is the global namespace's delivery
+        # target and must NEVER ingest as project doors.
+        pinned = claude_dir / "pinned" / "yggterm" / "global-door.md"
+        pinned.parent.mkdir(parents=True, exist_ok=True)
+        pinned.write_text("# global door\n", encoding="utf-8")
+        mod.cmd_sync_harness(args_sync)
+        check("pinned/yggterm native subtree never ingested as project doors",
+              not (ns_dir / "pinned" / "yggterm" / "global-door.md").exists()
+              and not (ns_dir / "global-door.md").exists())
+
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
