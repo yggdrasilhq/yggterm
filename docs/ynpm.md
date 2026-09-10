@@ -69,7 +69,12 @@ fleet scripts already know that roster and should pass it explicitly.
 archives the already-verified four-product generation once, imports it on each
 named host, and lets the remote `import-yggterm` gate preserve a newer or
 same-bytes dev build. A dev yggterm is distributed with `ynpm dev --fleet`;
-production never silently downgrades it.
+production never silently downgrades it. If the public version is unchanged
+but one or more product hashes differ, the remote generation refreshes only
+those products by atomic rename, so release-only polish and daemon fixes do
+not disappear behind an already-complete version directory. The manager that
+performed the sync is reasserted to both `ynpm` and `ynpx` aliases after the
+import, preventing a stale auxiliary copy from downgrading the fleet manager.
 
 ## One state and two safe destinations
 
@@ -107,6 +112,10 @@ resolved relative to the invoking directory; a relative `YNPM_DEST` is resolved
 relative to the manager home. Run `ynpm doctor` before introducing a new host
 or platform. It reports the native package target, the `curl`/`tar`/`npm`
 substrate, all resolved roots, and refuses an unsafe or incomplete preflight.
+When old fleet deployments leave more than one yggterm root, `ynpm list` and
+update discovery measure every managed executable and select the newest
+verified generation, so a stale compatibility state file cannot direct a new
+update into an older path.
 
 Native first-party packages are currently published for the targets named by
 their platform dependency matrix. A package without a matching native
@@ -316,6 +325,8 @@ on localhost and on each named fleet host without killing sessions.
 2. if the network is unavailable, use the last ynpm-verified generation;
 3. if the network works but the package or lifecycle is invalid, fail loudly;
 4. launch the package's matching bin with every argument after the package.
+   `--bin` and `--dev` are ynpx controls only before a package name; after the
+   package name they are passed through like every other application flag.
 
 `github:owner/repo`, `git+https://github.com/owner/repo`, and a local checkout
 are dev sources. GitHub sources are cloned/fast-forwarded under ynpm's own
@@ -347,9 +358,10 @@ legacy generation is an honest, named migration remainder, not a false
 The settings modal and the launch builder read the same per-CLI descriptor
 table. The configured text is forwarded per launch, including over SSH; the
 remote wrapper passes it as a request field rather than reading the remote
-host's unrelated settings file. A requested per-launch model or permission
-mode strips the configured spelling it overrides and appends the CLI's own
-native spelling.
+host's unrelated settings file. This applies to new launches and to the
+daemon's reconstructed resume/picker commands. A requested per-launch model
+or permission mode strips the configured spelling it overrides and appends the
+CLI's own native spelling.
 
 Codex has two distinct useful postures:
 

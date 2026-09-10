@@ -864,7 +864,10 @@ and therefore the only mouse route out of it.
 A fifth surface, and the only one that does NOT ride OSC 7717: an app that is
 merely *installed* must appear in the menus, whether or not it is running.
 
-An app writes a manifest to **its own host** on every run:
+`ynpm` writes a normalized manifest to **the app's host** when the package is
+installed, upgraded, imported, or removed. The package declares the launcher
+shape under `package.json.yggterm.app`; an app process must not register itself
+as a side effect of first use:
 
 ```text
 ~/.yggterm/apps/<name>.json
@@ -873,9 +876,10 @@ An app writes a manifest to **its own host** on every run:
   "verbs": [ { "id": "new", "label": "New Ychrome", "args": [] } ] }
 ```
 
-- The host's **daemon** scans the directory, checks each `binary` still resolves,
-  and **deletes the manifests of apps that are gone**. That is the entire
-  uninstall story; the GUI keeps no registry of its own. It rides
+- The host's **daemon** scans the directory and checks each `binary` still
+  resolves. It does not delete a manifest during a scan: `ynpm remove` owns
+  uninstall, while a missing binary is reported and omitted from live menus.
+  The GUI keeps no registry of its own. It rides
   `ServerUiSnapshot::apps`, so menus are per-host by construction — an app on
   `dev` but not `guihost` appears on `dev` viewports only.
 - `binary` must be **absolute**. A verb is launched by opening a terminal session
@@ -884,7 +888,9 @@ An app writes a manifest to **its own host** on every run:
 - `name` must equal the file stem, or the manifest is ignored — one app cannot
   squat another's entry. A malformed manifest is ignored, never deleted: it may
   belong to a newer yggterm.
-- Writing on **every run** is what repairs the recorded path after an upgrade.
+- `binary` in package metadata is a package bin key, never a host path. ynpm
+  resolves it against the immutable generation and writes the absolute path,
+  so an upgrade repairs the manifest without app startup code.
 
 GUI side: `app_launcher_entries(&snapshot.apps)` is the ONE derivation. The
 titlebar `+` menu, the cwd-tree context menu and the start page all render it,

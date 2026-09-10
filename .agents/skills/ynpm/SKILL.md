@@ -70,7 +70,10 @@ archive when it is ahead, then archives each final local production generation
 once and imports it on every named host. This is the download-once path. The
 remote host updates its own state and repeats the bin gate. A successful `scp`
 or SSH request is not the effect proof; run `ynpm list` and `ynpm check` on the
-target. `export` is the machine-readable peer protocol; it refuses dev trees.
+target. A same-version archive still replaces changed four-product bytes by
+atomic rename, allowing release-only polish to reach an existing generation;
+the syncing manager is reasserted to both `ynpm` and `ynpx` aliases after the
+import. `export` is the machine-readable peer protocol; it refuses dev trees.
 
 Run `ynpm doctor` on a new host before a fleet sync. It resolves
 `HOME`/`USERPROFILE`, expands `~`, reports absolute manager/destination/scratch
@@ -159,7 +162,9 @@ ynpx --dev /home/user/gh/tool -- --profile demo
 It attempts the newest install/update on every invocation. If the network is
 unavailable, it launches the last verified generation; a reachable package
 whose install or lifecycle is broken fails loudly rather than being mistaken
-for offline mode. Arguments after the package belong to the selected bin.
+for offline mode. Arguments after the package belong to the selected bin;
+`--bin` and `--dev` are controls only before the package name and are app flags
+after it.
 GitHub sources are cloned or fast-forwarded under ynpm's own state root and
 then use the same checkout recipe and `--version` gate.
 
@@ -176,8 +181,10 @@ Configured extra args cross SSH as a per-launch request field. For Codex,
 `-s danger-full-access` disables the sandbox but still asks for approvals;
 `--dangerously-bypass-approvals-and-sandbox` is the actual visible YOLO
 posture. The modal labels that exact tier `YOLO: skip checks and prompts`.
-No YOLO warning is therefore not, by itself, evidence of dropped flags. Check
-the composed command and the remote process command line.
+The same forwarded setting is used when a daemon rebuilds a remote resume or
+picker command, not just for a fresh start. No YOLO warning is therefore not,
+by itself, evidence of dropped flags. Check the composed command and the
+remote process command line.
 
 ## Cleanup safety
 
