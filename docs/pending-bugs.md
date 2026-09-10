@@ -34,7 +34,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | OPEN (server-side session truth, not the TUI) |
 | 11.6.4 | agy | C | OPEN (trust gate eats input + untitled-forever measured, see baseline; resume arm verified) |
-| 11.6.5 | muse | C | OPEN (same shape as agy) |
+| 11.6.5 | muse | C | OPEN (baseline measured 2026-09-10 — v2 data fixes queued: composer U+276F, phrase table, startup gate) |
 | 11.6.6 | kimi | C | OPEN |
 | 11.6.7 | qwen | C | OPEN |
 | 11.6.8 | grok | C | OPEN |
@@ -185,6 +185,97 @@ one live daemon row; probe rows despawned; measured on the GUI host):
    line gains its plan suffix — `(Google AI Pro)` — when login completes;
    input typed before that moment is at risk (see 5).
 
+
+#### 11.6.5 muse measured baseline (wave-1 seat D, 2026-09-10, the muse lab host)
+
+Probe battery on Muse Code 1.1.1 (1.1.1-R2514.1) via the xterm-harness
+pattern extended with a live process: node-pty spawns the real muse TUI, its
+bytes are rendered by the byte-identical vendored `assets/xterm/xterm.js`
+under jsdom, and the harness answers the startup DSR/CPR query (`ESC[6n`)
+from the parsed buffer — muse EXITS code 1 ("The cursor position could not
+be read within a normal duration") without that answer, which is why a naive
+pty drive renders nothing. Lab + raw byte captures:
+`~/.yggterm/scratchpad/zseat-d-muse-probe-112700/` (the muse lab host).
+
+1. **`composer_marker` DRIFTED: muse 1.1.1 draws U+276F `❯` (e2 9d af),
+   not the declared U+27E9 `⟩`** — byte-verified in the fresh-start AND the
+   resumed composer. The declared value was ⭐-measured 2026-08-22 on
+   0.1.0-R708.1 and is stale on 1.1.1. Every readiness path keyed on
+   `composer_marker` (`terminal_observe`, `screen_state`, the daemon
+   shared_composer_marker_count) sees NO muse composer →
+   `consuming_input: false` forever and delivery verbs burn their timeout —
+   exactly the failure the field was created for. v2 data fix queued behind
+   seat A's conversion; re-measure on every muse update (stone §6).
+2. **Working-phrase table re-measured.** The 1.1.1 working-state line is
+   `◇ <State> (<N>s · esc to interrupt)` — e.g. `◇ Thinking (4s · esc to
+   interrupt)`; finished tool runs render `◆ Ran command · <summary> · ✓ ·
+   <N>s · ctrl+o`. `esc to interrupt` held across 92 working frames of a
+   real meta turn. The declared `working...`/`thinking...` (trailing-dot)
+   needles were NEVER observed on 1.1.1 and must not survive into v2
+   as-is. New footer/other needles measured: idle hint line `Start a
+   message with ! to run a shell command yourself`, status footer
+   `<model> · <effort> · <cwd>`, default model `muse-spark-1.3-contributor`.
+3. **Startup gate measured** (fresh workspace): full-screen trust picker —
+   `Do you trust this workspace?` / `> 1 Trust and continue` / `2 Quit` /
+   `Use Up/Down or 1/2, then Enter. Esc quits.` — fills the currently EMPTY
+   `startup_gate_screen_phrases`. Trusting a workspace auto-approves its
+   tool calls: a shell tool ran with NO approval picker under both muse's
+   default AND `--approval-mode untrusted` (the LLM approval judge
+   auto-resolves safe calls; turn A ran 5.9 s judge-inclusive). The
+   question/approval-picker phrases therefore remain UNMEASURED — needs a
+   call the judge refuses. Startup latency measured ~20 s picker-to-picker
+   on first run (model-catalog/auth init) — the reattach SLA must not
+   assume fast cold start for muse.
+4. **Resume arm re-proven, with a FREE verification needle.**
+   `muse resume <uuid>` (subcommand; ⛔ never `--resume <uuid>`) rederives
+   the FULL transcript on screen and prints a named banner
+   `resumed session <uuid>` — yggterm's restore path can READ that line to
+   verify a resume took instead of hoping. Measured spawn→transcript paint:
+   **2.4 s** (stone §4 re-resume target met on store-id resume). Resume by
+   uuid is NOT cwd-gated (a session born in one workspace resumed from
+   another). `muse resume` bare opens the workspace picker; `--last` takes
+   the most recent. `content_rederives_on_resume: true` is now PTY-proven.
+5. **Tenancy: `.session.lock` holds `pid=<pid>` and LINGERS after exit**
+   — left behind by clean exit (code 0) AND by crash (code 1); stale locks
+   accumulate (Sep-8 dead locks still on disk). yggterm's fd-based
+   `LiveSessionMarker::EnclosingDirectory` stays correct (a LIVE process
+   must HOLD the fd open), but any store-side liveness reader MUST verify
+   `/proc/<pid>` AND cmdline identity (pid reuse). Measured on 1.1.1: ONE
+   muse process can hold TWO session dirs — a `New session` /
+   `missing_metadata` stub plus the real conversation (title = first
+   prompt, `prompt_count` ≥ 1). pid→session is therefore ambiguous without
+   the index: store readers must tie-break on `updated_at_us` recency and
+   filter `status='missing_metadata'` (status_rank 3) rows, which must
+   never win title authority.
+6. **The store cannot distinguish clean exit from death.** Both leave lock
+   + jsonl and nothing else; muse records no end-state. The
+   `died_with_me` vs `adopted` verdict for the ledger (stone §4) can only
+   come from yggterm's own handoff bookkeeping — a muse store scan can
+   never answer "who owns this session NOW". Falsifier owed: whether a
+   mid-turn kill orphans the in-flight tool child (a `sleep 30` child
+   outlived direct observation once, unproven — the `server terminal
+   tenants` probe on a killed muse row is the instrument).
+7. **Store layout confirmed on 1.1.1** (descriptor already declared the
+   paths; schema re-verified): `session-index.db` (WAL; tables
+   `schema_meta`, `sessions` — `session_id` uuid PK, `session_log_path`
+   the jsonl, `workspace_root`, `title`, `first_user_prompt`,
+   `created_at_us`/`updated_at_us`, `prompt_count`, `status`+
+   `status_rank`, plus the `msp_*` projection/fork columns
+   (`msp_fork_source_session_id`, `session_name`+`_revision`)) and
+   `sessions/YYYY/MM/DD/<uuid>/session.jsonl` (event-sourced
+   `retained_frame` records, content-hashed transactions) with sidecars
+   `cron.db` (+WAL — per-session, several held open by one process),
+   `approval-review/`, `session.peer-history.sqlite3`, `subagent/`,
+   `cli-<uuid>.log`. `~/.muse/projects/<path-slug>/` is legacy — 1.1.1
+   wrote nothing there for new workspaces. `muse schema` exports the MSP
+   wire schema and `muse serve` hosts MSP over stdio — a future
+   server-truth integration path worth a probe before class-C screen
+   scraping is hardened further. One process–two-session-dirs observation (finding 5) is plausibly
+   the fork mechanism itself — the index carries
+   `msp_fork_source_session_id`/`msp_fork_cut_cursor`; unconfirmed —
+   if forks are the story, a forked child’s live lock can outlive the
+   parent conversation’s and id-discovery must read the fork chain,
+   not just recency.
 
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
