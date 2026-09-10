@@ -2426,6 +2426,78 @@ mod tests {
         }
     }
 
+    fn write_ynpm_dev_state(paths: &ManagedCliPaths, slug: &str) {
+        let state = paths.home.join(".yggterm/ynpm/state.json");
+        std::fs::create_dir_all(state.parent().unwrap()).expect("state dir");
+        std::fs::write(
+            &state,
+            format!(r#"{{"packages":{{"{slug}":{{"dev":{{"built_at_ms":1}}}}}}}}"#),
+        )
+        .expect("state");
+    }
+
+    /// The dev channel consult answers the NEWEST dev generation's binary,
+    /// not the first dev-shaped directory it happens to see.
+    #[test]
+    fn ynpm_dev_generation_prefers_the_newest_dev_generation() {
+        let paths = provision_test_paths("ynpm-dev-newest");
+        write_ynpm_dev_state(&paths, "zcode-tui");
+        let gens = paths.home.join(".yggterm/ynpm/generations").join("zcode-tui");
+        let old = gens.join("dev-1000-1/bin");
+        std::fs::create_dir_all(&old).expect("old gen");
+        std::fs::write(old.join("zcode-tui"), b"old").expect("old bin");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let new = gens.join("dev-2000-1/bin");
+        std::fs::create_dir_all(&new).expect("new gen");
+        std::fs::write(new.join("zcode-tui"), b"new").expect("new bin");
+        let got = ynpm_dev_generation(&paths, "zcode-tui", "zcode-tui")
+            .expect("consult runs")
+            .expect("dev generation found");
+        assert_eq!(got, new.join("zcode-tui"));
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// The legacy rolling dev dir kept the binary at the top level; that
+    /// layout must still resolve when it is the only one present.
+    #[test]
+    fn ynpm_dev_generation_accepts_the_legacy_flat_dev_dir() {
+        let paths = provision_test_paths("ynpm-dev-legacy");
+        write_ynpm_dev_state(&paths, "zcode-tui");
+        let flat = paths.home.join(".yggterm/ynpm/generations/zcode-tui/dev");
+        std::fs::create_dir_all(&flat).expect("flat dev dir");
+        std::fs::write(flat.join("zcode-tui"), b"legacy").expect("legacy bin");
+        let got = ynpm_dev_generation(&paths, "zcode-tui", "zcode-tui")
+            .expect("consult runs")
+            .expect("dev generation found");
+        assert_eq!(got, flat.join("zcode-tui"));
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// No dev marker in the state file means "no dev channel" — the registry
+    /// install path must answer, never an error and never a stale hit.
+    #[test]
+    fn ynpm_dev_generation_is_none_without_a_dev_marker() {
+        let paths = provision_test_paths("ynpm-dev-absent");
+        assert_eq!(
+            ynpm_dev_generation(&paths, "zcode-tui", "zcode-tui").expect("consult runs"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    /// A marker with no generation on disk (crash between write and build,
+    /// manual sweep) degrades to "no dev channel", never a bogus path.
+    #[test]
+    fn ynpm_dev_generation_is_none_when_the_generation_is_missing() {
+        let paths = provision_test_paths("ynpm-dev-missing");
+        write_ynpm_dev_state(&paths, "zcode-tui");
+        assert_eq!(
+            ynpm_dev_generation(&paths, "zcode-tui", "zcode-tui").expect("consult runs"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
     /// Removal of an npm-managed CLI takes the WHOLE managed tree with it: the
     /// published symlink AND every generation directory. The regression this
     /// locks: a removal that only unlinked the symlink would leave the
@@ -4486,6 +4558,91 @@ const NPM_CACHE_GC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// Best-effort throughout — a cache that cannot be collected is untidy, never a
 /// failed provisioning pass.
+/// The ynpm dev channel (docs/ynpm.md §11.2): when ynpm holds a locally
+/// built generation of this slug, THAT outranks the registry — a developer's
+/// machine must not be silently reverted by the TTL sweep. Read tolerantly:
+/// a missing, stale, or foreign-shaped state file is simply "no dev channel",
+/// never an install blocker.
+///
+/// Generation layouts seen in the wild, all accepted:
+///   generations/<slug>/dev/<binary>              (rolling dev dir)
+///   generations/<slug>/dev-<ts>-<n>/bin/<binary> (timestamped, current ynpm)
+/// The NEWEST dev generation wins (dir mtime), because a fresh
+/// `ynpm install --dev` must outrank whatever it superseded.
+#[cfg(unix)]
+fn ynpm_dev_generation(
+    paths: &ManagedCliPaths,
+    slug: &str,
+    binary: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let state_path = paths.home.join(".yggterm/ynpm/state.json");
+    let Ok(text) = fs::read_to_string(&state_path) else {
+        return Ok(None);
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(None);
+    };
+    let entry = doc.pointer(&format!("/packages/{slug}"));
+    let has_dev = entry
+        .and_then(|e| e.get("dev"))
+        .map(|d| !d.is_null())
+        .unwrap_or(false);
+    if !has_dev {
+        return Ok(None);
+    }
+    let gens_dir = paths.home.join(".yggterm/ynpm/generations").join(slug);
+    let Ok(entries) = fs::read_dir(&gens_dir) else {
+        return Ok(None);
+    };
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name != "dev" && !name.starts_with("dev-") {
+            continue;
+        }
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        // timestamped generations keep the binary under bin/, the legacy
+        // rolling dev dir kept it at the top level.
+        let direct = dir.join(binary);
+        let candidate = if direct.exists() {
+            direct
+        } else {
+            let nested = dir.join("bin").join(binary);
+            if !nested.exists() {
+                continue;
+            }
+            nested
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, candidate));
+        }
+    }
+    Ok(best.map(|(_, path)| path))
+}
+
+/// Copy the dev binary into the staged generation at the exact slot
+/// `publish_cli_binary` reads (`bin/<binary>`), executable.
+#[cfg(unix)]
+fn stage_ynpm_dev_bin(staged: &Path, binary: &str, dev_bin: &Path) -> anyhow::Result<()> {
+    let bin_dir = staged.join("bin");
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("creating {}", bin_dir.display()))?;
+    let dst = bin_dir.join(binary);
+    fs::copy(dev_bin, &dst)
+        .with_context(|| format!("copying the ynpm dev binary {} into {}", dev_bin.display(), dst.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&dst, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 755 {}", dst.display()))?;
+    Ok(())
+}
+
 fn gc_npm_cache_if_due(paths: &ManagedCliPaths, npm: &Path) {
     let marker = paths.cache_dir.join(".ygg-last-gc");
     let due = match fs::metadata(&marker).and_then(|meta| meta.modified()) {
@@ -4624,6 +4781,36 @@ fn install_one_npm_cli(
         //    size of what is left is set by WHERE the install died, and a
         //    network drop mid-download leaves far more than the 1 MB a registry
         //    resolution error does.
+        // ynpm dev channel first (docs/ynpm.md §11.2): a dev build for this
+        // slug outranks the registry — the sweep republishes the DEV build
+        // instead of silently reverting a developer's machine. The staged
+        // generation then carries the dev ELF at bin/<binary>, exactly where
+        // publish_cli_binary expects it.
+        let mut dev_channel = false;
+        let install_result = match ynpm_dev_generation(paths, slug, binary) {
+            Ok(Some(dev_bin)) => match stage_ynpm_dev_bin(&staged, binary, &dev_bin) {
+                Ok(()) => {
+                    dev_channel = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&staged);
+                    return Err(error);
+                }
+            },
+            Ok(None) if managed_cli_fetcher_is_direct() => run_direct_install(
+                paths,
+                &staged,
+                package,
+                yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+            ),
+            Ok(None) => run_npm_install(paths, npm, &staged, package, background),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staged);
+                return Err(error);
+            }
+        };
+        #[cfg(not(unix))]
         let install_result = if managed_cli_fetcher_is_direct() {
             run_direct_install(
                 paths,
@@ -4665,6 +4852,7 @@ fn install_one_npm_cli(
                 "package": package,
                 "generation": generation,
                 "replaced": published,
+                "channel": if dev_channel { "ynpm-dev" } else { "npm" },
             }),
         );
         Ok(())
