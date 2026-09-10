@@ -61,6 +61,37 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ===== platform =====
 
+const CANONICAL_YGGTERM_RELEASE_REPO: &str = "yggdrasilhq/yggterm";
+
+/// Compatibility deploys used a bare `fleet-deploy` repo and `fleet` asset
+/// label. Those values describe the transport, not a GitHub release. Letting
+/// them escape into `releases/latest` made the new ynpm updater ask GitHub for
+/// `github.com/fleet-deploy`, which is a 404 rather than an honest update
+/// result. Keep real owner/repo overrides for forks, but normalize the old
+/// transport markers before any release URL or fleet archive is built.
+fn normalize_yggterm_release_repo(repo: &str) -> String {
+    let repo = repo.trim().trim_end_matches(".git");
+    let mut segments = repo.split('/');
+    let valid = segments.next().is_some_and(|part| !part.is_empty())
+        && segments.next().is_some_and(|part| !part.is_empty())
+        && segments.next().is_none()
+        && !repo.chars().any(|ch| ch.is_whitespace());
+    if repo == "fleet-deploy" || !valid {
+        CANONICAL_YGGTERM_RELEASE_REPO.to_string()
+    } else {
+        repo.to_string()
+    }
+}
+
+fn normalize_yggterm_asset_label(label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() || matches!(label, "fleet" | "unknown") {
+        yggterm_core::current_asset_label().unwrap_or_else(|_| "unknown".to_string())
+    } else {
+        label.to_string()
+    }
+}
+
 /// The npm platform identifier this host maps to, or the reason it does not
 /// map at all. The mapping is HONEST: a platform we do not ship is a refusal
 /// naming what we do ship, never a guess that downloads nothing runnable.
@@ -949,11 +980,45 @@ fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::Instal
         }
     }
     if let Some((_, context)) = best {
+        let mut context = context;
+        context.repo = normalize_yggterm_release_repo(&context.repo);
+        context.asset_label = normalize_yggterm_asset_label(&context.asset_label);
         return Ok(context);
     }
     anyhow::bail!(
         "yggterm is not a direct ynpm-compatible install on this host; install it with the curl/PowerShell quickstart first"
     )
+}
+
+/// Rewrite compatibility install metadata from the measured executable. The
+/// direct install state is a routing record, not a version oracle: old fleet
+/// deploys can leave a stale active version or transport-only repo/asset
+/// markers beside a newer binary. Repair it before querying production so the
+/// first `ynpm self-update` after an upgrade is itself safe and useful.
+fn repair_yggterm_install_state(context: &yggterm_core::InstallContext) -> anyhow::Result<()> {
+    let Some(root) = context.managed_root.as_ref() else {
+        return Ok(());
+    };
+    let executable = context
+        .preferred_executable
+        .as_ref()
+        .filter(|path| path.is_file())
+        .unwrap_or(&context.executable_path);
+    if !executable.is_file() {
+        return Ok(());
+    }
+    let version = run_version(executable)
+        .ok()
+        .and_then(|answer| version_from_answer(&answer))
+        .unwrap_or_else(|| context.current_version.clone());
+    yggterm_core::write_direct_install_state(
+        root,
+        &normalize_yggterm_release_repo(&context.repo),
+        &normalize_yggterm_asset_label(&context.asset_label),
+        &version,
+        executable,
+    )?;
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
@@ -1257,6 +1322,7 @@ fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport>
             });
         }
     };
+    repair_yggterm_install_state(&context)?;
     let current_version = context.current_version.clone();
     let dev_fingerprint = yggterm_dev_fingerprint(paths);
     let update = if dev_fingerprint.is_some() {
@@ -4770,6 +4836,34 @@ mod tests {
         // shipped, so the fetch 404s somewhere downstream.
         assert!(platform_target("macos", "x86_64").is_err());
         assert!(platform_target("windows", "x86_64").is_err());
+    }
+
+    #[test]
+    fn legacy_fleet_release_metadata_routes_to_the_canonical_yggterm_release() {
+        assert_eq!(
+            normalize_yggterm_release_repo("fleet-deploy"),
+            CANONICAL_YGGTERM_RELEASE_REPO
+        );
+        assert_eq!(
+            normalize_yggterm_release_repo("yggdrasilhq/yggterm.git"),
+            CANONICAL_YGGTERM_RELEASE_REPO
+        );
+        assert_eq!(
+            normalize_yggterm_release_repo("avikalpa/yggterm"),
+            "avikalpa/yggterm"
+        );
+        assert_eq!(
+            normalize_yggterm_release_repo("not-a-github-repo"),
+            CANONICAL_YGGTERM_RELEASE_REPO
+        );
+    }
+
+    #[test]
+    fn legacy_fleet_asset_metadata_uses_this_host_platform() {
+        let current = yggterm_core::current_asset_label().unwrap();
+        assert_eq!(normalize_yggterm_asset_label("fleet"), current);
+        assert_eq!(normalize_yggterm_asset_label("unknown"), current);
+        assert_eq!(normalize_yggterm_asset_label(&current), current);
     }
 
     #[test]

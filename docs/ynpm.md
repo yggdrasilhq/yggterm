@@ -310,6 +310,12 @@ are identical, the dev generation remains active. The GUI invokes this command
 and owns only the user notification plus session-preserving restart; the old
 GUI download/install workflow is retired.
 
+The first self-update also repairs legacy compatibility metadata. Historical
+fleet deploys may record `fleet-deploy`/`fleet` beside a newer executable; ynpm
+normalizes that transport marker to the canonical yggterm GitHub release and
+rewrites the active version from the executable's own `--version` answer before
+it queries production. Those values must never become a release URL.
+
 `ynpm sync` also invokes this yggterm self-update, and a failed network check is
 reported as offline while existing verified generations remain runnable. A
 direct yggterm startup that installs a newer generation notifies the user and
