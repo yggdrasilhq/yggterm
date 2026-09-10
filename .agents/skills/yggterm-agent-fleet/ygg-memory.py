@@ -29,7 +29,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 DEFAULT_MEMORY_ROOT = Path(os.environ.get("YGGTERM_MEMORY_ROOT", Path.home() / ".yggterm" / "memory"))
 ARCHIVE_ROOT = Path.home() / ".yggterm" / "memory-archive"
@@ -101,15 +101,27 @@ def validate_namespace(namespace: str) -> str:
 
 
 def validate_door_filename(filename: str) -> str:
-    """Return a single Markdown filename that cannot escape its namespace."""
+    """Return a namespace-relative door path that cannot escape its namespace.
+
+    A door is usually a single Markdown filename. Doors that live in a
+    namespace subdirectory (e.g. ``campaign-cli-integration/codex.md``, the
+    per-CLI doors of the 3.3.0 integration campaign) name that subpath —
+    the journal, watermarks and sync all key doors by this string, so a
+    subpath door is a first-class door everywhere a flat one is. Every
+    path segment must be a plain, non-hidden filename: no absolute paths,
+    no ``..``, no backslashes, no control characters.
+    """
     if not isinstance(filename, str) or not filename:
         raise ValueError("memory door filename must not be empty")
-    if filename in {".", ".."} or Path(filename).name != filename:
-        raise ValueError(f"memory door must be a filename, not a path: {filename!r}")
-    if any(char in filename for char in ("/", "\\", "\x00")):
+    if "\\" in filename or "\x00" in filename:
         raise ValueError(f"invalid character in memory door filename: {filename!r}")
     if any(ord(char) < 32 for char in filename):
         raise ValueError(f"invalid control character in memory door filename: {filename!r}")
+    segments = filename.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise ValueError(
+            f"memory door must be a relative path under its namespace: {filename!r}"
+        )
     return filename
 
 
@@ -217,6 +229,51 @@ def _native_document_path(content: str) -> Path | None:
     return _safe_native_relative(match.group(1).strip()) if match else None
 
 
+_native_door_causal_cache: dict = {}
+
+
+def _door_causal_state(root: Path, ns: str, filename: str) -> tuple[str | None, str | None]:
+    """(latest journal action, last upserted content digest) for one door.
+
+    One lazy scan per (root, namespace) per process, invalidated per door
+    after a local write. This is the causal-store consult the mirror
+    projection owed: a door whose journal ends in a delete is RETIRED, and
+    an unchanged source must not resurrect it on every sync tick (the
+    2026-09-08..10 _global churn — ~100 re-creates fighting one resolved
+    deletion).
+    """
+    ns_key = (str(root), ns)
+    index = _native_door_causal_cache.get(ns_key)
+    if index is None:
+        index = {}
+        for record in read_journal_entries(root, namespace=ns):
+            fname = record.get("file")
+            if not fname or not record.get("version_id"):
+                continue
+            if record.get("action") == "delete":
+                index[fname] = ("delete", index.get(fname, (None, None))[1])
+            elif record.get("digest"):
+                index[fname] = ("upsert", record["digest"])
+        _native_door_causal_cache[ns_key] = index
+    return index.get(filename, (None, None))
+
+
+def _door_causal_forget(root: Path, ns: str, filename: str) -> None:
+    index = _native_door_causal_cache.get((str(root), ns))
+    if index is not None:
+        index.pop(filename, None)
+
+
+def _is_causally_deleted_unchanged(root: Path, ns: str, filename: str, content_digest: str | None) -> bool:
+    """True when the door is retired by the causal store AND the would-be
+    upserted content is byte-identical to what was deleted — i.e. the only
+    thing standing behind this write is the churn, not a real change."""
+    if content_digest is None:
+        return False
+    latest_action, last_digest = _door_causal_state(root, ns, filename)
+    return latest_action == "delete" and (last_digest is None or last_digest == content_digest)
+
+
 def _sync_native_document(
     root: Path,
     harness: str,
@@ -244,6 +301,21 @@ def _sync_native_document(
     hub_payload = native_document_payload(hub.read_text(encoding="utf-8")).rstrip() if hub_exists else ""
     local_digest = text_sha256(local_payload) if semantic_local_exists else None
     hub_digest = text_sha256(hub_payload) if hub_exists else None
+    # The door this native content would produce, and its journal-domain
+    # digest (sha256 of the hub FILE), computed once for both the upsert
+    # churn guard and the native-side deletion guard below.
+    candidate_hub = (
+        native_document_content(
+            harness,
+            label,
+            local_payload,
+            target_harness=target_harness,
+            native_path=native_path,
+        )
+        if semantic_local_exists
+        else None
+    )
+    candidate_hub_digest = text_sha256(candidate_hub) if candidate_hub is not None else None
 
     watermark = load_watermark(root, harness)
     state_key = f"{namespace}/{filename}"
@@ -255,16 +327,15 @@ def _sync_native_document(
     def publish_local(causal_base: str | None) -> None:
         nonlocal ingested, deleted
         if semantic_local_exists:
-            hub.write_text(
-                native_document_content(
-                    harness,
-                    label,
-                    local_payload,
-                    target_harness=target_harness,
-                    native_path=native_path,
-                ),
-                encoding="utf-8",
-            )
+            # The churn guard: a door the causal store retired stays retired
+            # while the produced door content is byte-identical to what was
+            # deleted. A real content change (a different digest than the
+            # deleted one) is a genuine resurrection and passes.
+            if _is_causally_deleted_unchanged(
+                root, namespace, filename, candidate_hub_digest
+            ):
+                return
+            hub.write_text(candidate_hub, encoding="utf-8")
             action = "upsert"
             ingested += 1
         else:
@@ -283,6 +354,7 @@ def _sync_native_document(
             target_harness=target_harness,
             base_version=causal_base,
         )
+        _door_causal_forget(root, namespace, filename)
         materialize_store(root)
 
     if base_digest is None:
@@ -317,9 +389,15 @@ def _sync_native_document(
             temp.replace(path)
             delivered += 1
         elif not hub_exists and path.exists():
-            backup_native_file(root, harness, namespace, path)
-            path.unlink()
-            delivered += 1
+            # A retired door must not eat the native source: when the causal
+            # store retired this door and the content is unchanged, the
+            # native file is the only surviving copy — leave it alone.
+            if _is_causally_deleted_unchanged(root, namespace, filename, candidate_hub_digest):
+                pass
+            else:
+                backup_native_file(root, harness, namespace, path)
+                path.unlink()
+                delivered += 1
     else:
         before = path.read_text(encoding="utf-8") if path.is_file() else None
         write_managed_block(path, harness, hub_payload if hub_exists else "", managed_block)
@@ -355,7 +433,9 @@ def backup_native_file(root: Path, harness: str, namespace: str, path: Path) -> 
     if not path.is_file():
         return
     digest = file_sha256(path)
-    target = root.parent / "memory-backups" / harness / namespace / path.name / f"{digest}.md"
+    # Subpath doors keep their directory prefix in the backup path so two
+    # sub/sub.md and sub2/sub.md cannot evict each other's safety copies.
+    target = root.parent / "memory-backups" / harness / namespace / path.parent.name / path.name / f"{digest}.md"
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
@@ -1352,6 +1432,11 @@ def detect_harness(override: str = None) -> str:
 def detect_namespace(cwd: Path = None, override: str = None) -> str:
     if override:
         ns = override.strip()
+        if ns == GLOBAL_NAMESPACE:
+            # The reserved global namespace is its own name — the dash-slug
+            # convention would invent "-_global", which no adapter ever
+            # reads (the mirror projection writes _global directly).
+            return validate_namespace(ns)
         if not ns.startswith("-"):
             ns = "-" + ns.replace("/", "-").replace("\\", "-").strip("-")
         return validate_namespace(ns)
@@ -1669,12 +1754,21 @@ def materialize_store(root: Path, namespaces: set[str] | None = None) -> dict:
     for (namespace, filename), records in groups.items():
         if namespaces is not None and namespace not in namespaces:
             continue
+        if filename == "MEMORY.md" or filename.endswith("/MEMORY.md"):
+            # Namespace indexes are per-host hand-curated state. Index-line
+            # edits carry no journal events, so materializing a journaled
+            # MEMORY.md head silently rewound every hand-appended line
+            # (fleet-wide 2026-08-22..09-09 defect, reintroduced by the
+            # 09-09 deploy that predated this fix). Old heads stay in the
+            # store; they are simply never materialized again. The guard
+            # covers subdirectory doors too (e.g. sub/MEMORY.md).
+            continue
         heads = causal_heads_for(root, namespace, filename, records)
         if not heads:
             continue
 
         live = get_namespace_dir(root, namespace) / filename
-        conflict_dir = root / "conflicts" / namespace / filename
+        conflict_dir = root / "conflicts" / namespace / filename.replace("/", "__")
         if conflict_dir.exists():
             shutil.rmtree(conflict_dir)
 
@@ -1907,11 +2001,14 @@ def cmd_ack(args):
             watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             # Record current hashes of all doors in ns matching this harness
             ns_dir = get_namespace_dir(root, ns)
-            for fpath in ns_dir.glob("*.md"):
+            for fpath in sorted(ns_dir.rglob("*.md")):
+                if not fpath.is_file():
+                    continue
+                fname_key = fpath.relative_to(ns_dir).as_posix()
                 content = fpath.read_text(encoding="utf-8")
                 _, _, target_h = extract_metadata_and_summary(content, fpath.name)
                 if matches_target_harness(target_h, harness):
-                    ns_map[fpath.name] = file_sha256(fpath)
+                    ns_map[fname_key] = file_sha256(fpath)
             save_watermark(root, watermark)
             if args.json:
                 print(json.dumps({"status": "ok", "acked": "all", "seq": latest_seq}))
@@ -1957,11 +2054,19 @@ def cmd_publish(args):
     lock = _flock_open(root / ".ygg-memory.lock")
     try:
         ns_dir = get_namespace_dir(root, ns)
-        dest_filename = source_path.name
+        # The door name is the source basename unless --dest names a
+        # namespace-relative subpath (e.g. campaign-cli-integration/codex.md).
+        # Journal, watermark and index all key on this string, so a subpath
+        # door is a first-class door everywhere a flat one is.
+        if getattr(args, "dest", None) and args.dest.strip():
+            dest_filename = validate_door_filename(args.dest.strip())
+        else:
+            dest_filename = source_path.name
         dest_path = ns_dir / dest_filename
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         content = source_path.read_text(encoding="utf-8")
-        kind, summary, extracted_target = extract_metadata_and_summary(content, dest_filename)
+        kind, summary, extracted_target = extract_metadata_and_summary(content, Path(dest_filename).name)
 
         if args.summary:
             summary = args.summary.strip()
@@ -1979,6 +2084,7 @@ def cmd_publish(args):
         if source_path != dest_path:
             shutil.copy2(source_path, dest_path)
         record = append_journal_entry(root, ns, dest_filename, kind, action, harness, summary, target_harness=target_harness)
+        _door_causal_forget(root, ns, dest_filename)
 
         # Update publisher's own watermark for this file
         watermark = load_watermark(root, harness)
@@ -1996,21 +2102,111 @@ def cmd_publish(args):
         watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         save_watermark(root, watermark)
 
-        # Update root MEMORY.md if absent or add pointer
-        memory_index = ns_dir / "MEMORY.md"
-        if not memory_index.exists():
-            memory_index.write_text(STEERING_HEADER + f"\n## Doors\n\n- [{dest_filename}]({dest_filename}) — {summary}\n", encoding="utf-8")
-        else:
-            idx_content = memory_index.read_text(encoding="utf-8")
-            if not idx_content.startswith("> 🌐 **UNIFIED FLEET MEMORY**") and "UNIFIED FLEET MEMORY" not in idx_content:
-                idx_content = STEERING_HEADER + "\n" + idx_content
-                memory_index.write_text(idx_content, encoding="utf-8")
+        # Update the namespace index (per-host hand state — deliberately NOT
+        # journaled; materialize_store never touches MEMORY.md). Idempotent
+        # per door filename; a failure here never fails the publish.
+        try:
+            memory_index = ns_dir / "MEMORY.md"
+            hook = (summary or kind or "door").replace("\n", " ").strip() or "door"
+            door_label = Path(dest_filename).name
+            index_line = f"- [{door_label}]({dest_filename}) — {hook}"
+            if memory_index.exists():
+                idx_content = memory_index.read_text(encoding="utf-8")
+                if f"]({dest_filename})" not in idx_content:
+                    if "UNIFIED FLEET MEMORY" not in idx_content:
+                        idx_content = STEERING_HEADER + "\n" + idx_content
+                    if not idx_content.endswith("\n"):
+                        idx_content += "\n"
+                    memory_index.write_text(idx_content + index_line + "\n", encoding="utf-8")
+            else:
+                memory_index.write_text(
+                    STEERING_HEADER + f"\n## Doors\n\n{index_line}\n", encoding="utf-8"
+                )
+        except OSError as index_error:
+            print(f"ygg-memory: index line not updated: {index_error}", file=sys.stderr)
 
         if args.json:
             print(json.dumps({"status": "ok", "record": record}))
         else:
             target_info = f" [target: {target_harness}]" if target_harness != "all" else ""
             print(f"Published '{dest_filename}' to namespace '{ns}' (seq #{record['seq']}){target_info}.")
+    finally:
+        _flock_close(lock)
+
+
+def cmd_delete(args):
+    """Retire a door: journal action=delete with total supersede.
+
+    The verb form of the delete the sync's native path already journals:
+    the record supersedes every causal head of the door (append_journal_entry
+    computes the full base_versions set), so both concurrent deleters and
+    older content heads converge — a door deleted here STAYS deleted, and a
+    later publish resurrects it deliberately. The content objects stay in
+    the store, so nothing is unrecoverable. The next sync-harness carries
+    the retirement into the native store (backup first); native mirror
+    trees whose source content is unchanged leave their source file alone.
+    """
+    root = Path(args.root)
+    harness = detect_harness(args.harness)
+    ns = detect_namespace(override=args.ns)
+    filename = validate_door_filename(args.file)
+    lock = _flock_open(root / ".ygg-memory.lock")
+    try:
+        ns_dir = get_namespace_dir(root, ns)
+        target = ns_dir / filename
+        kind, target_h = "other", "all"
+        if target.is_file():
+            kind, _, target_h = extract_metadata_and_summary(
+                target.read_text(encoding="utf-8"), Path(filename).name
+            )
+        else:
+            known = any(
+                record.get("file") == filename and record.get("version_id")
+                for record in read_journal_entries(root, namespace=ns)
+            )
+            if not known:
+                print(
+                    f"Error: Door '{filename}' not found in namespace '{ns}'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        record = append_journal_entry(
+            root,
+            ns,
+            filename,
+            kind,
+            "delete",
+            harness,
+            f"deleted {filename}",
+            target_harness=target_h,
+        )
+        _door_causal_forget(root, ns, filename)
+        if target.exists():
+            target.unlink()
+        materialize_store(root)
+
+        # Our own retirement is not news to us: drop the door's sync state
+        # (the next sync-harness then retires the native copy with a backup)
+        # and acknowledge the event so status stays quiet.
+        watermark = load_watermark(root, harness)
+        watermark.setdefault("namespaces", {}).setdefault(ns, {}).pop(filename, None)
+        watermark.setdefault("sync_state", {}).setdefault(ns, {}).pop(filename, None)
+        watermark.setdefault("sync_versions", {}).setdefault(ns, {}).pop(filename, None)
+        if record.get("origin"):
+            vector = watermark.setdefault("seen_origin_seq", {}).setdefault(ns, {})
+            vector[record["origin"]] = max(vector.get(record["origin"], 0), record.get("seq", 0))
+        seen = set(watermark.get("seen_event_ids", []))
+        if record.get("event_id"):
+            seen.add(record["event_id"])
+        watermark["seen_event_ids"] = sorted(seen)
+        watermark["last_seq"] = max(watermark.get("last_seq", 0), record["seq"])
+        watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save_watermark(root, watermark)
+
+        if args.json:
+            print(json.dumps({"status": "ok", "record": record}))
+        else:
+            print(f"Deleted door '{filename}' from namespace '{ns}' (seq #{record['seq']}).")
     finally:
         _flock_close(lock)
 
@@ -2061,6 +2257,35 @@ def cmd_resolve(args):
         _flock_close(lock)
 
 
+def _relative_md_names(directory: Path, exclude=None) -> set[str]:
+    """Namespace-relative names of every Markdown file under ``directory``.
+
+    Subpath names are what make subdirectory doors syncable: the three-way
+    sync keys every door by this string, and ``local_dir / name`` /
+    ``ns_dir / name`` resolve it on either side.
+    """
+    if not directory.is_dir():
+        return set()
+    names = set()
+    for path in directory.rglob("*.md"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(directory).as_posix()
+        if exclude and exclude(relative):
+            continue
+        names.add(relative)
+    return names
+
+
+def _is_native_pinned_door(relative: str) -> bool:
+    """The native ``pinned/yggterm/`` subtree is the global namespace's
+    delivery shelf, owned by the fleet-door projection — never project-door
+    sync, or every sync would ingest the shared global doors into every
+    project namespace."""
+    parts = PurePosixPath(relative).parts
+    return len(parts) >= 2 and parts[0] == "pinned" and parts[1] == "yggterm"
+
+
 def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir: Path) -> tuple:
     """Three-way sync one project-memory directory without mtime arbitration."""
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -2081,11 +2306,9 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
         backend_identities[ns] = backend_identity
     sync_state = watermark.setdefault("sync_state", {}).setdefault(ns, {})
     version_state = watermark.setdefault("sync_versions", {}).setdefault(ns, {})
-    names = {
-        path.name for path in local_dir.glob("*.md")
-    } | {
-        path.name for path in ns_dir.glob("*.md")
-    } | set(sync_state)
+    names = _relative_md_names(
+        local_dir, exclude=_is_native_pinned_door
+    ) | _relative_md_names(ns_dir) | set(sync_state)
 
     for fname in sorted(names):
         local = local_dir / fname
@@ -2115,13 +2338,14 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
             nonlocal in_count, del_count
             if local_exists:
                 content = local.read_text(encoding="utf-8")
-                kind, summary, native_target = extract_metadata_and_summary(content, fname)
+                kind, summary, native_target = extract_metadata_and_summary(content, Path(fname).name)
+                hub.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(local, hub)
                 action = "upsert"
                 in_count += 1
             else:
                 previous = hub.read_text(encoding="utf-8") if hub_exists else ""
-                kind, summary, native_target = extract_metadata_and_summary(previous, fname)
+                kind, summary, native_target = extract_metadata_and_summary(previous, Path(fname).name)
                 if hub.exists():
                     hub.unlink()
                 action = "delete"
@@ -2162,6 +2386,7 @@ def _sync_project_memory_namespace(root: Path, harness: str, ns: str, local_dir:
             if not local.is_file() or file_sha256(local) != hub_digest:
                 if local.is_file():
                     backup_native_file(root, harness, ns, local)
+                local.parent.mkdir(parents=True, exist_ok=True)
                 temp = local.with_suffix(local.suffix + ".tmp")
                 shutil.copyfile(hub, temp)
                 temp.replace(local)
@@ -2688,7 +2913,7 @@ def main():
 
     # get
     p_get = subparsers.add_parser("get", parents=[common_parser], help="Retrieve body of a specific memory door")
-    p_get.add_argument("--file", required=True, help="Memory filename (e.g. finding-pty-grid-ssot.md)")
+    p_get.add_argument("--file", required=True, help="Memory door path relative to the namespace (e.g. finding-pty-grid-ssot.md or campaign-cli-integration/codex.md)")
     p_get.add_argument("--lines", type=int, default=None, help="Show only the first N lines (a loud slice marker goes to stderr)")
     p_get.add_argument("--grep", default=None, help="Show only lines matching this regex (a loud slice marker goes to stderr)")
 
@@ -2700,9 +2925,14 @@ def main():
     # publish
     p_pub = subparsers.add_parser("publish", parents=[common_parser], help="Publish a local file into unified memory")
     p_pub.add_argument("--file", required=True, help="Source markdown file to publish")
+    p_pub.add_argument("--dest", default=None, help="Door path relative to the namespace; may include subdirectories (e.g. campaign-cli-integration/codex.md). Defaults to the source basename.")
     p_pub.add_argument("--kind", default=None, help="Kind (finding, campaign, spec, feedback, steer)")
     p_pub.add_argument("--summary", default=None, help="One-line summary description")
     p_pub.add_argument("--target-harness", "--scope", dest="target_harness", default=None, help="Target harness scope ('all' or specific: gemini, claude, grok, codex)")
+
+    # delete
+    p_del = subparsers.add_parser("delete", parents=[common_parser], help="Retire a memory door (journaled delete; recoverable by re-publishing)")
+    p_del.add_argument("--file", required=True, help="Door path relative to the namespace (may include subdirectories)")
 
     # resolve
     p_resolve = subparsers.add_parser("resolve", parents=[common_parser], help="Resolve all divergent heads of one door")
