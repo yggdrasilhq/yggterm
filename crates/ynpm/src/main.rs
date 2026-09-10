@@ -548,6 +548,17 @@ fn find_package_key<'a>(state: &'a State, package: &str) -> Option<&'a str> {
         .map(|(key, _)| key.as_str())
 }
 
+fn package_name_for_app(state: &State, app_name: &str) -> Option<String> {
+    state.packages.iter().find_map(|(key, package)| {
+        let declared_name = package
+            .integration
+            .as_ref()
+            .and_then(|metadata| metadata.app.as_ref())
+            .and_then(|app| app.name.as_deref());
+        (declared_name == Some(app_name)).then(|| package_identity(key, package))
+    })
+}
+
 fn package_destination(paths: &Paths, package: &Package) -> PathBuf {
     package
         .destination
@@ -3458,7 +3469,8 @@ fn verb_list(paths: &Paths) -> anyhow::Result<()> {
         named.insert(package);
     }
     for app in read_app_manifests(paths) {
-        let package = format!("@ygghq/{}", app.name);
+        let package = package_name_for_app(&state, &app.name)
+            .unwrap_or_else(|| format!("@ygghq/{}", app.name));
         let binary = Path::new(&app.binary);
         let version = run_version(binary)
             .ok()
@@ -6310,6 +6322,41 @@ mod tests {
         let back: Package = serde_json::from_str(&json).unwrap();
         assert_eq!(back, package);
         assert_eq!(back.versions.len(), 3);
+    }
+
+    #[test]
+    fn app_inventory_preserves_a_package_name_that_differs_from_app_name() {
+        let state = State {
+            packages: BTreeMap::from([(
+                "ydesign".to_string(),
+                Package {
+                    package_name: Some("@ygghq/ydesign-app".to_string()),
+                    current: "0.1.1".to_string(),
+                    versions: vec!["0.1.1".to_string()],
+                    bins: BTreeMap::from([(
+                        "ydesign".to_string(),
+                        "bin/ydesign".to_string(),
+                    )]),
+                    external_prev: None,
+                    destination: None,
+                    dev: None,
+                    dev_generation: None,
+                    channel: Some("npm".to_string()),
+                    source: Some("npm:@ygghq/ydesign-app".to_string()),
+                    integration: Some(yggterm_core::YggtermPackageMetadata {
+                        schema: 1,
+                        app: Some(yggterm_core::YggtermAppMetadata {
+                            name: Some("ydesign".to_string()),
+                            ..Default::default()
+                        }),
+                    }),
+                },
+            )]),
+        };
+        assert_eq!(
+            package_name_for_app(&state, "ydesign").as_deref(),
+            Some("@ygghq/ydesign-app")
+        );
     }
 
     #[test]
