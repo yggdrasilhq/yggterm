@@ -144,6 +144,43 @@ what would answer the gate), and answers `accepted:false` with
 answer `accepted:false, reason:"startup_gate_shown_refusal"` with zero
 bytes written; answer the gate interactively; resend must deliver.
 
+## ⛔ [11.97] A FAILED INTEGRATION TICK SILENTLY DROPS EVERY LANE THAT RODE IT — THE TRAIN GOES GREEN WITHOUT MERGED CONTENT, AND THE DEPLOY SHIPS THE HOLE (filed 2026-09-10)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+ygg-ci (the fleet integration watcher). Measured 2026-09-10 22:33-23:01,
+three ticks, on the yggterm train:
+
+- Tick 1 merged lane/integration/agy (innocent) + lane/integration/family-ledger
+  (whose pending-bugs Status line failed the docs-ssot gate). The failure arm
+  reset main AND quarantined BOTH lanes at their tips, and the failure record
+  listed both as `lanes`.
+- `_dirty_subs` baselined "dirty" against that FAILED record — so the
+  unchanged innocent lane was never dirty again, AND it was quarantined.
+  Doubly stuck; recovery required a hand-made empty commit (the standing
+  "new tip re-arms" rule).
+- Tick 3 merged only the sibling new tip, went green, pushed, and the
+  deploy swept a main that did NOT contain the logged-as-merged lane. The
+  content was invisible for two trains (verified by ancestry against
+  origin/main, not by reading the log).
+
+**Fix (this lane):** (1) `_dirty_subs` baselines on the last CONSUMED record
+only — build-failed/push-failed records consumed nothing; (2) quarantine
+entries carry an expiry (default 900 s, project knob
+`quarantine_ttl_secs`): a guilty lane re-fails alone and re-quarantines on
+its first expired probe, an innocent lane LANDS on that probe — no more
+permanent bystander deadlock, no repeated doomed-union rebuilds (consult
+2026-09-10, gemini-3.8-flash HIGH via agy: fail fast at K=1; text-scraped
+gate attribution REJECTED — a merge commit carries every prior lane, so
+diff-blame is false blame; behavioral self-heal preferred); (3) the merge
+order is FIFO by tip push time, not subscription-file order, so lane a/ no
+longer beats lane z/ to a conflict purely by name. Legacy plain-string
+quarantine entries inherit a fresh TTL on first load. Selftest covers
+normalize + consumed-only baseline.
+
+**LIVE PROOF OWED:** the next real gate failure must (a) re-merge the
+unchanged innocent lanes within `quarantine_ttl_secs` of the failure with no
+human commit, and (b) land the guilty lane the moment its fixed tip arrives.
 ## ⛔ [11.96] AGY ROWS ARE UNTITLED FOREVER ON 1.2.0 — THE CLI NEVER WRITES THE SUMMARIES TABLE THE TITLE AUTHORITY READS, AND THE FALLBACK LABEL MISNAMES THE KIND (filed 2026-09-10)
 
 **Status:** OPEN
