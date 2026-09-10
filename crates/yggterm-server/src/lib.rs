@@ -82,6 +82,7 @@ pub mod hot_restart_queue;
 pub mod hot_restart_repair;
 mod host;
 mod live_row_tombstones;
+mod ownership_ledger;
 mod profile_write_lock;
 // Level (b) increment 1: owning a PTY we did not spawn — the Owned/Adopted
 // child split and a MasterPty over a received fd. Not yet wired to any
@@ -22217,17 +22218,50 @@ pub fn run_remote_resume_codex(
             session_id
         ));
     }
-    if saved_session_exists {
-        let wait = wait_for_external_codex_resume_to_clear(&home, session_id);
-        // ⛔ Falling through here would start a SECOND resume against a
-        // transcript the holder still has open. The deadline is a refusal, not
-        // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
-        if wait == ExternalResumeWait::DeadlineExpired {
-            anyhow::bail!(remote_resume_external_active_message(
-                SessionKind::Codex,
-                session_id,
-                &external_agent_resume_processes_for_session(SessionKind::Codex, session_id),
-            ));
+    // ★ §4 cli-integration-layer: the handoff-witnessed ledger answers BEFORE
+    // the saved-session gate. A self-minting CLI (codex) is asked about
+    // yggterm's ROW id, which its store has never heard of, so
+    // `saved_session_exists` reads false for exactly the rows the ledger CAN
+    // vouch for — the consult must not sit behind that probe. The daemon
+    // orchestrated the swap, so it witnessed — per row — whether the PTY
+    // crossed to a successor (`Adopted`) or the row is a designed corpse
+    // (`DiedWithMe`); either answer skips the /proc wait entirely, and only a
+    // ledger with nothing true to say falls back to the scan-and-banner path
+    // (which is the NAMED-failure path).
+    match ownership_ledger::lookup(&home, SessionKind::Codex, session_id) {
+        ownership_ledger::LedgerAnswer::NoAnswer if saved_session_exists => {
+            let wait = wait_for_external_codex_resume_to_clear(&home, session_id);
+            // ⛔ Falling through here would start a SECOND resume against a
+            // transcript the holder still has open. The deadline is a refusal, not
+            // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
+            if wait == ExternalResumeWait::DeadlineExpired {
+                anyhow::bail!(remote_resume_external_active_message(
+                    SessionKind::Codex,
+                    session_id,
+                    &external_agent_resume_processes_for_session(SessionKind::Codex, session_id),
+                ));
+            }
+        }
+        ownership_ledger::LedgerAnswer::NoAnswer => {}
+        served => {
+            append_trace_event(
+                &home,
+                "remote",
+                "resume_codex",
+                "reattach_ledger_served",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "disposition": served.word(),
+                }),
+            );
+            // The record served one reattach — the hot-restart-queue law
+            // says whoever it satisfies clears it.
+            if let ownership_ledger::LedgerAnswer::DiedWithMe { .. } = served {
+                ownership_ledger::clear_satisfied(&home, SessionKind::Codex, session_id);
+            }
+            // Fall through: the ensure path below binds to the live runtime
+            // (adopted) or spawns the resume the record names, with no wait
+            // in front of it.
         }
     }
     let _ = ensure_local_managed_cli_for_focus(ManagedCliTool::Codex)?;
@@ -22470,18 +22504,38 @@ pub fn run_remote_resume_cc(
             session_id
         ));
     }
-    if saved_session_exists {
-        let wait =
-            wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
-        // ⛔ Falling through here would start a SECOND resume against a
-        // transcript the holder still has open. The deadline is a refusal, not
-        // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
-        if wait == ExternalResumeWait::DeadlineExpired {
-            anyhow::bail!(remote_resume_external_active_message(
-                SessionKind::ClaudeCode,
-                session_id,
-                &external_agent_resume_processes_for_session(SessionKind::ClaudeCode, session_id),
-            ));
+    // ★ §4 cli-integration-layer: the ledger answers before the saved-session
+    // gate (see run_remote_resume_codex for the full rationale).
+    match ownership_ledger::lookup(&home, SessionKind::ClaudeCode, session_id) {
+        ownership_ledger::LedgerAnswer::NoAnswer if saved_session_exists => {
+            let wait =
+                wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
+            // ⛔ Falling through here would start a SECOND resume against a
+            // transcript the holder still has open. The deadline is a refusal, not
+            // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
+            if wait == ExternalResumeWait::DeadlineExpired {
+                anyhow::bail!(remote_resume_external_active_message(
+                    SessionKind::ClaudeCode,
+                    session_id,
+                    &external_agent_resume_processes_for_session(SessionKind::ClaudeCode, session_id),
+                ));
+            }
+        }
+        ownership_ledger::LedgerAnswer::NoAnswer => {}
+        served => {
+            append_trace_event(
+                &home,
+                "remote",
+                "resume_cc",
+                "reattach_ledger_served",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "disposition": served.word(),
+                }),
+            );
+            if let ownership_ledger::LedgerAnswer::DiedWithMe { .. } = served {
+                ownership_ledger::clear_satisfied(&home, SessionKind::ClaudeCode, session_id);
+            }
         }
     }
     let _ = ensure_local_managed_cli_for_focus(ManagedCliTool::ClaudeCode)?;
@@ -22562,17 +22616,41 @@ pub fn run_remote_resume_agent(
     {
         anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
     }
-    if saved_session_exists {
-        let wait = wait_for_external_agent_resume_to_clear(kind, &home, session_id);
-        // ⛔ Falling through here would start a SECOND resume against a
-        // transcript the holder still has open. The deadline is a refusal, not
-        // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
-        if wait == ExternalResumeWait::DeadlineExpired {
-            anyhow::bail!(remote_resume_external_active_message(
-                kind,
-                session_id,
-                &external_agent_resume_processes_for_session(kind, session_id),
-            ));
+    // ★ §4 cli-integration-layer: the ledger answers before the saved-session
+    // gate (see run_remote_resume_codex for the full rationale). Every
+    // registered CLI rides this one wrapper, so the ledger-served reattach is
+    // uniform across classes — and for the self-minting class-C CLIs this is
+    // the arm that can name a resume instead of silently fresh-spawning.
+    match ownership_ledger::lookup(&home, kind, session_id) {
+        ownership_ledger::LedgerAnswer::NoAnswer if saved_session_exists => {
+            let wait = wait_for_external_agent_resume_to_clear(kind, &home, session_id);
+            // ⛔ Falling through here would start a SECOND resume against a
+            // transcript the holder still has open. The deadline is a refusal, not
+            // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
+            if wait == ExternalResumeWait::DeadlineExpired {
+                anyhow::bail!(remote_resume_external_active_message(
+                    kind,
+                    session_id,
+                    &external_agent_resume_processes_for_session(kind, session_id),
+                ));
+            }
+        }
+        ownership_ledger::LedgerAnswer::NoAnswer => {}
+        served => {
+            append_trace_event(
+                &home,
+                "remote",
+                "resume_agent",
+                "reattach_ledger_served",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "kind": kind,
+                    "disposition": served.word(),
+                }),
+            );
+            if let ownership_ledger::LedgerAnswer::DiedWithMe { .. } = served {
+                ownership_ledger::clear_satisfied(&home, kind, session_id);
+            }
         }
     }
     if let Some(tool) = ManagedCliTool::from_session_kind(kind) {

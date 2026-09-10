@@ -5825,6 +5825,10 @@ impl DaemonRuntime {
         let mut precommit = crate::pty_handoff::PrecommitSupport::default();
         let mut refused_before_commit = 0usize;
         let mut refused_after_commit = 0usize;
+        // ★ §4 cli-integration-layer: per-row witness of WHO adopted WHAT, so
+        // the ownership ledger can answer the next reattach with zero
+        // discovery.
+        let mut adopted_identities: Vec<(String, (u32, u64))> = Vec::new();
         // ⛔⛔ ATTEMPT EVERY SESSION. This loop used to `break` on the first
         // failure, so ONE stuck key abandoned every remaining runtime — measured
         // live 2026-08-14 as `readers_stood_down: 11, moved: 0`, eleven healthy
@@ -5872,6 +5876,9 @@ impl DaemonRuntime {
                     moved += 1;
                     moved_keys.push(key.clone());
                     successor_identity = ack.adopter_identity().or(successor_identity);
+                    if let Some(identity) = ack.adopter_identity() {
+                        adopted_identities.push((key.clone(), identity));
+                    }
                 }
                 Err(error) => {
                     // ⛔ `refused` is asked, not `!committed`. A connect that
@@ -5889,6 +5896,61 @@ impl DaemonRuntime {
                     continue;
                 }
             }
+        }
+        // ★ §4 THE OWNERSHIP LEDGER — record what this sweep witnessed while
+        // this daemon is still the authority to vouch. Moved rows become
+        // `adopted { by_pid }` records: the successor acked them SEATED (the
+        // ack is the commit point), so a reattach for those sessions reads the
+        // ledger and binds without any /proc scan. Rows that did NOT move stay
+        // UNRECORDED — on a partial sweep this daemon keeps serving them, and
+        // a `died_with_me` written for a row its writer still serves would be
+        // exactly the lie the staleness law exists to kill. `record_handoff`
+        // replaces THIS daemon's previous records wholesale, so a retried
+        // sweep can never leave a stale witness behind.
+        let session_identity: Vec<(String, SessionKind, String)> = self
+            .server
+            .live_sessions()
+            .iter()
+            .filter_map(|session| {
+                match session.kind {
+                    SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
+                        return None;
+                    }
+                    _ => {}
+                }
+                let runtime_key = self.terminal_runtime_key_for_path(&session.session_path);
+                Some((runtime_key, session.kind, session.id.clone()))
+            })
+            .collect();
+        let ledger_records = crate::ownership_ledger::handoff_ownership_records(
+            &session_identity,
+            &adopted_identities,
+            crate::ownership_ledger::now_ms(),
+            std::process::id(),
+            SERVER_PROTOCOL_VERSION,
+        );
+        match crate::ownership_ledger::record_handoff(self.store.home_dir(), ledger_records) {
+            Ok(()) => append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "lifecycle",
+                "reattach_ledger_written",
+                serde_json::json!({
+                    "adopted_records": adopted_identities.len(),
+                    "successor_version": successor_version,
+                    "pid": std::process::id(),
+                }),
+            ),
+            Err(error) => append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "lifecycle",
+                "reattach_ledger_write_failed",
+                serde_json::json!({
+                    "error": error.to_string(),
+                    "pid": std::process::id(),
+                }),
+            ),
         }
         // Whatever did NOT move is still ours to serve, and a session nobody
         // reads is a session that has stopped painting. Only the runtimes the
