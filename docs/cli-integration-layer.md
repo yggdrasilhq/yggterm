@@ -109,13 +109,18 @@ Implementation status (11.6.0, first land): `ownership_ledger.rs` in
 yggterm-server holds the record types, the staleness law (an adoption dies
 with its adopter's pid; a death sentence expires in minutes; consume-on-
 satisfy) and the crash-safe writer. The handoff sweep writes
-`adopted { by_pid }` per moved row from the ack itself, and all three resume
-wrappers consult the ledger before the /proc wait. `died_with_me` is typed,
-served and consumed but **no current exit path writes one**: a daemon exits
-only after an AllMoved sweep (nothing left held), and a partial sweep's held
-rows stay unrecorded because their writer keeps serving them — the first
-writers of death sentences will be the force-retire / cold-exit paths and
-the class-C resume arms. NoAnswer falls back to today's scan-and-banner.
+`adopted { by_pid }` per moved row from the ack itself — LIVE-PROVEN on a
+real rotation (AllMoved → `reattach_ledger_written` → clean predecessor
+exit, 2026-09-10, dev) — and all three resume wrappers consult the ledger
+BEFORE the saved-session probe and the /proc wait: a self-minting CLI is
+asked about yggterm's row id, which its store has never heard of, so the
+store probe reads false for exactly the rows the ledger can vouch for.
+`died_with_me` is typed, served and consumed but **no current exit path
+writes one**: a daemon exits only after an AllMoved sweep (nothing left
+held), and a partial sweep's held rows stay unrecorded because their writer
+keeps serving them — the first writers of death sentences will be the
+force-retire / cold-exit paths and the class-C resume arms. NoAnswer falls
+back to today's scan-and-banner.
 
 ## 5. Observability — tiered, mostly file-shaped
 
