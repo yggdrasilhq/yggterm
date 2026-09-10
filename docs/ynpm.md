@@ -149,7 +149,9 @@ substrate, all resolved roots, and refuses an unsafe or incomplete preflight.
 When old fleet deployments leave more than one yggterm root, `ynpm list` and
 update discovery measure every managed executable and select the newest
 verified generation, so a stale compatibility state file cannot direct a new
-update into an older path.
+update into an older path. The canonical direct install state's
+`active_executable` is consulted first, including an active dev generation
+outside the production `versions/<version>` directory.
 
 Native first-party packages are currently published for the targets named by
 their platform dependency matrix. A package without a matching native

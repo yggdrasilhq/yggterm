@@ -146,6 +146,9 @@ fleet deploy may have left `fleet-deploy`/`fleet` as transport markers beside
 the active binary; ynpm maps those markers to the canonical yggterm GitHub
 release and rewrites the active version from the binary's `--version` answer.
 Never turn those legacy values into a release URL or hand-copy a replacement.
+The canonical direct install state's active executable also wins over an older
+production `versions/<version>` directory, so a dev generation remains the
+reported and launched product until production handback.
 
 Every installable libyggterm app release must carry the same `package.json`
 metadata inside its npm package, GitHub/Forgejo archive, or local checkout.
