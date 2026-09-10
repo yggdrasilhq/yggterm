@@ -32,7 +32,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN (rotation AllMoved → reattach_ledger_written; consumer widened before the saved-session gate); schema v2 + battery + wrapper-level SLA run OPEN (3.3.0) |
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
-| 11.6.3 | opencode | B | OPEN (server-side session truth, not the TUI) |
+| 11.6.3 | opencode | B | OPEN (server truth DECODED 2026-09-10 — see the seat E section; descriptor v2 fills queue behind 11.6.0) |
 | 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
 | 11.6.5 | muse | C | OPEN (baseline measured 2026-09-10 — v2 data fixes queued: composer U+276F, phrase table, startup gate) |
 | 11.6.6 | kimi | C | OPEN |
@@ -247,6 +247,68 @@ one live daemon row; probe rows despawned; measured on the GUI host):
    input typed before that moment is at risk (see 5).
 
 
+#### 11.6.3 measured decode (wave-1 seat E, 2026-09-10, dev)
+
+The server-side session-truth decode the family table asks for, measured
+against the INSTALLED service on dev (`opencode2 serve --service`, pid
+2996638, version 0.0.0-beta-19271; registration
+`~/.local/state/opencode/service.json`, HTTP Basic `opencode:<password>`,
+openapi at `/openapi.json` — 119 paths):
+
+1. **`/api/session/active` is the WORKING set, never "the open tabs."**
+   Server-side it is the run-coordinator's in-memory map of sessions with
+   in-flight executions (`packages/core/src/session/run-coordinator.ts`,
+   `active`); the endpoint's own doc says "foreground Session drains
+   currently owned by this OpenCode process". Measured live: a session
+   enters the set ≤0.1s after a prompt and leaves when the turn settles
+   (33s turn measured); idle fleet ⇒ `{"data":{}}`. yggterm's
+   `opencode_service::active_sessions()` doc-comment claims it is "the open
+   tabs" and derives the tab mirror + viewing signal from that join —
+   **the viewing signal starves BY DESIGN whenever no turn runs** (the F2
+   falsification, root-caused). Defect [11.6.3-a]: re-purpose the active
+   set to Working status only; viewing must come from the OSC title +
+   store recency.
+2. **The focus verb contract: `POST /api/session/{id}/view` body
+   `{"idle": <int>}` (required), which persists the client-supplied value
+   VERBATIM into `session_v2.time_viewed`** (measured: idle:0 → stored 0;
+   idle:5000 → stored 5000; the TUI sends epoch-ms). `time_viewed` is NULL
+   at session birth. Defect [11.6.3-b]: yggterm's `view_session` posts
+   `{}` → HTTP 400 on this build every time — the focus verb never works.
+3. **The in-TUI switch has NO server-side surface in beta-19271.**
+   "Switch session" lives at ctrl+x l (commands palette ctrl+p; there is
+   no `/sessions` slash command — the composer eats it as text). Completing
+   a real switch to ses_f740bccf (driven under a clean pty, transcript
+   rendered) produced ZERO writes: no `/view` POST (0 log hits in the
+   window), no store change (`time_viewed` untouched), no active-set
+   change, no `session.updated` event. The switch is client-side
+   rendering; the only server truth for viewing is the OSC title
+   (`OC | <title>`, Defect B) plus whatever wrote the historical
+   `time_viewed` values (a tab-focus flow, UNVERIFIED — falsifier owed).
+   Descriptor v2 consequence: viewing = the OSC title, NOT ServerIpc;
+   ServerIpc answers working/status (the active set) + list/recency.
+4. **Store (`opencode.db`, WAL, 407MB on dev):** `session_v2` is
+   authoritative (48 rows; v1 `session` is legacy, 3 rows, migration
+   `migration.v1-v2: completed`). INTEGER ms epochs (typeof-verified — the
+   epoch lesson holds). Turn settle writes `time_idle` + `idle_outcome`.
+   The `event` table is v1-only (0 rows for v2 sessions; `created`=0 → not
+   even time-orderable) — **NOT a T1 watch surface**; T1 should watch
+   `opencode.db` itself (mtime; WAL SIZE IS A FALSE SIGNAL — real writes
+   did not grow the preallocated WAL), with the stone §5 rules: debounced,
+   short-lived read-only connections with busy_timeout, local-only.
+5. **Version skew is violent:** the `~/gh/opencode` checkout (core
+   1.18.21, PR #44029) has NO view endpoint and NO `time_viewed` writer at
+   all; the installed beta-19271 serves both. Probe-battery re-runs per
+   installed build (stone §6) are load-bearing for opencode, not hygiene.
+   TUI drive mechanics for the battery: the launcher runs
+   `opencode2 --auto` with a full TUI env; an open dialog is INVISIBLE in
+   the daemon `terminal_lines` snapshot (the mouse-mode arm `?1003h` in
+   the trailing escapes is the tell) and eats all input until ESC.
+
+**Falsifiers owed:** (a) which UI flow makes the installed TUI POST /view
+(tab focus? window focus? NOT the session-list switch — falsified today);
+(b) PTY-law proof for a tab-mirror row following a switch (row title +
+pane, one tick); (c) re-run this decode on the next ynpm channel bump —
+the checkout says the view endpoint may vanish.
 #### 11.6.5 muse measured baseline (wave-1 seat D, 2026-09-10, the muse lab host)
 
 Probe battery on Muse Code 1.1.1 (1.1.1-R2514.1) via the xterm-harness
