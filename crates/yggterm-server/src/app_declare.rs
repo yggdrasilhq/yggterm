@@ -385,14 +385,15 @@ pub struct AgentAnnounce {
     pub phase: String,
 }
 
-/// Strict parse: an announce with an empty session id or a phase outside the
-/// enum is not an announce — it is noise wearing the verb, and the fallback
-/// matcher must not be poisoned by it.
+/// Strict parse: a phase outside the enum is not an announce — it is noise
+/// wearing the verb, and the fallback matcher must not be poisoned by it.
+/// The session id may be EMPTY: the TUI at its home surface has no active
+/// session, and that is a legitimate frame — the phase claim stands (a booting
+/// row is StartupGate, measably not Working), the identity claim is nil. Phase
+/// and identity are orthogonal claims; rejecting a frame for a missing half
+/// would discard the half that was there.
 pub fn parse_agent_announce(payload: &serde_json::Value) -> Option<AgentAnnounce> {
     let session_id = payload.get("session_id")?.as_str()?;
-    if session_id.is_empty() {
-        return None;
-    }
     let phase = payload.get("phase")?.as_str()?;
     if !ANNOUNCE_PHASES.contains(&phase) {
         return None;
@@ -756,14 +757,32 @@ mod tests {
             seq: 1,
         };
         assert_eq!(announce_working_signal(&[record], 1_000), None);
-        let empty = AppDeclareRecord {
+        let missing = AppDeclareRecord {
             verb: "announce".to_string(),
             action: "state".to_string(),
-            payload: serde_json::json!({ "session_id": "", "phase": "Working" }),
+            payload: serde_json::json!({ "phase": "Working" }),
             at_ms: 1_000,
             seq: 2,
         };
-        assert_eq!(announce_working_signal(&[empty], 1_000), None);
+        assert_eq!(announce_working_signal(&[missing], 1_000), None);
+    }
+
+    #[test]
+    fn an_empty_session_id_is_a_phase_claim_without_an_identity_claim() {
+        // Measured live (seat B, 2026-09-10): the TUI at its home surface
+        // announces StartupGate with session_id "" — a booting row's phase
+        // must reach the gate even though there is no session to name yet.
+        let home = AppDeclareRecord {
+            verb: "announce".to_string(),
+            action: "state".to_string(),
+            payload: serde_json::json!({ "session_id": "", "phase": "StartupGate" }),
+            at_ms: 1_000,
+            seq: 3,
+        };
+        assert_eq!(announce_working_signal(&[home.clone()], 1_000), Some(false));
+        let parsed = fresh_agent_announce(&[home], 1_000).expect("parsed");
+        assert_eq!(parsed.session_id, "");
+        assert_eq!(parsed.phase, "StartupGate");
     }
 
 
