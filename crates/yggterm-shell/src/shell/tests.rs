@@ -13697,7 +13697,7 @@ console.log('ok');
 
     #[test]
     fn screen_reconcile_deadline_forces_a_working_surface_once() {
-        let working = "\n• Working (12s)\n› Ask Codex to do anything";
+        let working = "doing things\r\n(2m 10s • esc to interrupt)\r\n";
         assert_eq!(
             screen_reconcile_apply_decision(working, false, false),
             ScreenReconcileDecision::DeferWorking
