@@ -115,6 +115,12 @@ fn retention_for(verb: &str, action: &str) -> Retention {
         // could be replayed at a moment nobody is there to consent — never
         // store one.
         ("fido2", _) => Retention::Ignore,
+        // NativeAnnounce (3.3.0, spec §2 cap-2/§3): a first-party CLI
+        // (zcode-tui) announces its identity + phase on this verb. Latest-wins
+        // retention IS the listener; the record is freshness-bounded by
+        // `at_ms` (see [`ANNOUNCE_FRESH_MS`]), so a dead TUI's last phase
+        // expires instead of lying forever — no `close` action is needed.
+        ("announce", "state") => Retention::Store,
         _ => Retention::Ignore,
     }
 }
@@ -348,6 +354,79 @@ impl AppDeclareLog {
     pub fn records(&self) -> Vec<AppDeclareRecord> {
         self.latest.values().cloned().collect()
     }
+}
+
+// ─── NativeAnnounce — the first-party identity + phase wire ──────────────────
+
+/// How long a retained announce stays authoritative: four missed 5 s
+/// heartbeats. Past this the row degrades to its descriptor's phrase matcher
+/// (spec §3 precedence — native announce is the TOP of the chain only while
+/// it is alive; a dead TUI is not a phase source).
+pub const ANNOUNCE_FRESH_MS: u64 = 20_000;
+
+/// The phase enum on the wire (stone spec §2 cap-3), verbatim strings. The
+/// hot-restart gate and the sidebar dot consume THIS; it must never disagree
+/// with itself by carrying two spellings of one phase.
+pub const ANNOUNCE_PHASES: [&str; 5] = [
+    "Working",
+    "Idle",
+    "QuestionPrompt",
+    "LimitWait",
+    "StartupGate",
+];
+
+/// One parsed announce: WHO the row's session is, and WHAT it is doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAnnounce {
+    /// The CLI's OWN session id — the [11.75]-class answer for rows whose id
+    /// drifted from the store truth (identity precedence, spec §3). Served to
+    /// the GUI through the existing app-declares plane.
+    pub session_id: String,
+    pub phase: String,
+}
+
+/// Strict parse: a phase outside the enum is not an announce — it is noise
+/// wearing the verb, and the fallback matcher must not be poisoned by it.
+/// The session id may be EMPTY: the TUI at its home surface has no active
+/// session, and that is a legitimate frame — the phase claim stands (a booting
+/// row is StartupGate, measably not Working), the identity claim is nil. Phase
+/// and identity are orthogonal claims; rejecting a frame for a missing half
+/// would discard the half that was there.
+pub fn parse_agent_announce(payload: &serde_json::Value) -> Option<AgentAnnounce> {
+    let session_id = payload.get("session_id")?.as_str()?;
+    let phase = payload.get("phase")?.as_str()?;
+    if !ANNOUNCE_PHASES.contains(&phase) {
+        return None;
+    }
+    Some(AgentAnnounce {
+        session_id: session_id.to_string(),
+        phase: phase.to_string(),
+    })
+}
+
+/// The freshest `announce;state` record, parsed — or `None` when the row
+/// never announced, the frame is unparseable, or the record expired.
+pub fn fresh_agent_announce(
+    records: &[AppDeclareRecord],
+    now_ms: u64,
+) -> Option<AgentAnnounce> {
+    let record = records
+        .iter()
+        .rev()
+        .find(|r| r.verb == "announce" && r.action == "state")?;
+    if now_ms.saturating_sub(record.at_ms) >= ANNOUNCE_FRESH_MS {
+        return None;
+    }
+    parse_agent_announce(&record.payload)
+}
+
+/// The gate's shape of the same answer: `Some(true)` only for `Working`.
+/// `Some(false)` is a real "not working" from a live TUI and must NOT fall
+/// through to the screen matcher (the announce outranks phrases in BOTH
+/// directions — a screen that still shows a working footer while the TUI
+/// says Idle is the footer lying, not the TUI).
+pub fn announce_working_signal(records: &[AppDeclareRecord], now_ms: u64) -> Option<bool> {
+    fresh_agent_announce(records, now_ms).map(|a| a.phase == "Working")
 }
 
 // ─── Generic OSC class witness (NOT 7717-specific) ──────────────────────────
@@ -621,6 +700,91 @@ impl OscWitness {
 
 #[cfg(test)]
 mod tests {
+
+    fn announce_record(session_id: &str, phase: &str, age_ms: u64, now_ms: u64) -> AppDeclareRecord {
+        AppDeclareRecord {
+            verb: "announce".to_string(),
+            action: "state".to_string(),
+            payload: serde_json::json!({ "session_id": session_id, "phase": phase }),
+            at_ms: now_ms - age_ms,
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn the_announce_verb_is_retained_and_served_back() {
+        let mut log = AppDeclareLog::new();
+        log.ingest(
+            AppDeclareMessage {
+                verb: "announce".to_string(),
+                action: "state".to_string(),
+                payload: serde_json::json!({ "session_id": "sess_1", "phase": "Working" }),
+            },
+            1_000,
+        );
+        let records = log.records();
+        assert_eq!(records.len(), 1);
+        let announce = fresh_agent_announce(&records, 1_000).expect("fresh");
+        assert_eq!(announce.session_id, "sess_1");
+        assert_eq!(announce.phase, "Working");
+        assert_eq!(announce_working_signal(&records, 1_000), Some(true));
+    }
+
+    #[test]
+    fn a_stale_announce_is_not_a_phase_source() {
+        let record = announce_record("sess_1", "Working", ANNOUNCE_FRESH_MS, 100_000);
+        assert_eq!(announce_working_signal(&[record], 100_000), None);
+        // One ms inside the window still answers.
+        let record = announce_record("sess_1", "Working", ANNOUNCE_FRESH_MS - 1, 100_000);
+        assert_eq!(announce_working_signal(&[record], 100_000), Some(true));
+    }
+
+    #[test]
+    fn an_announce_saying_idle_outranks_even_a_working_screen() {
+        // The dot and the gate must not OR the two sources: a live TUI's
+        // "Idle" is authoritative in BOTH directions.
+        let record = announce_record("sess_1", "Idle", 0, 1_000);
+        assert_eq!(announce_working_signal(&[record], 1_000), Some(false));
+    }
+
+    #[test]
+    fn a_frame_outside_the_phase_enum_is_rejected_not_coerced() {
+        let record = AppDeclareRecord {
+            verb: "announce".to_string(),
+            action: "state".to_string(),
+            payload: serde_json::json!({ "session_id": "sess_1", "phase": "COOKING" }),
+            at_ms: 1_000,
+            seq: 1,
+        };
+        assert_eq!(announce_working_signal(&[record], 1_000), None);
+        let missing = AppDeclareRecord {
+            verb: "announce".to_string(),
+            action: "state".to_string(),
+            payload: serde_json::json!({ "phase": "Working" }),
+            at_ms: 1_000,
+            seq: 2,
+        };
+        assert_eq!(announce_working_signal(&[missing], 1_000), None);
+    }
+
+    #[test]
+    fn an_empty_session_id_is_a_phase_claim_without_an_identity_claim() {
+        // Measured live (seat B, 2026-09-10): the TUI at its home surface
+        // announces StartupGate with session_id "" — a booting row's phase
+        // must reach the gate even though there is no session to name yet.
+        let home = AppDeclareRecord {
+            verb: "announce".to_string(),
+            action: "state".to_string(),
+            payload: serde_json::json!({ "session_id": "", "phase": "StartupGate" }),
+            at_ms: 1_000,
+            seq: 3,
+        };
+        assert_eq!(announce_working_signal(&[home.clone()], 1_000), Some(false));
+        let parsed = fresh_agent_announce(&[home], 1_000).expect("parsed");
+        assert_eq!(parsed.session_id, "");
+        assert_eq!(parsed.phase, "StartupGate");
+    }
+
 
     #[test]
     fn the_title_tracker_reassembles_a_sequence_split_across_chunks() {

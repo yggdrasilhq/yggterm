@@ -40,7 +40,22 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.8 | grok | C | OPEN |
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
-| 11.6.11 | zcode-tui | B | OPEN (native announce — the reference implementation) |
+| 11.6.11 | zcode-tui | B | OPEN (native announce LANDED on `lane/integration/zcode-tui` — emitter commit zcode-tui 0bd590f + daemon `announce` verb with fresh-phase precedence; arm-matrix gap open, see the entry below; live PTY proof owed) |
+
+### ⛔ 11.6.11 defect — ZCODE-TUI IS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` IS RED ON MAIN (found by wave-1 seat B, 2026-09-10)
+
+Open, and blocks no lane: the descriptor fill it belongs to queues behind 11.6.0's schema-v2 conversion.
+
+Measured on origin/main (e2ccb9dc9): `cargo test -p yggterm-server --lib
+agent_arm_matrix` fails — "ZcodeTui on Local must appear EXACTLY once in the
+arm matrix — a CLI registered without arms is a CLI whose harness decisions
+nothing checks (spec §6 A6, the new-CLI drill)". The ARMS table carries 20
+arms for 11 of the 12 registered CLIs; zcode-tui joined the registry in the
+2026-09-08 intake without its Local+Remote arms. Measured facts for the LOCAL
+arm already exist (zcode-tui's own entrypoint parses `--resume <sessionId>`;
+binary `zcode-tui`); the REMOTE arm's wrapper facts are UNMEASURED — do not
+half-fill cells to green a drill. Filed by seat B with the failing test named;
+fix belongs with the zcode-tui descriptor fill.
 
 #### 11.6.1+11.6.2 measured baseline (wave-1 seat F, 2026-09-10, dev)
 

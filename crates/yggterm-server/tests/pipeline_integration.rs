@@ -908,3 +908,89 @@ fn a_consumed_web_surface_open_never_replays_verbatim_on_attach() {
         "every consumed open in the cursor-0 seed is history and must serve as seen"
     );
 }
+
+// ---- NativeAnnounce (11.6.11, wave-1 seat B) -----------------------------------
+// ⚠ LOCK — the first-party emitter's frame must survive the REAL pipeline:
+// PTY bytes → reader thread → AppDeclareScanner → retained record → the
+// announce phase signal. The frames below are byte-identical to what the TS
+// Announcer writes (src/tui/announce.ts in ~/gh/zcode-tui:
+// `ESC ] 7717 ; announce ; state ; <base64-json> BEL`, base64 STANDARD with
+// padding, payload keys session_id/phase). If either side drifts, this
+// reddens. Freshness decay itself is unit-tested in app_declare; here the
+// proof is that the daemon LIFTS the frames off a live PTY.
+#[test]
+fn a_native_announce_frame_lands_as_a_retained_record_and_answers_the_gate() {
+    use yggterm_server::app_declare::{announce_working_signal, fresh_agent_announce};
+
+    fn now_unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as u64)
+            .unwrap_or_default()
+    }
+
+    fn fresh_phase(mgr: &TerminalManager, key: &str) -> Option<(String, bool)> {
+        let records = mgr.session_app_declares(key)?;
+        let announce = fresh_agent_announce(&records, now_unix_ms())?;
+        let working = announce_working_signal(&records, now_unix_ms())?;
+        Some((announce.phase, working))
+    }
+
+    // Two frames, one second apart: Working then Idle — latest-wins must end
+    // on Idle, which also proves the second frame was ingested, not just the
+    // first. Payloads: {"session_id":"sess_abc","phase":"Working"} and the
+    // same with "Idle". (bash printf turns the \\xHH escapes into the real
+    // ESC/BEL bytes on the PTY.)
+    let cmd = "printf '\\x1b]7717;announce;state;eyJzZXNzaW9uX2lkIjoic2Vzc19hYmMiLCJwaGFzZSI6IldvcmtpbmcifQ==\\x07'; sleep 1; printf '\\x1b]7717;announce;state;eyJzZXNzaW9uX2lkIjoic2Vzc19hYmMiLCJwaGFzZSI6IklkbGUifQ==\\x07'; sleep 6";
+    let mut mgr = TerminalManager::new();
+    let key = "test://native-announce";
+    mgr.ensure_session(key, cmd, None).expect("ensure_session");
+
+    // The first announce is Working (the retained record carries the
+    // session_id too — the identity half of the wire).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_working = false;
+    while Instant::now() < deadline {
+        if let Some((phase, working)) = fresh_phase(&mgr, key) {
+            assert_eq!(
+                phase, "Working",
+                "the first frame must land as the retained announce"
+            );
+            assert!(working, "a Working announce must answer the gate Some(true)");
+            saw_working = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        saw_working,
+        "no announce record was ever retained; records: {:?}",
+        mgr.session_app_declares(key)
+    );
+
+    // One second later the Idle frame replaces it — and Some(false) STICKS
+    // (the announce outranks everything in BOTH directions; nothing may
+    // resurrect Working from it).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_idle = false;
+    while Instant::now() < deadline {
+        if let Some((phase, working)) = fresh_phase(&mgr, key) {
+            if phase == "Idle" {
+                assert!(
+                    !working,
+                    "an Idle announce must answer the gate Some(false), not fall through"
+                );
+                saw_idle = true;
+            }
+            if saw_idle {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        saw_idle,
+        "the second frame never replaced the first; records: {:?}",
+        mgr.session_app_declares(key)
+    );
+}

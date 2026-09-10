@@ -3590,12 +3590,31 @@ pub enum HotRestartDeadlineVerdict {
 /// `None` = "no opinion" (unreadable screen, unmeasurable shell) — the gate's
 /// fail-open bias then leans on the output-idle arm, which is the one signal
 /// that cannot lie about a streaming turn.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn hot_restart_gate_working_signal(
     kind: Option<SessionKind>,
     key_is_app_row: bool,
     screen: Option<&str>,
     foreground_active: Option<bool>,
+    announce_working: Option<bool>,
 ) -> Option<bool> {
+    // NativeAnnounce precedence (spec §3): the first-party CLI's own phase
+    // word outranks anything its screen happens to render — in BOTH
+    // directions. The call site passes `Some` only for the CLI that declares
+    // the strategy (today zcode-tui, `SessionKind::ZcodeTui`) and only from a
+    // FRESH record ([`crate::app_declare::announce_working_signal`]); a stale
+    // or absent announce arrives as `None` and the per-kind matcher below
+    // answers as before. The generalization from this one-kind check to the
+    // descriptor's resolution-strategy enum is 11.6.0's schema-v2 conversion.
+    if kind == Some(SessionKind::ZcodeTui) && announce_working.is_some() {
+        return announce_working;
+    }
     match kind {
         Some(kind) if kind.is_agent() => {
             let screen = screen?;
@@ -5709,24 +5728,44 @@ impl DaemonRuntime {
             .iter()
             .filter_map(|session| {
                 let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
-                let working = match yggterm_core::agent_cli::agent_cli_descriptor(session.kind) {
-                    // PER-CLI matcher, not the kind-agnostic one. This has the
-                    // session's kind in hand, so it can ask THAT CLI's phrases
-                    // — and the kind-agnostic detector ORs across every
-                    // descriptor, which means one CLI's completion trace
-                    // (codex's `Worked for 12s`) can read as another's work
-                    // signal. The agnostic function still exists for callers
-                    // that genuinely have no kind (the hot-update idle gate).
-                    Some(descriptor) => self
-                        .terminals
-                        .session_screen_snapshot(&runtime_path)
-                        .as_deref()
-                        .map(|screen| descriptor.screen_shows_working(screen)),
-                    None if session.kind == SessionKind::Shell => self
-                        .terminals
-                        .session_foreground_process_active(&runtime_path),
-                    None => None,
-                }?;
+                // NativeAnnounce precedence (spec §3): a fresh first-party
+                // announce IS the phase answer — zcode-tui knows its turn
+                // lifecycle in-process, so its screen matcher is only the
+                // fallback for a row that never announced or went stale.
+                // `Some(false)` from the announce stays `Some(false)`: the
+                // TUI's "Idle" outranks a stale working footer on screen.
+                let working = if session.kind == SessionKind::ZcodeTui {
+                    self.terminals
+                        .session_app_declares(&runtime_path)
+                        .and_then(|records| {
+                            crate::app_declare::announce_working_signal(
+                                &records,
+                                now_unix_ms(),
+                            )
+                        })
+                } else {
+                    None
+                }
+                .or_else(
+                    || match yggterm_core::agent_cli::agent_cli_descriptor(session.kind) {
+                        // PER-CLI matcher, not the kind-agnostic one. This has the
+                        // session's kind in hand, so it can ask THAT CLI's phrases
+                        // — and the kind-agnostic detector ORs across every
+                        // descriptor, which means one CLI's completion trace
+                        // (codex's `Worked for 12s`) can read as another's work
+                        // signal. The agnostic function still exists for callers
+                        // that genuinely have no kind (the hot-update idle gate).
+                        Some(descriptor) => self
+                            .terminals
+                            .session_screen_snapshot(&runtime_path)
+                            .as_deref()
+                            .map(|screen| descriptor.screen_shows_working(screen)),
+                        None if session.kind == SessionKind::Shell => self
+                            .terminals
+                            .session_foreground_process_active(&runtime_path),
+                        None => None,
+                    },
+                )?;
                 Some((session.session_path.clone(), working))
             })
             .collect()
@@ -6462,6 +6501,15 @@ impl DaemonRuntime {
             // footer, a shell whose screen quoted this source file — each a
             // phantom WORKING blocker, and each one a daemon that never
             // converges ([[finding-stale-daemon-trap]] is exactly that shape).
+            let announce_working = if session_kind == Some(SessionKind::ZcodeTui) {
+                self.terminals
+                    .session_app_declares(&runtime_path)
+                    .and_then(|records| {
+                        crate::app_declare::announce_working_signal(&records, now_unix_ms())
+                    })
+            } else {
+                None
+            };
             let working = hot_restart_gate_working_signal(
                 session_kind,
                 app_row_paths.contains(key) || app_row_paths.contains(&runtime_path),
@@ -6470,6 +6518,7 @@ impl DaemonRuntime {
                     .as_deref(),
                 self.terminals
                     .session_foreground_process_active(&runtime_path),
+                announce_working,
             );
             if working == Some(true) {
                 blockers.push(HotRestartBlocker {
@@ -30260,6 +30309,7 @@ mod tests {
                 false,
                 Some("esc to interrupt · ctrl+b background"),
                 Some(false),
+                None,
             ),
             Some(true)
         );
@@ -30272,6 +30322,7 @@ mod tests {
                 false,
                 Some("esc to interrupt · ctrl+b background"),
                 Some(false),
+                None,
             ),
             Some(false)
         );
@@ -30284,6 +30335,7 @@ mod tests {
                 false,
                 Some("esc to cancel"),
                 Some(false),
+                None,
             ),
             Some(false)
         );
@@ -30294,6 +30346,7 @@ mod tests {
                 false,
                 None,
                 Some(false),
+                None,
             ),
             None
         );
@@ -30309,6 +30362,7 @@ mod tests {
                 false,
                 Some("user@host:~$ "),
                 Some(true),
+                None,
             ),
             Some(true)
         );
@@ -30319,6 +30373,7 @@ mod tests {
                 false,
                 Some("user@host:~$ "),
                 Some(false),
+                None,
             ),
             Some(false)
         );
@@ -30330,6 +30385,65 @@ mod tests {
                 true,
                 Some("ychrome: web surface open"),
                 Some(true),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fresh_zcode_tui_announce_outranks_the_screen_in_both_directions() {
+        // Working while the screen still shows the idle prompt: the TUI knows
+        // the turn started; the frame the screen shows is already history.
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ZcodeTui),
+                false,
+                Some("zcode-tui >"),
+                Some(false),
+                Some(true),
+            ),
+            Some(true)
+        );
+        // Idle while the screen still shows a working footer: the footer is
+        // the stale half, the announce is alive — Some(false), not the
+        // matcher's Some(true).
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ZcodeTui),
+                false,
+                Some("esc to interrupt · working"),
+                Some(false),
+                Some(false),
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_announce_precedence_is_scoped_to_the_cli_that_declares_it() {
+        // Another CLI's row must not be steered by an announce that happens
+        // to be lying around: its own matcher answers, the announce is
+        // ignored by this precedence arm (generalization is 11.6.0's enum).
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ClaudeCode),
+                false,
+                None,
+                Some(false),
+                Some(true),
+            ),
+            None
+        );
+        // A zcode-tui row without a fresh announce keeps the old contract:
+        // no announce means no opinion from this arm (None screen → None).
+        assert_eq!(
+            hot_restart_gate_working_signal(
+                Some(SessionKind::ZcodeTui),
+                false,
+                None,
+                Some(false),
+                None,
             ),
             None
         );
