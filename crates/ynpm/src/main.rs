@@ -559,6 +559,17 @@ fn package_name_for_app(state: &State, app_name: &str) -> Option<String> {
     })
 }
 
+fn another_package_owns_app_name(state: &State, excluded_key: &str, app_name: &str) -> bool {
+    state
+        .packages
+        .iter()
+        .filter(|(key, _)| key.as_str() != excluded_key)
+        .any(|(key, package)| {
+            app_name_for_package(&package_identity(key, package), package.integration.as_ref())
+                == app_name
+        })
+}
+
 fn package_destination(paths: &Paths, package: &Package) -> PathBuf {
     package
         .destination
@@ -4088,7 +4099,10 @@ fn verb_remove(paths: &Paths, name: &str) -> anyhow::Result<()> {
     }
     paths.save_state(&state)?;
     if integration.is_some() || pkg.starts_with("@ygghq/") {
-        remove_app_registration(paths, &app_name_for_package(&pkg, integration.as_ref()))?;
+        let app_name = app_name_for_package(&pkg, integration.as_ref());
+        if !another_package_owns_app_name(&state, &key, &app_name) {
+            remove_app_registration(paths, &app_name)?;
+        }
     }
     println!("ynpm: removed {pkg} and its ynpm generations");
     Ok(())
@@ -6379,6 +6393,53 @@ mod tests {
             package_name_for_app(&state, "ydesign").as_deref(),
             Some("@ygghq/ydesign-app")
         );
+    }
+
+    #[test]
+    fn removing_a_stale_app_identity_preserves_the_new_package_registration() {
+        let state = State {
+            packages: BTreeMap::from([
+                (
+                    "ydesign".to_string(),
+                    Package {
+                        package_name: Some("@ygghq/ydesign".to_string()),
+                        current: "0.0.0".to_string(),
+                        versions: Vec::new(),
+                        bins: BTreeMap::new(),
+                        external_prev: None,
+                        destination: None,
+                        dev: None,
+                        dev_generation: None,
+                        channel: None,
+                        source: None,
+                        integration: None,
+                    },
+                ),
+                (
+                    "ydesign-app".to_string(),
+                    Package {
+                        package_name: Some("@ygghq/ydesign-app".to_string()),
+                        integration: Some(yggterm_core::YggtermPackageMetadata {
+                            schema: 1,
+                            app: Some(yggterm_core::YggtermAppMetadata {
+                                name: Some("ydesign".to_string()),
+                                ..Default::default()
+                            }),
+                        }),
+                        current: "0.1.1".to_string(),
+                        versions: Vec::new(),
+                        bins: BTreeMap::new(),
+                        external_prev: None,
+                        destination: None,
+                        dev: None,
+                        dev_generation: None,
+                        channel: None,
+                        source: None,
+                    },
+                ),
+            ]),
+        };
+        assert!(another_package_owns_app_name(&state, "ydesign", "ydesign"));
     }
 
     #[test]
