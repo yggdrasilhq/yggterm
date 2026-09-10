@@ -1367,7 +1367,11 @@ def _flock_open(lock_path: Path, timeout_seconds: float = 10):
             except BlockingIOError:
                 pass
         else:
-            raise RuntimeError(f"Lock held by another process: {lock_path}")
+            raise RuntimeError(
+                f"Lock held by another process: {lock_path} "
+                f"(waited {timeout_seconds:.0f}s — another ygg-memory verb is "
+                "mid-run; retry shortly, or let the catch-up tick cover it)"
+            )
     return f
 
 
@@ -2463,7 +2467,11 @@ def cmd_sync_harness(args):
             print(f"Harness sync completed ({harness} <-> {ns}): {result['pulled_in']} ingested, {result['pushed_out']} propagated{extra}.")
         return
 
-    lock = _flock_open(root / ".ygg-memory.lock")
+    # 60s, not the 10s startup default: --all is the seat's explicit
+    # session-end push and competes with every other seat's verbs. It still
+    # fails loudly on timeout on purpose — a seat must know its push did not
+    # land (the catch-up tick is recovery, not an excuse).
+    lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
 
     try:
         migrate_legacy_store(root)
@@ -2807,7 +2815,25 @@ def cmd_sync_fleet(args):
     """Mesh synchronize semantic objects/events across reachable SSH peers."""
     root = Path(args.root)
     mesh = resolve_fleet_mesh(args.mesh)
-    report = _run_fleet_sync(root, mesh, quick=getattr(args, "quick", False))
+    try:
+        report = _run_fleet_sync(root, mesh, quick=getattr(args, "quick", False))
+    except RuntimeError as error:
+        # ⛔ Busy hub ≠ broken sync. sync-fleet is the recovery convergence
+        # leg — the catch-up tick re-runs it — so a busy lock is a DEFERRAL,
+        # not a failure. Exiting 1 here read as breakage in every seat's
+        # session-end ritual whenever another seat's long sync held the hub
+        # (measured 2026-09-10: three seats, one flock, two false alarms).
+        # A non-lock RuntimeError is a real fault and still raises.
+        if not str(error).startswith("Lock held by another process"):
+            raise
+        if getattr(args, "json", False):
+            print(json.dumps({"status": "deferred", "reason": str(error)}))
+        else:
+            print(
+                "Fleet memory sync deferred — the hub lock is busy; "
+                "the catch-up tick will cover it."
+            )
+        return
     if getattr(args, "json", False):
         print(json.dumps(report))
     elif not getattr(args, "quiet", False):
