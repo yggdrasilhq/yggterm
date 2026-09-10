@@ -3499,6 +3499,26 @@ mod tests {
             "the exact Codex YOLO flag must reach the binary: {command}"
         );
     }
+
+    #[test]
+    fn configured_override_reaches_every_registered_cli_launch() {
+        for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            let command = managed_cli_shell_command_configured(
+                descriptor.kind,
+                Some("/home/user/project"),
+                ManagedCliAction::Launch,
+                None,
+                &AgentLaunchOptions::default(),
+                Some("--configured-probe"),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", descriptor.slug));
+            assert!(
+                command.contains("'--configured-probe'"),
+                "{} lost the configured override: {command}",
+                descriptor.slug
+            );
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
