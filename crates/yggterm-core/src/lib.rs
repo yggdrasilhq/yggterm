@@ -125,7 +125,7 @@ pub use icon::{
 pub use install::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_ENABLE_NATIVE_IME, InstallChannel, InstallContext,
     ReleaseUpdate, UpdatePolicy, YGGTERM_DESKTOP_APP_ID, check_for_update, current_asset_label,
-    current_version, detect_install_context, direct_install_root,
+    current_version, detect_install_context, direct_install_context, direct_install_root,
     handoff_target_is_not_a_downgrade, handoff_target_is_usable, install_mode_summary,
     install_path_declared_version, promote_direct_install_active_version,
     refresh_desktop_integration, write_direct_install_state,

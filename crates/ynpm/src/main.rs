@@ -1261,6 +1261,28 @@ struct YggtermUpdateReport {
 
 fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::InstallContext> {
     let extension = cfg!(target_os = "windows").then_some(".exe").unwrap_or("");
+    // The canonical install-state record also names a dev executable outside
+    // the direct install's version directory. Consult that record first so an
+    // older production directory cannot hide an active ynpm dev generation.
+    if let Ok(root) = yggterm_core::direct_install_root()
+        && let Ok(Some(mut context)) = yggterm_core::direct_install_context(&root)
+    {
+        let executable = context
+            .preferred_executable
+            .as_ref()
+            .unwrap_or(&context.executable_path);
+        if executable.is_file() {
+            if let Some(observed) = run_version(executable)
+                .ok()
+                .and_then(|answer| version_from_answer(&answer))
+            {
+                context.current_version = observed;
+            }
+            context.repo = normalize_yggterm_release_repo(&context.repo);
+            context.asset_label = normalize_yggterm_asset_label(&context.asset_label);
+            return Ok(context);
+        }
+    }
     let mut candidates = Vec::new();
     // Linux/macOS use a launcher in ~/.local/bin; Windows' bootstrap keeps the
     // executable in %LOCALAPPDATA%\Yggterm\versions instead. Inspect the
@@ -2711,6 +2733,14 @@ fn install_dev_bins(
     let destination = destination
         .map(absolute_path)
         .unwrap_or_else(|| default_dev_destination(paths, &package));
+    let observed_version = answers
+        .values()
+        .next()
+        .and_then(|answer| version_from_answer(answer));
+    let state_version = expected_version
+        .map(str::to_string)
+        .or(observed_version)
+        .unwrap_or_else(|| "0.0.0".to_string());
     let mut state = paths.load_state()?;
     let key = find_package_key(&state, &package)
         .map(str::to_string)
@@ -2769,10 +2799,7 @@ fn install_dev_bins(
     let previous = existing.map(|package| package.current.clone());
     let package_state = state.packages.entry(key.clone()).or_insert(Package {
         package_name: Some(package.clone()),
-        current: marker
-            .supersedes
-            .clone()
-            .unwrap_or_else(|| "0.0.0".to_string()),
+        current: state_version.clone(),
         versions: Vec::new(),
         bins: BTreeMap::new(),
         external_prev: None,
@@ -2784,6 +2811,7 @@ fn install_dev_bins(
         integration: None,
     });
     package_state.package_name = Some(package.clone());
+    package_state.current = state_version;
     package_state.bins = bin_table;
     package_state.destination = Some(destination.display().to_string());
     package_state.dev = Some(marker.clone());

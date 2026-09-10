@@ -661,6 +661,28 @@ pub fn direct_install_root() -> Result<PathBuf> {
     }
 }
 
+/// Read the canonical direct-install record without requiring the executable
+/// to live under that record's root. Fleet launchers normally live in
+/// `~/.local/bin`, while a dev generation lives under ynpm's generation root;
+/// neither path is an ancestor of `%LOCALAPPDATA%/Yggterm/install-state.json`
+/// or `~/.local/share/yggterm/direct/install-state.json`.
+pub fn direct_install_context(root: &Path) -> Result<Option<InstallContext>> {
+    let Some(state) = load_direct_install_state(root)? else {
+        return Ok(None);
+    };
+    Ok(Some(InstallContext {
+        channel: InstallChannel::Direct,
+        update_policy: UpdatePolicy::Auto,
+        repo: state.repo,
+        asset_label: state.asset_label,
+        current_version: state.active_version,
+        executable_path: state.active_executable.clone(),
+        preferred_executable: Some(state.active_executable),
+        managed_root: Some(root.to_path_buf()),
+        manager_hint: Some("Direct install".to_string()),
+    }))
+}
+
 pub fn write_direct_install_state(
     root: &Path,
     repo: &str,
