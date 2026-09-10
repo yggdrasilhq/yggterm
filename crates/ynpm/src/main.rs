@@ -1425,7 +1425,7 @@ fn mirror_legacy_compatibility_state(
         version,
         executable,
     )?;
-    println!(
+    eprintln!(
         "ynpm: repaired legacy yggterm compatibility state to {}",
         executable.display()
     );
@@ -1651,6 +1651,8 @@ fn install_yggterm_release(
     let integrate = Command::new(&yggterm)
         .args(["install", "integrate"])
         .env(yggterm_core::ENV_YGGTERM_DIRECT_INSTALL_ROOT, root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     if !integrate.as_ref().is_ok_and(|status| status.success()) {
         eprintln!("ynpm: yggterm release activated; desktop integration refresh was unavailable");
