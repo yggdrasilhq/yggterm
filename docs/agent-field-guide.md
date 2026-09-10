@@ -246,21 +246,30 @@ kilobytes, is the misdelivery announcing itself. Both tells were present and bot
 `server app input-check`, which answers `unsupported app control command` — easy to misread as "this
 build lacks the verb" rather than "the parent verb is missing".
 
-### ⛔ `server app rows` DOES NOT CARRY THE WEDGE FIELDS — `server snapshot` DOES
+### ⛔ `server app rows` carries wedge/attention fields, but not daemon ownership
 
-A brief handed on the claim that `server app rows` emits `input_unanswered_ms` and
-`wedge_suspected`, which would make it the instrument for measuring a deaf row. **It does not.**
-Measured: 384 rows, and the union of every field name across all of them contains neither.
+The older version of this entry claimed that `server app rows` omitted
+`input_unanswered_ms` and `wedge_suspected`. That is stale: current app-row
+projection carries those fields, plus `terminal_attention_reason`,
+`terminal_transport_degraded`, `ghost_frame`, and `cached_input_bytes`.
 
 ```sh
 server app rows | python3 -c 'import sys,json; rs=json.load(sys.stdin)["data"]["rows"]; \
-  print(sorted({k for r in rs for k in r}))'      # ⇒ no input_unanswered_ms, no wedge_suspected
+  print(sorted({k for r in rs for k in r if "input" in k or "attention" in k or "wedge" in k or "ghost" in k}))'
 ```
 
-`input_unanswered_ms` lives on `SnapshotSessionView` (`daemon.rs`), so **`server snapshot`** is the
-owner; `wedge_suspected` is not a field at all but a derived predicate —
-`input_unanswered_suggests_wedge()` against `INPUT_UNANSWERED_WEDGE_SUSPECT_MS` in `yggterm-core`,
-which is the single owner of the threshold that gate, row payload and sidebar all read.
+These are the GUI projection's current observations. `input_unanswered_ms` and
+`wedge_suspected` remain a trigger/suspicion, not a verdict: the threshold is
+owned by `input_unanswered_suggests_wedge()` in `yggterm-core`, and
+`server app terminal input-check` settles whether the row is actually
+consuming input. `terminal_attention_reason` explains the transport/render
+attention state (for example a held frame awaiting fresh Paint).
+
+The app-row projection does **not** prove which daemon owns a PTY or whether a
+CLI process still carries the row identity. For that separate question use the
+host-wide `server rows live` witness (`daemon_pid`, `endpoint`, and `holder`),
+then query the owning daemon's screen/runtime key. A `RemoteBootstrap` phase
+alone is not a fault signal.
 
 ⭐ **The lesson is the shape, not the fields:** the claim arrived in a handover as an established
 fact and was one command from being falsified. A relayed measurement is a CLAIM until you have run
@@ -2998,5 +3007,4 @@ every local reads as a global and the scan reported CLEAN over the very defect i
 was written for. Then, tracking no scope chain, it called all 30 legitimate
 closures findings — and 30 false alarms teach a reader to stop believing a gate as
 surely as one missed finding does. Both polarities are pinned in the test.
-
 

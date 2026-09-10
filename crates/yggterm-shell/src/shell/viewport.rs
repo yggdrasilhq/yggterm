@@ -6286,11 +6286,16 @@ fn TerminalCanvas(
             // the js_event branch (the keystroke path) queued behind them.
             // The fetch now spawns off the loop behind an in-flight latch and
             // the decision/apply logic runs on this channel's own select
-            // branch. Payload: (reason, reveal_incomplete, screen — None when
-            // the fetch itself failed, which the inline path swallowed
-            // silently and the branch now traces).
+            // branch. Payload: (reason, reveal_incomplete, deadline_expired,
+            // screen — None when the fetch itself failed, which the inline
+            // path swallowed silently and the branch now traces).
             let (screen_reconcile_result_tx, mut screen_reconcile_result_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(&'static str, bool, Option<String>)>();
+                tokio::sync::mpsc::unbounded_channel::<(
+                    &'static str,
+                    bool,
+                    bool,
+                    Option<String>,
+                )>();
             let mut screen_reconcile_fetch_in_flight = false;
             let mut startup_resize_repair_scheduled = false;
             // THE DAEMON RPCs INSIDE THE js_event BRANCH LEAVE THE LOOP THE SAME
@@ -6716,6 +6721,7 @@ fn TerminalCanvas(
                             trace_home.clone(),
                             reconcile_reason,
                             reveal_incomplete,
+                            defer_deadline_expired,
                             screen_reconcile_result_tx.clone(),
                         );
                     }
@@ -10030,7 +10036,7 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    Some((reconcile_reason, reveal_incomplete, fetched)) = screen_reconcile_result_rx.recv() => {
+                    Some((reconcile_reason, reveal_incomplete, defer_deadline_expired, fetched)) = screen_reconcile_result_rx.recv() => {
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "screen_reconcile_apply",
                             &session_path,
@@ -10071,8 +10077,31 @@ fn TerminalCanvas(
                                 // Write and fill the blank from the daemon's authoritative
                                 // screen. An unwritable (empty/launch-seed) daemon frame still
                                 // Skips — nothing to paint.
-                                let decision = match screen_reconcile_decision(&screen_text) {
-                                    ScreenReconcileDecision::DeferWorking if reveal_incomplete => {
+                                let decision = match screen_reconcile_apply_decision(
+                                    &screen_text,
+                                    reveal_incomplete,
+                                    defer_deadline_expired,
+                                ) {
+                                    ScreenReconcileDecision::Write
+                                        if defer_deadline_expired
+                                            && !reveal_incomplete
+                                            && yggterm_core::screen_text_shows_agent_working(
+                                                &screen_text,
+                                            ) => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "screen_reconcile_forced_working_deadline",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "reason": reconcile_reason,
+                                                "bytes": screen_text.len(),
+                                            }),
+                                        );
+                                        ScreenReconcileDecision::Write
+                                    }
+                                    ScreenReconcileDecision::Write if reveal_incomplete => {
                                         append_trace_event(
                                             &trace_home,
                                             "ui",
@@ -18251,7 +18280,13 @@ fn spawn_screen_reconcile_fetch(
     trace_home: PathBuf,
     reconcile_reason: &'static str,
     reveal_incomplete: bool,
-    result_tx: tokio::sync::mpsc::UnboundedSender<(&'static str, bool, Option<String>)>,
+    defer_deadline_expired: bool,
+    result_tx: tokio::sync::mpsc::UnboundedSender<(
+        &'static str,
+        bool,
+        bool,
+        Option<String>,
+    )>,
 ) {
     tokio::spawn(async move {
         let fetched = terminal_snapshot_async(endpoint, session_path, &trace_home)
@@ -18260,7 +18295,12 @@ fn spawn_screen_reconcile_fetch(
             .map(|(screen_text, _running, _out, _post, _seq, _spawn, ..)| screen_text);
         // The loop dropping its receiver means the session unmounted: nothing
         // left to reconcile.
-        let _ = result_tx.send((reconcile_reason, reveal_incomplete, fetched));
+        let _ = result_tx.send((
+            reconcile_reason,
+            reveal_incomplete,
+            defer_deadline_expired,
+            fetched,
+        ));
     });
 }
 
