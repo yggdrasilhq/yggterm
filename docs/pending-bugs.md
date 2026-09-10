@@ -29,7 +29,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | OPEN (3.3.0) |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED IN CODE (ownership_ledger.rs + sweep writer + 3 resume guards; SLA measurement OWED — see below); schema v2 + battery OPEN (3.3.0) |
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | OPEN (server-side session truth, not the TUI) |
@@ -276,6 +276,25 @@ pty drive renders nothing. Lab + raw byte captures:
    if forks are the story, a forked child’s live lock can outlive the
    parent conversation’s and id-discovery must read the fork chain,
    not just recency.
+
+### [11.6.0] acceptance OWED: reattach SLA measured on a forced same-version rotation (spec §9)
+
+**Status:** OPEN — the ledger unit landed with 8 passing unit tests
+(adopted-liveness, dead-adopter prune, death-sentence TTL, crash-mid-write,
+one-writer replacement, consume-clear, newest-true-wins, identityless-key
+skip), but the §9 acceptance is a LIVE measurement and is still owed:
+
+- force a same-version rotation with an adopted agent row and read the trace:
+  `reattach_ledger_written` at the sweep, then `reattach_ledger_served
+  {disposition: adopted}` on the next resume, with `external_active_wait`
+  ABSENT for that session — the /proc scans must be unreachable from the
+  ledger-served path;
+- measure the reattach interval end-to-end (banner-to-prompt must not appear
+  for a ledger-served row; target ≤2 s for a died_with_me re-resume once the
+  force-retire writers exist);
+- `died_with_me` has no writer yet (no exit path abandons owned rows — a
+  daemon exits only on AllMoved; force-retire/cold-exit paths are the future
+  writers). The disposition is typed, served and consumed.
 
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
