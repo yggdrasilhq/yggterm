@@ -2,6 +2,11 @@ pub mod agent_cli;
 pub mod agent_presence;
 pub mod agent_scheme;
 pub mod app_registry;
+/// Descriptor schema v2 — the stone spec's five capabilities, the shared
+/// phase enum and the per-CLI rebind chains (docs/cli-integration-layer.md
+/// §2/§9). CONTRACT-first: the 35 descriptor fields stay; this adds what was
+/// missing and the version marker the release gate asks for.
+pub mod descriptor_v2;
 /// `New {Machine} {Thing}` — the birth-title convention, in ONE place because
 /// it was in two and an app spawn silently missed the builder.
 pub mod birth_title;
