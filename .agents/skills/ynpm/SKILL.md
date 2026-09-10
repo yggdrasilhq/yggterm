@@ -196,7 +196,8 @@ events to `~/.yggterm/event-trace.jsonl`, correlated by `run_id`. Read these
 events when a fetch, metadata parse, version gate, generation swap, app
 registration, fleet import, offline fallback, or launch fails. Human output is
 not the effect proof, and raw application flags or credential query strings do
-not belong in trace payloads.
+not belong in trace payloads. `--json` verbs keep stdout to one JSON result;
+repair notices and diagnostics go to stderr.
 
 ## Server integration and flags
 

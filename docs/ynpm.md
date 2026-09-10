@@ -338,6 +338,8 @@ Records use `component: "ynpm"`, `category: "distribution"`, and a stable
 package/version/stage/result facts, never raw application flags or credential
 query strings. A failed command is incomplete until its error event names the
 stage and the preserved generation decision.
+Machine-readable verbs such as `self-update --json` reserve stdout for exactly
+one JSON result; repair notices and other diagnostics belong on stderr.
 
 ## Development is a first-class channel
 
