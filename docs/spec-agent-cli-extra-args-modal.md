@@ -257,3 +257,36 @@ than faking measurements, and the modal inherits that discipline.
 done: open it through app control, screenshot it, and read back one changed
 value from a launched row's `launch_command`. If app control cannot open it, the
 verb to open it is part of this work, not a follow-up.
+
+### 7.1 The remote-wrapper forwarding boundary
+
+The value selected in this modal belongs to the **client that owns the launch
+request**, not to the destination host's yggterm settings. A remote launch has
+two yggterm processes in its path: the SSH wrapper on the destination host and
+the host-resident daemon that composes and owns the PTY. The wrapper must read
+the client-forwarded per-CLI value and carry it as an explicit daemon request
+field. The daemon must pass that field to the descriptor composer.
+
+This rule applies to both paths:
+
+- the generic `remote/start-agent` and `remote/resume-agent` paths used by the
+  newer CLI registry; and
+- the legacy `remote/start-codex` and `remote/resume-codex` compatibility paths
+  still used by existing saved Codex rows.
+
+The daemon must not read `YGGTERM_AGENT_EXTRA_ARGS` from its own ambient
+environment as a substitute: that environment belongs to the SSH wrapper and
+is absent or stale in a long-lived daemon. The request field is optional for
+wire compatibility; an absent or empty value means “use the destination
+descriptor's normal stored/default policy.”
+
+The falsifier is a fresh remote Codex row created from a client whose Codex
+value is `--dangerously-bypass-approvals-and-sandbox`: the client trace,
+daemon-composed `launch_command`, and the Codex PTY must all show the same
+value, including Codex's visible YOLO warning. A client-side export alone is
+not proof.
+
+**Not covered:** this section does not change Codex's native flag semantics,
+write `config.toml`, make a remote existing PTY restart with new flags, or make
+non-npm CLIs npm-managed. Those remain the CLI descriptor, runtime ownership,
+and ynpm contracts respectively.

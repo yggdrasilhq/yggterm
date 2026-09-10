@@ -4154,6 +4154,10 @@ pub enum ServerRequest {
         initial_cols: Option<u16>,
         #[serde(default)]
         initial_rows: Option<u16>,
+        /// Client-side configured Codex extra args forwarded so the host
+        /// daemon composes the same per-launch flags as the GUI client.
+        #[serde(default)]
+        configured_extra_args: Option<String>,
     },
     StartRemoteRuntimeCodexSession {
         session_id: String,
@@ -4164,6 +4168,10 @@ pub enum ServerRequest {
         initial_cols: Option<u16>,
         #[serde(default)]
         initial_rows: Option<u16>,
+        /// Client-side configured Codex extra args forwarded so the host
+        /// daemon composes the same per-launch flags as the GUI client.
+        #[serde(default)]
+        configured_extra_args: Option<String>,
     },
     /// Claude Code twins of the codex daemon-runtime requests — same lane,
     /// CC PTY owned by this host's daemon ([[spec-unify-local-remote]]).
@@ -12300,6 +12308,7 @@ impl DaemonRuntime {
                 terminal_appearance,
                 initial_cols,
                 initial_rows,
+                configured_extra_args,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.ensure_remote_runtime_codex_session(
@@ -12307,6 +12316,7 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     require_existing,
                     terminal_appearance.as_deref(),
+                    configured_extra_args.as_deref(),
                 )?;
                 self.adopt_legacy_local_codex_runtime(&session_id, &key);
                 let _ = self.ensure_terminal_for_path_with_initial_size(
@@ -12322,12 +12332,14 @@ impl DaemonRuntime {
                 terminal_appearance,
                 initial_cols,
                 initial_rows,
+                configured_extra_args,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_runtime_codex_session(
                     &session_id,
                     cwd.as_deref(),
                     terminal_appearance.as_deref(),
+                    configured_extra_args.as_deref(),
                 )?;
                 self.adopt_legacy_local_codex_runtime(&session_id, &key);
                 let _ = self.ensure_terminal_for_path_with_initial_size(
@@ -20956,6 +20968,7 @@ pub fn ensure_remote_runtime_codex_session(
     require_existing: bool,
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -20966,6 +20979,7 @@ pub fn ensure_remote_runtime_codex_session(
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
+            configured_extra_args: configured_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -20977,6 +20991,7 @@ pub fn start_remote_runtime_codex_session(
     cwd: Option<&str>,
     initial_size: Option<(u16, u16)>,
     terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -20986,6 +21001,7 @@ pub fn start_remote_runtime_codex_session(
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
+            configured_extra_args: configured_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -37195,17 +37211,59 @@ mod tests {
             terminal_appearance: Some("dark".to_string()),
             initial_cols: Some(120),
             initial_rows: Some(36),
+            configured_extra_args: Some(
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            ),
         };
         let value = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(value["terminal_appearance"], "dark");
+        assert_eq!(
+            value["configured_extra_args"],
+            "--dangerously-bypass-approvals-and-sandbox"
+        );
 
         let decoded: super::ServerRequest =
             serde_json::from_value(value).expect("deserialize request");
         match decoded {
             super::ServerRequest::EnsureRemoteRuntimeCodexSession {
                 terminal_appearance,
+                configured_extra_args,
                 ..
-            } => assert_eq!(terminal_appearance.as_deref(), Some("dark")),
+            } => {
+                assert_eq!(terminal_appearance.as_deref(), Some("dark"));
+                assert_eq!(
+                    configured_extra_args.as_deref(),
+                    Some("--dangerously-bypass-approvals-and-sandbox")
+                );
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let start_request = super::ServerRequest::StartRemoteRuntimeCodexSession {
+            session_id: "start-abc123".to_string(),
+            cwd: Some("/srv/app".to_string()),
+            terminal_appearance: Some("dark".to_string()),
+            initial_cols: Some(120),
+            initial_rows: Some(36),
+            configured_extra_args: Some(
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            ),
+        };
+        let start_value = serde_json::to_value(&start_request).expect("serialize start request");
+        assert_eq!(
+            start_value["configured_extra_args"],
+            "--dangerously-bypass-approvals-and-sandbox"
+        );
+        let decoded_start: super::ServerRequest =
+            serde_json::from_value(start_value).expect("deserialize start request");
+        match decoded_start {
+            super::ServerRequest::StartRemoteRuntimeCodexSession {
+                configured_extra_args,
+                ..
+            } => assert_eq!(
+                configured_extra_args.as_deref(),
+                Some("--dangerously-bypass-approvals-and-sandbox")
+            ),
             other => panic!("unexpected request: {other:?}"),
         }
     }
