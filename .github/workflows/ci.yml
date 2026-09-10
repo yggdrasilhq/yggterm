@@ -67,7 +67,7 @@ jobs:
           toolchain: 1.94.0
 
       - name: Build release binaries
-        run: cargo build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
+        run: cargo build --release -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm --no-default-features
 
       - name: Test ynpm
         run: cargo test -p ynpm
@@ -231,7 +231,7 @@ jobs:
 
       - name: Build release binaries
         shell: bash
-        run: cargo build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
+        run: cargo build --release -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm --no-default-features
 
       - name: Validate release binary
         shell: bash
