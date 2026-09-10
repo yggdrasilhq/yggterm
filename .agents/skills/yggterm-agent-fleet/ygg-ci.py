@@ -599,6 +599,21 @@ def _scratch_dir(project, ts):
 
 EVENTS = CI_STATE / "events.jsonl"
 QUARANTINE = CI_STATE / "quarantine.json"
+# ⛔ A quarantined tip used to be stuck until a NEW tip replaced it: an
+# innocent lane that rode a failed set (the gate failed on a SIBLING lane's
+# content) was quarantined at its tip AND recorded in the failure's `lanes`,
+# so it was never dirty again — the train silently lost it and origin/main
+# went green without it (measured 2026-09-10 22:33, lane/integration/agy;
+# recovery was a hand-made empty commit). The fix is two-sided: quarantine
+# entries EXPIRE (bounded self-probe — a guilty lane re-fails alone and
+# re-quarantines, an innocent lane lands on its first expired probe), and
+# `_dirty_subs` baselines on the last CONSUMED record (a failed tick consumed
+# nothing). Verdicts (gemini-3.8-flash HIGH via agy, 2026-09-10): fail fast
+# at K=1 for multi-lane sets — never repeat a doomed union on a timer faster
+# than this; text-scraped gate attribution rejected (a merge commit carries
+# every prior lane — blame by diff is false blame).
+DEFAULT_QUARANTINE_TTL_SECS = 900
+NON_CONSUMED_STATUSES = {"build-failed", "push-failed"}
 BOARD_THROTTLE = CI_STATE / "board-throttle.json"
 BOARD = "infra/ci"
 
@@ -665,6 +680,14 @@ def _board_post(project, kind, rec):
               "--body", f"[{kind}] {body}"], timeout=30)
     except Exception as e:
         log(f"⚠ board post failed: {e}")
+
+def _quarantine_entry(entry, now, ttl_secs):
+    """Normalize a quarantine entry to {tip, expires}; legacy values are plain
+    tip strings and inherit a fresh TTL (they are exactly the stuck ones)."""
+    if isinstance(entry, dict):
+        return {"tip": entry.get("tip"), "expires": float(entry.get("expires") or 0)}
+    return {"tip": entry, "expires": now + ttl_secs}
+
 
 def _quarantine_load():
     try:
@@ -774,6 +797,21 @@ def _do_tick_project(project, dry=False):
     merged, conflicts = [], []
     quar = _quarantine_load().get(project, {})
     quar_changed = False
+
+    # FIFO by push time, not subscription-file order: alphabetical order let
+    # lane a/ always merge (and win conflicts) ahead of lane z/ regardless of
+    # who actually moved first (consult 2026-09-10 D4).
+    def _tip_ts(s):
+        r = _run(["git", "log", "-1", "--format=%ct", f"{pcfg.get('remote', 'origin')}/{s['lane']}"],
+                 cwd=str(repo), timeout=30)
+        try:
+            return int((r.stdout or "0").strip() or 0)
+        except ValueError:
+            return 0
+    subs = sorted(subs, key=_tip_ts)
+    ttl_secs = int(pcfg.get("quarantine_ttl_secs", DEFAULT_QUARANTINE_TTL_SECS))
+    now = time.time()
+    quar = {lane: _quarantine_entry(e, now, ttl_secs) for lane, e in quar.items()}
     for s in subs:
         lane = s["lane"]
         remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
@@ -785,10 +823,23 @@ def _do_tick_project(project, dry=False):
             log(f"  skip {lane}: already in main ({tip[:12]})")
             merged.append({"lane": lane, "tip": tip, "already_in_main": True})
             continue
-        if quar.get(lane) == tip:
-            log(f"  ⏳ skip {lane}: quarantined (this tip already failed a build) — new tip re-arms it")
-            conflicts.append({"lane": lane, "tip": tip, "reason": "quarantined"})
-            continue
+        qentry = quar.get(lane)
+        if qentry is not None:
+            if qentry.get("tip") != tip:
+                # a new tip re-arms the lane (the standing rule)
+                quar.pop(lane, None)
+                quar_changed = True
+            elif qentry.get("expires", 0) < time.time():
+                # the quarantine expired: probe this tip again. A guilty lane
+                # re-fails and re-quarantines with a fresh TTL; an innocent
+                # bystander lands here without a hand-made commit.
+                quar.pop(lane, None)
+                quar_changed = True
+                log(f"  ⏳ quarantine expired for {lane} ({tip[:12]}) — probing again")
+            else:
+                log(f"  ⏳ skip {lane}: quarantined until {time.strftime('%H:%M:%S', time.localtime(qentry['expires']))} (this tip failed a build) — new tip or expiry re-arms it")
+                conflicts.append({"lane": lane, "tip": tip, "reason": "quarantined"})
+                continue
         r = _run(["git", "merge", "--no-ff", "--no-edit", remote_ref], cwd=str(repo), timeout=120)
         if r.returncode == 0:
             log(f"  merged {lane} {tip[:12]}")
@@ -866,9 +917,10 @@ def _do_tick_project(project, dry=False):
         log(f"  ⛔ integration failed — main reset to {pre_tick[:12]} ({r.returncode})")
         q = _quarantine_load(); qp = q.setdefault(project, {})
         failed_lanes = [m["lane"] for m in viable]
+        expires = time.time() + ttl_secs
         for lane in failed_lanes:
             tip = next((m["tip"] for m in viable if m["lane"] == lane), None)
-            if tip: qp[lane] = tip
+            if tip: qp[lane] = {"tip": tip, "expires": expires}
         q[project] = qp; _quarantine_save(q)
         kind = "build_failed" if not build_ok else "gate_failed"
         _emit_event(project, kind, lanes=failed_lanes, reset_to=pre_tick,
@@ -930,21 +982,29 @@ def _do_tick_project(project, dry=False):
 def ts_stamp():
     return time.strftime("%Y%m%d-%H%M%S")
 
-def _last_build(project):
+def _last_build(project, consumed_only=False):
     if not BUILDS.exists():
         return None
     cands = sorted(BUILDS.glob(f"{project}--*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in cands[:1]:
+    for p in cands:
         try:
-            return json.loads(p.read_text())
+            rec = json.loads(p.read_text())
         except Exception:
             continue
+        # A failed tick consumed nothing: its lanes must not baseline the
+        # dirty check, or an unchanged lane that rode a failed set is never
+        # dirty again (the silent lane-drop of 2026-09-10 22:33).
+        if consumed_only and rec.get("status") in NON_CONSUMED_STATUSES:
+            continue
+        return rec
     return None
 
 def _dirty_subs(project, pcfg, subs):
-    """which subs have moved since last build, or are new. Returns dirty list."""
+    """which subs have moved since the last CONSUMED build, or are new.
+    Returns dirty list. A failed tick (build-failed/push-failed) consumed
+    nothing, so its lanes stay dirty and re-integrate on the next tick."""
     repo = Path(pcfg["repo"]).expanduser()
-    last = _last_build(project)
+    last = _last_build(project, consumed_only=True)
     last_map = {}
     if last and last.get("lanes"):
         for l in last["lanes"]:
