@@ -570,6 +570,23 @@ fn another_package_owns_app_name(state: &State, excluded_key: &str, app_name: &s
         })
 }
 
+fn another_package_owns_binary(
+    paths: &Paths,
+    state: &State,
+    excluded_key: &str,
+    destination: &Path,
+    binary: &str,
+) -> bool {
+    state
+        .packages
+        .iter()
+        .filter(|(key, _)| key.as_str() != excluded_key)
+        .any(|(_, package)| {
+            package_destination(paths, package) == destination
+                && package.bins.contains_key(binary)
+        })
+}
+
 fn package_destination(paths: &Paths, package: &Package) -> PathBuf {
     package
         .destination
@@ -4089,6 +4106,13 @@ fn verb_remove(paths: &Paths, name: &str) -> anyhow::Result<()> {
     }
     for bin in package.bins.keys() {
         let path = destination.join(bin);
+        if another_package_owns_binary(paths, &state, &key, &destination, bin) {
+            println!(
+                "ynpm: retained {bin}; another package still owns {}",
+                path.display()
+            );
+            continue;
+        }
         if path.is_symlink() || path.is_file() {
             fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
@@ -6440,6 +6464,37 @@ mod tests {
             ]),
         };
         assert!(another_package_owns_app_name(&state, "ydesign", "ydesign"));
+    }
+
+    #[test]
+    fn removing_a_stale_package_cannot_unlink_a_shared_binary() {
+        let package = |name: &str| Package {
+            package_name: Some(name.to_string()),
+            current: "0.1.0".to_string(),
+            versions: vec!["0.1.0".to_string()],
+            bins: BTreeMap::from([("app".to_string(), "bin/app".to_string())]),
+            external_prev: None,
+            destination: Some("/home/user/.local/bin".to_string()),
+            dev: None,
+            dev_generation: None,
+            channel: Some("npm".to_string()),
+            source: Some(format!("npm:{name}")),
+            integration: None,
+        };
+        let state = State {
+            packages: BTreeMap::from([
+                ("old".to_string(), package("@ygghq/old")),
+                ("new".to_string(), package("@ygghq/new")),
+            ]),
+        };
+        let paths = Paths::new("/home/user");
+        assert!(another_package_owns_binary(
+            &paths,
+            &state,
+            "old",
+            Path::new("/home/user/.local/bin"),
+            "app"
+        ));
     }
 
     #[test]
