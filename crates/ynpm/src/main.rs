@@ -1700,17 +1700,22 @@ fn activate_yggterm_dev(paths: &Paths) -> anyhow::Result<()> {
             yggterm.display()
         );
     }
-    let version = marker
-        .supersedes
-        .as_deref()
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    // `supersedes` is the production version the dev build replaced, not the
+    // dev build's own identity. On a fresh fleet host it is legitimately
+    // absent (or the migrated state may say 0.0.0), so activation must read
+    // the same verified executable answer that publication used.
+    let version = run_version(&yggterm)
+        .ok()
+        .and_then(|answer| version_from_answer(&answer))
+        .or_else(|| marker.supersedes.clone())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let root = yggterm_core::direct_install_root()?;
     let asset = yggterm_core::current_asset_label()?;
     yggterm_core::write_direct_install_state(
         &root,
         "yggdrasilhq/yggterm",
         &asset,
-        version,
+        &version,
         &yggterm,
     )?;
     mirror_legacy_compatibility_state(
@@ -1718,7 +1723,7 @@ fn activate_yggterm_dev(paths: &Paths) -> anyhow::Result<()> {
         &root,
         "yggdrasilhq/yggterm",
         &asset,
-        version,
+        &version,
         &yggterm,
     )?;
     for name in ["ynpm", "ynpx"] {
