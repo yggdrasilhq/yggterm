@@ -382,7 +382,10 @@ pub struct AgentAnnounce {
     /// drifted from the store truth (identity precedence, spec §3). Served to
     /// the GUI through the existing app-declares plane.
     pub session_id: String,
-    pub phase: String,
+    /// THE phase enum (descriptor v2 cap-3, `yggterm_core::descriptor_v2`) —
+    /// parsed strictly at the wire, so no consumer can ever see a phase
+    /// spelling the core enum does not own.
+    pub phase: yggterm_core::descriptor_v2::AgentPhase,
 }
 
 /// Strict parse: a phase outside the enum is not an announce — it is noise
@@ -394,13 +397,10 @@ pub struct AgentAnnounce {
 /// would discard the half that was there.
 pub fn parse_agent_announce(payload: &serde_json::Value) -> Option<AgentAnnounce> {
     let session_id = payload.get("session_id")?.as_str()?;
-    let phase = payload.get("phase")?.as_str()?;
-    if !ANNOUNCE_PHASES.contains(&phase) {
-        return None;
-    }
+    let phase = yggterm_core::descriptor_v2::AgentPhase::from_wire(payload.get("phase")?.as_str()?)?;
     Some(AgentAnnounce {
         session_id: session_id.to_string(),
-        phase: phase.to_string(),
+        phase,
     })
 }
 
@@ -426,7 +426,8 @@ pub fn fresh_agent_announce(
 /// directions — a screen that still shows a working footer while the TUI
 /// says Idle is the footer lying, not the TUI).
 pub fn announce_working_signal(records: &[AppDeclareRecord], now_ms: u64) -> Option<bool> {
-    fresh_agent_announce(records, now_ms).map(|a| a.phase == "Working")
+    fresh_agent_announce(records, now_ms)
+        .map(|a| a.phase == yggterm_core::descriptor_v2::AgentPhase::Working)
 }
 
 // ─── Generic OSC class witness (NOT 7717-specific) ──────────────────────────
@@ -701,6 +702,27 @@ impl OscWitness {
 #[cfg(test)]
 mod tests {
 
+    /// THE DRIFT LOCK: the wire's verbatim string table and the core enum
+    /// must name the same five phases in the same order, forever. The parse
+    /// now goes through the enum, so this array is documentation — and
+    /// documentation that can silently rot is worse than none. One test
+    /// owns the agreement.
+    #[test]
+    fn the_wire_phase_table_names_exactly_the_core_enum() {
+        use yggterm_core::descriptor_v2::AgentPhase;
+        let enum_names: Vec<&str> = [
+            AgentPhase::Working,
+            AgentPhase::Idle,
+            AgentPhase::QuestionPrompt,
+            AgentPhase::LimitWait,
+            AgentPhase::StartupGate,
+        ]
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+        assert_eq!(ANNOUNCE_PHASES.as_slice(), enum_names.as_slice());
+    }
+
     fn announce_record(session_id: &str, phase: &str, age_ms: u64, now_ms: u64) -> AppDeclareRecord {
         AppDeclareRecord {
             verb: "announce".to_string(),
@@ -726,7 +748,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         let announce = fresh_agent_announce(&records, 1_000).expect("fresh");
         assert_eq!(announce.session_id, "sess_1");
-        assert_eq!(announce.phase, "Working");
+        assert_eq!(announce.phase, yggterm_core::descriptor_v2::AgentPhase::Working);
         assert_eq!(announce_working_signal(&records, 1_000), Some(true));
     }
 
@@ -782,7 +804,7 @@ mod tests {
         assert_eq!(announce_working_signal(&[home.clone()], 1_000), Some(false));
         let parsed = fresh_agent_announce(&[home], 1_000).expect("parsed");
         assert_eq!(parsed.session_id, "");
-        assert_eq!(parsed.phase, "StartupGate");
+        assert_eq!(parsed.phase, yggterm_core::descriptor_v2::AgentPhase::StartupGate);
     }
 
 

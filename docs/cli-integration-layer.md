@@ -74,6 +74,22 @@ the probe battery (§5.4) passes for its class.
 ⛔ **Schema v2 is versioned.** Adding a capability = a descriptor-schema
 version bump + the probe battery re-run per CLI, in the same commit.
 
+Implementation status (11.6.0, first land): **contract-first, not a field
+migration.** `yggterm_core::descriptor_v2` owns
+[`DESCRIPTOR_SCHEMA_VERSION = 2`], the §2.2 rebind chains as declared
+per-CLI data (`rebind_chain`, precedence order = array order), the §2.3
+phase enum (`AgentPhase` — the announce wire's parse now produces it, with a
+drift lock tying `ANNOUNCE_PHASES` to the enum's names), the ONE screen
+classifier composing the per-state phrase tables in a documented precedence
+(`screen_phase`, with `NoOpinion` as the declared-unmeasured answer), and
+the §2.5 `supports_pty_fd_handoff` table (true for every shipped CLI — a
+measured fact, kept as a table so the first exception can be declared). The
+35 descriptor fields stay where they are; capabilities 1 and 4 are answered
+by existing fields and the §9 table-driven test walks every registry entry
+asserting each of the five is answered or named-missing. Per-CLI seats
+refine their chain order and fill their phrase tables against the probe
+battery (§5.4) — the test is the completeness gate they fill against.
+
 ## 3. The identity contract
 
 Precedence, highest wins: **native announce → env marker → argv → store →
