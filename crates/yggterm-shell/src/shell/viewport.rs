@@ -18394,6 +18394,71 @@ fn update_terminal_surface_status(
         );
     });
 }
+/// The refusal slug a guarded write's Ack message carries, if it refused.
+/// Only the startup gate refuses today; the draft marker is matched by the
+/// caller that asks for it.
+fn terminal_write_refusal_reason(message: &Option<String>) -> Option<&'static str> {
+    if yggterm_server::terminal_write_was_refused_for_startup_gate(
+        message.as_deref(),
+    ) {
+        Some("startup_gate_shown")
+    } else {
+        None
+    }
+}
+
+/// The app-control write runs through the DAEMON'S GUARDS (refuse_if_draft):
+/// a programmatic send into a row parked on its CLI's startup gate must come
+/// back as a named refusal, not as bytes the modal eats (pending-bugs [11.94]).
+async fn terminal_write_guarded_with_local_runtime_retry_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    data: String,
+    trace_home: &Path,
+) -> Result<Option<String>> {
+    let is_recoverable_local = {
+        let path = session_path.as_str();
+        path.starts_with("local::") || path.starts_with("local://")
+    };
+    let first = {
+        let endpoint = endpoint.clone();
+        let session_path = session_path.clone();
+        let data = data.clone();
+        task::spawn_blocking(move || {
+            yggterm_server::terminal_write_guarded(&endpoint, &session_path, &data, true)
+        })
+        .await
+        .map_err(|error| anyhow!("joining guarded terminal write task: {error}"))?
+    };
+    match first {
+        Ok(message) => Ok(message),
+        Err(error)
+            if is_recoverable_local
+                && is_recoverable_local_terminal_runtime_error(&error.to_string()) =>
+        {
+            append_trace_event(
+                trace_home,
+                "ui",
+                "terminal_io",
+                "app_control_write_retry_after_missing_runtime",
+                json!({
+                    "session_path": session_path,
+                    "error": error.to_string(),
+                }),
+            );
+            terminal_ensure_with_retry_async(endpoint.clone(), session_path.clone(), trace_home)
+                .await?;
+            let message = task::spawn_blocking(move || {
+                yggterm_server::terminal_write_guarded(&endpoint, &session_path, &data, true)
+            })
+            .await
+            .map_err(|error| anyhow!("joining guarded terminal write task: {error}"))??;
+            Ok(message)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn terminal_write_with_local_runtime_retry_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -18495,11 +18560,17 @@ struct AppControlTerminalWriteReport {
     interrupt_chunk_count: usize,
     interline_read_nudge_count: usize,
     last_chunk_tail: String,
+    /// Some(write) when the daemon refused the write — the row is parked on
+    /// its CLI's startup gate and the bytes would have been eaten (and a
+    /// trailing Enter would have ANSWERED the gate; measured agy 1.2.0,
+    /// pending-bugs [11.94]). Carries the refusal reason slug.
+    refused: Option<&'static str>,
 }
 
 impl AppControlTerminalWriteReport {
     fn to_json(&self) -> Value {
         json!({
+            "refused": self.refused,
             "chunk_count": self.chunk_count,
             "line_chunk_count": self.line_chunk_count,
             "interrupt_chunk_count": self.interrupt_chunk_count,
@@ -18527,13 +18598,28 @@ async fn terminal_write_app_control_input_async(
     let mut chunks = chunks.into_iter().peekable();
     while let Some(chunk) = chunks.next() {
         last_chunk_tail = terminal_tail_chars(&chunk, 80);
-        terminal_write_with_local_runtime_retry_async(
+        let ack_message = terminal_write_guarded_with_local_runtime_retry_async(
             endpoint.clone(),
             session_path.clone(),
             chunk.clone(),
             trace_home,
         )
         .await?;
+        // ⛔ A startup-gate refusal means the row never received this chunk —
+        // and the remaining chunks (the Enters that submit the lines already
+        // typed) are exactly what would answer the gate. Abort before them.
+        if let Some(reason) =
+            terminal_write_refusal_reason(&ack_message)
+        {
+            return Ok(AppControlTerminalWriteReport {
+                chunk_count: chunk_count.saturating_sub(chunks.len() + 1),
+                line_chunk_count,
+                interrupt_chunk_count,
+                interline_read_nudge_count,
+                last_chunk_tail,
+                refused: Some(reason),
+            });
+        }
         if chunk.ends_with('\u{3}') && chunks.peek().is_some() {
             interrupt_chunk_count = interrupt_chunk_count.saturating_add(1);
             sleep(Duration::from_millis(
@@ -18561,6 +18647,7 @@ async fn terminal_write_app_control_input_async(
         interrupt_chunk_count,
         interline_read_nudge_count,
         last_chunk_tail,
+        refused: None,
     })
 }
 

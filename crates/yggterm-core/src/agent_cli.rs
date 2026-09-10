@@ -3095,9 +3095,25 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
-        question_picker_screen_phrases: &[],
+        // ⭐ MEASURED 2026-09-10, agy 1.2.0, guihost (11.6.4 seat C, bare-PTY
+        // probes rendered through the vendored xterm.js): a non-allowlisted
+        // shell command parks the TUI on this picker while the footer still
+        // reads "esc to cancel" — the QuestionPrompt phase must outrank
+        // Working for agy or a question reads as busy forever.
+        question_picker_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "requesting permission for:",
+            also_any: &["run this command?"],
+        }],
         background_agent_hint_screen_phrases: &[],
-        startup_gate_screen_phrases: &[],
+        // ⭐ MEASURED 2026-09-10, agy 1.2.0, guihost (11.6.4 seat C): a
+        // first-run folder parks the TUI on this picker BEFORE any composer —
+        // typed input during it is discarded and the trailing Enter CONFIRMS
+        // trust (pending-bugs [11.94]). Declared so a programmatic send can be
+        // refused by name instead of eaten.
+        startup_gate_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "do you trust the contents of this project?",
+            also_any: &[],
+        }],
         plan_limit_choice_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
@@ -9469,9 +9485,23 @@ mod tests {
 ❯ Try \"write a test for <filepath>\"
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent";
 
+        // agy 1.2.0, measured 2026-09-10 on the GUI host (11.6.4 seat C): the
+        // workspace-trust picker a first-run folder shows BEFORE any composer,
+        // and the ordinary idle composer + footer.
+        const AGY_GATE: &str = "Accessing workspace:
+/home/example/work
+Do you trust the contents of this project?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> Yes, I trust this folder
+  No, exit
+  up/down Navigate - enter Confirm";
+        const AGY_IDLE: &str = ">
+? for shortcuts                                                                   Gemini 3.7 Flash - high";
+
         for (kind, gate, idle) in [
             (SessionKind::Codex, CODEX_GATE, CODEX_IDLE),
             (SessionKind::ClaudeCode, CLAUDE_GATE, CLAUDE_IDLE),
+            (SessionKind::Antigravity, AGY_GATE, AGY_IDLE),
         ] {
             let d = agent_cli_descriptor(kind).expect("registered");
             assert!(

@@ -33,7 +33,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | OPEN (server-side session truth, not the TUI) |
-| 11.6.4 | agy | C | OPEN (trust gate eats input + untitled-forever measured, see baseline; resume arm verified) |
+| 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
 | 11.6.5 | muse | C | OPEN (baseline measured 2026-09-10 — v2 data fixes queued: composer U+276F, phrase table, startup gate) |
 | 11.6.6 | kimi | C | OPEN |
 | 11.6.7 | qwen | C | OPEN |
@@ -109,6 +109,67 @@ event trace `~/.yggterm/event-trace*.jsonl`):
 measure: zero `external_active_wait*` trace events on the ledger path, an
 explicit ledger-adoption event per row, swap→reattach latency, and the PTY
 law (viewport shows the session, never the banner).
+
+## ⛔ [11.94] AGY'S WORKSPACE-TRUST GATE IS UNDECLARED AND EATS SUBMITTED INPUT — A PROGRAMMATIC SEND INTO IT IS LOST AND ITS OWN ENTER CONFIRMS THE GATE (filed 2026-09-10)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Family: 11.6.4 (agy, class C). Measured 2026-09-10, agy 1.2.0 on the GUI
+host (full evidence: the 11.6.4 measured baseline below):
+
+- `startup_gate_screen_phrases` was EMPTY, so a first-run row parked on
+  `Do you trust the contents of this project? / Yes, I trust this folder /
+  No, exit` classified as typeable-idle — `busy=false, reason=idle` in the
+  sidebar while the TUI held a modal.
+- Typed input during the gate is DISCARDED by the CLI, and the trailing
+  `\r` CONFIRMS the picker (writes the folder into agy's own
+  `trustedWorkspaces`): reproduced twice in bare-PTY probes; agy's CLI log
+  shows `HandleUserInput` firing once across both losses. A resume prompt
+  or automation brief typed into a gated row is gone without a trace — the
+  silent-fresh-spawn mechanic this campaign exists to kill, end to end.
+
+**Fix (this lane):** the phrase is DECLARED from the measured screen (and
+the fixture table gained agy's real captures); the daemon's
+`TerminalWrite` path grew a startup-gate guard beside the draft guard —
+same flag (`refuse_if_draft`, i.e. programmatic sends only; a human's
+keystrokes must always reach the picker), same Ack-marker shape
+(`STARTUP_GATE_REFUSAL_MESSAGE` / `terminal_write_was_refused_for_startup_gate`),
+asked of the row's OWN descriptor on the RENDERED GRID, never the [11.92]
+cross-CLI union, never the raw stream. The app-control send path now writes
+through the guard, aborts its remaining chunks on a refusal (the Enters are
+what would answer the gate), and answers `accepted:false` with
+`reason: "startup_gate_shown_refusal"` instead of a success that lied.
+
+**LIVE PROOF OWED:** on a fresh-folder agy row — send while gated must
+answer `accepted:false, reason:"startup_gate_shown_refusal"` with zero
+bytes written; answer the gate interactively; resend must deliver.
+
+## ⛔ [11.96] AGY ROWS ARE UNTITLED FOREVER ON 1.2.0 — THE CLI NEVER WRITES THE SUMMARIES TABLE THE TITLE AUTHORITY READS, AND THE FALLBACK LABEL MISNAMES THE KIND (filed 2026-09-10)
+
+**Status:** OPEN
+
+Family: 11.6.4 (agy, class C). Measured 2026-09-10, agy 1.2.0 on the GUI
+host:
+
+- `read_antigravity_session_title` reads ONLY
+  `conversation_summaries.title` (authored titles — the prompt-text arms
+  were deliberately removed 2026-09-06), but the 1.2.0 CLI writes NO
+  summaries rows at all: the table sat at 9 rows (newest 2026-08-25)
+  across five fresh conversations the same day (print mode, four TUI
+  probes, one live row turn). No title exists in any readable store — the
+  per-conversation `conversations/<uuid>.db` carries prompt echoes only.
+- A live row that completed a turn kept its fallback label throughout, and
+  that fallback composes `<CwdName> Shell` for an Antigravity row ("Ws
+  Live Shell") — a kind-misleading name on a row whose
+  `icon_matches_session_kind` is true. Silent degradation against the
+  stone's loud-degradation law (§6).
+
+**Fix direction:** find where 1.2.0 persists titles (IDE-only? cloud-side
+summarizer?) or accept the untitled-by-design posture explicitly — and
+make the fallback label kind-aware so an agent row never wears a "Shell"
+name. Title generation must NOT be enabled for agy while the authored-title
+reader is the authority (the 2026-09-06 law: generation would fight the
+authored title); the fix is the fallback, not the generation.
 
 #### 11.6.4 measured baseline (wave-1 seat C, 2026-09-10, guihost — agy 1.2.0)
 
