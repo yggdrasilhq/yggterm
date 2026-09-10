@@ -7410,6 +7410,14 @@ pub fn assert_store_predicate_coverage(predicate_name: &str, probe: impl Fn(&str
 mod tests {
     use super::*;
 
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir()
+            .join(format!("yggterm-agent-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("temp home");
+        home
+    }
+
     /// ⛔ THE DYNAMICITY CONTRACT IS EXHAUSTIVE AND OPENCODE IS ITS FIRST
     /// MEMBER (owner directive 2026-09-02: "our metadata system should
     /// understand their dynamicity language"). A CLI the registry has not

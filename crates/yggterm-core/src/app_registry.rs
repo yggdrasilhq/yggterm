@@ -13,7 +13,9 @@
 //! ~/.yggterm/apps/<name>.json
 //! { "name": "ychrome", "label": "Ychrome", "icon": "🌐",
 //!   "binary": "/home/user/.local/bin/ychrome",
-//!   "verbs": [ { "id": "new", "label": "New Ychrome", "args": [] } ] }
+//!   "verbs": [ { "id": "new", "label": "New Ychrome", "args": [] } ],
+//!   "context_menu": { "enabled": true, "contexts": ["workspace", "session"],
+//!                     "verbs": ["new"] } }
 //! ```
 //!
 //! The host's daemon scans that directory and validates that `binary` still
@@ -126,10 +128,38 @@ impl AppContextMenu {
 /// The stable `package.json.yggterm` extension understood by ynpm. Keeping
 /// this typed at the platform boundary prevents each app and the package
 /// manager from inventing slightly different JSON for the same launcher.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YggtermPackageMetadata {
+    /// Versioned package metadata contract. Missing is v1 for old packages;
+    /// future versions must be rejected by ynpm before publication.
+    #[serde(default = "default_yggterm_metadata_schema")]
+    pub schema: u32,
     #[serde(default)]
     pub app: Option<YggtermAppMetadata>,
+}
+
+fn default_yggterm_metadata_schema() -> u32 {
+    1
+}
+
+impl Default for YggtermPackageMetadata {
+    fn default() -> Self {
+        Self {
+            schema: default_yggterm_metadata_schema(),
+            app: None,
+        }
+    }
+}
+
+impl YggtermPackageMetadata {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.schema == 1,
+            "unsupported package.json.yggterm schema {}; ynpm supports schema 1",
+            self.schema
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,5 +539,15 @@ mod tests {
         assert!(app.context_menu_allows("session", "new"));
         assert!(!app.context_menu_allows("workspace", "new"));
         assert!(!app.context_menu_allows("session", "other"));
+    }
+
+    #[test]
+    fn package_metadata_defaults_to_schema_one_and_rejects_unknown_versions() {
+        let metadata: YggtermPackageMetadata = serde_json::from_str(r#"{"app":null}"#).unwrap();
+        assert_eq!(metadata.schema, 1);
+        metadata.validate().unwrap();
+        let future: YggtermPackageMetadata =
+            serde_json::from_str(r#"{"schema":2,"app":null}"#).unwrap();
+        assert!(future.validate().is_err());
     }
 }

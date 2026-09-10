@@ -9,6 +9,40 @@ generic: an application, agent CLI, TUI, or libyggterm surface is a package
 with an executable contract. A package is downloaded and verified once, then
 its exact generation can be imported to every fleet host.
 
+## Normative contract
+
+The following are MUST rules for an ynpm-compatible package and implementation:
+
+1. A package MUST have one canonical identity, an exact version, and one or
+   more executable bins that pass their own `--version` gate before publication.
+2. An app package MUST carry `package.json.yggterm.schema: 1` and, when it is a
+   libyggterm launcher, a `yggterm.app` declaration. A generic CLI need not
+   declare an app block.
+3. `yggterm.app.binary` MUST name a package bin key, never an absolute path.
+   ynpm resolves it to an absolute host path only after the generation exists.
+4. ynpm MUST own generation publication, host app registration, rollback,
+   removal, fleet import, and event tracing. Apps and daemon scans MUST NOT
+   write or delete `~/.yggterm/apps` as a side effect of running or scanning.
+5. Every source transport MUST reduce to the same verified generation flow:
+   registry package, GitHub/Forgejo checkout, release tarball, or local dev
+   checkout. Transport changes where bytes come from, not what verification or
+   registration means.
+6. A production handback MAY replace a dev generation only when production is
+   newer, or the version is equal and the verified product fingerprint differs.
+   Unknown or malformed production metadata MUST keep the dev generation.
+7. Every operation and every failed stage MUST leave a correlatable record in
+   the yggterm event trace. Human output is convenience; the trace is the
+   falsifier.
+
+### Explicit non-scope
+
+This contract does not make ynpm the owner of a CLI's conversation store,
+resume syntax, TUI screen vocabulary, permission semantics, or title authority.
+Those remain yggterm's per-CLI adapter contract in `AGENT_CLIS` and
+`managed_cli/*.rs`. It also does not make a data-only library an app, or make a
+dashboard verb a row-spawning action. Those decisions must be explicit in the
+package metadata.
+
 The yggterm server remains the session/launch owner. `ynpm` is the package,
 generation, cache, and publication owner. No daemon or GUI is required to run
 it.
@@ -171,6 +205,7 @@ runs on first use:
   "name": "@ygghq/example-app",
   "bin": { "example-app": "bin/example-app" },
   "yggterm": {
+    "schema": 1,
     "app": {
       "name": "example-app",
       "label": "Example App",
@@ -205,6 +240,19 @@ package's registration. The daemon only reads the normalized registry and
 omits a currently unresolvable binary from its live snapshot; it does not
 delete registrations as a side effect of a scan, and apps no longer write
 registrations on every run.
+
+The same `package.json` MUST ship inside a GitHub or Forgejo release archive.
+For a Cargo, Lisp, or other non-npm app, a small package file at the checkout
+root is still the metadata contract; it need not imply that npm is the build
+system. A binary-only archive without the package file is not an integrated app
+release. It may be launched as a generic executable only when the caller names
+the bin and no yggterm launcher metadata is claimed.
+
+`ynpm` reads checkout metadata for `ynpm dev`, reads the packaged metadata from
+an extracted release/npm artifact, and compares the two before publication.
+Build hooks may produce the artifact or validate it, but they MUST NOT mutate
+the host registry. This prevents a postinstall or first run from creating a
+machine-local menu entry that cannot be reproduced on the next fleet host.
 
 ## Integrated inventory
 
@@ -245,6 +293,49 @@ decision.
 The remote import repeats the runs-before-publish gate. A transport success is
 not the proof: each host must report the imported package, and a later
 `ynpm list`/`ynpm check` is the state read-back.
+
+## Source transports
+
+All transports enter the same generation pipeline:
+
+```text
+source spec → resolve identity/package.json → fetch once → extract/build
+           → verify metadata + bins → immutable generation → publish links
+           → write app manifest → trace every result
+```
+
+The supported shapes are:
+
+```text
+@scope/name                    npm registry package
+github:owner/name              public Git checkout/dev source
+forgejo:https://host/o/name    private Forgejo Git checkout/dev source
+tarball:https://host/app.tgz   release archive containing package.json
+--dev /absolute/checkout       local development source
+```
+
+Private credentials belong to the user's git/curl credential helper or
+environment, never in `package.json`, event payloads, or a source URL recorded
+in state. A tarball MAY carry a SHA-256 fragment or a matching checksum sidecar;
+an archive whose metadata or executable gate fails is refused before any
+published link changes.
+
+## Event trace
+
+ynpm appends structured events to the normal host trace:
+
+```text
+~/.yggterm/event-trace.jsonl
+```
+
+Records use `component: "ynpm"`, `category: "distribution"`, and a stable
+`run_id`. Event names include `operation.start`, `source.resolve`,
+`package.metadata`, `package.verify`, `generation.publish`,
+`app_registration.write`, `fleet.import`, `ynpx.update`, `ynpx.offline`,
+`ynpx.launch`, `operation.complete`, and `operation.error`. Payloads contain
+package/version/stage/result facts, never raw application flags or credential
+query strings. A failed command is incomplete until its error event names the
+stage and the preserved generation decision.
 
 ## Development is a first-class channel
 
