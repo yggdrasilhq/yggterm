@@ -51,7 +51,7 @@ maybe_refresh_release_codex_cli() {
 }
 
 pushd "$ROOT_DIR" >/dev/null
-"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
+"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm --no-default-features
 popd >/dev/null
 maybe_refresh_release_codex_cli
 

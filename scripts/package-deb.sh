@@ -32,7 +32,7 @@ checksum_file() {
 }
 
 pushd "$ROOT_DIR" >/dev/null
-"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features
+"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm --no-default-features
 popd >/dev/null
 
 rm -rf "$STAGE_DIR"

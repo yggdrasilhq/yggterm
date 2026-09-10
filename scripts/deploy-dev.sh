@@ -298,9 +298,9 @@ fi
 if [ "$DO_BUILD" = 1 ]; then
   log "building $BUILD_PROFILE binaries: yggterm, yggterm-headless, ynpm (ynpx alias)..."
   if [ "$BUILD_PROFILE" = "release" ]; then
-    cargo build --release --bin yggterm --bin yggterm-headless --bin ynpm
+    cargo build --release -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm
   else
-    cargo build --bin yggterm --bin yggterm-headless --bin ynpm
+    cargo build -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm
   fi
 fi
 
