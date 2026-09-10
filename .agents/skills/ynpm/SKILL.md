@@ -147,6 +147,20 @@ the active binary; ynpm maps those markers to the canonical yggterm GitHub
 release and rewrites the active version from the binary's `--version` answer.
 Never turn those legacy values into a release URL or hand-copy a replacement.
 
+Every installable libyggterm app release must carry the same `package.json`
+metadata inside its npm package, GitHub/Forgejo archive, or local checkout.
+`package.json.yggterm.schema` is `1`; `yggterm.app.binary` names a bin key;
+`context_menu` is explicit, and `row_spawn` controls whether a verb belongs in
+a row menu. The package manager projects this into an absolute host manifest;
+the app must not write one at startup.
+
+`ynpx` source forms are `@scope/name`, `github:owner/name`,
+`forgejo:https://host/owner/name`, `tarball:https://host/app.tgz#sha256=…`,
+and `--dev /absolute/checkout`. They all use the same metadata, version gate,
+generation, and publication path. Release metadata and binaries are refused
+before a published link changes when the package file, checksum, or bin gate
+is invalid.
+
 For a new libyggterm app, declare the stable `package.json.yggterm.app` block
 documented in `docs/ynpm.md`. `binary` is a package bin key, not a path;
 `context_menu` is the explicit opt-in for workspace/session row menus. App
@@ -173,6 +187,13 @@ for offline mode. Arguments after the package belong to the selected bin;
 after it.
 GitHub sources are cloned or fast-forwarded under ynpm's own state root and
 then use the same checkout recipe and `--version` gate.
+
+Operations append structured `component: "ynpm"`, `category: "distribution"`
+events to `~/.yggterm/event-trace.jsonl`, correlated by `run_id`. Read these
+events when a fetch, metadata parse, version gate, generation swap, app
+registration, fleet import, offline fallback, or launch fails. Human output is
+not the effect proof, and raw application flags or credential query strings do
+not belong in trace payloads.
 
 ## Server integration and flags
 
