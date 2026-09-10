@@ -337,6 +337,186 @@ Never wait on human if clear directive exists.
         check("muse sync of unknown namespace created no dirs",
               sorted(p.name for p in muse_projects.iterdir()) == before)
 
+        # 12. Subpath doors — the campaign-cli-integration/<cli>.md shape
+        # (dream ACK-9cdea1ec3a / ACK-2dc9a05503): publish --dest, get, ack,
+        # and the three-way sync must treat a subpath door exactly like a
+        # flat one, while pinned/yggterm stays OUT of project-door sync.
+        check("validator accepts subpath door",
+              mod.validate_door_filename("campaign-cli-integration/codex.md")
+              == "campaign-cli-integration/codex.md")
+        for bad in ("../escape.md", "/abs.md", "a\\b.md", "sub//x.md",
+                    "sub/./x.md", "sub/../x.md", "sub/", "./x.md", ".."):
+            try:
+                mod.validate_door_filename(bad)
+                check(f"validator rejects {bad!r}", False)
+            except ValueError:
+                check(f"validator rejects {bad!r}", True)
+
+        sub_door_src = tmp_root / "codex-door.md"
+        sub_door_src.write_text("""---
+name: campaign-cli-integration-codex
+description: "Per-CLI door for codex (11.6.1) — measured reattach facts."
+metadata:
+  type: campaign
+---
+
+# codex — integration door
+""", encoding="utf-8")
+        args_pub.dest = "campaign-cli-integration/codex.md"
+        args_pub.file = str(sub_door_src)
+        args_pub.root = str(root)
+        args_pub.ns = ns
+        args_pub.harness = "claude"
+        args_pub.json = True
+        mod.cmd_publish(args_pub)
+        sub_door = ns_dir / "campaign-cli-integration" / "codex.md"
+        check("publish --dest wrote subdirectory door", sub_door.exists())
+        all_entries = mod.read_journal_entries(root, after_seq=0, namespace=ns)
+        check("journal keys the subpath door by its subpath",
+              any(e.get("file") == "campaign-cli-integration/codex.md" for e in all_entries))
+        check("namespace index links the subpath",
+              "](campaign-cli-integration/codex.md)" in mem_index.read_text(encoding="utf-8"))
+        republish_markers = mem_index.read_text(encoding="utf-8").count(
+            "](campaign-cli-integration/codex.md)")
+        mod.cmd_publish(args_pub)
+        check("publish --dest is idempotent in the index",
+              mem_index.read_text(encoding="utf-8").count(
+                  "](campaign-cli-integration/codex.md)") == republish_markers)
+
+        class ArgsGet:
+            pass
+
+        args_get = ArgsGet()
+        args_get.root = str(root)
+        args_get.ns = ns
+        args_get.file = "campaign-cli-integration/codex.md"
+        args_get.grep = None
+        args_get.lines = None
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod.cmd_get(args_get)
+        check("get --file reads a subpath door", "integration door" in buf.getvalue())
+
+        # The hub subpath door must reach the native store as a subpath file.
+        mod.cmd_sync_harness(args_sync)
+        check("harness sync delivered subpath door to claude dir",
+              (claude_dir / "campaign-cli-integration" / "codex.md").exists())
+
+        # A native subpath file must ingest into the hub as a subpath door.
+        native_sub = claude_dir / "notes" / "lane-note.md"
+        native_sub.parent.mkdir(parents=True, exist_ok=True)
+        native_sub.write_text("# lane note\n", encoding="utf-8")
+        mod.cmd_sync_harness(args_sync)
+        check("harness sync ingested native subpath file to hub",
+              (ns_dir / "notes" / "lane-note.md").exists())
+
+        # ack --all must record subpath keys, not skip them.
+        class ArgsAck:
+            pass
+
+        args_ack = ArgsAck()
+        args_ack.root = str(root)
+        args_ack.harness = "claude"
+        args_ack.ns = ns
+        args_ack.all = True
+        args_ack.files = None
+        args_ack.json = True
+        mod.cmd_ack(args_ack)
+        wm_claude = mod.load_watermark(root, "claude")
+        check("ack --all recorded the subpath door",
+              wm_claude.get("namespaces", {}).get(ns, {}).get(
+                  "campaign-cli-integration/codex.md") is not None)
+
+        # The native pinned/yggterm shelf is the global namespace's delivery
+        # target and must NEVER ingest as project doors.
+        pinned = claude_dir / "pinned" / "yggterm" / "global-door.md"
+        pinned.parent.mkdir(parents=True, exist_ok=True)
+        pinned.write_text("# global door\n", encoding="utf-8")
+        mod.cmd_sync_harness(args_sync)
+        check("pinned/yggterm native subtree never ingested as project doors",
+              not (ns_dir / "pinned" / "yggterm" / "global-door.md").exists()
+              and not (ns_dir / "global-door.md").exists())
+
+        # 13. The delete verb — journaled total supersede, recoverable by
+        # re-publishing (dream ACK-64299ad7cd).
+        class ArgsDelete:
+            pass
+
+        args_del = ArgsDelete()
+        args_del.root = str(root)
+        args_del.harness = "claude"
+        args_del.ns = ns
+        args_del.file = "finding-pty-grid-ssot.md"
+        args_del.json = True
+        mod.cmd_delete(args_del)
+        check("delete verb removed the hub door",
+              not (ns_dir / "finding-pty-grid-ssot.md").exists())
+        door_entries = [e for e in mod.read_journal_entries(root, after_seq=0, namespace=ns)
+                        if e.get("file") == "finding-pty-grid-ssot.md"]
+        del_records = [e for e in door_entries if e.get("action") == "delete"]
+        check("delete journaled with action=delete", bool(del_records))
+        check("delete superseded prior heads",
+              bool(del_records[-1].get("base_versions")))
+        wm_del = mod.load_watermark(root, "claude")
+        check("delete dropped the door from the watermark map",
+              wm_del.get("namespaces", {}).get(ns, {}).get("finding-pty-grid-ssot.md") is None)
+
+        args_del.file = "no-such-door-anywhere.md"
+        try:
+            mod.cmd_delete(args_del)
+            check("delete of unknown door refused", False)
+        except SystemExit:
+            check("delete of unknown door refused", True)
+
+        args_pub.dest = None
+        args_pub.file = str(dummy_door)
+        args_pub.root = str(root)
+        args_pub.ns = ns
+        args_pub.harness = "claude"
+        args_pub.json = True
+        mod.cmd_publish(args_pub)
+        check("republish after delete resurrects the door",
+              (ns_dir / "finding-pty-grid-ssot.md").exists())
+
+        # 14. The churn guard — a mirror door the causal store retired is not
+        # resurrected by an unchanged source, the native source survives, and
+        # a real content change resurrects deliberately (dream
+        # ACK-8fa18b0cc2).
+        mirror_native = tmp_root / "mirror_native"
+        mirror_native.mkdir(parents=True, exist_ok=True)
+        churn = mirror_native / "churn-note.md"
+        churn.write_text("# churn\n", encoding="utf-8")
+        mod._native_door_causal_cache.clear()
+        mod._sync_native_tree(root, "zcode", mod.GLOBAL_NAMESPACE, mirror_native,
+                              "memory", target_harness="all")
+        glob_dir = mod.get_namespace_dir(root, mod.GLOBAL_NAMESPACE)
+        mirrors = sorted(glob_dir.glob("native-zcode-memory-*-churn-note.md"))
+        check("mirror tree created the churn door", len(mirrors) == 1)
+        mirror_name = mirrors[0].name
+
+        args_del.file = mirror_name
+        args_del.ns = mod.GLOBAL_NAMESPACE
+        args_del.harness = "zcode"
+        mod.cmd_delete(args_del)
+        check("churn door deleted through the verb",
+              not (glob_dir / mirror_name).exists())
+
+        mod._native_door_causal_cache.clear()
+        mod._sync_native_tree(root, "zcode", mod.GLOBAL_NAMESPACE, mirror_native,
+                              "memory", target_harness="all")
+        check("unchanged source did NOT resurrect the retired mirror",
+              not (glob_dir / mirror_name).exists())
+        check("native churn source survived the retired door", churn.exists())
+
+        churn.write_text("# churn CHANGED\n", encoding="utf-8")
+        mod._native_door_causal_cache.clear()
+        mod._sync_native_tree(root, "zcode", mod.GLOBAL_NAMESPACE, mirror_native,
+                              "memory", target_harness="all")
+        check("changed source resurrects the mirror deliberately",
+              (glob_dir / mirror_name).exists())
+
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
