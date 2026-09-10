@@ -4487,6 +4487,127 @@ pub fn store_title_silent(kind: SessionKind, session_id: &str) -> bool {
     store_title_silent_in(&home, kind, session_id)
 }
 
+/// THE WRITE-THROUGH ARM (owner directive 2026-09-10): an owner rename is
+/// written INTO the CLI's own store, in the store's native shape, so the
+/// CLI's own picker shows what the owner chose and the row and the CLI can
+/// never disagree about a name the human set. Per-CLI shapes:
+/// - codex (new): `local_thread_catalog.display_title` — the Thread name the
+///   picker renders (an old codex has no catalog; refused, false)
+/// - opencode: `session_v2.title`, v1 fallback
+/// - muse: `sessions.session_name`
+/// - zcode-tui: `session.title` — the house's own db
+/// - claude code: append the `custom-title` record CC itself displays over
+///   its `ai-title` (the existing write-back)
+/// Returns false when the store could not be written (absent, read-only,
+/// unknown id) — the rename still lives on the row; the store simply could
+/// not follow, and the next audit says so honestly.
+pub fn write_store_title(home: &Path, kind: SessionKind, session_id: &str, title: &str) -> bool {
+    let title = title.trim();
+    if title.is_empty() || session_id.trim().is_empty() {
+        return false;
+    }
+    match kind {
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
+            let mut written = false;
+            for k in [SessionKind::Codex, SessionKind::CodexLiteLlm] {
+                let Some(descriptor) = agent_cli_descriptor(k) else {
+                    continue;
+                };
+                let Some(sessions_root) = descriptor.store_roots_absolute(home).into_iter().next()
+                else {
+                    continue;
+                };
+                let Some(codex_home) = sessions_root.parent() else {
+                    continue;
+                };
+                let db_path = codex_home.join("sqlite").join("codex-dev.db");
+                if !db_path.exists() {
+                    continue;
+                }
+                let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+                    continue;
+                };
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(400));
+                let updated = conn
+                    .execute(
+                        "UPDATE local_thread_catalog SET display_title = ?1 \
+                         WHERE thread_id = ?2",
+                        rusqlite::params![title, session_id],
+                    )
+                    .map(|count| count > 0)
+                    .unwrap_or(false);
+                written |= updated;
+            }
+            written
+        }
+        SessionKind::OpenCode => {
+            let Ok(conn) = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
+            else {
+                return false;
+            };
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(400));
+            for table in ["session_v2", "session"] {
+                let updated = conn
+                    .execute(
+                        &format!("UPDATE {table} SET title = ?1 WHERE id = ?2"),
+                        rusqlite::params![title, session_id],
+                    )
+                    .map(|count| count > 0)
+                    .unwrap_or(false);
+                if updated {
+                    return true;
+                }
+            }
+            false
+        }
+        SessionKind::Muse => {
+            let Ok(conn) =
+                rusqlite::Connection::open(home.join(".local/share/muse/session-index.db"))
+            else {
+                return false;
+            };
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(400));
+            conn.execute(
+                "UPDATE sessions SET session_name = ?1 WHERE session_dir = ?2",
+                rusqlite::params![title, session_id],
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false)
+        }
+        SessionKind::ZcodeTui => {
+            let Ok(conn) = rusqlite::Connection::open(home.join(".zcode/cli/db/db.sqlite")) else {
+                return false;
+            };
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(400));
+            conn.execute(
+                "UPDATE session SET title = ?1, time_title_updated = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    title,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or_default(),
+                    session_id
+                ],
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false)
+        }
+        SessionKind::ClaudeCode => {
+            let Some(projects) = agent_cli_descriptor(kind)
+                .and_then(|d| d.store_roots_absolute(home).into_iter().next())
+            else {
+                return false;
+            };
+            let Some(jsonl) = crate::local_cc_session_jsonl_path_in(&projects, session_id) else {
+                return false;
+            };
+            crate::append_cc_session_custom_title(&jsonl, session_id, title).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// [`store_title_silent`] against an explicit home — the test seam, so a test
 /// never reads the machine's real CLI stores.
 pub fn store_title_silent_in(home: &Path, kind: SessionKind, session_id: &str) -> bool {
@@ -4513,6 +4634,172 @@ pub fn store_title_silent_in(home: &Path, kind: SessionKind, session_id: &str) -
 /// fighting the generation that named the row.
 pub fn cached_generated_title(session_id: &str) -> Option<String> {
     cached_session_title(session_id)
+}
+
+/// THE STORE-CANDIDATE CURE (owner directive 2026-09-10): for a live row whose
+/// own store read is SILENT, ask the CLI's store which of ITS sessions most
+/// recently viewed this row's cwd, and answer `(session_id, title)` — the id
+/// the row SHOULD be carrying so its store can speak, plus the title that
+/// clinches it. This is the in-session-change detection the fd poll gives
+/// codex and the process tree gives Claude Code, for the CLIs whose holders
+/// keep no session identity in a fd or an environment (measured 2026-09-10:
+/// zcode-tui, muse and agy holders expose NOTHING): the store itself is the
+/// witness, one bounded sqlite read per silent row.
+///
+/// ⚠ ONE-WAY by contract: the caller rebinds ONLY a row whose store read is
+/// silent, and only onto a session whose own title read answers — a row that
+/// already answers is bound correctly and is never re-pointed by this
+/// heuristic (two rows sharing a cwd must not cross-wire mid-flight).
+pub fn store_candidate_session_for_directory(
+    home: &Path,
+    kind: SessionKind,
+    directory: &str,
+) -> Option<(String, Option<String>)> {
+    let cwd = directory.trim_end_matches('/');
+    if cwd.is_empty() {
+        return None;
+    }
+    match kind {
+        // The tier that proved the design (Issue Heading 36).
+        SessionKind::OpenCode => opencode_store_newest_session_for_directory(home, cwd)
+            .map(|id| (id, None)),
+        // The house's own client: the shared session db carries directory +
+        // title + time_updated, so one query answers id AND title.
+        SessionKind::ZcodeTui => {
+            let conn = open_cli_index_readonly(&home.join(".zcode/cli/db/db.sqlite"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title FROM session \
+                     WHERE directory = ?1 AND time_archived IS NULL \
+                     ORDER BY time_updated DESC LIMIT 1",
+                )
+                .ok()?;
+            let mut rows = stmt.query(rusqlite::params![cwd]).ok()?;
+            let row = rows.next().ok()??;
+            let id: String = row.get(0).ok()?;
+            let title: Option<String> = row.get(1).ok();
+            Some((id, title_without_fallbacks(title)))
+        }
+        // muse's session index: workspace_root is the cwd, session_name the
+        // CLI's own word, session_dir the id.
+        SessionKind::Muse => {
+            let conn = open_cli_index_readonly(&home.join(".local/share/muse/session-index.db"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_dir, session_name FROM sessions \
+                     WHERE workspace_root = ?1 \
+                     ORDER BY updated_at_us DESC LIMIT 1",
+                )
+                .ok()?;
+            let mut rows = stmt.query(rusqlite::params![cwd]).ok()?;
+            let row = rows.next().ok()??;
+            let id: String = row.get(0).ok()?;
+            let title: Option<String> = row.get(1).ok();
+            Some((id, title_without_fallbacks(title)))
+        }
+        // agy's summaries db: workspace_uris is a JSON list of roots — a
+        // substring match on the cwd is the honest bound here (the list is
+        // short and the cwd is absolute), last_modified_time the recency.
+        SessionKind::Antigravity => {
+            let conn = open_cli_index_readonly(
+                &home.join(".gemini/antigravity-cli/conversation_summaries.db"),
+            )?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT conversation_id, title FROM conversation_summaries \
+                     WHERE workspace_uris LIKE ?1 ESCAPE '\\' \
+                     ORDER BY last_modified_time DESC LIMIT 1",
+                )
+                .ok()?;
+            let pattern = format!("%{}%", cwd.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let mut rows = stmt.query(rusqlite::params![pattern]).ok()?;
+            let row = rows.next().ok()??;
+            let id: String = row.get(0).ok()?;
+            let title: Option<String> = row.get(1).ok();
+            Some((id, title_without_fallbacks(title)))
+        }
+        _ => None,
+    }
+}
+
+/// THE OBSERVABILITY PROBE (owner directive 2026-09-10): what yggterm can
+/// understand about one session's title, ARM BY ARM — the CLI's own store
+/// answers, the rollout/prompt arm, and yggterm's own generated cache,
+/// separately, so a wrong row title can be attributed to the exact wire that
+/// produced it instead of reverse-engineered. `read_live_store_title` composes
+/// these arms behind one `Option`; this is the same knowledge uncomposed.
+/// Answers are trimmed to 120 characters — a probe is displayed, not ingested.
+pub fn explain_store_title(
+    home: &Path,
+    kind: SessionKind,
+    session_id: &str,
+) -> Vec<(&'static str, Option<String>)> {
+    fn arm(name: &'static str, value: Option<String>) -> (&'static str, Option<String>) {
+        (
+            name,
+            value.map(|t| t.chars().take(120).collect::<String>()),
+        )
+    }
+    match kind {
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
+            let mut arms = Vec::new();
+            let homes: Vec<PathBuf> = [SessionKind::Codex, SessionKind::CodexLiteLlm]
+                .iter()
+                .filter_map(|k| agent_cli_descriptor(*k))
+                .filter_map(|d| d.store_roots_absolute(home).into_iter().next())
+                .collect();
+            let mut catalog = None;
+            let mut rollout = None;
+            for sessions_root in &homes {
+                let codex_home = match sessions_root.parent() {
+                    Some(parent) => parent.to_path_buf(),
+                    None => continue,
+                };
+                if catalog.is_none() {
+                    catalog = codex_thread_catalog_title(&codex_home, session_id);
+                }
+                if rollout.is_none()
+                    && let Some(file) =
+                        find_file_by_suffix(sessions_root, 4, &format!("-{session_id}.jsonl"))
+                {
+                    rollout = codex_first_real_user_prompt(&file);
+                }
+            }
+            arms.push(arm("catalog", catalog));
+            arms.push(arm("rollout_prompt", rollout));
+            arms.push(arm("yggterm_cache", cached_session_title(session_id)));
+            arms
+        }
+        SessionKind::ClaudeCode => vec![arm(
+            "transcript_title",
+            agent_cli_descriptor(kind)
+                .and_then(|d| d.read_live_store_title)
+                .and_then(|read| read(home, session_id)),
+        )],
+        SessionKind::OpenCode => vec![arm(
+            "db_title",
+            agent_cli_descriptor(kind)
+                .and_then(|d| d.read_live_store_title)
+                .and_then(|read| read(home, session_id)),
+        )],
+        SessionKind::Muse => {
+            vec![
+                arm(
+                    "store",
+                    agent_cli_descriptor(kind)
+                        .and_then(|d| d.read_live_store_title)
+                        .and_then(|read| read(home, session_id)),
+                ),
+                arm("yggterm_cache", cached_session_title(session_id)),
+            ]
+        }
+        _ => vec![arm(
+            "store",
+            agent_cli_descriptor(kind)
+                .and_then(|d| d.read_live_store_title)
+                .and_then(|read| read(home, session_id)),
+        )],
+    }
 }
 
 /// [`AgentCliDescriptor::read_live_store_title`] for OpenCode: the v2 store's

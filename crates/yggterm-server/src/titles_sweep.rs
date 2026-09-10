@@ -305,6 +305,10 @@ enum Plan {
     /// The transcript exists and says nothing worth naming — a one-word
     /// session, or boilerplate the context builder correctly strips.
     NoContext,
+    /// THE HONOR LAW (owner, 2026-09-10): an agent CLI's row is titled by its
+    /// CLI; the interface LLM never titles one. Counted separately from
+    /// no-context so a sweep reports the law's refusals honestly.
+    HonorLaw,
     /// Ready to generate, with the context to generate from.
     Generate { context: String, force: bool },
 }
@@ -315,6 +319,7 @@ impl Plan {
             Plan::FromStore(_) => "store",
             Plan::NoTranscript => "no-transcript",
             Plan::NoContext => "no-context",
+            Plan::HonorLaw => "honor-law",
             Plan::Generate { .. } => "generated",
         }
     }
@@ -324,6 +329,17 @@ impl Plan {
 /// writes its own title is the authority for it, and asking a model to invent a
 /// second one is how a row ends up with two names that disagree forever.
 fn plan_one(row: &StartpageDurableRow) -> Result<Plan> {
+    // ⭐ THE HONOR LAW before every other arm: an agent CLI's row is named by
+    // its CLI or not at all. The store-title arm still applies (that IS the
+    // law); generation never does.
+    if row.kind.is_agent() {
+        if let Some(title) = row.title.as_deref().map(str::trim) {
+            if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+                return Ok(Plan::FromStore(title.to_string()));
+            }
+        }
+        return Ok(Plan::HonorLaw);
+    }
     if let Some(title) = row.title.as_deref().map(str::trim) {
         if !title.is_empty() && !looks_like_generated_fallback_title(title) {
             return Ok(Plan::FromStore(title.to_string()));
@@ -354,6 +370,7 @@ fn resolve_one(
         Plan::FromStore(title) => Ok((Some(title), "store", None)),
         Plan::NoTranscript => Ok((None, "no-transcript", None)),
         Plan::NoContext => Ok((None, "no-context", Some(0))),
+        Plan::HonorLaw => Ok((None, "honor-law", Some(0))),
         Plan::Generate { context, force } => {
             let context_chars = context.chars().count();
             let title = store.generate_title_for_context(

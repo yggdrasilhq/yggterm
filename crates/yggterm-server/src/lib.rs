@@ -1446,39 +1446,22 @@ pub fn session_accepts_generated_copy(session: &ManagedSessionView) -> bool {
     if session_is_app_row(session) {
         return false;
     }
-    if session.kind.self_generates_copy() {
-        // Rule 2 — with the store-silent exception: a CLI whose store cannot
-        // answer for THIS session is not authoritative over it.
-        if yggterm_core::agent_cli::store_title_silent(session.kind, &session.id) {
-            return true;
-        }
+    // ⭐ THE HONOR LAW (owner, 2026-09-10, tightening the 2026-09-05/06
+    // titling words): an agent CLI's row is titled by its CLI. The interface
+    // LLM NEVER titles one — not when the store is silent (the store-silent
+    // exception this branch replaces was the overwrite engine: a row whose id
+    // had not yet rebound to its CLI's own session id read as "store silent",
+    // the model invented a title, and the invention then sat where the CLI's
+    // Thread name belongs), not by a path-shaped admission, not ever. The
+    // owner's two doors bypass this gate by construction: a rename is
+    // owner-authored, and an owner-invoked generation lands through the
+    // explicit title door.
+    if session.kind.is_agent() {
         return false;
     }
-    if session.kind == SessionKind::Document {
-        return true;
-    }
-    session.kind.is_agent() || session_path_can_only_be_an_agent_transcript(&session.session_path)
-}
-
-/// The path half of [`session_accepts_generated_copy`] — for a row whose KIND
-/// did not survive the trip (a durable row rebuilt from a scan, a remote row
-/// adopted from another daemon).
-///
-/// ⛔ Deliberately NOT "is this a local live path": `local://` is the runtime key
-/// of every live local row whatever it hosts, and reading it as an agent tell is
-/// the defect this function was split out of. `local://` carries no kind in the
-/// scheme registry precisely because it cannot answer this question.
-fn session_path_can_only_be_an_agent_transcript(path: &str) -> bool {
-    let trimmed = path.trim();
-    if trimmed.is_empty() || trimmed.starts_with("__") {
-        return false;
-    }
-    if let Some(kind) = yggterm_core::agent_scheme::session_kind_for_path(trimmed) {
-        return kind.is_agent();
-    }
-    // What is left with no scheme at all is a durable row, and a durable row's
-    // path IS the CLI store file the scan found it in.
-    Path::new(trimmed).is_absolute()
+    // ONLY a document row — a body yggterm may legitimately name from its own
+    // content — still accepts an automatic generated copy.
+    session.kind == SessionKind::Document
 }
 
 fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
@@ -7008,6 +6991,56 @@ impl YggtermServer {
             .map(|session| session.title.clone())
     }
 
+    /// Whether ANOTHER live row already carries `session_id` — the twin-poison
+    /// guard every identity stamp shares (the pid-recycling collapse of
+    /// 2026-09-04): one transcript, one row. `except_key` is the row asking.
+    pub fn live_agent_row_holding_session_id(
+        &self,
+        session_id: &str,
+        except_key: &str,
+    ) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|(key, session)| key.as_str() != except_key && session.id == session_id)
+            .map(|(key, _)| key.clone())
+    }
+
+    /// THE STORE-CANDIDATE REBIND (owner directive 2026-09-10): move a live
+    /// row's id onto the CLI session its store says this cwd was last viewing.
+    /// The caller has already bounded the heuristic — store-silent row,
+    /// answerable candidate, no other holder — so this is pure mechanics: the
+    /// id moves, the move is witnessed on the identity trace, and the KEY
+    /// stays (the [11.79] lesson: the record's id is the store-read
+    /// authority; the key is the PTY's seat and does not travel).
+    pub fn rebind_live_session_store_identity(
+        &mut self,
+        key: &str,
+        new_session_id: &str,
+    ) -> bool {
+        let Some(row_key) = self
+            .resolve_session_storage_key(key)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Some(session) = self.sessions.get_mut(&row_key) else {
+            return false;
+        };
+        if session.id == new_session_id {
+            return false;
+        }
+        let from = session.id.clone();
+        let path = session.session_path.clone();
+        session.id = new_session_id.to_string();
+        emit_identity_trace(
+            "identity_store_candidate_rebind",
+            &path,
+            Some(&from),
+            new_session_id,
+        );
+        true
+    }
+
     /// Whether this row's title was set by a human. The scanned mirror carries
     /// no provenance of its own, so the live row is the one owner of the
     /// answer — asking it here keeps the two copies from disagreeing.
@@ -7054,6 +7087,45 @@ impl YggtermServer {
         {
             session.title = title.to_string();
             session.title_is_explicit = true;
+            // THE WRITE-THROUGH ARM (owner directive 2026-09-10): an owner
+            // rename is written INTO the CLI's own store, in the store's
+            // native shape, so the CLI's picker and the row can never
+            // disagree about a name the human set. Loopback live agent rows
+            // only — a remote row's store lives behind an ssh hop (its
+            // write-through rides the remote-script plane, still owed), and
+            // a failure is named on the trace instead of blocking the rename.
+            if session.kind.is_agent()
+                && matches!(session.source, SessionSource::LiveLocal | SessionSource::LiveSsh)
+                && session.ssh_target.clone().map_or(true, |target| {
+                    yggterm_core::agent_cli::store_title_read_is_loopback(&target)
+                })
+            {
+                let kind = session.kind;
+                let id = session.id.clone();
+                let user_home = dirs::home_dir();
+                let written = user_home
+                    .map(|home| {
+                        yggterm_core::agent_cli::write_store_title(
+                            &home, kind, &id, title,
+                        )
+                    })
+                    .unwrap_or(false);
+                #[cfg(not(test))]
+                if let Ok(ygg_home) = yggterm_core::resolve_yggterm_home() {
+                    yggterm_core::append_trace_event(
+                        &ygg_home,
+                        "server",
+                        "cli",
+                        "title_write_through",
+                        serde_json::json!({
+                            "session_path": session_path,
+                            "kind": yggterm_core::agent_cli::session_kind_label(kind),
+                            "session_id": id,
+                            "written": written,
+                        }),
+                    );
+                }
+            }
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
@@ -27292,6 +27364,23 @@ pub fn run_row_show(selector: &str) -> anyhow::Result<()> {
                 .map(|title| title.trim().to_string())
                 .filter(|title| !title.is_empty());
             let row_title = row.title.trim().to_string();
+            // THE OBSERVABILITY PROBE (owner directive 2026-09-10): what the
+            // CLI's own store says, ARM BY ARM — the composed
+            // `cli_store_title` names the winner, `title_sources` names every
+            // wire that was asked and what each answered, so a wrong row title
+            // is attributable on the spot instead of reverse-engineered.
+            let title_sources: Vec<(String, Option<String>)> = descriptor
+                .map(|_| {
+                    yggterm_core::agent_cli::explain_store_title(
+                        &user_home,
+                        row.kind,
+                        &row.id,
+                    )
+                    .into_iter()
+                    .map(|(name, answer)| (name.to_string(), answer))
+                    .collect()
+                })
+                .unwrap_or_default();
             let mut value = serde_json::to_value(row)?;
             if let Some(object) = value.as_object_mut() {
                 object.insert(
@@ -27311,6 +27400,7 @@ pub fn run_row_show(selector: &str) -> anyhow::Result<()> {
                     serde_json::json!({
                         "row_title": row_title,
                         "cli_store_title": cli_store_title,
+                        "title_sources": title_sources,
                         "mismatch": matches!(&cli_store_title, Some(t) if t != &row_title)
                             && !row.title_is_explicit,
                     }),
@@ -40390,34 +40480,33 @@ mod tests {
             let session = server.sessions.get(&row).expect("the row exists");
             let expected = match kind {
                 SessionKind::Document => true,
-                // The store-silent exception (2026-09-06): codex/codex-litellm/
-                // muse are admitted ONLY when their store cannot answer this
-                // row's id — asserted through the SAME predicate the gate
-                // asks, against the same home, so the test tracks the law and
-                // not this machine's store contents.
-                kind @ (SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::Muse) => {
-                    yggterm_core::agent_cli::store_title_silent(kind, &session.id)
-                }
-                kind => kind.is_agent() && !kind.self_generates_copy(),
+                // THE HONOR LAW (owner, 2026-09-10): an agent CLI's row is
+                // titled by its CLI — NEVER by the interface LLM, store
+                // silent or not. The store-silent exception is retired.
+                kind if kind.is_agent() => false,
+                _ => false,
             };
             assert_eq!(
                 super::session_accepts_generated_copy(session),
                 expected,
                 "{kind:?} must answer the gate from what it IS — an agent CLI \
-                 whose store speaks, or a silent store admitting generation, \
-                 or a document with a body"
+                 never accepts generated copy under the honor law, and only a \
+                 document is titled from its own body"
             );
         }
     }
 
-    /// A DURABLE row still qualifies on its path alone.
+    /// ⛔ THE HONOR LAW HOLDS EVEN WHEN THE KIND IS LOST (owner, 2026-09-10).
     ///
-    /// The kind does not always survive the trip from a scan, and a durable
-    /// row's path IS the CLI store file it was found in — so the transcript is
-    /// right there to be named from. Losing this arm would silently stop
-    /// titling the scanned sessions the fleet sweep exists to fix.
+    /// A durable row's path IS the CLI store file it was found in — and when
+    /// that path names an AGENT transcript, the row is an agent row that lost
+    /// its kind on the trip from a scan. The old rule titled it from its body
+    /// ("the transcript is right there"); the honor law REFUSES: an agent
+    /// CLI's session is named by its CLI or not at all, and a lost kind is
+    /// exactly when the refusal matters most.
     #[test]
-    fn a_durable_transcript_path_is_a_candidate_even_when_the_kind_is_lost() {
+    fn an_agent_transcript_path_is_never_a_candidate_even_when_the_kind_is_lost(
+    ) {
         let mut session = build_session(
             SessionKind::Shell,
             "/home/user/.codex/sessions/2026/04/01/rollout-2026-04-01T06-18-55.jsonl",
@@ -40430,9 +40519,9 @@ mod tests {
             false,
             StoredPreviewHydrationMode::Deferred,
         );
-        assert!(super::session_accepts_generated_copy(&session));
+        assert!(!super::session_accepts_generated_copy(&session));
 
-        // …but a virtual sidebar path is not a transcript, whatever its kind.
+        // …a virtual sidebar path is not a transcript either, whatever its kind.
         session.session_path = "__remote_machine__/devhost".to_string();
         assert!(!super::session_accepts_generated_copy(&session));
     }

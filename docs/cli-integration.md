@@ -2292,3 +2292,78 @@ is the witness. One milestone, two sources; a half that never fired is the
 bug, pinned to a side. Milestone table + pairing queries: the repo's
 docs/probes.md (github.com/avikalpa/zcode-tui). The follow-up: a
 pairing-verifier verb that asserts the pairs over a launch→quit window.
+
+## Issue Heading 39: the honor law — the CLI names the row; the interface LLM never does (2026-09-10)
+
+THE LAW (owner, tightening the 2026-09-05/06 titling words): a row is titled
+by its CLI. The interface LLM never titles an agent-CLI row — not when the
+store is silent, not by a path-shaped admission, not ever. The owner's two
+doors are the ONLY ways a row wears anything else:
+
+1. **The owner renames the row** — `set_session_title_explicit`, the one
+   human door. Under this heading it is also WRITE-THROUGH: the rename is
+   written into the CLI's own store in the store's native shape (codex
+   `local_thread_catalog.display_title`, opencode `session_v2.title`, muse
+   `sessions.session_name`, zcode `session.title`, cc the appended
+   `custom-title` record), so the CLI's own picker shows what the owner
+   chose. Loopback rows first; remote write-through rides the remote-script
+   plane (owed). Failures are traced (`title_write_through`), never fatal.
+2. **The owner asks the interface LLM to generate** — the GUI's generate
+   action. Its result lands through the explicit door too: an owner-invoked
+   generation is owner authorship, and the CLI-title follow may never
+   overwrite it.
+
+**The inlets this closes** (each was a way yggterm invented a name and the
+invention then sat where the CLI's word belongs):
+
+- `session_accepts_generated_copy` — the store-silent exception (2026-09-06)
+  is RETIRED, and the bottom path-shaped arm with it. An agent kind answers
+  false; a Document answers true; nothing else does. The overwrite engine
+  measured live: a row whose id had not yet rebound to its CLI's session id
+  read "store silent", the model invented a title, and codex's own Thread
+  name lost the row.
+- The titles sweep — agent rows never take a Generate plan (`Plan::HonorLaw`
+  is counted honestly in the report).
+- The registry is unchanged and stays pinned: all agent CLIs are
+  `TitleAuthority::Store`; the scan side already suppresses generated copies
+  for store-authoritative kinds.
+
+**The in-session change contract** — how yggterm learns that the session a
+row is running CHANGED mid-flight (codex `/resume`, opencode `/sessions`,
+zcode-tui session switch), per CLI:
+
+| CLI | live detector | store shape | cure for a silent row |
+|---|---|---|---|
+| codex | rollout-fd identity poll | `local_thread_catalog` (new) / rollout first real prompt (old) | — (detector suffices) |
+| claude code | process-tree identity overlay | `<id>.jsonl` custom-title > ai-title | — |
+| opencode | OSC OC-title binding (+ F2 store fallback, owed) | `opencode.db` `session_v2.title` | store-candidate |
+| zcode-tui | store-candidate cure (+ the declare plane, our CLI — owed) | `~/.zcode/cli/db/db.sqlite` `session.title` | store-candidate |
+| muse | store-candidate cure | `session-index.db` `sessions.session_name` | store-candidate |
+| agy | store-candidate cure | `conversation_summaries.db` | store-candidate |
+
+**The store-candidate cure** (`store_candidate_session_for_directory` +
+`rebind_live_session_store_identity`, applied inside the title-follow
+chore): for a LIVE loopback row whose store read is SILENT, ask the CLI's
+store which of ITS sessions most recently viewed the row's cwd; if that
+session answers a title (the clincher), and NO other live row holds its id
+(the twin-poison guard), re-point the row's id — one-way, never re-pointing
+a row the store already answers. The rebind is witnessed on the identity
+trace (`identity_store_candidate_rebind`), the tick counts it
+(`store_candidate_cures`), and the title flows on the same or next tick.
+Resource shape: one bounded sqlite read per silent row, capped at 8 per
+tick; a correctly-bound row costs nothing.
+
+**The observability contract** — "log what yggterm understands" (owner):
+- `rows live` carries `ssot_verdict` per row (match / mismatch /
+  store_silent) + fleet counts, so the birth-named army is a number.
+- `rows show` carries `ssot.title_sources`: every reader arm asked for this
+  row's id and what each answered (catalog / rollout_prompt / yggterm_cache
+  / db_title / transcript_title / store) — a wrong title is attributable on
+  the spot.
+- The follow tick names every decision: applied / equal_skip / store_silent
+  / cure_refused_holder / store_candidate_rebind / refused_owner_set.
+
+Falsifier: fresh codex spawn on the GUI host shows codex's own Thread name
+and never an invention; a zcode-tui or muse session switch re-titles the row
+within ticks via the cure; `rows show` answers title_sources for every
+agent row.
