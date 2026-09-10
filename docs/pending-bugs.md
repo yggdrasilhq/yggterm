@@ -18,6 +18,30 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
+
+**Status:** OPEN
+
+Multi-session law: the owner runs SEVERAL integration sessions in parallel;
+each claims one member id, works `lane/integration/<cli>`, and keeps per-CLI
+state in its own door. Seeded members: [11.92] (11.6.0, FIXED IN CODE — LIVE
+PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
+
+| id | member | class | open work |
+|---|---|---|---|
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | OPEN (3.3.0) |
+| 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
+| 11.6.2 | claude | A | OPEN (ledger reattach) |
+| 11.6.3 | opencode | B | OPEN (server-side session truth, not the TUI) |
+| 11.6.4 | agy | C | OPEN (store-id discovery + named failure; silent fresh-spawn today) |
+| 11.6.5 | muse | C | OPEN (same shape as agy) |
+| 11.6.6 | kimi | C | OPEN |
+| 11.6.7 | qwen | C | OPEN |
+| 11.6.8 | grok | C | OPEN |
+| 11.6.9 | pi | C | OPEN |
+| 11.6.10 | codex-litellm | A | OPEN |
+| 11.6.11 | zcode-tui | B | OPEN (native announce — the reference implementation) |
+
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -7674,11 +7698,14 @@ the file is not the place to change this from the outside. Both edits were rever
 had. The maintenance path needs no setting at all: `server titles sweep --model <id>` names the
 model for one run and touches nothing.
 
-## ⛔⛔ [11.6] A LAUNCH THAT NEVER REACHED ITS CLI LEAVES A HUSK ROW THAT LOOKS IDLE
+## ⛔⛔ [11.95] A LAUNCH THAT NEVER REACHED ITS CLI LEAVES A HUSK ROW THAT LOOKS IDLE
 
 **Status:** OPEN
 
 *The npm half of this entry is fixed and re-diagnosed below.*
+
+*(Renumbered from [11.6] on 2026-09-10: the owner pinned 11.6.x for the per-CLI integration family — see `docs/cli-integration-layer.md` §7.)*
+
 
 *Originally filed 2026-08-20 as "the npm auto-update races itself across concurrent launches".
 **Both halves of that title were wrong**, and the correction is worth more than the entry was.*
