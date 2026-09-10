@@ -4875,6 +4875,17 @@ enum AppPaneWidget {
         /// the editor's keystrokes render without an app round trip.
         #[serde(default)]
         live_from: String,
+        /// Read-only projection (ymacs docs/spec-rendering.md): render the
+        /// plain prose body, NEVER the block click-to-edit editor.
+        /// serde-default: schemas that omit it behave exactly as before.
+        #[serde(default)]
+        read_only: bool,
+        /// When set, a click on a markdown link POSTs this action on the
+        /// document channel with the href as `values.value` (ymacs'
+        /// follow-link). serde-default: older shells ignore the field and
+        /// the links stay inert instead of breaking the pane.
+        #[serde(default)]
+        links_action: String,
     },
 }
 

@@ -4745,6 +4745,26 @@ JSON.stringify({{
         );
     }
 
+    #[test]
+    fn document_markdown_read_only_and_link_actions_are_the_ymacs_contract() {
+        // docs/spec-rendering.md (ymacs): the rendered view is a READ-ONLY
+        // projection whose links POST the app's action with the href as
+        // values.value, and ribbon labels shrink instead of clipping.
+        let source = include_str!("right_rail.rs");
+        assert!(
+            source.contains("md_block_node_linked"),
+            "the linked markdown renderer exists"
+        );
+        assert!(
+            source.contains("cb.call((action.clone(), Some(click_href.clone())))"),
+            "link clicks POST (action, href) through the owned channel"
+        );
+        assert!(
+            source.contains("text-overflow:ellipsis"),
+            "ribbon labels ellipsize instead of clipping off the strip"
+        );
+    }
+
     /// Both fetch-completion Ok arms must consult the noop mirror before
     /// taking the write. A future editor who deletes the guard re-imports the
     /// measured drumbeat silently — this fails on that edit instead.
@@ -18851,11 +18871,18 @@ console.log('ok');
                 {"kind": "button", "id": "add", "label": "Add", "action": "add"},
                 {"kind": "list-row", "id": "r1", "title": "github.com",
                  "actions": [{"action": "fill", "label": "⧉"}]},
+                {"kind": "markdown", "id": "doc1", "source": "# hi",
+                 "read_only": true, "links_action": "follow-link"},
             ],
         }))
         .expect("schema parses");
         assert_eq!(schema.title, "Vault");
-        assert_eq!(schema.widgets.len(), 11);
+        assert_eq!(schema.widgets.len(), 12);
+        // ymacs rendered-view contract (docs/spec-rendering.md): a
+        // read-only projection whose links POST the declared action.
+        assert!(matches!(&schema.widgets[11],
+                         AppPaneWidget::Markdown { read_only: true, links_action, .. }
+                         if links_action == "follow-link"));
         // An omitted `action` is empty, not an error: a search box need not act.
         assert!(
             matches!(&schema.widgets[3], AppPaneWidget::SearchBox { action, .. } if action.is_empty())
