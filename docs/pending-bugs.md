@@ -44,7 +44,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 ### ⛔ 11.6.11 defect — ZCODE-TUI IS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` IS RED ON MAIN (found by wave-1 seat B, 2026-09-10)
 
-**Status:** OPEN (blocks no lane; descriptor fills queue behind 11.6.0's schema-v2 conversion)
+Open, and blocks no lane: the descriptor fill it belongs to queues behind 11.6.0's schema-v2 conversion.
 
 Measured on origin/main (e2ccb9dc9): `cargo test -p yggterm-server --lib
 agent_arm_matrix` fails — "ZcodeTui on Local must appear EXACTLY once in the
