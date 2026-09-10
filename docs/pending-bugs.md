@@ -28332,3 +28332,47 @@ without a duplicate sidebar merge; the UI trace must attribute any later wait
 to the remote operation rather than the modal state write. A remote ensure may
 still take network time, but it must not hold the modal, keystroke loop, or
 existing terminal input hostage.
+
+## ⛔ [11.90] THE INTERFACE LLM OVERWRITES THE CLI'S OWN TITLE — THE STORE-SILENT GENERATION EXCEPTION INVENTED NAMES FOR ROWS WHOSE IDS HAD NOT REBOUND, AND THE INVENTION SAT WHERE THE CLI'S THREAD NAME BELONGS (owner report 2026-09-10: codex Thread names overwritten; opencode, muse, agy, zcode-tui not showing titles properly)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The owner's honor law (this is the spec now, docs/cli-integration.md Issue
+Heading 39): a row is titled by its CLI; the interface LLM never titles an
+agent-CLI row — the ONLY two doors past that are the owner's rename and the
+owner's explicit generation request. Three inlets closed on
+lane/cli/title-honor: (1) `session_accepts_generated_copy` — the
+store-silent exception (2026-09-06) RETIRED; agent kinds refuse, Document
+alone accepts (the overwrite engine: a row whose id had not rebound read
+"store silent", the model invented a title, codex's Thread name lost the
+row); (2) the titles sweep — agent rows never take a Generate plan
+(`Plan::HonorLaw` counted honestly); (3) the GUI's owner-invoked generation
+now lands through the EXPLICIT door (owner authorship — the follow may
+never overwrite it).
+
+SHIPPED IN THE SAME LANE (the owner's dynamic-metadata requirement):
+- **The store-candidate cure** — in-session change detection for the CLIs
+  whose holders expose no session identity (measured 2026-09-10: zcode-tui,
+  muse, agy holders keep NO fd/env into their stores): the title-follow
+  chore, for a live loopback row whose store read is SILENT, asks the CLI's
+  store which of its sessions most recently viewed the row's cwd
+  (`store_candidate_session_for_directory`), and if that session answers a
+  title and no other live row holds its id, re-points the row's id ONE WAY
+  (`rebind_live_session_store_identity`, traced
+  `identity_store_candidate_rebind`, tick-counted `store_candidate_cures`,
+  budget 8/tick). Bounded correctly-bound rows cost nothing.
+- **Write-through renames** — `write_store_title`: an owner rename writes
+  INTO the CLI's own store in its native shape (codex catalog display_title,
+  opencode session_v2.title, muse sessions.session_name, zcode session.title,
+  cc the custom-title record), traced `title_write_through`. Loopback rows;
+  remote write-through owed (the remote-script plane).
+- **The observability contract** — `rows show` carries
+  `ssot.title_sources` (every reader arm and its answer:
+  catalog/rollout_prompt/yggterm_cache/db_title/transcript_title/store);
+  the follow tick names cure outcomes
+  (store_candidate_rebind/cure_refused_holder/cure_no_change).
+
+**Falsifier:** fresh codex spawn on the GUI host wears codex's own Thread
+name, never an invention; a zcode-tui session switch (or a muse/agy one)
+re-titles the row within ticks via the cure; `rows show` answers
+title_sources for every agent row; the privacy gate passes.

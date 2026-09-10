@@ -15741,7 +15741,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
         let runtime = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
-        let rows: Vec<(String, SessionKind, String, String)> = runtime
+        let rows: Vec<(String, SessionKind, String, String, Option<String>)> = runtime
             .server
             .persisted_live_sessions()
             .into_iter()
@@ -15754,6 +15754,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                     row.kind,
                     row.id.clone(),
                     row.ssh_target.clone(),
+                    row.cwd.clone(),
                 )
             })
             .collect();
@@ -15782,7 +15783,11 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
     let mut remote_missing: HashSet<(String, SessionKind)> = HashSet::new();
     let mut remote_batches: HashMap<(String, SessionKind), Vec<String>> = HashMap::new();
     let mut local_answers: HashMap<String, String> = HashMap::new();
-    for (path, kind, id, ssh_target) in &candidates {
+    // The store-candidate cure queue, computed outside the lock (sqlite
+    // reads), applied under it — path → (candidate id, candidate title).
+    let mut cure_candidates: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut cure_budget: usize = 8;
+    for (path, kind, id, ssh_target, cwd) in &candidates {
         let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(*kind) else {
             continue;
         };
@@ -15794,6 +15799,43 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                 let title = title.trim().to_string();
                 if !title.is_empty() {
                     local_answers.insert(path.clone(), title);
+                    continue;
+                }
+            }
+            // THE STORE-CANDIDATE CURE (owner directive 2026-09-10): a live
+            // loopback row whose store read is SILENT may be carrying a birth
+            // id the CLI's store has never heard of — ask the store which of
+            // ITS sessions this cwd last viewed, and if that session answers
+            // a title, queue the rebind. One-way by contract (never re-point
+            // a row the store already answers), bounded per tick, and only
+            // for kinds with no live identity detector (codex and Claude
+            // Code have the fd poll and the process tree).
+            if cure_budget > 0
+                && matches!(
+                    *kind,
+                    SessionKind::ZcodeTui
+                        | SessionKind::Muse
+                        | SessionKind::Antigravity
+                        | SessionKind::OpenCode
+                )
+                && let Some(cwd) = cwd
+                && let Some((candidate_id, candidate_title)) =
+                    yggterm_core::agent_cli::store_candidate_session_for_directory(
+                        &user_home, *kind, &cwd,
+                    )
+                && candidate_id != *id
+            {
+                let clincher = candidate_title.clone().or_else(|| {
+                    descriptor
+                        .read_live_store_title
+                        .and_then(|read| read(&user_home, &candidate_id))
+                });
+                if clincher.is_some() {
+                    cure_candidates.insert(
+                        path.clone(),
+                        (candidate_id, candidate_title),
+                    );
+                    cure_budget -= 1;
                 }
             }
             continue;
@@ -15847,12 +15889,13 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
     let mut applied = 0usize;
     let mut store_silent = 0usize;
     let mut equal_skips = 0usize;
+    let mut cures = 0usize;
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     {
         let mut runtime = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
-        for (path, kind, id, ssh_target) in &candidates {
+        for (path, kind, id, ssh_target, _cwd) in &candidates {
             if yggterm_core::agent_cli::agent_cli_descriptor(*kind).is_none() {
                 continue;
             }
@@ -15870,6 +15913,55 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                 // because a silent read produced no tick evidence at all —
                 // [11.86]'s diagnosability half.
                 store_silent += 1;
+                // THE STORE-CANDIDATE CURE, applied: the row carries an id
+                // its CLI's store has never answered for, the store named the
+                // session this cwd last viewed, and no other row holds it —
+                // re-point the id (one-way: silent rows only) and flow the
+                // candidate's title in the same breath.
+                if let Some((candidate_id, candidate_title)) = cure_candidates.get(path)
+                {
+                    let holder = runtime
+                        .server
+                        .live_agent_row_holding_session_id(candidate_id, path);
+                    match holder {
+                        Some(other) if outcomes.len() < 12 => {
+                            outcomes.push(serde_json::json!({
+                                "path": path,
+                                "outcome": "cure_refused_holder",
+                                "candidate_id": candidate_id,
+                                "held_by": other,
+                            }));
+                        }
+                        _ => {
+                            let rebound = runtime
+                                .server
+                                .rebind_live_session_store_identity(
+                                    path,
+                                    candidate_id,
+                                );
+                            if rebound {
+                                cures += 1;
+                                if let Some(candidate_title) = candidate_title {
+                                    runtime.server.set_session_title_hint(
+                                        path,
+                                        candidate_title,
+                                    );
+                                }
+                            }
+                            if outcomes.len() < 12 {
+                                outcomes.push(serde_json::json!({
+                                    "path": path,
+                                    "outcome": if rebound {
+                                        "store_candidate_rebind"
+                                    } else {
+                                        "cure_no_change"
+                                    },
+                                    "candidate_id": candidate_id,
+                                }));
+                            }
+                        }
+                    }
+                }
                 if outcomes.len() < 12 {
                     outcomes.push(serde_json::json!({
                         "path": path,
@@ -15948,6 +16040,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                 "applied": applied,
                 "store_silent": store_silent,
                 "equal_skips": equal_skips,
+                "store_candidate_cures": cures,
                 "local_answers": local_answers.len(),
                 "remote_hosts_answered": remote_answers.len(),
                 "remote_missing": remote_missing.len(),
@@ -36436,9 +36529,11 @@ mod tests {
             "a self-titling CLI's working row must never become a generation \
              candidate — the title chore reads the CLI's own title instead"
         );
-        // The gate still gates the rows it still serves: a durable
-        // transcript-path row (kind lost in the trip, absolute .jsonl path)
-        // is a candidate while WORKING and never while idle.
+        // ⛔ THE HONOR LAW (owner, 2026-09-10): the gate serves NO agent rows
+        // any more — including a durable transcript-path row whose kind was
+        // lost in the trip. A codex rollout path with a Shell kind is exactly
+        // an agent row that lost its kind, and it is never a generation
+        // candidate, working or idle: the CLI names it or nobody does.
         let mut carried = server.live_sessions()[0].clone();
         carried.session_path = jsonl.to_string_lossy().to_string();
         carried.kind = crate::SessionKind::Shell;
@@ -36457,8 +36552,10 @@ mod tests {
         super::collect_live_copy_candidates(&store, &[carried.clone()], &working, &mut out);
         assert!(
             out.iter()
-                .any(|c| c.session_path == carried.session_path),
-            "working durable row must become a title candidate"
+                .all(|c| c.session_path != carried.session_path),
+            "working durable agent-transcript row must NEVER become a title \
+             candidate under the honor law — the path names a codex rollout, \
+             so the row is an agent row however its kind was lost"
         );
         let _ = std::fs::remove_file(&jsonl);
     }

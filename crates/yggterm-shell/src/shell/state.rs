@@ -37120,7 +37120,12 @@ fn spawn_title_generation_for_target(
                     restore_browser_tree(shell, browser_tree, Some(&target.session_path));
                 }
                 remember_session_title_override(shell, &target.session_path, &title);
-                shell.server.set_session_title_hint(&target.session_path, &title);
+                // THE HONOR LAW (owner, 2026-09-10): an owner-INVOKED
+                // generation is owner authorship — it lands through the
+                // explicit door so the CLI-title follow can never overwrite
+                // it. A hint would let the very next follow tick replace the
+                // title the owner just asked for.
+                shell.server.set_session_title_explicit(&target.session_path, &title);
                 let should_persist_live_hint = shell
                     .server
                     .live_sessions()
