@@ -6284,6 +6284,7 @@ impl YggtermServer {
             .clone()
             .unwrap_or_else(preferred_remote_binary_fallback);
         let fragments = local_resume_match_fragments(session);
+        let extra_exports = remote_agent_start_exports(session.kind, &AgentLaunchOptions::default());
         Some(remote_direct_attach_launch_command(
             &machine.ssh_target,
             machine.prefix.as_deref(),
@@ -6291,6 +6292,7 @@ impl YggtermServer {
             &remote_binary,
             cwd,
             &fragments,
+            &extra_exports,
         ))
     }
 
@@ -11388,6 +11390,7 @@ impl YggtermServer {
         cwd: Option<&str>,
         require_existing: bool,
         terminal_appearance: Option<&str>,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         self.ensure_remote_runtime_agent_session(
             SessionKind::Codex,
@@ -11395,7 +11398,7 @@ impl YggtermServer {
             cwd,
             require_existing,
             terminal_appearance,
-            None,
+            configured_extra_args,
         )
     }
 
@@ -11943,6 +11946,7 @@ impl YggtermServer {
         session_id: &str,
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
+        configured_extra_args: Option<&str>,
     ) -> anyhow::Result<String> {
         self.start_remote_runtime_agent_session(
             SessionKind::Codex,
@@ -11950,7 +11954,7 @@ impl YggtermServer {
             cwd,
             terminal_appearance,
             &AgentLaunchOptions::default(),
-            None,
+            configured_extra_args,
         )
     }
 
@@ -16454,6 +16458,7 @@ fn remote_direct_attach_launch_command(
     remote_binary_expr: &str,
     cwd: &str,
     _expected_fragments: &[String],
+    extra_exports: &[String],
 ) -> String {
     let mut helper_command = String::from(remote_binary_expr);
     for arg in [
@@ -16467,7 +16472,9 @@ fn remote_direct_attach_launch_command(
         helper_command.push(' ');
         helper_command.push_str(&shell_single_quote(arg));
     }
-    let env_exports = terminal_identity_shell_exports_for_remote().join(" && ");
+    let mut env_exports = terminal_identity_shell_exports_for_remote();
+    env_exports.extend(extra_exports.iter().cloned());
+    let env_exports = env_exports.join(" && ");
     let inner = if env_exports.is_empty() {
         format!("exec {helper_command}")
     } else {
@@ -17901,7 +17908,8 @@ fn configure_remote_resume_live_session(
     session.remote_deploy_state = remote_deploy_state;
     session.ssh_target = Some(target.ssh_target.clone());
     session.ssh_prefix = target.prefix.clone();
-    session.launch_command = remote_ssh_launch_command(
+    let extra_exports = remote_agent_start_exports(session.kind, &AgentLaunchOptions::default());
+    session.launch_command = remote_ssh_launch_command_with_extra_exports(
         &target.ssh_target,
         target.prefix.as_deref(),
         remote_binary,
@@ -17913,6 +17921,7 @@ fn configure_remote_resume_live_session(
             launch_cwd.unwrap_or(""),
             "--require-existing",
         ],
+        &extra_exports,
     );
     session.terminal_lines = vec![
         format!("$ {}", session.launch_command),
@@ -18001,7 +18010,8 @@ fn configure_remote_new_codex_live_session(
     session.remote_deploy_state = remote_deploy_state;
     session.ssh_target = Some(target.ssh_target.clone());
     session.ssh_prefix = target.prefix.clone();
-    session.launch_command = remote_ssh_launch_command(
+    let extra_exports = remote_agent_start_exports(SessionKind::Codex, &AgentLaunchOptions::default());
+    session.launch_command = remote_ssh_launch_command_with_extra_exports(
         &target.ssh_target,
         target.prefix.as_deref(),
         remote_binary,
@@ -18012,6 +18022,7 @@ fn configure_remote_new_codex_live_session(
             session_id,
             launch_cwd.unwrap_or(""),
         ],
+        &extra_exports,
     );
     session.terminal_lines = vec![
         format!("$ {}", session.launch_command),
@@ -22223,6 +22234,7 @@ pub fn run_remote_resume_codex(
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+    let configured_extra_args = forwarded_configured_extra_args();
     let key = daemon_ensure_remote_runtime_codex_session(
         &endpoint,
         session_id,
@@ -22230,6 +22242,7 @@ pub fn run_remote_resume_codex(
         require_existing,
         initial_size,
         Some(&terminal_appearance),
+        configured_extra_args.as_deref(),
     )?;
     finish_span(serde_json::json!({
         "session_id": session_id,
@@ -22380,12 +22393,14 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+    let configured_extra_args = forwarded_configured_extra_args();
     let key = daemon::start_remote_runtime_codex_session(
         &endpoint,
         session_id,
         cwd,
         initial_size,
         Some(&terminal_appearance),
+        configured_extra_args.as_deref(),
     )?;
     finish_span(serde_json::json!({
         "session_id": session_id,
@@ -43258,6 +43273,7 @@ mod tests {
             "$HOME/.yggterm/bin/yggterm",
             "/srv/app",
             &["recent meaningful transcript fragment".to_string()],
+            &[],
         );
         assert!(command.starts_with("__yggterm_initial_tty_size="));
         assert!(
