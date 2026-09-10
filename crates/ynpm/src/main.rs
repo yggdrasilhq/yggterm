@@ -57,6 +57,7 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ===== platform =====
@@ -278,6 +279,11 @@ pub struct Package {
     /// Compatibility/channel label. Old states have no label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    /// Source locator retained for non-registry ynpx/ynpm requests and audit
+    /// readback. Credentials are never stored here; authenticated transports
+    /// use the user's external credential helpers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// The package's host-integration declaration, normalized from
     /// `package.json.yggterm`. Keeping it in state lets fleet archive import
     /// reproduce menus without re-fetching package metadata.
@@ -428,6 +434,67 @@ impl Paths {
         fs::write(&path, serde_json::to_string_pretty(state)?)
             .with_context(|| format!("writing {}", path.display()))
     }
+}
+
+/// One correlation id per ynpm/ynpx process. Every distribution stage writes
+/// to yggterm's normal `event-trace.jsonl`, so a failed update can be replayed
+/// from durable records without trusting the last human-facing line.
+static YNPM_TRACE_RUN_ID: OnceLock<String> = OnceLock::new();
+
+fn ynpm_trace_run_id() -> &'static str {
+    YNPM_TRACE_RUN_ID
+        .get_or_init(|| format!("ynpm-{}-{}", std::process::id(), now_ms()))
+}
+
+fn ynpm_trace_home(paths: &Paths) -> PathBuf {
+    yggterm_core::resolve_yggterm_home()
+        .unwrap_or_else(|_| paths.home.join(".yggterm"))
+}
+
+fn trace_safe_text(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
+        .split_whitespace()
+        .map(|token| {
+            token
+                .split_once('?')
+                .map(|(prefix, _)| format!("{prefix}?<redacted>"))
+                .unwrap_or_else(|| token.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(500)
+        .collect()
+}
+
+fn trace_safe_detail(error: &anyhow::Error) -> String {
+    trace_safe_text(&error.to_string())
+}
+
+fn ynpm_trace(paths: &Paths, event: &str, fields: serde_json::Value) {
+    let mut object = match fields {
+        serde_json::Value::Object(object) => object,
+        value => serde_json::Map::from_iter([(String::from("value"), value)]),
+    };
+    object.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(ynpm_trace_run_id().to_string()),
+    );
+    object.insert(
+        "manager_version".to_string(),
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+    );
+    object.insert(
+        "pid".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(std::process::id())),
+    );
+    yggterm_core::append_trace_event(
+        &ynpm_trace_home(paths),
+        "ynpm",
+        "distribution",
+        event,
+        serde_json::Value::Object(object),
+    );
 }
 
 /// Convert a canonical package identity to a filesystem-safe state/generation
@@ -650,7 +717,14 @@ pub fn parse_manifest(doc: &serde_json::Value) -> anyhow::Result<Manifest> {
             .and_then(|dist| dist.get("shasum"))
             .and_then(|value| value.as_str())
             .map(str::to_string),
-        integration: integration_value.and_then(|value| serde_json::from_value(value.clone()).ok()),
+        integration: integration_value
+            .map(|value| -> anyhow::Result<yggterm_core::YggtermPackageMetadata> {
+                let metadata: yggterm_core::YggtermPackageMetadata =
+                    serde_json::from_value(value.clone())?;
+                metadata.validate()?;
+                Ok(metadata)
+            })
+            .transpose()?,
         optional_dependencies,
     })
 }
@@ -687,9 +761,16 @@ pub fn parse_bin_table(doc: &serde_json::Value) -> anyhow::Result<BTreeMap<Strin
     Ok(out)
 }
 
-fn package_integration(doc: &serde_json::Value) -> Option<yggterm_core::YggtermPackageMetadata> {
-    doc.get("yggterm")
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+fn package_integration(
+    doc: &serde_json::Value,
+) -> anyhow::Result<Option<yggterm_core::YggtermPackageMetadata>> {
+    let Some(value) = doc.get("yggterm") else {
+        return Ok(None);
+    };
+    let metadata: yggterm_core::YggtermPackageMetadata =
+        serde_json::from_value(value.clone()).context("parsing package.json.yggterm metadata")?;
+    metadata.validate()?;
+    Ok(Some(metadata))
 }
 
 fn metadata_bin_name(value: &str) -> &str {
@@ -702,7 +783,11 @@ fn app_manifest_from_metadata(
     destination: &Path,
     bins: &BTreeMap<String, String>,
 ) -> anyhow::Result<Option<yggterm_core::AppManifest>> {
-    let Some(app) = integration.and_then(|integration| integration.app.as_ref()) else {
+    let Some(integration) = integration else {
+        return Ok(None);
+    };
+    integration.validate()?;
+    let Some(app) = integration.app.as_ref() else {
         return Ok(None);
     };
     if app.verbs.is_empty() {
@@ -788,9 +873,24 @@ fn sync_app_registration(
     if previous_name.as_deref() != current_name.as_deref()
         && let Some(name) = previous_name
     {
+        ynpm_trace(
+            paths,
+            "app_registration.remove",
+            serde_json::json!({ "package": package, "app": name }),
+        );
         remove_app_registration(paths, &name)?;
     }
     if let Some(manifest) = current {
+        ynpm_trace(
+            paths,
+            "app_registration.write",
+            serde_json::json!({
+                "package": package,
+                "app": &manifest.name,
+                "binary": &manifest.binary,
+                "context_menu": &manifest.context_menu,
+            }),
+        );
         yggterm_core::write_app_manifest(&paths.home, &manifest)
             .with_context(|| format!("registering {} with yggterm", manifest.name))?;
         println!(
@@ -821,6 +921,256 @@ fn curl(url: &str) -> anyhow::Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+#[derive(Debug, Clone)]
+struct TarballSource {
+    url: String,
+    sha256: Option<String>,
+}
+
+fn parse_sha256(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .next()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn parse_tarball_source(spec: &str) -> anyhow::Result<TarballSource> {
+    let raw = spec
+        .strip_prefix("tarball:")
+        .context("tarball source wants tarball:URL")?;
+    let (url, fragment) = raw.split_once('#').map_or((raw, None), |(url, fragment)| {
+        (url, Some(fragment))
+    });
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        bail!("tarball source must use http:// or https://");
+    }
+    let sha256 = match fragment {
+        None => None,
+        Some(value) => Some(
+            value
+                .strip_prefix("sha256=")
+                .and_then(parse_sha256)
+                .context("tarball checksum fragment wants sha256=<64 hex digits>")?,
+        ),
+    };
+    Ok(TarballSource {
+        url: url.to_string(),
+        sha256,
+    })
+}
+
+fn source_cache_key(url: &str) -> String {
+    Sha256::digest(url.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn fetch_verified_tarball(paths: &Paths, spec: &str) -> anyhow::Result<(PathBuf, TarballSource)> {
+    let source = parse_tarball_source(spec)?;
+    ynpm_trace(
+        paths,
+        "source.resolve",
+        serde_json::json!({ "source": "tarball", "url": trace_safe_text(&source.url) }),
+    );
+    let root = paths.scratch().join("sources");
+    fs::create_dir_all(&root)?;
+    let archive = root.join(format!("{}.tgz", source_cache_key(&source.url)));
+    fs::write(&archive, curl(&source.url)?)?;
+    let expected = match source.sha256.clone() {
+        Some(expected) => expected,
+        None => curl(&format!("{}.sha256", source.url))
+            .ok()
+            .and_then(|body| parse_sha256(&String::from_utf8_lossy(&body)))
+            .context("tarball has no sha256 fragment and no readable .sha256 sidecar")?,
+    };
+    let actual = sha256_file(&archive)?;
+    if actual != expected {
+        bail!(
+            "tarball checksum mismatch: expected {}, got {}",
+            expected,
+            actual
+        );
+    }
+    ynpm_trace(
+        paths,
+        "source.fetch.complete",
+        serde_json::json!({
+            "source": "tarball",
+            "url": trace_safe_text(&source.url),
+            "sha256": actual,
+            "archive": archive.display().to_string(),
+        }),
+    );
+    Ok((archive, source))
+}
+
+fn archive_package_root(extracted: &Path) -> anyhow::Result<PathBuf> {
+    let npm_root = extracted.join("package");
+    if npm_root.join("package.json").is_file() {
+        return Ok(npm_root);
+    }
+    if extracted.join("package.json").is_file() {
+        return Ok(extracted.to_path_buf());
+    }
+    bail!(
+        "release archive has no package.json at its root or package/ root; an integrated app archive must carry package metadata"
+    )
+}
+
+fn install_prebuilt_tarball(
+    paths: &Paths,
+    spec: &str,
+    quiet: bool,
+    destination: Option<&Path>,
+) -> anyhow::Result<InstallOutcome> {
+    let (archive, source) = fetch_verified_tarball(paths, spec)?;
+    let extracted = paths
+        .scratch()
+        .join(format!("tarball-{}-{}", source_cache_key(&source.url), std::process::id()));
+    let _ = fs::remove_dir_all(&extracted);
+    extract_tarball(&archive, &extracted)?;
+    let package_dir = archive_package_root(&extracted)?;
+    let package_doc: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(package_dir.join("package.json"))
+            .context("reading release package.json")?,
+    )
+    .context("parsing release package.json")?;
+    let package = package_doc
+        .get("name")
+        .and_then(|value| value.as_str())
+        .context("release package.json has no name")?
+        .to_string();
+    let version = package_doc
+        .get("version")
+        .and_then(|value| value.as_str())
+        .context("release package.json has no version")?
+        .to_string();
+    let bins = parse_bin_table(&package_doc)?;
+    let integration = package_integration(&package_doc)?;
+    let destination = destination
+        .map(absolute_path)
+        .unwrap_or_else(|| paths.dest());
+    let key = package_storage_key(&package);
+    let staging = paths
+        .generations()
+        .join(format!(".tarball-{}-{}", key, std::process::id()));
+    let generation = paths.generation_dir(&key, &version);
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(staging.join("bin"))?;
+    for (bin, rel) in &bins {
+        let source_bin = package_dir.join(rel);
+        if !source_bin.is_file() {
+            bail!(
+                "release package {package}@{version} declares bin {bin} at {rel}, but it is absent"
+            );
+        }
+        let target = staging.join("bin").join(bin);
+        fs::copy(&source_bin, &target)?;
+        set_executable(&target)?;
+        let answer = run_version(&target)?;
+        if !version_answer_matches_identity(&answer, &version) {
+            bail!(
+                "REFUSED: release package {package}@{version} bin {bin} answered {:?}",
+                answer.trim()
+            );
+        }
+    }
+    fs::create_dir_all(&generation)?;
+    for bin in bins.keys() {
+        let incoming = staging.join("bin").join(bin);
+        let target = generation.join("bin").join(bin);
+        fs::create_dir_all(target.parent().context("generation bin has no parent")?)?;
+        if target.exists() {
+            if sha256_file(&incoming)? == sha256_file(&target)? {
+                fs::remove_file(&incoming)?;
+            } else {
+                fs::rename(&incoming, &target)?;
+            }
+        } else {
+            fs::rename(&incoming, &target)?;
+        }
+    }
+    let app_manifest = app_manifest_from_metadata(&package, integration.as_ref(), &destination, &bins)?;
+    let mut state = paths.load_state()?;
+    let previous = state.packages.get(&key).map(|entry| entry.current.clone());
+    let previous_integration = state
+        .packages
+        .get(&key)
+        .and_then(|entry| entry.integration.clone());
+    let external_prev = state
+        .packages
+        .get(&key)
+        .and_then(|entry| entry.external_prev.clone())
+        .or_else(|| {
+            bins.keys()
+                .next()
+                .and_then(|bin| destination.join(bin).exists().then(|| destination.join(bin)))
+                .and_then(|path| run_version(&path).ok())
+                .and_then(|answer| version_from_answer(&answer))
+        });
+    let entry = state.packages.entry(key.clone()).or_insert(Package {
+        package_name: Some(package.clone()),
+        current: version.clone(),
+        versions: Vec::new(),
+        bins: BTreeMap::new(),
+        external_prev: external_prev.clone(),
+        destination: Some(destination.display().to_string()),
+        dev: None,
+        dev_generation: None,
+        channel: Some("tarball".to_string()),
+        source: Some(format!("tarball:{}", source.url)),
+        integration: integration.clone(),
+    });
+    if entry.versions.last() != Some(&version) {
+        entry.versions.push(version.clone());
+    }
+    entry.package_name = Some(package.clone());
+    entry.current = version.clone();
+    entry.bins = bins
+        .iter()
+        .map(|(name, _rel)| (name.clone(), format!("bin/{name}")))
+        .collect();
+    entry.destination = Some(destination.display().to_string());
+    entry.dev = None;
+    entry.dev_generation = None;
+    entry.channel = Some("tarball".to_string());
+    entry.source = Some(format!("tarball:{}", source.url));
+    entry.integration = integration.clone();
+    fs::create_dir_all(&destination)?;
+    for bin in bins.keys() {
+        publish_link(&generation.join("bin").join(bin), &destination.join(bin))?;
+    }
+    paths.save_state(&state)?;
+    sync_app_registration(paths, &package, previous_integration.as_ref(), app_manifest)?;
+    let _ = fs::remove_dir_all(&staging);
+    let outcome = InstallOutcome {
+        name: package,
+        version,
+        previous,
+        bins: bins.keys().cloned().collect(),
+    };
+    ynpm_trace(
+        paths,
+        "generation.publish.complete",
+        serde_json::json!({
+            "package": &outcome.name,
+            "version": &outcome.version,
+            "source": "tarball",
+            "destination": destination.display().to_string(),
+        }),
+    );
+    if !quiet {
+        println!(
+            "ynpm: {}@{} -> {}",
+            outcome.name,
+            outcome.version,
+            destination.display()
+        );
+    }
+    Ok(outcome)
 }
 
 fn fetch_manifest(pkg: &str, pin: Option<&str>) -> anyhow::Result<Manifest> {
@@ -1359,6 +1709,11 @@ fn activate_yggterm_dev(paths: &Paths) -> anyhow::Result<()> {
 }
 
 fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport> {
+    ynpm_trace(
+        paths,
+        "yggterm.update.begin",
+        serde_json::json!({ "source": "github-release" }),
+    );
     let context = match yggterm_install_context(paths) {
         Ok(context) => context,
         Err(error) => {
@@ -1371,6 +1726,16 @@ fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport>
             });
         }
     };
+    ynpm_trace(
+        paths,
+        "yggterm.update.context",
+        serde_json::json!({
+            "current_version": &context.current_version,
+            "repo": &context.repo,
+            "asset": &context.asset_label,
+            "dev": yggterm_dev_fingerprint(paths).is_some(),
+        }),
+    );
     repair_yggterm_install_state(paths, &context)?;
     let current_version = context.current_version.clone();
     let dev_fingerprint = yggterm_dev_fingerprint(paths);
@@ -1380,6 +1745,11 @@ fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport>
         yggterm_core::check_for_update(&context)?
     };
     let Some(update) = update else {
+        ynpm_trace(
+            paths,
+            "yggterm.update.current",
+            serde_json::json!({ "version": current_version }),
+        );
         return Ok(YggtermUpdateReport {
             status: "current".to_string(),
             current_version,
@@ -1409,6 +1779,15 @@ fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport>
     let Some(executable) =
         install_yggterm_release(paths, &context, &update, dev_fingerprint.as_deref())?
     else {
+        ynpm_trace(
+            paths,
+            "yggterm.update.dev_preserved",
+            serde_json::json!({
+                "current_version": current_version,
+                "production_version": update.version,
+                "reason": "same_fingerprint",
+            }),
+        );
         return Ok(YggtermUpdateReport {
             status: "current".to_string(),
             current_version,
@@ -1421,6 +1800,11 @@ fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport>
         });
     };
     clear_yggterm_dev_state(paths)?;
+    ynpm_trace(
+        paths,
+        "yggterm.update.complete",
+        serde_json::json!({ "version": &update.version, "executable": executable.display().to_string() }),
+    );
     Ok(YggtermUpdateReport {
         status: "updated".to_string(),
         current_version,
@@ -1449,6 +1833,16 @@ fn verb_self_update(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         },
         Err(error) => return Err(error),
     };
+    ynpm_trace(
+        paths,
+        "yggterm.update.result",
+        serde_json::json!({
+            "status": &report.status,
+            "current_version": &report.current_version,
+            "version": &report.version,
+            "detail": trace_safe_text(&report.detail),
+        }),
+    );
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -1494,6 +1888,48 @@ fn install_one_at(
     quiet: bool,
     destination: Option<&Path>,
 ) -> anyhow::Result<InstallOutcome> {
+    let package = expand_package(spec).ok().map(|(package, _)| package);
+    ynpm_trace(
+        paths,
+        "package.install.begin",
+        serde_json::json!({
+            "package": package,
+            "request": trace_safe_text(spec),
+            "destination": destination.map(|path| path.display().to_string()),
+        }),
+    );
+    let result = install_one_at_impl(paths, spec, quiet, destination);
+    match &result {
+        Ok(outcome) => ynpm_trace(
+            paths,
+            "package.install.complete",
+            serde_json::json!({
+                "package": &outcome.name,
+                "version": &outcome.version,
+                "bins": &outcome.bins,
+            }),
+        ),
+        Err(error) => ynpm_trace(
+            paths,
+            "package.install.error",
+            serde_json::json!({
+                "package": package,
+                "error": trace_safe_detail(error),
+            }),
+        ),
+    }
+    result
+}
+
+fn install_one_at_impl(
+    paths: &Paths,
+    spec: &str,
+    quiet: bool,
+    destination: Option<&Path>,
+) -> anyhow::Result<InstallOutcome> {
+    if spec.starts_with("tarball:") {
+        return install_prebuilt_tarball(paths, spec, quiet, destination);
+    }
     let (pkg, pin) = expand_package(spec)?;
     if !pkg.starts_with("@ygghq/") {
         return install_npm_package(paths, &pkg, pin.as_deref(), quiet, destination);
@@ -1569,10 +2005,21 @@ fn install_one_at(
     )
     .context("parsing the platform package's package.json")?;
     let bins = parse_bin_table(&platform_doc)?;
-    let integration = manifest
-        .integration
-        .clone()
-        .or_else(|| package_integration(&platform_doc));
+    let integration = match manifest.integration.clone() {
+        Some(integration) => Some(integration),
+        None => package_integration(&platform_doc)?,
+    };
+    ynpm_trace(
+        paths,
+        "package.metadata",
+        serde_json::json!({
+            "package": pkg,
+            "version": version,
+            "source": "npm-native",
+            "has_app": integration.as_ref().and_then(|meta| meta.app.as_ref()).is_some(),
+            "schema": integration.as_ref().map(|meta| meta.schema),
+        }),
+    );
 
     // THE TRUTH CHECK (the 0.2.0 lesson): every binary must name the version
     // the package ships, BEFORE anything on this host changes. The main
@@ -1602,6 +2049,16 @@ fn install_one_at(
         }
         answers.insert(bin.clone(), answer);
     }
+    ynpm_trace(
+        paths,
+        "package.verify.complete",
+        serde_json::json!({
+            "package": pkg,
+            "version": version,
+            "source": "npm-native",
+            "bins": bins.keys().collect::<Vec<_>>(),
+        }),
+    );
 
     // Generation first: the bytes of this version, kept for rollback.
     let generation = paths.generation_dir(&name, &version);
@@ -1644,6 +2101,7 @@ fn install_one_at(
                 package.dev = None;
                 package.dev_generation = None;
                 package.channel = Some("npm".to_string());
+                package.source = Some(format!("npm:{pkg}"));
                 package.integration = integration.clone();
                 (previous, package.external_prev.clone())
             }
@@ -1670,6 +2128,7 @@ fn install_one_at(
                     dev: None,
                     dev_generation: None,
                     channel: Some("npm".to_string()),
+                    source: Some(format!("npm:{pkg}")),
                     integration: integration.clone(),
                 });
                 (None, external_prev)
@@ -1687,6 +2146,16 @@ fn install_one_at(
     }
     paths.save_state(&state)?;
     sync_app_registration(paths, &pkg, previous_integration.as_ref(), app_manifest)?;
+    ynpm_trace(
+        paths,
+        "generation.publish.complete",
+        serde_json::json!({
+            "package": pkg,
+            "version": version,
+            "source": "npm-native",
+            "destination": dest.display().to_string(),
+        }),
+    );
 
     if !quiet {
         for (bin, answer) in &answers {
@@ -1773,7 +2242,17 @@ fn install_npm_package(
     fs::create_dir_all(&scratch)
         .with_context(|| format!("creating npm staging {}", scratch.display()))?;
     let result = (|| -> anyhow::Result<InstallOutcome> {
+        ynpm_trace(
+            paths,
+            "source.fetch.begin",
+            serde_json::json!({ "source": "npm", "package": package, "version": version }),
+        );
         run_npm_install_package(&npm, paths, &scratch, package, &version)?;
+        ynpm_trace(
+            paths,
+            "source.fetch.complete",
+            serde_json::json!({ "source": "npm", "package": package, "version": version }),
+        );
         let package_dir = npm_package_dir(&scratch, package);
         let manifest_path = package_dir.join("package.json");
         let package_doc: serde_json::Value = serde_json::from_str(
@@ -1782,8 +2261,17 @@ fn install_npm_package(
         )
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
         let bins = parse_bin_table(&package_doc)?;
-        let integration =
-            package_integration(&package_doc).or_else(|| manifest.integration.clone());
+        let integration = package_integration(&package_doc)?.or_else(|| manifest.integration.clone());
+        ynpm_trace(
+            paths,
+            "package.metadata",
+            serde_json::json!({
+                "package": package,
+                "version": version,
+                "has_app": integration.as_ref().and_then(|meta| meta.app.as_ref()).is_some(),
+                "schema": integration.as_ref().map(|meta| meta.schema),
+            }),
+        );
         let app_manifest = app_manifest_from_metadata(package, integration.as_ref(), &dest, &bins)?;
         for (bin, rel) in &bins {
             let candidate = scratch.join("bin").join(bin);
@@ -1799,6 +2287,11 @@ fn install_npm_package(
                 bail!("npm package {package}@{version} bin '{bin}' answered no version");
             }
         }
+        ynpm_trace(
+            paths,
+            "package.verify.complete",
+            serde_json::json!({ "package": package, "version": version, "bins": bins.keys().collect::<Vec<_>>() }),
+        );
 
         let generation = paths.generation_dir(&key, &version);
         if generation.exists() {
@@ -1850,6 +2343,7 @@ fn install_npm_package(
             dev: None,
             dev_generation: None,
             channel: Some("npm".to_string()),
+            source: Some(format!("npm:{package}")),
             integration: integration.clone(),
         });
         if package_state.versions.last() != Some(&version) {
@@ -1865,6 +2359,7 @@ fn install_npm_package(
         package_state.dev = None;
         package_state.dev_generation = None;
         package_state.channel = Some("npm".to_string());
+        package_state.source = Some(format!("npm:{package}"));
         package_state.integration = integration.clone();
 
         fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -1873,6 +2368,16 @@ fn install_npm_package(
         }
         paths.save_state(&state)?;
         sync_app_registration(paths, package, previous_integration.as_ref(), app_manifest)?;
+        ynpm_trace(
+            paths,
+            "generation.publish.complete",
+            serde_json::json!({
+                "package": package,
+                "version": version,
+                "source": "npm",
+                "destination": dest.display().to_string(),
+            }),
+        );
         if !quiet {
             println!("ynpm: {package}@{version} -> {}", dest.display());
             for bin in bins.keys() {
@@ -2161,6 +2666,16 @@ fn install_dev_bins(
     } else {
         format!("@ygghq/{package}")
     };
+    ynpm_trace(
+        paths,
+        "dev.publish.begin",
+        serde_json::json!({
+            "package": &package,
+            "bin_count": bins.len(),
+            "destination": destination.map(|path| path.display().to_string()),
+            "watch": &watch,
+        }),
+    );
     let mut answers = BTreeMap::new();
     for (name, path) in bins {
         if !path.is_file() {
@@ -2178,6 +2693,15 @@ fn install_dev_bins(
         }
         answers.insert(name.clone(), answer);
     }
+    ynpm_trace(
+        paths,
+        "dev.verify.complete",
+        serde_json::json!({
+            "package": &package,
+            "bins": bins.keys().collect::<Vec<_>>(),
+            "expected_version": expected_version,
+        }),
+    );
 
     let destination = destination
         .map(absolute_path)
@@ -2225,6 +2749,7 @@ fn install_dev_bins(
         bin_table.insert(name.clone(), format!("bin/{name}"));
     }
     let dev_fingerprint = bins.values().next().and_then(|path| file_fingerprint(path));
+    let trace_watch = watch.clone();
     let marker = DevMarker {
         built_at_ms: now_ms(),
         commit,
@@ -2250,6 +2775,7 @@ fn install_dev_bins(
         dev: None,
         dev_generation: None,
         channel: Some("dev".to_string()),
+        source: Some(format!("dev:{package}")),
         integration: None,
     });
     package_state.package_name = Some(package.clone());
@@ -2258,13 +2784,25 @@ fn install_dev_bins(
     package_state.dev = Some(marker.clone());
     package_state.dev_generation = Some(generation_name);
     package_state.channel = Some("dev".to_string());
+    package_state.source = Some(format!("dev:{package}"));
     package_state.integration = integration.clone();
     fs::create_dir_all(&destination)?;
     for name in bins.keys() {
         publish_link(&generation.join("bin").join(name), &destination.join(name))?;
     }
+    let published_generation = package_state.dev_generation.clone();
     paths.save_state(&state)?;
     sync_app_registration(paths, &package, previous_integration.as_ref(), app_manifest)?;
+    ynpm_trace(
+        paths,
+        "dev.publish.complete",
+        serde_json::json!({
+            "package": &package,
+            "generation": published_generation,
+            "destination": destination.display().to_string(),
+            "watch": trace_watch,
+        }),
+    );
     if !quiet {
         println!("ynpm: {package} dev -> {}", destination.display());
         for (name, answer) in answers {
@@ -2283,10 +2821,16 @@ fn install_dev_bins(
     })
 }
 
-fn package_json(checkout: &Path) -> Option<serde_json::Value> {
-    fs::read_to_string(checkout.join("package.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+fn package_json(checkout: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let path = checkout.join("package.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("reading package metadata {}", path.display()))?;
+    let value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing package metadata {}", path.display()))?;
+    Ok(Some(value))
 }
 
 fn dev_checkout(
@@ -2298,7 +2842,55 @@ fn dev_checkout(
     destination: Option<PathBuf>,
     hosts: &[String],
 ) -> anyhow::Result<DevInstall> {
-    let package_doc = package_json(checkout);
+    ynpm_trace(
+        paths,
+        "dev.checkout.begin",
+        serde_json::json!({
+            "checkout": checkout.display().to_string(),
+            "fleet_host_count": hosts.len(),
+        }),
+    );
+    let result = dev_checkout_impl(
+        paths,
+        checkout,
+        build_override,
+        watch_override,
+        bin_overrides,
+        destination,
+        hosts,
+    );
+    match &result {
+        Ok(outcome) => ynpm_trace(
+            paths,
+            "dev.checkout.complete",
+            serde_json::json!({
+                "package": &outcome.package,
+                "bins": &outcome.bins,
+                "fleet_host_count": hosts.len(),
+            }),
+        ),
+        Err(error) => ynpm_trace(
+            paths,
+            "dev.checkout.error",
+            serde_json::json!({
+                "checkout": checkout.display().to_string(),
+                "error": trace_safe_detail(error),
+            }),
+        ),
+    }
+    result
+}
+
+fn dev_checkout_impl(
+    paths: &Paths,
+    checkout: &Path,
+    build_override: Option<String>,
+    watch_override: Option<String>,
+    bin_overrides: BTreeMap<String, PathBuf>,
+    destination: Option<PathBuf>,
+    hosts: &[String],
+) -> anyhow::Result<DevInstall> {
+    let package_doc = package_json(checkout)?;
     let package = package_doc
         .as_ref()
         .and_then(|doc| doc.get("name"))
@@ -2445,7 +3037,10 @@ fn dev_checkout(
             .and_then(|value| value.as_str())
             .map(str::to_string)
     });
-    let integration = package_doc.as_ref().and_then(package_integration);
+    let integration = match package_doc.as_ref() {
+        Some(document) => package_integration(document)?,
+        None => None,
+    };
     let yggterm_destination = is_yggterm_checkout.then(|| paths.root().join("bin"));
     let outcome = install_dev_bins(
         paths,
@@ -2735,6 +3330,16 @@ fn verb_list(paths: &Paths) -> anyhow::Result<()> {
             },
             app.binary
         );
+        ynpm_trace(
+            paths,
+            "inventory.app",
+            serde_json::json!({
+                "package": package,
+                "app": &app.name,
+                "version": version,
+                "context_menu": &app.context_menu,
+            }),
+        );
         named.insert(package);
     }
     for (key, package) in &state.packages {
@@ -2754,9 +3359,10 @@ fn verb_list(paths: &Paths) -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>();
         println!(
-            "pkg {:<15} version={} source=ynpm bins={} path={}",
+            "pkg {:<15} version={} source=ynpm locator={} bins={} path={}",
             identity,
             package.current,
+            package.source.as_deref().unwrap_or("unknown"),
             versions.join(","),
             destination.display()
         );
@@ -2968,6 +3574,11 @@ fn verb_doctor(paths: &Paths) -> anyhow::Result<()> {
 }
 
 fn sync_integrated(paths: &Paths) -> anyhow::Result<()> {
+    ynpm_trace(
+        paths,
+        "sync.integrated.begin",
+        serde_json::json!({ "scope": "AGENT_CLIS" }),
+    );
     let destination = paths.root().join("bin");
     fs::create_dir_all(&destination)?;
     let mut failures = Vec::new();
@@ -3064,12 +3675,24 @@ fn sync_integrated(paths: &Paths) -> anyhow::Result<()> {
         let tag = yggterm_core::agent_cli::npm_dist_tag(descriptor.kind).unwrap_or("latest");
         let spec = format!("{package}@{tag}");
         match install_one_at(paths, &spec, true, Some(&destination)) {
-            Ok(outcome) => println!(
-                "ynpm: integrated {} -> {} ({})",
-                descriptor.slug,
-                outcome.version,
-                destination.display()
-            ),
+            Ok(outcome) => {
+                ynpm_trace(
+                    paths,
+                    "sync.integrated.package",
+                    serde_json::json!({
+                        "cli": descriptor.slug,
+                        "package": package,
+                        "version": &outcome.version,
+                        "result": "updated",
+                    }),
+                );
+                println!(
+                    "ynpm: integrated {} -> {} ({})",
+                    descriptor.slug,
+                    outcome.version,
+                    destination.display()
+                )
+            }
             Err(error)
                 if is_network_failure(&error)
                     && package_is_healthy_at(paths, package, &destination) =>
@@ -3079,7 +3702,18 @@ fn sync_integrated(paths: &Paths) -> anyhow::Result<()> {
                     descriptor.slug
                 );
             }
-            Err(error) => failures.push(format!("{}: {error:#}", descriptor.slug)),
+            Err(error) => {
+                ynpm_trace(
+                    paths,
+                    "sync.integrated.package.error",
+                    serde_json::json!({
+                        "cli": descriptor.slug,
+                        "package": package,
+                        "error": trace_safe_detail(&error),
+                    }),
+                );
+                failures.push(format!("{}: {error:#}", descriptor.slug))
+            }
         }
     }
     println!(
@@ -3087,8 +3721,22 @@ fn sync_integrated(paths: &Paths) -> anyhow::Result<()> {
         failures.len()
     );
     if failures.is_empty() {
+        ynpm_trace(
+            paths,
+            "sync.integrated.complete",
+            serde_json::json!({ "attempted": attempted, "failures": 0 }),
+        );
         Ok(())
     } else {
+        ynpm_trace(
+            paths,
+            "sync.integrated.error",
+            serde_json::json!({
+                "attempted": attempted,
+                "failures": failures.len(),
+                "detail": failures.join("; "),
+            }),
+        );
         bail!("integrated sync failed: {}", failures.join("; "))
     }
 }
@@ -3342,6 +3990,7 @@ fn import_generation(
         dev: None,
         dev_generation: None,
         channel: Some("npm".to_string()),
+        source: Some(format!("peer:{package}")),
         integration: None,
     });
     if entry.versions.last() != Some(&version.to_string()) {
@@ -3357,6 +4006,7 @@ fn import_generation(
     entry.dev = None;
     entry.dev_generation = None;
     entry.channel = Some("npm".to_string());
+    entry.source = Some(format!("peer:{package}"));
     entry.integration = integration.clone();
     fs::create_dir_all(&destination)?;
     for bin in bins {
@@ -3708,6 +4358,11 @@ fn yggterm_aux_source_candidates(
 
 fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     let version = args.first().context("import-yggterm wants a version")?;
+    ynpm_trace(
+        paths,
+        "fleet.import_yggterm.begin",
+        serde_json::json!({ "version": version }),
+    );
     let mut archive = None;
     let mut asset_label = None;
     let mut repo = "yggdrasilhq/yggterm".to_string();
@@ -3753,6 +4408,11 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     let yggterm = staging.join(format!("yggterm{extension}"));
     let fingerprint = sha256_file(&yggterm)?;
     if !yggterm_dev_allows_production(paths, version, &fingerprint) {
+        ynpm_trace(
+            paths,
+            "fleet.import_yggterm.dev_preserved",
+            serde_json::json!({ "version": version, "reason": "remote_dev_is_newer_or_same" }),
+        );
         println!("ynpm: retained the remote yggterm dev build; production {version} is not ahead");
         let _ = fs::remove_dir_all(&staging);
         return Ok(());
@@ -3819,6 +4479,11 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         );
     }
     println!("ynpm: imported and activated yggterm {version} from the fleet archive");
+    ynpm_trace(
+        paths,
+        "fleet.import_yggterm.complete",
+        serde_json::json!({ "version": version, "replaced_products": replaced }),
+    );
     Ok(())
 }
 
@@ -4087,6 +4752,11 @@ fn verb_sync_fleet(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         })
         .filter(|hosts: &Vec<String>| !hosts.is_empty())
         .context("sync-fleet needs --hosts H1,H2 (ynpm cannot infer a GUI's SSH roster from a bare shell)")?;
+    ynpm_trace(
+        paths,
+        "fleet.sync.begin",
+        serde_json::json!({ "hosts": &hosts, "integrated": integrated }),
+    );
     for host in &hosts {
         bootstrap_remote_ynpm(host)?;
     }
@@ -4127,6 +4797,11 @@ fn verb_sync_fleet(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
             .map(|value| format!(" --integration-json {}", shell_quote(value)))
             .unwrap_or_default();
         for host in &hosts {
+            ynpm_trace(
+                paths,
+                "fleet.package.begin",
+                serde_json::json!({ "host": host, "package": package, "version": entry.current }),
+            );
             let status = Command::new("scp")
                 .args(["-q"])
                 .arg(&archive)
@@ -4149,6 +4824,11 @@ fn verb_sync_fleet(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
             if !status.success() {
                 bail!("could not import {package} on {host}");
             }
+            ynpm_trace(
+                paths,
+                "fleet.package.complete",
+                serde_json::json!({ "host": host, "package": package, "version": entry.current }),
+            );
             pushed += 1;
         }
         let _ = fs::remove_file(&archive);
@@ -4156,6 +4836,11 @@ fn verb_sync_fleet(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     println!(
         "ynpm: fleet sync imported {pushed} package generations across {} host(s)",
         hosts.len()
+    );
+    ynpm_trace(
+        paths,
+        "fleet.sync.complete",
+        serde_json::json!({ "hosts": &hosts, "packages": pushed }),
     );
     Ok(())
 }
@@ -4175,6 +4860,11 @@ fn sync_yggterm_to_hosts(paths: &Paths, hosts: &[String]) -> anyhow::Result<()> 
         std::process::id()
     );
     for host in hosts {
+        ynpm_trace(
+            paths,
+            "fleet.yggterm.begin",
+            serde_json::json!({ "host": host, "version": version }),
+        );
         let status = Command::new("scp")
             .args(["-q"])
             .arg(&archive)
@@ -4204,6 +4894,11 @@ fn sync_yggterm_to_hosts(paths: &Paths, hosts: &[String]) -> anyhow::Result<()> 
         // after import as well: it is the newest protocol peer and must not be
         // replaced by a stale auxiliary copy left by an older deploy layout.
         bootstrap_remote_ynpm(host)?;
+        ynpm_trace(
+            paths,
+            "fleet.yggterm.complete",
+            serde_json::json!({ "host": host, "version": version }),
+        );
         println!("ynpm: distributed yggterm {version} to {host}");
     }
     let _ = fs::remove_file(archive);
@@ -4451,26 +5146,82 @@ fn is_network_failure(error: &anyhow::Error) -> bool {
 }
 
 fn github_checkout(paths: &Paths, spec: &str) -> anyhow::Result<PathBuf> {
-    let repo = spec
-        .strip_prefix("github:")
-        .or_else(|| spec.strip_prefix("git+https://github.com/"))
+    git_checkout(paths, spec)
+}
+
+fn git_checkout(paths: &Paths, spec: &str) -> anyhow::Result<PathBuf> {
+    let (url, checkout) = if let Some(repo) = spec.strip_prefix("github:") {
+        let repo = repo.trim_end_matches('/').trim_end_matches(".git");
+        let mut pieces = repo.split('/');
+        let owner = pieces
+            .next()
+            .filter(|part| !part.is_empty())
+            .context("GitHub spec has no owner")?;
+        let name = pieces
+            .next()
+            .filter(|part| !part.is_empty())
+            .context("GitHub spec has no repository")?;
+        if pieces.next().is_some() {
+            bail!("GitHub spec must be github:owner/repo");
+        }
+        (
+            format!("https://github.com/{repo}.git"),
+            paths.root().join("github").join(format!("{owner}--{name}")),
+        )
+    } else if let Some(repo) = spec
+        .strip_prefix("git+https://github.com/")
         .or_else(|| spec.strip_prefix("https://github.com/"))
-        .context("GitHub spec wants github:owner/repo")?
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
-    let mut pieces = repo.split('/');
-    let owner = pieces
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("GitHub spec has no owner")?;
-    let name = pieces
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("GitHub spec has no repository")?;
-    if pieces.next().is_some() {
-        bail!("GitHub spec must be github:owner/repo");
-    }
-    let checkout = paths.root().join("github").join(format!("{owner}--{name}"));
+    {
+        let repo = repo.trim_end_matches('/').trim_end_matches(".git");
+        let mut pieces = repo.split('/');
+        let owner = pieces
+            .next()
+            .filter(|part| !part.is_empty())
+            .context("GitHub URL has no owner")?;
+        let name = pieces
+            .next()
+            .filter(|part| !part.is_empty())
+            .context("GitHub URL has no repository")?;
+        if pieces.next().is_some() {
+            bail!("GitHub URL must name owner/repo");
+        }
+        (
+            format!("https://github.com/{repo}.git"),
+            paths.root().join("github").join(format!("{owner}--{name}")),
+        )
+    } else if let Some(raw) = spec.strip_prefix("forgejo:") {
+        let raw = raw.trim().trim_end_matches('/').trim_end_matches(".git");
+        if raw.is_empty() {
+            bail!("Forgejo spec wants forgejo:<git-url-or-host/owner/repo>");
+        }
+        let url = if raw.starts_with("https://")
+            || raw.starts_with("http://")
+            || raw.starts_with("ssh://")
+            || raw.starts_with("git@")
+        {
+            raw.to_string()
+        } else {
+            format!("https://{raw}.git")
+        };
+        (
+            url.clone(),
+            paths
+                .root()
+                .join("forgejo")
+                .join(&source_cache_key(&url)[..16]),
+        )
+    } else {
+        bail!("git source wants github:owner/repo or forgejo:<git-url>");
+    };
+    ynpm_trace(
+        paths,
+        "source.checkout.begin",
+        serde_json::json!({
+            "source": if spec.starts_with("forgejo:") { "forgejo" } else { "github" },
+            "url": trace_safe_text(&url),
+            "checkout": checkout.display().to_string(),
+        }),
+    );
     if checkout.join(".git").exists() {
         let output = Command::new("git")
             .args(["-C", &checkout.display().to_string(), "pull", "--ff-only"])
@@ -4478,7 +5229,7 @@ fn github_checkout(paths: &Paths, spec: &str) -> anyhow::Result<PathBuf> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .with_context(|| format!("updating GitHub checkout {repo}"))?;
+            .with_context(|| format!("updating git checkout {}", trace_safe_text(&url)))?;
         if !output.status.success() {
             let detail = format!(
                 "{} {}",
@@ -4486,10 +5237,10 @@ fn github_checkout(paths: &Paths, spec: &str) -> anyhow::Result<PathBuf> {
                 String::from_utf8_lossy(&output.stderr)
             );
             if is_network_failure(&anyhow::anyhow!(detail.trim().to_string())) {
-                eprintln!("ynpx: GitHub unavailable; using the last local checkout {repo}");
+                eprintln!("ynpx: git source unavailable; using the last local checkout");
             } else {
                 bail!(
-                    "could not fast-forward GitHub checkout {repo}: {}",
+                    "could not fast-forward git checkout: {}",
                     detail.trim()
                 );
             }
@@ -4501,20 +5252,59 @@ fn github_checkout(paths: &Paths, spec: &str) -> anyhow::Result<PathBuf> {
                 "clone",
                 "--depth",
                 "1",
-                &format!("https://github.com/{repo}.git"),
+                &url,
             ])
             .arg(&checkout)
             .stdin(Stdio::null())
             .status()
-            .with_context(|| format!("cloning GitHub checkout {repo}"))?;
+            .with_context(|| format!("cloning git checkout {}", trace_safe_text(&url)))?;
         if !status.success() {
-            bail!("could not clone GitHub checkout {repo}");
+            bail!("could not clone git checkout");
         }
     }
+    ynpm_trace(
+        paths,
+        "source.checkout.complete",
+        serde_json::json!({
+            "source": if spec.starts_with("forgejo:") { "forgejo" } else { "github" },
+            "checkout": checkout.display().to_string(),
+        }),
+    );
     Ok(checkout)
 }
 
 fn launch_installed(
+    paths: &Paths,
+    package: &str,
+    bin: Option<&str>,
+    args: &[String],
+) -> anyhow::Result<i32> {
+    ynpm_trace(
+        paths,
+        "ynpx.launch.begin",
+        serde_json::json!({ "package": package, "bin": bin }),
+    );
+    let result = launch_installed_impl(paths, package, bin, args);
+    match &result {
+        Ok(code) => ynpm_trace(
+            paths,
+            "ynpx.launch.complete",
+            serde_json::json!({ "package": package, "bin": bin, "exit_code": code }),
+        ),
+        Err(error) => ynpm_trace(
+            paths,
+            "ynpx.launch.error",
+            serde_json::json!({
+                "package": package,
+                "bin": bin,
+                "error": trace_safe_detail(error),
+            }),
+        ),
+    }
+    result
+}
+
+fn launch_installed_impl(
     paths: &Paths,
     package: &str,
     bin: Option<&str>,
@@ -4551,6 +5341,15 @@ fn launch_installed(
     Ok(status.code().unwrap_or(1))
 }
 
+fn installed_package_for_source(paths: &Paths, source: &str) -> Option<String> {
+    let state = paths.load_state().ok()?;
+    state
+        .packages
+        .iter()
+        .find(|(_, entry)| entry.source.as_deref() == Some(source))
+        .map(|(key, entry)| package_identity(key, entry))
+}
+
 fn run_ynpx(paths: &Paths, args: &[String]) -> anyhow::Result<i32> {
     let mut package = None;
     let mut bin = None;
@@ -4579,11 +5378,81 @@ fn run_ynpx(paths: &Paths, args: &[String]) -> anyhow::Result<i32> {
         index += 1;
     }
     let package = package.context("ynpx wants a package, github:owner/repo, or --dev checkout")?;
+    if package.starts_with("tarball:") {
+        let source = parse_tarball_source(&package)?;
+        let locator = format!("tarball:{}", source.url);
+        ynpm_trace(
+            paths,
+            "source.resolve",
+            serde_json::json!({
+                "operation": "ynpx",
+                "source": "tarball",
+                "url": trace_safe_text(&source.url),
+            }),
+        );
+        ynpm_trace(
+            paths,
+            "ynpx.update.begin",
+            serde_json::json!({ "source": "tarball", "url": trace_safe_text(&source.url) }),
+        );
+        match install_prebuilt_tarball(paths, &package, true, None) {
+            Ok(outcome) => {
+                ynpm_trace(
+                    paths,
+                    "ynpx.update.complete",
+                    serde_json::json!({
+                        "package": &outcome.name,
+                        "version": &outcome.version,
+                        "source": "tarball",
+                    }),
+                );
+                return launch_installed(paths, &outcome.name, bin.as_deref(), &rest);
+            }
+            Err(error) if is_network_failure(&error) => {
+                let package = installed_package_for_source(paths, &locator)
+                    .context("tarball is offline and no verified generation is recorded")?;
+                ynpm_trace(
+                    paths,
+                    "ynpx.offline",
+                    serde_json::json!({
+                        "package": package,
+                        "source": "tarball",
+                        "preserved_generation": true,
+                        "error": trace_safe_detail(&error),
+                    }),
+                );
+                eprintln!("ynpx: offline; using the last verified tarball generation");
+                return launch_installed(paths, &package, bin.as_deref(), &rest);
+            }
+            Err(error) => {
+                ynpm_trace(
+                    paths,
+                    "ynpx.update.error",
+                    serde_json::json!({
+                        "source": "tarball",
+                        "error": trace_safe_detail(&error),
+                        "preserved_generation": false,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    }
     if package.starts_with("github:")
         || package.starts_with("https://github.com/")
         || package.starts_with("git+https://github.com/")
+        || package.starts_with("forgejo:")
     {
-        let checkout = github_checkout(paths, &package)?;
+        ynpm_trace(
+            paths,
+            "source.resolve",
+            serde_json::json!({
+                "operation": "ynpx",
+                "source": if package.starts_with("forgejo:") { "forgejo" } else { "github" },
+                "locator": trace_safe_text(&package),
+            }),
+        );
+        let checkout = git_checkout(paths, &package)?;
         let outcome = dev_checkout(paths, &checkout, None, None, BTreeMap::new(), None, &[])?;
         return launch_installed(paths, &outcome.package, bin.as_deref(), &rest);
     }
@@ -4600,6 +5469,15 @@ fn run_ynpx(paths: &Paths, args: &[String]) -> anyhow::Result<i32> {
         return launch_installed(paths, &outcome.package, bin.as_deref(), &rest);
     }
     let (canonical, pin) = expand_package(&package)?;
+    ynpm_trace(
+        paths,
+        "source.resolve",
+        serde_json::json!({
+            "operation": "ynpx",
+            "package": canonical,
+            "source": "npm",
+        }),
+    );
     let install_spec = pin
         .as_deref()
         .map(|pin| format!("{canonical}@{pin}"))
@@ -4627,16 +5505,60 @@ fn run_ynpx(paths: &Paths, args: &[String]) -> anyhow::Result<i32> {
                 .and_then(|manifest| manifest.integrity.as_deref().or(manifest.shasum.as_deref())),
         );
         if handback == DevHandback::KeepDev {
+            ynpm_trace(
+                paths,
+                "ynpx.dev_preserved",
+                serde_json::json!({
+                    "package": canonical,
+                    "reason": "production_not_newer_or_polished",
+                }),
+            );
             return launch_installed(paths, &canonical, bin.as_deref(), &rest);
         }
     }
+    ynpm_trace(
+        paths,
+        "ynpx.update.begin",
+        serde_json::json!({ "package": canonical, "requested": install_spec }),
+    );
     match install_one(paths, &install_spec, true) {
-        Ok(_) => launch_installed(paths, &canonical, bin.as_deref(), &rest),
+        Ok(outcome) => {
+            ynpm_trace(
+                paths,
+                "ynpx.update.complete",
+                serde_json::json!({
+                    "package": &outcome.name,
+                    "version": &outcome.version,
+                    "source": "npm",
+                }),
+            );
+            launch_installed(paths, &canonical, bin.as_deref(), &rest)
+        }
         Err(error) if is_network_failure(&error) => {
+            ynpm_trace(
+                paths,
+                "ynpx.offline",
+                serde_json::json!({
+                    "package": canonical,
+                    "preserved_generation": true,
+                    "error": trace_safe_detail(&error),
+                }),
+            );
             eprintln!("ynpx: offline; using the last verified {canonical} generation");
             launch_installed(paths, &canonical, bin.as_deref(), &rest)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            ynpm_trace(
+                paths,
+                "ynpx.update.error",
+                serde_json::json!({
+                    "package": canonical,
+                    "error": trace_safe_detail(&error),
+                    "preserved_generation": false,
+                }),
+            );
+            Err(error)
+        }
     }
 }
 
@@ -4710,6 +5632,16 @@ fn main() -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| "ynpm".to_string());
     let args: Vec<String> = argv.collect();
+    let operation = if invoked_as == "ynpx" {
+        "ynpx"
+    } else {
+        args.first().map(String::as_str).unwrap_or("<none>")
+    };
+    ynpm_trace(
+        &paths,
+        "operation.start",
+        serde_json::json!({ "operation": operation, "argv_count": args.len() }),
+    );
     const USAGE: &str = "ynpm - the yggdrasilhq package manager\n\
          verbs: install [--dest DIR] <pkg>[@<ver>]... | install --dev <pkg> [--watch PKG] [--bin NAME=PATH]... |\n\
          list | check | doctor | sync [--integrated] | sync-fleet --hosts H1,H2 [--integrated] | self-update [--json] | export <pkg> [--metadata] [--archive PATH] | import <pkg> <ver> --archive PATH --bins a,b | import-yggterm <ver> --archive PATH | rollback <pkg> | remove <pkg> | prod <pkg> |\n\
@@ -4718,12 +5650,22 @@ fn main() -> anyhow::Result<()> {
          ynpx <pkg> [flags] installs/updates when online, then launches the verified bin; github:owner/repo and --dev checkout are supported";
     if invoked_as != "ynpx" && args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{USAGE}");
+        ynpm_trace(
+            &paths,
+            "operation.complete",
+            serde_json::json!({ "operation": operation, "result": "help" }),
+        );
         return Ok(());
     }
     if invoked_as != "ynpx" && args.iter().any(|a| a == "--version" || a == "-V") {
         // Bare version, exactly what yggterm and yggterm-headless print: the
         // deploy script compares the three outputs verbatim.
         println!("{}", env!("CARGO_PKG_VERSION"));
+        ynpm_trace(
+            &paths,
+            "operation.complete",
+            serde_json::json!({ "operation": operation, "result": "version" }),
+        );
         return Ok(());
     }
     if invoked_as == "ynpx" && args.len() == 1 && args.iter().any(|a| a == "--version" || a == "-V")
@@ -4731,17 +5673,48 @@ fn main() -> anyhow::Result<()> {
         // A bare alias version query is the distribution identity; a
         // package's `ynpx <pkg> --version` continues through the launcher.
         println!("{}", env!("CARGO_PKG_VERSION"));
+        ynpm_trace(
+            &paths,
+            "operation.complete",
+            serde_json::json!({ "operation": operation, "result": "version" }),
+        );
         return Ok(());
     }
     if invoked_as == "ynpx" {
-        let code = run_ynpx(&paths, &args)?;
-        std::process::exit(code);
+        match run_ynpx(&paths, &args) {
+            Ok(code) => {
+                ynpm_trace(
+                    &paths,
+                    "operation.complete",
+                    serde_json::json!({ "operation": operation, "exit_code": code }),
+                );
+                std::process::exit(code);
+            }
+            Err(error) => {
+                ynpm_trace(
+                    &paths,
+                    "operation.error",
+                    serde_json::json!({
+                        "operation": operation,
+                        "error": trace_safe_detail(&error),
+                    }),
+                );
+                return Err(error);
+            }
+        }
     }
     let Some(verb) = args.first() else {
         eprintln!("{USAGE}");
-        bail!("no verb given");
+        let error = anyhow::anyhow!("no verb given");
+        ynpm_trace(
+            &paths,
+            "operation.error",
+            serde_json::json!({ "operation": operation, "error": trace_safe_detail(&error) }),
+        );
+        return Err(error);
     };
-    match verb.as_str() {
+    let result = (|| -> anyhow::Result<()> {
+        match verb.as_str() {
         "install" => verb_install(&paths, &args[1..]),
         "list" => verb_list(&paths),
         "check" => verb_check(&paths),
@@ -4837,7 +5810,24 @@ fn main() -> anyhow::Result<()> {
         other => bail!(
             "'{other}' is not an ynpm verb (install | list | check | doctor | sync | sync-fleet | self-update | export | import | import-yggterm | rollback | remove | prod | purge-legacy | dev)"
         ),
+        }
+    })();
+    match &result {
+        Ok(()) => ynpm_trace(
+            &paths,
+            "operation.complete",
+            serde_json::json!({ "operation": operation, "result": "ok" }),
+        ),
+        Err(error) => ynpm_trace(
+            &paths,
+            "operation.error",
+            serde_json::json!({
+                "operation": operation,
+                "error": trace_safe_detail(error),
+            }),
+        ),
     }
+    result
 }
 
 #[cfg(test)]
@@ -5037,6 +6027,40 @@ mod tests {
     }
 
     #[test]
+    fn package_metadata_schema_is_required_and_versioned() {
+        let doc = serde_json::json!({
+            "version": "1.0.0",
+            "dist": { "tarball": "https://example.test/tool.tgz" },
+            "yggterm": { "schema": 1, "app": null }
+        });
+        assert_eq!(parse_manifest(&doc).unwrap().integration.unwrap().schema, 1);
+        let future = serde_json::json!({
+            "version": "1.0.0",
+            "dist": { "tarball": "https://example.test/tool.tgz" },
+            "yggterm": { "schema": 2, "app": null }
+        });
+        assert!(parse_manifest(&future).is_err());
+    }
+
+    #[test]
+    fn tarball_source_requires_a_valid_url_and_checksum_fragment() {
+        let source = parse_tarball_source(
+            "tarball:https://forgejo.example/releases/tool.tgz#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(source.url, "https://forgejo.example/releases/tool.tgz");
+        assert_eq!(source.sha256.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(parse_tarball_source("tarball:file:///tool.tgz").is_err());
+        assert!(parse_tarball_source("tarball:https://example.test/tool.tgz#sha256=bad").is_err());
+    }
+
+    #[test]
+    fn trace_text_redacts_query_strings_but_keeps_the_stage_locator() {
+        let safe = trace_safe_text("curl https://example.test/a.tgz?token=secret#fragment");
+        assert_eq!(safe, "curl https://example.test/a.tgz?<redacted>");
+    }
+
+    #[test]
     fn the_bin_table_is_the_whole_contract_of_what_gets_installed() {
         let doc = serde_json::json!({
             "name": "@ygghq/ychrome-linux-x64",
@@ -5134,6 +6158,7 @@ mod tests {
             dev: None,
             dev_generation: None,
             channel: Some("npm".to_string()),
+            source: None,
             integration: None,
         };
         let json = serde_json::to_string(&package).unwrap();
