@@ -33,7 +33,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | OPEN (server-side session truth, not the TUI) |
-| 11.6.4 | agy | C | OPEN (store-id discovery + named failure; silent fresh-spawn today) |
+| 11.6.4 | agy | C | OPEN (trust gate eats input + untitled-forever measured, see baseline; resume arm verified) |
 | 11.6.5 | muse | C | OPEN (same shape as agy) |
 | 11.6.6 | kimi | C | OPEN |
 | 11.6.7 | qwen | C | OPEN |
@@ -94,6 +94,82 @@ event trace `~/.yggterm/event-trace*.jsonl`):
 measure: zero `external_active_wait*` trace events on the ledger path, an
 explicit ledger-adoption event per row, swap→reattach latency, and the PTY
 law (viewport shows the session, never the banner).
+
+#### 11.6.4 measured baseline (wave-1 seat C, 2026-09-10, guihost — agy 1.2.0)
+
+Store layout, identity, resume arms, phrase table, and two defects, all
+measured (bare-PTY probes rendered through the vendored xterm.js harness +
+one live daemon row; probe rows despawned; measured on the GUI host):
+
+1. **Store layout 1.2.0.** Per-conversation SQLite
+   `~/.gemini/antigravity-cli/conversations/<uuid>.db` (tables
+   `trajectory_meta`/`steps`/`gen_metadata`/`executor_metadata`/… — protobuf
+   payloads, no readable title). Shared `conversation_summaries.db`
+   (+`-wal`/`-shm`) — **STALE BY WRITER ABANDONMENT**: 9 rows, newest
+   2026-08-25, and ZERO rows written by any of 2026-09-10s five CLI
+   conversations (print mode, four TUI probes, one live row turn).
+   `cache/last_conversations.json` is a cwd→conversation-id map, id-only,
+    written at EXIT (the live row cwd had no entry mid-session — useless for
+   live discovery, useful for crash recovery). `history.jsonl` dead since
+   Aug 25 (pre-1.2.0 layout). `session-index.db` 0 bytes, vestigial.
+   `crashes/crash_<pid>_<uuid>.log` is created at every launch and stays
+   empty on clean runs — the panic-falsifier landing zone.
+2. **Identity confirmed on 1.2.0.** The conversation id is minted at FIRST
+   TURN, not at launch (at launch the process holds only
+   `conversation_summaries.db` + its log; from turn one it holds
+   `conversations/<id>.db` + `presence/<id>.lock` OPEN) —
+   `id_assigned_at_birth: false` stands, and the `LiveSessionMarker::FileStem`
+   presence-lock marker is verified against a live process (`/proc/<pid>/fd`),
+   stale lock FILES left behind after exit are not open, so they cannot fake
+   liveness. Print mode (`--print --output-format json`) emits
+   `conversation_id` in stdout — a birth-id discovery channel print mode has
+   and the TUI lacks.
+3. **Resume arms measured.** `agy --conversation <id>` re-renders prior turns
+   and continues the SAME conversation id (`content_rederives_on_resume: true`
+   stands; a killed mid-turn renders prompt-without-response — honest). `-c`
+   continues the most recent. `ResumeSelector::Flag("--conversation")` stands.
+4. **Phrase table (harness-rendered screens).** Working = `Generating...`
+   (braille spinner line) + `esc to cancel` (footer); idle footer =
+   `? for shortcuts`. The matcher case-folds (`to_ascii_lowercase`), so the
+   declared lowercase needles match — checked, NOT a defect, do not re-file.
+   `esc to interrupt` never appears on agy (it is CODEXs phrase — harmless
+   cross-CLI contamination in the array); `thinking...`/`working...`
+   unconfirmed on 1.2.0. Live cross-check: a row turn showed the daemon
+   `busy=true reason=agent_working_daemon` while the screen carried exactly
+   those phrases — working detection works on 1.2.0.
+5. **⛔ DEFECT — the workspace-trust gate is undeclared and it EATS input.**
+   A fresh-folder launch parks agy on `Do you trust the contents of this
+   project? / Yes, I trust this folder / No, exit` while the sidebar reads
+   busy=false idle — `startup_gate_screen_phrases` is EMPTY, so the daemon
+   cannot name the gate. Typed input during the gate is DISCARDED, not
+   queued: two probes lost turns this way (the agy CLI log shows
+   `HandleUserInput` firing once across both), and the trailing `\r`
+   CONFIRMED the trust picker instead of submitting — writing the folder into
+   agy-settings `trustedWorkspaces` as a side effect. This is the
+   silent-fresh-spawn mechanic end-to-end: any yggterm resume/prompt typed
+   into a gated row is lost AND the gate silently resolves. Fix direction
+   (stone §2.3): declare the gate needles; gate-aware input policy
+   (queue-until-answered or named-block); never auto-answer (answering = a
+   settings write — the same prohibition as codex config.toml).
+6. **⛔ DEFECT — agy rows are untitled forever on 1.2.0.**
+   `read_antigravity_session_title` reads ONLY
+   `conversation_summaries.title` (authored titles; the prompt-text arms were
+   deliberately removed 2026-09-06), but the 1.2.0 CLI never writes summaries
+   rows at all (evidence in 1) — no title exists in ANY readable store
+   (per-conversation db scanned: prompt echoes only). Measured live: a
+   completed turn left the row at its fallback label, and that fallback
+   composes `<CwdName> Shell` for an Antigravity row ("Ws Live Shell") — a
+   kind-misleading name while `icon_matches_session_kind: true`. Until agys
+   title writer is found (IDE-only? cloud-side?), rows degrade SILENTLY into
+   wrong-kind fallback names — against the loud-degradation law (stone §6).
+7. **Failure modes.** SIGKILL mid-turn: the per-conversation db persists
+   completed turns; the killed turn stays prompt-without-response; resume
+   re-renders the truth. Daemon-swap survival is 11.6.0s ledger acceptance
+   (stone §9) — deliberately not driven by this seat.
+8. **Readiness marker** for any auto-prompt/resume arm: the banner account
+   line gains its plan suffix — `(Google AI Pro)` — when login completes;
+   input typed before that moment is at risk (see 5).
+
 
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
