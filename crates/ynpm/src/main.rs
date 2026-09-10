@@ -3178,12 +3178,17 @@ fn fleet_push_impl(
     let ynpm_self = if outcome.package == "@ygghq/yggterm" {
         generation.join("bin/ynpm")
     } else {
-        [
-            paths.root().join("bin/ynpm"),
-            paths.home.join(".local/bin/ynpm"),
-            paths.home.join(".yggterm/bin/ynpm"),
-            std::env::current_exe().context("locating ynpm for fleet bootstrap")?,
-        ]
+        // The manager's own executable is the source of truth for this
+        // transaction. The integrated CLI destination can still contain a
+        // previous yggterm dev manager after production handback; choosing it
+        // first silently bootstraps peers with stale code and makes a remote
+        // app import appear successful while its metadata writer is old.
+        let candidates = ynpm_bootstrap_source_candidates(
+            &paths.home,
+            &paths.root(),
+            std::env::current_exe().ok().as_deref(),
+        );
+        candidates
         .into_iter()
         .find(|candidate| candidate.is_file())
         .context("locating a stable ynpm binary for fleet bootstrap")?
@@ -4509,6 +4514,23 @@ fn yggterm_aux_source_candidates(
         root.join("versions").join(version).join(name),
         home.join(".yggterm/bin").join(name),
         home.join(".local/bin").join(name),
+    ]);
+    candidates
+}
+
+fn ynpm_bootstrap_source_candidates(
+    home: &Path,
+    manager_root: &Path,
+    current_executable: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(current_executable) = current_executable {
+        candidates.push(current_executable.to_path_buf());
+    }
+    candidates.extend([
+        home.join(".local/bin/ynpm"),
+        home.join(".yggterm/bin/ynpm"),
+        manager_root.join("bin/ynpm"),
     ]);
     candidates
 }
@@ -6409,6 +6431,23 @@ mod tests {
         assert_eq!(
             candidates.get(1),
             Some(&PathBuf::from("/home/user/.yggterm/versions/3.2.91/ynpm"))
+        );
+    }
+
+    #[test]
+    fn fleet_dev_bootstrap_prefers_the_running_manager_over_integrated_bin() {
+        let candidates = ynpm_bootstrap_source_candidates(
+            Path::new("/home/user"),
+            Path::new("/home/user/.yggterm/ynpm"),
+            Some(Path::new("/workspace/target/release/ynpm")),
+        );
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from("/workspace/target/release/ynpm"))
+        );
+        assert_eq!(
+            candidates.last(),
+            Some(&PathBuf::from("/home/user/.yggterm/ynpm/bin/ynpm"))
         );
     }
 
