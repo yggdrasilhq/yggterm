@@ -894,9 +894,10 @@ fn sync_app_registration(
                 "app": &manifest.name,
                 "binary": &manifest.binary,
                 "context_menu": &manifest.context_menu,
+                "registry_dir": paths.home.join(".yggterm/apps").display().to_string(),
             }),
         );
-        yggterm_core::write_app_manifest(&paths.home, &manifest)
+        yggterm_core::write_app_manifest(&paths.home.join(".yggterm"), &manifest)
             .with_context(|| format!("registering {} with yggterm", manifest.name))?;
         println!(
             "ynpm: registered {} with yggterm from package metadata",
