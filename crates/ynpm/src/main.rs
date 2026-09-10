@@ -4431,11 +4431,11 @@ fn run_ynpx(paths: &Paths, args: &[String]) -> anyhow::Result<i32> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--bin" => {
+            "--bin" if package.is_none() => {
                 index += 1;
                 bin = Some(args.get(index).context("--bin wants a bin name")?.clone());
             }
-            "--dev" => {
+            "--dev" if package.is_none() => {
                 index += 1;
                 let checkout = PathBuf::from(args.get(index).context("--dev wants a checkout")?);
                 let outcome =

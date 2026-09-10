@@ -1256,9 +1256,12 @@ package path, tries the newest version every time, and falls back to the last
 verified generation only for an unavailable network. Yggterm itself follows
 the same path: `ynpm self-update` owns the four-product release generation and
 `sync-fleet` transfers that verified production generation once to each named
-host. New libyggterm apps should put their launcher and context-menu policy in
-`package.json.yggterm.app`; their processes do not register themselves at
-runtime.
+host. A same-version archive compares the four product hashes and atomically
+refreshes changed bytes, so release-only polish is not hidden by an existing
+generation directory; the syncing manager is reasserted to both canonical
+`ynpm`/`ynpx` aliases after import. New libyggterm apps should put their
+launcher and context-menu policy in `package.json.yggterm.app`; their processes
+do not register themselves at runtime.
 
 `ynpm list` is the recognition instrument, not just state-file output. It reads
 the compiled `AGENT_CLIS` registry and `~/.yggterm/apps/*.json`, and reports
@@ -1267,6 +1270,13 @@ OpenCode v2 identity is `@opencode-ai/cli@beta` / `opencode2`; never substitute
 the abandoned `opencode-ai@beta` line. Legacy cleanup follows the liveness law:
 publish and verify ynpm first, then remove only exact old paths no live process
 or helper executes from.
+
+Per-CLI flags in the settings modal are part of the launch contract. They are
+forwarded as a request field across SSH and are applied to fresh starts,
+remote resume commands, and remote resume pickers. For Codex,
+`-s danger-full-access` means no sandbox but approvals remain; the visible YOLO
+warning requires `--dangerously-bypass-approvals-and-sandbox`. Verify the
+composed command and the target process argv, not a settings-file readback.
 
 With `--integrated`, `sync-fleet` first asks the named peers for their highest
 verified production generation and reuses an ahead-of-registry peer archive;
