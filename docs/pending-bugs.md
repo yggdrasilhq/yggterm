@@ -42,6 +42,59 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.10 | codex-litellm | A | OPEN |
 | 11.6.11 | zcode-tui | B | OPEN (native announce — the reference implementation) |
 
+#### 11.6.1+11.6.2 measured baseline (wave-1 seat F, 2026-09-10, dev)
+
+Ledger-shaped reattach requirements + baseline for seat A (11.6.0), all
+measured on dev (descriptor data in `agent_cli.rs`, live `/proc`, the daemon
+event trace `~/.yggterm/event-trace*.jsonl`):
+
+1. **The 12s wait is actually a 122s kill.** Three real waits this morning
+   (03:50/04:55/05:08 UTC, codex sessions `8ed54eec`, `01a084c1`,
+   `01a084c2`): every one ran the resume-wrapper loop
+   `wait_for_external_agent_resume_to_clear` (3s /proc cadence, 120s
+   deadline, `lib.rs` ~2568) to its DEADLINE, then two ended in
+   `external_active_wait_recovered_stranded_orphan` — the reaper KILLED live
+   `stranded_yggterm_owned` codex TUIs (pids 2910285/2910302 class) and
+   re-resumed from the rollout. Holders were "provably ours" (environ
+   `YGGTERM_SESSION_ID` marker) the whole time. Claude: zero wait events in
+   any surviving trace — unexercised; the falsifier must drive it.
+2. **Two reattach paths disagree for the same holder.** The daemon ensure
+   arm ([11.79] adoption, `external_own_child_runtime_adopted`) adopts a
+   live `stranded_yggterm_owned` holder INSTANTLY; the resume wrapper
+   (`yggterm server remote resume-codex|resume-cc`, category `resume_codex`)
+   has NO adoption arm — pure wait → deadline → reap-or-refuse. This
+   morning's 122s waits burned in the wrapper for holders the daemon path
+   would have adopted. The ledger (stone §4) must serve BOTH paths from one
+   book (crash-safe file, cleared by whoever satisfies it).
+3. **Today's handoff record is not a ledger.** `write_handoff`
+   (`daemon.rs` ~2397, `PreservedTerminalOwnerEntry`) persists only
+   runtime_key → old-owner endpoint/pid/version. No per-row verdict, no CLI
+   pids, no store session id, no resume argv, no cwd — everything §4's
+   `adopted/died_with_me` needs. It is the natural file to extend (the
+   hot-restart-queue laws already govern it).
+4. **codex ledger record (11.6.1):** `id_assigned_at_birth: false`
+   (agent_cli.rs:1786 — [11.74] picker rule; stone §2's "(codex/claude)"
+   parenthetical is imprecise and must not drive the v2 enum). Store id is
+   only known post-discovery (`.codex/sessions/**/rollout-*-<id>.jsonl`, id
+   in the filename). A `died_with_me` record for a codex row whose
+   discovery never answered CANNOT name an id → named-failure path, never a
+   composed `codex resume <row-id>`. Resume arm measured live:
+   `codex resume <id>` + `-C <cwd>` re-root (`resume_re_roots_with_cwd:
+   true`) + the launch permission args. Holder class: fresh-launch TUIs
+   (argv has NO id — `codex -s danger-full-access`) hold the rollout purely
+   by fd; /proc re-derivation can never answer "which session" for them —
+   only the ledger can.
+5. **claude ledger record (11.6.2):** `id_assigned_at_birth: true`
+   (agent_cli.rs:2116) — row id IS the transcript id at birth, so
+   `died_with_me` can always name the id; resume arm `claude --resume <id>`;
+   store `.claude/projects/*/<id>.jsonl` (+ sidecar dir).
+
+**Falsifier protocol for seat A (stone §9):** live codex + claude rows
+(claude MANDATORY — no baseline exists), forced same-version rotation,
+measure: zero `external_active_wait*` trace events on the ledger path, an
+explicit ledger-adoption event per row, swap→reattach latency, and the PTY
+law (viewport shows the session, never the banner).
+
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
