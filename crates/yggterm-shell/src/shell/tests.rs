@@ -13695,6 +13695,23 @@ console.log('ok');
         assert!(screen_reconcile_output_quiet(5_000, 0));
     }
 
+    #[test]
+    fn screen_reconcile_deadline_forces_a_working_surface_once() {
+        let working = "\n• Working (12s)\n› Ask Codex to do anything";
+        assert_eq!(
+            screen_reconcile_apply_decision(working, false, false),
+            ScreenReconcileDecision::DeferWorking
+        );
+        assert_eq!(
+            screen_reconcile_apply_decision(working, false, true),
+            ScreenReconcileDecision::Write
+        );
+        assert_eq!(
+            screen_reconcile_apply_decision(working, true, false),
+            ScreenReconcileDecision::Write
+        );
+    }
+
     // THE DEFER MUST CONVERGE (user-reported broken bottom, 2026-07-31).
     //
     // The quiet gate above is correct as a PREFERENCE and was wrong as the only

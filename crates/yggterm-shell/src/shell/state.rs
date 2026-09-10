@@ -726,6 +726,26 @@ fn screen_reconcile_decision(screen_text: &str) -> ScreenReconcileDecision {
         ScreenReconcileDecision::SkipUnwritable
     }
 }
+
+/// Apply the result of the visible-screen reconcile fetch.
+///
+/// The quiet gate is the preferred protection against tearing a live TUI, but
+/// its deadline is a real convergence promise: once a correction has been
+/// owed for the full deadline, returning to `DeferWorking` would turn the
+/// deadline into an endless 3-second polling loop. The caller carries the
+/// deadline witness from the pre-fetch gate so this decision cannot lose it at
+/// the off-loop apply boundary.
+fn screen_reconcile_apply_decision(
+    screen_text: &str,
+    reveal_incomplete: bool,
+    defer_deadline_expired: bool,
+) -> ScreenReconcileDecision {
+    match screen_reconcile_decision(screen_text) {
+        ScreenReconcileDecision::DeferWorking
+            if reveal_incomplete || defer_deadline_expired => ScreenReconcileDecision::Write,
+        decision => decision,
+    }
+}
 /// Recent-output pre-gate for a due reconcile, checked BEFORE the daemon
 /// snapshot fetch: while forwarded output is still flowing the surface is
 /// mid-turn (regardless of what a single working-footer sample says) and the
