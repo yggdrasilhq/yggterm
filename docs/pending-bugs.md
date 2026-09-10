@@ -341,11 +341,18 @@ openapi at `/openapi.json` — 119 paths):
    the daemon `terminal_lines` snapshot (the mouse-mode arm `?1003h` in
    the trailing escapes is the tell) and eats all input until ESC.
 
-**Falsifiers owed:** (a) which UI flow makes the installed TUI POST /view
-(tab focus? window focus? NOT the session-list switch — falsified today);
-(b) PTY-law proof for a tab-mirror row following a switch (row title +
-pane, one tick); (c) re-run this decode on the next ynpm channel bump —
-the checkout says the view endpoint may vanish.
+**Falsifiers owed:** (a) RESHAPED 2026-09-10 late: the /view writer is not
+any TUI flow measured — the session-list switch was falsified first, then a
+90-second idle-viewing watch of the switched-to session (fresh TUI, bytes
+captured) produced ZERO /view POSTs and an untouched `time_viewed`; the
+historical epoch-ms `time_viewed` values predate the installed build (or
+come from another client). Consequence: on beta-19271, `time_viewed` is
+API-writer-only — store recency for opencode is turn-recency
+(`time_updated`), and the viewing signal is the OSC title alone; treat any
+StoreIndex-recency viewing strategy as dead for this CLI; (b) PTY-law proof
+for a tab-mirror row following a switch (row title + pane, one tick);
+(c) re-run this decode on the next ynpm channel bump — the checkout says
+the view endpoint may vanish.
 #### 11.6.5 muse measured baseline (wave-1 seat D, 2026-09-10, the muse lab host)
 
 Probe battery on Muse Code 1.1.1 (1.1.1-R2514.1) via the xterm-harness
