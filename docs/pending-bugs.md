@@ -35,9 +35,9 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.3 | opencode | B | OPEN (server truth DECODED 2026-09-10 — see the seat E section; descriptor v2 fills queue behind 11.6.0) |
 | 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
 | 11.6.5 | muse | C | OPEN (baseline measured 2026-09-10 — v2 data fixes queued: composer U+276F, phrase table, startup gate) |
-| 11.6.6 | kimi | C | OPEN |
+| 11.6.6 | kimi | C | OPEN (store drifted off state.json in 1.50.0 — batch-groundwork entry below) |
 | 11.6.7 | qwen | C | OPEN |
-| 11.6.8 | grok | C | OPEN |
+| 11.6.8 | grok | C | OPEN (working phrases drifted on 1.0.24, false-IDLE-while-working; live active_sessions.json registry — batch-groundwork entry below) |
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
 | 11.6.11 | zcode-tui | B | OPEN (native announce LANDED on `lane/integration/zcode-tui` — emitter commit zcode-tui 0bd590f + daemon `announce` verb with fresh-phase precedence; arm-matrix gap open, see the entry below; live PTY proof owed) |
@@ -470,6 +470,66 @@ Still owed:
 - the `died_with_me` WRITERS (force-retire / cold-exit paths) so the
   re-resume SLA (≤2 s) becomes measurable;
 - schema v2 + probe battery (the rest of the 11.6.0 family work).
+
+#### 11.6.6 + 11.6.8 measured groundwork, and the 11.6.7/.9/.10 availability record (batch seat, 2026-09-10, the muse lab host)
+
+No descriptor edits (schema v2 conversion still open); measurements land in
+the per-CLI doors. Probe harness: the muse seat's node-pty + vendored
+xterm.js + CPR-answering bridge, reused as-is for both CLIs.
+
+**11.6.8 grok-build (1.0.24) — WORKING-PHRASE DRIFT, false-IDLE direction.**
+Declared needles `esc to cancel` / `esc to interrupt` / `thinking...` /
+`working...` NEVER appear on 1.0.24 (two live turns, one with a tool call).
+Measured working state instead: spinner line `⠸ Waiting for response… <N>s`
+with right-side `<N>s ⇣<bytes> [stop]`, and the hint bar swaps to
+`Ctrl+c:cancel` for the turn's duration (idle has no Ctrl+c; completion adds
+`Ctrl+b:send to bg` — a background-agent hint the empty
+`background_agent_hint_screen_phrases` should adopt). ⚠ Direction matters:
+a false-IDLE-while-working means the hot-restart gate classifies a mid-turn
+grok as idle (spec-hot-restart §3.1 violated in the dangerous direction —
+the auto-update path may swap under a working turn).
+Confirmed-still-true on 1.0.24: composer `❯` U+276F ✓, `summary.json`
+generated_title ✓, `ResumeSelector::Flag("--resume")` ✓.
+**THE FIND: `~/.grok/active_sessions.json` is a LIVE
+`[{session_id, pid, cwd, opened_at}]` registry** (with `active_sessions.lock`
+beside it) — the strongest row→session tenancy anchor of any class-C CLI:
+one file answers rebind discovery positively, pid-liveness-checked. Also
+measured: `events.jsonl` carries machine phases (`phase_changed` →
+`streaming_text`, `turn_ended outcome=completed`) — a wire-grade phase
+source for v2's phase enum; `--resume <id>` reuses the SAME session id and
+re-registers it under the new pid (fork only via `--fork-session`); store is
+`~/.grok/sessions/<url-encoded-cwd>/<uuid>/` (chat_history/updates ACP
+stream/events/rewind_points/prompt_context/summary.json/title_refresh_idx)
++ per-cwd prompt_history.jsonl + `session_search.sqlite` (FTS5) + a
+`leader.sock` leader process (`grok leader list/kill`).
+
+**11.6.6 kimi (1.50.0) — STORE DRIFTED OFF `state.json`.** The descriptor's
+title story ("kimi writes state.json title — measured end-to-end
+2026-08-30") is stale: a fresh 1.50.0 session is
+`~/.kimi/sessions/<md5-of-cwd>/<session-uuid>/` holding ONLY
+`context.jsonl` (role/content) and `wire.jsonl` (typed events:
+`metadata protocol_version 1.10`, `TurnBegin{user_input}`, `TurnEnd{}`);
+`find ~/.kimi -name state.json` is EMPTY and neither file carries any title
+key. `read_kimi_live_store_title` reads NOTHING on 1.50.0. Screen facts: the
+welcome panel prints `Session: <uuid>` ON SCREEN at startup (screen-level id
+source); the composer is a labeled rule region `── input ──` with NO marker
+glyph (the declared composer marker needs re-derivation); typed prompts echo
+as `✨ <text>`. Host has no kimi credentials, so the declared working
+phrases (`composing...`/`thinking...`/`compacting...`, negation
+`thought for `) are UNVERIFIED on 1.50.0 — not falsified, login-gated.
+`wire.jsonl`'s typed events are the natural v2 phase source.
+
+**11.6.7 qwen / 11.6.9 pi / 11.6.10 codex-litellm — AVAILABILITY.** qwen and
+pi are installed NOWHERE in the fleet (the muse lab host and dev both
+checked): no measurement is possible; their descriptor rows are unverified
+on any current binary and stay that way until the owner installs them.
+codex-litellm's wrapper is present at /usr/local/bin/codex-litellm (reports
+`codex-cli 0.132.0+13595c36+litc03171d9` — a codex fork, class A) but
+BROKEN: the native binary is missing
+(`/usr/local/lib/node_modules/@avikalpa/codex-litellm/dist/linux-x64/...`),
+and the fix (`npm install -g @avikalpa/codex-litellm`) needs root on the
+/usr/local prefix — owner-gated reinstall. First probe when runnable must
+VERIFY it inherits codex's store story, not assume it.
 
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
