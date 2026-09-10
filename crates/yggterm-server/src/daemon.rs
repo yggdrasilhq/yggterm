@@ -13033,6 +13033,40 @@ impl DaemonRuntime {
                         )),
                     });
                 }
+                // The startup-gate guard, the draft guard's twin: a programmatic
+                // send into a row parked on its CLI's first-run modal is a
+                // silent loss — the modal eats the bytes and a trailing Enter
+                // ANSWERS the gate (measured 2026-09-10, agy 1.2.0: a prompt
+                // typed at the workspace-trust picker never reached
+                // HandleUserInput AND confirmed trust). Asked of the row's OWN
+                // descriptor, never a cross-CLI union ([11.92]), and of the
+                // RENDERED GRID, not the raw stream — a modal paints with
+                // absolute cursor moves, so raw bytes fuse adjacent rows.
+                // ⛔ Gated on the same flag as the draft guard: refuse_if_draft
+                // marks a PROGRAMMATIC send; a plain write is a human's
+                // keystrokes and must always reach the picker.
+                if refuse_if_draft
+                    && self
+                        .server
+                        .live_session_kind(&runtime_path)
+                        .is_some_and(|kind| {
+                            yggterm_core::agent_cli::agent_cli_descriptor(kind)
+                                .is_some_and(|descriptor| {
+                                    self.terminals
+                                        .session_screen_plain_rows(&runtime_path)
+                                        .is_some_and(|rows| {
+                                            let grid = rows.join("\n");
+                                            descriptor.screen_shows_startup_gate(&grid)
+                                        })
+                                })
+                        })
+                {
+                    return Ok(ServerResponse::Ack {
+                        message: Some(format!(
+                            "{STARTUP_GATE_REFUSAL_MESSAGE}: {runtime_path} is parked on its startup gate - answer it interactively (arrow keys + Enter), then resend"
+                        )),
+                    });
+                }
                 // The conditional submit, answered HERE for the same reason the
                 // draft guard is: this is where the runtime — and therefore the
                 // line — actually lives. A daemon that only proxies the row
@@ -21556,6 +21590,13 @@ pub fn terminal_write(endpoint: &ServerEndpoint, path: &str, data: &str) -> Resu
 /// reply. ⛔ Which is also the caveat: a bare acceptance from an old owner is not
 /// proof the guard ran, only that nothing objected.
 pub const DRAFT_REFUSAL_MESSAGE: &str = "refused: pending input draft";
+/// The prefix a STARTUP-GATE refusal carries. A programmatic send into a row
+/// parked on its CLI's first-run modal (agy's workspace-trust prompt) is not a
+/// delivery: the CLI discards the bytes and the trailing Enter ANSWERS the
+/// gate — measured 2026-09-10, agy 1.2.0 (pending-bugs [11.94]). Refused by
+/// name at the same seam as the draft guard, for the same reason: bytes that
+/// vanish while the reply says nothing are the worst available behaviour.
+pub const STARTUP_GATE_REFUSAL_MESSAGE: &str = "refused: startup gate shown";
 /// The prefix a conditional submit refuses with. ⛔ It must never be followed by
 /// the line itself — the line may be the human's own half-typed sentence.
 pub const SUBMIT_LINE_REFUSAL_MESSAGE: &str = "refused: composer line does not match";
@@ -21622,6 +21663,11 @@ pub fn terminal_submit_landed(message: Option<&str>) -> bool {
 /// Did this write land, or was it refused because the owner has unsent text?
 pub fn terminal_write_was_refused_for_draft(message: Option<&str>) -> bool {
     message.is_some_and(|message| message.starts_with(DRAFT_REFUSAL_MESSAGE))
+}
+
+/// Was this write refused because the row is parked on its CLI's startup gate?
+pub fn terminal_write_was_refused_for_startup_gate(message: Option<&str>) -> bool {
+    message.is_some_and(|message| message.starts_with(STARTUP_GATE_REFUSAL_MESSAGE))
 }
 
 pub fn terminal_resize(
@@ -30974,6 +31020,26 @@ mod tests {
     }
 
     #[test]
+    fn a_startup_gate_refusal_is_distinguishable_from_a_delivery() {
+        use super::terminal_write_was_refused_for_startup_gate as refused;
+        // Same law as the draft marker: the discriminator is a string, and an
+        // untested string discriminator drifts.
+        assert!(refused(Some(&format!(
+            "{}: cc-runtime://abc is parked on its startup gate - answer it interactively",
+            super::STARTUP_GATE_REFUSAL_MESSAGE
+        ))));
+        assert!(!refused(None), "a delivered write carries no message");
+        assert!(
+            !refused(Some("wrote 12 bytes")),
+            "an unrelated message is not a refusal"
+        );
+        assert!(
+            !refused(Some("this refused: startup gate shown is a suffix")),
+            "the marker must anchor at the start, or any prose containing it reads as a refusal"
+        );
+    }
+
+    #[test]
     fn an_endpoint_selector_is_read_by_shape_and_says_what_to_do_when_it_misses() {
         // Three forms, disambiguated by shape rather than by three flags,
         // because a reader of the census has a PID in hand and a reader of a
@@ -32443,6 +32509,28 @@ mod tests {
     /// it. This test states the split so that "finish the migration" cannot
     /// silently break the probe.
     #[test]
+    fn a_startup_gate_guard_reads_the_rows_own_descriptor_on_the_rendered_grid() {
+        let source = include_str!("daemon.rs");
+        // Per-descriptor, never the cross-CLI union ([11.92] — the gate's
+        // WORKING blocker was classified by a union once already).
+        assert!(
+            source.contains("descriptor.screen_shows_startup_gate(&grid)"),
+            "the startup-gate guard must ask the ROW'S OWN descriptor, not a union"
+        );
+        // The rendered grid, never the raw stream (a modal paints with
+        // absolute cursor moves; raw bytes fuse adjacent rows).
+        assert!(
+            source.contains("session_screen_plain_rows(&runtime_path)"),
+            "the startup-gate guard must read the rendered grid"
+        );
+        // Programmatic sends only: the flag is what separates an agent's send
+        // from a human's keystrokes reaching the picker.
+        assert!(
+            source.contains("if refuse_if_draft\n                    && self\n                        .server\n                        .live_session_kind(&runtime_path)"),
+            "the startup-gate guard must stay gated on refuse_if_draft"
+        );
+    }
+
     fn a_draft_guard_that_does_not_write_first_reads_the_union() {
         let source = include_str!("daemon.rs");
         let terminal_source = include_str!("terminal.rs");

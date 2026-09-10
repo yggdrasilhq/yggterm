@@ -85882,24 +85882,49 @@ async fn process_pending_app_control_requests(
                             },
                         );
                     }
-                    let read_nudge = dispatch_terminal_external_input_read_nudge(
-                        &session_path,
-                        read_nudge_reason,
-                    )
-                    .await;
-                    AppControlResponse {
-                        request_id: request.request_id.clone(),
-                        handled_by_pid: std::process::id(),
-                        completed_at_ms: current_millis() as u128,
-                        output_path: None,
-                        data: Some(json!({
-                            "accepted": true,
-                            "session_path": session_path,
-                            "bytes": data.len(),
-                            "read_nudge": read_nudge,
-                            "write": write_report.to_json(),
-                        })),
-                        error: None,
+                    // ⛔ A startup-gate refusal is a NAMED non-delivery, not an
+                    // error: the row is parked on its CLI's first-run modal, the
+                    // bytes were NOT written, and the remaining chunks (the
+                    // Enters) were NOT sent — which is the point, because that
+                    // Enter is what silently answers the gate (measured agy
+                    // 1.2.0, pending-bugs [11.94]). The caller re-tries AFTER a
+                    // human answers the gate; nothing says "accepted".
+                    if let Some(reason) = write_report.refused {
+                        AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: Some(json!({
+                                "accepted": false,
+                                "session_path": session_path,
+                                "reason": format!("{}_refusal", reason),
+                                "detail": "the row is parked on its CLI's startup gate (a first-run modal). Typed input is discarded by the CLI and the trailing Enter answers the gate. Answer it interactively in the row (arrow keys + Enter), then resend.",
+                                "bytes": data.len(),
+                                "write": write_report.to_json(),
+                            })),
+                            error: None,
+                        }
+                    } else {
+                        let read_nudge = dispatch_terminal_external_input_read_nudge(
+                            &session_path,
+                            read_nudge_reason,
+                        )
+                        .await;
+                        AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: Some(json!({
+                                "accepted": true,
+                                "session_path": session_path,
+                                "bytes": data.len(),
+                                "read_nudge": read_nudge,
+                                "write": write_report.to_json(),
+                            })),
+                            error: None,
+                        }
                     }
                 }
                 Err(error) => AppControlResponse {
