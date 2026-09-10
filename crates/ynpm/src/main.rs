@@ -2026,6 +2026,10 @@ fn git_head(checkout: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn yggterm_dev_artifact_name(name: &str) -> &str {
+    if name == "ynpx" { "ynpm" } else { name }
+}
+
 fn install_dev_bins(
     paths: &Paths,
     package: &str,
@@ -2309,9 +2313,9 @@ fn dev_checkout(
                     checkout
                         .join("target/release")
                         .join(if cfg!(target_os = "windows") {
-                            format!("{name}.exe")
+                            format!("{}.exe", yggterm_dev_artifact_name(name))
                         } else {
-                            name.to_string()
+                            yggterm_dev_artifact_name(name).to_string()
                         });
                 bins.insert(name.to_string(), executable);
             }
@@ -5038,6 +5042,13 @@ mod tests {
             candidates.get(1),
             Some(&PathBuf::from("/home/user/.yggterm/versions/3.2.91/ynpm"))
         );
+    }
+
+    #[test]
+    fn yggterm_dev_uses_one_manager_binary_for_ynpx() {
+        assert_eq!(yggterm_dev_artifact_name("ynpm"), "ynpm");
+        assert_eq!(yggterm_dev_artifact_name("ynpx"), "ynpm");
+        assert_eq!(yggterm_dev_artifact_name("yggterm"), "yggterm");
     }
 
     #[test]
