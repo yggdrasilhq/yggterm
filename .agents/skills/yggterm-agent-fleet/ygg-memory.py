@@ -1669,6 +1669,14 @@ def materialize_store(root: Path, namespaces: set[str] | None = None) -> dict:
     for (namespace, filename), records in groups.items():
         if namespaces is not None and namespace not in namespaces:
             continue
+        if filename == "MEMORY.md":
+            # Namespace indexes are per-host hand-curated state. Index-line
+            # edits carry no journal events, so materializing a journaled
+            # MEMORY.md head silently rewound every hand-appended line
+            # (fleet-wide 2026-08-22..09-09 defect, reintroduced by the
+            # 09-09 deploy that predated this fix). Old heads stay in the
+            # store; they are simply never materialized again.
+            continue
         heads = causal_heads_for(root, namespace, filename, records)
         if not heads:
             continue
@@ -1996,15 +2004,27 @@ def cmd_publish(args):
         watermark["last_sync_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         save_watermark(root, watermark)
 
-        # Update root MEMORY.md if absent or add pointer
-        memory_index = ns_dir / "MEMORY.md"
-        if not memory_index.exists():
-            memory_index.write_text(STEERING_HEADER + f"\n## Doors\n\n- [{dest_filename}]({dest_filename}) — {summary}\n", encoding="utf-8")
-        else:
-            idx_content = memory_index.read_text(encoding="utf-8")
-            if not idx_content.startswith("> 🌐 **UNIFIED FLEET MEMORY**") and "UNIFIED FLEET MEMORY" not in idx_content:
-                idx_content = STEERING_HEADER + "\n" + idx_content
-                memory_index.write_text(idx_content, encoding="utf-8")
+        # Update the namespace index (per-host hand state — deliberately NOT
+        # journaled; materialize_store never touches MEMORY.md). Idempotent
+        # per door filename; a failure here never fails the publish.
+        try:
+            memory_index = ns_dir / "MEMORY.md"
+            hook = (summary or kind or "door").replace("\n", " ").strip() or "door"
+            index_line = f"- [{dest_filename}]({dest_filename}) — {hook}"
+            if memory_index.exists():
+                idx_content = memory_index.read_text(encoding="utf-8")
+                if f"]({dest_filename})" not in idx_content:
+                    if "UNIFIED FLEET MEMORY" not in idx_content:
+                        idx_content = STEERING_HEADER + "\n" + idx_content
+                    if not idx_content.endswith("\n"):
+                        idx_content += "\n"
+                    memory_index.write_text(idx_content + index_line + "\n", encoding="utf-8")
+            else:
+                memory_index.write_text(
+                    STEERING_HEADER + f"\n## Doors\n\n{index_line}\n", encoding="utf-8"
+                )
+        except OSError as index_error:
+            print(f"ygg-memory: index line not updated: {index_error}", file=sys.stderr)
 
         if args.json:
             print(json.dumps({"status": "ok", "record": record}))
