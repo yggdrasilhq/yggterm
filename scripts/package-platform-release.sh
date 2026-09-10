@@ -47,7 +47,7 @@ elif [[ -n "$TARGET_TRIPLE" && "$TARGET_TRIPLE" != "$HOST_TRIPLE" ]] && command 
 else
   BUILD_CMD+=("build")
 fi
-BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless --bin ynpm --no-default-features)
+BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless -p ynpm --bin ynpm --no-default-features)
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
 YNPM_BIN_PATH="${ROOT_DIR}/target/release/${YNPM_BIN_NAME}"
