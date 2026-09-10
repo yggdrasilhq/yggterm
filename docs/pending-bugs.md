@@ -277,11 +277,11 @@ pty drive renders nothing. Lab + raw byte captures:
    parent conversation’s and id-discovery must read the fork chain,
    not just recency.
 
-### [11.6.0] acceptance: reattach SLA on a forced rotation (spec §9) — WRITER PROVEN LIVE 2026-09-10; remainder OWED
+### [11.6.0] acceptance: reattach SLA on a forced rotation (spec §9) — writer half proven live 2026-09-10
 
-**Status:** PARTIAL — writer half PROVEN on dev (isolated scratch home, real
-handoff rotation, worktree binaries): the superseded-self-retire sweep ran
-`AllMoved { moved: 1 }`, traced `reattach_ledger_written
+This acceptance item is OPEN. Writer half PROVEN on dev (isolated scratch
+home, real handoff rotation, worktree binaries): the superseded-self-retire
+sweep ran `AllMoved { moved: 1 }`, traced `reattach_ledger_written
 {adopted_records: 1, successor_version: 3.2.109}`, wrote a correct
 `ownership-ledger.json` (`adopted { by_pid: <successor>, by_start_time }`,
 witness = the predecessor pid), and the predecessor exited clean with the
