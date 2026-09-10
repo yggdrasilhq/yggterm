@@ -18,6 +18,78 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Two halves, one owner ruling (2026-09-10: *"only non-working daemons are auto
+updated... in case of running sessions like these we should connect to the old
+daemon"*):
+
+1. **The gate's WORKING blocker called the kind-agnostic
+   `screen_text_shows_agent_working` union** — ANY registered CLI's phrases
+   matched against ANY session's screen — even though the session's kind was
+   resolvable twenty lines above the call, and even though the union function's
+   own doc says callers with the kind in hand must use the per-CLI matcher.
+   Consequences measured in data and live: a plain shell whose screen quoted an
+   agent footer (an editor on this very source file, a cat of a CLI's output)
+   read as a WORKING agent; an agent idle at its own prompt could read another
+   CLI's needle. With WORKING now deadline-exempt (next half) every phantom
+   positive would have been a daemon that never updates.
+2. **`hot_restart_blocker_is_deadline_exempt` did not exempt WORKING**, so the
+   §5 deadline forced a swap straight through a live turn at 30 minutes. The
+   ruling replaces the force with old-daemon service: the working session's
+   daemon KEEPS SERVING (clients attach to it), the update waits, and §13's
+   24-hour stale-held notification keeps the wait visible. The force arm
+   survives only for deadline-stale recently-active sets and the user-initiated
+   hot-restart verb.
+
+FIXED ON `lane/trace/hot-restart-spec`: per-kind
+`hot_restart_gate_working_signal` (agent → own descriptor's phrases; plain
+shell → foreground job, app rows exempt; never a screen scrape for shells),
+WORKING added to the deadline-exempt set, spec §3.1 + §5.1 written.
+
+**Falsifier:** (a) `server gate-screen` on a shell row whose screen quotes an
+agent footer reports the row NOT blocking on `working`; (b) a daemon holding a
+genuinely working agent row through 30 minutes logs
+`daemon_cold_shutdown_deferred_idle_gate` naming it and never
+`hot_restart_forced_past_deadline` with a `working` blocker in the set; (c)
+the next natural update during a long codex/claude turn leaves the row's
+process alive on its (preserved or canonical) daemon — no twin-writer
+*"open in another app"* on the affected rows (read the PTY, not the trace).
+
+⭐ **(a) PROVEN LIVE 2026-09-10 ~10:20 on dev.** A scratch shell row
+(`local://tracefix-falsifier`) with `esc to interrupt` printed on its screen:
+the pre-fix build answered `gate verdict: working` (the phantom WORKING
+blocker); after the 3.2.94 build (lane/trace/hot-restart-spec) reached the
+host the REAL gate answered `recently_active` (correct — the row had painted
+output 1 s before) and, once the 300 s output-idle window passed with the
+phrase STILL on screen, `gate verdict: not blocking`. The verb's separate
+`screen_text_shows_agent_working` display line still answers the union
+question by name — it is the documented diagnostic of the union classifier,
+not the gate's decision. (b) and (c) stay armed on natural events.
+
+## ⛔ [11.93] THE PER-CLI WORKING-PHRASE TABLE HAS NEVER BEEN AUDITED AGAINST THE LIVE CLIS — A CLI WHOSE WORKING FOOTER THE TABLE MISSES READS IDLE MID-TURN (filed 2026-09-10)
+
+**Status:** OPEN
+
+The owner's 2026-09-10 hunch: *"yggterm's working indicator is buggy for ALL
+CLIs except codex, claude, and plain shells."* Codex and ClaudeCode needles are
+measured (their descriptor docs cite the PTY drives); the rest of the table
+(opencode, qwen, kimi, muse, antigravity, grokbuild, zcode-tui, pi) is
+unaudited. One concrete suspect already: **OpenCode's needle is
+`esc interrupt`**, which is not a substring of the conventional
+`esc to interrupt` footer spelling — if that is what opencode paints, its
+working indicator has NEVER fired, and per §3.1 the dangerous direction is
+exactly this: a silent mid-turn (tool exec writing nothing) clears every other
+arm, the gate reads idle, and the update fires into a live turn.
+
+THE AUDIT (standing campaign work, one CLI at a time): drive the real CLI in a
+PTY until it is mid-turn, read the working screen through
+`yggterm server gate-screen` (the §3 instrument, shipped), fix the needle,
+pin it with a descriptor test. Negations matter as much as needles: a
+completion trace must not arm the NEXT CLI that shares a footer word.
+
 
 ## ⛔ [11.57] A REMOTE RUNTIME LOST TO A DAEMON HANDOVER IS UNOWNABLE FOREVER — THE RESIZE RE-QUEUE BURNS ITS RETRIES AGAINST A CORPSE AND THE ROW COMPOSTS ITS SCREEN
 
