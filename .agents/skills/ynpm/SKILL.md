@@ -141,6 +141,12 @@ over only when its verified binary fingerprint differs. The GUI delegates its
 update check to this verb and owns only the notification and graceful,
 PTY-preserving restart. `ynpm sync` invokes the same self-update path.
 
+The first self-update also repairs old compatibility state. A historical
+fleet deploy may have left `fleet-deploy`/`fleet` as transport markers beside
+the active binary; ynpm maps those markers to the canonical yggterm GitHub
+release and rewrites the active version from the binary's `--version` answer.
+Never turn those legacy values into a release URL or hand-copy a replacement.
+
 For a new libyggterm app, declare the stable `package.json.yggterm.app` block
 documented in `docs/ynpm.md`. `binary` is a package bin key, not a path;
 `context_menu` is the explicit opt-in for workspace/session row menus. App
