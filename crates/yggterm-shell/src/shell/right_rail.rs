@@ -1802,7 +1802,12 @@ fn md_inline_plain_text(items: &[MdInline]) -> String {
     out
 }
 
-fn md_inline_nodes(items: &[MdInline], prose: &ProseTokens, ink: &ProseInk) -> Element {
+/// A markdown link-click contract, threaded from the widget that owns the
+/// POST channel: Some((action, callback)) makes every Link in the body POST
+/// the href as `values.value`; None keeps links inert (styled, no POST).
+type MdLinks = Option<(String, dioxus::prelude::Callback<(String, Option<String>)>)>;
+
+fn md_inline_nodes_linked(items: &[MdInline], prose: &ProseTokens, ink: &ProseInk, links: MdLinks) -> Element {
     let code_style = prose.inline_code_style(ink);
     let link_style = prose.link_style(ink);
     let image_frame_style = prose.image_frame_style();
@@ -1814,19 +1819,32 @@ fn md_inline_nodes(items: &[MdInline], prose: &ProseTokens, ink: &ProseInk) -> E
                     span { key: "t{index}", {md_text_with_inline_images(text, prose, ink)} }
                 },
                 MdInline::Code(code) => rsx! { code { key: "c{index}", style: "{code_style}", "{code}" } },
-                MdInline::Strong(children) => rsx! { b { key: "b{index}", {md_inline_nodes(children, prose, ink)} } },
-                MdInline::Emphasis(children) => rsx! { i { key: "i{index}", {md_inline_nodes(children, prose, ink)} } },
-                MdInline::Strikethrough(children) => rsx! { s { key: "s{index}", {md_inline_nodes(children, prose, ink)} } },
-                MdInline::Link { href, children } => rsx! {
-                    a {
-                        key: "a{index}",
-                        style: "{link_style}",
-                        title: "{href}",
-                        href: "{href}",
-                        prevent_default: "onclick",
-                        {md_inline_nodes(children, prose, ink)}
+                MdInline::Strong(children) => rsx! { b { key: "b{index}", {md_inline_nodes_linked(children, prose, ink, links.clone())} } },
+                MdInline::Emphasis(children) => rsx! { i { key: "i{index}", {md_inline_nodes_linked(children, prose, ink, links.clone())} } },
+                MdInline::Strikethrough(children) => rsx! { s { key: "s{index}", {md_inline_nodes_linked(children, prose, ink, links.clone())} } },
+                MdInline::Link { href, children } => {
+                    let click_links = links.clone();
+                    let click_href = href.clone();
+                    rsx! {
+                        a {
+                            key: "a{index}",
+                            style: "{link_style}",
+                            title: "{href}",
+                            href: "{href}",
+                            prevent_default: "onclick",
+                            onclick: move |evt: MouseEvent| {
+                                evt.prevent_default();
+                                // The widget's link contract: POST the declared
+                                // action with the href as values.value; inert
+                                // when the app declared no action (default).
+                                if let Some((action, cb)) = click_links.as_ref() {
+                                    cb.call((action.clone(), Some(click_href.clone())));
+                                }
+                            },
+                            {md_inline_nodes_linked(children, prose, ink, links.clone())}
+                        }
                     }
-                },
+                }
                 // An image is DISPLAYED, not linked. This is the one place a
                 // transcript full of pasted screenshots differs from a document,
                 // and it is why `MdInline::Image` is a typed node in
@@ -2391,17 +2409,17 @@ fn emd_component_node(
     }
 }
 
-fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: usize) -> Element {
+fn md_block_node_linked(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: usize, links: MdLinks) -> Element {
     match block {
         MdBlock::Heading { level, children } => {
             let style = prose.heading_style(*level, ink);
-            rsx! { div { key: "h{index}", style: "{style}", {md_inline_nodes(children, prose, ink)} } }
+            rsx! { div { key: "h{index}", style: "{style}", {md_inline_nodes_linked(children, prose, ink, links.clone())} } }
         }
         MdBlock::Paragraph(children) => rsx! {
             p {
                 key: "p{index}",
                 style: prose.paragraph_style(ink),
-                {md_inline_nodes(children, prose, ink)}
+                {md_inline_nodes_linked(children, prose, ink, links.clone())}
             }
         },
         MdBlock::CodeBlock(code) => rsx! {
@@ -2431,7 +2449,7 @@ fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: us
                 key: "q{index}",
                 style: prose.blockquote_style(ink),
                 for (child_index, child) in body.iter().enumerate() {
-                    {md_block_node(child, prose, ink, child_index)}
+                    {md_block_node_linked(child, prose, ink, child_index, links.clone())}
                 }
             }
         },
@@ -2443,7 +2461,7 @@ fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: us
                         key: "li{item_index}",
                         style: "{item_style}",
                         for (child_index, child) in item.iter().enumerate() {
-                            {md_block_node(child, prose, ink, child_index)}
+                            {md_block_node_linked(child, prose, ink, child_index, links.clone())}
                         }
                     }
                 }
@@ -2469,7 +2487,7 @@ fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: us
                             thead {
                                 tr {
                                     for (cell_index, cell) in header.iter().enumerate() {
-                                        th { key: "th{cell_index}", style: "{head_style}", {md_inline_nodes(cell, prose, ink)} }
+                                        th { key: "th{cell_index}", style: "{head_style}", {md_inline_nodes_linked(cell, prose, ink, links.clone())} }
                                     }
                                 }
                             }
@@ -2479,7 +2497,7 @@ fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: us
                                 tr {
                                     key: "tr{row_index}",
                                     for (cell_index, cell) in row.iter().enumerate() {
-                                        td { key: "td{cell_index}", style: "{cell_style}", {md_inline_nodes(cell, prose, ink)} }
+                                        td { key: "td{cell_index}", style: "{cell_style}", {md_inline_nodes_linked(cell, prose, ink, links.clone())} }
                                     }
                                 }
                             }
@@ -2503,17 +2521,26 @@ fn md_block_node(block: &MdBlock, prose: &ProseTokens, ink: &ProseInk, index: us
 /// meant the transcript silently inherited the rail's leading — every answer on
 /// the reading surface drew at line-height 1.55 while the turn around it, and
 /// the token set, said 1.72. Three surfaces, three names, no guessing.
-fn markdown_widget_body(source: &str, palette: &DocTheme, prose: ProseTokens) -> Element {
+fn markdown_widget_body_linked(
+    source: &str,
+    palette: &DocTheme,
+    prose: ProseTokens,
+    links: MdLinks,
+) -> Element {
     let blocks = parse_markdown_blocks(source);
     let ink = palette.prose_ink();
     rsx! {
         div {
             style: prose.root_style(),
             for (index, block) in blocks.iter().enumerate() {
-                {md_block_node(block, &prose, &ink, index)}
+                {md_block_node_linked(block, &prose, &ink, index, links.clone())}
             }
         }
     }
+}
+
+fn markdown_widget_body(source: &str, palette: &DocTheme, prose: ProseTokens) -> Element {
+    markdown_widget_body_linked(source, palette, prose, None)
 }
 
 /// The pure-Markdown reader with BLOCK CLICK-TO-EDIT ([[campaign-libyggterm]]
@@ -2619,7 +2646,7 @@ fn EditableMarkdownBody(
                                 }
                             }
                         },
-                        {md_block_node(block, &document_prose, &document_ink, index)}
+                        {md_block_node_linked(block, &document_prose, &document_ink, index, None)}
                     }
                 }
             }
@@ -3132,6 +3159,9 @@ const RIBBON_CSS: &str = r##"
 [data-document-ribbon] .ygg-ribbon-keys {
   margin-left: auto; font-size: 11px; font-weight: 600;
   color: var(--rb-muted); letter-spacing: .03em; white-space: nowrap;
+  /* A long mode line SHRINKS, it never clips off the strip (owner report
+     2026-09-10). Ellipsis keeps the buffer name, which leads the label. */
+  min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis;
 }
 [data-document-ribbon] .ygg-ribbon-backdrop {
   position: fixed; inset: 0; z-index: 1;
@@ -3880,23 +3910,12 @@ fn DocumentSurfaceBody(
                         {
                             let widget_key = widget.key(index, &value_epochs);
                             match widget {
-                                AppPaneWidget::Markdown { id, source, live_from } => rsx! {
+                                AppPaneWidget::Markdown { id, source, live_from, read_only, links_action } => rsx! {
                                     div {
                                         key: "{widget_key}",
                                         "data-document-markdown": "{id}",
                                         style: "padding:16px 28px 40px 28px; max-width:880px; width:100%; margin:0 auto; box-sizing:border-box;",
-                                        if live_from.is_empty() {
-                                            // The pure READER: no sibling editor, so
-                                            // blocks are click-to-edit in place
-                                            // (Phase 4 — Typora-lite, not WYSIWYG).
-                                            EditableMarkdownBody {
-                                                source: source.clone(),
-                                                doc: doc.clone(),
-                                                state,
-                                                session_path: session_path.clone(),
-                                                pane_id: pane_id.clone(),
-                                            }
-                                        } else {
+                                        if !live_from.is_empty() {
                                             // Live preview beside an editor: the
                                             // sibling's draft renders per keystroke,
                                             // no app round trip — and edits belong
@@ -3908,6 +3927,42 @@ fn DocumentSurfaceBody(
                                                     &doc,
                                                     ProseTokens::document(),
                                                 )
+                                            }
+                                        } else if *read_only || !links_action.is_empty() {
+                                            // The READ-ONLY projection (ymacs
+                                            // docs/spec-rendering.md): the plain prose
+                                            // body — never the block editor — and a
+                                            // link click POSTs the app's declared
+                                            // action with the href as values.value.
+                                            {
+                                                let run = run_action.clone();
+                                                let links = (!links_action.is_empty()).then(|| {
+                                                    (
+                                                        links_action.clone(),
+                                                        dioxus::prelude::Callback::new(
+                                                            move |(a, v): (String, Option<String>)| {
+                                                                run(a, v);
+                                                            },
+                                                        ),
+                                                    )
+                                                });
+                                                markdown_widget_body_linked(
+                                                    &source,
+                                                    &doc,
+                                                    ProseTokens::document(),
+                                                    links,
+                                                )
+                                            }
+                                        } else {
+                                            // The pure READER: no sibling editor, so
+                                            // blocks are click-to-edit in place
+                                            // (Phase 4 — Typora-lite, not WYSIWYG).
+                                            EditableMarkdownBody {
+                                                source: source.clone(),
+                                                doc: doc.clone(),
+                                                state,
+                                                session_path: session_path.clone(),
+                                                pane_id: pane_id.clone(),
                                             }
                                         }
                                     }
