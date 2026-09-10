@@ -995,7 +995,10 @@ fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::Instal
 /// deploys can leave a stale active version or transport-only repo/asset
 /// markers beside a newer binary. Repair it before querying production so the
 /// first `ynpm self-update` after an upgrade is itself safe and useful.
-fn repair_yggterm_install_state(context: &yggterm_core::InstallContext) -> anyhow::Result<()> {
+fn repair_yggterm_install_state(
+    paths: &Paths,
+    context: &yggterm_core::InstallContext,
+) -> anyhow::Result<()> {
     let Some(root) = context.managed_root.as_ref() else {
         return Ok(());
     };
@@ -1011,13 +1014,43 @@ fn repair_yggterm_install_state(context: &yggterm_core::InstallContext) -> anyho
         .ok()
         .and_then(|answer| version_from_answer(&answer))
         .unwrap_or_else(|| context.current_version.clone());
+    let repo = normalize_yggterm_release_repo(&context.repo);
+    let asset_label = normalize_yggterm_asset_label(&context.asset_label);
+    yggterm_core::write_direct_install_state(root, &repo, &asset_label, &version, executable)?;
+    mirror_legacy_compatibility_state(paths, root, &repo, &asset_label, &version, executable)?;
+    Ok(())
+}
+
+/// Keep an old `~/.yggterm/install-state.json` launch path pointed at the
+/// verified direct generation when a host still has that compatibility file.
+/// The canonical direct root remains authoritative; this mirror only prevents
+/// an older launcher from routing into a dead or stale generation.
+fn mirror_legacy_compatibility_state(
+    paths: &Paths,
+    active_root: &Path,
+    repo: &str,
+    asset_label: &str,
+    version: &str,
+    executable: &Path,
+) -> anyhow::Result<()> {
+    let compatibility_root = paths.home.join(".yggterm");
+    if compatibility_root == active_root
+        || !compatibility_root.join("install-state.json").is_file()
+        || !executable.is_file()
+    {
+        return Ok(());
+    }
     yggterm_core::write_direct_install_state(
-        root,
-        &normalize_yggterm_release_repo(&context.repo),
-        &normalize_yggterm_asset_label(&context.asset_label),
-        &version,
+        &compatibility_root,
+        &normalize_yggterm_release_repo(repo),
+        &normalize_yggterm_asset_label(asset_label),
+        version,
         executable,
     )?;
+    println!(
+        "ynpm: repaired legacy yggterm compatibility state to {}",
+        executable.display()
+    );
     Ok(())
 }
 
@@ -1227,6 +1260,14 @@ fn install_yggterm_release(
         &update.version,
         &yggterm,
     )?;
+    mirror_legacy_compatibility_state(
+        paths,
+        root,
+        &context.repo,
+        &context.asset_label,
+        &update.version,
+        &yggterm,
+    )?;
     publish_release_aux_link(&paths.home, &format!("ynpm{extension}"), &ynpm)?;
     publish_release_aux_link(&paths.home, &format!("ynpx{extension}"), &ynpx)?;
     let integrate = Command::new(&yggterm)
@@ -1295,6 +1336,14 @@ fn activate_yggterm_dev(paths: &Paths) -> anyhow::Result<()> {
         version,
         &yggterm,
     )?;
+    mirror_legacy_compatibility_state(
+        paths,
+        &root,
+        "yggdrasilhq/yggterm",
+        &asset,
+        version,
+        &yggterm,
+    )?;
     for name in ["ynpm", "ynpx"] {
         let target = generation.join(format!("bin/{name}"));
         if target.is_file() {
@@ -1322,7 +1371,7 @@ fn run_yggterm_self_update(paths: &Paths) -> anyhow::Result<YggtermUpdateReport>
             });
         }
     };
-    repair_yggterm_install_state(&context)?;
+    repair_yggterm_install_state(paths, &context)?;
     let current_version = context.current_version.clone();
     let dev_fingerprint = yggterm_dev_fingerprint(paths);
     let update = if dev_fingerprint.is_some() {
@@ -3731,6 +3780,14 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     }
     let yggterm = final_dir.join(format!("yggterm{extension}"));
     yggterm_core::write_direct_install_state(&root, &repo, &asset_label, version, &yggterm)?;
+    mirror_legacy_compatibility_state(
+        paths,
+        &root,
+        &repo,
+        &asset_label,
+        version,
+        &yggterm,
+    )?;
     for name in ["ynpm", "ynpx"] {
         publish_release_aux_link(
             &paths.home,
