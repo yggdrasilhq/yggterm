@@ -9343,6 +9343,54 @@ mod tests {
         assert_eq!(codex.store_home_prefix_of("/home/user/notes.jsonl"), None);
     }
 
+    /// ⛔ THE WRITE-THROUGH ARM WRITES THE STORE THE CLI ACTUALLY READS
+    /// (owner directive 2026-09-10): a rename through yggterm must land in
+    /// the CLI's native shape, or the CLI's own picker and the row disagree
+    /// about a name the human set. Fixture db, real write path.
+    #[test]
+    fn write_store_title_updates_the_zcode_session_db() {
+        let home = temp_home("write-through-zcode");
+        let db_dir = home.join(".zcode/cli/db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = rusqlite::Connection::open(db_dir.join("db.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, \
+             time_title_updated INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES ('sess_fixture1', 'old name')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(write_store_title(
+            &home,
+            SessionKind::ZcodeTui,
+            "sess_fixture1",
+            "owner rename",
+        ));
+        let conn = rusqlite::Connection::open(db_dir.join("db.sqlite")).unwrap();
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM session WHERE id = 'sess_fixture1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "owner rename");
+
+        // An unknown id is an honest false — the rename lives on the row; the
+        // store could not follow.
+        assert!(!write_store_title(
+            &home,
+            SessionKind::ZcodeTui,
+            "sess_absent",
+            "no such session",
+        ));
+    }
+
     #[test]
     fn store_roots_absolute_default_to_home_without_an_override() {
         let home = Path::new("/home/user");
