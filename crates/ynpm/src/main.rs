@@ -443,7 +443,12 @@ static YNPM_TRACE_RUN_ID: OnceLock<String> = OnceLock::new();
 
 fn ynpm_trace_run_id() -> &'static str {
     YNPM_TRACE_RUN_ID
-        .get_or_init(|| format!("ynpm-{}-{}", std::process::id(), now_ms()))
+        .get_or_init(|| {
+            std::env::var("YNPM_TRACE_RUN_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("ynpm-{}-{}", std::process::id(), now_ms()))
+        })
 }
 
 fn ynpm_trace_home(paths: &Paths) -> PathBuf {
@@ -3079,10 +3084,77 @@ fn fleet_push(
     outcome: &DevInstall,
     destination: &Path,
 ) -> anyhow::Result<()> {
+    ynpm_trace(
+        paths,
+        "fleet.push.begin",
+        serde_json::json!({
+            "package": &outcome.package,
+            "hosts": hosts,
+            "bins": &outcome.bins,
+        }),
+    );
+    let result = fleet_push_impl(paths, hosts, outcome, destination);
+    match &result {
+        Ok(()) => ynpm_trace(
+            paths,
+            "fleet.push.complete",
+            serde_json::json!({ "package": &outcome.package, "host_count": hosts.len() }),
+        ),
+        Err(error) => ynpm_trace(
+            paths,
+            "fleet.push.error",
+            serde_json::json!({
+                "package": &outcome.package,
+                "host_count": hosts.len(),
+                "error": trace_safe_detail(error),
+            }),
+        ),
+    }
+    result
+}
+
+fn fleet_push_impl(
+    paths: &Paths,
+    hosts: &[String],
+    outcome: &DevInstall,
+    destination: &Path,
+) -> anyhow::Result<()> {
     let key = outcome.storage_key.clone();
     let generation =
         paths.generation_dir(&key, outcome.marker.generation.as_deref().unwrap_or("dev"));
-    let ynpm_self = std::env::current_exe().context("locating ynpm for fleet bootstrap")?;
+    // Publishing a dev generation may atomically replace the link through
+    // which this process was launched. `current_exe()` can therefore answer
+    // with the deleted link (`/path/ynpm (deleted)`) halfway through this
+    // function. A yggterm dev generation contains the exact new manager, so
+    // use that stable inode; other packages use the stable ynpm publication
+    // before falling back to the process path.
+    let ynpm_self = if outcome.package == "@ygghq/yggterm" {
+        generation.join("bin/ynpm")
+    } else {
+        [
+            paths.root().join("bin/ynpm"),
+            paths.home.join(".local/bin/ynpm"),
+            paths.home.join(".yggterm/bin/ynpm"),
+            std::env::current_exe().context("locating ynpm for fleet bootstrap")?,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .context("locating a stable ynpm binary for fleet bootstrap")?
+    };
+    if !ynpm_self.is_file() {
+        bail!(
+            "ynpm bootstrap source is not a regular file: {}",
+            ynpm_self.display()
+        );
+    }
+    let remote_destination = if destination == paths.root().join("bin") {
+        "$HOME/.yggterm/ynpm/bin".to_string()
+    } else if destination == paths.home.join(".local/bin") {
+        "$HOME/.local/bin".to_string()
+    } else {
+        shell_quote(&destination.display().to_string())
+    };
+    let trace_env = format!("export YNPM_TRACE_RUN_ID={}; ", shell_quote(ynpm_trace_run_id()));
     for host in hosts {
         let remote_root = format!(
             ".yggterm/scratchpad/ynpm/incoming/{}-{}",
@@ -3095,6 +3167,11 @@ fn fleet_push(
         let bootstrap_cmd = format!(
             "mkdir -p $HOME/.local/bin && chmod 755 {bootstrap} && mv -f {bootstrap} $HOME/.local/bin/ynpm",
             bootstrap = bootstrap_remote
+        );
+        ynpm_trace(
+            paths,
+            "fleet.bootstrap.begin",
+            serde_json::json!({ "package": &outcome.package, "host": host }),
         );
         // Always send the current package manager first when a dev build is
         // distributed. This is what makes a new dev verb usable on a host
@@ -3109,6 +3186,11 @@ fn fleet_push(
         if !status.success() {
             bail!("could not copy ynpm to {host}");
         }
+        ynpm_trace(
+            paths,
+            "fleet.bootstrap.complete",
+            serde_json::json!({ "package": &outcome.package, "host": host }),
+        );
         let status = Command::new("ssh")
             .arg(host)
             .arg(format!("{bootstrap_cmd}; mkdir -p {remote_dir}"))
@@ -3116,6 +3198,7 @@ fn fleet_push(
         if !status.success() {
             bail!("could not prepare ynpm dev staging on {host}");
         }
+        let mut bin_args = String::new();
         for name in &outcome.bins {
             let local = generation.join("bin").join(name);
             let remote_file = format!("{remote_dir}/{name}");
@@ -3129,45 +3212,71 @@ fn fleet_push(
             if !status.success() {
                 bail!("could not push {name} to {host}");
             }
-            let watch = outcome
-                .marker
-                .watch
-                .as_deref()
-                .map(|watch| format!(" --watch {}", shell_quote(watch)))
-                .unwrap_or_default();
-            let integration = outcome
-                .integration
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
-            let integration = integration
-                .as_deref()
-                .map(|value| format!(" --integration-json {}", shell_quote(value)))
-                .unwrap_or_default();
-            let remote_dest = shell_quote(&destination.display().to_string());
             let remote_bin = format!("{}={remote_file}", shell_quote(name));
-            let command = format!(
-                "$HOME/.local/bin/ynpm install --dev --dest {remote_dest}{watch}{integration} --bin {name} {package}; rm -f {remote_file}; rmdir {remote_dir} 2>/dev/null || true",
-                remote_dest = remote_dest,
-                watch = watch,
-                integration = integration,
-                name = remote_bin,
-                remote_file = remote_file,
-                package = shell_quote(&outcome.package)
+            bin_args.push_str(&format!(" --bin {remote_bin}"));
+            ynpm_trace(
+                paths,
+                "fleet.bin.transfer.complete",
+                serde_json::json!({ "package": &outcome.package, "host": host, "bin": name }),
             );
-            let status = Command::new("ssh").arg(host).arg(command).status()?;
-            if !status.success() {
-                bail!("ynpm dev install failed on {host} for {name}");
-            }
         }
+        let watch = outcome
+            .marker
+            .watch
+            .as_deref()
+            .map(|watch| format!(" --watch {}", shell_quote(watch)))
+            .unwrap_or_default();
+        let integration = outcome
+            .integration
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let integration = integration
+            .as_deref()
+            .map(|value| format!(" --integration-json {}", shell_quote(value)))
+            .unwrap_or_default();
+        let command = format!(
+            "{trace_env}$HOME/.local/bin/ynpm install --dev --dest {remote_destination}{watch}{integration}{bin_args} {package}; rm -f {remote_root}/*; rmdir {remote_dir} 2>/dev/null || true",
+            trace_env = trace_env,
+            remote_destination = remote_destination,
+            watch = watch,
+            integration = integration,
+            bin_args = bin_args,
+            package = shell_quote(&outcome.package),
+            remote_root = format!("$HOME/{remote_root}"),
+            remote_dir = remote_dir,
+        );
+        ynpm_trace(
+            paths,
+            "fleet.import.begin",
+            serde_json::json!({
+                "package": &outcome.package,
+                "host": host,
+                "bins": &outcome.bins,
+            }),
+        );
+        let status = Command::new("ssh").arg(host).arg(command).status()?;
+        if !status.success() {
+            bail!("ynpm dev install failed on {host}");
+        }
+        ynpm_trace(
+            paths,
+            "fleet.import.complete",
+            serde_json::json!({ "package": &outcome.package, "host": host, "bins": &outcome.bins }),
+        );
         if outcome.package == "@ygghq/yggterm" {
             let status = Command::new("ssh")
                 .arg(host)
-                .arg("$HOME/.local/bin/ynpm activate-yggterm-dev")
+                .arg(format!("{trace_env}$HOME/.local/bin/ynpm activate-yggterm-dev"))
                 .status()?;
             if !status.success() {
                 bail!("could not activate the yggterm dev build on {host}");
             }
+            ynpm_trace(
+                paths,
+                "fleet.yggterm.activate.complete",
+                serde_json::json!({ "host": host, "version": &outcome.marker.supersedes }),
+            );
         }
         println!("ynpm: distributed {} dev build to {host}", outcome.package);
     }
