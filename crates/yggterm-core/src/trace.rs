@@ -223,10 +223,7 @@ pub fn append_trace_event(
     // so it is the better witness to what ran just before a stall.
     crate::ui_block::note_activity(&format!("{category_s}/{name_s}"));
     let record = EventTraceRecord {
-        ts_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default(),
+        ts_ms: crate::clock::amortized_unix_ms(),
         pid: std::process::id(),
         component: component_s.clone(),
         category: category_s.clone(),
@@ -280,10 +277,7 @@ pub fn append_tagged_trace_event(
     let name_s = name.into();
     crate::ui_block::note_activity(&format!("{category_s}/{name_s}"));
     let record = EventTraceRecord {
-        ts_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default(),
+        ts_ms: crate::clock::amortized_unix_ms(),
         pid: std::process::id(),
         component: component_s.clone(),
         category: category_s.clone(),

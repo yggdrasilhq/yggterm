@@ -23,6 +23,7 @@ pub mod cli_args;
 pub mod cli_install;
 pub mod cli_plane;
 pub mod click_grid;
+pub mod clock;
 pub mod gl_probe;
 mod icon;
 mod install;
