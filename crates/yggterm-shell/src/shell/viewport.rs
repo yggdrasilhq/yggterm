@@ -15223,7 +15223,8 @@ fn TerminalCanvas(
 }
 /// GUI-native ychrome profile picker (surface picker phase). Chrome-like:
 /// profile choice is a first-class step BEFORE any web page exists. Cards
-/// come from the GUI host's `~/.yggterm/web-profiles/` (+ Temporary + New);
+/// profiles come from the SESSION host's picker server when it answers, and
+/// from the GUI host's `~/.yggterm/web-profiles/` otherwise (+ Temporary + New);
 /// choosing GETs `/open?url=&profile=` on the app's control endpoint, whose
 /// handler re-emits the real OSC "open".
 #[component]
@@ -15252,6 +15253,28 @@ fn WebSurfacePickerView(
     // A refusal (bad avatar, unwritable jar, protected profile) shown in place
     // of the subtitle. Never a silent no-op.
     let mut picker_notice = use_signal(|| None::<String>);
+    // The SESSION host's profile names, fetched from the picker's own control
+    // endpoint (the egress-resolved forward of the app's loopback server).
+    // The GUI host's disk answers only when that fetch is impossible — a
+    // GUI-host session, or an app predating the /profiles route. None until
+    // the fetch answers: the first paint draws local names and the fetch
+    // corrects the card in place, so a slow forward costs a flash of local
+    // names, never an empty picker.
+    let mut session_host_profiles = use_signal(|| None::<Vec<String>>);
+    {
+        let control_url_for_effect = control_url.clone();
+        use_effect(move || {
+            let control_url = control_url_for_effect.clone();
+            spawn(async move {
+                let fetched =
+                    task::spawn_blocking(move || web_surface_picker_host_profiles(&control_url))
+                        .await;
+                if let Ok(Ok(names)) = fetched {
+                    session_host_profiles.set(Some(names));
+                }
+            });
+        });
+    }
     let _ = profiles_refresh();
     let picker_window = use_window();
     let picker_window_inner = picker_window.inner_size();
@@ -15270,7 +15293,13 @@ fn WebSurfacePickerView(
     // Name + metadata together: the ✕ has to know whether the profile is
     // protected, and the card has to know its avatar, and both must be the
     // truth on disk at this render rather than a remembered one.
-    let profiles = enumerate_web_surface_profiles()
+    // THE NAMES. The session host's list when its picker server answered,
+    // else the GUI host's disk — the honest enumerator for a GUI-host
+    // session, and the fallback for an app too old to serve /profiles.
+    let picker_profile_names = session_host_profiles()
+        .unwrap_or_else(enumerate_web_surface_profiles);
+    let profiles_total = picker_profile_names.len();
+    let profiles = picker_profile_names
         .into_iter()
         .map(|name| {
             let meta = web_surface_profile_meta(&name);
@@ -15284,7 +15313,6 @@ fn WebSurfacePickerView(
             name.to_lowercase().contains(&q)
         })
         .collect::<Vec<_>>();
-    let profiles_total = enumerate_web_surface_profiles().len();
     let profiles_filtered = profiles.len();
     // Profile-first (Chrome-like): the picker ONLY chooses identity. The URL
     // is typed later in the surface's address bar — an empty url in the /open
