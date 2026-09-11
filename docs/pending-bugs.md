@@ -589,6 +589,68 @@ source-measured, the §9 gate passes them as declared, and the first runnable
 probe verifies before any data moves. Re-verified today on kimi's own
 `--help`: `--session,--resume -S,-r` and `--model -m` still true on 1.50.0.
 
+## ⛔ [11.97] A LINGERING PREDECESSOR DAEMON IS UNREACHABLE BY PATH, AND THE RESUME WRAPPER BURNS ITS WHOLE DEADLINE AGAINST A SESSION THAT IS BEING SERVED (filed 2026-09-11, owner screenshot)
+
+**Status:** FIXED IN CODE on lane/integration/attach-sla — LIVE PROOF OWED
+(the very session from the report, `280cebaf…`, is still lingering on dev and
+is the acceptance probe).
+
+**The measured chain (all live on dev, 2026-09-11 ~22:20):**
+
+1. The owner opened a dev:remote agy row for a session whose row had vanished
+   from the GUI; the viewport spammed "Antigravity session … is already
+   running under yggterm (pid 382426); waiting to attach … Waiting 84s so
+   far" while the row sat Bootstrapping · idle, twice (two wrapper runs in
+   the trace, each the full 120 s deadline).
+2. Holder pid 382426: alive, `agy --conversation 280cebaf…`, parent pid
+   14833 — the PREVIOUS daemon generation, alive 22h BY DESIGN
+   (progressive migration blocked, gate=transcript_unknown).
+3. Tonight's successor daemon (same version LABEL 3.2.113, different bytes)
+   had unlinked-and-rebound `server-3-2-113.sock`; the predecessor's
+   listening socket measured UNLINKED-BUT-LIVE (`/proc/<pid>/fd` +
+   `/proc/net/unix`). Both bind the same pty-handoff path the same way. The
+   version label not bumping between pre/post-deploy builds is what makes
+   the collision possible; the migration hold making the predecessor live
+   for hours is what makes it certain.
+4. The wrapper's exact-key probe dials by PATH — it saw only the successor,
+   which holds the key as a preserved/hollow entry (not owned). Ledger
+   empty (the row never crossed). So a LIVE yggterm runtime of a live
+   yggterm daemon — the one case the SLA says must bridge, not wait — fell
+   through to the /proc scan, the stranded-holder banner, and the deadline.
+
+**Fixed in this lane (consulted: gemini-3.8-flash HIGH via agy, 2026-09-11 —
+Q1 accept-with-correction, Q2 REBUT adopted, Q5 requirements adopted):**
+
+- **Linger socket:** a non-retiring daemon whose versioned name is
+  HeldByAnother (a real successor bind — the verdict the reclaim law never
+  acts on) now binds `server-<ver>-linger-<pid>.sock`, glob-visible, pid as
+  the sweep witness, served from the existing reclaim thread. The probe glob
+  + `parse_lingering_server_socket_name` discover it; the owner matcher
+  classifies a linger endpoint STALE even at an equal label (consult Q2:
+  never Current — bridge now, hot-update pressure stays on) ⇒ the existing
+  stale-arm serves the session instantly. The linger name is deliberately
+  NOT a versioned name so the alias machinery can never treat it as one.
+- **Sweep:** the classify function knows the linger shape — pid alive ⇒
+  load-bearing, gone ⇒ the ordinary re-proved-sighting removal (consult Q5).
+- **Named fast-fail:** when the resume wait's holders are provably ours AND
+  their parent is a live `yggterm … server daemon` process, the wait answers
+  NAMED after a 15 s grace (transient row-close covered) — trace
+  `external_active_wait_named_served_by_daemon`, viewport names the serving
+  daemon pid — instead of 120 s of "Waiting Ns so far" against a session
+  that will not clear. /proc stays diagnostic; discovery stays the
+  registry's.
+- **Deliberately NOT this lane:** alias widening of `<kind>-runtime://` →
+  `local://` for non-codex/cc kinds (consult Q4 flags real false-positive
+  and birth-id-divergence traps; no measured case needs it yet — recorded as
+  an open question for the per-CLI seats). The pre-existing
+  `a_symlink_to_our_own_socket_is_self_not_a_peer` failure reproduces on
+  clean main on dev (environment-sensitive) — unrelated, needs an owner.
+
+**Acceptance (PTY law):** resume `280cebaf…` on dev after deploy → bridges
+to the live session (viewport shows the agent, not a banner);
+`external_active_wait` ABSENT for that resume; unit tests for the parser,
+the probe glob, and the served-holder law.
+
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

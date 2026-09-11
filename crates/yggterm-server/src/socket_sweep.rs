@@ -98,7 +98,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::daemon::{parse_retired_server_socket_artifact, parse_versioned_server_socket_name};
+use crate::daemon::{
+    parse_lingering_server_socket_name, parse_retired_server_socket_artifact,
+    parse_versioned_server_socket_name,
+};
 use crate::pty_handoff::parse_handoff_socket_name;
 use yggterm_core::append_trace_event;
 
@@ -401,6 +404,26 @@ pub(crate) fn classify_socket_entry(
         //     deliberately ignored here — a live daemon of the same version
         //     elsewhere says nothing about THIS retired path's owner.
         if let Some((_version, pid)) = parse_retired_server_socket_artifact(path) {
+            return match proc_pid_alive(pid) {
+                Some(true) => SocketVerdict::Keep(KeepReason::RetiredOwnerAlive),
+                Some(false) => match first_seen_dead_ms {
+                    Some(first) if now_ms.saturating_sub(first) >= SOCKET_DEAD_CONFIRM_MS => {
+                        SocketVerdict::Remove
+                    }
+                    _ => SocketVerdict::ConfirmLater,
+                },
+                None => SocketVerdict::Keep(KeepReason::Unreadable),
+            };
+        }
+        // 1b′. A lingering daemon's own socket
+        //      (`server-X-Y-Z-linger-<pid>.sock`, [11.97]): the pid in the
+        //      name is the liveness witness, exactly like the retired-<pid>
+        //      bequest above — alive ⇒ load-bearing (a still-running
+        //      predecessor serves status+bridge on it so its unmigrated rows
+        //      stay openable); gone ⇒ the ordinary re-proved-sighting removal.
+        //      KeepReason reuses RetiredOwnerAlive deliberately: the witness
+        //      is the same shape — the name's own pid, no census needed.
+        if let Some((_version, pid)) = parse_lingering_server_socket_name(path) {
             return match proc_pid_alive(pid) {
                 Some(true) => SocketVerdict::Keep(KeepReason::RetiredOwnerAlive),
                 Some(false) => match first_seen_dead_ms {

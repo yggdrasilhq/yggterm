@@ -2126,6 +2126,81 @@ fn linux_proc_ppid(pid: u32) -> Option<u32> {
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
+/// [11.97] — the pure decision core of the named fast-fail: a holder counts
+/// as SERVED only when it is provably ours (the environ marker), its parent
+/// is known and not init-reparented (orphans belong to the deadline's
+/// recovery arms), and that parent is a live `yggterm … server daemon`.
+fn holder_is_served_by_a_live_daemon(
+    holder: AgentResumeHolderKind,
+    ppid: Option<u32>,
+    parent_is_live_yggterm_daemon: bool,
+) -> bool {
+    holder == AgentResumeHolderKind::StrandedYggtermOwned
+        && ppid.is_some_and(|ppid| ppid != 1)
+        && parent_is_live_yggterm_daemon
+}
+
+/// Is `pid` a live yggterm daemon (`…yggterm[-headless] server daemon …`)?
+/// Thin on purpose: the /proc read stays here so the decision above is
+/// testable purely.
+#[cfg(target_os = "linux")]
+fn parent_is_live_yggterm_daemon(pid: u32) -> bool {
+    if !ownership_ledger::process_is_alive(pid) {
+        return false;
+    }
+    let Ok(raw) = fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&str> = raw.split('\0').filter(|arg| !arg.is_empty()).collect();
+    args.len() >= 3
+        && args[0].contains("yggterm")
+        && args[1] == "server"
+        && args[2] == "daemon"
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_is_live_yggterm_daemon(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod served_holder_law_tests {
+    use super::*;
+
+    #[test]
+    fn a_served_holder_needs_marker_parent_and_live_daemon() {
+        assert!(holder_is_served_by_a_live_daemon(
+            AgentResumeHolderKind::StrandedYggtermOwned,
+            Some(14833),
+            true
+        ));
+        // An external holder is not ours to name.
+        assert!(!holder_is_served_by_a_live_daemon(
+            AgentResumeHolderKind::External,
+            Some(14833),
+            true
+        ));
+        // An init-reparented holder is an orphan — the deadline's recovery
+        // arms own it, not the named fast-fail.
+        assert!(!holder_is_served_by_a_live_daemon(
+            AgentResumeHolderKind::StrandedYggtermOwned,
+            Some(1),
+            true
+        ));
+        assert!(!holder_is_served_by_a_live_daemon(
+            AgentResumeHolderKind::StrandedYggtermOwned,
+            None,
+            true
+        ));
+        // A parent that is not a live yggterm daemon proves nothing.
+        assert!(!holder_is_served_by_a_live_daemon(
+            AgentResumeHolderKind::StrandedYggtermOwned,
+            Some(14833),
+            false
+        ));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn external_agent_resume_processes_for_session(
     kind: SessionKind,
@@ -2282,6 +2357,29 @@ fn external_agent_resume_processes_for_session(
 /// `elapsed_secs` is re-rendered as the wait runs: one static line in a blank
 /// viewport is indistinguishable from a hang, which is precisely how this read
 /// to the person waiting on it.
+/// [11.97] — the NAMED answer when the holder is a live yggterm-owned CLI
+/// whose parent is a live yggterm daemon: the session is SERVED there, so
+/// waiting the full deadline cannot end it and the honest failure names the
+/// server. (Measured 2026-09-11 on dev: a lingering predecessor held
+/// `agy-runtime://280cebaf…` for 22h while every wrapper resume burned 120 s
+/// against pid 382426 — the banner named a pid and never said WHO serves it.)
+fn remote_resume_served_by_live_daemon_message(
+    kind: SessionKind,
+    session_id: &str,
+    daemon_pid: u32,
+    holder_pids: &[u32],
+) -> String {
+    let display = remote_runtime_agent_display(kind);
+    let pids = holder_pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "yggterm: {display} session {session_id} is already served by the yggterm daemon          (pid {daemon_pid}, still running) — holder process {pids} will not exit while that          daemon serves it, so this resume cannot attach. The session stays open there; retry          after that daemon hands the row over or exits."
+    )
+}
+
 fn remote_resume_external_active_message_with_elapsed(
     kind: SessionKind,
     session_id: &str,
@@ -2561,11 +2659,21 @@ const EXTERNAL_ACTIVE_WAIT_REPRINT: Duration = Duration::from_secs(10);
 const EXTERNAL_ACTIVE_WAIT_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Did the holder let go, or did we stop waiting for it?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ExternalResumeWait {
     Released,
     DeadlineExpired,
+    /// [11.97] — every holder is a live yggterm-owned CLI whose parent is a
+    /// live yggterm daemon: the session is SERVED there, so waiting the full
+    /// deadline cannot end it. The named answer says who serves it.
+    ServedByLiveDaemon { daemon_pid: u32, holder_pids: Vec<u32> },
 }
+
+/// [11.97] — how long the resume wait tolerates a SERVED holder (a live
+/// yggterm-owned CLI under a live yggterm daemon) before answering NAMED
+/// instead of burning the full deadline. Covers the transient: a row the
+/// owner is closing right now clears within this window.
+const EXTERNAL_LINGER_NAMED_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn wait_for_external_agent_resume_to_clear(
     kind: SessionKind,
@@ -2602,6 +2710,49 @@ fn wait_for_external_agent_resume_to_clear(
                 let _ = std::io::stdout().flush();
             }
             return ExternalResumeWait::Released;
+        }
+        // ⛔ [11.97] NAMED FAST-FAIL FOR A SERVED SESSION. When every holder is
+        // provably ours (its environ marker names a yggterm row) AND its parent
+        // is a live yggterm daemon, the session is being SERVED — the holder
+        // will not exit because we wait, so the deadline would burn 120 s to
+        // answer a question the holder's parent already answers. Give the
+        // transient case (a row being closed right now) the usual grace, then
+        // answer NAMED: which daemon serves it, and that waiting cannot attach
+        // this row. /proc here stays DIAGNOSTIC — discovery remains the
+        // registry's job (consult verdict 2026-09-11, gemini-3.8-flash HIGH).
+        let served_by_daemon = processes.iter().all(|process| {
+            holder_is_served_by_a_live_daemon(
+                process.holder,
+                process.ppid,
+                process
+                    .ppid
+                    .map(parent_is_live_yggterm_daemon)
+                    .unwrap_or(false),
+            )
+        });
+        if served_by_daemon && started.elapsed() >= EXTERNAL_LINGER_NAMED_GRACE {
+            let daemon_pid = processes
+                .iter()
+                .find_map(|process| process.ppid)
+                .unwrap_or(0);
+            let holder_pids = processes.iter().map(|process| process.pid).collect::<Vec<_>>();
+            append_trace_event(
+                home,
+                "remote",
+                "resume_codex",
+                "external_active_wait_named_served_by_daemon",
+                json!({
+                    "session_id": session_id,
+                    "daemon_pid": daemon_pid,
+                    "pids": holder_pids,
+                    "waited_secs": started.elapsed().as_secs(),
+                    "policy": "named_failure_over_silent_wait",
+                }),
+            );
+            if in_place {
+                println!();
+            }
+            return ExternalResumeWait::ServedByLiveDaemon { daemon_pid, holder_pids };
         }
         if started.elapsed() >= EXTERNAL_ACTIVE_WAIT_DEADLINE {
             // ⛔ BUG B2 SELF-RECOVERY (owner-caught 2026-09-02, "sessions opened
@@ -22242,6 +22393,14 @@ pub fn run_remote_resume_codex(
                     &external_agent_resume_processes_for_session(SessionKind::Codex, session_id),
                 ));
             }
+            if let ExternalResumeWait::ServedByLiveDaemon { daemon_pid, holder_pids } = wait {
+                anyhow::bail!(remote_resume_served_by_live_daemon_message(
+                    SessionKind::Codex,
+                    session_id,
+                    daemon_pid,
+                    &holder_pids,
+                ));
+            }
         }
         ownership_ledger::LedgerAnswer::NoAnswer => {}
         served => {
@@ -22521,6 +22680,14 @@ pub fn run_remote_resume_cc(
                     &external_agent_resume_processes_for_session(SessionKind::ClaudeCode, session_id),
                 ));
             }
+            if let ExternalResumeWait::ServedByLiveDaemon { daemon_pid, holder_pids } = wait {
+                anyhow::bail!(remote_resume_served_by_live_daemon_message(
+                    SessionKind::ClaudeCode,
+                    session_id,
+                    daemon_pid,
+                    &holder_pids,
+                ));
+            }
         }
         ownership_ledger::LedgerAnswer::NoAnswer => {}
         served => {
@@ -22633,6 +22800,14 @@ pub fn run_remote_resume_agent(
                     kind,
                     session_id,
                     &external_agent_resume_processes_for_session(kind, session_id),
+                ));
+            }
+            if let ExternalResumeWait::ServedByLiveDaemon { daemon_pid, holder_pids } = wait {
+                anyhow::bail!(remote_resume_served_by_live_daemon_message(
+                    kind,
+                    session_id,
+                    daemon_pid,
+                    &holder_pids,
                 ));
             }
         }
@@ -22886,6 +23061,24 @@ fn agent_runtime_key_aliases(runtime_key: &str) -> Vec<String> {
     keys
 }
 
+/// [11.97] — does this endpoint name a lingering daemon's own socket
+/// (`server-<ver>-linger-<pid>.sock`)? Name-derived on purpose: the name IS
+/// the contract here (the binder, the probe glob and the sweep all share its
+/// one parser), so no status-field bump is needed.
+#[cfg(unix)]
+fn endpoint_is_lingering_daemon_socket(endpoint: &ServerEndpoint) -> bool {
+    matches!(
+        endpoint,
+        ServerEndpoint::UnixSocket(path)
+            if crate::daemon::parse_lingering_server_socket_name(path).is_some()
+    )
+}
+
+#[cfg(not(unix))]
+fn endpoint_is_lingering_daemon_socket(_endpoint: &ServerEndpoint) -> bool {
+    false
+}
+
 fn remote_runtime_bridge_owner_from_statuses(
     statuses: Vec<(ServerEndpoint, ServerRuntimeStatus)>,
     runtime_key: &str,
@@ -22915,7 +23108,13 @@ fn remote_runtime_bridge_owner_from_statuses(
         else {
             continue;
         };
-        if runtime.server_version == current_version {
+        // ⛔ [11.97] A LINGERING DAEMON IS NEVER "CURRENT", even at an equal
+        // version label: its binary is the one the deploy replaced, and the
+        // consultant's rebuttal holds — classifying it Current would bypass the
+        // hot-update arm and pin its rows to deleted code. The stale arm below
+        // is the designed answer: bridge NOW, hot-update behind it.
+        let lingering = endpoint_is_lingering_daemon_socket(&endpoint);
+        if !lingering && runtime.server_version == current_version {
             return Some(RemoteRuntimeBridgeOwner::Current {
                 endpoint,
                 runtime_key: owned_key,
