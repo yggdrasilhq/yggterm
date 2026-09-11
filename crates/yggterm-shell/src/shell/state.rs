@@ -3453,6 +3453,41 @@ fn web_surface_picker_control_get(url: &str) -> Result<(), String> {
     // forgotten one.
     control_request(url, None, None).map(|_| ())
 }
+/// Parse a `/profiles` answer into profile names. Non-string entries are
+/// skipped, never trusted-by-position: the endpoint is served by the app's
+/// dep-light picker server, so the parse assumes nothing about ordering or
+/// extra fields.
+fn parse_picker_profiles_json(parsed: &serde_json::Value) -> Vec<String> {
+    parsed
+        .get("profiles")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The picker card's profile list from the APP's picker server — the SESSION
+/// host's truth. The GUI host's `~/.yggterm/web-profiles` enumerates honestly
+/// only when the app runs on this same host; for a remote session it is
+/// another machine's jar list, and drawing it was the "ychrome always opens
+/// on jojo" defect (a dev session's picker showed every GUI-host profile).
+/// Names only: avatar and protect metadata stay GUI-side per name (cosmetic
+/// for names absent locally), never identity. `Err` = unreachable or an app
+/// predating the route, and the caller falls back to the local enumeration —
+/// a picker that draws something beats one that draws nothing.
+fn web_surface_picker_host_profiles(effective_control_url: &str) -> Result<Vec<String>, String> {
+    let trimmed = effective_control_url.trim_end_matches('/');
+    let parsed = control_request(&format!("{trimmed}/profiles"), None, None)?;
+    let names = parse_picker_profiles_json(&parsed);
+    if names.is_empty() {
+        return Err("picker /profiles answered no names".to_string());
+    }
+    Ok(names)
+}
 
 /// One request against a libyggterm app's loopback control endpoint, returning
 /// the parsed JSON body. `body` present ⇒ POST, absent ⇒ GET.

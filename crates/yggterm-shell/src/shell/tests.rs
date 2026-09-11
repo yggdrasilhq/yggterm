@@ -11,6 +11,21 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_profiles_json_parse_keeps_string_names_and_skips_the_rest() {
+        let parsed = serde_json::json!({
+            "profiles": ["cfa", "youtube", 7, null, "yy"]
+        });
+        let names = parse_picker_profiles_json(&parsed);
+        assert_eq!(names, vec!["cfa".to_string(), "youtube".to_string(), "yy".to_string()]);
+    }
+
+    #[test]
+    fn picker_profiles_json_parse_of_a_garbage_body_is_empty_not_a_panic() {
+        assert!(parse_picker_profiles_json(&serde_json::json!("hello")).is_empty());
+        assert!(parse_picker_profiles_json(&serde_json::json!({})).is_empty());
+    }
     use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
