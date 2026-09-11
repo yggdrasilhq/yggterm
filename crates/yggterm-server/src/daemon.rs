@@ -25738,16 +25738,32 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     );
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if daemon_should_idle_shutdown(
-                        &home_dir,
-                        endpoint,
-                        last_activity_ms.as_ref(),
-                        idle_shutdown_ms,
-                        lock_daemon_runtime(&runtime, "daemon_idle_terminal_count")
-                            .terminals
-                            .stats()
-                            .session_count,
-                    ) {
+                    // ⭐ THE ACCEPT LOOP'S PULSE NEVER WAITS ON THE RUNTIME
+                    // LOCK. The idle-shutdown check is a background concern;
+                    // accepting connections is the daemon's lifeline. A
+                    // contended lock here means some worker is mid-decision —
+                    // exactly when an idle check is meaningless — so this arm
+                    // SKIPS the check and keeps accepting. (guihost 2026-09-11:
+                    // one stuck remote bootstrap held the runtime lock through
+                    // the launch funnel, this arm blocked on it, the accept
+                    // loop froze, and 3,100+ client connections queued with
+                    // zero answered — the whole host's yggterm went dark
+                    // behind a single wedged upload.)
+                    let idle_terminal_count = runtime
+                        .try_lock()
+                        .ok()
+                        .map(|guard| guard.terminals.stats().session_count);
+                    let should_shutdown = match idle_terminal_count {
+                        Some(session_count) => daemon_should_idle_shutdown(
+                            &home_dir,
+                            endpoint,
+                            last_activity_ms.as_ref(),
+                            idle_shutdown_ms,
+                            session_count,
+                        ),
+                        None => false,
+                    };
+                    if should_shutdown {
                         append_trace_event(
                             &home_dir,
                             "daemon",
@@ -27843,6 +27859,25 @@ fn canonical_hot_restart_executable(raw_path: &str) -> Result<PathBuf> {
                 canonical.display()
             );
         }
+    }
+    // ⛔ A SUCCESSOR IS NEVER A DOWNGRADE. The shell guards its own offers
+    // (`hot_update_handoff_would_refuse_binary`), but the daemon accepted any
+    // executable a requester named. guihost 2026-09-10/11: the direct channel's
+    // install-state.json sat at 3.2.105 through a network outage while the
+    // deployed app was 3.2.111, and every hot-restart successor spawned from
+    // that stale registry — the daemon stayed a version behind its own GUI
+    // for a day and the host skew never self-healed. The daemon now refuses
+    // a target that reports strictly older than itself; same-version newer
+    // builds (the normal deploy shape) still pass. Symmetric with the
+    // successor-side `handoff_target_regression_refused`.
+    if let Some(target_version) = crate::yggterm_executable_reported_version(&canonical)
+        && server_version_is_strictly_newer(env!("CARGO_PKG_VERSION"), &target_version)
+    {
+        bail!(
+            "hot restart target {} reports version {target_version}, older than this daemon {} — downgrade refused",
+            canonical.display(),
+            env!("CARGO_PKG_VERSION")
+        );
     }
     Ok(canonical)
 }

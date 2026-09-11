@@ -189,8 +189,29 @@ pub fn memory_pressure() -> (Option<f64>, Option<f64>) {
 /// lived there and nothing was looking.
 pub fn runtime_tmpfs_bytes() -> Option<u64> {
     let dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    fn walk(path: &Path, depth: u32) -> u64 {
+    #[cfg(unix)]
+    fn device_of(meta: &std::fs::Metadata) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        meta.dev()
+    }
+    #[cfg(not(unix))]
+    fn device_of(_meta: &std::fs::Metadata) -> u64 {
+        0
+    }
+    // The walk measures ONE tmpfs — the one mounted at XDG_RUNTIME_DIR.
+    // Directories on any other device (portal mounts, sshfs/samba leftovers,
+    // anything a session left mounted under /run/user) are other filesystems,
+    // and descending into them risks an unbounded FUSE wait on a dead mount
+    // (guihost 2026-09-11: this walk wedged the whole daemon in opendir on a
+    // stale mount). du -x law: never cross filesystems.
+    fn walk(path: &Path, depth: u32, root_dev: u64) -> u64 {
         if depth > 12 {
+            return 0;
+        }
+        let Ok(meta) = path.symlink_metadata() else {
+            return 0;
+        };
+        if !meta.is_dir() || device_of(&meta) != root_dev {
             return 0;
         }
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -211,12 +232,16 @@ pub fn runtime_tmpfs_bytes() -> Option<u64> {
             if meta.is_file() {
                 total += meta.len();
             } else if meta.is_dir() {
-                total += walk(&entry.path(), depth + 1);
+                total += walk(&entry.path(), depth + 1, root_dev);
             }
         }
         total
     }
-    Some(walk(Path::new(&dir), 0))
+    let root = Path::new(&dir);
+    let Ok(root_meta) = root.symlink_metadata() else {
+        return None;
+    };
+    Some(walk(root, 0, device_of(&root_meta)))
 }
 
 /// Cores burned by OUR process tree — the GUI and its webview helpers.

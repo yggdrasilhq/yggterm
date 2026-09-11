@@ -20257,6 +20257,16 @@ fn remote_bootstrap_install_command(remote_path: &str) -> String {
     )
 }
 
+/// Hard ceiling for one remote bootstrap upload (≈26MB binary over ssh):
+/// local pipe write + remote `cat` + install + stdout flush. Even a 1MB/s
+/// path finishes in under a minute; 300s is generously past any healthy
+/// link. This MUST be finite — the guihost wedge of 2026-09-11 (network died
+/// behind an established ssh session, TCP blackholed with no RST) blocked a
+/// `write_all` here FOREVER, and that thread held the per-target resolve
+/// lock, which held the launch funnel's runtime lock, which froze the whole
+/// daemon (3,100+ queued connections, zero answered).
+const REMOTE_BOOTSTRAP_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn upload_remote_bootstrap_payload(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -20277,22 +20287,92 @@ fn upload_remote_bootstrap_payload(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to start remote bootstrap for {ssh_target}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&payload)
-            .with_context(|| format!("failed to upload yggterm binary to {ssh_target}"))?;
+    // ⛔ THE UPLOAD IS BOUNDED. `stdin.write_all(&payload)` on a blocking pipe
+    // stalls forever once the remote stops draining (dead network behind an
+    // established session, throttled sshd, full remote disk) — `ConnectTimeout`
+    // only bounds the TCP connect, not the session. The write and both output
+    // drains run on their own threads so the calling thread can enforce the
+    // deadline; expiry kills the child, whose closing pipes unblock every
+    // thread with EOF/EPIPE. Bounded, named failure — never a wedged daemon.
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let writer = std::thread::Builder::new()
+        .name(format!("remote-bootstrap-write-{ssh_target}"))
+        .spawn(move || {
+            let mut stdin = stdin;
+            match stdin.as_mut() {
+                Some(stream) => stream.write_all(&payload).and_then(|()| stream.flush()),
+                None => Ok(()),
+            }
+        })
+        .context("spawning remote bootstrap writer thread")?;
+    fn spawn_drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> (Arc<Mutex<Vec<u8>>>, Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let drained = Arc::new(AtomicBool::new(false));
+        let Some(mut pipe) = pipe else {
+            drained.store(true, Ordering::Relaxed);
+            return (buffer, drained);
+        };
+        let sink = Arc::clone(&buffer);
+        let done = Arc::clone(&drained);
+        std::thread::spawn(move || {
+            let mut collected = Vec::new();
+            if pipe.read_to_end(&mut collected).is_ok()
+                && let Ok(mut guard) = sink.lock()
+            {
+                *guard = collected;
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        (buffer, drained)
     }
-    let output = child
-        .wait_with_output()
+    let (stdout_buffer, stdout_drained) = spawn_drain(stdout);
+    let (stderr_buffer, stderr_drained) = spawn_drain(stderr);
+    let expiry = Instant::now() + REMOTE_BOOTSTRAP_UPLOAD_TIMEOUT;
+    loop {
+        let stdout_done = stdout_drained.load(std::sync::atomic::Ordering::Relaxed);
+        let stderr_done = stderr_drained.load(std::sync::atomic::Ordering::Relaxed);
+        if writer.is_finished() && stdout_done && stderr_done {
+            break;
+        }
+        if Instant::now() >= expiry {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            anyhow::bail!(
+                "remote bootstrap upload to {ssh_target} stalled past {}s (network or remote stopped draining; child killed)",
+                REMOTE_BOOTSTRAP_UPLOAD_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    writer
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("remote bootstrap writer panicked")))
+        .with_context(|| format!("failed to upload yggterm binary to {ssh_target}"))?;
+    let output_status = child
+        .wait()
         .with_context(|| format!("failed waiting for remote bootstrap on {ssh_target}"))?;
-    if !output.status.success() {
+    let output_stdout = stdout_buffer
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let output_stderr = stderr_buffer
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    if !output_status.success() {
         anyhow::bail!(
             "remote bootstrap failed for {}: {}",
             ssh_target,
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&output_stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output_stdout).trim().to_string())
 }
 
 fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyhow::Result<String> {
@@ -20405,13 +20485,23 @@ fn local_bootstrap_executable_from_current(current: &Path, names: &[String]) -> 
 }
 
 fn local_remote_bootstrap_executable_from_current(current: &Path) -> Option<PathBuf> {
-    if let Some(preferred) = preferred_install_headless_bootstrap_executable(current) {
-        return Some(preferred);
-    }
+    // ⛔ THE BINARY YOU UPLOAD IS THE BINARY YOU ARE. Precedence here used to
+    // put the install registry's preferred executable FIRST, so a running
+    // daemon bootstrapped every remote with whatever version the (stale-able)
+    // install-state.json named instead of its own adjacent companion — guihost
+    // 2026-09-11: the direct channel sat at 3.2.105 through a network outage
+    // while 3.2.111 ran, and the test suite (`uses_adjacent_*`) has always
+    // encoded adjacency-first. The registry is the LAST resort, for installs
+    // where the running exe has no headless sibling at all.
     if current.is_file() && is_headless_bootstrap_path(current) {
         return Some(current.to_path_buf());
     }
-    local_bootstrap_executable_from_current(current, &headless_bootstrap_file_names(current))
+    if let Some(adjacent) =
+        local_bootstrap_executable_from_current(current, &headless_bootstrap_file_names(current))
+    {
+        return Some(adjacent);
+    }
+    preferred_install_headless_bootstrap_executable(current)
 }
 
 fn preferred_install_headless_bootstrap_executable(current: &Path) -> Option<PathBuf> {
@@ -20460,7 +20550,7 @@ fn resolve_remote_yggterm_binary(
     // entry needs no serialization with an in-flight resolve. Waiting on the
     // lock here is what turned "cache_hit" spans into 200s+ stalls queued
     // behind a slow host's first bootstrap scp (perf incidents 2026-07-17:
-    // practice bootstrapped=263.6s, cache_hit=218.6s in the same window),
+    // a remote bootstrapped=263.6s, cache_hit=218.6s in the same window),
     // and those stalls surfaced as multi-minute daemon_request/startup hangs.
     if let Some(binary_expr) = fresh_cached_remote_binary_expr(&cache_key, local_build_id) {
         finish_span(serde_json::json!({
@@ -44349,9 +44439,27 @@ terminal_window_id: None,
             }))?,
         )?;
 
+        // ⛔ THE RUNNING BINARY WINS, EVEN WHEN THE REGISTRY DISAGREES. This
+        // test used to assert the OPPOSITE — an old direct-installed daemon
+        // bootstraps remotes with the ACTIVE registry version — and the guihost
+        // outage of 2026-09-11 falsified that law from the other side: the
+        // registry can be STALER than the running binary (its channel refresh
+        // died with the network while deploys advanced), and the remote
+        // bootstrap cache validates against the RUNNING daemon's build id, so
+        // uploading any other generation is incoherent under skew in BOTH
+        // directions. A version-skewed host is the convergence planes' job to
+        // heal, not the bootstrap upload's to hide.
+        //
+        // (The registry keeps its legitimate case as the LAST resort — a
+        // running exe that is not a headless and has no headless sibling
+        // resolves through the active install. That arm is not asserted here
+        // because `detect_install_context` consults the machine-global install
+        // root, which on a host with a real direct install answers the real
+        // registry regardless of the staged one — the same env dependence that
+        // made the adjacency tests fail on guihost while passing on bare CI.)
         assert_eq!(
             local_remote_bootstrap_executable_from_current(&old_current),
-            Some(active_headless.clone())
+            Some(old_current.clone())
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -28965,3 +28965,133 @@ SHIPPED IN THE SAME LANE (the owner's dynamic-metadata requirement):
 name, never an invention; a zcode-tui session switch (or a muse/agy one)
 re-titles the row within ticks via the cure; `rows show` answers
 title_sources for every agent row; the privacy gate passes.
+
+---
+
+## ⛔ [11.96] ONE STALLED REMOTE BOOTSTRAP FROZE THE WHOLE DAEMON — THE UPLOAD WROTE FOREVER, HELD THE RESOLVE LOCK, THE LAUNCH FUNNEL HELD THE RUNTIME LOCK THROUGH IT, AND THE ACCEPT LOOP'S IDLE CHECK BLOCKED BEHIND THE SAME LOCK (guihost outage 2026-09-11, fixed in code same session)
+
+The guihost went fully dark: yggterm "not starting", nothing launched,
+`server status` hung, and the canonical socket answered NOTHING. Measured on
+the live wedged daemon (eu-stack + /proc/thread syscalls + strace):
+
+1. a fleet machine had been offline ~5 h (tailscale `last seen`) and a remote machine was
+   resetting ssh. The remote-machine scan threads entered
+   `resolve_remote_yggterm_binary` → `bootstrap_remote_yggterm` →
+   `upload_remote_bootstrap_payload`, whose `stdin.write_all(&payload)`
+   (~26 MB) blocked FOREVER — the ssh session was established but the remote
+   stopped draining (dead network behind open TCP = no RST, no error;
+   `ConnectTimeout` only bounds the connect). Two threads parked in that
+   write, each holding its target's resolve mutex.
+2. The terminal-launch funnel (`ensure_terminal_for_path_…`, a `&mut self`
+   method — the caller holds the GLOBAL daemon runtime lock across it) runs
+   the remote ensure's first-launch hop synchronously; it waited on that
+   resolve lock while holding the runtime lock.
+3. Every handler thread then blocked on `lock_daemon_runtime`; the accept
+   loop's idle-shutdown arm takes the same lock, so accepting itself froze —
+   the listen backlog filled to 4097/4096 and every later client connection
+   (ping, status, launch) queued unanswered. The daemon accepted and said
+   nothing: the owner's "nothing was launching properly".
+
+**Fixed in code (lane/trace/daemon-wedge-isolation):**
+- `upload_remote_bootstrap_payload` is bounded (`REMOTE_BOOTSTRAP_UPLOAD_TIMEOUT`,
+  300 s): the payload write and both output drains run on their own threads,
+  the caller enforces the deadline, expiry kills the child (whose closing
+  pipes unblock every thread) and the failure is NAMED
+  ("stalled past 300 s … child killed"). A stalled remote now costs one
+  bounded error, never a wedged daemon.
+- The accept loop's idle-shutdown check reads the terminal count through
+  `try_lock` and SKIPS the check when the runtime lock is contended — a
+  contended lock means the daemon is mid-work, exactly when an idle check is
+  meaningless. Accepting never again waits behind the runtime lock.
+
+**Structural half kept OPEN for 3.3.0 (the deterministic-pulse law):** the
+launch funnel still holds the runtime mutex across a bounded-but-remote ssh
+hop (≤300 s worst case). The full law — the runtime lock is NEVER held across
+remote I/O; request answering and rotation evaluation are structurally
+independent of remote-machine machinery — wants the lock discipline
+restructured, not patched; it is the strongest requirement the 3.3.0
+"reliable deterministic traffic indicators" milestone has produced.
+
+**Falsifier (natural, armed):** a host with a dead remote machine must keep
+answering `server status` and launching LOCAL rows while the scan to the dead
+machine runs; the bootstrap to the dead machine must end in the named
+timeout, and the daemon must stay live throughout. PARTIALLY PROVEN LIVE on
+guihost post-fix (that machine still down: scans fail continuously while status answers
+instantly); the full 300 s timeout path needs a half-open TCP remote.
+
+---
+
+## ⛔ [11.97] THE HOST-PANIC WATCHER'S TMPFS WALK CROSSES FILESYSTEMS — ONE DEAD FUSE MOUNT PARKED IT IN OPENDIR FOREVER (guihost 2026-09-11, fixed in code same session)
+
+`host_panic::runtime_tmpfs_bytes` walks `$XDG_RUNTIME_DIR` to measure tmpfs
+RAM, but nothing told it to STAY on the tmpfs: a directory entry that is
+itself a mountpoint (a dead sshfs left over from a workspace session at
+a stale workspace sshfs mount was one candidate; an xdg-desktop-portal FUSE mount
+under /run/user/1000 the likelier blocker) got descended into and the walk
+parked in `opendir` → `request_wait_answer` forever — thread 1424050 of the
+wedged daemon sat there for hours. The watcher is the crash-loop detector:
+an observability component that can hang on a hostile filesystem is a
+component that stops watching exactly when the host is misbehaving.
+
+**Fixed in code:** the walk records the root's `st_dev` once and never
+descends into a directory whose device differs (du -x semantics), so
+mountpoints of every kind — portal, sshfs, samba, anything a session left
+mounted under /run/user — are skipped at `symlink_metadata` cost. The
+existing symlink skip (uglass, 2026-08-23) is untouched and composes with
+it.
+
+**Falsifier:** mount any FUSE filesystem (even a healthy one) under
+$XDG_RUNTIME_DIR, unmount its backing transport, and verify the watcher
+still ticks (`runtime_tmpfs_bytes` in the trace advances, thread count
+stable). Proven by construction: the walk can no longer issue a syscall that
+enters a foreign device.
+
+---
+
+## ⛔ [11.98] THE HOT-RESTART SPAWN AUTHORITY TRUSTED A STALE INSTALL REGISTRY — THE DAEMON SAT ONE VERSION BEHIND ITS OWN GUI FOR A DAY (guihost 2026-09-10/11; downgrade refusal + adjacency-first fixed in code same session, channel-refresh health surface stays OPEN)
+
+The owner's report — "daemon was sitting in 3.2.105 while yggterm was
+3.2.111, hot-restart was not updating properly" — measured out as a VERSION
+AUTHORITY defect, not a rotation defect: hot-restart worked (successors
+spawned within seconds of every predecessor's death), but the successor's
+executable came from the direct channel's `install-state.json`
+(`active_version: 3.2.105`), whose channel refresh silently died with the
+network while the deployed binary in `~/.local/bin` advanced to 3.2.111.
+Every rotation reproduced the skew. Live proof during the unblock: killing
+the 3.2.105 daemon spawned a 3.2.105 successor; after provisioning 3.2.111
+into `direct/versions/` and healing the registry (backup
+`install-state.json.pre-3.2.111-heal-20260911`), the identical spawn produced
+a 3.2.111 successor.
+
+**Fixed in code:**
+- `canonical_hot_restart_executable` now REFUSES a hot-restart target that
+  reports strictly older than the running daemon (a successor is never a
+  downgrade — same-version newer builds pass; symmetric with the
+  successor-side `handoff_target_regression_refused` and the shell-side
+  `hot_update_handoff_would_refuse_binary`). A stale registry can no longer
+  pin a host to an old daemon.
+- `local_remote_bootstrap_executable_from_current` precedence is now
+  RUNNING BINARY → adjacent companion → install registry (was
+  registry-first): the binary uploaded to bootstrap a remote is the binary
+  that is running, and the remote bootstrap cache validates against the
+  RUNNING build id, so the old precedence was incoherent under skew in both
+  directions. The test that encoded registry-first
+  (`…_prefers_active_direct_install_headless`) is rewritten with the
+  falsifier story; the five `uses_adjacent_*` tests pass again on hosts
+  with a real direct install (they failed on guihost before the fix — an env
+  dependence that was itself a symptom of the wrong precedence).
+
+**OPEN (3.3.0):** the direct channel's refresh failure is SILENT — during the
+outage nothing named the registry as stale, and nothing today distinguishes
+"registry current" from "registry frozen since the last network-healthy
+tick". The deterministic-indicators milestone should carry a named
+`install_registry_stale_since` signal (age of install-state.json vs the
+running binary's build, surfaced in `server status`/`server map`) so the next
+outage reports itself instead of masquerading as a hot-restart defect.
+
+**Operational note for the unblock recipe (worked 2026-09-11):** provision
+the deployed binaries into `direct/versions/<ver>/` (yggterm,
+yggterm-headless, ynpm, ynpx), point `install-state.json` at it atomically,
+SIGTERM the stale daemon — the supervisor/GUI spawns a successor from the
+healed registry in seconds, and convergence retires any transient sibling on
+its own.
