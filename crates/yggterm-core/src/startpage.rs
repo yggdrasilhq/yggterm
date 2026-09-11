@@ -92,11 +92,13 @@ pub struct StartpageDurableRow {
 /// sessions will be invisible" on every run while `scan_opencode_sessions` and
 /// `scan_kimi_sessions` were reading them perfectly well.
 pub fn kind_has_dedicated_scanner(kind: crate::SessionKind) -> bool {
-    // ⛔ Kimi left this set 2026-08-30: its installed CLI (kimi-code 0.27)
-    // writes `~/.kimi-code/sessions/*/*/state.json` — glob-expressible, so the
-    // generic walk + `read_kimi_code_store_entry` own it, and the old
-    // `scan_kimi_sessions` (which read the DEAD `~/.kimi/` home the installed
-    // CLI never touches) is gone.
+    // ⛔ Kimi left this set 2026-08-30 and STAYS out on the 1.50 layout
+    // ([11.6.6-a], fixed 2026-09-11): `~/.kimi/sessions/*/*/wire.jsonl` is
+    // glob-expressible, so the generic walk + `read_kimi_store_entry` own it.
+    // History: the old `scan_kimi_sessions` read the then-dead `~/.kimi/`
+    // home; kimi-code 0.27 moved to `~/.kimi-code/.../state.json`; 1.50.0
+    // moved BACK to `~/.kimi/` with md5-of-cwd buckets — still
+    // glob-expressible, so no scanner revival.
     matches!(
         kind,
         crate::SessionKind::OpenCode | crate::SessionKind::Antigravity
@@ -1478,7 +1480,7 @@ mod scan_truth_tests {
         assert!(kind_has_dedicated_scanner(crate::SessionKind::OpenCode));
         assert!(
             !kind_has_dedicated_scanner(crate::SessionKind::Kimi),
-            "kimi's store moved to ~/.kimi-code and is glob-expressible now"
+            "kimi's store is glob-expressible on the 1.50 layout (~/.kimi md5 buckets) too"
         );
         assert!(!kind_has_dedicated_scanner(crate::SessionKind::Codex));
     }

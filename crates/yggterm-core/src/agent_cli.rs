@@ -2757,9 +2757,16 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `None` here and why that is NOT the hole the store-authority lock
         // hunts: there is nothing to read. This flips back only if the CLI
         // starts writing a title, in the same commit as the reader for it.
-        title_authority: TitleAuthority::Store, // OWNER TITLING LAW (2026-09-05): every
-        // CLI except codex and muse code self-titles; yggterm READS this CLI's title and
-        // never generates over it. kimi writes state.json title (first prompt; isCustomTitle on rename) — measured end-to-end 2026-08-30.
+        // ⛔ FLIPPED BACK TO `Generated` 2026-09-11 (kimi 1.50.0, measured on
+        // jojo): the 1.50 store has NO state.json and NO title key anywhere —
+        // the 2026-09-05 owner-law premise ("kimi writes state.json title,
+        // measured end-to-end 2026-08-30") described 0.27.0's store and died
+        // with that layout. `Store` over a title-less store is exactly the
+        // split-brain the block above documents: the scan half generates, the
+        // live half refuses, and the row wears its birth title forever (the
+        // [11.96] shape agy ships). Flips back to `Store` the day kimi writes
+        // a title again, in the same commit as the reader for it.
+        title_authority: TitleAuthority::Generated,
         // `kimi -r <unknown-id>` CREATES that session rather than failing, so a
         // caller-supplied id at birth is honoured. Its id is a directory name
         // verbatim, with no format validation.
@@ -2770,6 +2777,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // ⚠ Kimi's main turn spinner draws a moon frame with EMPTY text, and
         // its interrupt is Ctrl-C, not esc — there is no "esc to interrupt"
         // affordance to match. These are the per-block spinners.
+        // ⚠ UNVERIFIED ON 1.50.0 (2026-09-10/11 groundwork, no kimi
+        // credentials on the probe host): the phrases stay as DECLARED, not
+        // falsified — the first credentialed host re-measures them.
         working_screen_phrases: &[
             ScreenWorkingPhrase {
                 needle: "composing...",
@@ -2803,6 +2813,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // and re-derives the work dir from its own metadata.
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
+        // ⛔ [11.6.6-b] THE DECLARED GLYPH IS UNDRAWN ON 1.50.0 (measured
+        // 2026-09-10/11): kimi's composer is a labeled rule region
+        // `── input ──` with NO marker glyph, and the welcome panel prints
+        // `Session: <uuid>` on screen — a screen-level id source. The char
+        // field cannot say "none" (the drawable-glyph lock exists), so the
+        // stale ❯ stays DECLARED until the readiness gate grows a
+        // region-label shape — a consumer change, queued as [11.6.6-b], not
+        // silently re-pointed to a glyph kimi does not draw.
         composer_marker: '\u{276f}',
         composer_footer_hints: &["ctrl", "kimi", "/help", "tab"],
         working_footer_hints: &["composing...", "thinking..."],
@@ -2863,26 +2881,39 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Resume replays only the last 5 turns to the screen; the full history
         // stays on disk, so the PTY is NOT a faithful re-derivation.
         content_rederives_on_resume: false,
-        // ⛔⛔ THE STORE MOVED UNDER US (measured 2026-08-30, kimi 0.27.0):
-        // kimi-code writes `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<uuid>/`,
-        // one directory per session with `state.json` (title, workDir,
-        // createdAt/updatedAt, isCustomTitle) and `agents/main/wire.jsonl`.
-        // Everything earlier in this descriptor described `~/.kimi/` — the
-        // PREVIOUS kimi's home — which the installed CLI never touches, so
-        // yggterm's kimi rows read a dead store.
-        session_store_globs: &[".kimi-code/sessions/*/*/state.json"],
+        // ⛔⛔ [11.6.6-a] THE STORE MOVED UNDER US AGAIN (measured 2026-09-11 on
+        // jojo, kimi 1.50.0): the 2026-08-30 destination is itself a dead
+        // store now. A fresh 1.50.0 session is
+        // `~/.kimi/sessions/<md5hex-of-cwd>/<session-uuid>/` holding ONLY
+        // `context.jsonl` (role/content lines, system prompt first) and
+        // `wire.jsonl` (line 1 `{"type":"metadata","protocol_version":"1.10"}`,
+        // then timestamped `TurnBegin{user_input}` / `TurnEnd{}` events);
+        // `find ~/.kimi -name state.json` is EMPTY. The bucket name is the
+        // md5 hex of the cwd — VERIFIED on this host (md5("/home/pi") and
+        // md5("/tmp") are both bucket names verbatim) — and the cwd itself is
+        // recoverable from context.jsonl's embedded system prompt ("current
+        // working directory is `<path>`"). Three layouts inside a year
+        // (`~/.kimi` hashed buckets → `~/.kimi-code` state.json → `~/.kimi`
+        // md5 buckets): every kimi store claim carries its date on purpose.
+        session_store_globs: &[".kimi/sessions/*/*/wire.jsonl"],
+        // One file per session BY the glob: context.jsonl is deliberately not
+        // matched (it would yield a second entry per session — the grok
+        // summary.json lesson); the reader reaches it as the matched file's
+        // sibling when it needs the cwd.
         store_excluded_name_fragments: &[],
         durable_store_files: &[],
-        // None of the 2026-08-08 intake relocates its home with an env var.
+        // None of the intakes relocates its home with an env var.
         store_home_env_override: None,
         store_scan_gap: None,
-        read_store_entry: read_kimi_code_store_entry,
+        read_store_entry: read_kimi_store_entry,
         store_membership_index: None,
         live_session_argv_flag: None,
         live_session_marker: None,
-        // The session's own state.json carries `title` (the first prompt,
-        // `isCustomTitle` when the user renamed) — read it for live rows too.
-        read_live_store_title: Some(read_kimi_live_store_title),
+        // ⛔ `read_live_store_title` is None again: the reader it pointed at
+        // opens state.json, and 1.50.0 ships no state.json — there is nothing
+        // to read (see the title_authority block). Restored only together
+        // with a reader for a store that exists.
+        read_live_store_title: None,
         remote_live_store_title: Some(KIMI_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
@@ -3314,28 +3345,38 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("grok"),
         remote_row_scheme: Some("remote-grok://"),
         runtime_key_scheme: Some("grok-runtime://"),
+        // ⛔ THE 1.0.3-ERA NEEDLES ARE GONE (measured 2026-09-10 on grok
+        // 1.0.24, two live turns incl. one tool call): `esc to cancel`,
+        // `esc to interrupt`, `thinking...` and `working...` NEVER appear.
+        // The in-flight screen is a spinner line
+        // `⠸ Waiting for response… <N>s` with right-side `<N>s ⇣<bytes>
+        // [stop]`, and the hint bar swaps to `Ctrl+c:cancel` for the turn
+        // (working_footer_hints below). Keeping the dead needles was the
+        // false-IDLE-while-working defect: the classifier read a mid-turn
+        // grok as idle — the dangerous direction, the hot-restart gate
+        // swapping under a working turn ([11.92]'s twin). Needles are the
+        // stable fragments; the spinner char and ellipsis glyph vary.
         working_screen_phrases: &[
             ScreenWorkingPhrase {
-                needle: "esc to cancel",
+                needle: "waiting for response",
                 also_any: &[],
             },
             ScreenWorkingPhrase {
-                needle: "esc to interrupt",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "thinking...",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "working...",
+                needle: "[stop]",
                 also_any: &[],
             },
         ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
-        background_agent_hint_screen_phrases: &[],
+        // MEASURED 2026-09-10 on 1.0.24: a completed turn adds
+        // `Ctrl+b:send to bg` to the hint bar — the background-agent
+        // affordance this table exists for (hint-present + working-false is a
+        // healthy idle row, never a work signal).
+        background_agent_hint_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "ctrl+b:send to bg",
+            also_any: &[],
+        }],
         startup_gate_screen_phrases: &[],
         plan_limit_choice_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
@@ -3360,7 +3401,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // either the idle composer or the in-flight footer, and a hint in the
         // wrong half makes a working row read as a prompt.
         composer_footer_hints: &["/help for commands", "ctrl", "grok"],
-        working_footer_hints: &[],
+        // MEASURED 2026-09-10 on 1.0.24: the hint bar swaps to
+        // `Ctrl+c:cancel` for the turn's duration; idle has NO Ctrl+c. This
+        // is the row plane's honest work signal now that the old footer
+        // words are gone (the screen table above carries the spinner line).
+        // Empty here previously meant UNMEASURED-Unknown; it is measured now.
+        working_footer_hints: &["ctrl+c:cancel"],
         // MEASURED on the installed binary: `--permission-mode <MODE>` with
         // `[possible values: default, acceptEdits, auto, dontAsk,
         // bypassPermissions, plan]`. ⚠ `auto` and `dontAsk` are NOT mapped —
@@ -3443,6 +3489,20 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `chat_history.jsonl`, `events.jsonl` and `updates.jsonl`, and globbing
         // those would yield three entries for one session.
         session_store_globs: &[".grok/sessions/*/*/summary.json"],
+        // ⭐ THE TENANCY FIND (measured 2026-09-10 on 1.0.24): beside the
+        // durable store, `~/.grok/active_sessions.json` is a LIVE
+        // `[{session_id, pid, cwd, opened_at}]` registry
+        // (`active_sessions.lock` beside it) — the strongest row→session
+        // anchor of any class-C CLI: rebind discovery answered positively and
+        // pid-liveness-checked from one file. It is deliberately NOT in
+        // `durable_store_files` (it holds live sessions only, not history);
+        // the declared StoreIndex rebind chain (descriptor_v2 §2.2) already
+        // names it. Also measured: `events.jsonl` carries machine phase
+        // events (`phase_changed` → `streaming_text`, `turn_ended
+        // outcome=completed`) — the wire-grade phase source for a future
+        // event-fed classifier; `--resume <id>` REUSES the session id and
+        // re-registers it under the new pid (forking only via
+        // `--fork-session`).
         // The `.lock` siblings are not matched by the glob, so nothing to exclude.
         store_excluded_name_fragments: &[],
         durable_store_files: &[],
@@ -4923,56 +4983,45 @@ fn find_dir_by_name(root: &Path, depth: u8, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// [`read_store_entry`] for Kimi Code 0.27+: the session directory's
-/// `state.json` carries everything — `title` (the first prompt;
-/// `isCustomTitle` when renamed), `workDir`, `createdAt`/`updatedAt` — and
-/// the session id is the grandparent directory's own name (`session_<uuid>`).
-fn read_kimi_code_store_entry(path: &Path) -> Option<AgentStoreEntry> {
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let session_dir = path.parent()?.file_name()?.to_str()?.to_string();
-    if session_dir.is_empty() {
+/// [`read_store_entry`] for Kimi 1.50+: the glob matches the session's
+/// `wire.jsonl`; the session id is the parent directory's own name (a bare
+/// uuid verbatim). No file in the 1.50 layout carries a title (see the
+/// descriptor's title_authority block), and the bucket name is a one-way md5
+/// of the cwd — but the cwd survives as prose inside the session's own
+/// system prompt in the SIBLING `context.jsonl` ("current working directory
+/// is `<path>`", measured 2026-09-11): scrape the first backticked absolute
+/// path after the phrase, and fall back to home when kimi rewords it again.
+fn read_kimi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
+    let session_dir = path.parent()?;
+    let session_id = session_dir.file_name()?.to_str()?.to_string();
+    if session_id.is_empty() {
         return None;
     }
-    let cwd = value
-        .get("workDir")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let title = value
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    // Recency from the state.json FILE: kimi rewrites it every turn, so the
-    // mtime is the session's own clock without a second RFC3339 parse.
+    let cwd = std::fs::read_to_string(session_dir.join("context.jsonl"))
+        .ok()
+        .and_then(|text| {
+            const NEEDLE: &str = "current working directory is `";
+            text.find(NEEDLE).and_then(|at| {
+                let rest = &text[at + NEEDLE.len()..];
+                let end = rest.find('`')?;
+                let candidate = &rest[..end];
+                candidate.starts_with('/').then(|| candidate.to_string())
+            })
+        });
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        // The same fallback the 0.27 reader had: home, never empty.
+        None => dirs::home_dir()?.display().to_string(),
+    };
+    // Recency from the wire.jsonl FILE: kimi appends a typed event per turn,
+    // so the mtime is the session's own clock without an RFC3339 parse.
     Some(AgentStoreEntry {
-        session_id: session_dir,
-        cwd: if cwd.is_empty() {
-            dirs::home_dir()?.display().to_string()
-        } else {
-            cwd
-        },
+        session_id,
+        cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
-        title: title_without_fallbacks(title),
+        title: None,
         detail: None,
     })
-}
-
-/// [`AgentCliDescriptor::read_live_store_title`] for Kimi: the session
-/// directory's `state.json` `title` (the first prompt; `isCustomTitle` when
-/// the user renamed). Measured 2026-08-30 against kimi 0.27.0's real store.
-fn read_kimi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
-    if session_id.trim().is_empty() {
-        return None;
-    }
-    let sessions_root = home.join(".kimi-code/sessions");
-    if !sessions_root.exists() {
-        return None;
-    }
-    let session_dir = find_dir_by_name(&sessions_root, 2, session_id)?;
-    let entry = read_kimi_code_store_entry(&session_dir.join("state.json"))?;
-    title_without_fallbacks(entry.title)
 }
 
 fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
@@ -8385,27 +8434,32 @@ mod tests {
     }
 
     #[test]
-    fn a_kimi_live_title_reads_the_session_state_json() {
-        // kimi 0.27 moved to ~/.kimi-code and writes a real per-session
-        // state.json (title = first prompt, workDir, isCustomTitle). The old
-        // integration watched ~/.kimi — a home the installed CLI never
-        // touches — which is why kimi rows had no store title at all.
+    fn a_kimi_store_entry_reads_the_150_layout() {
+        // kimi 1.50 moved BACK to ~/.kimi — md5-of-cwd buckets, a bare-uuid
+        // session directory, and NO state.json (measured 2026-09-11 on jojo,
+        // [11.6.6-a]). The glob anchors on wire.jsonl; the cwd survives only
+        // as prose in the sibling context.jsonl's system prompt; no file
+        // carries a title, so the entry's title is None by construction.
         let home =
-            std::env::temp_dir().join(format!("yggterm-kimi-title-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("yggterm-kimi-store-{}", uuid::Uuid::new_v4()));
         let session_dir = home
-            .join(".kimi-code/sessions/wd_user-proj_ab12cd34")
-            .join("session_6c9d662b-d553-4d4e-a4f8-e10aeb810bbf");
+            .join(".kimi/sessions/ee92353f161d4cf6e8cde85dd517c632")
+            .join("6c9d662b-d553-4d4e-a4f8-e10aeb810bbf");
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(
-            session_dir.join("state.json"),
-            r#"{"title":"Fix the kimi store drift","workDir":"/home/user/proj","isCustomTitle":false,"createdAt":"2026-08-30T18:32:21.620Z","updatedAt":"2026-08-30T18:40:00.000Z"}"#,
+            session_dir.join("wire.jsonl"),
+            "{\"type\": \"metadata\", \"protocol_version\": \"1.10\"}\n",
         )
         .unwrap();
-        assert_eq!(
-            read_kimi_live_store_title(&home, "session_6c9d662b-d553-4d4e-a4f8-e10aeb810bbf")
-                .as_deref(),
-            Some("Fix the kimi store drift"),
-        );
+        std::fs::write(
+            session_dir.join("context.jsonl"),
+            "{\"role\": \"_system_prompt\", \"content\": \"You are Kimi Code CLI. The current working directory is `/home/user/proj`. Consider it the project root.\"}\n",
+        )
+        .unwrap();
+        let entry = read_kimi_store_entry(&session_dir.join("wire.jsonl")).unwrap();
+        assert_eq!(entry.session_id, "6c9d662b-d553-4d4e-a4f8-e10aeb810bbf");
+        assert_eq!(entry.cwd, "/home/user/proj");
+        assert_eq!(entry.title, None, "the 1.50 store holds no title");
         let _ = std::fs::remove_dir_all(&home);
     }
 

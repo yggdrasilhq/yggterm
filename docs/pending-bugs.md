@@ -35,9 +35,9 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.3 | opencode | B | OPEN (server truth DECODED 2026-09-10 — see the seat E section; descriptor v2 fills queue behind 11.6.0) |
 | 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
 | 11.6.5 | muse | C | OPEN (baseline measured 2026-09-10 — v2 data fixes queued: composer U+276F, phrase table, startup gate) |
-| 11.6.6 | kimi | C | OPEN (store drifted off state.json in 1.50.0 — batch-groundwork entry below) |
+| 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer OPEN (gate shape change); working phrases still login-gated-unverified |
 | 11.6.7 | qwen | C | OPEN |
-| 11.6.8 | grok | C | OPEN (working phrases drifted on 1.0.24, false-IDLE-while-working; live active_sessions.json registry — batch-groundwork entry below) |
+| 11.6.8 | grok | C | phrase drift FIXED in the descriptor (measured 1.0.24 needles + Ctrl+c footer swap + send-to-bg hint — entry below); active_sessions.json tenancy registry documented on the descriptor; events.jsonl event-fed classifier OPEN |
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
 | 11.6.11 | zcode-tui | B | OPEN (native announce LANDED on `lane/integration/zcode-tui` — emitter commit zcode-tui 0bd590f + daemon `announce` verb with fresh-phase precedence; arm-matrix gap open, see the entry below; live PTY proof owed) |
@@ -530,6 +530,64 @@ BROKEN: the native binary is missing
 and the fix (`npm install -g @avikalpa/codex-litellm`) needs root on the
 /usr/local prefix — owner-gated reinstall. First probe when runnable must
 VERIFY it inherits codex's store story, not assume it.
+
+### [11.6.6-a]/[11.6.6-b] kimi store re-drift fixed + glyphless composer filed; [11.6.8] phrase drift fixed (wave-2 batch fill seat, 2026-09-11, lane/integration/c-tail-fill)
+
+Unblocked by seat A's schema v2 (ee876a66). Every change is measured: this
+seat re-measured the kimi 1.50.0 store and the grok 1.0.24 artifacts
+directly on the muse lab host before touching data (the 09-10 groundwork
+findings reproduced; the md5 bucket scheme additionally VERIFIED —
+md5("/home/pi") and md5("/tmp") are bucket names verbatim).
+
+**[11.6.6-a] FIXED IN CODE — kimi store root drift, the second time.** The
+2026-08-30 fix (glob `.kimi-code/sessions/*/*/state.json` + a state.json
+reader) points at a dead store again: 1.50.0 writes
+`~/.kimi/sessions/<md5hex-of-cwd>/<session-uuid>/{context.jsonl,wire.jsonl}`,
+no state.json anywhere. Shipped: glob → `.kimi/sessions/*/*/wire.jsonl` (one
+file per session; context.jsonl deliberately unmatched), reader rewritten —
+session id = bare-uuid dir name, cwd scraped from the sibling context.jsonl
+system prompt ("current working directory is `<path>`", measured; home
+fallback when the wording drifts), mtime of wire.jsonl as the session clock.
+Future hardening noted, not this lane: verify the scraped cwd against
+md5(cwd) == bucket-name (core carries no md5 dependency yet).
+
+**Title authority flipped Store → Generated (split-brain fix).** The 1.50
+store holds NO title key anywhere, so the 2026-09-05 owner-law premise
+("kimi writes state.json title — measured end-to-end 2026-08-30") described
+0.27.0 and died with that layout. Keeping `Store` meant the scan half
+generated while the live half refused — rows wearing birth titles forever,
+the same shape as agy's [11.96]. `read_live_store_title` is None again
+(there is nothing to read). Flips back the day kimi writes titles, with the
+reader, in one commit.
+
+**[11.6.6-b] OPEN — the readiness gate cannot represent kimi's composer.**
+1.50.0 draws NO composer glyph: a labeled rule region `── input ──` (the
+declared ❯ is undrawn). `composer_marker` is a plain char under a
+drawable-glyph lock, so no data fill can be honest here; the gate needs a
+second composer shape (region-label) — a consumer change deliberately NOT
+hacked into a fill lane. Also measured for whoever takes it: the welcome
+panel prints `Session: <uuid>` on screen (a screen-level id source), and
+wire.jsonl's typed TurnBegin/TurnEnd events are the natural v2 phase feed.
+
+**[11.6.8] FIXED IN CODE — grok false-IDLE-while-working.** The four
+1.0.3-era needles never appear on 1.0.24 (groundwork measurement). The
+descriptor now carries the measured working state: the spinner line
+(`waiting for response`, `[stop]`), the hint-bar swap `ctrl+c:cancel` as the
+row-plane work signal (idle has no Ctrl+c), and `ctrl+b:send to bg` as the
+background-agent hint (a completion affordance — a healthy idle marker,
+never a work signal). Also documented on the descriptor:
+`~/.grok/active_sessions.json` is the live `[{session_id,pid,cwd,opened_at}]`
+tenancy registry (the declared StoreIndex rebind chain names it; deliberately
+NOT a durable_store_files member — it holds live sessions only), events.jsonl
+carries machine phase events for a future event-fed classifier, and
+`--resume <id>` reuses the id re-registered under the new pid. Re-verified on
+today's 1.0.24 artifacts: composer ❯, summary.json title, `--resume` flag.
+
+**11.6.7 / 11.6.9 / 11.6.10 — no descriptor edits**, per the availability
+record above (installed nowhere / wrapper broken root-gated): their rows are
+source-measured, the §9 gate passes them as declared, and the first runnable
+probe verifies before any data moves. Re-verified today on kimi's own
+`--help`: `--session,--resume -S,-r` and `--model -m` still true on 1.50.0.
 
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
