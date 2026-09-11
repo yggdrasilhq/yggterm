@@ -29117,7 +29117,6 @@ name, never an invention; a zcode-tui session switch (or a muse/agy one)
 re-titles the row within ticks via the cure; `rows show` answers
 title_sources for every agent row; the privacy gate passes.
 
-<<<<<<< HEAD
 ## ⛔ [identity-stale-metadata] EXHAUSTED ROWS FREEZE POISONED IDENTITY METADATA — NO PATH BACK TO THE BIRTH ID
 
 **Status:** OPEN
