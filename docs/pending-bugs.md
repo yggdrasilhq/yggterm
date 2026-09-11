@@ -18,6 +18,28 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ OWNER-REPORTED: FAVICONS DO NOT RENDER FOR ALL SITES, AND STALE ENTRIES PERSIST IN THE CACHE (filed 2026-09-11)
+
+**Status:** OPEN
+
+Owner-reported 2026-09-11 as one of the named daily-use
+blockers of the ychrome spec-up directive (ychrome queue, top entry — the two
+files cross-reference). Two symptoms, likely two mechanisms:
+
+1. **Sites exist whose favicon never renders.** The right rail's favicon lookup
+   fails for some sites outright — the engine never fetches, or the fetch
+   never reaches the rail. Measure which: same site in the webview vs a
+   chromium browser, and what `~/.yggterm/web-favicons` holds for it.
+2. **A stale icon, once cached, stays cached.** There is no observed
+   refresh/invalidation path — a site that changes its icon keeps showing the
+   old one indefinitely. The cache grows old without growing wrong, so nothing
+   complains.
+
+The render + cache live in `crates/yggterm-shell/src/shell/right_rail.rs` and
+`state.rs` (found by grep, not yet read). ⛔ The ychrome half of this blocker
+is the directive entry in `ychrome/docs/pending-bugs.md` — the user-visible
+symptom is ychrome's, the mechanism is here; do not fix half of it anywhere.
+
 ## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
 
 **Status:** OPEN
