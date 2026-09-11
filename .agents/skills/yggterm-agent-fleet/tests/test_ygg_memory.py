@@ -521,8 +521,97 @@ metadata:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+
+def run_dream_tests():
+    """Dream materializations 2026-09-11 (zcode@jojo): publish --as + mint
+    guard (ACK-bccf702553), delete-dispatch regression guard."""
+    import io
+    from contextlib import redirect_stderr
+
+    mod = load_module(YGG_MEMORY_SCRIPT)
+    tmp_root = Path(tempfile.mkdtemp(prefix="yggmem-dreams-"))
+    try:
+        dream_ns = "-dreams-check"
+        scratch = tmp_root / "scratch-name.md"
+        scratch.write_text(
+            "---\nname: real-door\ndescription: \"the door that deserves a name.\"\n"
+            "metadata:\n  type: finding\n---\n\n# Real Door\nBody.\n",
+            encoding="utf-8",
+        )
+
+        def pub_args(source, as_name=None, dest=None, root=None, ns=None):
+            a = type("ArgsPub", (), {})()
+            a.root = str(root or (tmp_root / "memory"))
+            a.harness = "zcode"
+            a.ns = ns or dream_ns
+            a.file = str(source)
+            a.kind = None
+            a.summary = None
+            a.target_harness = None
+            a.json = True
+            a.dest = dest
+            a.as_name = as_name
+            return a
+
+        mod.cmd_publish(pub_args(scratch, as_name="real-door.md"))
+        check("--as publishes under the given basename",
+              (mod.get_namespace_dir(tmp_root / "memory", dream_ns) / "real-door.md").exists())
+        check("--as does not mint the scratch basename",
+              not (mod.get_namespace_dir(tmp_root / "memory", dream_ns) / "scratch-name.md").exists())
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            mod.cmd_publish(pub_args(scratch, as_name="real-door.md"))
+        check("no mint warning for a known basename",
+              "never seen" not in err.getvalue())
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            mod.cmd_publish(pub_args(scratch, as_name="door-fresh.md"))
+        check("mint warning fires for an unseen basename",
+              "never seen" in err.getvalue())
+        check("warned mint still publishes (warn, not veto)",
+              (mod.get_namespace_dir(tmp_root / "memory", dream_ns) / "door-fresh.md").exists())
+
+        refused = False
+        try:
+            mod.cmd_publish(pub_args(scratch, as_name="a.md", dest="b.md"))
+        except SystemExit:
+            refused = True
+        check("--as and --dest are mutually exclusive", refused)
+
+        # Delete must work through main() dispatch - the 2026-09-11
+        # regression (verb implemented, dispatch branch missing) printed
+        # help and exited 0 instead of deleting.
+        dispatch_root = tmp_root / "memory-dispatch"
+        dispatch_ns = "-dreams-dispatch"
+        mod.cmd_publish(pub_args(scratch, root=dispatch_root, ns=dispatch_ns))
+        check("dispatch door exists before delete",
+              (mod.get_namespace_dir(dispatch_root, dispatch_ns) / "scratch-name.md").exists())
+
+        saved_argv = sys.argv[:]
+        dispatched = False
+        try:
+            sys.argv = [
+                "ygg-memory.py", "--root", str(dispatch_root), "--harness", "zcode",
+                "delete", f"--ns={dispatch_ns}", "--file", "scratch-name.md",
+            ]
+            mod.main()
+            dispatched = True
+        except SystemExit:
+            dispatched = False
+        finally:
+            sys.argv = saved_argv
+        check("delete runs through main() dispatch", dispatched)
+        check("dispatched delete removed the door",
+              not (mod.get_namespace_dir(dispatch_root, dispatch_ns) / "scratch-name.md").exists())
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run_tests()
+    run_dream_tests()
     if FAILURES:
         print(f"\n{len(FAILURES)} checks failed: {', '.join(FAILURES)}")
         sys.exit(1)
