@@ -647,10 +647,27 @@ Q1 accept-with-correction, Q2 REBUT adopted, Q5 requirements adopted):**
   `a_symlink_to_our_own_socket_is_self_not_a_peer` failure reproduces on
   clean main on dev (environment-sensitive) — unrelated, needs an owner.
 
-**Acceptance (PTY law):** resume `280cebaf…` on dev after deploy → bridges
-to the live session (viewport shows the agent, not a banner);
-`external_active_wait` ABSENT for that resume; unit tests for the parser,
-the probe glob, and the served-holder law.
+**Proof state (updated 2026-09-12):**
+
+- Named fast-fail — **LIVE-PROVEN on the deployed binary** against the very
+  session from the report: `resume-agy 280cebaf…` on dev answered NAMED in
+  16 s (15 s grace; was 120 s twice), trace
+  `external_active_wait_named_served_by_daemon {daemon_pid: 14833, pids:
+  [382426]}`; `external_active_wait_deadline` absent.
+- Linger arm — **LIVE-PROVEN in an isolated scratch home on dev**
+  (2026-09-12, real daemons untouched, deployed binary): a daemon whose
+  primary path was taken by a real successor bind bound
+  `server-3-2-113-linger-<pid>.sock` within the 15 s reclaim poll, traced
+  `lingering_daemon_socket_bound`, answered `status` through the linger
+  socket from its own pid, and never touched the successor's file (the
+  reclaim law held). Unit tests: parser orthogonality, probe-glob
+  discovery, served-holder law.
+- Still owed: the composite case on a REAL rotation — a lingering
+  predecessor running the fixed binary while a real successor serves the
+  primary, then a client resume bridging through the linger socket. The
+  felt instance (280cebaf) stays under the OLD binary until that daemon
+  retires or the owner hot-restarts it; until then it correctly receives
+  the named answer.
 
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
