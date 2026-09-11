@@ -1569,7 +1569,25 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
         style { "{WEB_TABS_SCROLL_CSS}" }
         div {
             "data-web-tabs-rail": "1",
-            style: "display:flex; flex-direction:column; gap:8px; min-height:0; flex:1 1 auto;",
+            style: "display:flex; flex-direction:column; gap:8px; min-height:0; flex:1 1 auto; user-select:none; -webkit-user-select:none;",
+            // ⛔ THE NATIVE-DRAG KILL. The rows run THEIR OWN pointer-drag
+            // engine (arm → threshold → hover → drop), but nothing here told
+            // WebKit that: whitespace text nodes BETWEEN the rows sit outside
+            // the rows' own user-select:none, so a gesture can anchor a
+            // selection there, and a later press landing on a standing
+            // selection makes WebKit start a NATIVE selection drag — trusted
+            // dragstart measured on a row label span. From there the pointer
+            // belongs to the drag loop: no mousemove, no mouseup, the row
+            // engine frozen mid-gesture, and WebKit's own drag image (a flat
+            // snapshot of the selected rows) following the pointer — the
+            // owner's "shadow drag of all the tabs" report. On X11 the empty
+            // drag usually cancels itself; on KDE Wayland it doesn't.
+            // dragstart bubbles, so ONE refusal here covers every row, the
+            // omnibox and the badges. A plain click clears the selection,
+            // which is why his second drag always worked.
+            ondragstart: move |evt: DragEvent| {
+                evt.prevent_default();
+            },
             // A drag that ends anywhere in the rail commits against whatever row
             // it was last over; ending over nothing is a no-op, never a silent
             // move to the root.
@@ -4456,6 +4474,17 @@ fn AppPaneRailBody(
             content: rsx!{
             div {
                 style: "display:flex; flex-direction:column; gap:10px;",
+                // Same native-drag refusal as the WebTabs rail: the reorder
+                // rows run the shared pointer-drag engine, and a selection
+                // seeded across the inter-row whitespace hands the next press
+                // to WebKit's own selection drag. NO user-select:none here —
+                // contributed panes carry reading surfaces that select text
+                // legitimately; refusing dragstart alone already kills the
+                // hijack. See the rail's dragstart comment for the measured
+                // failure.
+                ondragstart: move |evt: DragEvent| {
+                    evt.prevent_default();
+                },
                 // A release ANYWHERE in the pane ends the gesture, exactly as
                 // the WebTabs rail container does. Without it the only exit was
                 // the per-row handler, so letting go over a section heading, the

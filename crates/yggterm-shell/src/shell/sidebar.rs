@@ -436,6 +436,23 @@ fn Sidebar(
             div {
                 "data-sidebar-scroll": "1",
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
+                // ⛔ THE NATIVE-DRAG KILL, same as the WebTabs rail's. The tree
+                // rows run their own pointer-drag engine, but the whitespace
+                // text nodes BETWEEN rows belong to this container and inherit
+                // no user-select:none, so a gesture can seed a selection there —
+                // and a later press landing on a standing selection hands the
+                // pointer to WebKit's own selection drag (trusted dragstart,
+                // measured): no mousemove, no mouseup, the engine frozen, and
+                // WebKit's drag image following the pointer as a flat snapshot
+                // of the selected rows. dragstart bubbles, so one refusal here
+                // covers every row and the resize handle below. No
+                // user-select:none here on purpose — rename fields live inside
+                // and must keep their own selection; refusing dragstart alone
+                // already kills the hijack, because a standing selection can
+                // then never BE dragged.
+                ondragstart: move |evt: DragEvent| {
+                    evt.prevent_default();
+                },
                 onmousemove: move |evt| {
                     let primary_down = evt.held_buttons().contains(MouseButton::Primary);
                     let coords = evt.client_coordinates();

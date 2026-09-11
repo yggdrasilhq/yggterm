@@ -58401,6 +58401,65 @@ mod webtabs_menu_switcher_locks {
         );
     }
 
+    /// ⛔ THE NATIVE-DRAG HIJACK, refused at the containers. The rows run their
+    /// OWN pointer-drag engine, but WebKit doesn't know that: whitespace text
+    /// nodes BETWEEN rows can anchor a selection (they sit outside the rows'
+    /// user-select:none), and a later press landing on a standing selection
+    /// starts a NATIVE selection drag — measured live, trusted dragstart on a
+    /// row label span. The native drag's drag image follows the pointer as a
+    /// flat snapshot of the selected rows — the owner's "shadow drag of all
+    /// the tabs" — while the engine it belongs to freezes for lack of
+    /// mousemove/mouseup. One refusal per row-list container (dragstart
+    /// bubbles) is the whole fix; these locks keep the three of them standing.
+    #[test]
+    fn the_row_list_containers_refuse_native_dragstart() {
+        let source = product_source();
+        // (container stamp, whether the container's own STYLE opts out of
+        // selection seeding — only the tab rail, which has prose nowhere)
+        for (stamp, wants_user_select_none) in [
+            ("data-web-tabs-rail", true),
+            ("data-sidebar-scroll", false),
+        ] {
+            let start = source
+                .iter()
+                .position(|line| line.contains(&format!("\"{stamp}\"")))
+                .unwrap_or_else(|| panic!("{stamp}: the container vanished"));
+            // The container's own style line — not the whole window, which
+            // legitimately mentions neighbouring options in comments.
+            let style = source[start..(start + 4).min(source.len())]
+                .iter()
+                .find(|line| line.contains("style:"))
+                .unwrap_or_else(|| panic!("{stamp}: the container lost its style"));
+            assert_eq!(
+                style.contains("user-select:none"),
+                wants_user_select_none,
+                "{stamp}: the selection opt-out drifted (inputs inside must \
+                 keep their own selection; prose panes select legitimately)"
+            );
+            let body: String = source[start..(start + 60).min(source.len())].join("\n");
+            assert!(
+                body.contains("ondragstart"),
+                "{stamp}: the native-drag refusal is gone — one press on a \
+                 standing selection hands the gesture to WebKit and the row \
+                 drag freezes under its shadow:\n{body}"
+            );
+        }
+        // The contributed app-pane body refuses too, and deliberately does NOT
+        // opt out of selection: its prose widgets are reading surfaces.
+        let pane = source
+            .iter()
+            .position(|line| line.contains("fn AppPaneRailBody("))
+            .and_then(|start| {
+                source[start..(start + 400).min(source.len())]
+                    .iter()
+                    .position(|line| line.contains("ondragstart"))
+            });
+        assert!(
+            pane.is_some(),
+            "the contributed pane's row list lost its native-drag refusal"
+        );
+    }
+
     fn group_head_of(shell: &ShellState, tab_id: u64) -> Option<u64> {
         shell.web_surfaces["local://ws"]
             .tabs
