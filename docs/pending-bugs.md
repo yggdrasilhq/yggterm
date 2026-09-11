@@ -591,7 +591,7 @@ probe verifies before any data moves. Re-verified today on kimi's own
 
 ## ⛔ [11.97] A LINGERING PREDECESSOR DAEMON IS UNREACHABLE BY PATH, AND THE RESUME WRAPPER BURNS ITS WHOLE DEADLINE AGAINST A SESSION THAT IS BEING SERVED (filed 2026-09-11, owner screenshot)
 
-**Status:** FIXED IN CODE on lane/integration/attach-sla — LIVE PROOF OWED
+**Status:** FIXED IN CODE — LIVE PROOF OWED (lane/integration/attach-sla)
 (the very session from the report, `280cebaf…`, is still lingering on dev and
 is the acceptance probe).
 
