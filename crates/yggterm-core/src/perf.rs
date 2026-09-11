@@ -331,10 +331,7 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
     let _ = create_dir_all(home);
     let path = perf_telemetry_path(home);
     let event = json!({
-        "ts_ms": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default(),
+        "ts_ms": crate::clock::amortized_unix_ms(),
         // Which PROCESS spent this time. `append_trace_event` has always carried
         // one; the perf stream did not, and that omission is why "the daemon
         // background chore ran 13,316 times" could not be split across the three
