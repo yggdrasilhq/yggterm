@@ -18,22 +18,6 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ THE WEB-SURFACE PROFILE PICKER DREW THE GUI HOST'S PROFILE JARS FOR A REMOTE SESSION — "YCHROME ALWAYS OPENS ON JOJO"
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Filed 2026-09-12 ~00:45 (zcode seat, the trace-fix/ctx-menu-host-affinity report). Owner report: "when I spawn a session or an app from the context menu it should be on the same host as the spawnee … some other apps like ychrome always opens on jojo."
-
-**The shell was never at fault.** Measured end-to-end 2026-09-11 23:20–00:15 (shadow client `agent-1` on jojo, build b2b9fe3a): the row context menu's app-verb path (`spawn_launch_app_verb_here` → `terminal_launch_context_for_row`) resolves a dev session row's host correctly — the replay spawn created the SSH session on dev (`ssh -tt dev … yggterm server attach`), typed the app command, and ychrome ran ON DEV (PTY proof: `pi@dev:~$ exec /home/pi/.local/bin/ychrome`). Dev's ychrome daemon anchored the surface for dev's session ids (`local://44933175…`, `local://7c9c7e8f…`). Terminal/CLI spawns share the same resolver — correct, as the owner said.
-
-**The defect was one host-local read.** ychrome's no-URL spawn serves the profile picker on a session-host loopback (`profile picker open — http://127.0.0.1:37577/`) and declares it with action `pick`; the GUI renders its NATIVE picker card (`WebSurfacePickerView`, viewport.rs) but enumerated `enumerate_web_surface_profiles()` — **the GUI host's `~/.yggterm/web-profiles/`** — instead of the session host's jars. Live capture (shadow compositor, session `Machine: dev · remote`): the card drew **62 profiles — jojo's list verbatim** (agent-cap, agent-cf, hinge, medlabs-era names…); none of dev's unique profiles (agent-fin31, ejagriti, gmat-console) appeared, and the count matched `ls ~/.yggterm/web-profiles` on jojo exactly. jojo had no listener on the declared port, so the page was never fetched — the card is GUI-rendered from the wrong host's disk. The card's choose-click DID reach dev (the picker control_url is the egress-resolved `ssh -L` forward), so the list was the only lie — but a list lie is identity-level for a browser.
-
-**Fix (both repos, same defect):** ychrome's picker control server serves `GET /profiles` — the SAME `enumerate_profiles()` the HTML picker renders, from the session host (lane `lane/fix/picker-profiles-route`, merged to ychrome main 5c1d116). The GUI's `WebSurfacePickerView` fetches it through the egress-resolved control_url and falls back to the local enumeration only when the fetch cannot answer (GUI-host session, or an app predating the route); avatars/protect metadata stay GUI-side per name (cosmetic for names absent locally, never identity). yggterm lane `lane/trace/ychrome-picker-host-truth` (5edfd617), tests `picker_profiles_json_parse_*`.
-
-**Follow-up defects noticed, not fixed here (owner decision):** the picker card's ✕ delete and avatar edit still write the GUI host's disk — for a remote session those actions should route to the session host or be refused by name; and `lane/dev/11.24-ychrome` (40 unmerged commits, 3 weeks old in the ychrome repo) needs an owner ruling — merge or retire.
-
-**Falsifier:** spawn "New Ychrome" from a dev row's context menu in the live GUI: the picker card must list the SESSION host's profiles (dev shows agent-fin31/ejagriti/gmat-console, never jojo-only names), with the row's machine stamp `dev`. After live proof this entry retires.
-
 ## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
 
 **Status:** OPEN
