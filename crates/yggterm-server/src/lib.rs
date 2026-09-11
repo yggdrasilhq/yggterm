@@ -1288,6 +1288,24 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
             .as_deref()
             .is_some_and(|target| !is_loopback_ssh_target(target));
     }
+    // An SshShell row classifies by its TARGET, before any key-scheme arm. The
+    // ssh birth sites key remote shells `live::<uuid>`
+    // (`start_ssh_shell_session`, `start_local_session_with_launch_options…`,
+    // `focus_or_create_live_runtime`), and `live::` is ALSO a runtime-key
+    // scheme — so keyed ssh rows fell into the local kind whitelist below and
+    // were persist-dropped on every pass: erased at the next restart while
+    // nothing ever closed their PTY children (live 2026-09-12: six Ychrome
+    // rows erased across one evening, the apps still running, audio
+    // included, with no row anywhere). This is also the order the load-side
+    // twin [`persisted_live_session_is_recoverable`] already answers in; the
+    // two gates must not disagree about the same row. A loopback target stays
+    // unpersistable: a local row in ssh clothing is still a local row.
+    if session.kind == SessionKind::SshShell {
+        return session
+            .ssh_target
+            .as_deref()
+            .is_some_and(|target| !is_loopback_ssh_target(target));
+    }
     // A row holding a LOCAL live runtime key (local:// / codex-runtime://) is
     // a live runtime session regardless of its `source` — recovery-created
     // rows (opened from their CLI JSONL) carry source=Stored, and requiring
@@ -1299,11 +1317,7 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
     if session.source == SessionSource::LiveLocal || local_runtime_id_from_key(key).is_some() {
         return local_live_session_kind_is_recoverable(session.kind);
     }
-    session.kind == SessionKind::SshShell
-        && session
-            .ssh_target
-            .as_deref()
-            .is_some_and(|target| !is_loopback_ssh_target(target))
+    false
 }
 
 const RUNTIME_PERSISTENCE_METADATA_LABEL: &str = "Runtime Persistence";
@@ -5006,6 +5020,98 @@ mod persist_drop_trace_tests {
         assert!(
             !persist_drop_already_traced(key, "some_other_gate"),
             "a different reason for the same key is a new fact and must be traced"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_session_recoverable_tests {
+    use super::*;
+
+    fn ssh_shell_row(key: &str, ssh_target: Option<&str>) -> ManagedSessionView {
+        ManagedSessionView {
+            id: "2d46c0ea-501d-4fd5-9117-603f98b7090b".to_string(),
+            session_path: key.to_string(),
+            title: "New dev Terminal".to_string(),
+            kind: SessionKind::SshShell,
+            host_label: "dev".to_string(),
+            source: SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::RemoteBootstrap,
+            remote_deploy_state: RemoteDeployState::Ready,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![],
+            preview: SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            last_activity_epoch_ms: None,
+            ssh_target: ssh_target.map(str::to_string),
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            limit_wait: false,
+            awaiting_user_choice: false,
+            input_unanswered_ms: None,
+            pty_in_alternate_screen: None,
+            agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        }
+    }
+
+    /// The ssh birth sites key remote shells `live::<uuid>`, and `live::` is
+    /// ALSO a runtime-key scheme — so keyed ssh rows fell into the local kind
+    /// whitelist and were persist-dropped on every pass (live 2026-09-12: six
+    /// Ychrome rows erased across one evening, their apps still running). An
+    /// SshShell row must classify by its TARGET — the same answer the
+    /// load-side twin [`persisted_live_session_is_recoverable`] already gives.
+    #[test]
+    fn an_ssh_shell_row_keyed_live_persists_when_its_target_is_remote() {
+        let key = "live::2d46c0ea-501d-4fd5-9117-603f98b7090b";
+        let row = ssh_shell_row(key, Some("dev"));
+        assert!(
+            managed_live_session_is_recoverable(key, &row),
+            "a remote ssh shell keyed live:: must ride every persist — the key \
+             spelling must not demote it to the local kind gate"
+        );
+    }
+
+    #[test]
+    fn a_loopback_ssh_shell_row_keyed_live_stays_unpersistable() {
+        let key = "live::2d46c0ea-501d-4fd5-9117-603f98b7090b";
+        let row = ssh_shell_row(key, Some("127.0.0.1"));
+        assert!(
+            !managed_live_session_is_recoverable(key, &row),
+            "a loopback target is a local row in ssh clothing"
+        );
+    }
+
+    /// The local kind whitelist itself is unchanged: a live::-keyed plain
+    /// shell (the scheme's registered kind) still persists through it.
+    #[test]
+    fn a_live_keyed_local_shell_row_still_persists() {
+        let key = "live::2d46c0ea-501d-4fd5-9117-603f98b7090b";
+        let mut row = ssh_shell_row(key, None);
+        row.kind = SessionKind::Shell;
+        row.source = SessionSource::LiveLocal;
+        assert!(
+            managed_live_session_is_recoverable(key, &row),
+            "the reorder must not disturb the local kind whitelist"
         );
     }
 }

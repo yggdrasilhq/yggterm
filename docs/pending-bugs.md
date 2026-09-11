@@ -29117,6 +29117,7 @@ name, never an invention; a zcode-tui session switch (or a muse/agy one)
 re-titles the row within ticks via the cure; `rows show` answers
 title_sources for every agent row; the privacy gate passes.
 
+<<<<<<< HEAD
 ## ⛔ [identity-stale-metadata] EXHAUSTED ROWS FREEZE POISONED IDENTITY METADATA — NO PATH BACK TO THE BIRTH ID
 
 **Status:** OPEN
@@ -29141,3 +29142,58 @@ live in other rows and a fresh spawn binds exactly.
 **Falsifier:** a row frozen on a wrong id with no alias must, within one
 poll of exhausting, show its birth id in `server app rows` and resume as a
 fresh launch; the stale id appears nowhere.
+## ⛔ [11.98] AN SSH ROW KEYED `live::` IS PERSIST-DROPPED ON EVERY PASS — ERASED AT THE NEXT RESTART WHILE ITS APP KEEPS RUNNING (filed 2026-09-12, owner report: ychrome rows vanish from Live sessions while the audio keeps playing)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+(lane/trace/live-ssh-persist; the GUI host, night of 2026-09-11/12)
+
+**The measured chain (all live on the GUI host):**
+
+1. Six Ychrome rows persist-dropped in one evening (23:10:09 → 00:01:03) plus a
+   seventh deliberate replay row: every departure `reason=not_recoverable`,
+   detail `kind=SshShell source=LiveSsh ssh_target=dev`, title fallen back to
+   "New dev Terminal". The same rows' retained app declares say
+   `app_name=Ychrome, env_id=local://<same uuid>` — a LOCAL app row wearing an
+   SshShell-to-dev session record, both facts in one state file.
+2. Row `2d46c0ea…` at 00:01:03.455: `live_session_birth` already SshShell/dev
+   with a LOCAL cwd → `live_session_persist_dropped` at .459, 4 ms later →
+   `spawn`/`pty`/`first_bytes` all succeed after. The row lived while
+   unrecorded; at the next daemon restart nothing restored it and nothing ever
+   closed its process tree — the owner heard the row's YouTube long after the
+   row was gone from Live.
+3. The gate: the ssh birth sites mint `live::<uuid>` keys for SshShell sessions
+   (`start_ssh_shell_session`, `start_local_session_with_launch_options…`,
+   `focus_or_create_live_runtime`), and `live::` is ALSO a runtime-key scheme
+   (registered RowAndRuntimeKey/Local/Shell), so
+   `managed_live_session_is_recoverable`'s local-runtime arm keyed them into
+   `local_live_session_kind_is_recoverable(SshShell)` = false. The load-side
+   twin `persisted_live_session_is_recoverable` classifies the same row by
+   TARGET (non-loopback → recoverable); the two gates disagreed, and EVERY
+   plain remote shell row shared the defect — the departures ledger carries
+   persist-dropped "New dev Terminal" rows every day.
+
+**Fixed in this lane:** the persist gate asks SshShell rows by TARGET before
+any key-scheme arm (the load-side order), with the local kind whitelist
+untouched. Regression locks:
+`an_ssh_shell_row_keyed_live_persists_when_its_target_is_remote`,
+`a_loopback_ssh_shell_row_keyed_live_stays_unpersistable`,
+`a_live_keyed_local_shell_row_still_persists`.
+
+**Open half (filed here, NOT fixed — the ghost-audio orphan):** a web surface
+whose session was erased keeps playing. `sweep_stale_web_surfaces` only sweeps
+the ACTIVE-visible session's surface, and the reconciler's background hold
+keeps a backgrounded surface stashed-alive indefinitely on a comfortable
+machine (`web_surface_background_hold_ms_for` answers None) — it never asks
+whether the session still exists in the daemon's live set. Erasure (this bug),
+a genuine backgrounded app crash, or any future drop leaves a headless WebView
+playing media with no row anywhere. Fix shape: the reconciler's hold takes a
+confirmed-absence input — session absent from the daemon's live set AND from
+the persisted restore set beyond a grace window (a handover hop must not kill
+surfaces) → `close_web_surface` (kill forward + prune panes).
+
+**Falsifier:** open a remote (dev) row on the GUI host, run `ychrome` in it,
+note it in Live sessions, deploy (forcing a daemon rotation) — the row must
+still be in Live after the rotation and the departures ledger must record NO
+`persist-dropped` for it. The open half re-tests separately: erase a
+backgrounded surface session's row deliberately and the media must stop at the
+grace window.
