@@ -993,6 +993,7 @@ fn spawn_versioned_socket_name_reclaim(
         .name("yggterm-socket-reclaim".to_string())
         .spawn(move || {
             let mut reclaimed: Option<std::os::unix::net::UnixListener> = None;
+            let mut linger_listener: Option<std::os::unix::net::UnixListener> = None;
             let mut last_check_ms = 0_u64;
             loop {
                 let now_ms = current_millis() as u64;
@@ -1049,9 +1050,68 @@ fn spawn_versioned_socket_name_reclaim(
                                 );
                             }
                         }
+                    } else if verdict == OwnSocketName::HeldByAnother
+                        && !retiring.load(Ordering::SeqCst)
+                        && linger_listener.is_none()
+                    {
+                        // ⛔ [11.97] THE LINGERING PREDECESSOR. HeldByAnother is
+                        // the one verdict the reclaim never acts on — a REAL
+                        // socket stands at our name, and taking it would strand
+                        // whoever bound it. But the binder being our same-label
+                        // SUCCESSOR does not stop us from owning rows: the
+                        // progressive-migration hold can keep this daemon alive
+                        // for many hours (measured 2026-09-11 on dev: 22h, one
+                        // blocked agy row) while every PATH into it is gone —
+                        // a daemon nobody can dial owns rows nobody can open,
+                        // and a resume for one of those rows burned its whole
+                        // 120 s deadline polling /proc before failing unnamed.
+                        // So: never take the name; bind a name of our own
+                        // instead — `server-<ver>-linger-<pid>.sock`,
+                        // glob-visible, pid in the name as the sweep's liveness
+                        // witness — and serve it from this thread. The status
+                        // probe dials it like any versioned path, and the
+                        // bridge-owner matcher classifies a linger endpoint as
+                        // STALE even at an equal label, so the existing
+                        // "bridge now, hot-update behind it" arm serves the
+                        // session while drain pressure stays on. Deliberately
+                        // UNgated on row count: reaching this arm at all means
+                        // our address was taken while we live; a rowless linger
+                        // socket is inert (no owned keys to match) and the
+                        // sweep reaps it a day after our pid dies.
+                        let linger_path = lingering_server_socket_name_for(&path);
+                        match bind_lingering_listener(&linger_path) {
+                            Ok(listener) => {
+                                append_trace_event(
+                                    &home_dir,
+                                    "daemon",
+                                    "lifecycle",
+                                    "lingering_daemon_socket_bound",
+                                    serde_json::json!({
+                                        "path": linger_path.display().to_string(),
+                                        "pid": std::process::id(),
+                                        "server_version": SERVER_PROTOCOL_VERSION,
+                                        "reason": "our versioned name was taken by a real                                                    successor bind while we still run; serving                                                    status+bridge on our own name so owned rows                                                    stay openable",
+                                    }),
+                                );
+                                linger_listener = Some(listener);
+                            }
+                            Err(error) => {
+                                append_trace_event(
+                                    &home_dir,
+                                    "daemon",
+                                    "lifecycle",
+                                    "lingering_daemon_socket_bind_failed",
+                                    serde_json::json!({
+                                        "path": linger_path.display().to_string(),
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                        }
                     }
                 }
-                let Some(listener) = reclaimed.as_ref() else {
+                let served_primary = reclaimed.is_some();
+                let Some(listener) = reclaimed.as_ref().or_else(|| linger_listener.as_ref()) else {
                     // Nothing to serve yet: sleep until the next check is due
                     // rather than ticking, so an idle daemon pays one wake per
                     // interval instead of one per second forever.
@@ -1074,7 +1134,12 @@ fn spawn_versioned_socket_name_reclaim(
                     Err(_) => {
                         // A listener that will not accept is worse than none:
                         // drop it and let the next check re-bind.
-                        reclaimed = None;
+                        drop(listener);
+                        if served_primary {
+                            reclaimed = None;
+                        } else {
+                            linger_listener = None;
+                        }
                     }
                 }
             }
@@ -1082,6 +1147,47 @@ fn spawn_versioned_socket_name_reclaim(
     if let Err(error) = spawned {
         warn!(error=%error, "failed to spawn yggterm socket-name reclaim thread");
     }
+}
+
+/// The name a LINGERING daemon serves on: `server-<maj>-<min>-<patch>-linger-<pid>.sock`
+/// beside the primary it lost ([`spawn_versioned_socket_name_reclaim`], the
+/// HeldByAnother arm). The pid in the name is the liveness witness — the socket
+/// sweep classifies it by that alone, the same shape as the `retired-<pid>`
+/// bequest artifacts.
+#[cfg(unix)]
+fn lingering_server_socket_name_for(primary: &Path) -> PathBuf {
+    let stem = primary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".sock"))
+        .unwrap_or("server-0-0-0");
+    primary.with_file_name(format!("{stem}-linger-{}.sock", std::process::id()))
+}
+
+/// The parser twin of [`lingering_server_socket_name_for`]: the ONE owner of
+/// the linger name shape. The probe glob and the socket sweep borrow it so
+/// neither can disagree with the binder about what a linger socket is — and
+/// ⛔ a linger name is deliberately NOT a versioned name: the alias machinery
+/// must never treat one daemon's linger address as an alias of another's
+/// primary.
+#[cfg(unix)]
+pub(crate) fn parse_lingering_server_socket_name(path: &Path) -> Option<((u64, u64, u64), u32)> {
+    let file_name = path.file_name()?.to_str()?;
+    let (stem, pid_text) = file_name.strip_suffix(".sock")?.rsplit_once("-linger-")?;
+    let pid = pid_text.parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    let version = parse_versioned_server_socket_name(Path::new(&format!("{stem}.sock")))?;
+    Some((version, pid))
+}
+
+/// Bind a linger listener — nonblocking, like every daemon accept loop.
+#[cfg(unix)]
+fn bind_lingering_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 #[cfg(unix)]
@@ -18542,7 +18648,10 @@ fn versioned_server_status_probe_paths(home_dir: &Path) -> Vec<PathBuf> {
         let mut home_paths = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| parse_versioned_server_socket_name(path).is_some())
+            .filter(|path| {
+                parse_versioned_server_socket_name(path).is_some()
+                    || parse_lingering_server_socket_name(path).is_some()
+            })
             .collect::<Vec<_>>();
         home_paths.sort_by(|a, b| {
             parse_versioned_server_socket_name(b)
@@ -39094,6 +39203,55 @@ mod tests {
             .is_err()
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lingering_socket_names_parse_and_reject() {
+        let ok = Path::new("/h/server-3-2-113-linger-14833.sock");
+        assert_eq!(
+            super::parse_lingering_server_socket_name(ok),
+            Some(((3, 2, 113), 14833))
+        );
+        // A plain versioned name is not a linger name…
+        assert_eq!(
+            super::parse_lingering_server_socket_name(Path::new("/h/server-3-2-113.sock")),
+            None
+        );
+        // …and a linger name is NOT a versioned name: the alias machinery must
+        // never treat one daemon's linger address as an alias of another's.
+        assert_eq!(super::parse_versioned_server_socket_name(ok), None);
+        // pid 0 is not a witness.
+        assert_eq!(
+            super::parse_lingering_server_socket_name(Path::new("/h/server-3-2-113-linger-0.sock")),
+            None
+        );
+        assert_eq!(
+            super::parse_lingering_server_socket_name(Path::new("/h/server-3-2-113-linger-x.sock")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_paths_discover_a_lingering_daemons_socket() {
+        let home =
+            std::env::temp_dir().join(format!("ygg-probe-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::net::UnixListener::bind(home.join("server-9-9-1.sock")).unwrap();
+        std::os::unix::net::UnixListener::bind(home.join("server-9-9-1-linger-4242.sock"))
+            .unwrap();
+        let paths = super::versioned_server_status_probe_paths(&home);
+        let names: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("linger-4242")),
+            "the linger socket must be discovered: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]
