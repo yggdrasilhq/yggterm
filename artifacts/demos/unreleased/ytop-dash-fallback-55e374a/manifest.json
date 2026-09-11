@@ -1,4 +1,37 @@
 {
+  "bundle_version": 1,
+  "app_id": "yggterm",
+  "feature_id": "ytop-dash-fallback-55e374a",
+  "title": "ytop dash falls back to yggterm live sessions; Top shows daemon cost and live ZFS IOSTAT",
+  "status": "unreleased",
+  "category": "dashboard",
+  "user_value": "When the dash source reads empty, ytop falls back to daemon ground truth: 54 live sessions with the 5-min ring and a per-row Last-60s sparkline instead of `0 live`; the Top pane carries the Daemon Cost card (4.5x sharing win) and per-pool live ZFS IOSTAT; the viewport heartbeat no longer mints web surfaces (open-only).",
+  "source_repo": "yggdrasilhq/yggterm",
+  "links": {
+    "changelog_section": "3.2.0",
+    "site_demo_path": "/demos/yggterm/ytop-dash-fallback-55e374a"
+  },
+  "macro": {
+    "script": "cargo",
+    "args": ["test", "-p", "yggterm-shell", "--lib", "web_surface"]
+  },
+  "proof": {
+    "screenshots": false,
+    "recording": false,
+    "trace": true,
+    "app_state": true
+  },
+  "changelog": {
+    "section": "Added",
+    "summary": "ytop dash falls back to yggterm live sessions (54 live, per-row sparkline); Top gains the Daemon Cost card and live ZFS IOSTAT; viewport heartbeat is open-only"
+  },
+  "tags": [
+    "ytop",
+    "dashboard",
+    "fallback",
+    "zfs",
+    "proof-bundle"
+  ],
   "bundle": "ytop-dash-fallback-55e374a",
   "claim": "Dash fallback to yggterm live_sessions + Last 60s sparkline; Top daemon-cost + ZFS IOSTAT live; viewport heartbeat open-only",
   "commits": [
