@@ -1285,6 +1285,23 @@ the internal metadata/archive protocol behind that step. Omit `--dest` for an
 integrated CLI dev build so it lands in the server's `~/.yggterm/ynpm/bin`;
 older user-local dev states are bridged there during integrated sync.
 
+## 3e. repo-doctor - verify against ORIGIN/main before any cross-repo claim
+
+Cross-repo claims are verified against `origin/main`, never the local
+checkout - a stale checkout once nearly produced a false defect (dream
+ACK-4fbea73342). The verb fetches and prints the one line every
+verify-before-relay needs:
+
+```
+python3 .agents/skills/yggterm-agent-fleet/repo-doctor.py <repo>                # EVEN / N BEHIND / AHEAD / DIVERGED
+python3 .agents/skills/yggterm-agent-fleet/repo-doctor.py <repo> --ancestor <sha>   # did it land on origin?
+python3 .agents/skills/yggterm-agent-fleet/repo-doctor.py <repo> --grep PATTERN     # search ORIGIN's log, not local
+```
+
+`<repo>` is a path or a fleet name (yggterm, jyas, practice-rs, ydesign,
+yggdrasil, ...). Exit 0 = even/landed/found; 1 = behind/diverged/not-found;
+2 = error. Tests: `tests/test_repo_doctor.py`.
+
 ## 4. Correspondence — any session can reach any other
 
 A row is an address. That is the whole mechanism, and it needs no new protocol:
