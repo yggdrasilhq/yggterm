@@ -2062,12 +2062,35 @@ def cmd_publish(args):
         # namespace-relative subpath (e.g. campaign-cli-integration/codex.md).
         # Journal, watermark and index all key on this string, so a subpath
         # door is a first-class door everywhere a flat one is.
-        if getattr(args, "dest", None) and args.dest.strip():
+        if getattr(args, "as_name", None) and getattr(args, "dest", None):
+            raise SystemExit("ygg-memory: --as and --dest are mutually exclusive")
+        if getattr(args, "as_name", None):
+            if "/" in args.as_name:
+                raise SystemExit(
+                    "ygg-memory: --as takes a flat basename (no '/'); "
+                    "use --dest for subdirectory doors"
+                )
+            dest_filename = validate_door_filename(args.as_name.strip())
+        elif getattr(args, "dest", None) and args.dest.strip():
             dest_filename = validate_door_filename(args.dest.strip())
         else:
             dest_filename = source_path.name
         dest_path = ns_dir / dest_filename
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Dream ACK-bccf702553: warn when minting a basename the namespace
+        # has never seen — scratch-name publishes are how junk duplicate
+        # doors get minted (ten of them in -home-pi-gh-yggterm alone).
+        if not dest_path.exists() and not any(
+            r.get("file") == dest_filename
+            for r in read_journal_entries(root, namespace=ns)
+        ):
+            print(
+                f"WARNING: '{dest_filename}' is a basename namespace '{ns}' has "
+                f"never seen — you may be minting a duplicate of an existing "
+                f"door. Use --as/--dest with the existing door name to update "
+                f"in place.",
+                file=sys.stderr,
+            )
 
         content = source_path.read_text(encoding="utf-8")
         kind, summary, extracted_target = extract_metadata_and_summary(content, Path(dest_filename).name)
@@ -2658,7 +2681,14 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
         else:
             unreachable.append(peer)
 
-    local_lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
+    # Dream ACK-d7795fc74c: block generously for a busy hub instead of a
+    # fail-fast; on expiry cmd_sync_fleet reports a deferral (success), and
+    # operators can raise YGG_MEMORY_FLEET_LOCK_WAIT (seconds) in known-busy
+    # windows.
+    local_lock = _flock_open(
+        root / ".ygg-memory.lock",
+        timeout_seconds=float(os.environ.get("YGG_MEMORY_FLEET_LOCK_WAIT", "60")),
+    )
     try:
         migrate_legacy_store(root)
     finally:
@@ -2952,6 +2982,7 @@ def main():
     p_pub = subparsers.add_parser("publish", parents=[common_parser], help="Publish a local file into unified memory")
     p_pub.add_argument("--file", required=True, help="Source markdown file to publish")
     p_pub.add_argument("--dest", default=None, help="Door path relative to the namespace; may include subdirectories (e.g. campaign-cli-integration/codex.md). Defaults to the source basename.")
+    p_pub.add_argument("--as", dest="as_name", default=None, help="Door basename shorthand (flat name only; mutually exclusive with --dest). Renames the published door instead of minting a scratch-name duplicate.")
     p_pub.add_argument("--kind", default=None, help="Kind (finding, campaign, spec, feedback, steer)")
     p_pub.add_argument("--summary", default=None, help="One-line summary description")
     p_pub.add_argument("--target-harness", "--scope", dest="target_harness", default=None, help="Target harness scope ('all' or specific: gemini, claude, grok, codex)")
@@ -3007,6 +3038,8 @@ def main():
         cmd_ack(args)
     elif args.subcommand == "publish":
         cmd_publish(args)
+    elif args.subcommand == "delete":
+        cmd_delete(args)
     elif args.subcommand == "resolve":
         cmd_resolve(args)
     elif args.subcommand == "sync":
