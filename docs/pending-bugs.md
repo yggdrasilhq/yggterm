@@ -29242,3 +29242,36 @@ still be in Live after the rotation and the departures ledger must record NO
 `persist-dropped` for it. The open half re-tests separately: erase a
 backgrounded surface session's row deliberately and the media must stop at the
 grace window.
+
+## ⛔ [11.99] DURING A DEPLOY-SKEW WINDOW THE NEW CLI CANNOT WRITE OLD-DAEMON ROWS — THE WRITE VERB FAILS WHOLE INSTEAD OF HANDING OFF (filed 2026-09-12, GUI host, live 2× in one session)
+
+**Status:** OPEN
+
+**Measured (2026-09-12 ~00:20–03:30, GUI host):** after the 01:39 deploy (and
+again after a later one), `yggterm server terminal write <session> --data …`
+run by the NEW on-disk CLI against the STILL-RUNNING pre-rotate daemon
+answered `Error: local yggterm daemon did not become reachable` — twice,
+minutes apart, while the SAME verb via the version-matched binary
+(`~/.local/share/yggterm/direct/versions/<running>/yggterm-headless`) was
+accepted immediately (`"accepted":true`). Reads (`server terminal screen`,
+`server map`) worked from the new CLI in the same window, so the skew is not
+total: the failure shape is verb- or path-specific.
+
+**Why it matters:** the deploy skew window is exactly when an agent seat is
+driving rows (deploys land at fleet cadence; rotations lag behind on the
+working-row gate), and the write verb is the seat's hands. The warm-daemon
+bind-race family ([11.62]) explains ephemeral daemons, but here the error
+persisted across minutes and retries — the new CLI never reached the old
+daemon at all.
+
+**Workaround (live-proven):** run the verb from the running daemon's own
+version dir. The fix shape: a CLI whose version ≠ the answering daemon's
+should hand the request to the daemon-matched binary (the mirror of the
+active-exec handoff the worktree path already does), or at minimum answer
+with a NAMED error naming the version mismatch instead of "did not become
+reachable".
+
+**Falsifier:** deploy a new build, do not force the rotation, run a write via
+the new CLI against a pre-rotate daemon's row — it must be accepted (handed
+off) or refused with the version mismatch named; "did not become reachable"
+is the bug.
