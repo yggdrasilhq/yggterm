@@ -8236,7 +8236,7 @@ fn row_menu_items(
         );
         if !app_context_menu_entries(apps, "workspace").is_empty() {
             items.push(
-                RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App", 'b')
+                RowMenuItem::new(OPEN_APP_MENU_ID, "Open App", 'b')
                     .submenu(libyggterm_app_menu_items(apps, false)),
             );
         }
@@ -8278,7 +8278,7 @@ fn row_menu_items(
             );
             if !app_context_menu_entries(apps, "session").is_empty() {
                 items.push(
-                    RowMenuItem::new(OPEN_APP_MENU_ID, "Open libyggterm App Here", 'b')
+                    RowMenuItem::new(OPEN_APP_MENU_ID, "Open App Here", 'b')
                         .submenu(libyggterm_app_menu_items(apps, true)),
                 );
             }

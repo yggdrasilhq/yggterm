@@ -57649,7 +57649,7 @@ mod webtabs_menu_switcher_locks {
     }
 
     /// An app whose verbs are ALL non-rows must not leave an empty submenu
-    /// behind: the gate that decides whether to draw "Open libyggterm App" has
+    /// behind: the gate that decides whether to draw "Open App" has
     /// to ask the same question the submenu's contents do.
     #[test]
     fn an_app_with_no_row_verbs_leaves_no_empty_submenu() {
