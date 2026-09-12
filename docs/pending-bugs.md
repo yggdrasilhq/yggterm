@@ -717,6 +717,63 @@ other half). Muse's `session-index.db` may carry a per-session updated_at
 that would beat the file-mtime arm — a question for the 11.6.5 seat.
 
 
+
+## ⛔ [11.99] A GUI READ STALL DESTROYS A LIVE BROWSER SURFACE AND A DEAD ONE WEDGES THE ROW — THE CORPSE ARM NEVER ASKED THE ONE WITNESS THAT STAYS FRESH (filed 2026-09-12, owner screenshot)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+(lane/trace/web-surface-live-rebuild)
+
+The owner's "viewport suddenly drops to terminal view while I am browsing"
+(screenshot 2026-09-12 ~07:10, row live::279ae521). Measured in the GUI host's
+ytrace generations, drop at 06:43:03-06:43:50 IST:
+
+- ychrome in the row heartbeats OSC 7717 every ~4s. At 06:43:03 the
+  heartbeats stopped — this instance's app death was dev's documented
+  infra event (IO stall at load 84, ACK-cb9c80e740, then the hard-off);
+  the CLASS is any transient heartbeat gap longer than the GUI's 45s
+  WEB_SURFACE_STALE_AFTER_MS (starved host, GUI main-loop stall, swap).
+- +46s: `stale_detected` and the restore tick's CORPSE ARM fired
+  `web_surface_reload_active_tab` -> `native_close (reload)` = the drop.
+  The corpse arm read ONLY client-side liveness and never consulted the
+  batch verdict IN HAND — yet the daemon's AppDeclareLog retains the
+  web-surface record until a `close`, its `at_ms` refreshed by every
+  heartbeat the DAEMON reads off the PTY. Client-stale + daemon-fresh is
+  a live app this client stopped hearing, and the old code destroyed it.
+- The recreate could never land: the reconciler's lazy-create needs the
+  `[data-ws-page]` placeholder rect, which is stamped only while a LIVE
+  web surface owns the viewport. Catch-22 — and the entry that would
+  have to be reaped is only swept by the event-driven sweep, which never
+  fires for a session whose output stopped: absent + corpse_reload +
+  stale_detected looped 441+ times over 40 minutes, the row on a bare
+  terminal with NO reason anywhere. The user's only signal was the
+  symptom itself; "switch rows and come back" heals only the
+  app-still-alive flavor (remount renews the record), the dead flavor
+  needed a manual re-run.
+
+**Fix (this lane):** in `restore_app_surfaces_tick` the corpse path now
+branches on the web verdict. Verdict Rebuild/AskSingle (the daemon still
+holds the declare — the one witness independent of the client's read
+loop) runs `rebuild_web_surface_from_daemon_declare` INSTEAD of the
+nonce: its own 30s ceiling stays the authority on "the app really
+exited" (a live app's record reads ~4s old no matter how stale the
+client's view is) and its upsert renews the existing entry — tabs kept,
+liveness restored, placeholder and reconciler follow, the page returns
+with no row switch. Verdict AbsentLocally keeps the historical first-arm
+nonce reload, and a shared ladder (`corpse_arm_decision`, locked) RETIRES
+the surface on the second no-fresh-declare arm: `close_web_surface` +
+`push_notification(Warning)` + trace `restore_tick_corpse_retired` — the
+loop is gone and the user learns WHY the viewport dropped. FetchFailed
+never climbs the ladder (transport trouble is not an app death); a
+successful rebuild clears the session's ladder.
+
+**Falsifiers:** (1) an app that goes silent >45s while the daemon record
+stays fresh (GUI stall) must show NO native_close and NO drop — the
+rebuild trace fires and the page persists; (2) a killed app must produce
+exactly one reload, then `restore_tick_corpse_retired` + a Warning
+notification, and NO further corpse arms for that session; (3) the
+existing `the_restore_tick_asks_for_a_dead_web_surface_record` and the
+new `the_corpse_ladder_reloads_once_then_retires` stay green.
+
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

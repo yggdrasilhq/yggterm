@@ -1605,6 +1605,33 @@ mod app_surface_batch_tests {
         assert!(bare.want_web);
         assert!(!bare.web_surface_dead);
     }
+
+    #[test]
+    fn the_corpse_ladder_reloads_once_then_retires() {
+        // 2026-09-12 06:43 drop (GUI host, measured in ytrace): a surface
+        // with no fresh declare behind it fired the corpse arm 441 times in
+        // 40 minutes — the reload nonce cannot recreate a destroyed surface
+        // (the DOM placeholder exists only while the surface is live), so
+        // the ladder must retire it and tell the user instead of looping.
+        // The FIRST arm keeps the historical reload; a refused rebuild's
+        // first arm deliberately does nothing (its ask already ran).
+        assert_eq!(
+            corpse_arm_decision(1, true),
+            CorpseArmDecision::Reload,
+            "first absent arm: the historical reload nonce"
+        );
+        assert_eq!(
+            corpse_arm_decision(1, false),
+            CorpseArmDecision::Wait,
+            "first refused-rebuild arm: the rebuild's ask already ran"
+        );
+        assert_eq!(
+            corpse_arm_decision(2, false),
+            CorpseArmDecision::Retire,
+            "second arm with nothing behind it: retire + notify, never loop"
+        );
+        assert_eq!(corpse_arm_decision(9, true), CorpseArmDecision::Retire);
+    }
 }
 
 #[cfg(test)]
@@ -38701,6 +38728,134 @@ enum AppSurfaceBatchVerdict {
 /// asks permanently for this process — one lost tick, not a per-tick tax.
 static APP_SURFACE_BATCH_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
+/// How many no-fresh-declare corpse arms a session may fire before the client
+/// gives up on the surface and retires it. ONE arm keeps the historical reload
+/// behaviour (the destroy-and-recreate nonce — the shape a daemon-swap corpse
+/// was measured to need, 2026-09-05); the SECOND arm proves the reload did not
+/// bring anything back, which for a surface with no fresh declare behind it it
+/// never can (the recreate needs the DOM placeholder that only a live surface
+/// earns), so past this the entry is a corpse that would otherwise loop here
+/// forever — measured 441 arms in 40 minutes on the 2026-09-12 06:43 drop.
+const WEB_SURFACE_CORPSE_RETIRE_AFTER_ARMS: u32 = 2;
+
+/// What the Nth corpse arm does. PURE — locked below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorpseArmDecision {
+    /// Nothing this tick (a refused rebuild already did the ask; the nonce is
+    /// only meaningful where it historically fired).
+    Wait,
+    /// Fire the historical destroy-and-recreate nonce.
+    Reload,
+    /// The ladder is exhausted: retire the surface and tell the user.
+    Retire,
+}
+fn corpse_arm_decision(arms: u32, reload_nonce: bool) -> CorpseArmDecision {
+    if arms < WEB_SURFACE_CORPSE_RETIRE_AFTER_ARMS {
+        if reload_nonce {
+            CorpseArmDecision::Reload
+        } else {
+            CorpseArmDecision::Wait
+        }
+    } else {
+        CorpseArmDecision::Retire
+    }
+}
+
+/// ONE corpse arm of the surface-restore tick, driven by
+/// [`corpse_arm_decision`]. On [`CorpseArmDecision::Retire`] the surface is
+/// removed — the entry deleted, the loop ended — and the user is TOLD, because
+/// the alternative to this notice is exactly the defect being fixed here: a
+/// row that silently fell back to the terminal with no reason anywhere.
+fn web_surface_corpse_arm(
+    mut state: Signal<ShellState>,
+    trace_home: &std::path::PathBuf,
+    target: &AppSurfaceRestoreTarget,
+    corpse_arms: &Rc<RefCell<HashMap<String, u32>>>,
+    reload_nonce: bool,
+) {
+    let arms = {
+        let mut arms = corpse_arms.borrow_mut();
+        let entry = arms.entry(target.session_path.clone()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    };
+    match corpse_arm_decision(arms, reload_nonce) {
+        CorpseArmDecision::Wait => {}
+        CorpseArmDecision::Reload => {
+            // THE CORPSE RELOAD. A record with tabs whose liveness is gone —
+            // measured 2026-09-05 (GUI host, swap window 01:49): a daemon
+            // swap killed the app behind the active row's web surface; the
+            // client's record survived as a corpse, so `want_web` read
+            // "already up", this tick never asked, and the row stayed dead
+            // ~6.5 minutes until the user's own click drove the ensure
+            // path's liveness probe. The reload nonce is the existing
+            // destroy-and-recreate trigger, the same arm the ensure path
+            // drives; the reconciler owns the teardown. Quiet by doctrine:
+            // no activation, no focus move.
+            state.with_mut_counted(|shell| {
+                if shell
+                    .web_surfaces
+                    .get(&target.session_path)
+                    .is_some_and(|surface| !surface.tabs.is_empty())
+                {
+                    shell.web_surface_reload_active_tab(&target.session_path);
+                }
+            });
+            append_trace_event(
+                trace_home,
+                "ui",
+                "web_surface",
+                "restore_tick_corpse_reload",
+                json!({ "session_path": target.session_path }),
+            );
+        }
+        CorpseArmDecision::Retire => {
+            // THE RETIRE ARM. Nothing rebuilt across the whole ladder: the
+            // surface is gone for good (the sweep that would otherwise reap
+            // this entry is event-driven and never fires for a session whose
+            // output stopped — the entry would loop here forever). Retire it
+            // and say so.
+            let closed = state.with_mut_counted(|shell| {
+                let closed = shell.close_web_surface(&target.session_path);
+                if closed {
+                    let row_title = shell
+                        .server
+                        .live_session_views()
+                        .into_iter()
+                        .find(|view| view.session_path == target.session_path)
+                        .map(|view| view.title.clone());
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Browser surface closed",
+                        match row_title.as_deref() {
+                            Some(title) if !title.is_empty() => format!(
+                                "The app behind “{title}” stopped responding, so its web view \
+                                 was closed. Re-run the app in that row to reopen it."
+                            ),
+                            _ => format!(
+                                "The app behind this row's web view stopped responding, so the \
+                                 view was closed. Re-run the app in the row to reopen it."
+                            ),
+                        },
+                    );
+                }
+                closed
+            });
+            append_trace_event(
+                trace_home,
+                "ui",
+                "web_surface",
+                "restore_tick_corpse_retired",
+                json!({
+                    "session_path": target.session_path,
+                    "arms": arms,
+                    "closed": closed,
+                }),
+            );
+        }
+    }
+}
+
 /// Re-establish app surfaces this client never witnessed being declared.
 ///
 /// The user's words (docs/pending-bugs.md, settled call #5): *"yedit AND
@@ -38724,6 +38879,7 @@ async fn restore_app_surfaces_tick(
     mut state: Signal<ShellState>,
     trace_home: std::path::PathBuf,
     attempts: Rc<RefCell<HashMap<String, AppSurfaceRestoreAttempt>>>,
+    corpse_arms: Rc<RefCell<HashMap<String, u32>>>,
 ) {
     let now_ms = current_millis() as u64;
     let targets = state.with(|shell| {
@@ -38838,35 +38994,64 @@ async fn restore_app_surfaces_tick(
         // where it was wrong) because a browser surface heartbeats every ~4s —
         // an old web-surface record means the app really did exit.
         let web = if target.web_surface_dead {
-            // THE CORPSE ARM. A record with tabs whose liveness is gone —
-            // measured 2026-09-05 (GUI host, swap window 01:49): a daemon
-            // swap killed the app behind the active row's web surface; the
-            // client's record survived as a corpse, so `want_web` read
-            // "already up", this tick never asked, and the row stayed dead
-            // ~6.5 minutes until the user's own click drove the ensure
-            // path's liveness probe. The batch cannot vouch for a corpse
-            // (the successor's declare registry is pruned empty after a
-            // swap) and the rebuild would decline the duplicate — the
-            // reload nonce is the existing destroy-and-recreate trigger,
-            // the same arm the ensure path drives; the reconciler owns the
-            // teardown. Quiet by doctrine: no activation, no focus move.
-            state.with_mut_counted(|shell| {
-                if shell
-                    .web_surfaces
-                    .get(&target.session_path)
-                    .is_some_and(|surface| !surface.tabs.is_empty())
-                {
-                    shell.web_surface_reload_active_tab(&target.session_path);
+            match web_verdict {
+                // ⭐ THE LIVE-APP ARM (2026-09-12 06:43 drop, GUI host). The
+                // client's liveness is stale, but the batch still holds (or
+                // defers to) the session's web-surface declare — and the
+                // DAEMON's record is a witness independent of this client's
+                // read loop, refreshed by every heartbeat the daemon itself
+                // reads off the PTY. Client-stale + daemon-fresh is a GUI
+                // read stall (main-loop congestion, a starved app that is
+                // catching up), NOT an app death — and the old code here
+                // destroyed the live surface anyway (`native_close` reload),
+                // then could never rebuild it: the DOM `[data-ws-page]`
+                // placeholder rect exists only while a live web surface owns
+                // the viewport, so the reconcile's lazy-create had no rect to
+                // create against. Catch-22; the row sat on the bare terminal
+                // until the user manually switched rows or re-ran the app.
+                // Rebuild instead: the rebuild's own 30s staleness ceiling
+                // stays the authority on "the app really exited" (a daemon
+                // record refreshed by live heartbeats reads ~4s old no matter
+                // how stale the CLIENT's view is), and its upsert renews the
+                // existing entry in place — tabs kept, liveness restored, the
+                // placeholder and the reconciler follow, the page comes back.
+                AppSurfaceBatchVerdict::Rebuild | AppSurfaceBatchVerdict::AskSingle => {
+                    let rebuilt = rebuild_web_surface_from_daemon_declare(
+                        state,
+                        trace_home.clone(),
+                        &target.session_path,
+                    )
+                    .await;
+                    if rebuilt.rebuilt() {
+                        // Healed: the record is live again. A stall that
+                        // recurs starts the corpse ladder over from clean.
+                        corpse_arms.borrow_mut().remove(&target.session_path);
+                    } else if !matches!(rebuilt, DeclareRebuild::FetchFailed { .. }) {
+                        // The daemon's answer carries NO FRESH declare behind
+                        // this surface (too stale, absent, or unusable): the
+                        // app really did go quiet. Climb the same ladder the
+                        // absent verdict uses — but WITHOUT the reload nonce:
+                        // destroying the (possibly still-painted) view is the
+                        // 06:43 drop itself, and a WAIT costs one backoff
+                        // window while an app that is only catching up
+                        // re-freshens its declare and heals instead. A failed
+                        // FETCH alone must not climb the ladder at all
+                        // (transport trouble is not an app death).
+                        web_surface_corpse_arm(state, &trace_home, &target, &corpse_arms, false);
+                    }
+                    Some(rebuilt)
                 }
-            });
-            append_trace_event(
-                &trace_home,
-                "ui",
-                "web_surface",
-                "restore_tick_corpse_reload",
-                json!({ "session_path": target.session_path }),
-            );
-            None
+                AppSurfaceBatchVerdict::AbsentLocally => {
+                    // No record at all (the batch answered): the historical
+                    // corpse arm — nonce reload on the first fire, retire on
+                    // the second.
+                    web_surface_corpse_arm(state, &trace_home, &target, &corpse_arms, true);
+                    // Decided locally; carried as the honest `no_declare`
+                    // reason so the restored-trace below cannot read it as
+                    // `already_up`.
+                    Some(DeclareRebuild::NoDeclare)
+                }
+            }
         } else {
             match web_verdict {
                 AppSurfaceBatchVerdict::Rebuild | AppSurfaceBatchVerdict::AskSingle => {
@@ -38926,6 +39111,11 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
         // stops tick N+1 re-asking a session tick N is still probing.
         let restore_attempts: Rc<RefCell<HashMap<String, AppSurfaceRestoreAttempt>>> =
             Rc::new(RefCell::new(HashMap::new()));
+        // The corpse-arm ladder (see [`web_surface_corpse_arm`]): how many
+        // no-fresh-declare arms each session has fired, so the SECOND one can
+        // retire the surface instead of looping on it. Loop-local for the same
+        // reason the ask ledger is: nothing renders it.
+        let corpse_arms: Rc<RefCell<HashMap<String, u32>>> = Rc::new(RefCell::new(HashMap::new()));
         // The webview edit-plane fault watch. Both counters live in vendored
         // dioxus-desktop, which has no trace plane of its own: an edit batch
         // the webview never applied (`edit_faults` — the DOM has diverged for
@@ -39004,6 +39194,7 @@ fn spawn_working_flags_poll_loop(mut state: Signal<ShellState>) {
                     state,
                     trace_home.clone(),
                     Rc::clone(&restore_attempts),
+                    Rc::clone(&corpse_arms),
                 ));
             }
             // Webview edit-plane fault deltas → the incident stream. Reads two
