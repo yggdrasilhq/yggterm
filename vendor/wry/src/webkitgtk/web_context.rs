@@ -48,7 +48,17 @@ impl WebContextImpl {
       context_builder = context_builder.website_data_manager(&data_manager);
     }
     let context = context_builder.build();
-    if let Some(cache_model) = configured_cache_model() {
+    // THE CACHE DEFAULT. `YGGTERM_WEBKIT_CACHE_MODEL` wins when set; when it
+    // is not, a PERSISTENT profile context (this arm — a data directory means
+    // a browser profile whose disk cache is expected to outlive the process)
+    // runs `WebBrowser`, the model desktop browsers ship: resources stay in
+    // the network disk cache across navigations and restarts instead of the
+    // engine's lean viewer behavior of pruning like a document viewer. An
+    // ephemeral context keeps the engine default — there is no disk worth
+    // keeping warm. Measured 2026-09-12: the GUI process env carried no
+    // cache-model variable at all, so every browsing surface ran the engine
+    // default, not the browser model.
+    if let Some(cache_model) = configured_cache_model().or_else(|| default_cache_model(data_directory.is_some())) {
       context.set_cache_model(cache_model);
     }
     if let Some(data_directory) = data_directory {
@@ -126,8 +136,12 @@ impl WebContextImpl {
 }
 
 fn configured_cache_model() -> Option<CacheModel> {
-  match var("YGGTERM_WEBKIT_CACHE_MODEL")
-    .ok()?
+  parse_cache_model(var("YGGTERM_WEBKIT_CACHE_MODEL").ok().as_deref())
+}
+
+/// One owner of the env spellings, so a test can pin the table.
+fn parse_cache_model(env_value: Option<&str>) -> Option<CacheModel> {
+  match env_value?
     .trim()
     .to_ascii_lowercase()
     .as_str()
@@ -138,6 +152,14 @@ fn configured_cache_model() -> Option<CacheModel> {
     _ => None,
   }
 }
+
+/// The cache model a context runs with when the env named nothing: a
+/// persistent profile context defaults to `WebBrowser` (see the call site for
+/// why), an ephemeral one keeps the engine default (`None` = do not set).
+fn default_cache_model(persistent: bool) -> Option<CacheModel> {
+  persistent.then_some(CacheModel::WebBrowser)
+}
+
 
 /// A `WebContext` builder already carrying the configured memory policy.
 ///
