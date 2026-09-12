@@ -6913,7 +6913,18 @@ impl DaemonRuntime {
         let Some(kind) = self.server.live_session_kind(runtime_key) else {
             return TranscriptActivity::Unknown;
         };
-        let session_id = runtime_key.rsplit('/').next().unwrap_or("");
+        // ⛔ ASK WITH THE BOUND ID, NOT THE KEY SUFFIX ([11.97] follow-up,
+        // measured 2026-09-12 on dev): the identity chore re-binds self-minting
+        // CLIs to the conversation id their CLI actually minted
+        // (`apply_agent_runtime_session_id_to_live_session` — the agy row
+        // whose key said 280cebaf… has a store that only knows 04a3b380…).
+        // The raw key suffix answered recency None for exactly those rows,
+        // Unknown blocks the migration gate, and the predecessor pinned
+        // forever.
+        let session_id = self
+            .server
+            .live_session_id(runtime_key)
+            .unwrap_or_else(|| runtime_key.rsplit('/').next().unwrap_or("").to_string());
         // ⛔ THE USER HOME, NOT THE YGGTERM HOME (the F3 lesson, again —
         // caught live by the drain's own blocked announcements 2026-09-06:
         // a codex/opencode pair answered transcript_unknown forever because
@@ -6922,7 +6933,7 @@ impl DaemonRuntime {
         // `~/.local/share/opencode`). The CLIs' own stores are anchored on
         // the user home and nothing else.
         let recency = dirs::home_dir().and_then(|user_home| {
-            yggterm_core::agent_cli::agent_session_recency_ms(&user_home, kind, session_id)
+            yggterm_core::agent_cli::agent_session_recency_ms(&user_home, kind, &session_id)
         });
         match recency {
             Some(recency_ms) => {

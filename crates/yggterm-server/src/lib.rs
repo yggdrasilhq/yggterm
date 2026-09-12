@@ -7134,6 +7134,18 @@ impl YggtermServer {
             .map(|(_resolved_key, session)| session.kind)
     }
 
+    /// The live session's OWN id — post-binding, i.e. the conversation id the
+    /// CLI actually minted when the identity chore has re-pointed the row
+    /// ([`Self::apply_agent_runtime_session_id_to_live_session`]). Consumers
+    /// that read the CLI's STORE (transcript recency, title, membership) must
+    /// ask with THIS id: the runtime key's suffix is yggterm's birth uuid,
+    /// which a self-minting CLI's store has never heard of (measured: the agy
+    /// row keyed 280cebaf… whose store only knows 04a3b380…).
+    pub fn live_session_id(&self, path: &str) -> Option<String> {
+        self.resolve_live_session_entry(path)
+            .map(|(_resolved_key, session)| session.id.clone())
+    }
+
     /// The ROW PATH behind a runtime key.
     ///
     /// The two are not the same string and the difference is load-bearing: the
