@@ -671,7 +671,7 @@ Q1 accept-with-correction, Q2 REBUT adopted, Q5 requirements adopted):**
   retires or the owner hot-restarts it; until then it correctly receives
   the named answer.
 
-## ⛔ [11.98] AGENT-SESSION TRANSCRIPT RECENCY HAS ARMS FOR ONLY 3 OF 11 CLIS, AND THE GATE ASKS WITH THE WRONG ID — EVERY NON-CODEX/CC/OPENCODE ROW PINNED ITS DAEMON FOREVER (filed 2026-09-12)
+## ⛔ [11.100] AGENT-SESSION TRANSCRIPT RECENCY HAS ARMS FOR ONLY 3 OF 11 CLIS, AND THE GATE ASKS WITH THE WRONG ID — EVERY NON-CODEX/CC/OPENCODE ROW PINNED ITS DAEMON FOREVER (filed 2026-09-12)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 (lane/integration/agent-recency; consulted in-session, no external consult — the pattern followed [11.97])
