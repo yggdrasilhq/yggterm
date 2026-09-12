@@ -671,6 +671,52 @@ Q1 accept-with-correction, Q2 REBUT adopted, Q5 requirements adopted):**
   retires or the owner hot-restarts it; until then it correctly receives
   the named answer.
 
+## ⛔ [11.98] AGENT-SESSION TRANSCRIPT RECENCY HAS ARMS FOR ONLY 3 OF 11 CLIS, AND THE GATE ASKS WITH THE WRONG ID — EVERY NON-CODEX/CC/OPENCODE ROW PINNED ITS DAEMON FOREVER (filed 2026-09-12)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+(lane/integration/agent-recency; consulted in-session, no external consult — the pattern followed [11.97])
+
+The progressive-migration release gate ([11.64]) reads the agent CLI's own
+transcript freshness — `agent_session_recency_ms`. That dispatcher answered
+arms ONLY for Codex, ClaudeCode and OpenCode; every 2026-08-13+ intake CLI
+(agy, muse, kimi, qwen, grok, pi, codex-litellm, zcode-tui) answered None →
+`TranscriptActivity::Unknown` → `transcript_unknown` BLOCKS → no predecessor
+daemon ever released one of these rows. Measured on dev: four-plus daemon
+generations in ONE night, each lingering on the same blocked agy rows (the
+fleet-wide pile the [11.97] linger socket was built to survive).
+
+Second layer, same gate: `session_transcript_activity` asked recency with
+the RUNTIME-KEY SUFFIX (yggterm's birth id). The identity chore had already
+re-bound the row's id to the conversation the CLI actually minted
+(`apply_agent_runtime_session_id_to_live_session`; trace
+`agent_runtime_session_id_bound`) — the agy row keyed `280cebaf…` has a
+store that only knows `04a3b380…` — so even a correct arm missed.
+
+**Fixed:**
+
+- Recency arms for every registered kind, each reading the store its
+  descriptor already measured: Antigravity
+  (`~/.gemini/antigravity-cli/conversations/<id>.db` mtime, `brain/<id>/`
+  fallback — MEASURED on dev: the live conversation's 6 MB db moves with
+  every turn; presence locks are NOT a recency signal, mtime frozen);
+  GrokBuild/Kimi/Muse (newest mtime under a session DIRECTORY named by the
+  id); QwenCode (`.qwen/projects/*/chats/<id>.jsonl` name match);
+  ZcodeTui (`rollout/model-io-<id>.jsonl` name match); Pi (both glob
+  shapes — pi is installed on no fleet host, so the arm tries the file-name
+  and directory-name readings of its own glob and stays None = blocks = the
+  safe direction when neither matches); CodexLiteLlm rides the codex arm.
+  Path-escape ids refused, never sanitized. A store that cannot answer
+  still returns None → blocks — "cannot say" never widens the release.
+- `live_session_id` accessor + the gate asks recency with the BOUND id,
+  falling back to the key suffix.
+
+**Still owed:** the live gate proof — on dev, the 280cebaf row's drain
+announcement stops naming `transcript_unknown`, its predecessor retires,
+and a fresh resume bridges on the reachable daemon (the [11.97] acceptance's
+other half). Muse's `session-index.db` may carry a per-session updated_at
+that would beat the file-mtime arm — a question for the 11.6.5 seat.
+
+
 ## ⛔ [11.92] THE HOT-RESTART GATE CLASSIFIED "WORKING" BY A CROSS-CLI SCREEN UNION, AND A WORKING TURN WAS FORCIBLY SWAPPED AT THE 30-MINUTE DEADLINE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

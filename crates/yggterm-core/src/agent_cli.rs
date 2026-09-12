@@ -6522,14 +6522,267 @@ pub fn agent_session_recency_ms(home: &Path, kind: SessionKind, session_id: &str
         return None;
     }
     match kind {
-        SessionKind::Codex => {
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
             newest_jsonl_mtime_under(&home.join(".codex").join("sessions"), session_id, 4)
         }
         SessionKind::ClaudeCode => {
             newest_jsonl_mtime_under(&home.join(".claude").join("projects"), session_id, 2)
         }
         SessionKind::OpenCode => opencode_store_row_recency_ms(home, session_id),
+        // ⛔ [11.97 follow-up] THE MIGRATION BLOCKER: every kind without an
+        // arm here answered None → TranscriptActivity::Unknown → the
+        // migration gate blocks forever — so every predecessor daemon holding
+        // one of these rows lingered until process death (dev measured 4+
+        // generations in one night, all pinned by the same agy rows). The
+        // arms below read the stores the descriptors already measured; a
+        // store that does not answer still returns None, which BLOCKS — the
+        // safe direction. Never widen an arm from a guess.
+        SessionKind::Antigravity => {
+            // MEASURED 2026-09-12 on dev: agy keeps ONE SQLITE DB PER
+            // CONVERSATION at `~/.gemini/antigravity-cli/conversations/<id>.db`
+            // whose mtime moves with every turn (the live conversation's db:
+            // 6 MB, written minutes before this arm was written), plus a
+            // `brain/<id>/` directory. The presence locks are NOT a recency
+            // signal — created once per conversation, mtime frozen (the live
+            // conversation's lock measured 2 days stale).
+            antigravity_conversation_recency_ms(home, session_id)
+        }
+        SessionKind::GrokBuild => newest_mtime_under_dir_named(
+            &home.join(".grok").join("sessions"),
+            session_id,
+            2,
+        ),
+        SessionKind::Kimi => newest_mtime_under_dir_named(
+            &home.join(".kimi").join("sessions"),
+            session_id,
+            2,
+        ),
+        SessionKind::QwenCode => {
+            newest_jsonl_mtime_under(&home.join(".qwen").join("projects"), session_id, 3)
+        }
+        SessionKind::Muse => newest_mtime_under_dir_named(
+            &home.join(".local/share/muse/sessions"),
+            session_id,
+            4,
+        ),
+        // The glob `.pi/agent/sessions/*/*.jsonl` does not say whether the id
+        // names the FILE or the parent DIRECTORY, and pi is installed on no
+        // fleet host to measure (the availability record); try both shapes.
+        SessionKind::Pi => newest_jsonl_mtime_under(
+            &home.join(".pi/agent/sessions"),
+            session_id,
+            2,
+        )
+        .or_else(|| {
+            newest_mtime_under_dir_named(&home.join(".pi/agent/sessions"), session_id, 2)
+        }),
+        SessionKind::ZcodeTui => {
+            newest_jsonl_mtime_under(&home.join(".zcode/cli/rollout"), session_id, 1)
+        }
         _ => None,
+    }
+}
+
+/// The id guard the agy membership reader carries, factored: a session id is
+/// used to build a path here, so anything that could escape the directory is
+/// refused rather than sanitized.
+fn recency_session_id_is_safe(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+        && !session_id.contains("..")
+}
+
+/// Newest mtime among the per-conversation artifacts agy actually writes
+/// (see the [`SessionKind::Antigravity`] arm): the conversation db first,
+/// then the brain directory's files.
+fn antigravity_conversation_recency_ms(home: &Path, session_id: &str) -> Option<i64> {
+    if !recency_session_id_is_safe(session_id) {
+        return None;
+    }
+    let root = home.join(".gemini/antigravity-cli");
+    if let Ok(meta) = std::fs::metadata(root.join("conversations").join(format!("{session_id}.db"))) {
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        return Some(mtime);
+    }
+    newest_mtime_under_dir_named(&root.join("brain"), session_id, 1)
+}
+
+/// Newest mtime of ANY file under a directory whose NAME is exactly
+/// `needle`, walked to `depth` directory levels. The store shape for CLIs
+/// whose session directory is named by the session id while the files inside
+/// carry their own names (grok `sessions/<url-encoded-cwd>/<uuid>/…`, kimi
+/// `sessions/<md5-of-cwd>/<uuid>/…`, muse `sessions/<uuid>/…`, agy's
+/// `brain/<id>/`).
+fn newest_mtime_under_dir_named(root: &Path, needle: &str, depth: u8) -> Option<i64> {
+    if depth == 0 || !recency_session_id_is_safe(needle) {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut newest: Option<i64> = None;
+    let mut directories: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                if path.file_name().and_then(|name| name.to_str()) == Some(needle) {
+                    // The found dir is itself the last level the caller paid
+                    // for; its CONTENTS still need a full walk at this depth.
+                    newest = walk_newest_mtime(&path, depth, newest);
+                } else {
+                    directories.push(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    for directory in directories {
+        if let Some(found) = newest_mtime_under_dir_named(&directory, needle, depth - 1) {
+            if newest.is_none_or(|known| found > known) {
+                newest = Some(found);
+            }
+        }
+    }
+    newest
+}
+
+/// Depth-bounded newest-mtime walk over every regular file below `root`.
+fn walk_newest_mtime(root: &Path, depth: u8, mut newest: Option<i64>) -> Option<i64> {
+    if depth == 0 {
+        return newest;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                let found = meta
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as i64;
+                if newest.is_none_or(|known| found > known) {
+                    newest = Some(found);
+                }
+            }
+            Ok(meta) if meta.is_dir() => {
+                newest = walk_newest_mtime(&path, depth - 1, newest);
+            }
+            _ => {}
+        }
+    }
+    newest
+}
+
+#[cfg(test)]
+mod session_recency_law_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-recency-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn every_measured_kind_answers_recency_from_its_measured_store() {
+        let id = "6c9d662b-d553-4d4e-a4f8-e10aeb810bbf";
+        // agy: per-conversation db (measured 2026-09-12).
+        let home = scratch("agy");
+        touch(&home.join(format!(".gemini/antigravity-cli/conversations/{id}.db")));
+        assert_eq!(
+            agent_session_recency_ms(&home, SessionKind::Antigravity, id).is_some(),
+            true
+        );
+        // agy: the brain/ fallback shape.
+        let home = scratch("agy-brain");
+        touch(&home.join(format!(".gemini/antigravity-cli/brain/{id}/turn.json")));
+        assert!(agent_session_recency_ms(&home, SessionKind::Antigravity, id).is_some());
+        // grok / kimi / muse: the session DIRECTORY is named by the id.
+        for (tag, root) in [
+            ("grok", ".grok/sessions"),
+            ("kimi", ".kimi/sessions"),
+            ("muse", ".local/share/muse/sessions"),
+        ] {
+            let home = scratch(tag);
+            touch(&home.join(format!("{root}/bucket/{id}/transcript.jsonl")));
+            let kind = match tag {
+                "grok" => SessionKind::GrokBuild,
+                "kimi" => SessionKind::Kimi,
+                _ => SessionKind::Muse,
+            };
+            assert!(
+                agent_session_recency_ms(&home, kind, id).is_some(),
+                "{tag} must answer"
+            );
+        }
+        // qwen / zcode-tui: the FILE name contains the id.
+        let home = scratch("qwen");
+        touch(&home.join(format!(".qwen/projects/-home-u/chats/{id}.jsonl")));
+        assert!(agent_session_recency_ms(&home, SessionKind::QwenCode, id).is_some());
+        let home = scratch("zcode");
+        touch(&home.join(format!(".zcode/cli/rollout/model-io-{id}.jsonl")));
+        assert!(agent_session_recency_ms(&home, SessionKind::ZcodeTui, id).is_some());
+        // pi: both glob shapes answer.
+        let home = scratch("pi-file");
+        touch(&home.join(format!(".pi/agent/sessions/wd_x/{id}.jsonl")));
+        assert!(agent_session_recency_ms(&home, SessionKind::Pi, id).is_some());
+        let home = scratch("pi-dir");
+        touch(&home.join(format!(".pi/agent/sessions/wd_x/{id}/turn.jsonl")));
+        assert!(agent_session_recency_ms(&home, SessionKind::Pi, id).is_some());
+        // codex-litellm rides the codex store.
+        let home = scratch("litellm");
+        touch(&home.join(format!(".codex/sessions/2026/09/12/rollout-{id}.jsonl")));
+        assert!(agent_session_recency_ms(&home, SessionKind::CodexLiteLlm, id).is_some());
+    }
+
+    #[test]
+    fn a_missing_or_unsafe_store_stays_none() {
+        let home = scratch("empty");
+        let id = "6c9d662b-d553-4d4e-a4f8-e10aeb810bbf";
+        for kind in [
+            SessionKind::Antigravity,
+            SessionKind::GrokBuild,
+            SessionKind::Kimi,
+            SessionKind::QwenCode,
+            SessionKind::Muse,
+            SessionKind::Pi,
+            SessionKind::ZcodeTui,
+        ] {
+            assert_eq!(
+                agent_session_recency_ms(&home, kind, id),
+                None,
+                "{kind:?}: cannot-say must stay None (it blocks)"
+            );
+        }
+        // Path escape is refused, not sanitized.
+        let home = scratch("escape");
+        std::fs::create_dir_all(home.join(".gemini/antigravity-cli/conversations")).unwrap();
+        std::fs::write(
+            home.join(".gemini/antigravity-cli/conversations/..db"),
+            b"x",
+        )
+        .unwrap();
+        assert_eq!(
+            agent_session_recency_ms(&home, SessionKind::Antigravity, "../../etc"),
+            None
+        );
     }
 }
 
