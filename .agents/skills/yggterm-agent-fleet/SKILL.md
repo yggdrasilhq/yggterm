@@ -1194,6 +1194,22 @@ tested by more than one agent goes through `ygg-ci`.
 - The push to upstream is the LAST gate: build green → gates green → push → deploy. The deploy never runs commits upstream lacks.
 - Lanes land via the CI's own push of main (the build publishes); ci auto-unsubscribes lanes already in `main`.
 
+**Step watchdog (2026-09-12, dream dreams/features ACK-d541de0e72).** Every
+build/gate/deploy step runs with a wall-clock budget — build and deploy 3600 s,
+each gate 900 s, tunable per project (`tune --build-timeout / --gate-timeout /
+--deploy-timeout / --step-heartbeat`). While a named step runs, ci.log carries a
+`step start: … pid=… budget=…s` slot and a periodic `⏱ step heartbeat …
+elapsed=…s`, so a long build is silence-with-heartbeat instead of pure silence.
+On overrun the step's whole process GROUP is killed (the child runs in its own
+session, so `shell=True` grandchildren die with it), the step is marked failed
+(rc=124, `build_step_overrun` / `gate_step_overrun` / `deploy_step_overrun`
+events), and the tick proceeds down the normal failure path — reset + lane
+quarantine, re-armed by a new tip. The point of the shape: the watchdog NEVER
+waits for the killed child to exit, because a child wedged in uninterruptible
+sleep (a stalled disk) ignores even SIGKILL — the measured 2026-09-12 dev
+outage hung the old `subprocess.run(timeout=…)` inside its own timeout for
+70+ minutes for exactly that reason.
+
 **Conflicts — deterministic, no guessing, no extra turns:**
 
 *Same file, different hunks:* `git merge` auto-merges — both lanes land in the

@@ -50,6 +50,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import uuid
 import time
 from pathlib import Path
@@ -72,6 +73,10 @@ HOLDFILE = CI_STATE / "ci.hold"
 CI_HOST = "dev"  # auto host for all ci builds — see yggsteer
 DEFAULT_INTERVAL = 300
 DISARM_HOURS = 4.0
+DEFAULT_BUILD_TIMEOUT_SECS = 3600
+DEFAULT_GATE_TIMEOUT_SECS = 900
+DEFAULT_DEPLOY_TIMEOUT_SECS = 3600
+DEFAULT_STEP_HEARTBEAT_SECS = 120
 
 # in-process heartbeat bookkeeping (watcher only)
 _LAST_LOG_WRITE_TS = 0.0
@@ -182,15 +187,105 @@ def _sanitize_lane(lane):
 def _sub_path(project, lane):
     return SUBS / f"{project}--{_sanitize_lane(lane)}.json"
 
-def _run(cmd, cwd=None, timeout=120, shell=False):
+def _reap_bounded(pid, secs=2.0):
+    """WNOHANG reap loop, bounded. True if the child is gone.
+
+    ⛔ NEVER block past `secs` here: a child wedged in uninterruptible sleep
+    (measured 2026-09-12: the docs-ssot gate's grep in zfs dbuf_find during the
+    dev IO stall) ignores even SIGKILL, and waiting for it to die is the exact
+    wedge the step watchdog exists to prevent. The caller hands an un-reaped
+    pid to a daemon thread and moves on."""
+    end = time.time() + secs
+    while time.time() < end:
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                return True
+        except ChildProcessError:
+            return True
+        time.sleep(0.05)
+    return False
+
+def _heartbeat_loop(label, pid, started, interval, stop):
+    """ci.log heartbeat while one step runs, so a long build is visible as
+    silence-WITH-heartbeat and a wedged step is diagnosable from the log
+    alone (`grep heartbeat ~/.yggterm/relay/ci/ci.log`)."""
+    while not stop.wait(interval):
+        log(f"  ⏱ step heartbeat: {label} pid={pid} elapsed={int(time.time() - started)}s")
+
+def _run(cmd, cwd=None, timeout=120, shell=False, label=None, heartbeat_secs=0):
+    """Run one step under the step watchdog.
+
+    The old shape was subprocess.run(timeout=…) — whose timeout path kills the
+    child and then WAITS FOR ITS PIPES TO CLOSE. A D-state child never closes
+    them, so a gate wedged on a stalled disk hung the whole watcher inside its
+    own 900 s timeout (measured 2026-09-12, ci.log frozen on one gate line for
+    70+ minutes while the watcher sat in cv_wait_common). This shape:
+
+      - starts the child in its own session (start_new_session) so the whole
+        process tree dies together — a `shell=True` step's grandchildren hold
+        the pipes even after the shell itself is killed;
+      - on overrun: killpg(SIGKILL), close OUR pipe ends (the output of a
+        wedged step is worthless), reap with a BOUNDED loop, hand any
+        un-reapable pid to a daemon thread, and return rc=124 immediately;
+      - never blocks on child exit after the kill — the guarantee is by
+        construction, not by the child's good behavior;
+      - with a `label` + `heartbeat_secs`, logs a start slot (pid + budget)
+        and a periodic heartbeat so long steps are visible in ci.log live.
+
+    Callers that care read `r.overrun` (a dict {pid, budget}) to name the
+    event; rc=124 means the watchdog fired."""
+    started = time.time()
     try:
-        if shell:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, shell=True)
-        else:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
-        return r
+        # start_new_session: the child leads its own process group, so the
+        # watchdog can killpg the whole tree in one signal.
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, cwd=cwd, shell=shell, start_new_session=True)
     except Exception as e:
         return subprocess.CompletedProcess(cmd, 127, "", f"{type(e).__name__}: {e}")
+    shown = label or (cmd if isinstance(cmd, str) else " ".join(map(str, cmd)))
+    if len(shown) > 80:
+        shown = shown[:80] + "…"
+    if label:
+        log(f"  step start: {label} pid={p.pid} budget={timeout}s")
+    stop = None
+    if label and heartbeat_secs and heartbeat_secs > 0:
+        stop = threading.Event()
+        threading.Thread(target=_heartbeat_loop,
+                         args=(label, p.pid, started, heartbeat_secs, stop),
+                         daemon=True).start()
+    timed_out = False
+    try:
+        out, err = p.communicate(timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        for f in (p.stdout, p.stderr):
+            try:
+                f.close()
+            except Exception:
+                pass
+        if not _reap_bounded(p.pid):
+            # the pid is unkillable (D-state) — a daemon thread inherits the
+            # wait so the watcher never does; init reaps when the watcher exits
+            threading.Thread(target=p.wait, daemon=True).start()
+        rc, out, err = 124, "", f"step overrun: killed after {timeout}s (pid {p.pid})"
+    finally:
+        if stop is not None:
+            stop.set()
+    if timed_out:
+        log(f"  ⛔ step overrun: {shown} pid={p.pid} killed after {timeout}s")
+    r = subprocess.CompletedProcess(cmd, rc, out, err)
+    if timed_out:
+        r.overrun = {"pid": p.pid, "budget": timeout}
+    return r
 
 def _repo_for(project, explicit=None):
     cfg = _project_cfg(project)
@@ -446,6 +541,18 @@ def cmd_tune(a):
     if a.push_remote:
         pcfg["push_remote"] = a.push_remote
         changed.append(f"push_remote={a.push_remote}")
+    if a.build_timeout is not None:
+        pcfg["build_timeout_secs"] = int(a.build_timeout)
+        changed.append(f"build_timeout_secs={pcfg['build_timeout_secs']}")
+    if a.gate_timeout is not None:
+        pcfg["gate_timeout_secs"] = int(a.gate_timeout)
+        changed.append(f"gate_timeout_secs={pcfg['gate_timeout_secs']}")
+    if a.deploy_timeout is not None:
+        pcfg["deploy_timeout_secs"] = int(a.deploy_timeout)
+        changed.append(f"deploy_timeout_secs={pcfg['deploy_timeout_secs']}")
+    if a.step_heartbeat is not None:
+        pcfg["step_heartbeat_secs"] = int(a.step_heartbeat)
+        changed.append(f"step_heartbeat_secs={pcfg['step_heartbeat_secs']}")
     _save_config(cfg)
     log(f"tuned {project}: {', '.join(changed) or 'no change'}")
     # verify
@@ -864,9 +971,14 @@ def _do_tick_project(project, dry=False):
     integ_sha = git_rev(repo, "HEAD")
     build_ok = True
     build_log = ""
+    hb_secs = int(pcfg.get("step_heartbeat_secs", DEFAULT_STEP_HEARTBEAT_SECS))
+    build_to = int(pcfg.get("build_timeout_secs", DEFAULT_BUILD_TIMEOUT_SECS))
+    gate_to = int(pcfg.get("gate_timeout_secs", DEFAULT_GATE_TIMEOUT_SECS))
     if build_cmd:
-        log(f"  building {project} IN {repo} ({main_branch}@{integ_sha[:12]}): {build_cmd}")
-        r = _run(build_cmd, cwd=str(repo), timeout=3600, shell=True)
+        log(f"  building {project} IN {repo} ({main_branch}@{integ_sha[:12]}, budget {build_to}s): {build_cmd}")
+        r = _run(build_cmd, cwd=str(repo), timeout=build_to, shell=True, label=f"build {project}", heartbeat_secs=hb_secs)
+        if getattr(r, "overrun", None):
+            _emit_event(project, "build_step_overrun", sha=integ_sha, budget_secs=r.overrun["budget"], pid=r.overrun["pid"])
         build_log = (r.stdout or "")[-4000:] + (r.stderr or "")[-4000:]
         build_ok = (r.returncode == 0)
         log("  build ok" if build_ok else f"  ⛔ build FAILED: {build_log[-1200:]}")
@@ -877,8 +989,9 @@ def _do_tick_project(project, dry=False):
     for g in gates:
         if not build_ok:
             break
-        log(f"  gate: {g}")
-        r = _run(g, cwd=str(repo), timeout=900, shell=True)
+        r = _run(g, cwd=str(repo), timeout=gate_to, shell=True, label=f"gate {Path(g).name}", heartbeat_secs=hb_secs)
+        if getattr(r, "overrun", None):
+            _emit_event(project, "gate_step_overrun", gate=g, budget_secs=r.overrun["budget"], pid=r.overrun["pid"])
         if r.returncode != 0:
             gate_ok = False
             build_log = (r.stdout or "")[-2000:] + (r.stderr or "")[-2000:]
@@ -947,7 +1060,11 @@ def _do_tick_project(project, dry=False):
     if pushed is not False:
         if deploy_cmd:
             log(f"  deploying {project}: {deploy_cmd}")
-            r = _run(deploy_cmd, cwd=str(repo), timeout=3600, shell=True)
+            r = _run(deploy_cmd, cwd=str(repo),
+                     timeout=int(pcfg.get("deploy_timeout_secs", DEFAULT_DEPLOY_TIMEOUT_SECS)),
+                     shell=True, label=f"deploy {project}", heartbeat_secs=hb_secs)
+            if getattr(r, "overrun", None):
+                _emit_event(project, "deploy_step_overrun", sha=integ_sha, budget_secs=r.overrun["budget"], pid=r.overrun["pid"])
             deploy_ok = (r.returncode == 0)
             if not deploy_ok:
                 log(f"  ⛔ deploy FAILED: {(r.stderr or r.stdout or '')[-1200:]}")
@@ -1231,6 +1348,10 @@ def main():
     s.add_argument("--gates", help="space-separated gate scripts run after the build, before the push (e.g. 'scripts/check-privacy.sh')")
     s.add_argument("--push", choices=["true", "false"], help="push main to the upstream after a green build (default true)")
     s.add_argument("--push-remote", help="remote to push the integration to (default: the fetch remote)")
+    s.add_argument("--build-timeout", type=int, help="step watchdog budget for the build step, seconds (default 3600)")
+    s.add_argument("--gate-timeout", type=int, help="step watchdog budget per gate, seconds (default 900)")
+    s.add_argument("--deploy-timeout", type=int, help="step watchdog budget for the deploy step, seconds (default 3600)")
+    s.add_argument("--step-heartbeat", type=int, help="ci.log heartbeat interval while a named step runs, seconds (default 120, 0 disables)")
 
     s = sub.add_parser("status", help="is watcher alive, subs, last build")
     s.add_argument("--json", action="store_true")
