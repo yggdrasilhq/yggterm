@@ -6559,6 +6559,49 @@ fn app_policy_url(control_url: &str) -> String {
     format!("{}/policy", control_url.trim_end_matches('/'))
 }
 
+/// Percent-encode one query-parameter value, RFC 3986 unreserved set kept
+/// literal. The plan ask carries the page URL as `origin`; a hand-rolled
+/// encoder because the shell pulls no URL crate for one parameter.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// One fetched plan waiting for the GUI loop that owns the surface handle.
+struct PendingAutofillPlan {
+    native_id: u64,
+    apply_script: String,
+    secret_script: Option<String>,
+}
+
+/// THE handoff between the off-thread plan fetch and the poll that evaluates.
+/// A static because the plan outlives no request: it is pushed by one spawned
+/// fetch and drained by the next poll tick, and a dropped queue entry (push
+ /// under lock contention) costs nothing but one unfilled form.
+static PENDING_AUTOFILL_PLANS: std::sync::Mutex<Vec<PendingAutofillPlan>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn push_pending_autofill_plan(plan: PendingAutofillPlan) {
+    if let Ok(mut queue) = PENDING_AUTOFILL_PLANS.lock() {
+        queue.push(plan);
+    }
+}
+
+fn take_pending_autofill_plans() -> Vec<PendingAutofillPlan> {
+    PENDING_AUTOFILL_PLANS
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
+
 /// `<control>/zoom` — the app's per-site zoom overrides, `{ "sites": { host:
 /// percent } }`. No query param, like `/policy`: the whole map is small and the
 /// GUI does the per-host matching itself.
@@ -14706,6 +14749,92 @@ async fn web_surface_native_reconcile_loop(
                                 append_web_surface_history(&entry.profile, &page_url, fresh_title);
                             } else if record && title_changed {
                                 append_web_surface_history(&entry.profile, &page_url, &page_title);
+                            }
+                            // THE AUTOFILL PLAN DRAIN: plans are fetched off
+                            // this loop and land in the pending queue; they are
+                            // evaluated HERE, where the desktop handle lives.
+                            // A one-tick delay is invisible; a plan whose tab
+                            // closed targets a dead surface id and the
+                            // evaluator refuses it.
+                            for plan in take_pending_autofill_plans() {
+                                let _ = desktop.eval_web_surface(
+                                    plan.native_id,
+                                    &plan.apply_script,
+                                    |_| {},
+                                );
+                                if let Some(secret_script) = &plan.secret_script {
+                                    let _ = desktop
+                                        .eval_web_surface(plan.native_id, secret_script, |_| {});
+                                }
+                            }
+                            // THE LEARNED AUTOFILL PLAN, riding the same
+                            // navigation the zoom and the icon ride. The app's
+                            // control endpoint answers what this profile knows
+                            // about the origin just navigated to: manual
+                            // values inline, and — when a vault item is
+                            // remembered for this site — a fill script ARMED
+                            // on the user's first gesture (it never runs on
+                            // load, so a page watching its DOM cannot read a
+                            // secret that has not been typed; consult
+                            // lores/chain-of-thought 2026-09-12, Q1/Q5). The
+                            // plan is fire-and-forget: a slow or locked vault
+                            // delays nothing but its own fill, and a tab whose
+                            // plan lands after it closed targets a dead
+                            // surface id, which the evaluator refuses.
+                            if record {
+                                let session_path = key.0.clone();
+                                let native_id = entry.native_id;
+                                let origin = page_url.clone();
+                                let (control_url, control_token) = {
+                                    let shell = state.read();
+                                    (
+                                        shell.sidebar_control_url(&session_path),
+                                        shell.sidebar_control_token(&session_path),
+                                    )
+                                };
+                                if let Some(control_url) = control_url {
+                                    let native_id = native_id;
+                                    let plan_url = format!(
+                                        "{}/autofill/plan?origin={}",
+                                        control_url.trim_end_matches('/'),
+                                        percent_encode_query(&origin)
+                                    );
+                                    task::spawn(async move {
+                                        let plan = task::spawn_blocking(move || {
+                                            control_request(&plan_url, None, control_token.as_deref())
+                                        })
+                                        .await;
+                                        let Ok(Ok(plan)) = plan else {
+                                            return;
+                                        };
+                                        // The desktop handle is an Rc — it cannot
+                                        // cross into this task. The plan lands in
+                                        // the pending queue and the poll's NEXT
+                                        // tick evaluates it where that handle
+                                        // lives (the policy-fetch pattern).
+                                        let mut apply_script = None;
+                                        if plan["values"]
+                                            .as_array()
+                                            .is_some_and(|values| !values.is_empty())
+                                        {
+                                            apply_script = Some(format!(
+                                                "window.__ychromeApplyPlan && window.__ychromeApplyPlan({});",
+                                                plan["values"]
+                                            ));
+                                        }
+                                        let secret_script =
+                                            plan["secret"]["script"].as_str().map(str::to_string);
+                                        if let Some(apply_script) =
+                                            apply_script.or(secret_script.clone())
+                                        {
+                                            push_pending_autofill_plan(PendingAutofillPlan {
+                                                native_id,
+                                                apply_script,
+                                                secret_script,
+                                            });
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
