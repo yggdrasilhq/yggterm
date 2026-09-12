@@ -966,6 +966,26 @@ def _do_tick_project(project, dry=False):
             p = _sub_path(project, m["lane"])
             if p.exists(): p.unlink(missing_ok=True)
             log(f"  auto-unsubscribed {m['lane']} (already in main)")
+    # ── RESTORE BUILD-INDUCED DIRT (the Cargo.lock loop, dream
+    # ACK-3b75d1a48f). A build or deploy that rewrites tracked files
+    # (Cargo.lock via a drifted adjacent path dep) must not leave the
+    # integration floor dirty, or the hygiene gate blocks EVERY later tick
+    # behind "non-untracked change(s)" — measured 2026-09-12: practice-rs
+    # built+pushed green, then every following tick sat BLOCKED on
+    # ` M Cargo.lock` until an agent hand-restored it. The failed paths
+    # already reset --hard to pre_tick; the success path leaked. This must
+    # run AFTER the deploy (a deploy that builds in this tree can re-dirty
+    # it) and is the last thing that touches the tree before the record.
+    # The work is safely upstream by now — restore tracked churn to HEAD.
+    st = _run(["git", "status", "--porcelain"], cwd=str(repo), timeout=30)
+    dirt = [l[3:] for l in (st.stdout or "").splitlines()
+            if l.strip() and not l.startswith(("??", "R", "!")) and len(l) > 3]
+    if dirt:
+        _run(["git", "checkout", "--"] + dirt, cwd=str(repo), timeout=60)
+        log(f"  restored build dirt in {repo}: {', '.join(dirt[:8])}"
+            + ("…" if len(dirt) > 8 else ""))
+        _emit_event(project, "ci_restored_build_dirt", files=dirt[:12])
+
     rec = {
         "id": f"{project}--{ts_stamp()}--{integ_sha[:12] if integ_sha else 'no-sha'}",
         "project": project, "at": int(time.time()), "host": this_host(),
