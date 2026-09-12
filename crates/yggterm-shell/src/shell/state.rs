@@ -38767,7 +38767,7 @@ fn corpse_arm_decision(arms: u32, reload_nonce: bool) -> CorpseArmDecision {
 /// the alternative to this notice is exactly the defect being fixed here: a
 /// row that silently fell back to the terminal with no reason anywhere.
 fn web_surface_corpse_arm(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     trace_home: &std::path::PathBuf,
     target: &AppSurfaceRestoreTarget,
     corpse_arms: &Rc<RefCell<HashMap<String, u32>>>,
