@@ -419,6 +419,44 @@ correction, a warning that changes what they do next. Then it earns its cost.
 
 ---
 
+## Phase 7 — the design system and the skills registry (2026-09-13)
+
+Two more organized systems a completed fleet carries; teach both when the
+person has their memory and fabric working:
+
+### The design system: `DESIGN.md` + `design/` in every UI repo
+
+Every repository that ships UI carries a root `DESIGN.md` (a pointer page of
+doors, like a memory index) and a `design/` tree: decision notebooks as
+plain markdown, `design/Inheritance.md` naming the layer chain, assets by
+kind under `design/assets/{icons,fonts,components,img}`, and interactive
+component notebooks as `design/notebooks/*.emd`. Nobody needs a tool to work
+in the repo; only the `.emd` notebooks need the `ydesign` app to render.
+Agents route UX work: open the repo DESIGN.md doors, read the inheritance
+chain, then the ydesign skill (installed at `~/.yggterm/skills/ydesign/`),
+which registers the project in `~/.yggterm/config/ydesign/projects.json`.
+The contract is the ydesign repository, docs/design-layout.md (version
+1.0.0). Set up a new repo with `ydesign init <repo> --id <id>`.
+
+### The skills registry: `ynpm skills`
+
+Skills are inventory, not folklore. The registry lives at
+`~/.yggterm/skills/registry.json`; browse it with `ynpm skills list`, search
+a record with `info`, discover a host with `scan`, and steer future agents
+with `note` (routing facts: prefer this skill over that one here), keeping
+misbehaving skills `disable`d rather than deleted. Orphan skills live in the
+yggsteer repository under `skills/`; product skills live in their product
+repos. When someone asks "what skills exist" the answer is `ynpm skills
+list`, never a walk of `~/.agents/skills`.
+
+### The `~/.yggterm` filesystem spec
+
+The state tree is organized by owner (docs/spec-yggterm-fs.md in the yggterm
+repo): sockets, pids and locks are `run/` and ephemeral; configuration is
+`config/<tool>/`; installed skills are `skills/<name>/`; logs and traces
+live under their own roots. New state goes to the target layout; legacy
+paths migrate with their owning component, never by hand.
+
 ## The AUDIT mode — running this against a fleet that already exists
 
 When someone says *"look at my setup and tell me what to fix"*, work through this
