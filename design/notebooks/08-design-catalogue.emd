@@ -9,7 +9,7 @@ you build a surface, find its pattern here first and match what you see.
 
 ## 1. The forms rail, the short-phrase rule
 
-![The fixed Settings rail](%ASSETS%/catalogue-forms-rail.png)
+![The fixed Settings rail](%ASSETS%/img/catalogue-forms-rail.png)
 
 What you are seeing:
 
@@ -29,7 +29,7 @@ to refuse in review.
 
 ## 2. The emd reader, the block vocabulary at rest
 
-![The extended-markdown reader rendering every block kind](%ASSETS%/catalogue-emd-reader.png)
+![The extended-markdown reader rendering every block kind](%ASSETS%/img/catalogue-emd-reader.png)
 
 What you are seeing:
 
@@ -60,7 +60,7 @@ granularity, which is why a heading block edits AT heading size.
 
 ## 4. The notebook is a surface too
 
-![A ydesign notebook page as the running surface](%ASSETS%/catalogue-notebook-page.png)
+![A ydesign notebook page as the running surface](%ASSETS%/img/catalogue-notebook-page.png)
 
 The meta-exhibit: these pages are themselves rendered by the machinery they
 document, prose typography, tables, emd components, a rail shelf with the
