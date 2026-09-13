@@ -12,6 +12,7 @@ fix the drifted layer and record the correction in both.
 
 ## Doors
 
+- [design/notebooks](design/notebooks/) — the chrome books, owned HERE: the worked examples (real schemas as specimens) and the design catalogue (the fleet pixels and the choices behind them).
 - [design/00-core-system](design/00-core-system.md) — the reusable rules that transfer across projects: brand intent, visual structure, control language, status vocabulary, motion.
 - [design/10-overlay-interface](design/10-overlay-interface.md) — the generic overlay template: keep the core system, replace or trim the overlay; do not bury project-only nouns in reusable sections.
 - [design/11-yggterm-overlay](design/11-yggterm-overlay.md) — yggterm's own overlay: product vocabulary, workflows, UI emphasis.
