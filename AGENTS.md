@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Design system
+
+**UX guidelines route through [DESIGN.md](DESIGN.md)** — the pointer page; decisions live in `design/`. The layout contract is ydesign 1.0.0 (`yggdrasilhq/ydesign`, docs/design-layout.md).
+
 ## Mission & Core Value Proposition
 
 Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed, a daemon-owned PTY core, and an embedded xterm.js terminal surface.
