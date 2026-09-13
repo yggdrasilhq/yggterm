@@ -36,7 +36,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | OPEN (server truth DECODED 2026-09-10 — see the seat E section; descriptor v2 fills queue behind 11.6.0) |
 | 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
-| 11.6.5 | muse | C | OPEN (baseline measured 2026-09-10 — v2 data fixes queued: composer U+276F, phrase table, startup gate) |
+| 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
 | 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer OPEN (gate shape change); working phrases still login-gated-unverified |
 | 11.6.7 | qwen | C | OPEN |
 | 11.6.8 | grok | C | phrase drift FIXED in the descriptor (measured 1.0.24 needles + Ctrl+c footer swap + send-to-bg hint — entry below); active_sessions.json tenancy registry documented on the descriptor; events.jsonl event-fed classifier OPEN |
@@ -445,6 +445,43 @@ pty drive renders nothing. Lab + raw byte captures:
    if forks are the story, a forked child’s live lock can outlive the
    parent conversation’s and id-discovery must read the fork chain,
    not just recency.
+
+### [11.6.5] muse descriptor v2 fill LANDED — every queued fix re-measured on the DRIFTED binary first (muse lane, 2026-09-14, lane/integration/muse)
+
+The wave-1 seat D fixes were queued against **1.1.1**; the muse lab host had
+drifted to **1.2.1 (1.2.1-R2847.1)** by the time this seat sat down — so the
+kimi re-drift lesson was applied and EVERY fact was re-proven on the live
+binary (node-pty + vendored xterm.js, `encoding: null` BYTE-EXACT capture —
+seat D's original harness stringified the pty stream and truncated multibyte
+UTF-8 to low bytes, which is how a first probe "lost" the glyph; raw captures:
+`~/.yggterm/scratchpad/zseat-muse-v2-20260914/lab/`):
+
+- **composer_marker `❯` U+276F re-proven byte-exact** (6 hits fresh turn,
+  1 resumed screen, 3 resume rederive; U+27E9 `⟩` ZERO everywhere). The
+  2026-08-22 `⟩` measurement describes a binary two versions dead; declared
+  `⟩` the readiness probe never finds today's composer.
+- **working table reduced to its one live needle** `esc to interrupt`
+  (6 turn frames). Dead on 1.2.1: `esc to cancel`, `working...`,
+  `thinking...` (zero frames each). ⛔ The `◆ Ran command · …` tool lines
+  were measured PERSISTING on screen after the turn ends (present in the
+  settled capture) — deliberately NOT adopted as working needles, they
+  would read working forever after the first tool call. `ctrl+o` hits every
+  frame including idle (the skills header) — chrome, not a phase.
+- **startup gate DECLARED** (was empty): `do you trust this workspace?` +
+  `trust and continue`, measured on a fresh-workspace drive (`> 1  Trust and
+  continue` / `2  Quit`), own-line witnesses per the codex/claude gate idiom.
+- **resume re-proven end-to-end on 1.2.1**: `muse resume <uuid>` (Subcommand,
+  unchanged) prints `resumed session <uuid>` AND rederives the committed
+  transcript (prompt text back on screen; `content_rederives_on_resume`).
+  Muse also says so itself now: "the previous run … ended abnormally … It
+  was resumed cleanly."
+- `working_footer_hints`: `esc to cancel` dropped (zero frames anywhere);
+  `esc to interrupt` kept.
+
+Tests: yggterm-core 713 passed with the composer-marker fixture updated to
+the 1.2.1 capture; descriptor_v2 §9 gate + shell terminal_observe (the
+composer_marker consumer) green; the only reds are main's pre-existing ones
+(filed below as [11.104] + the environment-sensitive [11.54]).
 
 ### [11.6.0] acceptance: reattach SLA on a forced rotation (spec §9) — writer half proven live 2026-09-10
 
@@ -29467,3 +29504,34 @@ yggterm-headless, ynpm, ynpx), point `install-state.json` at it atomically,
 SIGTERM the stale daemon — the supervisor/GUI spawns a successor from the
 healed registry in seconds, and convergence retires any transient sibling on
 its own.
+
+## ⛔ [11.104] MAIN'S YGGTERM-CORE SUITE CARRIES THREE KIMI REDS — THE 11.6.6-a LANDING UPDATED THE REGISTRY BUT NOT THE FLEET JSON AND TWO FIXTURES (found on pristine main 60e6af57 by the muse lane, 2026-09-14)
+
+**Status:** OPEN
+
+`cargo test -p yggterm-core --lib` on pristine main fails three kimi-named
+tests; all three are the incomplete half of the wave-2 batch fill's kimi
+11.6.6-a landing (b2b9fe3a), not new drift:
+
+1. `the_fleet_transcript_table_matches_the_registry` — `.agents/skills/
+   yggterm-agent-fleet/cli-stores.json` still says kimi
+   `.kimi-code/sessions/*/*/state.json` while the registry now declares
+   `.kimi/sessions/*/*/wire.jsonl`. The test's own panic names the fix:
+   the JSON is wrong, not the test.
+2. `title_authority_matches_the_owner_titling_law` — the test's law table
+   still demands `Store` for kimi while the descriptor now (deliberately)
+   says `Generated` (the 1.50 store provably holds no title). Whichever
+   way the law resolves, the two must agree — as landed, the descriptor
+   and its own gate test disagree.
+3. `a_remote_title_probe_never_ships_without_its_local_reader` — kimi
+   still ships `remote_live_store_title: Some(KIMI_REMOTE_TITLE_PROBE)`
+   after `read_live_store_title` went `None`; a remote probe with no
+   local reader is two answers to one question, free to drift.
+
+Found while greening the muse lane's own suite (the same run: the fourth
+red, `promote_direct_install_active_version_is_noop_without_managed_install`,
+is the already-filed environment-sensitive [11.54] — the muse lab host is a
+live-install host). The muse lane changed none of these files; this entry
+exists so the
+kimi follow-up (11.6.6-b's gate-shape seat, or the batch seat returning)
+lands the JSON + fixtures in one commit.

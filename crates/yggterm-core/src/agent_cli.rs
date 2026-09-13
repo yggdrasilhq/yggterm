@@ -2943,34 +2943,49 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("muse"),
         remote_row_scheme: Some("remote-muse://"),
         runtime_key_scheme: Some("muse-runtime://"),
-        // Measured from Muse Code TUI: shows "esc to interrupt", "esc to cancel", "working...", "thinking..."
-        working_screen_phrases: &[
-            ScreenWorkingPhrase {
-                needle: "esc to interrupt",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "esc to cancel",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "working...",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "thinking...",
-                also_any: &[],
-            },
-        ],
+        // MEASURED 2026-09-14 on Muse Code 1.2.1 (1.2.1-R2847.1, the muse lab
+        // host; node-pty + vendored xterm.js, byte-exact capture — the seat-D
+        // 1.1.1 lab re-run against the drifted binary). The working-state line
+        // is `◇ <State> (<N>s · esc to interrupt)` and tool events paint
+        // `◆ … · ✓ · <N>s · ctrl+o`; of the old four needles ONLY
+        // `esc to interrupt` still fires (6 turn frames; `esc to cancel`,
+        // `working...`, `thinking...` — zero frames). ⛔ `esc to interrupt` is
+        // the discriminator precisely because it lives only in the LIVE ◇
+        // line: the `◆` tool lines PERSIST on screen after the turn ends
+        // (measured in the settled capture), so a `◆` needle would read
+        // working forever after the first tool call.
+        working_screen_phrases: &[ScreenWorkingPhrase {
+            needle: "esc to interrupt",
+            also_any: &[],
+        }],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
-        startup_gate_screen_phrases: &[],
+        // MEASURED 2026-09-14 on 1.2.1: a fresh workspace parks the TUI on the
+        // trust picker BEFORE any composer (`Do you trust this workspace?` →
+        // `> 1  Trust and continue` / `2  Quit`). Two own-line witnesses, no
+        // `also_any` — the gate paints each on its own visible row (the same
+        // shape as codex/claude's gates). The approval/question pickers stay
+        // UNMEASURED (they need a judge-refused call); empty is the declared
+        // honest answer.
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "do you trust this workspace?",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "trust and continue",
+                also_any: &[],
+            },
+        ],
         plan_limit_choice_screen_phrases: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
-        // <session-uuid>`. ⛔ The placeholder here said `Flag("--resume")`,
+        // <session-uuid>`. RE-VERIFIED 2026-09-14 on 1.2.1 live: `resume
+        // <uuid>` prints the banner `resumed session <uuid>` and rederives the
+        // full transcript (content_rederives_on_resume re-proven). ⛔ The
+        // placeholder here said `Flag("--resume")`,
         // guessed from the other CLIs — a resume built from it would have
         // handed `muse --resume <uuid>` to an arg parser that has no such flag,
         // and EVERY Muse resume would have failed. The click-to-resume handoff
@@ -2979,15 +2994,21 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_footer_hints: &["esc", "ctrl", "enter", "tab"],
-        // ⭐ MEASURED 2026-08-22 from a real muse row: it draws U+27E9 `⟩`, not the
-        // U+276F `❯` that seven of the ten descriptors carry. Declared as `❯`, the
-        // readiness probe never found this CLI's composer at all, so every row of
-        // it reported `consuming_input: false` forever and the delivery verb waited
-        // out its whole timeout without ever sending — the SAME failure this field
-        // was created for when a hardcoded `›` did it to Claude Code on 2026-08-06.
-        // ⇒ The mechanism was made per-CLI; the value stayed a guess.
-        composer_marker: '\u{27e9}',
-        working_footer_hints: &["esc to interrupt", "esc to cancel"],
+        // ⭐ MEASURED 2026-09-14 on Muse Code 1.2.1 (byte-exact pty capture:
+        // U+276F `❯` present, U+27E9 `⟩` ZERO in fresh AND resumed composer),
+        // re-measured because the binary drifted past the 2026-08-22 1.1.1
+        // reading. History: the value was `⟩` per that 08-22 row measurement,
+        // flipping an earlier `❯` guess — the glyph swapped BACK under 1.1.1
+        // (seat D, 2026-09-10) and 1.2.1 keeps `❯`. Declared `⟩`, the
+        // readiness probe never finds this CLI's composer on today's binary,
+        // so every row reports `consuming_input: false` forever and the
+        // delivery verb waits out its whole timeout without ever sending —
+        // the SAME failure this field was created for when a hardcoded `›`
+        // did it to Claude Code on 2026-08-06.
+        composer_marker: '\u{276f}',
+        // `esc to cancel` dropped: measured ZERO frames on 1.2.1 (it never
+        // appears anywhere on screen, working or idle).
+        working_footer_hints: &["esc to interrupt"],
         // MEASURED from `muse --help` §Safety: approval and the sandbox are ON
         // by default, and `--yolo` is the one flag that turns both off. Muse
         // expresses no plan/accept-edits posture, so those are absent rather
@@ -9838,9 +9859,15 @@ Antigravity CLI requires permission to read, edit, and execute files here.
     /// the same failure a hardcoded `›` caused for Claude Code on 2026-08-06.
     #[test]
     fn a_composer_marker_is_the_glyph_that_cli_actually_draws() {
-        // Real composer lines, captured 2026-08-22. Paths invented.
+        // Real composer lines. Codex/Claude captured 2026-08-22; muse
+        // re-captured 2026-09-14 on 1.2.1 — the binary drifted past the
+        // 08-22 `⟩` reading and draws `❯` again (byte-exact: U+276F present,
+        // U+27E9 zero, fresh AND resumed).
         for (kind, line) in [
-            (SessionKind::Muse, "\u{27e9}"),
+            (
+                SessionKind::Muse,
+                "\u{276f} Reply with exactly: PROBE-ECHO-OK-M121",
+            ),
             (
                 SessionKind::Codex,
                 "\u{203a} Run /review on my current changes",
