@@ -29336,6 +29336,8 @@ is the bug.
 
 ## ⛔ [11.101] ONE STALLED REMOTE BOOTSTRAP FROZE THE WHOLE DAEMON — THE UPLOAD WROTE FOREVER, HELD THE RESOLVE LOCK, THE LAUNCH FUNNEL HELD THE RUNTIME LOCK THROUGH IT, AND THE ACCEPT LOOP'S IDLE CHECK BLOCKED BEHIND THE SAME LOCK (guihost outage 2026-09-11, fixed in code same session)
 
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
 The guihost went fully dark: yggterm "not starting", nothing launched,
 `server status` hung, and the canonical socket answered NOTHING. Measured on
 the live wedged daemon (eu-stack + /proc/thread syscalls + strace):
@@ -29389,6 +29391,8 @@ instantly); the full 300 s timeout path needs a half-open TCP remote.
 
 ## ⛔ [11.102] THE HOST-PANIC WATCHER'S TMPFS WALK CROSSES FILESYSTEMS — ONE DEAD FUSE MOUNT PARKED IT IN OPENDIR FOREVER (guihost 2026-09-11, fixed in code same session)
 
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
 `host_panic::runtime_tmpfs_bytes` walks `$XDG_RUNTIME_DIR` to measure tmpfs
 RAM, but nothing told it to STAY on the tmpfs: a directory entry that is
 itself a mountpoint (a dead sshfs left over from a workspace session at
@@ -29415,6 +29419,8 @@ enters a foreign device.
 ---
 
 ## ⛔ [11.103] THE HOT-RESTART SPAWN AUTHORITY TRUSTED A STALE INSTALL REGISTRY — THE DAEMON SAT ONE VERSION BEHIND ITS OWN GUI FOR A DAY (guihost 2026-09-10/11; downgrade refusal + adjacency-first fixed in code same session, channel-refresh health surface stays OPEN)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The owner's report — "daemon was sitting in 3.2.105 while yggterm was
 3.2.111, hot-restart was not updating properly" — measured out as a VERSION
