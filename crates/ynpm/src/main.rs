@@ -5864,7 +5864,8 @@ fn main() -> anyhow::Result<()> {
          list | check | doctor | sync [--integrated] | sync-fleet --hosts H1,H2 [--integrated] | self-update [--json] | export <pkg> [--metadata] [--archive PATH] | import <pkg> <ver> --archive PATH --bins a,b | import-yggterm <ver> --archive PATH | rollback <pkg> | remove <pkg> | prod <pkg> |\n\
          purge-legacy                                        # remove old yggterm/npm copies when no live process uses them\n\
          dev [--build CMD] [--watch PKG] [--fleet H1,H2] [--dest DIR] [--bin NAME=PATH] <checkout>\n\
-         ynpx <pkg> [flags] installs/updates when online, then launches the verified bin; github:owner/repo and --dev checkout are supported";
+         ynpx <pkg> [flags] installs/updates when online, then launches the verified bin; github:owner/repo and --dev checkout are supported\n\
+         skills scan | list [--json] | info N | register N --home P [--summary S] [--notes N] [--tag T] | install N | note N TEXT | enable/disable N | check    # the fleet skills registry (~/.yggterm/skills/registry.json)";
     if invoked_as != "ynpx" && args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{USAGE}");
         ynpm_trace(
@@ -5934,6 +5935,7 @@ fn main() -> anyhow::Result<()> {
         match verb.as_str() {
         "install" => verb_install(&paths, &args[1..]),
         "list" => verb_list(&paths),
+        "skills" => verb_skills(&paths, &args[1..]),
         "check" => verb_check(&paths),
         "doctor" => {
             if args.len() != 1 {
@@ -6613,4 +6615,459 @@ mod tests {
         assert!(!staging.exists(), "staging must be reaped after activation");
         fs::remove_dir_all(root).expect("test cleanup");
     }
+}
+
+// ---- skills registry ------------------------------------------------------
+// The fleet's skill inventory: one JSON registry at ~/.yggterm/skills/, the
+// organized skill root (docs/spec-yggterm-fs.md). Skills live in repos; the
+// registry records where each one lives, where an installed copy sits, and
+// the routing notes (the "minimap") that steer future agents — e.g. prefer
+// one skill over another, or that a skill is disabled but kept installed.
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct SkillRecord {
+    name: String,
+    #[serde(default)]
+    home: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    installed: Vec<String>,
+    #[serde(default)]
+    updated: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct SkillRegistry {
+    version: u32,
+    #[serde(default)]
+    skills: Vec<SkillRecord>,
+}
+
+fn skills_root(paths: &Paths) -> PathBuf {
+    paths.home.join(".yggterm/skills")
+}
+
+fn skills_registry_file(paths: &Paths) -> PathBuf {
+    skills_root(paths).join("registry.json")
+}
+
+fn today_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    // days since epoch -> YYYY-MM-DD (civil-from-days, no external crate)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn load_skill_registry(paths: &Paths) -> SkillRegistry {
+    let path = skills_registry_file(paths);
+    if !path.exists() {
+        return SkillRegistry {
+            version: 1,
+            skills: Vec::new(),
+        };
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| SkillRegistry {
+            version: 1,
+            skills: Vec::new(),
+        }),
+        Err(_) => SkillRegistry {
+            version: 1,
+            skills: Vec::new(),
+        },
+    }
+}
+
+fn save_skill_registry(paths: &Paths, registry: &SkillRegistry) -> anyhow::Result<()> {
+    let path = skills_registry_file(paths);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(registry)?)?;
+    Ok(())
+}
+
+/// The (name, description) pair from a SKILL.md frontmatter block; the
+/// file's own `name:` wins, else the directory name.
+fn skill_frontmatter(dir: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
+    let mut name = None;
+    let mut description = None;
+    let mut in_frontmatter = false;
+    for line in text.lines().take(40) {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            if in_frontmatter {
+                break;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if !in_frontmatter {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("name:") {
+            if name.is_none() {
+                name = Some(value.trim().to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("description:") {
+            if description.is_none() {
+                description = Some(value.trim().to_string());
+            }
+        }
+    }
+    let name = name.unwrap_or_else(|| {
+        dir.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
+    Some((name, description.unwrap_or_default()))
+}
+
+fn skill_dirs_under(root: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if dir.join("SKILL.md").is_file() {
+            found.push(dir);
+        }
+    }
+}
+
+/// Every directory a skill could plausibly live in on this host: the
+/// harness-visible roots, one .agents/skills level under every repo
+/// checkout in ~/gh and ~/git, and installed ynpm generations.
+fn skill_scan_roots(paths: &Paths) -> Vec<PathBuf> {
+    let home = &paths.home;
+    let mut roots = vec![
+        home.join(".agents/skills"),
+        home.join(".claude/skills"),
+        skills_root(paths),
+    ];
+    for base in [home.join("gh"), home.join("git")] {
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join(".agents/skills");
+                if candidate.is_dir() {
+                    roots.push(candidate);
+                }
+            }
+        }
+    }
+    let generations = paths.home.join(".yggterm/ynpm/generations");
+    if let Ok(name_entries) = std::fs::read_dir(&generations) {
+        for name_entry in name_entries.flatten() {
+            if let Ok(ver_entries) = std::fs::read_dir(name_entry.path()) {
+                for ver in ver_entries.flatten() {
+                    let candidate = ver.path().join(".agents/skills");
+                    if candidate.is_dir() {
+                        roots.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+    roots
+}
+
+fn skill_installed_copies(paths: &Paths, name: &str) -> Vec<String> {
+    let mut copies = Vec::new();
+    let organized = skills_root(paths).join(name);
+    if organized.is_dir() {
+        copies.push(organized.to_string_lossy().to_string());
+    }
+    let harness = paths.home.join(".agents/skills").join(name);
+    if harness.is_dir() {
+        copies.push(harness.to_string_lossy().to_string());
+    }
+    copies
+}
+
+fn upsert_skill_record(
+    registry: &mut SkillRegistry,
+    name: &str,
+    home: &str,
+    summary: &str,
+) -> usize {
+    if let Some(index) = registry.skills.iter().position(|s| s.name == name) {
+        let record = &mut registry.skills[index];
+        if !home.is_empty() && record.home.is_empty() {
+            record.home = home.to_string();
+        }
+        if record.summary.is_empty() && !summary.is_empty() {
+            record.summary = summary.to_string();
+        }
+        record.updated = today_stamp();
+        index
+    } else {
+        registry.skills.push(SkillRecord {
+            name: name.to_string(),
+            home: home.to_string(),
+            summary: summary.to_string(),
+            notes: String::new(),
+            tags: Vec::new(),
+            disabled: false,
+            installed: Vec::new(),
+            updated: today_stamp(),
+        });
+        registry.skills.len() - 1
+    }
+}
+
+fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
+    let Some(sub) = args.first() else {
+        bail!("skills needs a subcommand: scan | list [--json] | info <name> | register <name> --home PATH [--summary S] [--notes N] [--tag T] | install <name> | note <name> <text> | enable <name> | disable <name> | check");
+    };
+    let mut registry = load_skill_registry(paths);
+    match sub.as_str() {
+        "scan" => {
+            let mut dirs = Vec::new();
+            for root in skill_scan_roots(paths) {
+                skill_dirs_under(&root, &mut dirs);
+            }
+            dirs.sort();
+            dirs.dedup();
+            let mut fresh = 0usize;
+            let mut known = 0usize;
+            for dir in &dirs {
+                let Some((name, description)) = skill_frontmatter(dir) else {
+                    continue;
+                };
+                let home = dir.to_string_lossy().to_string();
+                let existed = registry.skills.iter().any(|s| s.name == name);
+                let index = upsert_skill_record(&mut registry, &name, &home, &description);
+                registry.skills[index].installed = skill_installed_copies(paths, &name);
+                if existed {
+                    known += 1;
+                } else {
+                    fresh += 1;
+                    println!("ynpm skills: found {} ({})", name, home);
+                }
+            }
+            save_skill_registry(paths, &registry)?;
+            println!(
+                "ynpm skills: {} scanned, {} new, {} known; registry at {}",
+                dirs.len(),
+                fresh,
+                known,
+                skills_registry_file(paths).display()
+            );
+        }
+        "list" => {
+            let as_json = args.iter().any(|a| a == "--json");
+            registry
+                .skills
+                .sort_by(|a, b| a.name.cmp(&b.name));
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&registry.skills).unwrap_or_else(|_| "[]".into())
+                );
+                return Ok(());
+            }
+            if registry.skills.is_empty() {
+                println!("ynpm skills: registry empty; run `ynpm skills scan`");
+                return Ok(());
+            }
+            for record in &registry.skills {
+                let state = if record.disabled {
+                    "disabled"
+                } else if record.installed.is_empty() {
+                    "registered"
+                } else {
+                    "installed"
+                };
+                println!(
+                    "{:24} {:10} {}",
+                    record.name,
+                    state,
+                    if record.summary.is_empty() {
+                        &record.home
+                    } else {
+                        &record.summary
+                    }
+                );
+                if !record.notes.is_empty() {
+                    for line in record.notes.lines() {
+                        println!("    note: {line}");
+                    }
+                }
+            }
+        }
+        "info" => {
+            let name = args
+                .get(1)
+                .context("skills info needs a skill name")?;
+            let record = registry
+                .skills
+                .iter()
+                .find(|s| &s.name == name)
+                .context(format!("skill `{name}` not registered; run `ynpm skills scan`"))?;
+            println!("{}", serde_json::to_string_pretty(record)?);
+        }
+        "register" => {
+            let mut name = None;
+            let mut home = String::new();
+            let mut summary = String::new();
+            let mut notes = String::new();
+            let mut tags = Vec::new();
+            let mut iter = args[1..].iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--home" => home = iter.next().context("--home needs a value")?.clone(),
+                    "--summary" => summary = iter.next().context("--summary needs a value")?.clone(),
+                    "--notes" => notes = iter.next().context("--notes needs a value")?.clone(),
+                    "--tag" => tags.push(iter.next().context("--tag needs a value")?.clone()),
+                    other if name.is_none() => name = Some(other.to_string()),
+                    other => bail!("unknown skills register argument `{other}`"),
+                }
+            }
+            let name = name.context("skills register needs a name")?;
+            let index = upsert_skill_record(&mut registry, &name, &home, &summary);
+            let record = &mut registry.skills[index];
+            if !notes.is_empty() {
+                record.notes = notes;
+            }
+            for tag in tags {
+                if !record.tags.contains(&tag) {
+                    record.tags.push(tag);
+                }
+            }
+            record.installed = skill_installed_copies(paths, &name);
+            record.updated = today_stamp();
+            save_skill_registry(paths, &registry)?;
+            println!("ynpm skills: registered {name}");
+        }
+        "install" => {
+            let name = args.get(1).context("skills install needs a skill name")?;
+            let source = registry
+                .skills
+                .iter()
+                .find(|s| &s.name == name)
+                .map(|s| PathBuf::from(&s.home))
+                .context(format!("skill `{name}` not registered; run `ynpm skills scan` or `skills register`"))?;
+            let target = skills_root(paths).join(name);
+            if target.exists() {
+                std::fs::remove_dir_all(&target)?;
+            }
+            std::fs::create_dir_all(&target)?;
+            for entry in std::fs::read_dir(&source)? {
+                let entry = entry?;
+                let target_path = target.join(entry.file_name());
+                if entry.path().is_dir() {
+                    copy_dir_recursive(&entry.path(), &target_path)?;
+                } else {
+                    std::fs::copy(entry.path(), &target_path)?;
+                }
+            }
+            let index = registry
+                .skills
+                .iter()
+                .position(|s| &s.name == name)
+                .context("record vanished")?;
+            registry.skills[index].installed = skill_installed_copies(paths, name);
+            registry.skills[index].updated = today_stamp();
+            save_skill_registry(paths, &registry)?;
+            println!("ynpm skills: installed {name} -> {}", target.display());
+        }
+        "note" => {
+            let name = args.get(1).context("skills note needs a skill name")?;
+            let text = args[2..].join(" ");
+            anyhow::ensure!(!text.is_empty(), "skills note needs note text");
+            let index = registry
+                .skills
+                .iter()
+                .position(|s| &s.name == name)
+                .context(format!("skill `{name}` not registered"))?;
+            let record = &mut registry.skills[index];
+            if !record.notes.is_empty() {
+                record.notes.push('\n');
+            }
+            record.notes.push_str(&text);
+            record.updated = today_stamp();
+            save_skill_registry(paths, &registry)?;
+            println!("ynpm skills: noted {name}");
+        }
+        "enable" | "disable" => {
+            let name = args.get(1).context("enable/disable needs a skill name")?;
+            let index = registry
+                .skills
+                .iter()
+                .position(|s| &s.name == name)
+                .context(format!("skill `{name}` not registered"))?;
+            registry.skills[index].disabled = sub == "disable";
+            registry.skills[index].updated = today_stamp();
+            save_skill_registry(paths, &registry)?;
+            println!("ynpm skills: {} {name}", if sub == "disable" { "disabled" } else { "enabled" });
+        }
+        "check" => {
+            let mut broken = 0usize;
+            for record in &registry.skills {
+                let mut problems = Vec::new();
+                if !record.home.is_empty() && !PathBuf::from(&record.home).exists() {
+                    problems.push(format!("home missing: {}", record.home));
+                }
+                for copy in &record.installed {
+                    if !PathBuf::from(copy).join("SKILL.md").is_file() {
+                        problems.push(format!("installed copy broken: {copy}"));
+                    }
+                }
+                if record.installed.is_empty() {
+                    problems.push("not installed on this host".to_string());
+                }
+                if problems.is_empty() {
+                    println!("ynpm skills: {} ok", record.name);
+                } else {
+                    broken += 1;
+                    println!("ynpm skills: {} PROBLEM", record.name);
+                    for problem in problems {
+                        println!("    {problem}");
+                    }
+                }
+            }
+            if broken > 0 {
+                bail!("{broken} skill record(s) need attention");
+            }
+        }
+        other => bail!(
+            "unknown skills subcommand `{other}`; use scan | list | info | register | install | note | enable | disable | check"
+        ),
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target_path = target.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir_recursive(&entry.path(), &target_path)?;
+        } else {
+            std::fs::copy(entry.path(), &target_path)?;
+        }
+    }
+    Ok(())
 }
