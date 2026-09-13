@@ -47,6 +47,37 @@ The yggterm server remains the session/launch owner. `ynpm` is the package,
 generation, cache, and publication owner. No daemon or GUI is required to run
 it.
 
+## Skills registry
+
+`ynpm skills` is the fleet skill inventory (2026-09-13, owner-directed).
+The registry lives at `~/.yggterm/skills/registry.json` — the organized
+skill root per [the filesystem spec](spec-yggterm-fs.md). Skills live in
+repositories (`.agents/skills/<name>/`); the registry records where each
+skill lives, where installed copies sit, and the routing notes — the
+"minimap" that steers future agents (prefer one skill over another; a skill
+disabled for future sessions yet kept installed).
+
+```sh
+ynpm skills scan                          # discover skills on this host, upsert the registry
+ynpm skills list [--json]                 # name, state (installed/registered/disabled), summary + notes
+ynpm skills info <name>                   # the full record
+ynpm skills register <name> --home <dir> [--summary S] [--notes N] [--tag T]
+ynpm skills install <name>                # copy the skill into ~/.yggterm/skills/<name>/
+ynpm skills note <name> <text>            # append a routing note
+ynpm skills enable <name> | disable <name>
+ynpm skills check                         # homes resolve, installed copies intact
+```
+
+`scan` reads the harness-visible roots (`~/.agents/skills`, `~/.claude/skills`),
+one `.agents/skills` level under every checkout in `~/gh` and `~/git`, and
+installed ynpm generations. Canonical skill repos: yggterm ships its
+operational skills in-repo; owner-authored orphans (data-fabric, delta-zero,
+dossiergraph, fingraph) live in the yggsteer repository under `skills/`;
+product skills live in their product repos. When an app package ships
+`.agents/skills`, installing or updating it through ynpm should register
+those rows too (run `ynpm skills scan` after such an install until that
+becomes automatic).
+
 ## Commands
 
 ```sh
