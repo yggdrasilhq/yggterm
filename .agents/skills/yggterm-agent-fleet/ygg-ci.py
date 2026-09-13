@@ -889,8 +889,18 @@ def _do_tick_project(project, dry=False):
             log(f"⛔ tick {project}: local {main_branch} DIVERGED from upstream — refusing (local {local_main[:12]} vs upstream {upstream_main[:12]})")
             return {"status": "refused-diverged"}
 
+    # ── MAIN-MOVED TRIGGER (dream ACK-180c05f734; measured 2026-09-13): an
+    # external main push (a seat landing directly, a hotfix, a human) moves
+    # HEAD without any sub going dirty, and the ticks answered "nothing new"
+    # forever — the commit sat unbuilt and undeployed until it was hand-built.
+    # The baseline is the last ATTEMPT, failed ones included: a sha already
+    # tried must not rebuild-loop a red main, while a failed sub-integration
+    # resetting to bare main re-arms the bare-main build (build-the-REST).
+    # A project with no subscriptions is still not under the plane's watch.
+    last_attempt = _last_build(project, consumed_only=False)
+    main_moved = bool(last_attempt and last_attempt.get("sha"))         and local_main != last_attempt["sha"]
     dirty, last = _dirty_subs(project, pcfg, subs)
-    if not dirty and last and upstream_main == local_main:
+    if not dirty and last and upstream_main == local_main and not main_moved:
         log(f"tick {project}: {len(subs)} subs but none dirty since {last.get('id')} — skipping")
         return {"status": "clean", "last": last.get("id")}
     if dry:
@@ -963,7 +973,7 @@ def _do_tick_project(project, dry=False):
 
     viable = [m for m in merged if not m.get("already_in_main")]
     integrated_local = local_main != pre_tick  # local was ahead: push pending
-    if not viable and not integrated_local and not (conflicts and last is None):
+    if not viable and not integrated_local and not main_moved and not (conflicts and last is None):
         log(f"tick {project}: nothing new to integrate (merged={len(merged)} conflicts={len(conflicts)})")
         return {"status": "clean", "merged": len(merged), "conflicts": len(conflicts)}
 
