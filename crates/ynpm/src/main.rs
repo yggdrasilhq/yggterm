@@ -3627,6 +3627,58 @@ fn verb_install(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     if failed > 0 {
         bail!("{failed} of {} package(s) failed", specs.len());
     }
+    register_skills_from_installed(paths)?;
+    Ok(())
+}
+
+/// Packages that SHIP skills register them at install time (owner law,
+/// 2026-09-13): after a successful install, upsert registry rows for every
+/// `.agents/skills` skill found in the installed generations. Updating a
+/// package re-runs install, so updates re-register too.
+fn register_skills_from_installed(paths: &Paths) -> anyhow::Result<()> {
+    let generations = paths.home.join(".yggterm/ynpm/generations");
+    let mut dirs = Vec::new();
+    skill_dirs_under(&generations.join("."), &mut dirs);
+    let mut names = Vec::new();
+    for name_entry in std::fs::read_dir(&generations).ok().into_iter().flatten().flatten() {
+        let candidate = name_entry.path().join(".agents/skills");
+        if candidate.is_dir() {
+            skill_dirs_under(&candidate, &mut dirs);
+        }
+        for ver_entry in
+            std::fs::read_dir(name_entry.path()).ok().into_iter().flatten().flatten()
+        {
+            let candidate = ver_entry.path().join(".agents/skills");
+            if candidate.is_dir() {
+                skill_dirs_under(&candidate, &mut dirs);
+            }
+        }
+    }
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    dirs.sort();
+    dirs.dedup();
+    let mut registry = load_skill_registry(paths);
+    let mut registered = 0usize;
+    for dir in &dirs {
+        let Some((name, description)) = skill_frontmatter(dir) else {
+            continue;
+        };
+        names.push(name.clone());
+        let index = upsert_skill_record(&mut registry, &name, &dir.to_string_lossy(), &description);
+        registry.skills[index].installed = skill_installed_copies(paths, &name);
+        registry.skills[index].updated = today_stamp();
+        registered += 1;
+    }
+    if registered > 0 {
+        save_skill_registry(paths, &registry)?;
+        println!(
+            "ynpm skills: {} package-shipped skill(s) registered: {}",
+            registered,
+            names.join(", ")
+        );
+    }
     Ok(())
 }
 
