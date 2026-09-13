@@ -170,6 +170,35 @@ if [ -z "$LICENCE_PAT" ] || [ "${probe_hit:-0}" -lt 1 ] || [ "${probe_clean:-0}"
   fail=1
 else
   lh=$(echo "$LICENCE_FILES" | xargs grep -nIEi -- "$LICENCE_PAT" 2>/dev/null)
+  # ⭐ OWN-LICENCE TAG ALLOWLIST (2026-09-13). The current terms are public
+  #    and live in LICENSE/NOTICE — "state them, never narrate them". A line
+  #    whose ONLY licence-pattern matches are this repo's own tags, stated
+  #    plainly, IS a statement of the current terms and is not a leak: docs
+  #    legitimately say what licence the code carries. Derived at run time
+  #    from the compliance files only (LICENSE*/NOTICE) — never dependency
+  #    manifests, whose licence lists are third parties'. A line that carries
+  #    ANY narrative vocabulary (change, claim, flip, estate, CLA, dual,
+  #    history) still fails, and a repo that narrates its licence lineage is
+  #    caught exactly as before. Measured 2026-09-13: libyggterm docs lanes
+  #    naming the repo's own MPL-2.0 bounced three ygg-ci integration pushes,
+  #    because the CI has no path to the human override.
+  OWN_TAGS=$(cat LICENSE* NOTICE 2>/dev/null \
+    | grep -hioE '(GPL-[23](\.[0-9])?(-or-later|-only)?|MPL-2\.0|Apache-2\.0|CC-BY-SA-[0-9.]+|CC-BY-4\.0|MIT|ISC|BSD-[0-9]-Clause|Unlicense)' \
+    | sort -u | head -8)
+  if [ -n "$OWN_TAGS" ] && [ -n "$lh" ]; then
+    OWN_RE=$(echo "$OWN_TAGS" | sed 's/[^A-Za-z0-9.\-]/./g' | paste -sd'|' -)
+    NARR_RE='re-?licen[sc]e|dual licen[sc]e|licen[sc]e (change|decision|claim|flip|history)|estate|paid edition|first-class|\bCLA\b'
+    filtered=""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      if printf '%s\n' "$line" | grep -oIE "$LICENCE_PAT" 2>/dev/null | grep -qivE "^($OWN_RE)$" \
+         || printf '%s\n' "$line" | grep -qiE "$NARR_RE"; then
+        filtered="${filtered}${line}
+"
+      fi
+    done <<< "$lh"
+    lh=$(printf '%s' "$filtered")
+  fi
   [ -n "$lh" ] && { echo "$lh" | grep -vqiE 'first-class' && { note "licence-history / estate-intent narrative — state the current terms, never the change:"; echo "$lh" | head -8 >&2; fail=1; }; }
 fi
 
