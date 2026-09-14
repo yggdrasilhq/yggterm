@@ -30220,3 +30220,67 @@ merge. Until then every spawn, every row-resolving verb, and every
 agent's `server app rows` poll taxes the UI plane on large desktops —
 and the pollers multiply it. Evidence: ux-speed door §BASELINES
 (`campaign-ux-speed.md`), trace window of the 2026-09-15 spawn probe.
+## ⛔ [11.118] THE MODAL'S REQUEST EDGE IS SILENT ON THE LIVE BUILD — `modal_open_requested` FIRES FOR THE BULK CLOSE-ALL BUT NEVER FOR SINGLE-ROW DELETES, AND THE CHORD-PATH OPENER `open_delete_dialog` CARRIES NO EMISSION AT ALL — the modal pair the ux-speed door defines cannot be measured end-to-end on 3.2.113 (measured live 2026-09-15 ~01:15-01:45 IST, five controlled opens, tools/uxspeed/uxprobe.py modal action)
+
+**Status:** OPEN (instrument gap; [11.113] family — the modal row of the
+door's event map is affected)
+
+The ux-speed modal-driver lane built the campaign's modal probe (lane
+`lane/uxspeed/modal-driver`, tools/uxspeed/uxprobe.py `--actions modal`)
+and hit this while trying to measure the door's confirmed pair
+`ui_telemetry/modal_open_requested` → `modal/shown`. The shown edge fires
+every time; the request edge does not.
+
+**Evidence chain (all on the live client, 3.2.113):**
+
+- 5 controlled single-row dialog opens through the row's real context
+  menu (dispatched right-click on the sidebar node → click the
+  `delete-session` item → the delete-confirm overlay mounted, DOM-verified,
+  right title in the dialog text, `modal/shown` {kind:"delete"} in ytrace
+  each time): **zero `modal_open_requested` events** — in neither
+  `ui-telemetry.jsonl` nor `ytrace.jsonl` (live file, full-text grep, not
+  just the tail) nor any rolled generation from tonight.
+- The same client's BULK site demonstrably fires: three
+  `modal_open_requested {bulk:true, kind:"delete", rows:2}` events
+  yesterday evening (~20:52-20:54 IST) from natural close-all usage. So
+  the writer, the file, the mirror and the 2 s duplicate-throttle gate all
+  work, and identical payloads within minutes pass the gate.
+- Static chain says the single-row site should fire too: emission in
+  `open_delete_dialog_for_row` (state.rs, `3def75d9a` 2026-09-07), routing
+  `delete-session => open_context_menu_delete_for_row` since `0e6cb9b4`
+  (2026-08-17), both present in the client's build commit (`243cadce`,
+  2026-09-14 19:05, the merge tip the running binary was built from).
+  Code-silent divergence: **open the dialog, get no request event.**
+- Certain regardless of the mystery above: a THIRD opener —
+  `open_delete_dialog` (state.rs, the selection/chord path, the ALT+E,X
+  route) — sets `pending_delete` with **no** `record_ui_telemetry` call.
+  The chord the owner actually presses is the one plane that can never
+  appear in the pair.
+
+**Why it matters:** the door's modal pair is the campaign's only in-app
+request→paint edge for modals; with the request edge silent, modal
+latency is currently measurable only from the outside (DOM mount-poll —
+which is what the new probe action measures and reports honestly). Any
+consumer of `modal_open_requested` for single-row deletes (analytics,
+the §12 keytips audit family, future regression fences) is reading a
+count of zero.
+
+**Fix shape:** (a) find why the instrumented single-row site is silent on
+the live build (build-divergence check first: `strings` the deployed
+binary for the site's neighbouring literals, then a debug run); (b) add
+the missing `record_ui_telemetry("modal_open_requested", …)` to
+`open_delete_dialog` (chord path), kind `delete`, with the chord's shape
+in the payload so the chord path is distinguishable from the menu path.
+
+**Meanwhile the driver's primary metric** is the DOM dispatch→mount wall
+(click→mount p50 25 ms / max 30, dispatch→mount p50 386 / max 458,
+menu-open p50 138, cancel-to-gone p50 91, n=5, quiet desktop, CLI floor
+~80 ms) — the modal plane PASSES the ≤100 ms interactive bar on the
+click→mount edge with 3× headroom; the menu-open dominates the action.
+Re-measure the pair when (a)/(b) land.
+
+> Renumber note: drafted as [11.116] within the hour two sibling lanes
+> claimed [11.116] and [11.117] on main — renumbered to [11.118] per the
+> defect-id law (grep at FILE time on FRESH origin/main); [11.115]
+> precedent.
+
