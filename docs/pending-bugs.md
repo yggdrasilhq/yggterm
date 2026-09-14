@@ -29951,3 +29951,20 @@ suites/zcode-tui.js --cwd <dir> --suite-arg bin=<0.5.9 build>` — green and
 `turn.declared_phrases_observed` all false until the descriptor is filled
 from this measurement; after the fill, the suite's fact table IS the
 regression test.
+
+## ⛔ [11.112] THE YGG-CI WATCHER DIES ON MULTIBYTE GATE OUTPUT — ONE UTF-8 CHAR SPLIT ACROSS A READ CHUNK KILLED THE WHOLE TICK LOOP AND EVERY SUBSCRIBED LANE WAITED IN SILENCE (wedged 2026-09-14 22:29:54 IST, found by the kimi-draft-guard seat waiting on its lane)
+
+**Status:** OPEN
+
+The 22:26 tick built yggterm ok and started the docs gate; at 22:29:54 the
+watcher logged `tick error: 'utf-8' codec can't decode byte 0xe2 in
+position 191: invalid continuation byte` and the log went SILENT for 32+
+minutes at interval=300 — seven ticks missing, the process alive but never
+ticking again (recovery: kill + setsid restart, the pattern another seat
+used earlier the same day). Byte 0xe2 mid-string is a multibyte UTF-8 char
+(box-drawing/arrows in gate output) split across a pipe-read chunk boundary
+and decoded per-chunk — the classic incremental-decode defect. The fix is
+in the watcher's gate-output read: decode with an incremental decoder (or
+`errors='replace'`), never chunk-wise str-decoding; a gate crash must also
+be contained to its tick (log + continue), not able to take the loop down.
+Board record: infra/meta ACK-cc6f9f88d0 + recovery ACK-a3a32ade01.
