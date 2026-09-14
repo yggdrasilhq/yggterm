@@ -29565,3 +29565,34 @@ live-install host). The muse lane changed none of these files; this entry
 exists so the
 kimi follow-up (11.6.6-b's gate-shape seat, or the batch seat returning)
 lands the JSON + fixtures in one commit.
+
+## ⚠ [11.105] YGGTERM-SHELL STILL DRAWS ITS GLYPHS BY HAND — THE ICON CRATE WAS EXTRACTED FROM YGGTERM AND THEN NEVER ADOPTED BACK (iconography audit 2026-09-14, ydesign campaign)
+
+**Status:** OPEN
+
+The one-owner law lives in `libyggterm/crates/yggui-icons/src/lib.rs`: "A new
+inline `<svg` in an app layer is the defect this crate exists to prevent." The
+2026-09-14 audit (ydesign repo, `docs/iconography-audit-2026-09-14.md`) swept
+every registry UI repo and retired 19 duplicated icon definitions into the
+crate (yggui-chat `a2798d8`, jyas-webapp `cc1761a`) — but yggterm-shell, the
+crate the lucide set was originally extracted FROM (the arrows defect), still
+hand-draws its icons inline:
+
+- `crates/yggterm-shell/src/shell/sidebar.rs` — `RowDisclosureChevron`
+  (bespoke 12-grid, stroke-width 1.35, deliberately ONE shared chevron per
+  its own doc comment) plus ~5 more inline `svg {}` icon sites;
+- `crates/yggterm-shell/src/shell/overlays.rs` (×2), `viewport.rs`,
+  `right_rail.rs` — inline `svg {}` icon sites.
+
+The audit classed `yggterm-core/src/icon.rs` (brand app-icon install assets)
+as legitimate — desktop-entry pixmaps, not UI iconography.
+
+**The shape of the fix.** One adoption lane: depend on `yggui-icons`, swap
+the glyph sites to the crate (`Icon` / constants), and GRADUATE the bespoke
+`RowDisclosureChevron` into the crate with its measured rationale intact —
+a 12-grid compact chevron at stroke 1.35, not a flattened 24-grid lookalike;
+if the compact recipe wins, the crate grows a size-aware chevron. Not
+urgent: the shell is internally consistent today. But the crate only prevents
+the defect it names if its birthplace obeys it — every session the shell
+grows a new glyph by hand, the second encoding the crate exists to kill
+grows back.
