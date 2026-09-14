@@ -407,7 +407,7 @@ class Probe:
             ia, ib = self.rows_order_index(a_path), self.rows_order_index(b_path)
             if ia is not None and ib is not None and ib - ia == 1:
                 return True, int((time.perf_counter() - t0) * 1000)
-            time.sleep(0.15)
+            time.sleep(0.3)
         return False, None
 
     def wait_depth(self, a_path: str, expected_child_of: str | None,
@@ -424,7 +424,7 @@ class Probe:
                     return True, int((time.perf_counter() - t0) * 1000)
             elif a and a.get("depth") == b_depth:
                 return True, int((time.perf_counter() - t0) * 1000)
-            time.sleep(0.15)
+            time.sleep(0.3)
         return False, None
 
     def ensure_two_scratch_rows(self) -> list[str]:
