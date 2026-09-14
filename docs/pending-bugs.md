@@ -29968,3 +29968,55 @@ in the watcher's gate-output read: decode with an incremental decoder (or
 `errors='replace'`), never chunk-wise str-decoding; a gate crash must also
 be contained to its tick (log + continue), not able to take the loop down.
 Board record: infra/meta ACK-cc6f9f88d0 + recovery ACK-a3a32ade01.
+
+## ⛔ [11.113] THE TRACE PLANE CANNOT SEE THE UX ACTIONS THE UX-SPEED CAMPAIGN MUST MEASURE — NO DRAG END, NO MENU CLOSE/ACTIVATE, CHORD-IDENTITY ABSENT FROM `input/keystroke`, AND `first_frame` NEVER FIRES FOR IDLE SHELLS (measured 2026-09-14 late, live ytrace + synthetic verbs, the ux-speed founding lane)
+
+**Status:** OPEN
+
+The ux-speed campaign (door `campaign-ux-speed.md`) needs begin→end event
+pairs for every UX action; the L1 sweep found the plane cannot answer four
+of them. Evidence, each measured on the GUI host tonight:
+
+1. `tree_drag_begin` has NO end/drop sibling. The synthetic drag twin
+   (`server app drag begin/hover/drop`) emitted ZERO drag-named trace
+   events across 5 measured drags (probe report
+   `trace_events_in_window: null` every iteration) — drag latency is
+   unmeasurable end-to-end.
+2. `context_menu_open` has NO close/item-activation sibling, and
+   `server app terminal probe-context-menu` emits no trace event either;
+   it answers `accepted:false, reason:"terminal_host_dom_missing"` when
+   the row's surface DOM is absent (3/3 measured) — honest, but invisible
+   to the trace plane.
+3. `input/keystroke` (2974 events in a 2-generation window) carries SHAPE
+   ONLY — `bytes/chars/control/has_escape` — never WHICH key. A chord
+   (alt-keypress close-all, the campaign's named action) is
+   unidentifiable, so chord latency cannot be attributed. Suggested shape:
+   add `mods` + key name ONLY when a modifier is held — chord names are
+   commands, not content, so typing privacy is preserved.
+4. `xterm_paint/first_frame` marks first WRITE→frame; an idle shell (bare
+   bash prompt) never emits it (0/2 synthetic spawns), so spawn→paint for
+   the most common row is blind. `xterm_paint/settle` is the honest
+   paint-ready marker for spawn latency — document it as such.
+
+Consumers: tools/uxspeed/uxprobe.py (landed with this entry) currently
+asserts on app-state truth because the trace pairs do not exist.
+
+## ⛔ [11.114] TERMINAL SPAWN/CLOSE/DRAG ARE SECONDS-CLASS, NOT MILLISECOND-CLASS — MEASURED COST LADDER FOR SPAWN: ~0.6s DAEMON PROCESSING → ~0.6-1.0s QUEUED GAP → ~2.1s MOUNT ENSURE → +0.5s SETTLE (measured 2026-09-14 late on the GUI host, synthetic scratch rows, tools/uxspeed/uxprobe.py)
+
+**Status:** OPEN
+
+First controlled numbers of the ux-speed campaign, verb→effect with
+accuracy assertions, scratch rows only. Quiet-load window
+(cli-overhead floor 75 ms): spawn→paint (t0→`xterm_paint/settle`) p50
+3.7 s, max 4.4 s, n=2; the named ladder is the finding — `terminal new`
+reply completes ~0.6 s after the verb, the row sits `queued:true`
+~0.6-1.0 s more before `terminal_open_attempt/begin`, `terminal_mount`
+ensure runs ~2.1 s, settle lands +0.5 s. `server app session remove`
+(verified:true, row gone) took 2.7-8.4 s across loads. Drag-begin is
+BIMODAL: 0.5 s warm vs 11.0-11.2 s cold (first drag of a batch, twice);
+hover/drop are sub-second and reorder accuracy was correct whenever the
+verbs succeeded. Under load (floor 274→483 ms; likely the [11.108]
+webview/swap-thrash class) spawn never completed its ladder inside a 12 s
+timeout — the report carries start/end overhead floors as the load proxy.
+Re-run quiet before tuning any single stage; the ladder is the map of
+where the seconds live. Campaign door: `campaign-ux-speed.md` §BASELINES.
