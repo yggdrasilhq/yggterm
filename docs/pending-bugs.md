@@ -31,7 +31,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). OPEN: per-CLI battery suites + the composite real-rotation ledger-served run |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites for the remaining CLIs |
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
@@ -650,9 +650,9 @@ once the host daemon rotates. A dev spawn attempt the same day died
 pre-paint (no muse process, no departure record) — its own small mystery,
 not this lane's.
 
-### [11.6.0] acceptance: reattach SLA on a forced rotation (spec §9) — writer half proven live 2026-09-10
+### [11.6.0] acceptance: reattach SLA (spec §9) — COMPOSITE REAL-ROTATION RUN PROVEN LIVE 2026-09-15; writer half proven live 2026-09-10
 
-This acceptance item is OPEN. Writer half PROVEN on dev (isolated scratch
+This acceptance item is CLOSED — every bullet landed or proven, ending with the composite real-rotation run (bottom of this entry). Writer half PROVEN on dev (isolated scratch
 home, real handoff rotation, worktree binaries): the superseded-self-retire
 sweep ran `AllMoved { moved: 1 }`, traced `reattach_ledger_written
 {adopted_records: 1, successor_version: 3.2.109}`, wrote a correct
@@ -688,8 +688,49 @@ Still owed:
 
 - per-CLI battery suites — the zcode-tui §9 reference suite is LANDED
   (green 6/6 on main 0.5.9, 2026-09-14); remaining: the other CLIs' suites
-  (kimi's exists) and the composite real-rotation ledger-served run
-  riding a fleet rotation.
+  (kimi's exists).
+
+#### THE COMPOSITE REAL-ROTATION LEDGER-SERVED RUN — PROVEN LIVE (2026-09-15 ~00:29-01:10 IST, a fleet host's production daemon; proof-only lane `lane/integration/composite-rotation`)
+
+Vehicle: two real agy rows spawned through the LIVE production daemon via
+the `server remote start-agy` / `resume-agy` wrapper arms (one with a
+deliberate fake-id probe uuid; no turns — the rows only had to be owned).
+The rotation under test arrived on its own: the same-version hot-restart
+cold swap (the 30-min same-label cooldown expired over a deploy-replaced
+disk binary, while the predecessor daemon stayed alive behind the owner's
+draft-blocked codex row — by design).
+
+- WRITER HALF, PRODUCTION: the daemon traced
+  `hot_restart_same_version_cold_swap_armed` →
+  `daemon_self_retire_handoff_ok` →
+  **`reattach_ledger_died_with_me_written {dying_rows: 2}`** →
+  `run_end {hot_restart: true}`, and the ledger file held both records
+  verbatim (kind antigravity, disposition died_with_me, resume_argv
+  `--conversation <id>`, written_by_pid, from_version).
+- CONSUMER HALF, PRODUCTION: each `server remote resume-agy <id>` traced
+  **`reattach_ledger_served {disposition: died_with_me}`** ~150 ms from
+  invocation (served → bridge raw-mode → first paint),
+  `external_active_wait` ABSENT, agy rederived through the record's
+  resume_argv, and `clear_satisfied` consumed each record — the ledger
+  returned to `[]`. Pre-rotation baseline: the same resume of a LIVE owned
+  row bridges instantly (`bridge_stdin_raw_mode_enable` + first paint,
+  NO ledger consult — the live-runtime arm outranks the ledger by
+  design).
+- MEASURED EN ROUTE: a wrapper resume bridge hands the row's pty to the
+  serving daemon at first paint (the wrapper-spawned CLI re-parents to the
+  daemon — headless wrapper rows become daemon-owned rows); the
+  hot-restart successor may exit while a blocked predecessor keeps the
+  primary socket (the fleet converged back to the migration-blocked
+  predecessor; status pings answer — a benign [11.97]-class flow).
+
+Honest limits: the ADOPTED disposition (resume served from a bequeath
+`adopted` record) was not the observed path — every migration-capable
+handoff in this window bridged live rows (no ledger consult to trace), and
+the window's one cold exit wrote deaths; the CI test covers adopted
+synthetically. Production daemon deaths with owned rows remain the
+crash/kill class; this cold exit was the DESIGNED hot-restart same-version
+swap — which is the point: the writers fire on a flow the fleet
+actually runs.
 
 #### 11.6.6 + 11.6.8 measured groundwork, and the 11.6.7/.9/.10 availability record (batch seat, 2026-09-10, the muse lab host)
 
