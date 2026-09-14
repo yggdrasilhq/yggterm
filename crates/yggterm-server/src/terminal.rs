@@ -10009,4 +10009,135 @@ line-two on the real screen\r\n\
         );
     }
 
+    /// ⛔ [11.6.6-b follow-up] THE DRAFT GUARD'S REGION ARM, END-TO-END ON A
+    /// LIVE PTY. kimi 1.50.0 draws no composer glyph; the owed region arm
+    /// anchors `composer_row_holds_text` on the `── input ──` label instead.
+    /// The unit fixtures in yggterm-core pin the classifier on the measured
+    /// screens; this test proves the daemon consumer path on a live session:
+    /// the vt100 grid a real pty produced (raw rows, blanks included) anchors
+    /// by the label, refuses while text sits in the region, and clears once it
+    /// is gone. bash's pty echo paints the typed rows, which is exactly the
+    /// echo-shaped grid kimi draws.
+    #[test]
+    fn a_kimi_region_composer_refuses_while_text_sits_and_clears_when_empty() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("bash start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send_master_fd");
+        let master = crate::pty_handoff_wire::recv_master_fd(&recv)
+            .expect("recv_master_fd")
+            .0;
+        drop(pair);
+
+        let mut manager = TerminalManager::new();
+        let key = "local://kimi-region-draft-test";
+        manager
+            .adopt_session(key, "bash", None, 100, 24, master, pid, start, None)
+            .expect("adopt_session");
+
+        // Paint the kimi composer shape: the labeled rule region. The command
+        // line itself echoes above it, but its `input` sits inside quotes and
+        // never trims to the bare label — no false anchor.
+        manager
+            .write(key, "printf '%s\\n' '── input ────────────'\r")
+            .expect("paint the region label");
+        let label = "\u{2500}\u{2500} input \u{2500}\u{2500}";
+        let mut label_painted = false;
+        for _ in 0..50 {
+            if manager
+                .session_screen_plain_rows(key)
+                .is_some_and(|rows| rows.iter().any(|row| row.starts_with(label)))
+            {
+                label_painted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(label_painted, "the region label never painted");
+
+        // Text sits in the region (the pty echo paints it below the label):
+        // the guard must refuse.
+        manager.write(key, "PROBE-REGION-DRAFT").expect("type the draft");
+        let mut echo_painted = false;
+        for _ in 0..50 {
+            if manager
+                .session_screen_plain_rows(key)
+                .is_some_and(|rows| rows.iter().any(|row| row.contains("PROBE-REGION-DRAFT")))
+            {
+                echo_painted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(echo_painted, "the echo never painted");
+        assert_eq!(
+            manager.session_composer_holds_draft(key, Some(yggterm_core::SessionKind::Kimi)),
+            Some(true),
+            "typed-but-unsent text below the region label is a draft"
+        );
+
+        // Backspace it away and the GRID layer must read empty — `Some(false)`,
+        // the answer that lets a clean wake through on a row whose keystroke
+        // state was rebuilt from zero (every adoption/handover). The UNION
+        // deliberately stays refused here: the owning runtime's keystroke arm
+        // is sticky by design ("a line edited down to nothing is still was
+        // typed at"), and sticky-dominates-grid is the safe direction on the
+        // runtime that SAW the typing. This half is the discriminator against
+        // a residue-happy region arm: the echo row is gone from the vt100
+        // grid, so only a correct label-anchor read answers Some(false).
+        manager
+            // "PROBE-REGION-DRAFT" is 18 chars; two spare so the erase is
+            // never short by one.
+            .write(key, &"\x7f".repeat(20))
+            .expect("backspace the draft");
+        let mut cleared = false;
+        let mut last_rows = Vec::new();
+        for _ in 0..50 {
+            last_rows = manager.session_screen_plain_rows(key).unwrap_or_default();
+            if yggterm_core::composer_row_holds_text(
+                Some(yggterm_core::SessionKind::Kimi),
+                &last_rows,
+            ) == Some(false)
+            {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            cleared,
+            "the region never read empty after the backspaces; rows: {last_rows:?}"
+        );
+        assert_eq!(
+            manager.session_composer_holds_draft(key, Some(yggterm_core::SessionKind::Kimi)),
+            Some(true),
+            "the sticky keystroke arm dominates after typing, even erased — by design"
+        );
+
+        // The grid layer stays kind-scoped on the live rows: the same grid
+        // answers None for a marker-anchored kind (codex draws `›`, not a
+        // label region) — a label line must never anchor another CLI's guard.
+        let rows = manager.session_screen_plain_rows(key).expect("rows");
+        assert_eq!(
+            yggterm_core::composer_row_holds_text(Some(yggterm_core::SessionKind::Codex), &rows),
+            None,
+            "kimi's region label must not anchor a marker-scoped guard"
+        );
+        let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
 }
