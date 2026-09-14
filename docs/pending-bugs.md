@@ -30047,6 +30047,27 @@ mount_open vs 0.6-1.0 s warm). The seconds live in UI-plane congestion
 daemon. The original queued-gap reading above is superseded by this
 paragraph.
 
+**DRAG ARM: ROOT-CAUSED + FIX LANDED 2026-09-15** (`lane/uxspeed/drag-cold`,
+same sitting): the cold begin was `resolve_app_control_row`'s snapshot-miss
+fallback — a just-created session is not yet a promoted live view in the
+rendered snapshot, so the resolve fell into the full expansion rebuild:
+seven iterative `search_expanded_paths` passes (trace: expanded_path_count
+108→285), each re-merging the whole sidebar and pulling remote machine
+projections, ON the UI thread — the app's block instrument measured a
+10 532 ms stall ending exactly at `tree_drag_begin` (batch 1 also showed
+the request waiting ~9.6 s behind the preceding spawn's mount storm before
+pickup; batch 2 picked up in ~1.5 s and spent the rest in the rebuild —
+total ≈11 s both times). Fix: the live-session synthesis that rebuild path
+already ended on now answers BEFORE the rebuild; the rebuild stays the
+fallback for groups/documents/stored-but-not-live rows, and every
+row-naming verb (drag, menu, describe, close, group) rides the fast path.
+Re-probe of the fixed build is the close condition for this arm. STILL
+OPEN in this entry: the expansion rebuild's own cost when it genuinely
+runs (the same redundant-full-merge disease as [11.117], on the resolve
+path — seconds of UI-thread block per miss), and [11.113]'s missing drag
+end/drop events (this arm's evidence came from
+`request_begin`→`tree_drag_begin` pairs instead). (fix(shell): resolve app-control rows from live-session synthesis before the expansion rebuild)
+
 ## ⛔ [11.115] UNTHROTTLED BUILD STORMS ON THE GUI HOST STARVE THE UI PLANE — cpu some 40-52%, THE SHELL WEBVIEW RUNNABLE-STALLED 6.4s OF EVERY 10s, AND ui/block p95 LANDED 45× OVER THE BAR WHILE TWO CAMPAIGNS COMPILED ON THE DESKTOP HOST (caught live 2026-09-15 ~00:10-01:00 IST, GUI host)
 
 **Status:** OPEN
