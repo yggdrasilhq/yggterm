@@ -30041,3 +30041,90 @@ webview/swap-thrash class) spawn never completed its ladder inside a 12 s
 timeout — the report carries start/end overhead floors as the load proxy.
 Re-run quiet before tuning any single stage; the ladder is the map of
 where the seconds live. Campaign door: `campaign-ux-speed.md` §BASELINES.
+
+## ⛔ [11.115] UNTHROTTLED BUILD STORMS ON THE GUI HOST STARVE THE UI PLANE — cpu some 40-52%, THE SHELL WEBVIEW RUNNABLE-STALLED 6.4s OF EVERY 10s, AND ui/block p95 LANDED 45× OVER THE BAR WHILE TWO CAMPAIGNS COMPILED ON THE DESKTOP HOST (caught live 2026-09-15 ~00:10-01:00 IST, GUI host)
+
+**Status:** OPEN
+
+The ux-speed PSI lane (queue item 11 of the trace-fixing door: "PSI cpu-some
+63-88 with ~1-2 cores busy — own measurement session first") took its
+measurement session and found the felt-symptom half live and attributable:
+**any unthrottled compile on the GUI host stalls the desktop's UI plane far
+past the campaign bar.** The GUI host is also a workstation — build storms
+and UX latency share the same 16 cores.
+
+Measured (jojo, system PSI + GUI cgroup PSI + /proc schedstat + ytrace ui/block):
+
+- **Generators observed back-to-back, two different campaigns:** the
+  mac-kvm campaign's `ninja` build of qemu 11.0.1 (17 cc1 workers, load
+  avg 30.08 on 16 cores — the build later failed at [4589/4821] for its
+  own reasons), followed within minutes by a ux-speed sibling seat's
+  `cargo test -p yggterm-shell` (15 rustc units, ~80-180% each) — both
+  unthrottled, both on the GUI host, neither aware of the other or of the
+  desktop above them.
+- **System cpu PSI:** some avg10 42-52 (p50 39 across the build-on
+  window), avg60 36-40; memory PSI calm (some 1.58, kswapd 0.2% — the
+  [11.108] remediation holds; this is PURE CPU-scheduling starvation, not
+  swap).
+- **The GUI's own cgroup** (`yggterm-gui-2259287.scope/gui`): cpu
+  pressure **full avg60 = 16.4%** — every non-idle GUI task was
+  simultaneously stalled one-sixth of wall time.
+- **Victim cost, per instrument:** the shell WebProcess accumulated
+  run-queue delay of **p50 6.4 s / p95 9.4 s per 10 s window** (quiet
+  windows: 1.2 s); ui/block during the build hour: **n=612, p50 405 ms,
+  p95 2270 ms, max 13268 ms** vs the ≤50 ms p95 bar — 45× over. Cross-check:
+  summed ui/block gaps = 9.0 stall-minutes in the ~50-minute build-on
+  window (18% of wall time), matching the cgroup full reading (16.4%) —
+  two independent instruments agree.
+- **Historic queue-11 signature re-attributed:** the recorded "cpu-some
+  63-88 with ~1-2 cores busy + kswapd0 58%/kcompactd0 48% at 11:20" was
+  the RECLAIM half — kswapd/kcompactd storms pin their cores and pile
+  every task landing there into the run queue; that half is addressed by
+  the [11.108] memory remediation (memory PSI now ~0) and stays with the
+  gui-thrash-freeze family. THIS entry is the other half: healthy-memory
+  hosts still starve the UI under compile storms.
+
+**Also measured in the same window, FILED SEPARATELY (app-plane, do not
+fix here):** a 336 ms UI-stall METRONOME (~1.3 stalls/s for hours, p50
+337/max 481, diagnosis names `cli/scan_total` +
+`dioxus_render/component_window`) cost **33.4 UI-stall minutes across a
+2 h window** — larger than the build storm and NOT caused by it (it ran
+in a quiet period); and a 2.05 s-p50 storm (23:38-00:20 IST, max 7018 ms)
+naming `component_window`/`ui_telemetry/working_edge`. Both handed to the
+app-plane seats on infra/meta (ACK-76fa459c21); natural-traffic baselines
+must bucket by generator class or they will mix internal stalls with
+host-pressure stalls.
+
+**Fix shapes (in order):**
+(a) **Polite-build default for the GUI host** — heavy builds/test suites
+either ride dev (the ygg-ci plane) or run niced/capped (`nice -n 19`,
+`-j` ≤ half the cores, or a systemd-run --scope with cpu.max). This is a
+fleet-habit gap, not one campaign's fault: filed as a dreams post, and the
+mac-kvm door carries a note (its qemu build was the first generator
+measured).
+(b) **yggterm-side mitigation (proposed, own lane):** raise the GUI/UI and
+webview-render threads' scheduling priority (or drop background chores to
+SCHED_IDLE) so an oversubscribed desktop degrades build throughput before
+it degrades input→paint. Small, measurable against this entry's numbers.
+(c) Re-measure ritual: any GUI-host build under (a)/(b) re-runs this
+lane's sampler (`/tmp/psi-lane/` pattern: PSI + webview schedstat delta +
+ui/block buckets) and compares.
+
+**OFF arm (measured, 19:09 UTC, both builds stopped):** system cpu some
+avg10 0.15 (from 42-52); GUI cgroup cpu some avg10 **0.00** (from 17.5),
+full avg60 0.14 (from 16.4); webview run-delay collapsed to ~0.16 s per
+10 s window (from 6.4 s). ui/block after the storm keeps p50 ≈ 341 ms —
+that residual is the internal metronome above, not host pressure: the
+pressure-attributable stalls went to zero with the builds. The on/off
+pair is the cleanest single proof this campaign has that host-plane CPU
+storms, not the app, owned the felt lag during this window.
+
+**Falsifier (metronome-independent instruments):** during a polite
+(niced/capped) build on the GUI host: GUI cgroup cpu full avg60 < 2%,
+system cpu some avg60 < 10, webview run-delay p95 < 1 s per 10 s window,
+and no ui/block gap over 1 s beyond the internal-metronome floor
+(336 ms-class, separately owned). During an UNthrottled build the same
+instruments must reproduce this entry's numbers (they did, twice, two
+different toolchains, on/off pair measured).
+
+> Renumber note: this entry was drafted as [11.113] the same hour the probe-driver lane filed its own [11.113] (trace-plane gaps) — renumbered to [11.115] per the defect-id law (grep at FILE time on FRESH origin/main, not a stale checkout); [11.98]-to-[11.100] precedent.
