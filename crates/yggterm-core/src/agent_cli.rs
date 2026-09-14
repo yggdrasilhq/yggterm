@@ -9854,7 +9854,8 @@ Antigravity CLI requires permission to read, edit, and execute files here.
 
     /// ⛔ The composer marker is a MEASUREMENT, and seven of ten descriptors carry
     /// the same `❯`, which is how an assumed default hides among real ones. muse
-    /// draws U+27E9 and was declared U+276F, so its rows reported
+    /// was declared `⟩` from a 2026-08-22 reading, but the 1.1.1→1.2.1 binaries
+    /// draw U+276F — so while `⟩` stood, muse rows reported
     /// `consuming_input: false` forever and delivery waited out every timeout —
     /// the same failure a hardcoded `›` caused for Claude Code on 2026-08-06.
     #[test]
@@ -9885,6 +9886,74 @@ Antigravity CLI requires permission to read, edit, and execute files here.
                 line.chars().next().unwrap()
             );
         }
+    }
+
+    /// muse's phase tables against REAL 1.2.1 screens (captured 2026-09-14,
+    /// the muse lab host, node-pty + vendored xterm.js, one echo turn —
+    /// `~/.yggterm/scratchpad/zseat-muse-v2-20260914/lab/`). The same turn is
+    /// shown mid-flight and settled, because the trap is the DIFFERENCE: the
+    /// `◆` tool-event line PERSISTS on screen after the turn ends, so a `◆`
+    /// needle would read working forever after the first tool call. The
+    /// fixture keeps the screens' non-empty lines verbatim (chrome warning
+    /// rows and the workspace path trimmed), which is what the footer-window
+    /// matcher consumes; blank rows are dropped by the matcher itself.
+    #[test]
+    fn muse_working_reads_the_live_turn_line_not_the_persisted_tool_lines() {
+        let d = agent_cli_descriptor(SessionKind::Muse).expect("registered");
+        let midturn: &str = "Muse Code 1.2.1\n\
+             Skills: 29 loaded · 1 warning (ctrl+o to expand)\n\
+             ❯ Reply with exactly: MIDTURN-CAPTURE\n\
+             ◇ Working (0s · esc to interrupt)\n\
+             ────────────────────────────────────────────────\n\
+             ❯ \n\
+             ────────────────────────────────────────────────\n\
+             echo · ~/.yggterm/scratchpad/zseat-muse-v2-20260914/ws\n";
+        let settled: &str = "Muse Code 1.2.1\n\
+             Skills: 29 loaded · 1 warning (ctrl+o to expand)\n\
+             ❯ Reply with exactly: MIDTURN-CAPTURE\n\
+             ◆ echo: Reply with exactly: MIDTURN-CAPTURE\n\
+             ────────────────────────────────────────────────\n\
+             ❯ Type @ to search and insert workspace file paths\n\
+             ────────────────────────────────────────────────\n\
+             echo · ~/.yggterm/scratchpad/zseat-muse-v2-20260914/ws\n";
+        let gate: &str = "Muse Code updated 1.1.1-R2514.1 -> 1.2.1-R2847.1\n\
+             Do you trust this workspace?\n\
+             Workspace: ~/…/ws\n\
+             Trusting allows project-local skills, rules, hooks, and plugin config to load before the model runs.\n\
+             Only trust this workspace when you trust its contents.\n\
+             > 1  Trust and continue\n\
+             2  Quit\n\
+             Use Up/Down or 1/2, then Enter. Esc quits.\n";
+        // mid-flight: the live ◇ line is THE work signal (the one live needle).
+        assert!(
+            d.screen_shows_working(midturn),
+            "muse mid-turn must read Working — the ◇ … esc to interrupt line is live"
+        );
+        assert_eq!(
+            crate::descriptor_v2::screen_phase(&d, midturn),
+            crate::descriptor_v2::PhaseAnswer::Known(crate::descriptor_v2::AgentPhase::Working)
+        );
+        // settled: the ◇ line is gone; the ◆ tool line persists but MUST NOT
+        // read working. This is the regression lock for the never-adopted `◆`
+        // needle — and for the dropped dead needles (`working...`,
+        // `thinking...`, `esc to cancel` measured zero frames on 1.2.1),
+        // whose absence is what makes this quiet screen read Idle.
+        assert!(
+            !d.screen_shows_working(settled),
+            "muse settled screen with a persisted ◆ tool line must NOT read Working"
+        );
+        assert_eq!(
+            crate::descriptor_v2::screen_phase(&d, settled),
+            crate::descriptor_v2::PhaseAnswer::Known(crate::descriptor_v2::AgentPhase::Idle)
+        );
+        // the trust gate classifies as StartupGate (declared 2026-09-14; was
+        // empty, so a row parked on it read idle while typed input went
+        // into the picker).
+        assert!(d.screen_shows_startup_gate(gate), "the 1.2.1 trust gate must classify");
+        assert_eq!(
+            crate::descriptor_v2::screen_phase(&d, gate),
+            crate::descriptor_v2::PhaseAnswer::Known(crate::descriptor_v2::AgentPhase::StartupGate)
+        );
     }
 
     #[test]

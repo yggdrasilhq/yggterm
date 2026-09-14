@@ -527,6 +527,20 @@ the 1.2.1 capture; descriptor_v2 §9 gate + shell terminal_observe (the
 composer_marker consumer) green; the only reds are main's pre-existing ones
 (filed below as [11.104] + the environment-sensitive [11.54]).
 
+Proof state after the landing (main 3bb4c675, deployed fleetwide same day):
+the DATA is PTY-proven byte-exact against the real 1.2.1 binary, and the
+classifier leg is locked by a fixture test fed the REAL captured screens of
+one turn mid-flight and settled (`muse_working_reads_the_live_turn_line_not_
+the_persisted_tool_lines` — mid-turn reads Working, the settled screen with
+its persistent `◆` tool line reads Idle, the trust gate reads StartupGate).
+Still owed: ONE live muse row through a deployed daemon reading
+`consuming_input` true — the muse lab host daemon was still on the pre-fix generation
+at the sitting's end (deferring rotation on active owner rows); any seat can
+complete it with a bridge `spawn-row --cli muse` plus `server screen --state`
+once the host daemon rotates. A dev spawn attempt the same day died
+pre-paint (no muse process, no departure record) — its own small mystery,
+not this lane's.
+
 ### [11.6.0] acceptance: reattach SLA on a forced rotation (spec §9) — writer half proven live 2026-09-10
 
 This acceptance item is OPEN. Writer half PROVEN on dev (isolated scratch
