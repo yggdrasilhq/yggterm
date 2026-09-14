@@ -29863,3 +29863,44 @@ non-thread-local signal.
 
 **Falsifier:** an idle GUI (no output, no input) with zero ui/block
 incidents for 10 min while ytrace shows the normal snapshot cadence.
+
+## ⛔ [11.110] THE YNPM DEV AND NPM CHANNELS LEFT ONE BIN NAME ANSWERING TWO VERSIONS — THE FLEET PUSH WORKED, THE STALE CLI LINK KEPT SERVING 0.5.7, AND `ynpm install` BLESSED IT IN SILENCE (owner report + measured across the fleet 2026-09-14)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The owner: "I do not think ynpm dev install is installing fleetwide. There is
+version discrepancy between zcode-tui." Measured: the fleet push WORKED — dev,
+the GUI host and the muse lab host all imported dev-channel
+`@ygghq/zcode-tui` 0.6.4 within 26 s of one another (09:39:36/09:39:56/09:40:02
+IST; each host mints its own `dev-<ms>-<pid>` generation by design; no fleet
+host ran `dev.checkout.begin`, so the build came from the operator's own seat).
+The discrepancy was channel split-brain, not a failed push: dev and the muse
+lab host still served `zcode-tui` 0.5.7 through `~/.yggterm/ynpm/bin/zcode-tui`
+(npm channel `@avikalpa/zcode-tui`, which npm's latest still is) while
+`~/.local/bin/zcode-tui` served 0.6.4; the GUI host had been healed by hand the
+day before (its cli link redirected at `~/.local/bin`), the other two never.
+`ynpm list` faithfully measured the split (cli row 0.5.7 vs 0.6.4 per host) —
+the manager just had no verb that would heal it, and worse, two
+`ynpm install @avikalpa/zcode-tui` runs that morning "completed" in 652/639 ms
+as silent no-ops at 0.5.7 (the fast path even borrowed the dev-channel binary
+as its health check) while the dev channel held 0.6.4 — the operator read the
+quiet exits as "the fleet install did not happen".
+
+Fix (crates/ynpm/src/main.rs): `install_dev_bins` — the choke point for both
+local dev publishes and fleet imports — now converges: a dev build strictly
+newer than the npm-channel entry owning the same-named cli link repoints that
+link at the dev publication (the healed GUI-host shape) and prints the repoint;
+equal/older dev builds never touch it (dev tests, it does not pin back). An
+explicit npm install stays authoritative for the cli link but NAMES a newer
+dev-channel build of the same bin instead of exiting silently — on both the
+fast path and the full-install path. `ynpm check` classifies a cli link
+answering the dev channel's newer build as converged, not DRIFT. Contract
+documented in docs/ynpm.md §"Two channels, one bin name: convergence"; tests
+cover converge, no-touch-below-equal, and the superseded-install note.
+
+**Falsifier (the owed live proof):** run a real `ynpm install --dev` import of
+the same package on a host whose cli link still serves the older npm build and
+read both lookups (`~/.yggterm/ynpm/bin/<bin> --version` and
+`~/.local/bin/<bin> --version`) answering alike, with the converge line in the
+output; until that is witnessed on a host served by a deployed build, dev and
+the muse lab host still answer 0.5.7 through the integrated cli dir.

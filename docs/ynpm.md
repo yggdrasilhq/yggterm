@@ -430,6 +430,25 @@ build, one local health check, one optional fleet push, and no ten-command
 copy/repoint ritual. Release polish can arrive at the same package version and
 still be recognised by its production fingerprint.
 
+### Two channels, one bin name: convergence
+
+A dev install and the npm channel can both publish the same bin name into
+different destinations (`zcode-tui` served 0.6.4 from `~/.local/bin` while the
+integrated cli dir still served npm's 0.5.7 — the 2026-09-14 fleet split, where
+hosts answered differently by lookup path until one was healed by hand). The
+manager therefore converges on publish:
+
+- A dev publish (local or fleet-imported) that is STRICTLY NEWER than the
+  npm-channel entry owning the same-named link in `~/.yggterm/ynpm/bin`
+  repoints that link at the dev publication and says so. Equal or older dev
+  builds never touch the link: the dev channel tests, it does not pin back.
+- An explicit npm install stays authoritative for the cli link, but when the
+  dev channel holds a newer build of the same bin, the install NAMES the
+  divergence instead of exiting silently (the quiet exit was read as "the
+  fleet install did not happen").
+- `ynpm check` treats a cli link answering the dev channel's newer build as
+  converged, not drifted; any other disk/state disagreement is still DRIFT.
+
 Yggterm itself follows the same generation discipline, although its public
 release source is the GitHub release archive rather than an npm package:
 
