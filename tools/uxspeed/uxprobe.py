@@ -11,6 +11,12 @@ Actions:
   drag   — server app drag begin/hover/drop reorder of two scratch rows
   group  — server app row-set --into / --out on two scratch rows
   menu   — server app terminal probe-context-menu on a scratch row
+  modal  — the delete-confirm dialog on a scratch row, opened through the
+           REAL context-menu path (dispatched right-click → Delete item
+           click via server app dom-eval), timed as the in-app
+           modal_open_requested → modal/shown pair AND the DOM
+           dispatch→mount wall; cancelled through the dialog's own
+           Cancel button; the row must survive the cancel
   close  — server app session remove of the scratch rows (the teardown,
            instrumented — every spawned row is closed exactly once)
 
@@ -36,6 +42,145 @@ PROBE_TITLE_PREFIX = "uxspeed-probe-"
 YGGTERM = "yggterm"
 YTRACE = "ytrace"
 
+# The modal action opens the delete-confirm dialog through the row's REAL
+# context menu: a dispatched right-click on the row's SIDEBAR tree node
+# (data-sidebar-row-path — always rendered, unlike the xterm surface which
+# mounts lazily), then a click on the menu's Delete item. That is the DOM
+# path a human's right-click takes, and the same menu the ALT+E,X chord
+# drives. Everything happens in ONE dom-eval so the open→click→mount
+# deltas are in-page walls, unpolluted by CLI round-trips. Every exit
+# calls dioxus.send explicitly — the dom-eval bridge delivers the FIRST
+# sent message; a bare `return` value reads back null. The in-app pair
+# (modal_open_requested → modal/shown) is read from ytrace separately —
+# the app's own account of the same open.
+MODAL_OPEN_CLICK_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const PATH = {session!r};
+const refuse = (reason, extra) => dioxus.send(
+    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+if (document.querySelector('[data-delete-confirm-overlay]')) {{
+    refuse("delete_overlay_already_open");
+    return;
+}}
+const dismiss = async () => {{
+    try {{
+        const t = document.elementFromPoint(3, 3) || document.body;
+        const b = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, clientX: 3, clientY: 3, screenX: 3,
+                     screenY: 3, button: 0, buttons: 1 }};
+        t.dispatchEvent(new MouseEvent('mousedown', b));
+        t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
+        t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
+        await settle(80);
+    }} catch (_e) {{}}
+}};
+await dismiss();
+const row = await (async () => {{
+    // the sidebar virtualizes: the node may not exist until the row is
+    // selected and scrolled into view (the driver tree-selects first)
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {{
+        const n = document.querySelector(
+            '[data-sidebar-row-path="' + PATH + '"]');
+        if (n) return n;
+        await settle(50);
+    }}
+    return null;
+}})();
+if (!row) {{
+    refuse("sidebar_row_missing", {{ session_path: PATH }});
+    return;
+}}
+const rect = row.getBoundingClientRect();
+if (!(rect.width > 0 && rect.height > 0)) {{
+    refuse("sidebar_row_not_visible", {{ session_path: PATH }});
+    return;
+}}
+const cx = Number((rect.left + rect.width / 2).toFixed(2));
+const cy = Number((rect.top + rect.height / 2).toFixed(2));
+const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                button: 2, buttons: 2, detail: 1 }};
+const t_open = Date.now();
+row.dispatchEvent(new MouseEvent('mousedown', init));
+row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('contextmenu', init));
+let menu = null, deleteItem = null;
+const openDeadline = Date.now() + 1500;
+while (Date.now() < openDeadline) {{
+    await settle(40);
+    menu = document.querySelector('[data-context-menu="1"]');
+    // a LIVE session row's item is delete-session; plain delete is the
+    // folder/saved-ssh variant — same confirm dialog either way
+    deleteItem = menu?.querySelector(
+        '[data-context-menu-action="delete-session"],'
+        + ' [data-context-menu-action="delete"]') || null;
+    if (menu && deleteItem) break;
+}}
+if (!menu || !deleteItem) {{
+    await dismiss();
+    refuse("context_menu_or_delete_item_not_observed",
+           {{ session_path: PATH }});
+    return;
+}}
+const menu_open_ms = Date.now() - t_open;
+await settle(120);
+const clickInit = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 }};
+deleteItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
+deleteItem.dispatchEvent(new MouseEvent('mouseup',
+    {{ ...clickInit, buttons: 0 }}));
+deleteItem.dispatchEvent(new MouseEvent('click', clickInit));
+const t_click = Date.now();
+const mountDeadline = t_click + 1100;
+let overlay = null;
+while (Date.now() < mountDeadline) {{
+    await settle(20);
+    overlay = document.querySelector('[data-delete-confirm-overlay]');
+    if (overlay) break;
+}}
+if (!overlay) {{
+    refuse("delete_overlay_did_not_mount", {{ menu_open_ms }});
+    return;
+}}
+const t_mounted = Date.now();
+const dialog = overlay.querySelector('[data-delete-confirm-dialog]');
+dioxus.send({{
+    accepted: true,
+    menu_open_ms,
+    click_to_mount_ms: t_mounted - t_click,
+    dispatch_to_mount_ms: t_mounted - t_open,
+    overlay_count: document.querySelectorAll(
+        '[data-delete-confirm-overlay]').length,
+    dialog_text: String(dialog?.textContent || '').slice(0, 400),
+}});
+"""
+
+MODAL_CANCEL_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const t0 = Date.now();
+const refuse = (reason) => dioxus.send(
+    { accepted: false, reason });
+const cancel = document.querySelector('[data-delete-confirm-cancel]');
+if (!cancel) { refuse("cancel_button_missing"); return; }
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
+               button: 0, buttons: 1 };
+cancel.dispatchEvent(new MouseEvent('mousedown', init));
+cancel.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+cancel.dispatchEvent(new MouseEvent('click', init));
+const deadline = Date.now() + 1500;
+while (Date.now() < deadline) {
+    await settle(30);
+    if (!document.querySelector('[data-delete-confirm-overlay]')) {
+        dioxus.send({ accepted: true,
+                      cancel_to_gone_ms: Date.now() - t0 });
+        return;
+    }
+}
+refuse("delete_overlay_did_not_close");
+"""
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -49,6 +194,7 @@ class Probe:
         if self.artifacts:
             os.makedirs(self.artifacts, exist_ok=True)
         self.spawned_paths: list[str] = []
+        self.scratch_titles: list[dict] = []
         self.trace_events_seen: dict[str, set] = {}
 
     # ---- instruments -------------------------------------------------
@@ -120,6 +266,8 @@ class Probe:
         if not self.artifacts:
             return
         safe = "".join(c if c.isalnum() or c in "-._" else "_" for c in name)
+        if len(safe) > 120:  # a dom-eval script must not become the filename
+            safe = safe[:100] + "…" + safe[-16:]
         try:
             with open(os.path.join(self.artifacts, safe), "w") as fh:
                 json.dump(payload, fh, indent=1, default=str)
@@ -167,6 +315,7 @@ class Probe:
         if not path:
             return {"error": "no session path in reply or rows diff"}
         self.spawned_paths.append(path)
+        self.scratch_titles.append({"path": path, "title": title})
         row = {"path": path, "title": title, "cli_ms": r["wall_ms"],
                "t0_ms": t0}
         data = (r.get("json") or {}).get("data") or {}
@@ -384,6 +533,116 @@ class Probe:
             })
         return summarize(out, key="menu_open_ms")
 
+    def action_modal(self, iters: int) -> dict:
+        """Open the delete-confirm dialog on ONE scratch row through the real
+        context-menu path, time it, assert it, cancel it. The dialog is
+        never confirmed — the Cancel button is part of the action under
+        test, and the row must survive it (that IS an accuracy assertion:
+        a modal that eats the row on cancel is wrong)."""
+        rows_ready = self.ensure_scratch_rows(1, activate=True)
+        if not rows_ready:
+            return {"error": "no scratch row to probe", "iterations": []}
+        path = rows_ready[0]
+        title = next((r["title"] for r in self.scratch_titles
+                      if r["path"] == path), "")
+        out = {"iterations": []}
+        for i in range(iters):
+            # the sidebar virtualizes; selecting renders + scrolls to the
+            # row's node so the right-click has a target
+            self.verb("tree", "select", path)
+            self.verb("terminal", "focus", path)
+            time.sleep(0.2)
+            t0 = now_ms()
+            script = MODAL_OPEN_CLICK_JS.format(session=path)
+            r = self.verb("dom-eval", script, timeout=15)
+            open_wall_ms = now_ms() - t0
+            reply = r.get("json") or {}
+            result = (reply.get("data") or {}).get("result") or {}
+            acc = []
+            if not r["ok"]:
+                acc.append(f"dom-eval failed: {r.get('error')}")
+            if result.get("dom_eval_error"):
+                acc.append(f"script error: {result['dom_eval_error']}")
+            if not result.get("accepted"):
+                acc.append(f"modal open refused: {result.get('reason')}")
+            if result.get("accepted"):
+                if result.get("overlay_count") != 1:
+                    acc.append("overlay_count=%s (want exactly 1)"
+                               % result.get("overlay_count"))
+                if title and title not in (result.get("dialog_text") or ""):
+                    acc.append("scratch row title absent from dialog text "
+                               "(wrong row in the modal?)")
+            # the app's own account: the request→shown pair from ytrace
+            pair = self.modal_pair_from_trace(t0)
+            if result.get("accepted"):
+                if pair.get("pair_ms") is None:
+                    acc.append("no modal_open_requested → modal/shown pair "
+                               "in ytrace within window")
+                else:
+                    rows_n = pair.get("requested_rows")
+                    if rows_n not in (1, None):
+                        acc.append("modal_open_requested rows=%s (want 1)"
+                                   % rows_n)
+                    if pair.get("shown_kind") not in ("delete", None):
+                        acc.append("modal/shown kind=%s (want delete)"
+                                   % pair.get("shown_kind"))
+            # cancel — and the row must survive it
+            cancel = {}
+            if result.get("accepted"):
+                rc = self.verb("dom-eval", MODAL_CANCEL_JS, timeout=10)
+                cancel = ((rc.get("json") or {}).get("data")
+                          or {}).get("result") or {}
+                if not cancel.get("accepted"):
+                    acc.append(f"cancel failed: {cancel.get('reason')}")
+                else:
+                    time.sleep(0.15)
+                    if self.find_row(path) is None:
+                        acc.append("SCRATCH ROW GONE AFTER CANCEL — the "
+                                   "modal path deleted the row")
+            out["iterations"].append({
+                "open_wall_ms": open_wall_ms,
+                "menu_open_ms": result.get("menu_open_ms"),
+                "click_to_mount_ms": result.get("click_to_mount_ms"),
+                "dispatch_to_mount_ms": result.get("dispatch_to_mount_ms"),
+                "pair_ms": pair.get("pair_ms"),
+                "requested_rows": pair.get("requested_rows"),
+                "shown_kind": pair.get("shown_kind"),
+                "cancel_to_gone_ms": cancel.get("cancel_to_gone_ms"),
+                "dialog_text_head": (result.get("dialog_text") or "")[:160],
+                "accuracy_failures": acc,
+            })
+        return summarize(out, key="dispatch_to_mount_ms")
+
+    def modal_pair_from_trace(self, since_ms: int,
+                              timeout_s: float = 6.0) -> dict:
+        """modal_open_requested (ui_telemetry intent) and modal/shown
+        (category modal, name shown, kind delete — the DeleteConfirmOverlay
+        mount effect). Both ts_ms are the app's own clock; the pair delta is
+        the in-app request→paint latency."""
+        requested = shown = None
+        deadline = time.time() + timeout_s
+        while time.time() < deadline and not (requested and shown):
+            for e in self.ytrace_events(since_ms):
+                name = e.get("name")
+                if name == "modal_open_requested" and requested is None:
+                    requested = e
+                elif (name == "shown" and e.get("category") == "modal"
+                        and shown is None):
+                    shown = e
+            if not (requested and shown):
+                time.sleep(0.25)
+        payload = (requested or {}).get("payload") or {}
+        shown_payload = (shown or {}).get("payload") or {}
+        pair_ms = None
+        if requested and shown:
+            pair_ms = shown["ts_ms"] - requested["ts_ms"]
+        return {"requested_ts_ms": (requested or {}).get("ts_ms"),
+                "shown_ts_ms": (shown or {}).get("ts_ms"),
+                "pair_ms": pair_ms,
+                "requested_rows": payload.get("rows"),
+                "requested_kind": payload.get("kind"),
+                "shown_kind": shown_payload.get("kind")}
+
     def action_close(self) -> dict:
         """The teardown, instrumented — every spawned row closed exactly once."""
         out = {"iterations": []}
@@ -427,15 +686,18 @@ class Probe:
             time.sleep(0.3)
         return False, None
 
-    def ensure_two_scratch_rows(self) -> list[str]:
+    def ensure_scratch_rows(self, n: int, activate: bool = False) -> list[str]:
         live = [p for p in self.spawned_paths if self.find_row(p) is not None]
-        while len(live) < 2:
-            row = self.spawn_scratch_row(len(live))
+        while len(live) < n:
+            row = self.spawn_scratch_row(len(live), activate=activate)
             if "error" in row:
                 break
             live = [p for p in self.spawned_paths
                     if self.find_row(p) is not None]
-        return live[:2]
+        return live[:n]
+
+    def ensure_two_scratch_rows(self) -> list[str]:
+        return self.ensure_scratch_rows(2)
 
 
 def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
@@ -457,7 +719,8 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--actions", default="spawn,drag,group,menu,close")
+    ap.add_argument("--actions",
+                    default="spawn,drag,group,menu,modal,close")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -493,6 +756,8 @@ def main() -> int:
                 report["actions"]["group"] = probe.action_group(args.iters)
             elif action == "menu":
                 report["actions"]["menu"] = probe.action_menu(args.iters)
+            elif action == "modal":
+                report["actions"]["modal"] = probe.action_modal(args.iters)
             elif action == "close":
                 report["actions"]["close"] = probe.action_close()
             else:
