@@ -146,7 +146,8 @@ law (viewport shows the session, never the banner).
 never the draft refusal, never `accepted:true`.
 
 Family: 11.6.4 (agy, class C) — found 2026-09-14 by the [11.94] LIVE PROOF
-drive (board ACK-6cb208b072); jojo, daemon build 2026-09-11, GUI 3bb4c675,
+drive (board ACK-6cb208b072); the GUI host, daemon build 2026-09-11,
+GUI 3bb4c675,
 agy 1.2.2:
 
 - The gate renders (`shows_startup_gate: true`, plain rows carry "Do you
@@ -177,7 +178,7 @@ naming.
 
 **LIVE PROOF OWED:** the [11.94] entry's drive, restarted on a build with
 this fix — raw wire on a lane-built scratch daemon; GUI path on the next
-jojo daemon rotation.
+GUI-host daemon rotation.
 
 ## ⛔ [11.94] AGY'S WORKSPACE-TRUST GATE IS UNDECLARED AND EATS SUBMITTED INPUT — A PROGRAMMATIC SEND INTO IT IS LOST AND ITS OWN ENTER CONFIRMS THE GATE (filed 2026-09-10)
 
@@ -209,7 +210,7 @@ through the guard, aborts its remaining chunks on a refusal (the Enters are
 what would answer the gate), and answers `accepted:false` with
 `reason: "startup_gate_shown_refusal"` instead of a success that lied.
 
-**LIVE PROOF FALSIFIED 2026-09-14 (11.6.4 seat, jojo; board
+**LIVE PROOF FALSIFIED 2026-09-14 (11.6.4 seat, the GUI host; board
 ACK-6cb208b072) — RE-FIXED IN CODE same sitting, see [11.107]:** the first
 end-to-end drive of a gated row (fresh folder, agy 1.2.2, production daemon
 + GUI and raw wire both) answered NOTHING this entry promised. The daemon
@@ -232,7 +233,7 @@ gated must answer by name (`refused: startup gate shown: …` on the wire;
 `accepted:false, reason:"startup_gate_shown_refusal"` through app-control)
 with zero bytes written; answer the gate interactively; resend must
 deliver. Raw-wire half provable on a lane-built scratch daemon; the
-GUI-path half rides the next jojo daemon rotation (the live daemon's
+GUI-path half rides the next GUI-host daemon rotation (the live daemon's
 Sep-11 build predates the re-fix).
 
 ## ⛔ [11.97] A FAILED INTEGRATION TICK SILENTLY DROPS EVERY LANE THAT RODE IT — THE TRAIN GOES GREEN WITHOUT MERGED CONTENT, AND THE DEPLOY SHIPS THE HOLE (filed 2026-09-10)
@@ -303,7 +304,7 @@ name. Title generation must NOT be enabled for agy while the authored-title
 reader is the authority (the 2026-09-06 law: generation would fight the
 authored title); the fix is the fallback, not the generation.
 
-**2026-09-14 UPDATE (11.6.4 seat, jojo) — the store half resolved UPSTREAM;
+**2026-09-14 UPDATE (11.6.4 seat, the GUI host) — the store half resolved UPSTREAM;
 the fallback half FIXED IN CODE:**
 
 - **agy 1.2.2 writes the summaries table again** (bin 2026-09-12;
@@ -667,7 +668,7 @@ never heard of it, so the old gate read false for exactly the rows the
 ledger can vouch for.
 
 LANDED 2026-09-14 (lane/integration/probe-battery, zcode seat
-sess_8cfd41e8 on jojo): **the wrapper-level ledger-served run exists as a CI
+sess_8cfd41e8 on the GUI host): **the wrapper-level ledger-served run exists as a CI
 test** — `crates/yggterm-server/tests/reattach_sla_integration.rs`
 (410b4c60). Half A: a real `adopted` record (written through the real
 `handoff_ownership_records` + `record_handoff` verbs) makes
@@ -759,7 +760,7 @@ Unblocked by seat A's schema v2 (ee876a66). Every change is measured: this
 seat re-measured the kimi 1.50.0 store and the grok 1.0.24 artifacts
 directly on the muse lab host before touching data (the 09-10 groundwork
 findings reproduced; the md5 bucket scheme additionally VERIFIED —
-md5("/home/pi") and md5("/tmp") are bucket names verbatim).
+md5("/tmp") is a bucket name verbatim, and so is the home-dir bucket).
 
 **[11.6.6-a] FIXED IN CODE — kimi store root drift, the second time.** The
 2026-08-30 fix (glob `.kimi-code/sessions/*/*/state.json` + a state.json

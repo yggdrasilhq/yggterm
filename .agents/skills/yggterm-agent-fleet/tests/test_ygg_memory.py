@@ -523,7 +523,7 @@ metadata:
 
 
 def run_dream_tests():
-    """Dream materializations 2026-09-11 (zcode@jojo): publish --as + mint
+    """Dream materializations 2026-09-11 (zcode@gui-host): publish --as + mint
     guard (ACK-bccf702553), delete-dispatch regression guard."""
     import io
     from contextlib import redirect_stderr

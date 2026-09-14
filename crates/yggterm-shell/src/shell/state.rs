@@ -3501,7 +3501,8 @@ fn parse_picker_profiles_json(parsed: &serde_json::Value) -> Vec<String> {
 /// host's truth. The GUI host's `~/.yggterm/web-profiles` enumerates honestly
 /// only when the app runs on this same host; for a remote session it is
 /// another machine's jar list, and drawing it was the "ychrome always opens
-/// on jojo" defect (a dev session's picker showed every GUI-host profile).
+/// on the GUI host" defect (a dev session's picker showed every other
+/// host's profile).
 /// Names only: avatar and protect metadata stay GUI-side per name (cosmetic
 /// for names absent locally), never identity. `Err` = unreachable or an app
 /// predating the route, and the caller falls back to the local enumeration —
