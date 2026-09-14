@@ -25045,7 +25045,7 @@ fn run_opencode_tab_mirror_if_due(
     if yggterm_core::opencode_service::service_registration(&home).is_none() {
         return;
     }
-    let Some(active) = yggterm_core::opencode_service::active_sessions(&home) else {
+    let Some(sessions) = yggterm_core::opencode_service::service_sessions(&home) else {
         return;
     };
     let mut guard = lock_daemon_runtime(runtime, "opencode_tab_mirror");
@@ -25079,7 +25079,7 @@ fn run_opencode_tab_mirror_if_due(
         .collect();
     guard
         .server
-        .apply_opencode_tab_mirror(&active, &screen_live, &terminal_titles);
+        .apply_opencode_tab_mirror(&sessions, &screen_live, &terminal_titles);
 }
 
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
@@ -25310,7 +25310,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 if yggterm_core::opencode_service::service_registration(&home).is_none() {
                     continue;
                 }
-                let Some(active) = yggterm_core::opencode_service::active_sessions(&home)
+                let Some(sessions) = yggterm_core::opencode_service::service_sessions(&home)
                 else {
                     continue;
                 };
@@ -25347,7 +25347,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                             .collect();
                     guard
                         .server
-                        .apply_opencode_tab_mirror(&active, &screen_live, &terminal_titles);
+                        .apply_opencode_tab_mirror(&sessions, &screen_live, &terminal_titles);
                 }
             })
             .expect("spawn opencode mirror loop");

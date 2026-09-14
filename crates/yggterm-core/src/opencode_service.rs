@@ -16,8 +16,9 @@
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// One session the service currently reports — joined from the session list
-/// (metadata) and the active set (open tabs).
+/// One session the service's store lists, with the working set marked on it.
+/// The list is the tab mirror's universe; `running` is a per-session status
+/// (a turn in flight), not a membership filter — [11.6.3-a].
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpencodeServiceSession {
     /// The CLI's own id (`ses_…`) — the id a cold resume spells after
@@ -26,10 +27,13 @@ pub struct OpencodeServiceSession {
     pub title: Option<String>,
     pub directory: Option<String>,
     pub updated_epoch_ms: u128,
-    /// When the TUI last VIEWED this session — the focus signal a tab mirror
-    /// follows. `0` = the service did not say.
+    /// When the service last recorded a view. ⛔ API-WRITER-ONLY on the
+    /// installed beta-19271 — no TUI flow writes it (measured, falsifier (a)),
+    /// so this is a dormant signal: viewing truth is the OSC window title.
+    /// `0` = the service did not say.
     pub viewed_epoch_ms: u128,
-    /// In the service's active set = an open tab somewhere.
+    /// In the service's working set = a turn is in flight on this session
+    /// (a STATUS on the list — never a membership filter; [11.6.3-a]).
     pub running: bool,
 }
 
@@ -117,34 +121,55 @@ fn service_post(registration: &OpencodeServiceRegistration, path: &str, body: &V
         .unwrap_or(false)
 }
 
-/// Sessions the service currently reports as ACTIVE — the open tabs. One PTY
-/// hosts the TUI that shows them; these are the sessions a tab row mirrors.
-pub fn active_sessions(home: &PathBuf) -> Option<Vec<OpencodeServiceSession>> {
+/// The service's session list with the working set marked — the tab mirror's
+/// universe and its per-session status in one read.
+///
+/// ⛔ MEASURED TRUTH (the 2026-09-10 decode, installed beta-19271): the
+/// service's `/api/session/active` is the WORKING set — the run-coordinator's
+/// map of in-flight executions — never "the open tabs". A session enters it
+/// ≤0.1 s after a prompt and leaves when the turn settles; an idle fleet
+/// answers `{"data":{}}` BY DESIGN. This function used to join on that set
+/// and call the result "the open tabs", so the tab mirror starved (rows only
+/// existed while a turn ran) and the viewing signal emptied with it —
+/// defect [11.6.3-a]. Now the UNIVERSE is the store list (`/api/session`,
+/// `session_v2` — the service's own db) and the working set is a per-session
+/// STATUS on it (`running`). Viewing is deliberately NOT answered here: the
+/// viewed times are API-writer-only on this build (no TUI flow writes them —
+/// measured), so viewing truth lives on the OSC window title, which the
+/// mirror binds.
+pub fn service_sessions(home: &PathBuf) -> Option<Vec<OpencodeServiceSession>> {
     let registration = service_registration(home)?;
-    let active = service_get(&registration, "/api/session/active")?;
-    let running_ids: Vec<String> = match active.get("data").and_then(|d| d.as_object()) {
-        Some(map) => map
-            .keys()
-            .filter(|id| !id.trim().is_empty())
-            .cloned()
-            .collect(),
-        None => return None,
-    };
-    if running_ids.is_empty() {
-        return Some(Vec::new());
-    }
     let listed = service_get(&registration, "/api/session")?;
-    let sessions = decode_session_list(&listed);
-    // The list carries metadata; the active set carries running-ness. Join on
-    // id, and keep an active id whose detail has not landed yet (a session
-    // created between the two reads) — presence outranks metadata.
-    let mut out: Vec<OpencodeServiceSession> = sessions
-        .into_iter()
-        .filter(|s| running_ids.contains(&s.id))
-        .collect();
-    for id in &running_ids {
-        if !out.iter().any(|s| &s.id == id) {
-            out.push(OpencodeServiceSession {
+    let sessions = join_working_set(decode_session_list(&listed), service_get(&registration, "/api/session/active").as_ref());
+    Some(sessions)
+}
+
+/// Mark each listed session `running` when the working set holds it — the
+/// status a phase read consumes — and keep a working id whose store detail
+/// has not landed yet (a session created between the two reads): presence
+/// outranks metadata. The result is ordered by store recency, which on this
+/// build IS turn recency (`time.updated`; the viewed column is dead and must
+/// order nothing).
+fn join_working_set(
+    mut sessions: Vec<OpencodeServiceSession>,
+    active: Option<&Value>,
+) -> Vec<OpencodeServiceSession> {
+    let working: Vec<String> = active
+        .and_then(|a| a.get("data"))
+        .and_then(|d| d.as_object())
+        .map(|map| {
+            map.keys()
+                .filter(|id| !id.trim().is_empty())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    for ses in &mut sessions {
+        ses.running = working.contains(&ses.id);
+    }
+    for id in &working {
+        if !sessions.iter().any(|s| s.id == *id) {
+            sessions.push(OpencodeServiceSession {
                 id: id.clone(),
                 title: None,
                 directory: None,
@@ -154,8 +179,8 @@ pub fn active_sessions(home: &PathBuf) -> Option<Vec<OpencodeServiceSession>> {
             });
         }
     }
-    out.sort_by(|a, b| b.viewed_epoch_ms.cmp(&a.viewed_epoch_ms));
-    Some(out)
+    sessions.sort_by(|a, b| b.updated_epoch_ms.cmp(&a.updated_epoch_ms));
+    sessions
 }
 
 fn decode_session_list(value: &Value) -> Vec<OpencodeServiceSession> {
@@ -196,14 +221,25 @@ fn decode_session_list(value: &Value) -> Vec<OpencodeServiceSession> {
 /// TUI's own focus path reports the same thing (`time.viewed`), so a row
 /// click and a human's tab switch converge on one signal. Best-effort: some
 /// builds shape this route differently, and a failure costs nothing.
+///
+/// [11.6.3-b] FIXED IN CODE: the route REQUIRES `{"idle": <int>}` and
+/// persists the value VERBATIM into `session_v2.time_viewed` (measured on
+/// beta-19271: idle:0 → stored 0, idle:5000 → stored 5000; the TUI sends
+/// epoch-ms). The old `{}` body was a guaranteed 400 — this verb could never
+/// work on the installed build. "Viewed" here means now, so the body carries
+/// the current epoch-ms.
 pub fn view_session(home: &PathBuf, session_id: &str) -> bool {
     let Some(registration) = service_registration(home) else {
         return false;
     };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     service_post(
         &registration,
         &format!("/api/session/{session_id}/view"),
-        &serde_json::json!({}),
+        &serde_json::json!({ "idle": now_ms }),
     )
 }
 
@@ -245,8 +281,9 @@ mod tests {
         let reg = service_registration(&home).expect("registration readable");
         assert_eq!(reg.url, "http://127.0.0.1:49374");
         assert_eq!(reg.password, "shared-secret-1");
-        // The active join: list metadata + running set → sessions sorted by
-        // viewed recency (the focus signal a tab mirror follows).
+        // The join under the measured truth: the LIST is the universe, the
+        // working set is a status, and order is store recency (updated), not
+        // the dead viewed column.
         let active = serde_json::json!({
             "data": {
                 "ses_a0000000000000000000000001": {"type": "running"},
@@ -260,25 +297,49 @@ mod tests {
             {"id": "ses_b0000000000000000000000002", "title": "focused now",
              "location": {"directory": "/home/user/proj"},
              "time": {"updated": 2000, "viewed": 9000}},
-            {"id": "ses_c0000000000000000000000003", "title": "closed",
+            {"id": "ses_c0000000000000000000000003", "title": "quiet in the store",
              "location": {"directory": "/home/user/proj"},
              "time": {"updated": 3000, "viewed": 3000}}
         ]);
-        // decode path: reuse the join logic through the module's own builder
-        let sessions = decode_session_list(&listed);
-        let mut out: Vec<OpencodeServiceSession> = sessions
-            .into_iter()
-            .filter(|s| {
-                ["ses_a0000000000000000000000001", "ses_b0000000000000000000000002"]
-                    .contains(&s.id.as_str())
-            })
-            .collect();
-        out.sort_by(|a, b| b.viewed_epoch_ms.cmp(&a.viewed_epoch_ms));
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].id, "ses_b0000000000000000000000002", "focused tab first");
+        let out = join_working_set(decode_session_list(&listed), Some(&active));
+        // The idle-in-the-store session SURVIVES the join — the old filter
+        // dropped it, which is exactly how the mirror starved ([11.6.3-a]).
+        assert_eq!(out.len(), 3, "the store list is the universe, working or not");
+        assert!(out.iter().find(|s| s.id == "ses_c0000000000000000000000003").unwrap().running == false,
+            "listed but not working = an idle session, not an absent one");
+        assert!(out.iter().find(|s| s.id == "ses_a0000000000000000000000001").unwrap().running);
+        // Ordering is turn recency: ses_c (updated 3000) first even though
+        // its viewed time is the oldest — viewed orders nothing.
+        assert_eq!(out[0].id, "ses_c0000000000000000000000003", "store recency orders");
         assert_eq!(out[0].directory.as_deref(), Some("/home/user/proj"));
-        let _ = active;
+        // A working id the list has not caught up with still shows (presence
+        // outranks metadata), marked running.
+        let race = serde_json::json!({"data": {"ses_new000000000000000000009": {"type": "running"}}});
+        let out = join_working_set(decode_session_list(&listed), Some(&race));
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().find(|s| s.id == "ses_new000000000000000000009").unwrap().running);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// [11.6.3-a]'s red case: an IDLE fleet (`{"data":{}}`) must not empty the
+    /// answer — the old early-return turned "nothing is running" into "no
+    /// tabs exist" and the mirror retired its rows every quiet tick.
+    #[test]
+    fn an_idle_working_set_leaves_the_store_list_whole() {
+        let idle = serde_json::json!({"data": {}});
+        let listed = serde_json::json!([
+            {"id": "ses_a0000000000000000000000001", "title": "one",
+             "time": {"updated": 1000, "viewed": 0}},
+            {"id": "ses_b0000000000000000000000002", "title": "two",
+             "time": {"updated": 2000, "viewed": 0}}
+        ]);
+        let out = join_working_set(decode_session_list(&listed), Some(&idle));
+        assert_eq!(out.len(), 2, "idle is a status, not an absence");
+        assert!(out.iter().all(|s| !s.running));
+        // A missing active answer (fetch refused) degrades to unmarked, not
+        // to None — the universe is the list.
+        let out = join_working_set(decode_session_list(&listed), None);
+        assert_eq!(out.len(), 2);
     }
 }
 
@@ -289,16 +350,16 @@ fn opencode_live_service_fetch() {
     let reg = service_registration(&std::path::PathBuf::from(&home));
     println!("registration: {:?}", reg.as_ref().map(|r| r.url.clone()));
     assert!(reg.is_some(), "no service registration — is opencode2 running?");
-    let sessions = active_sessions(&std::path::PathBuf::from(&home));
+    let sessions = service_sessions(&std::path::PathBuf::from(&home));
     match sessions {
         Some(list) => {
-            println!("active sessions: {}", list.len());
+            println!("service sessions: {}", list.len());
             for s in &list {
                 println!("  {} | {:?} | dir {:?}", &s.id[..s.id.len().min(24)], s.title.as_deref().unwrap_or(""), s.directory.as_deref().unwrap_or(""));
             }
-            assert!(!list.is_empty(), "service reachable but zero active tabs");
+            assert!(!list.is_empty(), "service reachable but the store lists zero sessions");
         }
-        None => panic!("active_sessions returned None — fetch failed inside the client (this is the daemon's exact code path)"),
+        None => panic!("service_sessions returned None — fetch failed inside the client (this is the daemon's exact code path)"),
     }
 }
 

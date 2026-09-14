@@ -34,7 +34,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN (rotation AllMoved → reattach_ledger_written; consumer widened before the saved-session gate); schema v2 + battery + wrapper-level SLA run OPEN (3.3.0) |
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
-| 11.6.3 | opencode | B | OPEN (server truth DECODED 2026-09-10 — see the seat E section; descriptor v2 fills queue behind 11.6.0) |
+| 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
 | 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
 | 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
 | 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer OPEN (gate shape change); working phrases still login-gated-unverified |
@@ -366,6 +366,26 @@ openapi at `/openapi.json` — 119 paths):
    `opencode2 --auto` with a full TUI env; an open dialog is INVISIBLE in
    the daemon `terminal_lines` snapshot (the mouse-mode arm `?1003h` in
    the trailing escapes is the tell) and eats all input until ESC.
+
+**2026-09-14, lane/integration/opencode-v2 (claim ACK-948e30a78b): defects
+[11.6.3-a] + [11.6.3-b] FIXED IN CODE — LIVE PROOF OWED.** The falsifying
+observations: after a deploy riding this lane, an IDLE opencode fleet's
+mirror tick (`opencode_mirror/tick_state` in the trace) must report
+`active_tabs` = the store's listed-session count with rows persisting
+between turns (not blinking with the working set), and a live TUI's anchor
+row must carry `Viewing Tab Session Id` bound from its own `OC | <title>`
+window title while no turn runs; the `/view` verb must answer 200. Landed:
+`opencode_service::service_sessions` (renamed from `active_sessions` — the
+STORE list is the mirror's universe, the working set is a per-session
+`running` status, ordering is turn recency; the empty-active-set early
+return that emptied the mirror is gone), the anchor's Viewing/focus/
+header-title arms fall back to the anchor's OSC window title when the
+viewed stream is silent (the viewed column is API-writer-only on
+beta-19271), `view_session` posts the required `{"idle": <epoch_ms>}`
+(the old `{}` body was a guaranteed 400; the verb has no consumer wired
+yet — this fixes its contract). Descriptor v2 caps were already declared
+(rebind chain StoreIndex→ServerIpc, durable store opencode.db); the
+phrase-table fills stay with the probe battery (11.6.0's).
 
 **Falsifiers owed:** (a) RESHAPED 2026-09-10 late: the /view writer is not
 any TUI flow measured — the session-list switch was falsified first, then a

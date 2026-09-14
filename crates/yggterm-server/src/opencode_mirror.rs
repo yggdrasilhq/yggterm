@@ -1,11 +1,21 @@
-//! The OpenCode tab mirror — one yggterm row per open opencode2 session tab.
+//! The OpenCode tab mirror — one yggterm row per session the service's store
+//! lists.
 //!
 //! opencode2 is client-server: the row's PTY hosts a TUI (a window), the
 //! background service owns the sessions, and one window renders N tabs
 //! (docs/cli-integration.md, Issue Heading 26). The mirror keeps yggterm's
-//! one-row-per-session invariant: every ACTIVE (open-tab) session gets a real
-//! row, keyed by its service id, seated under the opencode anchor row, with
-//! the launch line `opencode2 --session <ses_id>`.
+//! one-row-per-session invariant: every session in the service's store list
+//! gets a real row, keyed by its service id, seated under the opencode anchor
+//! row, with the launch line `opencode2 --session <ses_id>`.
+//!
+//! ⛔ MEASURED (2026-09-10 decode, beta-19271): the server has NO surface
+//! that says which tabs are open — the active set is the WORKING set
+//! (in-flight executions, empty-when-idle BY DESIGN), and the in-TUI switch
+//! writes nothing server-side. Mirroring the working set ([11.6.3-a]) made
+//! rows blink into existence with a turn and retire when it settled. So the
+//! mirror's UNIVERSE is the store list (turn recency orders it), the working
+//! set is a per-session status on it, and which session a window RENDERS is
+//! answered where the truth lives: the OSC window title (`OC | <title>`).
 //!
 //! Why real rows and not a side table: opencode2's service is BUILT for
 //! several windows on one session (measured 2026-08-29 — a second
@@ -19,7 +29,7 @@
 //! The service is the truth; this mirror is a projection. Rows the mirror
 //! created are marked `Source: opencode-tab-mirror` and are the ONLY rows it
 //! may retire. A row the user engaged (opened — a PTY exists) is never
-//! retired for leaving the active set: it has become a window, and windows
+//! retired for leaving the working set: it has become a window, and windows
 //! close when the user closes them.
 
 use crate::YggtermServer;
@@ -29,10 +39,13 @@ pub const TAB_SOURCE_METADATA: &str = "opencode-tab-mirror";
 pub const MIRROR_INTERVAL_MS: u64 = 5_000;
 pub const TAB_SESSION_ID_METADATA: &str = "Tab Session Id";
 /// The anchor's currently-rendered session — the tab the human is LOOKING at
-/// in the TUI, refreshed every tick from the service's viewed-focus stream.
-/// This is how the metadata pane speaks opencode's dynamicity language: a
-/// uuid-keyed anchor row is not A session, it is A WINDOW onto whichever
-/// session is focused, and this entry names it.
+/// in the TUI. This is how the metadata pane speaks opencode's dynamicity
+/// language: a uuid-keyed anchor row is not A session, it is A WINDOW onto
+/// whichever session is focused, and this entry names it. The truth source
+/// is the anchor's own OSC window title first (the surface the TUI actually
+/// writes per session route), the service's viewed-focus stream second —
+/// API-writer-only on beta-19271, so dormant there but kept for builds with
+/// a writer ([11.6.3-a]).
 pub const VIEWING_SESSION_METADATA: &str = "Viewing Tab Session Id";
 pub const SPAWN_BUDGET_PER_TICK: usize = 1;
 const VIEWED_METADATA: &str = "Tab Viewed Ms";
@@ -41,12 +54,14 @@ const VIEWED_METADATA: &str = "Tab Viewed Ms";
 /// testable without a service, a daemon, or rows.
 #[derive(Debug, Default, PartialEq)]
 pub struct TabSyncPlan {
-    /// Active sessions with no mirror row yet.
+    /// Listed sessions with no mirror row yet.
     pub spawn: Vec<OpencodeServiceSession>,
-    /// Session ids whose tab closed AND whose row was never engaged.
+    /// Session ids no longer in the store list AND whose row was never
+    /// engaged.
     pub retire: Vec<String>,
     /// The tab row key the human just focused — viewed recency moved to a
-    /// session this mirror already mirrors.
+    /// session this mirror already mirrors. (Dormant on beta-19271: no TUI
+    /// flow writes the viewed times; kept for builds with a writer.)
     pub focus: Option<String>,
 }
 
@@ -128,18 +143,18 @@ fn owned_tabs_from(
 }
 
 pub fn plan_tab_sync(
-    active: &[OpencodeServiceSession],
+    sessions: &[OpencodeServiceSession],
     owned: &std::collections::HashMap<String, OwnedTab>,
 ) -> TabSyncPlan {
     let mut spawn = Vec::new();
-    for ses in active {
+    for ses in sessions {
         if !owned.contains_key(&ses.id) {
             spawn.push(ses.clone());
         }
     }
     let mut retire = Vec::new();
     for (ses, tab) in owned {
-        if !active.iter().any(|s| &s.id == ses) && !tab.engaged {
+        if !sessions.iter().any(|s| &s.id == ses) && !tab.engaged {
             retire.push(ses.clone());
         }
     }
@@ -147,7 +162,7 @@ pub fn plan_tab_sync(
     // and following is due only when that view moved PAST what this mirror
     // has already recorded for the row — a no-op on quiet ticks.
     let mut focus = None;
-    if let Some(newest) = active
+    if let Some(newest) = sessions
         .iter()
         .filter(|s| s.viewed_epoch_ms > 0)
         .max_by_key(|s| s.viewed_epoch_ms)
@@ -192,15 +207,15 @@ fn opencode_title_window(title: &str) -> String {
     }
 }
 
-/// The ONE active service session whose window-title form equals `name`;
+/// The ONE sessions service session whose window-title form equals `name`;
 /// `None` when none matches or when two match (ambiguous is not identity —
 /// a fork view is fine to share, a shared NAME is not).
 fn unique_session_by_title<'a>(
-    active: &'a [OpencodeServiceSession],
+    sessions: &'a [OpencodeServiceSession],
     name: &str,
 ) -> Option<&'a OpencodeServiceSession> {
     let mut found: Option<&OpencodeServiceSession> = None;
-    for session in active {
+    for session in sessions {
         if opencode_title_window(session.title.as_deref().unwrap_or("")) == name {
             if found.is_some() {
                 return None;
@@ -222,12 +237,12 @@ impl YggtermServer {
     /// before this call (`fetch` in the chore, which holds no lock).
     pub fn apply_opencode_tab_mirror(
         &mut self,
-        active: &[OpencodeServiceSession],
+        sessions: &[OpencodeServiceSession],
         screen_live: &std::collections::HashSet<String>,
         terminal_titles: &std::collections::HashMap<String, String>,
     ) {
         let owned = owned_tabs_from(&self.sessions);
-        let plan = plan_tab_sync(active, &owned);
+        let plan = plan_tab_sync(sessions, &owned);
         // ⛔ A tick whose silence is indistinguishable from not having run is
         // the §7 sin in mirror form: report EVERY tick — counts, not contents
         // (no ids, no titles) — so "why did nothing happen" is answerable
@@ -242,8 +257,8 @@ impl YggtermServer {
                     "opencode_mirror",
                     "tick_state",
                     serde_json::json!({
-                        "active_tabs": active.len(),
-                        "active_ids": active.iter().map(|s| s.id.len()).collect::<Vec<_>>().len(),
+                        "active_tabs": sessions.len(),
+                        "active_ids": sessions.iter().map(|s| s.id.len()).collect::<Vec<_>>().len(),
                         "owned": owned.len(),
                         "plan_spawn": plan.spawn.len(),
                         "plan_retire": plan.retire.len(),
@@ -257,7 +272,7 @@ impl YggtermServer {
         // ⛔ ADOPTION IS UNLIMITED; ONLY NEW INSERTS ARE BUDGETED. Daemon
         // takeovers restore rows WITHOUT their metadata (measured 2026-08-29:
         // owned fell 4→1 across a takeover), so after every generation the
-        // whole active set re-enters plan.spawn as adoptions. Budgeting them
+        // whole listed set re-enters plan.spawn as adoptions. Budgeting them
         // made post-takeover convergence crawl at one row per tick. Adoption
         // is metadata-only on rows that already exist — it costs nothing and
         // must complete in one tick; the budget gates only genuinely NEW
@@ -405,7 +420,7 @@ impl YggtermServer {
         // not in the sidebar), so drift is corrected every tick — placeholders
         // excepted (a never-prompted session's `New session - <iso>` would
         // UN-name a row; its directory name holds the handle instead).
-        for ses in active {
+        for ses in sessions {
             let Some(title) = mirror_display_title(ses) else {
                 continue;
             };
@@ -435,11 +450,26 @@ impl YggtermServer {
             // (owner directive 2026-09-02: the metadata system should
             // understand the CLI's dynamicity language — opencode's is the
             // viewed-tab focus stream).
-            let viewing = active
+            //
+            // [11.6.3-a]: the viewed stream is API-writer-only on beta-19271
+            // (no TUI flow writes it — measured), so keyed on it alone this
+            // starved to `no_viewing` on every quiet tick. The surface the
+            // TUI DOES write is the per-window OSC title (`OC | <title>`),
+            // and the anchor row IS the live TUI — its own title names the
+            // session it renders. Precedence kept as documented: a real
+            // viewed stream (this or a future build) outranks a possibly-
+            // lagged title; the title answers when the stream is silent.
+            let viewing = sessions
                 .iter()
                 .filter(|s| s.viewed_epoch_ms > 0)
                 .max_by_key(|s| s.viewed_epoch_ms)
-                .map(|s| s.id.clone());
+                .map(|s| s.id.clone())
+                .or_else(|| {
+                    let name = terminal_titles
+                        .get(&anchor_key)?
+                        .strip_prefix(OPENCODE_WINDOW_TITLE_PREFIX)?;
+                    unique_session_by_title(sessions, name).map(|s| s.id.clone())
+                });
             if let Some(session) = self.sessions.get_mut(&anchor_key) {
                 if let Some(ses_id) = &viewing {
                     crate::upsert_session_metadata(
@@ -510,20 +540,22 @@ impl YggtermServer {
                 }
             }
             if !explicit {
-                if let Some(newest) = active
-                    .iter()
-                    .filter(|s| s.viewed_epoch_ms > 0)
-                    .max_by_key(|s| s.viewed_epoch_ms)
-                {
-                    if let Some(title) = mirror_display_title(newest) {
-                        if let Some(anchor) = self.sessions.get_mut(&anchor_key) {
-                            anchor.title = title;
+                // The header follows the SAME viewing truth the metadata
+                // stamp and the rebind use — one answer, three surfaces
+                // ([11.6.3-a]: the OSC title keeps it alive when the viewed
+                // stream is silent).
+                if let Some(ses_id) = viewing.as_ref() {
+                    if let Some(newest) = sessions.iter().find(|s| s.id == *ses_id) {
+                        if let Some(title) = mirror_display_title(newest) {
+                            if let Some(anchor) = self.sessions.get_mut(&anchor_key) {
+                                anchor.title = title;
+                            }
                         }
                     }
                 }
             }
             // ⭐ PER-ROW TITLE IDENTITY (Issue Heading 34, Defect B): the
-            // focus stream stamps THE anchor; every OTHER live TUI carries
+            // viewing truth stamps THE anchor; every OTHER live TUI carries
             // its own truth on the window-title plane — opencode2 titles its
             // window `OC | <session title>` per session route (measured in
             // its app.tsx; `OpenCode` on home/default = no signal). Bind a
@@ -547,7 +579,7 @@ impl YggtermServer {
                 else {
                     continue;
                 };
-                let Some(session) = unique_session_by_title(active, name) else {
+                let Some(session) = unique_session_by_title(sessions, name) else {
                     continue;
                 };
                 let Some(bound) = bound_id else { continue };
@@ -633,7 +665,7 @@ impl YggtermServer {
                             viewing: viewing.as_deref(),
                             bound: bound.as_deref(),
                             decision,
-                            active_tabs: active.len(),
+                            active_tabs: sessions.len(),
                         },
                     );
                 }
@@ -657,14 +689,14 @@ impl YggtermServer {
                         yggterm_core::cli_plane::CliMirrorTickDecision {
                             anchor: None,
                             candidates: 0,
-                            viewing: active
+                            viewing: sessions
                                 .iter()
                                 .filter(|s| s.viewed_epoch_ms > 0)
                                 .max_by_key(|s| s.viewed_epoch_ms)
                                 .map(|s| s.id.as_str()),
                             bound: None,
                             decision: "no_anchor",
-                            active_tabs: active.len(),
+                            active_tabs: sessions.len(),
                         },
                     );
                 }
@@ -674,7 +706,7 @@ impl YggtermServer {
         if let Some(ses_id) = &plan.focus {
             // Follow the human's tab switch only while they are already in
             // the opencode context (the anchor or a mirrored tab is the
-            // active row); elsewhere in the GUI a tab switch must not yank
+            // sessions row); elsewhere in the GUI a tab switch must not yank
             // the viewport.
             let in_context = self
                 .active_session_path
@@ -705,7 +737,7 @@ impl YggtermServer {
             }
             // Record the view we followed so the next tick compares against
             // it instead of re-following every tick.
-            if let Some(newest) = active.iter().find(|s| &s.id == ses_id) {
+            if let Some(newest) = sessions.iter().find(|s| &s.id == ses_id) {
                 let key = owned
                     .get(ses_id)
                     .map(|t| t.key.clone())
@@ -734,7 +766,7 @@ impl YggtermServer {
                         "spawned": spawned,
                         "retired": retired,
                         "focus": plan.focus,
-                        "active_tabs": active.len(),
+                        "active_tabs": sessions.len(),
                     }),
                 );
             }
@@ -878,14 +910,14 @@ mod tests {
 
     #[test]
     fn a_new_tab_spawns_a_cold_row_and_a_closed_unengaged_tab_retires() {
-        let active = vec![ses("ses_new000000000000000000001", 100)];
+        let sessions = vec![ses("ses_new000000000000000000001", 100)];
         let owned_map = std::collections::HashMap::from([owned(
             "ses_gone00000000000000000001",
             "opencode-runtime://ses_gone00000000000000000001",
             50,
             false,
         )]);
-        let plan = plan_tab_sync(&active, &owned_map);
+        let plan = plan_tab_sync(&sessions, &owned_map);
         assert_eq!(plan.spawn.len(), 1);
         assert_eq!(plan.spawn[0].id, "ses_new000000000000000000001");
         assert_eq!(plan.retire, vec!["ses_gone00000000000000000001"]);
@@ -896,28 +928,28 @@ mod tests {
 
     #[test]
     fn an_engaged_row_is_never_retired_for_losing_its_tab() {
-        let active = vec![]; // the tab closed everywhere
+        let sessions = vec![]; // the tab closed everywhere
         let owned_map = std::collections::HashMap::from([owned(
             "ses_engaged00000000000000001",
             "opencode-runtime://ses_engaged00000000000000001",
             50,
             true, // the user opened it: it is a window now
         )]);
-        let plan = plan_tab_sync(&active, &owned_map);
+        let plan = plan_tab_sync(&sessions, &owned_map);
         assert!(plan.retire.is_empty(), "windows close when the user closes them");
         assert!(plan.spawn.is_empty());
     }
 
     #[test]
     fn focus_follows_a_freshly_viewed_session_and_stands_down_when_quiet() {
-        let active = vec![ses("ses_mirrored0000000000000000001", 9_000)];
+        let sessions = vec![ses("ses_mirrored0000000000000000001", 9_000)];
         let owned_map = std::collections::HashMap::from([owned(
             "ses_mirrored0000000000000000001",
             "opencode-runtime://ses_mirrored0000000000000000001",
             1_000,
             false,
         )]);
-        let plan = plan_tab_sync(&active, &owned_map);
+        let plan = plan_tab_sync(&sessions, &owned_map);
         assert_eq!(
             plan.focus.as_deref(),
             Some("ses_mirrored0000000000000000001"),
@@ -930,8 +962,39 @@ mod tests {
             9_000,
             false,
         )]);
-        let plan = plan_tab_sync(&active, &settled);
+        let plan = plan_tab_sync(&sessions, &settled);
         assert_eq!(plan.focus, None, "quiet tick — nothing to follow");
+    }
+
+    /// [11.6.3-a]'s red case at the plan level: an idle fleet's store list
+    /// still mirrors. Under the old working-set universe this same tick
+    /// spawned nothing and retired every unengaged row — rows blinked into
+    /// existence with a turn and vanished when it settled.
+    #[test]
+    fn an_idle_fleets_store_list_still_mirrors_and_never_retires() {
+        let mut idle = ses("ses_idle000000000000000000001", 0);
+        idle.running = false;
+        idle.viewed_epoch_ms = 0;
+        // A listed session with no row yet still spawns, idle or not.
+        let plan = plan_tab_sync(&[idle.clone()], &std::collections::HashMap::new());
+        assert_eq!(
+            plan.spawn.len(),
+            1,
+            "an idle listed session still gets its projection row"
+        );
+        // A row whose session is LISTED but idle is never retired.
+        let owned_map = std::collections::HashMap::from([owned(
+            "ses_idle000000000000000000001",
+            "opencode-runtime://ses_idle000000000000000000001",
+            0,
+            false,
+        )]);
+        let plan = plan_tab_sync(&[idle], &owned_map);
+        assert!(
+            plan.retire.is_empty(),
+            "listed-but-idle never retires an unengaged row"
+        );
+        assert!(plan.spawn.is_empty());
     }
 }
 
@@ -1118,11 +1181,11 @@ mod anchor_tests {
         };
         // Two open tabs; ses_b was looked at LAST, so it is what the TUI
         // renders right now.
-        let active = vec![
+        let sessions = vec![
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &empty_titles());
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &empty_titles());
         let anchor_key = server
             .opencode_anchor_key(&empty_screen_live())
             .expect("an anchor exists");
@@ -1159,8 +1222,8 @@ mod anchor_tests {
             viewed_epoch_ms: viewed,
             running: true,
         };
-        let active = vec![viewed("ses_b0000000000000000000000002", 200)];
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &empty_titles());
+        let sessions = vec![viewed("ses_b0000000000000000000000002", 200)];
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &empty_titles());
         for key in [dead, live] {
             let row = server.sessions.get(&key).expect("fixture row survives");
             assert_ne!(
@@ -1201,7 +1264,7 @@ mod anchor_tests {
             viewed_epoch_ms: viewed,
             running: true,
         };
-        let active = vec![
+        let sessions = vec![
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
@@ -1213,7 +1276,7 @@ mod anchor_tests {
             other.clone(),
             "OC | Tab ses_a0000000000000000000000001".to_string(),
         );
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &titles);
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &titles);
         let row = server.sessions.get(&other).expect("row survives");
         assert_eq!(
             row.id, "ses_a0000000000000000000000001",
@@ -1241,11 +1304,11 @@ mod anchor_tests {
             viewed_epoch_ms: viewed,
             running: true,
         };
-        let active = vec![viewed("ses_a0000000000000000000000001", 100), viewed("ses_b0000000000000000000000002", 200)];
+        let sessions = vec![viewed("ses_a0000000000000000000000001", 100), viewed("ses_b0000000000000000000000002", 200)];
         let mut titles = empty_titles();
         titles.insert(live.clone(), "OC | Same".to_string());
         titles.insert(dead.clone(), "OpenCode".to_string());
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &titles);
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &titles);
         for key in [&dead, &live] {
             let row = server.sessions.get(key).expect("row survives");
             assert_ne!(
@@ -1267,13 +1330,13 @@ mod anchor_tests {
             viewed_epoch_ms: viewed,
             running: true,
         };
-        let active = vec![viewed("ses_a0000000000000000000000001", 100)];
+        let sessions = vec![viewed("ses_a0000000000000000000000001", 100)];
         let mut titles = empty_titles();
         titles.insert(
             dead.clone(),
             "OC | Tab ses_a0000000000000000000000001".to_string(),
         );
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &titles);
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &titles);
         let row = server.sessions.get(&dead).expect("row survives");
         assert_ne!(
             row.id, "ses_a0000000000000000000000001",
@@ -1294,11 +1357,11 @@ mod anchor_tests {
         };
         // Two open tabs; ses_b was looked at LAST, so it is what the TUI
         // renders right now.
-        let active = vec![
+        let sessions = vec![
             viewed("ses_a0000000000000000000000001", 100),
             viewed("ses_b0000000000000000000000002", 200),
         ];
-        server.apply_opencode_tab_mirror(&active, &empty_screen_live(), &empty_titles());
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &empty_titles());
         let anchor_key = server
             .opencode_anchor_key(&empty_screen_live())
             .expect("an anchor exists");
@@ -1350,7 +1413,7 @@ mod anchor_tests {
                 .any(|m| m.label == VIEWING_SESSION_METADATA)
         };
         assert!(with_tabs, "a viewed tab stamps the viewing entry");
-        // The service's active set goes quiet (no tabs anywhere): a stale
+        // The service's working set goes quiet (no tabs anywhere): a stale
         // "Viewing …" would now be a lie about the present.
         server.apply_opencode_tab_mirror(&[], &empty_screen_live(), &empty_titles());
         let anchor_key = server.opencode_anchor_key(&empty_screen_live()).expect("anchor");
@@ -1361,6 +1424,67 @@ mod anchor_tests {
                 .iter()
                 .any(|m| m.label == VIEWING_SESSION_METADATA),
             "no viewed tab anywhere must not leave a frozen 'Viewing' claim",
+        );
+    }
+
+    /// [11.6.3-a]'s felt half: with the viewed stream dormant (beta-19271
+    /// writes no viewed times), the anchor's viewing truth comes from its own
+    /// OSC window title — the one per-session surface the TUI writes. The
+    /// same idle tick under the old code answered `no_viewing` and left the
+    /// anchor's identity on its birth uuid (the phantom-resume class).
+    #[test]
+    fn the_anchor_reads_viewing_from_its_own_window_title_when_the_stream_is_dormant() {
+        let (mut server, _dead, _live) = server_with_two_anchors();
+        // The real plane's rows carry Cwd; the rebind's birth-command rebuild
+        // reads it to recompose the resume.
+        for row in server.sessions.values_mut() {
+            crate::upsert_session_metadata(
+                &mut row.metadata,
+                "Cwd",
+                "/home/user/proj".to_string(),
+            );
+        }
+        // Every listed session is quiet: no viewed times, nothing working.
+        let idle = |id: &str| OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(format!("Tab {id}")),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: 1_000,
+            viewed_epoch_ms: 0,
+            running: false,
+        };
+        let sessions = vec![
+            idle("ses_a0000000000000000000000001"),
+            idle("ses_b0000000000000000000000002"),
+        ];
+        let anchor_key = server
+            .opencode_anchor_key(&empty_screen_live())
+            .expect("an anchor exists");
+        // The anchor TUI's window names ses_b — the session it renders.
+        let mut titles = empty_titles();
+        titles.insert(
+            anchor_key.clone(),
+            "OC | Tab ses_b0000000000000000000000002".to_string(),
+        );
+        server.apply_opencode_tab_mirror(&sessions, &empty_screen_live(), &titles);
+        let anchor = server.sessions.get(&anchor_key).expect("anchor row");
+        assert_eq!(
+            anchor.id, "ses_b0000000000000000000000002",
+            "identity follows the session the window title names"
+        );
+        let viewing = anchor
+            .metadata
+            .iter()
+            .find(|m| m.label == VIEWING_SESSION_METADATA)
+            .map(|m| m.value.clone());
+        assert_eq!(
+            viewing.as_deref(),
+            Some("ses_b0000000000000000000000002"),
+            "the Viewing stamp survives an idle fleet through the title plane"
+        );
+        assert!(
+            anchor.launch_command.contains("ses_b0000000000000000000000002"),
+            "the resume command names the title-bound session"
         );
     }
 }
