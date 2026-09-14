@@ -30222,8 +30222,9 @@ and the pollers multiply it. Evidence: ux-speed door §BASELINES
 (`campaign-ux-speed.md`), trace window of the 2026-09-15 spawn probe.
 ## ⛔ [11.118] THE MODAL'S REQUEST EDGE IS SILENT ON THE LIVE BUILD — `modal_open_requested` FIRES FOR THE BULK CLOSE-ALL BUT NEVER FOR SINGLE-ROW DELETES, AND THE CHORD-PATH OPENER `open_delete_dialog` CARRIES NO EMISSION AT ALL — the modal pair the ux-speed door defines cannot be measured end-to-end on 3.2.113 (measured live 2026-09-15 ~01:15-01:45 IST, five controlled opens, tools/uxspeed/uxprobe.py modal action)
 
-**Status:** OPEN (instrument gap; [11.113] family — the modal row of the
-door's event map is affected)
+**Status:** OPEN
+
+Instrument gap; [11.113] family — the modal row of the door's event map is affected.
 
 The ux-speed modal-driver lane built the campaign's modal probe (lane
 `lane/uxspeed/modal-driver`, tools/uxspeed/uxprobe.py `--actions modal`)
@@ -30284,3 +30285,119 @@ Re-measure the pair when (a)/(b) land.
 > defect-id law (grep at FILE time on FRESH origin/main); [11.115]
 > precedent.
 
+## ⛔ [11.119] THE ~336ms UI-THREAD METRONOME — IN MULTI-MINUTE BURSTS THE MAIN THREAD BURNS ~320-344ms OF UNTRACED USERSPACE CPU PER CYCLE, 33 UI-STALL MINUTES PER 2h; MEMORY, LOCKS, VDOM RENDERS AND describe_rows ARE ALL EXONERATED BY THE KERNEL WITNESS; THE FINAL NAMING STEP NEEDS A SAMPLING PROFILER ON THE GUI HOST (measured 2026-09-14 phases + live 2026-09-15, the ux-speed metronome lane)
+
+**Status:** OPEN
+
+Attribution complete to the trace-plane limit; naming needs L4 (owner-gated perf install).
+
+The ux-speed PSI lane's handoff (ACK-76fa459c21) promised attribution of the
+"336ms metronome" first seen as `cli/scan_total`-adjacent stalls. Root-caused
+to the trace-plane limit on `lane/uxspeed/metronome` (claim infra/meta
+ACK-23c31583b4):
+
+- **The signature.** In multi-minute-to-hour phases, the GUI main thread
+  runs a lockstep cycle: ~18ms awake, then ~337ms blocked (gap p10 314 /
+  p50 337 / p90 366 — extremely tight), ~1.3 cycles/s. 5,908 stalls in one
+  2h phase = 33.4 UI-stall minutes (18% duty). Phases come and go: ~97%
+  class-share during a busy morning (04:30-06:30Z), ~24% evening, 0 at
+  night. In quiet windows the same gap class appears at ~4/min.
+- **The meter.** `interactive_request/dispatch` for
+  `background_live_session_snapshot` (the 15s live-session snapshot loop —
+  inter-arrival p50 = 15.00s exactly, in-phase too) carries
+  `ui_wait_ms`: normally p50 **27-33ms**; during the phase **p50 318-319ms
+  every single cycle** (hourly buckets 04:00-06:00Z). queue_delay_ms stays
+  1ms and the worker finishes in 16-30ms — the WORK is cheap; the UI thread
+  just does not reach the completion dispatch for ~320-344ms. One stall per
+  dispatch, 1:1, plus additional lockstep stalls in dense bursts.
+- **The kernel witness exonerates the usual suspects** (per-stall
+  pre/post deltas, phase A n=2954): `maj_flt` p90 = **0** (NOT swap-in —
+  contrast [11.87]'s storm and [11.115]'s build wind), `min_flt` ~0 (no
+  heap churn), context switches modest — combined with live wchan sampling
+  during stall windows (main thread mostly **R (running userspace)** or in
+  plain poll — never futex, never page-wait), the verdict is **CPU-bound
+  work on the main thread itself**.
+- **Also exonerated:** the dioxus vdom pass (`component_window` renders
+  11-12ms max in the dense minute; whole-root storms would show 85-522ms);
+  the sidebar merge (2.3ms for 378 rows); describe_rows app-control
+  requests (p50 90ms, cadence 24s — not 355ms); the [11.115] build storm
+  (separate generator, exonerated here by maj_flt=0 and by phases that
+  predate any build).
+- **What the untraced ~320ms is NOT yet named.** It produces no trace
+  events (the interactive-request meter and the watchdog see only its
+  shadow), it is not the traced render plane, and it sits in the GTK/WebKit
+  main-loop interior. Naming it needs a sampling profiler attached during a
+  phase — `perf`/`bpftrace` are not installed on the GUI host (campaign
+  door L4, owner-gated install). **ASK: owner approval to install `perf`
+  (linux-tools) on the GUI host; the probe is 60s of `perf record -F 99 -t
+  <ui_tid> -g` during a phase, flamegraph to the campaign door.**
+
+**Falsifier:** with the burning site named and fixed, `ui_wait_ms` p50 of
+`background_live_session_snapshot` returns to ~30ms during all phases, and
+ui/block counts in the 337ms class drop to the quiet-window floor (<5/min).
+The meter is already shipped and costs nothing — no new instrumentation
+needed to verify a fix.
+
+**Fix shape (once named):** if the burn is a GTK/WebKit sync section, the
+remedy is moving it off the main loop or bounding it; if it is an
+untraced app section, it gets a span and joins the L2/L3 harness. Either
+way the campaign bar (≤100ms input→paint) is unreachable while a single
+cycle eats 337ms.
+
+Cross-refs: [11.115] (host-plane storms — different generator, same victim),
+[11.117] (snapshot-apply merge cost — the apply runs AFTER the ui_wait this
+entry measures; both make the 15s snapshot cycle expensive), trace-fixing
+queue item 7 (render residues — the whole-root family, distinct: renders
+are 11ms here).
+
+## ⛔ [11.120] THE ui-BLOCK WATCHDOG'S MID-STALL WAIT CAPTURE IS BYTE-ABSENT FROM EVERY GUI BINARY IN THE FIELD WHILE ITS OWN SOURCE AND NEIGHBOR LITERALS ARE PRESENT — STALLS CAN NEVER NAME WHAT THE THREAD WAS DOING (found 2026-09-15 ~01:30 IST, GUI host + dev, the ux-speed metronome lane)
+
+**Status:** OPEN
+
+Build-plane/instrument provenance; needs an owner with the ygg-ci build path.
+
+Hunting the [11.119] metronome, the lane went to read the mid-stall kernel
+wait channel the watchdog was built to capture (fdf45fbb, 2026-09-08: "the
+ui_block watchdog now names the kernel wait mid-stall" —
+`crates/yggterm-core/src/ui_block.rs` `ui_thread_wait()`, attached into the
+span's `witness` map). It has never appeared in a single event:
+
+- 7,938 ui/block events mined across two generations (Sep 14 full day +
+  live): **zero** carry `ui_thread_wait` (checked both
+  `payload.observed` and `payload.witness.ui_thread_wait`).
+- The source is unambiguous: ONE `ui_block.rs` in the workspace (no
+  duplicates, no cfg gates), the insert at line ~428, present in
+  `origin/main` AND in the 3.2.113 release tree (bea49768) — `git show
+  bea49768:...ui_block.rs | grep -c ui_thread_wait` → 3.
+- The shipped binaries disagree: byte-search (`find(b'ui_thread_wait')`)
+  on BOTH `/home/pi/.local/share/yggterm/direct/versions/3.2.113/yggterm`
+  (the build the GUI actually runs, app_version 3.2.113) AND the freshest
+  deploy `/home/pi/.local/bin/yggterm` (ygg-ci 20260915-005119) → **absent
+  (-1)**, while literals from the SAME file that predate fdf45fbb
+  (`yggterm-ui-block-watchdog`, `blocks_per_min`) ARE present, and —
+  the impossibility — the events at runtime DO carry `witness` objects
+  whose `witness_fields` json keys (`min_flt` et al., same json! macro,
+  same file) are ALSO byte-absent. Plaintext serde keys cannot be absent
+  from a binary that emits them; naive byte-grep on stripped/merged
+  `.rodata` is the suspect, but that must be proven by a fresh build +
+  repro, not assumed.
+
+**Consequence:** every ui/block incident the fleet has ever filed
+([11.87], [11.108], [11.109], [11.115], [11.118]) lacks the one field
+whose whole purpose was to end the "dark time" guessing — the mid-stall
+`wchan`/`syscall` of the stalled thread. The watchdog polls every 50ms and
+the capture costs two /proc reads; it is designed to be essentially free.
+
+**Fix shape:** (a) repro — build main on dev, byte-search the artifact for
+`ui_thread_wait`/`min_flt`, and run the binary's watchdog across a
+synthetic 300ms main-thread block (the probe-battery pattern) to see
+whether the capture exists at runtime; (b) if absent from a fresh build,
+walk the ygg-ci build path for the source-of-truth drift (same class as
+the [11.110] binary-convergence family — different plane: the Rust build
+inputs, not the ynpm channel); (c) if present-but-unserialized, the bug is
+in the witness attach path (the `let Some(map) = witness.as_object_mut()`
+arm) and is a one-line fix in ui_block.rs.
+
+**Falsifier:** the next ui/block incident on a freshly built binary
+carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
+`/proc/<tid>/wchan` sample taken during the same stall.
