@@ -78,6 +78,44 @@ module.exports = {
       return labelLine ? `region label: ${JSON.stringify(labelLine)}` : 'label trims to `input`';
     });
 
+    // 2.5 THE DRAFT-STATE MEASUREMENT — the evidence the draft-guard region
+    //     arm is built on: type WITHOUT sending, and record where the text
+    //     renders relative to the `── input ──` label (and whether the footer
+    //     stays). Then clear and prove the region is empty again — the guard
+    //     must be able to answer Some(false) on a clean kimi composer, not
+    //     just residue.
+    await ctx.probe('composer-draft-shape', async () => {
+      const SENTINEL = 'PROBE-DRAFT-REGION';
+      drive.write(SENTINEL);
+      const painted = await drive.waitFor(() => drive.screen().includes(SENTINEL), 10000);
+      if (!painted) throw new Error('typed text never appeared on screen');
+      await new Promise((r) => setTimeout(r, 1200)); // let the redraw settle
+      drive.snap('draft-typed');
+      const lines = drive
+        .screen()
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+      const labelAt = lines.map((l) => /^─*[\s─]*input[\s─]*─*$/.test(l)).lastIndexOf(true);
+      const sentAt = lines.findIndex((l) => l.includes(SENTINEL));
+      ctx.facts.composer_draft = {
+        label_at_line: labelAt,
+        sentinel_at_line: sentAt,
+        text_below_label: labelAt >= 0 && sentAt > labelAt,
+        below_label: labelAt >= 0 ? lines.slice(labelAt + 1, labelAt + 6) : null,
+      };
+      // Clear: backspace past the sentinel (no ctrl+c guesswork), then the
+      // region must read empty again.
+      drive.write('\x7f'.repeat(SENTINEL.length + 2));
+      const cleared = await drive.waitFor(() => !drive.screen().includes(SENTINEL), 10000);
+      await new Promise((r) => setTimeout(r, 1000));
+      drive.snap('draft-cleared');
+      ctx.facts.composer_draft.cleared = cleared;
+      return cleared
+        ? `draft text rendered ${ctx.facts.composer_draft.text_below_label ? 'BELOW' : 'NOT below'} the label; cleared ok`
+        : 'sentinel never cleared — composer left dirty';
+    });
+
     // 3. a turn (unauth): the prompt echoes `✨ <text>` and kimi answers the
     //    instant not-logged-in refusal — the wire.jsonl TurnBegin/TurnEnd
     //    pair this drive produces is the natural v2 phase feed, and the

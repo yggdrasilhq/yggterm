@@ -1698,6 +1698,20 @@ pub fn screen_text_shows_agent_background_hint(sample: &str) -> bool {
 /// stopped carrying the distinction — in the direction that types over a
 /// sentence. A discriminator that has died is not repaired by reading it more
 /// carefully.
+///
+/// ⛔ [11.6.6-b follow-up] A GLYPH IS NOT THE ONLY COMPOSER SHAPE, so a glyph
+/// is not the only ANCHOR. kimi 1.50.0 draws no marker character at all — its
+/// composer is the labeled rule region `── input ────`
+/// ([`agent_cli::AgentCliDescriptor::composer_region_label`]), with the typed
+/// text rendering on the rows directly BELOW the label (measured live 2026-09-14,
+/// muse lab host: type-without-send via `tools/probe-battery suites/kimi.js`,
+/// probe `composer-draft-shape`). When no row matches the marker, the scan
+/// falls back to the declared label row — the box-drawing trim of the rule
+/// must equal the label — and the rows between the label and the chrome floor
+/// are the composer's content, exactly as the marker arm reads them. The
+/// anchor is glyph-FIRST per row and bottom-up, so a CLI that draws both keeps
+/// its glyph semantics; and the same below-chrome-only window guards this arm
+/// as guards the marker arm.
 pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Option<bool> {
     // How far above the CLI's own chrome the marker may sit. A long line wraps
     // over a few rows; anything deeper is transcript, not composer.
@@ -1716,12 +1730,8 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
     // its ERROR TEXT as typed composer text and held the row in
     // pending_draft forever. A session without a known descriptor answers
     // `None` — cannot say, which keeps the row protected.
-    let Some(marker) = kind
-        .and_then(|kind| agent_cli::agent_cli_descriptor(kind))
-        .map(|descriptor| descriptor.composer_marker)
-    else {
-        return None;
-    };
+    let descriptor = kind.and_then(|kind| agent_cli::agent_cli_descriptor(kind))?;
+    let marker = descriptor.composer_marker;
     let mut content = String::new();
     for index in (floor..end).rev() {
         let text = rows[index]
@@ -1731,9 +1741,37 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
             let head = text[marker.len_utf8()..].trim();
             return Some(!head.is_empty() || !content.trim().is_empty());
         }
+        // The region arm: the labeled rule the box-drawing trimmer reduces to
+        // the bare label word anchors a glyph-less composer. Exposed only to
+        // descriptors that declare one (kimi, 2026-09-14); a transcript row
+        // that trims to the bare word is the accepted false-anchor risk, the
+        // same one the readiness gate's region arm carries.
+        if let Some(label) = descriptor.composer_region_label {
+            if text
+                .trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        '\u{2500}'
+                            | '\u{2501}'
+                            | '\u{2502}'
+                            | '\u{256d}'
+                            | '\u{256e}'
+                            | '\u{2570}'
+                            | '\u{256f}'
+                            | '-'
+                            | '='
+                            | '_'
+                            | ' '
+                    )
+                })
+                .eq_ignore_ascii_case(label)
+            {
+                return Some(!content.trim().is_empty());
+            }
+        }
         content.push_str(text);
     }
-    // A marker further up than a composer can reach: what is at the bottom of
+    // An anchor further up than a composer can reach: what is at the bottom of
     // this screen is transcript, and nothing here may be typed into.
     None
 }
@@ -3724,6 +3762,74 @@ mod tests {
         let agy = rows(&["> please hold the door", "? for shortcuts"]);
         assert_eq!(
             super::composer_row_holds_text(Some(SessionKind::Antigravity), &agy),
+            Some(true)
+        );
+    }
+
+    /// ⛔ [11.6.6-b follow-up] THE DRAFT GUARD GETS THE REGION ARM. kimi 1.50.0
+    /// draws no composer glyph, so the marker scan found no anchor and every
+    /// kimi row answered `None` — the daemon could never see typed-but-unsent
+    /// input in a kimi composer. Measured live 2026-09-14 (muse lab host, kimi
+    /// 1.50.0, type-without-send via `tools/probe-battery suites/kimi.js`,
+    /// probe `composer-draft-shape`, snap `kimi-draft-typed`): the typed text
+    /// renders on the rows directly BELOW the `── input ──` label, above the
+    /// box's bottom rule; the measured footer (`ctrl-j: newline …`,
+    /// `context: 0.0%`) stays. Both fixtures are the real screens, blank vt
+    /// rows included — the guard consumes the raw grid, not a normalized
+    /// extract.
+    #[test]
+    fn kimi_region_composer_holds_the_typed_draft() {
+        let rows = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>()
+        };
+        let rule = "\u{2500}".repeat(24);
+        let typed = rows(&[
+            "\u{2500}\u{2500} input \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            " PROBE-DRAFT-REGION",
+            "",
+            " ",
+            &rule,
+            "agent  /tmp/kimi-draft-probe  ctrl-j: newline | /feedback: send feedback",
+            "                                                                                           context: 0.0%",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Kimi), &typed),
+            Some(true),
+            "typed-but-unsent text below the region label is a draft"
+        );
+        // The same screen with the draft cleared (snap `kimi-draft-cleared`):
+        // the label anchors, the region is empty — `Some(false)`, the answer
+        // that lets a clean wake through. `None` (the pre-arm answer) is NOT
+        // acceptable here: it leaves the verdict to the keystroke arm alone,
+        // which is blind after every handover.
+        let cleared = rows(&[
+            "\u{2500}\u{2500} input \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "",
+            " ",
+            &rule,
+            "agent  /tmp/kimi-draft-probe  ctrl-j: newline | /feedback: send feedback",
+            "                                                                                           context: 0.0%",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Kimi), &cleared),
+            Some(false),
+            "the glyph-less region composer empty must read empty, not unknown"
+        );
+        // Delivered output sitting below a label line must not read as an
+        // empty region either — it is content, and the guard refuses: the
+        // asymmetric cost is a wrong "it is empty", never a needless refusal.
+        let stale = rows(&[
+            "\u{2500}\u{2500} input \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2728} PROBE-KIMI-1104-OK",
+            "LLM not set, send \"/login\" to login",
+            "agent  /tmp/kimi-draft-probe  ctrl-j: newline | /feedback: send feedback",
+            "                                                                                           context: 0.0%",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Kimi), &stale),
             Some(true)
         );
     }

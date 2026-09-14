@@ -803,14 +803,22 @@ gate — a kimi row at its composer reads READY, forever-refused before) and
 `terminal_chunk_agent_activity` (Idle at the region, Unknown forever before).
 Measured chrome below the region: `agent <cwd> shift-tab… ctrl-o: editor` +
 `context: 0.0%` — the `context:` hint added to kimi's footer hints.
-Fixtures are the real drive screens (`tools/probe-battery suites/kimi.js`,
-5/5 probes green live on the muse lab host): gate-READY on the idle screen
-(red on main),
-stray-`input`-word-with-output-below NOT ready, activity Idle. OWED
-follow-up (filed here, not silently dropped): `composer_row_holds_text`
-(the draft guard) still anchors on the glyph only — kimi rows keep the
-safe None answer; the region arm for draft detection is the next consumer
-change. Also measured for whoever takes it: the welcome panel prints
+Fixture
+tests lock all three screens. FOLLOW-UP LANDED same day (the
+kimi-draft-guard lane): `composer_row_holds_text` (the draft guard) grew
+the region arm — glyph-FIRST per row, label-fallback anchor, the rows
+between the label and the chrome floor are the composer content. Measured
+FIRST (type-without-send: the battery's `composer-draft-shape` probe,
+6/6 green live on the muse lab host): the typed text renders on the rows
+DIRECTLY BELOW the label, above the box's bottom rule, footer stays. The
+grid `Some(false)` is what clears an ADOPTED successor's clean composer
+(the keystroke reconstruction is rebuilt from zero at every handover); on
+the owning runtime the sticky keystroke arm still dominates after typing
+(backspace is deliberately draft-invisible) — locked by test. Live-pty
+daemon test: refuse-while-text, grid-clears-after-erase, and the region
+label never anchors another CLI's guard (codex → None on the same grid).
+Full-suite delta vs clean main: +2 green / 0 changed (the reds that remain
+are pre-existing, other owners). Also measured for whoever takes it: the welcome panel prints
 `Session: <uuid>` on screen (a screen-level id source), and wire.jsonl's
 typed TurnBegin/TurnEnd events are the natural v2 phase feed (this drive's
 unauth turn recorded metadata; an authed turn enriches).
