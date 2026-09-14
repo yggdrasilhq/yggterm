@@ -24,6 +24,7 @@ target/
 
 # JS test harness deps
 tools/xterm-harness/node_modules/
+tools/probe-battery/node_modules/
 tools/xterm-harness/package-lock.json
 .gstack/
 
