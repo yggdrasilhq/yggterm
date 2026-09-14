@@ -29790,3 +29790,76 @@ Measured while landing [11.6.3-a]+[11.6.3-b] (the live-proof half):
   an equal-label deploy does not trigger a same-label daemon's
   self-replacement, and neither the linger/fast-fail work ([11.97]) nor
   the hot-restart gate schedules one.
+
+## ⛔ [11.108] THE GUI SHELL WEBVIEW BALLOONS TO 1.8GB OVER ~10H AND DRIVES THE DESKTOP INTO SWAP-THRASH — THE "HANGING GUI" IS MEMORY RECLAIM, NOT A DAEMON WEDGE (measured live 2026-09-14 ~18:40 IST on the muse lab host)
+
+**Status:** OPEN
+
+Owner report: the muse lab host yggterm GUI "hanged like". Live evidence chain
+(ytrace + /proc + eu-stack; no code reasoning):
+
+- The GUI's own linux_memory_scope puts the app in cgroup
+  `yggterm-gui-<pid>.scope` with `memory.high` 3.69GiB. The shell
+  WebKitWebProcess (pid 1863536, born with the GUI 10.5h earlier) held
+  **1.2G RSS + 621M swap in ONE renderer**, repeatedly caught in
+  `__mem_cgroup_handle_over_high` (kernel reclaim throttle).
+- System thrash: PSI memory full avg10 17.5-17.8%, 8.5G/15G swap in use
+  on the 14G box; the ui/block witness shows maj_flt climbing
+  (min_flt 4.8M cumulative) — every repaint page-faults swap. Kernel log
+  has ZERO OOM kills: the desktop thrashes, nothing dies.
+- ytrace 12h on the GUI: `render/gui` 656 samples = **12,230 CPU-sec**
+  (p50 16.6s PER render pass, max 53s); `ui/block` **5,814 incidents**,
+  all `thrashing: true`, **max gap 6,592s (1h49m)** — the hang the owner
+  felt; `webview/edit_stall`: 36 flush timeouts, 190 gate bypasses,
+  VirtualDom frozen ~2s each.
+- Co-tenants on the box: ZCode desktop zygote 842M RSS + 329M swap,
+  helium, and FOUR more stashed web-surface webviews (largest 753M).
+
+**Live remediation (what un-hung him), for the repair loop:** SIGKILL of
+the bloated shell renderer only. PSI full 17.8 → 1.6 within 25s; the GUI
+respawned the shell webview in ~2 min; once pressure lifted the
+web-surface reaper collected all four stashed surface webviews (~1.1G
+more) within ~10 min; PSI 0.00 after. View-plane only — the headless
+daemon (11310, 25 live rows) and every PTY row were untouched throughout.
+PTY-law proof: post-recovery full-window screenshot shows sidebar, the
+active agy row and composer all rendering.
+
+**What is NOT fixed: the growth.** Nothing bounds shell-webview memory;
+the fresh webview can be expected to re-bloat over a similar session
+(suspected feeders, unprofiled: xterm canvases/scrollback for 20 live
+sessions, the 2,377-row sidebar merge every ~12s, the 849-session dev
+ingest × 4 machines). Amplifier: when the scope rides its 3.69G
+watermark, yggterm's own memory.high converts growth into
+reclaim-stall storms instead of slow swap absorption.
+
+**Falsifier for the fix:** a GUI up >24h with shell webview RSS flat
+(<300M) and PSI memory full <2%; or a bounded/trimmed shell (canvas /
+scrollback virtualization) that survives the owner's normal day.
+
+## ⚠ [11.109] ui/block FILES SEVERE 2s "STALLS" ON A HEALTHY IDLE GUI — INTER-EVENT GAPS CONFUSE PARKED-IDLE WITH STALLED (measured 2026-09-14, same sitting as [11.108])
+
+**Status:** OPEN
+
+After [11.108]'s remediation (PSI 0.00, renderers idle, pixels
+rendering), `ui/block` kept filing ~2,052ms SEVERE incidents ~4/min.
+Evidence this is the instrument, not the UI:
+
+- eu-stack × 4 on the main thread inside its R-state windows: every catch
+  is `ppoll` in `g_main_context_iteration` via `gtk_main_iteration_do` —
+  parked, not computing. Dense sampling (0.02-0.25s over ~2 min) found no
+  multi-second R stretch at all.
+- The post-recovery population is uniform (p50 2052-2089ms) at the ~13s
+  snapshot cadence, unlike the pre-fix population (p50 343ms, 40/min)
+  which was real churn under thrash.
+- The witness PSI delta inside those gaps is 0 — nothing waited on
+  memory, and the desktop had free RAM.
+
+Consequence: the incident feed (`complaint_for: llm`) cries wolf on a
+healthy GUI, drowning the real signal that caught [11.108]. Suspected
+shape: the detector measures inter-event gaps on the UI thread; a quiet
+park between periodic events (working_edge / snapshot cycle) exceeds
+severe_ms and files a fault with `thrashing` inferred from a stale or
+non-thread-local signal.
+
+**Falsifier:** an idle GUI (no output, no input) with zero ui/block
+incidents for 10 min while ytrace shows the normal snapshot cadence.
