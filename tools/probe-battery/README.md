@@ -28,8 +28,9 @@ node tools/probe-battery/run.js \
 ```
 
 Suites: `suites/mock-tui.js` (CI-reachable reference — proves the engine), 
-`suites/zcode-tui.js` (the §9 reference CLI; EXPERIMENTAL until 11.6.11's
-arm-matrix needles land). Add one file per CLI; keep per-CLI state in the
+`suites/zcode-tui.js` (the §9 reference CLI — filled and green against
+main zcode-tui 0.5.9, 2026-09-14; the measured-chrome regression net for
+that binary). Add one file per CLI; keep per-CLI state in the
 per-CLI campaign door (`campaign-cli-integration/<cli>.md`), defects in
 `docs/pending-bugs.md` under the CLI's `11.6.N` id.
 

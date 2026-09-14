@@ -42,7 +42,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.8 | grok | C | phrase drift FIXED in the descriptor (measured 1.0.24 needles + Ctrl+c footer swap + send-to-bg hint — entry below); active_sessions.json tenancy registry documented on the descriptor; events.jsonl event-fed classifier OPEN |
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
-| 11.6.11 | zcode-tui | B | OPEN (native announce LANDED — emitter commit zcode-tui 0bd590f + daemon `announce` verb; ARM-MATRIX GAP FILLED IN CODE on `lane/integration/zcode-tui` — both launch arms, sess_ fixture law, kimi glob twins ride-along, all 10 matrix tests green; live PTY proof owed) |
+| 11.6.11 | zcode-tui | B | OPEN (native announce LANDED — emitter commit zcode-tui 0bd590f + daemon `announce` verb; arm matrix FILLED — all 10 tests green; §9 battery suite LANDED on `lane/integration/zcode-tui-battery` — 6/6 green against true main 0.5.9 through a real pty: paint, U+258F caret byte-exact, turn, sess_ store law, resume rederive, panic; the SCREEN-side live proof is delivered, the announce-WIRE proof rides the daemon listener; descriptor screen-phrase drift filed [11.111]) |
 
 ### ⛔ 11.6.11 defect — ZCODE-TUI WAS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` RED (found by wave-1 seat B, 2026-09-10; FIXED IN CODE 2026-09-14)
 
@@ -688,9 +688,9 @@ Still owed:
 - the `died_with_me` WRITERS (force-retire / cold-exit paths) so the
   re-resume SLA (≤2 s) becomes measurable (the ledger types exist; only
   the `adopted` writer is wired);
-- per-CLI battery suites (zcode-tui reference in CI per stone §9 —
-  the runner + a skeleton suite are in tools/probe-battery; the 11.6.11
-  seat pins the needles) and the composite real-rotation ledger-served run
+- per-CLI battery suites — the zcode-tui §9 reference suite is LANDED
+  (green 6/6 on main 0.5.9, 2026-09-14); remaining: the other CLIs' suites
+  (kimi's exists) and the composite real-rotation ledger-served run
   riding a fleet rotation.
 
 #### 11.6.6 + 11.6.8 measured groundwork, and the 11.6.7/.9/.10 availability record (batch seat, 2026-09-10, the muse lab host)
@@ -29890,3 +29890,56 @@ non-thread-local signal.
 
 **Falsifier:** an idle GUI (no output, no input) with zero ui/block
 incidents for 10 min while ytrace shows the normal snapshot cadence.
+
+## ⛔ [11.111] ZCODE-TUI DESCRIPTOR SCREEN PHRASES DRIFTED OFF MAIN'S OWN 0.5.9 RELEASE — `streaming…`/`● running` NEVER DRAW AND `○ idle` IS GONE; THE MEASURED WORKING CHROME IS `working · working…` + THE `esc cancel` FOOTER SWAP (measured 2026-09-14 on origin/main zcode-tui 0.5.9 (5b97267), lane/integration/zcode-tui-battery)
+
+**Status:** OPEN — descriptor data fill owed (the zcode-tui seat; the
+measured source and the re-measure instrument both exist now). The battery
+suite landed green first (`tools/probe-battery/suites/zcode-tui.js`, 6/6
+against the real 0.5.9 binary through a real pty) precisely so this fill
+edits against a live measurement, not against the seat that guessed.
+
+The descriptor's ZcodeTui screen facts were measured on an earlier 0.5.x
+and the 0.5.9 release changed its chrome. Measured on true main (three real
+turns, pty + rendered-buffer reads, artifacts kept):
+
+- `working_screen_phrases`: declared `streaming…` and `● running` — **neither
+  ever draws** (0 frames across all turns). What 0.5.9 draws while a turn
+  runs: the status line reads `<cwd> · working · working…` (duplicated word
+  + ellipsis) and the footer swaps from `esc shortcuts …` to
+  `esc cancel · enter send`. Proposed fill: needle `working · working…`
+  (tight: the duplicated-word shape does not occur in transcript text),
+  optionally `esc cancel` as a second alternative.
+- `working_footer_hints`: declared `● running`, `streaming` — same absence.
+- `composer_footer_hints`: declared `i to type`, `○ idle`, `zcode-tui`.
+  Measured: `○ idle` **never draws** (idle status is bare `idle · N
+  sessions …`, no U+25CB ring); `i to type` draws only in the composer
+  mode-hint footer state (`i type …` / `i to type · enter sends` variants —
+  seen after `--resume`, not at birth); `zcode-tui` holds (the idle status
+  line's tail).
+- CONFIRMED unchanged on 0.5.9 (no edit needed): `composer_marker` U+258F
+  (byte-exact at rest AND trailing typed text), composer `›` U+203A +
+  `Ask anything…` placeholder, question-picker phrases (declared; this
+  drive's read-free turns did not open the banner — suite records the
+  honest null), `--resume <sess>` rederiving content, the
+  `.zcode/cli/rollout/model-io-sess_<uuid>.jsonl` store law.
+
+Blast radius is bounded but real: zcode-tui is class B — a fresh
+NativeAnnounce outranks the screen matcher — so the dead needles bite in
+exactly the degrade arm the stone §3.1 keeps (stale/absent announce falls
+back to screen phrases, which can now never say Working), and in every
+battery/fixture that asserts the declared table.
+
+Store-behavior facts measured en route (for the recency/store readers):
+the rollout jsonl is born LAZILY at the first model-io write (turn time),
+not at launch (measured ~15 s after spawn on a settled drive), and dead
+sessions' jsonls are pruned by zcode within minutes (a verified file was
+gone ≤8 min after its drive exited) — recency-by-mtime stays valid, but
+anything asserting a rollout file for a CLOSED session needs the sqlite
+store, not the glob.
+
+**Falsifier:** run `node tools/probe-battery/run.js --suite
+suites/zcode-tui.js --cwd <dir> --suite-arg bin=<0.5.9 build>` — green and
+`turn.declared_phrases_observed` all false until the descriptor is filled
+from this measurement; after the fill, the suite's fact table IS the
+regression test.
