@@ -1,0 +1,17 @@
+{
+  "name": "yggterm-probe-battery",
+  "version": "0.1.0",
+  "private": true,
+  "description": "T2 probe battery runner (stone docs/cli-integration-layer.md §5): per-CLI drive suites over node-pty + the vendored xterm.js, emitting measured schema-v2 facts. Graduated from the muse/kimi/grok probe lab.",
+  "type": "commonjs",
+  "scripts": {
+    "smoke": "node run.js --suite suites/mock-tui.js --cwd /tmp --artifacts /tmp/probe-battery-smoke"
+  },
+  "dependencies": {
+    "jsdom": "^29.1.1",
+    "node-pty": "1.1.0"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true
+  }
+}

@@ -82,7 +82,7 @@ pub mod hot_restart_queue;
 pub mod hot_restart_repair;
 mod host;
 mod live_row_tombstones;
-mod ownership_ledger;
+pub mod ownership_ledger;
 mod profile_write_lock;
 // Level (b) increment 1: owning a PTY we did not spawn — the Owned/Adopted
 // child split and a MasterPty over a received fd. Not yet wired to any
@@ -2672,6 +2672,22 @@ const EXTERNAL_ACTIVE_WAIT_REPRINT: Duration = Duration::from_secs(10);
 /// forbidden at any elapsed time.
 const EXTERNAL_ACTIVE_WAIT_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The deadline the probe battery / SLA harness may shorten. The §9
+/// acceptance run has to MEASURE the deadline-refusal path, and two
+/// wall-clock minutes per counterfactual is a penalty, not a measurement.
+/// Production never sets the variable; the default above is unchanged.
+const ENV_EXTERNAL_ACTIVE_WAIT_DEADLINE_MS: &str =
+    "YGGTERM_EXTERNAL_ACTIVE_WAIT_DEADLINE_MS";
+
+fn external_active_wait_deadline() -> Duration {
+    std::env::var(ENV_EXTERNAL_ACTIVE_WAIT_DEADLINE_MS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(EXTERNAL_ACTIVE_WAIT_DEADLINE)
+}
+
 /// Did the holder let go, or did we stop waiting for it?
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExternalResumeWait {
@@ -2768,7 +2784,7 @@ fn wait_for_external_agent_resume_to_clear(
             }
             return ExternalResumeWait::ServedByLiveDaemon { daemon_pid, holder_pids };
         }
-        if started.elapsed() >= EXTERNAL_ACTIVE_WAIT_DEADLINE {
+        if started.elapsed() >= external_active_wait_deadline() {
             // ⛔ BUG B2 SELF-RECOVERY (owner-caught 2026-09-02, "sessions opened
             // in the ether"): a holder that is PROVABLY OURS
             // (`StrandedYggtermOwned` — its environ marker names a yggterm row)
@@ -2839,7 +2855,7 @@ fn wait_for_external_agent_resume_to_clear(
                     "session_id": session_id,
                     "pids": processes.iter().map(|process| process.pid).collect::<Vec<_>>(),
                     "waited_secs": started.elapsed().as_secs(),
-                    "deadline_secs": EXTERNAL_ACTIVE_WAIT_DEADLINE.as_secs(),
+                    "deadline_secs": external_active_wait_deadline().as_secs(),
                 }),
             );
             if in_place {
