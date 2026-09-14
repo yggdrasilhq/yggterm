@@ -35,7 +35,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
-| 11.6.4 | agy | C | OPEN ([11.94] gate refusal FIXED IN CODE — LIVE PROOF OWED; [11.96] untitled-forever OPEN; baseline below) |
+| 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107]); [11.96] store half resolved upstream on 1.2.2, fallback half fixed in code; baseline below |
 | 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
 | 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer OPEN (gate shape change); working phrases still login-gated-unverified |
 | 11.6.7 | qwen | C | OPEN |
@@ -136,6 +136,49 @@ measure: zero `external_active_wait*` trace events on the ledger path, an
 explicit ledger-adoption event per row, swap→reattach latency, and the PTY
 law (viewport shows the session, never the banner).
 
+## ⛔ [11.107] A GATED AGY ROW'S GUARDED SEND WAS REFUSED BY THE WRONG GUARD AND THEN REPORTED AS DELIVERED — THE DRAFT DETECTOR FALSE-POSITIVES ON THE GATE PICKER AND THE APP-CONTROL PATH ONLY RECOGNIZES ONE REFUSAL (filed 2026-09-14)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Falsifier:** a guarded send into a fresh-folder gated agy row must answer
+`refused: startup gate shown: …` on the wire and
+`accepted:false, reason:"startup_gate_shown_refusal"` through app-control —
+never the draft refusal, never `accepted:true`.
+
+Family: 11.6.4 (agy, class C) — found 2026-09-14 by the [11.94] LIVE PROOF
+drive (board ACK-6cb208b072); jojo, daemon build 2026-09-11, GUI 3bb4c675,
+agy 1.2.2:
+
+- The gate renders (`shows_startup_gate: true`, plain rows carry "Do you
+  trust the contents of this project?"), yet a guarded send
+  (`refuse_if_draft=true`) came back **`refused: pending input draft: …
+  has typed-but-unsent input`** — nobody had typed. Chain, all measured:
+  agy's picker paints `> Yes, I trust this folder`; the draft-grid arm
+  (`composer_row_holds_text`) reads the `>` composer-marker row as
+  composer-with-text; the daemon asks the DRAFT guard FIRST; the named
+  gate refusal is unreachable on exactly the row shape [11.94] was built
+  for.
+- Through the GUI app-control path the same send answered
+  **`accepted:true, bytes:34`** — a success that lied. The app-control
+  slug matcher recognized only the startup-gate refusal message; the
+  draft refusal Ack rode home as a plain Ack, and the chunk loop counted
+  bytes the daemon never wrote.
+
+**Fix (this lane):** (1) `TerminalWrite` asks the startup-gate guard
+BEFORE the draft guard — a gated row can never hold a real draft (the CLI
+discards input while its modal is up, measured 2026-09-10), so the modal
+question goes first; source-shape test locks the order. (2) The app-control
+refusal matcher recognizes BOTH refusal markers
+(`terminal_write_refusal_reason` → `startup_gate_shown` |
+`pending_draft`), the refused reply carries a per-reason detail, and a
+refusal can never again read as `accepted:true`. Shell-side test
+`a_write_refusal_slug_names_both_refusals_and_never_a_delivery` locks the
+naming.
+
+**LIVE PROOF OWED:** the [11.94] entry's drive, restarted on a build with
+this fix — raw wire on a lane-built scratch daemon; GUI path on the next
+jojo daemon rotation.
+
 ## ⛔ [11.94] AGY'S WORKSPACE-TRUST GATE IS UNDECLARED AND EATS SUBMITTED INPUT — A PROGRAMMATIC SEND INTO IT IS LOST AND ITS OWN ENTER CONFIRMS THE GATE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -166,9 +209,31 @@ through the guard, aborts its remaining chunks on a refusal (the Enters are
 what would answer the gate), and answers `accepted:false` with
 `reason: "startup_gate_shown_refusal"` instead of a success that lied.
 
-**LIVE PROOF OWED:** on a fresh-folder agy row — send while gated must
-answer `accepted:false, reason:"startup_gate_shown_refusal"` with zero
-bytes written; answer the gate interactively; resend must deliver.
+**LIVE PROOF FALSIFIED 2026-09-14 (11.6.4 seat, jojo; board
+ACK-6cb208b072) — RE-FIXED IN CODE same sitting, see [11.107]:** the first
+end-to-end drive of a gated row (fresh folder, agy 1.2.2, production daemon
++ GUI and raw wire both) answered NOTHING this entry promised. The daemon
+refused — but by the DRAFT guard: agy's trust picker paints
+`> Yes, I trust this folder`, the draft-grid detector reads that as
+composer-marker-with-text, and the draft guard is asked FIRST, so the named
+gate refusal was unreachable. The GUI path then only recognizes the
+startup-gate refusal message, so the draft refusal rode home as
+`accepted:true` with the bytes counted while the modal had eaten every one
+of them. Re-fix: the daemon asks the gate guard BEFORE the draft guard (a
+gated row can never hold a real draft — the CLI discards input while its
+modal is up, measured 2026-09-10), and the app-control path treats ANY
+refusal marker as a non-delivery (`accepted:false`,
+`reason:"pending_draft_refusal"` for the draft one, per-reason detail).
+Gate phrases HELD across the 1.2.0 → 1.2.2 bump (daemon verdict
+`shows_startup_gate: true` on the 1.2.2 trust screen).
+
+**LIVE PROOF OWED:** on a fresh-folder agy row — a guarded send while
+gated must answer by name (`refused: startup gate shown: …` on the wire;
+`accepted:false, reason:"startup_gate_shown_refusal"` through app-control)
+with zero bytes written; answer the gate interactively; resend must
+deliver. Raw-wire half provable on a lane-built scratch daemon; the
+GUI-path half rides the next jojo daemon rotation (the live daemon's
+Sep-11 build predates the re-fix).
 
 ## ⛔ [11.97] A FAILED INTEGRATION TICK SILENTLY DROPS EVERY LANE THAT RODE IT — THE TRAIN GOES GREEN WITHOUT MERGED CONTENT, AND THE DEPLOY SHIPS THE HOLE (filed 2026-09-10)
 
@@ -209,7 +274,11 @@ unchanged innocent lanes within `quarantine_ttl_secs` of the failure with no
 human commit, and (b) land the guilty lane the moment its fixed tip arrives.
 ## ⛔ [11.96] AGY ROWS ARE UNTITLED FOREVER ON 1.2.0 — THE CLI NEVER WRITES THE SUMMARIES TABLE THE TITLE AUTHORITY READS, AND THE FALLBACK LABEL MISNAMES THE KIND (filed 2026-09-10)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Falsifier:** no agent-kind row may wear a `… Shell` recovered label while
+its icon says its CLI; on 1.2.2 a conversation with a turn must pick up its
+authored title from `conversation_summaries`.
 
 Family: 11.6.4 (agy, class C). Measured 2026-09-10, agy 1.2.0 on the GUI
 host:
@@ -233,6 +302,27 @@ make the fallback label kind-aware so an agent row never wears a "Shell"
 name. Title generation must NOT be enabled for agy while the authored-title
 reader is the authority (the 2026-09-06 law: generation would fight the
 authored title); the fix is the fallback, not the generation.
+
+**2026-09-14 UPDATE (11.6.4 seat, jojo) — the store half resolved UPSTREAM;
+the fallback half FIXED IN CODE:**
+
+- **agy 1.2.2 writes the summaries table again** (bin 2026-09-12;
+  re-measured live): 16 rows, newest 2026-09-13, with real authored titles
+  ("OpenCode UX Parity Specification", "Exact String Reply Test") — and
+  birth-rows with EMPTY titles for turnless conversations. The reader's
+  authority works again on 1.2.2 for any conversation with a turn;
+  untitled-forever is dead at the store. Titles still absent for
+  gated/turnless rows — the fallback still decides their label.
+- **Fallback FIXED IN CODE:** `humanized_title_for_copy_target` now takes
+  the row's session kind and DECLINES cwd-composed names for agent rows
+  entirely (the strong form of kind-aware: the 2026-09-02 owner law "the
+  cwd is not an agent's name" completed — the `{leaf} Shell` composition
+  was that law's Shell-noun sibling slipping through). An agent row keeps
+  its kind-aware birth title (`New {machine} Antigravity`); shell rows
+  keep today's compositions unchanged (test
+  `humanized_title_for_copy_target_uses_home_user_shell_title` stays
+  green). Falsifier: no agent-kind row may wear a `… Shell` recovered
+  label — `an_agent_row_never_gets_a_shell_fallback_name` locks it.
 
 #### 11.6.4 measured baseline (wave-1 seat C, 2026-09-10, guihost — agy 1.2.0)
 

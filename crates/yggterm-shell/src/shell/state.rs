@@ -48256,7 +48256,22 @@ fn generation_context_for_target(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
 }
-fn humanized_title_for_copy_target(target: &CopyGenerationTarget) -> Option<String> {
+fn humanized_title_for_copy_target(
+    target: &CopyGenerationTarget,
+    session_kind: Option<SessionKind>,
+) -> Option<String> {
+    // ⛔ [11.96]: an AGENT row never gets a cwd-composed fallback name — not
+    // "Ws Live Shell", and not its CLI's noun either. The 2026-09-02 owner law
+    // ("the cwd is not an agent's name") retired `{directory} {CLI}` birth
+    // titles; this fallback kept composing the Shell-noun sibling for agent
+    // rows whose title generation failed (measured 2026-09-10: an Antigravity
+    // row wore "Ws Live Shell" while its icon said Antigravity — silent
+    // degradation against the stone's loud-degradation law). An agent row's
+    // honest fallback is the kind-aware birth title it was born with
+    // (`New {machine} {noun}`), so decline here and leave that in place.
+    if session_kind.is_some_and(SessionKind::is_agent) {
+        return None;
+    }
     if let Some(machine) = target.remote_machine.as_ref() {
         let label = machine.label.trim();
         if !label.is_empty() {
@@ -49494,7 +49509,7 @@ fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> O
     }
     copy_target
         .as_ref()
-        .and_then(humanized_title_for_copy_target)
+        .and_then(|target| humanized_title_for_copy_target(&target, Some(session.kind)))
 }
 fn browser_row_for_session_identity<'a>(
     shell: &'a ShellState,
@@ -57489,7 +57504,7 @@ fn enrich_sidebar_rows_with_live_titles(
                 remote_machine: None,
                 cached_summary: None,
                 storage_path: None,
-            }) {
+            }, row_session_kind(row)) {
                 title = recovered_title;
             }
         }
@@ -86256,6 +86271,14 @@ async fn process_pending_app_control_requests(
                     // 1.2.0, pending-bugs [11.94]). The caller re-tries AFTER a
                     // human answers the gate; nothing says "accepted".
                     if let Some(reason) = write_report.refused {
+                        // The detail must name the refusal's own state: a
+                        // pending-draft refusal is NOT the gate ([11.107] — a
+                        // draft refusal used to wear the gate's detail because
+                        // only the gate slug was recognized at all).
+                        let detail = match reason {
+                            "pending_draft" => "the row's composer holds typed-but-unsent input. A programmatic send would submit or clobber a person's words. Clear the row's input (or send an empty write first) and resend.",
+                            _ => "the row is parked on its CLI's startup gate (a first-run modal). Typed input is discarded by the CLI and the trailing Enter answers the gate. Answer it interactively in the row (arrow keys + Enter), then resend.",
+                        };
                         AppControlResponse {
                             request_id: request.request_id.clone(),
                             handled_by_pid: std::process::id(),
@@ -86265,7 +86288,7 @@ async fn process_pending_app_control_requests(
                                 "accepted": false,
                                 "session_path": session_path,
                                 "reason": format!("{}_refusal", reason),
-                                "detail": "the row is parked on its CLI's startup gate (a first-run modal). Typed input is discarded by the CLI and the trailing Enter answers the gate. Answer it interactively in the row (arrow keys + Enter), then resend.",
+                                "detail": detail,
                                 "bytes": data.len(),
                                 "write": write_report.to_json(),
                             })),
