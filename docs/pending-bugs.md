@@ -30401,3 +30401,56 @@ arm) and is a one-line fix in ui_block.rs.
 **Falsifier:** the next ui/block incident on a freshly built binary
 carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 `/proc/<tid>/wchan` sample taken during the same stall.
+
+## ⛔ [11.121] ON A DIRECT-CHANNEL HOST THE HOURLY ROLL IS A DEAD WRITE FOR THE LIVE STACK — THE GUI AND DAEMON RUN A SEP-11 DIRECT BUILD WHILE THREE LANDED UX FIXES SIT EXECUTED-NEVER IN THE MANAGED LAYOUT, AND BOTH RESTART DOORS ARE BLIND TO SAME-VERSION REBUILDS (traced 2026-09-15 ~02:00 IST, GUI host, the drag-cold lane's re-probe)
+
+**Status:** OPEN
+
+The deploy plane and the install plane diverge on the GUI host, and the
+gap silently strands every GUI/daemon-side fix the roll lands:
+
+- The live stack is DIRECT-channel: the daemon (server pid, started Sep 11)
+  and the GUI app (started Sep 14 evening) both execute
+  `~/.local/share/yggterm/direct/versions/3.2.113/yggterm*`; the direct
+  install-state names that path as active. The ygg-ci roll's
+  `deploy-fleet.sh` writes the MANAGED layout (`~/.yggterm/versions/<v>/`,
+  `~/.local/bin/`, `~/.yggterm/bin/`) and the fleet reads "deployed" — but
+  nothing in the direct-channel stack ever executes those bytes.
+- The GUI's convergence restart triggers only on
+  `is_version_newer(daemon_version, own_version)` — a version-STRING
+  comparison. Same-version rebuilds (the normal case: the roll reuses
+  3.2.113 for every lane batch within the release window) answer
+  "same version … no GUI restart". `deploy-fleet.sh` itself documents the
+  pathology ("two different builds wear that string") for a sibling path.
+- `server app update restart` (RestartPendingUpdate) no-ops on this host:
+  `pending_restart_from_active_install_state` derives the pending update
+  from the DIRECT install-state, whose active_version/active_executable
+  the deploy never touches — preferred == current → None. The verb acked
+  `restart_pending_update` and nothing restarted (no restart/prepare trace
+  events, same pid minutes later).
+- Net effect measured tonight: the [11.87] restore-schedule cut (deployed
+  ~00:42), the spawn-ladder binary (01:28) and the [11.114] cold-drag fix
+  (01:41, `lane/uxspeed/drag-cold` tip in origin/main 38a98a1c, deployed
+  sha=38a98a1c5cd8) are ALL absent from the running desktop. The
+  drag-cold lane's close condition (live uxprobe re-probe of the fixed
+  build) is blocked on exactly this; the before-numbers on the old build
+  are in the door (cold begin 1797-2596 ms, warm ~160-214 ms, plus a
+  4/4 accuracy-artifact run and a clean control).
+
+**Fix shapes (in order):**
+(a) deploy-fleet.sh learns the direct channel: for hosts whose
+    install-state says channel=direct, refresh the direct versions root +
+    install-state (and let the existing pending-restart machinery do the
+    guarded restart), instead of writing only the managed layout.
+(b) or convergence learns BUILDS, not strings: the daemon_update_state
+    already carries `active_daemon_build_id`; comparing build ids (or
+    binary mtimes/hash) catches same-version rebuilds.
+(c) or the ci ledger stops claiming "deployed" on hosts whose live stack
+    cannot see the bundle — an honest `deployed-write-only` class, so
+    lanes stop believing their fix is live.
+
+Falsifier: on a direct-channel host, land a trivial binary-visible change
+through the roll; within one hour, `server status`/`server app drag clear`
+must report a handled_by_pid whose /proc exe mtime postdates the merge —
+today it does not, and no restart door fires.
+(docs(pending-bugs): [11.120] direct-channel hosts never execute the roll's bundle — deploy/install-plane divergence strands landed fixes; both restart doors blind to same-version rebuilds)
