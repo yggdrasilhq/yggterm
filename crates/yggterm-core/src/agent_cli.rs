@@ -2912,9 +2912,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // ⛔ `read_live_store_title` is None again: the reader it pointed at
         // opens state.json, and 1.50.0 ships no state.json — there is nothing
         // to read (see the title_authority block). Restored only together
-        // with a reader for a store that exists.
+        // with a reader for a store that exists. The remote probe died with
+        // it: a probe with no local reader is the exact drift its own gate
+        // test exists to refuse.
         read_live_store_title: None,
-        remote_live_store_title: Some(KIMI_REMOTE_TITLE_PROBE),
+        remote_live_store_title: None,
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -5529,41 +5531,6 @@ const GROK_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
 /// (session_v2, then the v1 table). The db path is fixed relative to $HOME —
 /// the descriptor declares no store globs, so the locators list is empty and
 /// this script never uses argv's locator half.
-/// Kimi's remote twin: the session directory's `state.json` — its own
-/// `title` (the first prompt; `isCustomTitle` when renamed), matched by the
-/// session directory's name, exactly like the local reader.
-const KIMI_REMOTE_TITLE_SCRIPT: &str = r#"
-import json, os, sys
-from pathlib import Path
-argv = sys.argv[1:]
-if '--' not in argv:
-    sys.exit(0)
-globs = [v for v in argv[:argv.index('--')] if v.strip()]
-ids = [v for v in argv[argv.index('--') + 1:] if v.strip()]
-if not ids or not globs:
-    sys.exit(0)
-home = Path(os.path.expanduser('~'))
-wanted = set(ids)
-seen = set()
-for g in globs:
-    try:
-        matches = home.glob(g)
-    except Exception:
-        continue
-    for p in matches:
-        try:
-            v = json.load(open(p, 'r', encoding='utf-8', errors='ignore'))
-        except Exception:
-            continue
-        sid = p.parent.name
-        if sid not in wanted or sid in seen:
-            continue
-        title = v.get('title')
-        if isinstance(title, str) and title.strip():
-            seen.add(sid)
-            print(json.dumps({'session_id': sid, 'candidates': [title.strip()]}, ensure_ascii=False))
-"#;
-
 const OPENCODE_REMOTE_TITLE_SCRIPT: &str = r#"
 import json, os, sqlite3, sys
 argv = sys.argv[1:]
@@ -5669,12 +5636,6 @@ for id_ in ids:
 const OPENCODE_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: OPENCODE_REMOTE_TITLE_SCRIPT,
     locators: RemoteStoreLocators::HomeRelative(".local/share/opencode/opencode.db"),
-    choose: first_non_empty_candidate,
-};
-
-const KIMI_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
-    script: KIMI_REMOTE_TITLE_SCRIPT,
-    locators: RemoteStoreLocators::StoreGlobs,
     choose: first_non_empty_candidate,
 };
 
@@ -10895,14 +10856,27 @@ mod tests {
 /// row. A descriptor that drifts from this map fails here, and the map
 /// itself changes only with the owner's word (docs/cli-integration.md
 /// Issue Heading 37).
+///
+/// THE ONE MEASURED EXCEPTION (2026-09-11, the 11.6.6-a c-tail landing; kept
+/// honest here rather than by deleting the map): kimi 1.50.0's store provably
+/// holds NO title key, so `Store` authority over it is an order to read a
+/// book that has no pages — the descriptor says `Generated` until kimi writes
+/// titles again, and flips back in the same commit as a working reader.
 #[test]
 fn title_authority_matches_the_owner_titling_law() {
+    // Every CLI is `Store` except the measured exceptions named here.
+    const GENERATED_EXCEPTIONS: &[&str] = &["kimi"];
     for descriptor in AGENT_CLIS.iter() {
+        let expected = if GENERATED_EXCEPTIONS.contains(&descriptor.slug) {
+            TitleAuthority::Generated
+        } else {
+            TitleAuthority::Store
+        };
         assert_eq!(
-            descriptor.title_authority,
-            TitleAuthority::Store,
+            descriptor.title_authority, expected,
             "{} drifts from the owner titling law — a CLI whose own title \
-             yggterm must read, never generate over",
+             yggterm must read, never generate over (measured Generated \
+             exceptions: {GENERATED_EXCEPTIONS:?})",
             descriptor.slug,
         );
     }

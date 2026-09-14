@@ -29694,37 +29694,6 @@ SIGTERM the stale daemon — the supervisor/GUI spawns a successor from the
 healed registry in seconds, and convergence retires any transient sibling on
 its own.
 
-## ⛔ [11.104] MAIN'S YGGTERM-CORE SUITE CARRIES THREE KIMI REDS — THE 11.6.6-a LANDING UPDATED THE REGISTRY BUT NOT THE FLEET JSON AND TWO FIXTURES (found on pristine main 60e6af57 by the muse lane, 2026-09-14)
-
-**Status:** OPEN
-
-`cargo test -p yggterm-core --lib` on pristine main fails three kimi-named
-tests; all three are the incomplete half of the wave-2 batch fill's kimi
-11.6.6-a landing (b2b9fe3a), not new drift:
-
-1. `the_fleet_transcript_table_matches_the_registry` — `.agents/skills/
-   yggterm-agent-fleet/cli-stores.json` still says kimi
-   `.kimi-code/sessions/*/*/state.json` while the registry now declares
-   `.kimi/sessions/*/*/wire.jsonl`. The test's own panic names the fix:
-   the JSON is wrong, not the test.
-2. `title_authority_matches_the_owner_titling_law` — the test's law table
-   still demands `Store` for kimi while the descriptor now (deliberately)
-   says `Generated` (the 1.50 store provably holds no title). Whichever
-   way the law resolves, the two must agree — as landed, the descriptor
-   and its own gate test disagree.
-3. `a_remote_title_probe_never_ships_without_its_local_reader` — kimi
-   still ships `remote_live_store_title: Some(KIMI_REMOTE_TITLE_PROBE)`
-   after `read_live_store_title` went `None`; a remote probe with no
-   local reader is two answers to one question, free to drift.
-
-Found while greening the muse lane's own suite (the same run: the fourth
-red, `promote_direct_install_active_version_is_noop_without_managed_install`,
-is the already-filed environment-sensitive [11.54] — the muse lab host is a
-live-install host). The muse lane changed none of these files; this entry
-exists so the
-kimi follow-up (11.6.6-b's gate-shape seat, or the batch seat returning)
-lands the JSON + fixtures in one commit.
-
 ## ⚠ [11.105] YGGTERM-SHELL STILL DRAWS ITS GLYPHS BY HAND — THE ICON CRATE WAS EXTRACTED FROM YGGTERM AND THEN NEVER ADOPTED BACK (iconography audit 2026-09-14, ydesign campaign)
 
 **Status:** OPEN
@@ -29863,44 +29832,3 @@ non-thread-local signal.
 
 **Falsifier:** an idle GUI (no output, no input) with zero ui/block
 incidents for 10 min while ytrace shows the normal snapshot cadence.
-
-## ⛔ [11.110] THE YNPM DEV AND NPM CHANNELS LEFT ONE BIN NAME ANSWERING TWO VERSIONS — THE FLEET PUSH WORKED, THE STALE CLI LINK KEPT SERVING 0.5.7, AND `ynpm install` BLESSED IT IN SILENCE (owner report + measured across the fleet 2026-09-14)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-The owner: "I do not think ynpm dev install is installing fleetwide. There is
-version discrepancy between zcode-tui." Measured: the fleet push WORKED — dev,
-the GUI host and the muse lab host all imported dev-channel
-`@ygghq/zcode-tui` 0.6.4 within 26 s of one another (09:39:36/09:39:56/09:40:02
-IST; each host mints its own `dev-<ms>-<pid>` generation by design; no fleet
-host ran `dev.checkout.begin`, so the build came from the operator's own seat).
-The discrepancy was channel split-brain, not a failed push: dev and the muse
-lab host still served `zcode-tui` 0.5.7 through `~/.yggterm/ynpm/bin/zcode-tui`
-(npm channel `@avikalpa/zcode-tui`, which npm's latest still is) while
-`~/.local/bin/zcode-tui` served 0.6.4; the GUI host had been healed by hand the
-day before (its cli link redirected at `~/.local/bin`), the other two never.
-`ynpm list` faithfully measured the split (cli row 0.5.7 vs 0.6.4 per host) —
-the manager just had no verb that would heal it, and worse, two
-`ynpm install @avikalpa/zcode-tui` runs that morning "completed" in 652/639 ms
-as silent no-ops at 0.5.7 (the fast path even borrowed the dev-channel binary
-as its health check) while the dev channel held 0.6.4 — the operator read the
-quiet exits as "the fleet install did not happen".
-
-Fix (crates/ynpm/src/main.rs): `install_dev_bins` — the choke point for both
-local dev publishes and fleet imports — now converges: a dev build strictly
-newer than the npm-channel entry owning the same-named cli link repoints that
-link at the dev publication (the healed GUI-host shape) and prints the repoint;
-equal/older dev builds never touch it (dev tests, it does not pin back). An
-explicit npm install stays authoritative for the cli link but NAMES a newer
-dev-channel build of the same bin instead of exiting silently — on both the
-fast path and the full-install path. `ynpm check` classifies a cli link
-answering the dev channel's newer build as converged, not DRIFT. Contract
-documented in docs/ynpm.md §"Two channels, one bin name: convergence"; tests
-cover converge, no-touch-below-equal, and the superseded-install note.
-
-**Falsifier (the owed live proof):** run a real `ynpm install --dev` import of
-the same package on a host whose cli link still serves the older npm build and
-read both lookups (`~/.yggterm/ynpm/bin/<bin> --version` and
-`~/.local/bin/<bin> --version`) answering alike, with the converge line in the
-output; until that is witnessed on a host served by a deployed build, dev and
-the muse lab host still answer 0.5.7 through the integrated cli dir.
