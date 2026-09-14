@@ -36,12 +36,21 @@ note() { echo "privacy: $*" >&2; fail=1; }
 #
 # `--exclude-standard` keeps .gitignore'd build output out, so this stays fast
 # and does not flood on target/ or node_modules.
+#
+# ⛔ `.git.*` backup dirs are NOT repo content (measured 2026-09-14: the
+# shared main checkout carried `.git.corrupt-*` recovery backups from the
+# 09-12 outage, and every scan of that tree failed on their git plumbing —
+# rebase-todo licence narratives, remote URLs, hook paths — training seats to
+# push through rc=1). The real `.git/` never appears in ls-files; only these
+# dot-git-prefixed backup dirs need the exclusion. `.github/` and
+# `.gitignore` stay in scope (`^\.git\.` does not match them).
 files=$(git ls-files --cached --others --exclude-standard \
   | grep -vE '^(vendor|third_party|node_modules)/' \
   | grep -vE '^assets/' \
   | grep -vE '(Cargo\.lock|\.b64|\.woff2?|\.png|\.jpg|\.ico|\.gz|\.zip)$' \
   | grep -vE '^docs/archive/' \
-  | grep -vE '^scripts/check-privacy\.sh$')
+  | grep -vE '^scripts/check-privacy\.sh$' \
+  | grep -vE '^\.git\.')
 [ -n "$files" ] || exit 0
 
 hits() { echo "$files" | xargs grep -nIE "$1" 2>/dev/null; }
@@ -69,12 +78,12 @@ PLACEHOLDER='/home/(user|u|x|y|z|operator|gui-host|example|someone|test|alice|bo
 #    the placeholders out FIRST, then ask whether any home path is still there.
 HOMEPATH='(^|[^a-zA-Z0-9_.-])/home/[a-z][a-z0-9_-]*'
 h=$(hits "$HOMEPATH" | sed -E "s#$PLACEHOLDER#<placeholder>#g" | grep -E "$HOMEPATH")
-[ -n "$h" ] && { note "absolute personal home paths — use /home/user or an invented placeholder:"; echo "$h" | head -12 >&2; }
+[ -n "$h" ] && { note "absolute personal home paths — use /home/user or an invented placeholder:"; echo "$h" | LC_ALL=C sort -u | head -12 >&2; }
 
 # 2. RFC1918 addresses. Real topology is a signpost to live attack surface;
 #    RFC 5737 (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) exists for docs.
 h=$(hits '\b(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)\b')
-[ -n "$h" ] && { note "private LAN addresses — use RFC 5737 ranges in examples:"; echo "$h" | head -12 >&2; }
+[ -n "$h" ] && { note "private LAN addresses — use RFC 5737 ranges in examples:"; echo "$h" | LC_ALL=C sort -u | head -12 >&2; }
 
 # 3. The owner's sidebar row taxonomy. A fixture shaped `"3. word: phrase"` or
 #    `"5.1 word: phrase"` is how his campaign lanes are named, and publishing the
@@ -91,7 +100,7 @@ h=$(hits '\b(192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[
 #    the same commit.
 SYNTHETIC='"[0-9]+(\.[0-9]+)? (widgets|gadgets|sprockets|cogs|levers|spindles|yggterm|demo|sample|project|alpha|beta|gamma|thing|probe|foo|bar|atlasstore|topic[a-z]*|records|word)(:|\b)'
 h=$(hits '"[0-9]+(\.[0-9]+)? [a-z][a-z0-9_-]{2,}: ' | grep -vE "$SYNTHETIC")
-[ -n "$h" ] && { note "numbered row-taxonomy fixture names a real lane — use an invented label:"; echo "$h" | head -12 >&2; }
+[ -n "$h" ] && { note "numbered row-taxonomy fixture names a real lane — use an invented label:"; echo "$h" | LC_ALL=C sort -u | head -12 >&2; }
 
 # 4. Named private stores / portals / personal projects, held encoded so this
 #    file does not republish them. Add new terms with:
@@ -104,7 +113,7 @@ do
   term=$(printf '%s' "$enc" | base64 -d 2>/dev/null) || continue
   [ -n "$term" ] || continue
   h=$(echo "$files" | xargs grep -nIiF -- "$term" 2>/dev/null)
-  [ -n "$h" ] && { note "a private store/portal/project name is present (term withheld) — use an invented name:"; echo "$h" | head -6 >&2; }
+  [ -n "$h" ] && { note "a private store/portal/project name is present (term withheld) — use an invented name:"; echo "$h" | LC_ALL=C sort -u | head -6 >&2; }
 done
 
 # 4b. THE SHARED LIST, if this machine has one. `ygg-privacy-guard` — the thing
@@ -127,7 +136,7 @@ if [ -r "$shared_terms" ]; then
     term=$(printf '%s' "$term" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ ${#term} -ge 4 ] || continue   # too short to match without false positives
     h=$(echo "$files" | xargs grep -nIiF -- "$term" 2>/dev/null)
-    [ -n "$h" ] && { note "a private name from the shared guard list is present (term withheld) — use an invented name:"; echo "$h" | head -6 >&2; }
+    [ -n "$h" ] && { note "a private name from the shared guard list is present (term withheld) — use an invented name:"; echo "$h" | LC_ALL=C sort -u | head -6 >&2; }
   done < "$shared_terms"
 fi
 
@@ -199,7 +208,7 @@ else
     done <<< "$lh"
     lh=$(printf '%s' "$filtered")
   fi
-  [ -n "$lh" ] && { echo "$lh" | grep -vqiE 'first-class' && { note "licence-history / estate-intent narrative — state the current terms, never the change:"; echo "$lh" | head -8 >&2; fail=1; }; }
+  [ -n "$lh" ] && { echo "$lh" | grep -vqiE 'first-class' && { note "licence-history / estate-intent narrative — state the current terms, never the change:"; echo "$lh" | LC_ALL=C sort -u | head -8 >&2; fail=1; }; }
 fi
 
 if [ "$fail" -eq 0 ]; then

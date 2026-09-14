@@ -72,7 +72,8 @@ ynpm skills check                         # homes resolve, installed copies inta
 one `.agents/skills` level under every checkout in `~/gh` and `~/git`, and
 installed ynpm generations. Canonical skill repos: yggterm ships its
 operational skills in-repo; owner-authored orphans (data-fabric, delta-zero,
-dossiergraph, fingraph) live in the yggsteer repository under `skills/`;
+and other private-scope campaigns) live in the yggsteer repository under
+`skills/`;
 product skills live in their product repos. When an app package ships
 `.agents/skills`, installing or updating it through ynpm should register
 those rows too (run `ynpm skills scan` after such an install until that

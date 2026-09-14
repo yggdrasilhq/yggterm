@@ -22,15 +22,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-FLEET_REPOS = {
-    "yggterm": ["~/gh/yggterm"],
-    "yggdrasil": ["~/gh/yggdrasil"],
-    "ydesign": ["~/git/ydesign", "~/gh/ydesign"],
-    "jyas": ["~/git/jyas"],
-    "practice-rs": ["~/git/practice-rs"],
-    "dossiergraph-manager": ["~/data/dossiergraph/git/dossiergraph-manager"],
-}
-
 REPO = None
 
 

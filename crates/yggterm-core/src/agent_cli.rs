@@ -2776,7 +2776,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // hunts: there is nothing to read. This flips back only if the CLI
         // starts writing a title, in the same commit as the reader for it.
         // ⛔ FLIPPED BACK TO `Generated` 2026-09-11 (kimi 1.50.0, measured on
-        // jojo): the 1.50 store has NO state.json and NO title key anywhere —
+        // the GUI host): the 1.50 store has NO state.json and NO title key anywhere —
         // the 2026-09-05 owner-law premise ("kimi writes state.json title,
         // measured end-to-end 2026-08-30") described 0.27.0's store and died
         // with that layout. `Store` over a title-less store is exactly the
@@ -2905,15 +2905,15 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // stays on disk, so the PTY is NOT a faithful re-derivation.
         content_rederives_on_resume: false,
         // ⛔⛔ [11.6.6-a] THE STORE MOVED UNDER US AGAIN (measured 2026-09-11 on
-        // jojo, kimi 1.50.0): the 2026-08-30 destination is itself a dead
+        // the GUI host, kimi 1.50.0): the 2026-08-30 destination is itself a dead
         // store now. A fresh 1.50.0 session is
         // `~/.kimi/sessions/<md5hex-of-cwd>/<session-uuid>/` holding ONLY
         // `context.jsonl` (role/content lines, system prompt first) and
         // `wire.jsonl` (line 1 `{"type":"metadata","protocol_version":"1.10"}`,
         // then timestamped `TurnBegin{user_input}` / `TurnEnd{}` events);
         // `find ~/.kimi -name state.json` is EMPTY. The bucket name is the
-        // md5 hex of the cwd — VERIFIED on this host (md5("/home/pi") and
-        // md5("/tmp") are both bucket names verbatim) — and the cwd itself is
+        // md5 hex of the cwd — VERIFIED on this host (md5("/tmp") is a bucket
+        // name verbatim, and so is the home-dir bucket) — and the cwd itself is
         // recoverable from context.jsonl's embedded system prompt ("current
         // working directory is `<path>`"). Three layouts inside a year
         // (`~/.kimi` hashed buckets → `~/.kimi-code` state.json → `~/.kimi`
@@ -8698,8 +8698,8 @@ mod tests {
     #[test]
     fn a_kimi_store_entry_reads_the_150_layout() {
         // kimi 1.50 moved BACK to ~/.kimi — md5-of-cwd buckets, a bare-uuid
-        // session directory, and NO state.json (measured 2026-09-11 on jojo,
-        // [11.6.6-a]). The glob anchors on wire.jsonl; the cwd survives only
+        // session directory, and NO state.json (measured 2026-09-11 on the GUI
+        // host, [11.6.6-a]). The glob anchors on wire.jsonl; the cwd survives only
         // as prose in the sibling context.jsonl's system prompt; no file
         // carries a title, so the entry's title is None by construction.
         let home =
