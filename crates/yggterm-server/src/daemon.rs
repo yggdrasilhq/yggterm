@@ -13242,33 +13242,23 @@ impl DaemonRuntime {
                 submit_iff_line_equals,
             } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
-                // The draft guard, checked HERE because this is where a runtime
-                // is owned. A daemon that only proxies the row reads `None` and
-                // must not decide — it forwards the flag and lets the owner
-                // answer. `Some(false)` and `None` both proceed: refusing on
-                // "unknown" would make every proxied row unbootable, which on
-                // the GUI host is all of them.
-                if refuse_if_draft
-                    && self.terminals.session_composer_holds_draft(
-                        &runtime_path,
-                        self.server.live_session_kind(&runtime_path),
-                    ) == Some(true)
-                {
-                    return Ok(ServerResponse::Ack {
-                        message: Some(format!(
-                            "{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input"
-                        )),
-                    });
-                }
-                // The startup-gate guard, the draft guard's twin: a programmatic
-                // send into a row parked on its CLI's first-run modal is a
-                // silent loss — the modal eats the bytes and a trailing Enter
-                // ANSWERS the gate (measured 2026-09-10, agy 1.2.0: a prompt
-                // typed at the workspace-trust picker never reached
-                // HandleUserInput AND confirmed trust). Asked of the row's OWN
-                // descriptor, never a cross-CLI union ([11.92]), and of the
-                // RENDERED GRID, not the raw stream — a modal paints with
-                // absolute cursor moves, so raw bytes fuse adjacent rows.
+                // The startup-gate guard runs BEFORE the draft guard, and the
+                // order is load-bearing (live-falsified 2026-09-14, [11.107]):
+                // agy's trust picker paints `> Yes, I trust this folder`, and
+                // the draft-grid detector reads that picker row as
+                // composer-marker-with-text — so on a gated row the draft
+                // guard always answered first and the named gate refusal was
+                // unreachable. A gated row can never hold a meaningful draft:
+                // the CLI DISCARDS input while its first-run modal is up
+                // (measured 2026-09-10, agy 1.2.0 — a prompt typed at the
+                // picker never reached HandleUserInput AND its trailing Enter
+                // ANSWERED the gate). Ask the modal question first; only a
+                // modal-free row can be asked about drafts.
+                //
+                // Asked of the row's OWN descriptor, never a cross-CLI union
+                // ([11.92]), and of the RENDERED GRID, not the raw stream — a
+                // modal paints with absolute cursor moves, so raw bytes fuse
+                // adjacent rows.
                 // ⛔ Gated on the same flag as the draft guard: refuse_if_draft
                 // marks a PROGRAMMATIC send; a plain write is a human's
                 // keystrokes and must always reach the picker.
@@ -13291,6 +13281,23 @@ impl DaemonRuntime {
                     return Ok(ServerResponse::Ack {
                         message: Some(format!(
                             "{STARTUP_GATE_REFUSAL_MESSAGE}: {runtime_path} is parked on its startup gate - answer it interactively (arrow keys + Enter), then resend"
+                        )),
+                    });
+                }
+                // The draft guard. A daemon that only proxies the row reads
+                // `None` and must not decide — it forwards the flag and lets
+                // the owner answer. `Some(false)` and `None` both proceed:
+                // refusing on "unknown" would make every proxied row
+                // unbootable, which on the GUI host is all of them.
+                if refuse_if_draft
+                    && self.terminals.session_composer_holds_draft(
+                        &runtime_path,
+                        self.server.live_session_kind(&runtime_path),
+                    ) == Some(true)
+                {
+                    return Ok(ServerResponse::Ack {
+                        message: Some(format!(
+                            "{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input"
                         )),
                     });
                 }
@@ -32827,6 +32834,25 @@ mod tests {
         assert!(
             source.contains("if refuse_if_draft\n                    && self\n                        .server\n                        .live_session_kind(&runtime_path)"),
             "the startup-gate guard must stay gated on refuse_if_draft"
+        );
+        // ⛔ THE ORDER ([11.107], live-falsified 2026-09-14): the gate guard
+        // must be asked BEFORE the draft guard. agy's trust picker paints
+        // `> Yes, I trust this folder`, the draft-grid detector reads that as
+        // composer-marker-with-text, and a draft-first order made the named
+        // gate refusal UNREACHABLE on exactly the row it was built for — a
+        // gated row can never hold a real draft (the CLI discards input while
+        // its modal is up), so the modal question goes first.
+        let gate_refusal = source
+            .find("{STARTUP_GATE_REFUSAL_MESSAGE}: {runtime_path} is parked")
+            .expect("the gate refusal message is present");
+        let draft_refusal = source
+            .find("{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input")
+            .expect("the draft refusal message is present");
+        assert!(
+            gate_refusal < draft_refusal,
+            "the startup-gate guard must fire before the draft guard, or the \
+             picker row drafts false-positive the draft check and the named \
+             gate refusal is unreachable"
         );
     }
 

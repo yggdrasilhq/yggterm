@@ -50438,6 +50438,48 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             TERMINAL_INPUT_ECHO_READ_BURST_READS
         );
     }
+
+    #[test]
+    fn a_write_refusal_slug_names_both_refusals_and_never_a_delivery() {
+        // [11.107]: the matcher used to recognize only the startup-gate
+        // message, so a DRAFT refusal rode home as `accepted: true` with the
+        // bytes counted while the daemon had written none of them. A refusal
+        // Ack that the caller cannot name is a success that lied.
+        let gate = format!(
+            "{}: local://abc is parked on its startup gate - answer it interactively (arrow keys + Enter), then resend",
+            yggterm_server::STARTUP_GATE_REFUSAL_MESSAGE
+        );
+        assert_eq!(
+            terminal_write_refusal_reason(&Some(gate)),
+            Some("startup_gate_shown")
+        );
+        let draft = format!(
+            "{}: local://abc has typed-but-unsent input",
+            yggterm_server::DRAFT_REFUSAL_MESSAGE
+        );
+        assert_eq!(
+            terminal_write_refusal_reason(&Some(draft)),
+            Some("pending_draft"),
+            "a draft refusal is a non-delivery and must be named as one"
+        );
+        assert_eq!(
+            terminal_write_refusal_reason(&None),
+            None,
+            "a delivered write carries no message"
+        );
+        assert_eq!(
+            terminal_write_refusal_reason(&Some("wrote 12 bytes".to_string())),
+            None,
+            "an unrelated ack is not a refusal"
+        );
+        assert_eq!(
+            terminal_write_refusal_reason(&Some(
+                "this refused: pending input draft is a suffix".to_string()
+            )),
+            None,
+            "the marker must anchor at the start"
+        );
+    }
     #[test]
     fn terminal_attach_blocks_background_work_for_active_ssh_restore() {
         let mut shell =
@@ -57122,8 +57164,33 @@ Updated at   Branch  Conversation\n\
             storage_path: None,
         };
         assert_eq!(
-            humanized_title_for_copy_target(&target).as_deref(),
+            humanized_title_for_copy_target(&target, None).as_deref(),
             Some("User Home Shell")
+        );
+    }
+    #[test]
+    fn an_agent_row_never_gets_a_shell_fallback_name() {
+        // [11.96]: title recovery used to compose `{cwd leaf} Shell` for ANY
+        // row whose generated title was low-signal — an Antigravity row wore
+        // "Ws Live Shell" while its icon said Antigravity. The 2026-09-02
+        // owner law (the cwd is not an agent's name) applies to the fallback
+        // too: an agent row declines the cwd name and keeps its kind-aware
+        // birth title instead.
+        let target = CopyGenerationTarget {
+            session_path: "local://agy".to_string(),
+            session_id: "agy".to_string(),
+            cwd: "/home/user/ws_live".to_string(),
+            title: "Ws Live".to_string(),
+            source_updated_at: None,
+            remote_context: None,
+            remote_machine: None,
+            cached_summary: None,
+            storage_path: None,
+        };
+        assert_eq!(
+            humanized_title_for_copy_target(&target, Some(SessionKind::Antigravity)),
+            None,
+            "an agent row's cwd is not its name, in a Shell noun or its own"
         );
     }
     #[test]

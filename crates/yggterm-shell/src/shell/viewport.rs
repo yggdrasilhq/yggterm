@@ -18423,13 +18423,21 @@ fn update_terminal_surface_status(
     });
 }
 /// The refusal slug a guarded write's Ack message carries, if it refused.
-/// Only the startup gate refuses today; the draft marker is matched by the
-/// caller that asks for it.
+/// The daemon refuses a programmatic write by name when the row is parked on
+/// its CLI's startup gate AND when the composer holds typed-but-unsent input.
+/// Both are NON-deliveries: reporting either as a plain Ack is a success that
+/// lied — live-measured 2026-09-14 ([11.107]): a gated agy row's send came
+/// back as a DRAFT refusal (the gate picker row reads as composer text), the
+/// slug matcher missed it, and the app-control reply said `accepted: true`
+/// with the bytes counted while the modal had eaten every one of them. The
+/// slug reuses the daemon's own `pending_draft` blocker vocabulary.
 fn terminal_write_refusal_reason(message: &Option<String>) -> Option<&'static str> {
     if yggterm_server::terminal_write_was_refused_for_startup_gate(
         message.as_deref(),
     ) {
         Some("startup_gate_shown")
+    } else if yggterm_server::terminal_write_was_refused_for_draft(message.as_deref()) {
+        Some("pending_draft")
     } else {
         None
     }
