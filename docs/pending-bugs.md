@@ -30073,3 +30073,39 @@ instruments must reproduce this entry's numbers (they did, twice, two
 different toolchains, on/off pair measured).
 
 > Renumber note: this entry was drafted as [11.113] the same hour the probe-driver lane filed its own [11.113] (trace-plane gaps) — renumbered to [11.115] per the defect-id law (grep at FILE time on FRESH origin/main, not a stale checkout); [11.98]-to-[11.100] precedent.
+
+## ⛔ [11.116] ROW TITLE GENERATION RETRIES FOREVER AGAINST TWO PERMANENTLY-FAILING REMOTE ROWS — 68% OF ATTEMPTS FAIL, p50 456 ms PER ATTEMPT, AND THE ok:false TRACE CARRIES NO REASON (measured 2026-09-15 ~00:15-01:15 IST on the GUI host, ux-speed switch-plane investigation)
+
+**Status:** OPEN
+
+Filed 2026-09-15 ~01:30 IST on `lane/uxspeed/switch-plane-vocab` (ux-speed
+campaign, the [11.87] switch-plane seat's follow-on investigation).
+
+Measured (GUI client pid's ytrace window, 6 h natural traffic): 111
+`copy_generation/title` wall spans; **76 are `ok:false`** — and the two
+failing session paths account for exactly all of them in a 38+38 split
+(`remote-cc://oc/d47381a8…`, `remote-cc://practice/b1f5d64f…`). Each
+attempt costs p50 456 ms wall (ok:false max 3.1 s; one ok:true took
+49 s), and the attempts continue roughly every 5 min per row for hours.
+The plane already knows it can eat windows (`copy_generation_busy` is an
+existing incident class: "title/summary generation ate > half the
+window") and has a pause mechanism (`copy_generation_pause`,
+`copy_generation_pause_remaining_ms`), but the pause is not stopping the
+per-row retry loop against rows that provably never succeed.
+
+Two defects in one:
+1. **The retry loop has no give-up per row.** A row that failed 38
+   consecutive times across 6 h will fail again; every retry is a wasted
+   generation call plus a trace span. The pause exists but evidently
+   keys on something else (rate, not per-row futility).
+2. **The failure is inarticulate.** The `ok:false` payload carries
+   `{announce, force, ok, session_path}` and NO error/reason field — an
+   operator reading the trace cannot tell refusal from timeout from
+   empty transcript. (The same plane emits a separate
+   `copy_generation/title rate_limited` event, so the vocabulary has the
+   slot; the failure path just never fills it.)
+
+Fix shape: per-row failure counter with a long floor (or give-up until
+the row's transcript actually changes), and the failure emit must carry
+the error kind. Falsifier: 6 h of trace with a permanently-failing row
+shows ≤2 `ok:false` spans for it and every span names its reason.
