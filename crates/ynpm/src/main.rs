@@ -2293,6 +2293,9 @@ fn install_npm_package(
             .keys()
             .all(|bin| run_version(&dest.join(bin)).is_ok())
     {
+        for note in dev_channel_supersedence_notes(&state, &version, &existing.bins) {
+            println!("ynpm: {note}");
+        }
         return Ok(InstallOutcome {
             name: package.to_string(),
             version,
@@ -2440,6 +2443,7 @@ fn install_npm_package(
         for bin in bins.keys() {
             publish_link(&generation.join("bin").join(bin), &dest.join(bin))?;
         }
+        let installed_bins = package_state.bins.clone();
         paths.save_state(&state)?;
         sync_app_registration(paths, package, previous_integration.as_ref(), app_manifest)?;
         ynpm_trace(
@@ -2460,6 +2464,9 @@ fn install_npm_package(
             if let Some(ref previous) = previous {
                 println!("  previous {previous} kept as a generation");
             }
+        }
+        for note in dev_channel_supersedence_notes(&state, &version, &installed_bins) {
+            println!("ynpm: {note}");
         }
         Ok(InstallOutcome {
             name: package.to_string(),
@@ -2871,6 +2878,16 @@ fn install_dev_bins(
         publish_link(&generation.join("bin").join(name), &destination.join(name))?;
     }
     let published_generation = package_state.dev_generation.clone();
+    let published_version = package_state.current.clone();
+    let published_bins = package_state.bins.clone();
+    converge_cli_links_to_dev(
+        paths,
+        &state,
+        &package,
+        &published_version,
+        &destination,
+        &published_bins,
+    );
     paths.save_state(&state)?;
     sync_app_registration(paths, &package, previous_integration.as_ref(), app_manifest)?;
     ynpm_trace(
@@ -2898,6 +2915,137 @@ fn install_dev_bins(
         bins: bins.keys().cloned().collect(),
         marker,
         integration,
+    })
+}
+
+/// The two channels share bin names: the integrated cli dir (`~/.yggterm/ynpm/bin`)
+/// serves the npm channel while a dev install publishes the same name elsewhere
+/// (`~/.local/bin` by default). Left alone the same command answers two different
+/// versions depending on which lookup path a launch resolves — the 2026-09-14
+/// zcode-tui split (npm 0.5.7 vs dev 0.6.4 diverging per host, healed by hand on
+/// one host and left split on the others). When the dev build is strictly newer
+/// than the npm-channel entry that owns the cli link, repoint that link at the
+/// dev publication so every lookup path answers alike. An npm build newer than
+/// or equal to the dev build is left alone: the dev channel is for testing, not
+/// for pinning a host backwards.
+fn converge_cli_links_to_dev(
+    paths: &Paths,
+    state: &State,
+    package: &str,
+    version: &str,
+    destination: &Path,
+    bins: &BTreeMap<String, String>,
+) {
+    let cli_dir = paths.root().join("bin");
+    if cli_dir == destination {
+        // An integrated dev publish manages its own cli links directly.
+        return;
+    }
+    let Ok(dev_semver) = SemVer::parse(version) else {
+        return;
+    };
+    for name in bins.keys() {
+        let cli_link = cli_dir.join(name);
+        let Ok(current_target) = fs::read_link(&cli_link) else {
+            // No cli-channel link of this name (or a real file ynpm does not
+            // manage): nothing to converge.
+            continue;
+        };
+        if current_target == destination.join(name) {
+            continue;
+        }
+        let Some((cli_package, cli_version)) = state.packages.iter().find_map(|(key, entry)| {
+            let serves = entry.dev.is_none()
+                && entry.bins.contains_key(name)
+                && entry.destination.as_deref() == Some(cli_dir.to_string_lossy().as_ref());
+            serves.then(|| {
+                (
+                    entry.package_name.clone().unwrap_or_else(|| key.clone()),
+                    entry.current.clone(),
+                )
+            })
+        }) else {
+            continue;
+        };
+        let Ok(cli_semver) = SemVer::parse(&cli_version) else {
+            continue;
+        };
+        if SemVer::cmp_semver(&dev_semver, &cli_semver) != std::cmp::Ordering::Greater {
+            continue;
+        }
+        if let Err(error) = publish_link(&destination.join(name), &cli_link) {
+            eprintln!("ynpm: ⛔ could not converge {name}: {error:#}");
+            continue;
+        }
+        println!(
+            "ynpm: {name} now serves {package} {version} (dev) — {} was {cli_package} {cli_version}",
+            cli_link.display()
+        );
+        ynpm_trace(
+            paths,
+            "dev.cli_link.converged",
+            serde_json::json!({
+                "bin": name,
+                "dev_package": package,
+                "dev_version": version,
+                "npm_package": cli_package,
+                "npm_version": cli_version,
+            }),
+        );
+    }
+}
+
+/// The honest mirror of convergence: an explicit npm-channel install keeps the
+/// cli link authoritative (the user chose the registry build), but when a dev
+/// build of the same bin is newer elsewhere on this host, SAY so — the
+/// 2026-09-14 morning was `install @avikalpa/zcode-tui` silently completing at
+/// 0.5.7 twice while the dev channel served 0.6.4, and the operator read the
+/// quiet exit as "the fleet install did not happen". Returns the note lines.
+fn dev_channel_supersedence_notes(
+    state: &State,
+    installed_version: &str,
+    bins: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for name in bins.keys() {
+        let Some((dev_package, dev_version, dev_dest)) = state.packages.iter().find_map(
+            |(key, entry)| {
+                let is_dev = entry.dev.is_some() && entry.bins.contains_key(name);
+                is_dev.then(|| {
+                    (
+                        entry.package_name.clone().unwrap_or_else(|| key.clone()),
+                        entry.current.clone(),
+                        entry.destination.clone(),
+                    )
+                })
+            },
+        ) else {
+            continue;
+        };
+        let (Ok(dev_semver), Ok(npm_semver)) = (
+            SemVer::parse(&dev_version),
+            SemVer::parse(installed_version),
+        ) else {
+            continue;
+        };
+        if SemVer::cmp_semver(&dev_semver, &npm_semver) != std::cmp::Ordering::Greater {
+            continue;
+        }
+        let where_at = dev_dest
+            .map(|dir| format!(" at {}", PathBuf::from(dir).join(name).display()))
+            .unwrap_or_default();
+        notes.push(format!(
+            "note: {name} {dev_version} ({dev_package}, dev channel){where_at} is newer than npm {installed_version}; the cli link serves npm — install the dev build to converge"
+        ));
+    }
+    notes
+}
+
+fn dev_channel_serves_bin(state: &State, bin: &str, version: &str) -> bool {
+    state.packages.values().any(|entry| {
+        entry.dev.is_some()
+            && entry.bins.contains_key(bin)
+            && version_answer_matches_identity(version, &entry.current)
     })
 }
 
@@ -3646,6 +3794,7 @@ fn verb_check(paths: &Paths) -> anyhow::Result<()> {
             .next()
             .and_then(|bin| run_version(&destination.join(bin)).ok());
         let mut flags = Vec::new();
+        let mut notes = Vec::new();
         if package.dev.is_none() {
             match disk_answer
                 .as_deref()
@@ -3655,10 +3804,24 @@ fn verb_check(paths: &Paths) -> anyhow::Result<()> {
                     if !version_answer_matches_identity(
                         disk_answer.as_deref().unwrap_or(""),
                         &package.current,
-                    ) => flags.push(format!(
-                    "DRIFT: disk answers {version}, state says {}",
-                    package.current
-                )),
+                    ) =>
+                {
+                    // A converged cli link answers the dev channel's newer
+                    // build on purpose; that is the split healed, not drift.
+                    let served_by_dev = package.bins.keys().next().is_some_and(|bin| {
+                        dev_channel_serves_bin(&state, bin, &version)
+                    });
+                    if served_by_dev {
+                        notes.push(format!(
+                            "cli link serves the dev channel's build {version} (converged)"
+                        ));
+                    } else {
+                        flags.push(format!(
+                            "DRIFT: disk answers {version}, state says {}",
+                            package.current
+                        ));
+                    }
+                }
                 None => flags.push("DRIFT: the installed binary answers no version".to_string()),
                 _ => {}
             }
@@ -3693,6 +3856,9 @@ fn verb_check(paths: &Paths) -> anyhow::Result<()> {
         } else {
             drifted += 1;
             println!("{identity}: {}", flags.join("; "));
+        }
+        for note in &notes {
+            println!("{identity}: {note}");
         }
     }
     if drifted > 0 {
@@ -6614,6 +6780,143 @@ mod tests {
         );
         assert!(!staging.exists(), "staging must be reaped after activation");
         fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    /// The 2026-09-14 zcode-tui split: the integrated cli dir serves the npm
+    /// channel's 0.5.7 while a dev install publishes 0.6.4 into ~/.local/bin —
+    /// the same command answering two versions by lookup path.
+    fn converge_fixture(home: &Path) -> (Paths, PathBuf, PathBuf) {
+        let paths = Paths::new(home);
+        let cli_dir = paths.root().join("bin");
+        let dev_dir = home.join(".local/bin");
+        fs::create_dir_all(&cli_dir).expect("cli dir");
+        fs::create_dir_all(&dev_dir).expect("dev dir");
+        fs::write(dev_dir.join("tool"), "dev-bytes").expect("dev bin");
+        let old_generation = paths.generation_dir("vendor__tool", "0.5.7");
+        fs::create_dir_all(old_generation.join("bin")).expect("npm generation");
+        fs::write(old_generation.join("bin/tool"), "npm-bytes").expect("npm bin");
+        publish_link(
+            &old_generation.join("bin/tool"),
+            &cli_dir.join("tool"),
+        )
+        .expect("npm link");
+        (paths, cli_dir, dev_dir)
+    }
+
+    fn converge_state(cli_dir: &Path) -> State {
+        let mut state = State::default();
+        state.packages.insert(
+            "vendor__tool".to_string(),
+            Package {
+                package_name: Some("@vendor/tool".to_string()),
+                current: "0.5.7".to_string(),
+                versions: vec!["0.5.7".to_string()],
+                bins: BTreeMap::from([("tool".to_string(), "bin/tool".to_string())]),
+                external_prev: None,
+                destination: Some(cli_dir.display().to_string()),
+                dev: None,
+                dev_generation: None,
+                channel: Some("npm".to_string()),
+                source: None,
+                integration: None,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn a_newer_dev_build_converges_the_npm_channel_cli_link() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test home")
+            .join(".yggterm/scratchpad/ynpm")
+            .join(format!("converge-newer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let (paths, cli_dir, dev_dir) = converge_fixture(&home);
+        let state = converge_state(&cli_dir);
+        let bins = BTreeMap::from([("tool".to_string(), "bin/tool".to_string())]);
+
+        converge_cli_links_to_dev(&paths, &state, "@ygghq/tool", "0.6.4", &dev_dir, &bins);
+        assert_eq!(
+            fs::read_link(cli_dir.join("tool")).expect("converged link"),
+            dev_dir.join("tool"),
+            "the cli link must serve the strictly newer dev build"
+        );
+        // Convergence is idempotent: the next dev publish sees its own link.
+        converge_cli_links_to_dev(&paths, &state, "@ygghq/tool", "0.6.4", &dev_dir, &bins);
+        assert_eq!(
+            fs::read_link(cli_dir.join("tool")).expect("link survived"),
+            dev_dir.join("tool")
+        );
+        fs::remove_dir_all(&home).expect("test cleanup");
+    }
+
+    #[test]
+    fn an_equal_or_older_dev_build_leaves_the_npm_channel_cli_link_alone() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test home")
+            .join(".yggterm/scratchpad/ynpm")
+            .join(format!("converge-older-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let (paths, cli_dir, dev_dir) = converge_fixture(&home);
+        let state = converge_state(&cli_dir);
+        let bins = BTreeMap::from([("tool".to_string(), "bin/tool".to_string())]);
+        let npm_target = fs::read_link(cli_dir.join("tool")).expect("npm link");
+
+        // The dev build is OLDER than the npm channel (0.5.7 dev vs 0.5.7 npm
+        // would be equal; use 0.5.6 to test the strictly-newer rule).
+        converge_cli_links_to_dev(&paths, &state, "@ygghq/tool", "0.5.6", &dev_dir, &bins);
+        assert_eq!(
+            fs::read_link(cli_dir.join("tool")).expect("link untouched"),
+            npm_target,
+            "a dev build that is not strictly newer must not pin the host back"
+        );
+        fs::remove_dir_all(&home).expect("test cleanup");
+    }
+
+    #[test]
+    fn npm_install_names_a_newer_dev_channel_and_stays_silent_otherwise() {
+        let mut state = State::default();
+        state.packages.insert(
+            "zcode-tui".to_string(),
+            Package {
+                package_name: Some("@ygghq/zcode-tui".to_string()),
+                current: "0.6.4".to_string(),
+                versions: vec!["0.6.4".to_string()],
+                bins: BTreeMap::from([("zcode-tui".to_string(), "bin/zcode-tui".to_string())]),
+                external_prev: None,
+                destination: Some("/home/user/.local/bin".to_string()),
+                dev: Some(DevMarker {
+                    built_at_ms: 0,
+                    commit: None,
+                    host: None,
+                    watch: None,
+                    supersedes: None,
+                    supersedes_fingerprint: None,
+                    dev_fingerprint: None,
+                    generation: Some("dev-0".to_string()),
+                }),
+                dev_generation: Some("dev-0".to_string()),
+                channel: Some("dev".to_string()),
+                source: None,
+                integration: None,
+            },
+        );
+        let bins = BTreeMap::from([("zcode-tui".to_string(), "bin/zcode-tui".to_string())]);
+
+        let notes = dev_channel_supersedence_notes(&state, "0.5.7", &bins);
+        assert_eq!(notes.len(), 1, "npm 0.5.7 under a dev 0.6.4 must be named");
+        assert!(notes[0].contains("0.6.4"), "the note names the dev version");
+
+        let notes = dev_channel_supersedence_notes(&state, "0.7.0", &bins);
+        assert!(
+            notes.is_empty(),
+            "a newer npm install is authoritative; no note"
+        );
+
+        assert!(dev_channel_serves_bin(&state, "zcode-tui", "0.6.4"));
+        assert!(!dev_channel_serves_bin(&state, "zcode-tui", "0.5.7"));
     }
 }
 
