@@ -37,7 +37,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
 | 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107]); [11.96] store half resolved upstream on 1.2.2, fallback half fixed in code; baseline below |
 | 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
-| 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer OPEN (gate shape change); working phrases still login-gated-unverified |
+| 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer FIXED IN CODE — region-label composer shape in the readiness gate (entry below); working phrases still login-gated-unverified |
 | 11.6.7 | qwen | C | OPEN |
 | 11.6.8 | grok | C | phrase drift FIXED in the descriptor (measured 1.0.24 needles + Ctrl+c footer swap + send-to-bg hint — entry below); active_sessions.json tenancy registry documented on the descriptor; events.jsonl event-fed classifier OPEN |
 | 11.6.9 | pi | C | OPEN |
@@ -788,14 +788,31 @@ the same shape as agy's [11.96]. `read_live_store_title` is None again
 (there is nothing to read). Flips back the day kimi writes titles, with the
 reader, in one commit.
 
-**[11.6.6-b] OPEN — the readiness gate cannot represent kimi's composer.**
-1.50.0 draws NO composer glyph: a labeled rule region `── input ──` (the
-declared ❯ is undrawn). `composer_marker` is a plain char under a
-drawable-glyph lock, so no data fill can be honest here; the gate needs a
-second composer shape (region-label) — a consumer change deliberately NOT
-hacked into a fill lane. Also measured for whoever takes it: the welcome
-panel prints `Session: <uuid>` on screen (a screen-level id source), and
-wire.jsonl's typed TurnBegin/TurnEnd events are the natural v2 phase feed.
+**[11.6.6-b] FIXED IN CODE — the readiness gate represents kimi's composer
+as a region-label shape** (lane/integration/kimi, 2026-09-14, the 11.6.6
+seat; attribution in the campaign doors). 1.50.0 draws NO composer glyph: a
+labeled rule region `── input ──` (the declared ❯ is undrawn — U+276F measured ZERO hits
+on the idle screen). `composer_marker` is a plain char under a
+drawable-glyph lock, so the gate grew the second composer shape:
+`AgentCliDescriptor::composer_region_label` (kimi: `Some("input")` — the
+normalized line the box-drawing trimmer reduces the rule to), the anchor is
+glyph-FIRST label-fallback, and the region arm is below-chrome-only (kimi
+draws no codex wrap). Both consumers rewired: `terminal_chunk_has_agent_composer_row` (the SubmitTerminalPrompt readiness
+gate — a kimi row at its composer reads READY, forever-refused before) and
+`terminal_chunk_agent_activity` (Idle at the region, Unknown forever before).
+Measured chrome below the region: `agent <cwd> shift-tab… ctrl-o: editor` +
+`context: 0.0%` — the `context:` hint added to kimi's footer hints.
+Fixtures are the real drive screens (`tools/probe-battery suites/kimi.js`,
+5/5 probes green live on the muse lab host): gate-READY on the idle screen
+(red on main),
+stray-`input`-word-with-output-below NOT ready, activity Idle. OWED
+follow-up (filed here, not silently dropped): `composer_row_holds_text`
+(the draft guard) still anchors on the glyph only — kimi rows keep the
+safe None answer; the region arm for draft detection is the next consumer
+change. Also measured for whoever takes it: the welcome panel prints
+`Session: <uuid>` on screen (a screen-level id source), and wire.jsonl's
+typed TurnBegin/TurnEnd events are the natural v2 phase feed (this drive's
+unauth turn recorded metadata; an authed turn enriches).
 
 **[11.6.8] FIXED IN CODE — grok false-IDLE-while-working.** The four
 1.0.3-era needles never appear on 1.0.24 (groundwork measurement). The

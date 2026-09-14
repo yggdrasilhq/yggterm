@@ -3546,21 +3546,26 @@ pub(crate) fn terminal_chunk_is_claude_prompt_surface(data: &str) -> bool {
 /// with only codex's glyph, a `--kind claude-code` row was never ready, so a
 /// readiness-gated prompt was correctly-but-uselessly never sent (live, guihost
 /// 2026-08-06 — the row sat at a clean `❯` composer while the gate timed out).
+///
+/// ⛔ [11.6.6-b] A GLYPH IS NOT THE ONLY COMPOSER SHAPE. kimi 1.50.0 draws no
+/// marker character at all — its composer is the labeled rule region
+/// `── input ────` ([`AgentCliDescriptor::composer_region_label`]), so a kimi
+/// row sat at a ready composer that this gate could not see, forever. When a
+/// descriptor declares a region label, the anchor falls back to it and the
+/// below-chrome rule alone decides (kimi draws no codex wrap).
 pub(crate) fn terminal_chunk_has_agent_composer_row(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let lines = normalized_composer_lines(&stripped);
     yggterm_core::AGENT_CLIS.iter().any(|descriptor| {
-        let Some(prompt_index) = lines
-            .iter()
-            .rposition(|line| line.starts_with(descriptor.composer_marker))
-        else {
+        let Some(prompt_index) = composer_anchor_line(&lines, descriptor) else {
             return false;
         };
         // Either the wrapped-input shape codex draws, or nothing below the
         // composer except this CLI's own footer chrome. Anything else means the
         // marker is an OLD prompt with real output beneath it, and firing a
         // prompt at that surface is what the gate exists to prevent.
-        terminal_chunk_has_wrapped_codex_input_region(&lines, prompt_index)
+        (descriptor.composer_region_label.is_none()
+            && terminal_chunk_has_wrapped_codex_input_region(&lines, prompt_index))
             || lines[prompt_index + 1..].iter().all(|line| {
                 let lower = line.to_ascii_lowercase();
                 descriptor
@@ -3569,6 +3574,25 @@ pub(crate) fn terminal_chunk_has_agent_composer_row(data: &str) -> bool {
                     .any(|hint| lower.contains(hint))
             })
     })
+}
+
+/// Where this CLI's composer sits on the normalized screen: the LAST line
+/// starting with its glyph, or — when the CLI draws no glyph and declares a
+/// [`AgentCliDescriptor::composer_region_label`] — the LAST line equal to that
+/// label (the box-drawing trimmer reduces kimi's `── input ────` rule to the
+/// bare word). Glyph-first, so a CLI that reintroduces a glyph keeps its old
+/// anchor unchanged.
+fn composer_anchor_line(lines: &[&str], descriptor: &yggterm_core::agent_cli::AgentCliDescriptor) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|line| line.starts_with(descriptor.composer_marker))
+        .or_else(|| {
+            descriptor.composer_region_label.and_then(|label| {
+                lines
+                    .iter()
+                    .rposition(|line| line.eq_ignore_ascii_case(label))
+            })
+        })
 }
 
 /// Screen text as the composer predicates read it: control sequences stripped,
@@ -6036,13 +6060,82 @@ Best thing to improve in the meantime:
         //
         // The real fix is upstream: `terminal_chunk_agent_activity` now takes
         // the session's KIND, so it never has to infer the CLI from a glyph.
-        // What still must hold is that every CLI declares SOMETHING drawable.
+        // What still must hold is that every CLI declares SOMETHING here —
+        // and since [11.6.6-b] a glyph-less CLI (kimi) also declares its
+        // `composer_region_label`, which is what the gate actually matches;
+        // the char is the drawable-glyph lock's shape, not a measurement.
         let markers: Vec<char> = yggterm_core::AGENT_CLIS
             .iter()
             .map(|descriptor| descriptor.composer_marker)
             .collect();
         assert_eq!(markers.len(), yggterm_core::AGENT_CLIS.len());
         assert!(markers.iter().all(|marker| !marker.is_whitespace()));
+    }
+
+    /// ⛔ [11.6.6-b] kimi 1.50.0 draws NO composer glyph — the composer is the
+    /// labeled rule region `── input ────`, and the readiness gate anchored on
+    /// the declared `❯` alone, so a kimi row was never-ready forever. Real
+    /// screen captured 2026-09-14 on the muse lab host (kimi 1.50.0,
+    /// node-pty + vendored xterm, `tools/probe-battery suites/kimi.js`,
+    /// probe session c6490bf8): the fixture keeps the non-empty lines verbatim
+    /// with the rule repeats and the probe cwd trimmed, which is what the
+    /// normalizer consumes.
+    #[test]
+    fn kimi_composer_region_label_anchors_the_readiness_gate() {
+        let d = yggterm_core::agent_cli::agent_cli_descriptor(yggterm_core::SessionKind::Kimi)
+            .expect("registered");
+        assert_eq!(d.composer_region_label, Some("input"));
+        let idle = "\
+Welcome to Kimi Code CLI!
+Send /help for help information.
+Directory: <probe-cwd>
+Session: c6490bf8-b0c4-44ec-9a9c-8f61041b448d
+Model: not set, send /login to login
+── input ──────────────────────────────────────────────────────────────────
+agent  <probe-cwd>  shift-tab: plan mode | ctrl-o: editor
+context: 0.0%";
+        // The defect, red on main until the region arm landed: a kimi row at
+        // its composer must read READY.
+        assert!(
+            terminal_chunk_has_agent_composer_row(idle),
+            "kimi's `── input ──` region composer did not ready the gate"
+        );
+        // The measured screens carry no U+276F anywhere — the declared glyph
+        // stays declared (the char lock), but nothing may silently start
+        // matching on it.
+        assert!(!idle.contains('\u{276f}'));
+    }
+
+    /// The region anchor is glyph-FIRST and takes the LAST label line, so a
+    /// stray `input` word in a transcript with real output beneath it must not
+    /// ready the gate — the below-chrome rule still guards the region shape.
+    #[test]
+    fn kimi_region_is_not_ready_when_output_sits_below_the_label() {
+        let stale = "\
+── input ──────────────────────────────────────────────────────────────────
+agent  <probe-cwd>  shift-tab: plan mode | ctrl-o: editor
+context: 0.0%
+✨ PROBE-KIMI-1104-OK
+LLM not set, send \"/login\" to login
+input
+── output that follows a stray label word ──";
+        assert!(!terminal_chunk_has_agent_composer_row(stale));
+    }
+
+    /// The activity classifier shares the anchor: a kimi row at its region
+    /// composer reads Idle (its working hints are below-declared), not the
+    /// `Unknown` the glyph-blind walk answered forever.
+    #[test]
+    fn kimi_activity_reads_idle_at_the_region_composer() {
+        let idle = "\
+Model: not set, send /login to login
+── input ──────────────────────────────────────────────────────────────────
+agent  <probe-cwd>  shift-tab: plan mode | ctrl-o: editor
+context: 0.0%";
+        assert_eq!(
+            terminal_chunk_agent_activity(Some(yggterm_core::SessionKind::Kimi), idle),
+            AgentRowActivity::Idle
+        );
     }
 
     #[test]
@@ -8671,10 +8764,7 @@ pub(crate) fn terminal_chunk_agent_activity(
         None => yggterm_core::AGENT_CLIS.iter().collect(),
     };
     for descriptor in candidates {
-        let Some(prompt_index) = lines
-            .iter()
-            .rposition(|line| line.starts_with(descriptor.composer_marker))
-        else {
+        let Some(prompt_index) = composer_anchor_line(&lines, descriptor) else {
             continue;
         };
         // Only the chrome BELOW the composer carries the in-flight marker;

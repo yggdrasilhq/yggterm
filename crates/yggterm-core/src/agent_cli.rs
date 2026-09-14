@@ -792,6 +792,18 @@ pub struct AgentCliDescriptor {
     /// row therefore read as never-ready forever, and the readiness-gated
     /// prompt delivery silently refused to send to it (live, guihost 2026-08-06).
     pub composer_marker: char,
+    /// The labeled rule region this CLI draws AS its composer when it draws no
+    /// glyph at all — kimi 1.50.0 rules in `── input ────` with no marker
+    /// character anywhere ([11.6.6-b], measured 2026-09-14 on the muse lab
+    /// host: U+276F zero hits on the idle screen).
+    ///
+    /// `None` for every CLI that draws a real glyph. When set, the readiness
+    /// gate anchors on the label instead: the normalized screen line the
+    /// box-drawing trimmer reduces to exactly this word (the rule dashes are
+    /// chrome) is the TOP of the composer region, and the below-chrome rule
+    /// then reads the rows under it. Anchoring is glyph-FIRST, label-fallback,
+    /// so a CLI that reintroduces a glyph keeps working unchanged.
+    pub composer_region_label: Option<&'static str>,
     /// Lowercase fragments of the chrome this CLI legitimately draws BELOW its
     /// composer — codex's model/shortcut hints, Claude Code's permission-mode
     /// footer.
@@ -1842,6 +1854,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: true,
         model_flag: "--model",
         composer_marker: '\u{203a}',
+        composer_region_label: None,
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
         // ⛔ UNMEASURED. Codex's in-flight phrase has never been observed on a
         // live working row, so this stays empty and the activity verdict for a
@@ -2026,6 +2039,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Same binary family as codex, so the same flag vocabulary.
         model_flag: "--model",
         composer_marker: '\u{203a}',
+        composer_region_label: None,
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
         // ⛔ UNMEASURED. Codex's in-flight phrase has never been observed on a
         // live working row, so this stays empty and the activity verdict for a
@@ -2232,6 +2246,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '\u{276f}',
+        composer_region_label: None,
         composer_footer_hints: &[
             "claude",
             "permissions",
@@ -2390,6 +2405,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '\u{203a}',
+        composer_region_label: None,
         composer_footer_hints: &["esc", "ctrl", "/help", "tab"],
         working_footer_hints: &["to interrupt"],
         // ⛔⛔ pi HAS NO PERMISSION GATE AT ALL, and that is its DOCUMENTED
@@ -2519,6 +2535,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '\u{276f}',
+        composer_region_label: None,
         composer_footer_hints: &["esc", "interrupt", "ctrl", "tab"],
         working_footer_hints: &["esc interrupt", "again to interrupt"],
         // `--auto` re-measured on the installed binary 2026-08-13: "auto-approve
@@ -2624,6 +2641,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '\u{276f}',
+        composer_region_label: None,
         composer_footer_hints: &["esc", "ctrl", "qwen", "tab"],
         working_footer_hints: &["esc to cancel"],
         // ⛔ THESE FLAGS ARE HIDDEN FROM `qwen --help`, and the first pass filed
@@ -2813,16 +2831,21 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // and re-derives the work dir from its own metadata.
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
-        // ⛔ [11.6.6-b] THE DECLARED GLYPH IS UNDRAWN ON 1.50.0 (measured
-        // 2026-09-10/11): kimi's composer is a labeled rule region
-        // `── input ──` with NO marker glyph, and the welcome panel prints
-        // `Session: <uuid>` on screen — a screen-level id source. The char
-        // field cannot say "none" (the drawable-glyph lock exists), so the
-        // stale ❯ stays DECLARED until the readiness gate grows a
-        // region-label shape — a consumer change, queued as [11.6.6-b], not
-        // silently re-pointed to a glyph kimi does not draw.
+        // ⛔ [11.6.6-b] FIXED 2026-09-14 (measured live on 1.50.0, muse lab
+        // host, node-pty + vendored xterm — tools/probe-battery
+        // suites/kimi.js): kimi's composer is a labeled rule region
+        // `── input ────…` with NO marker glyph (U+276F: zero hits on the
+        // idle screen). `composer_region_label` is the honest anchor the
+        // readiness gate now takes; the ❯ here is NOT drawn on 1.50.0 and
+        // stays only because the char field cannot say "none" (the
+        // drawable-glyph lock) — the region label, not this char, is what
+        // the gate matches. The welcome panel also prints `Session: <uuid>`
+        // on screen — a screen-level id source.
         composer_marker: '\u{276f}',
-        composer_footer_hints: &["ctrl", "kimi", "/help", "tab"],
+        composer_region_label: Some("input"),
+        // `context:` is kimi's measured status footer under the region
+        // (`context: 0.0%`); `ctrl` matches the `ctrl-o: editor` hints row.
+        composer_footer_hints: &["ctrl", "kimi", "/help", "tab", "context:"],
         working_footer_hints: &["composing...", "thinking..."],
         // MEASURED from the same `--help`: `--yolo,--yes,--auto-approve  -y`
         // ("Automatically approve all actions"). kimi expresses no plan or
@@ -3008,6 +3031,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // the SAME failure this field was created for when a hardcoded `›`
         // did it to Claude Code on 2026-08-06.
         composer_marker: '\u{276f}',
+        composer_region_label: None,
         // `esc to cancel` dropped: measured ZERO frames on 1.2.1 (it never
         // appears anywhere on screen, working or idle).
         working_footer_hints: &["esc to interrupt"],
@@ -3175,6 +3199,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         resume_re_roots_with_cwd: false,
         model_flag: "--model",
         composer_marker: '>',
+        composer_region_label: None,
         composer_footer_hints: &["shortcuts", "esc", "ctrl", "enter", "tab", "gemini", "?"],
         working_footer_hints: &[
             "esc to cancel",
@@ -3417,6 +3442,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // composer. ⇒ a binary's strings can be silent about a glyph its own
         // renderer composes; the screen settles it and nothing else does.
         composer_marker: '\u{276f}',
+        composer_region_label: None,
         // MEASURED from the executable's own strings plus one live screen:
         // `/help for commands` is composer chrome, and the row's footer names
         // the model (`Grok 4`). ⚠ `esc cancel` is NOT listed here: it sits
@@ -3628,6 +3654,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // The composer renders the draft with a U+258F left-bar caret while
         // typing; nothing else marks the input head.
         composer_marker: '\u{258f}',
+        composer_region_label: None,
         composer_footer_hints: &["i to type", "○ idle", "zcode-tui"],
         working_footer_hints: &["● running", "streaming"],
         // The TUI takes NO launch posture flags — permissions are owned
