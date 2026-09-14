@@ -38401,6 +38401,28 @@ const APP_SURFACE_RESTORE_RETRY_BASE_MS: u64 = 2_500;
 /// The longest gap. A row that will never host an app settles here.
 const APP_SURFACE_RESTORE_RETRY_CEILING_MS: u64 = 60_000;
 
+/// How many consecutive absent asks a session must serve before the schedule
+/// stops believing an app may still be seconds from declaring, and settles to
+/// the late ceiling instead.
+///
+/// Eight asks cover ~4.3 minutes of absence at the one-minute ceiling —
+/// about fifty times the five-second gap that shaped the 2026-07-31 contract
+/// above. A row still absent after that is a plain shell or a remote session
+/// that will never host an app, and at the owner's real row counts those were
+/// 28 paths asking once a minute each, forever (measured 2026-09-15: 852
+/// `daemon_declare_absent` in 45 idle minutes on one client).
+const APP_SURFACE_RESTORE_LATE_ASKS: u32 = 8;
+
+/// The late ceiling: the longest gap a MANY-times-absent session serves.
+///
+/// A genuine handover re-arms the schedule from the base interval (see
+/// [`runtime_token_is_new_runtime`]), so fast asks return exactly when a new
+/// runtime — and therefore a new app — can actually appear. The cost of the
+/// stretch is bounded: an app started on a long-absent row is noticed within
+/// ten minutes by this tick, at once by any user interaction with the row,
+/// and instantly by a client restart (the ledger is loop-local).
+const APP_SURFACE_RESTORE_LATE_CEILING_MS: u64 = 600_000;
+
 /// How long to wait before asking the daemon AGAIN about a session whose app has
 /// not declared yet.
 ///
@@ -38430,7 +38452,21 @@ const APP_SURFACE_RESTORE_RETRY_CEILING_MS: u64 = 60_000;
 /// prevent: an app that is seconds late is picked up almost at once, an app the
 /// user starts an hour later is picked up within a minute, and a plain shell
 /// that will never host one costs a single cheap daemon round trip per minute.
+///
+/// That one-minute contract is per SCHEDULE, not forever. Once a session has
+/// served [`APP_SURFACE_RESTORE_LATE_ASKS`] consecutive absent asks — minutes
+/// of absence, dozens of times the lateness this schedule was built for — it
+/// settles to [`APP_SURFACE_RESTORE_LATE_CEILING_MS`] instead. The 2026-07-31
+/// answer is still "not durable" in the sense that matters: a genuine handover
+/// re-arms from the base interval, and an app that appears is declared by the
+/// live OSC path regardless of this tick. What the stretch buys is measured
+/// (2026-09-15, GUI host): never-declaring rows — plain shells, dead remote
+/// sessions — were 28 paths × one ask a minute each, forever, and each ask
+/// fans a batch verdict, a trace line, and render work beside.
 fn app_surface_restore_retry_ms(asks: u32) -> u64 {
+    if asks > APP_SURFACE_RESTORE_LATE_ASKS {
+        return APP_SURFACE_RESTORE_LATE_CEILING_MS;
+    }
     let shift = asks.saturating_sub(1).min(5);
     APP_SURFACE_RESTORE_RETRY_BASE_MS
         .saturating_mul(1u64 << shift)
