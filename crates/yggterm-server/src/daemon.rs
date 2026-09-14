@@ -23222,6 +23222,91 @@ fn spawn_disk_binary_version_poll(
     });
 }
 
+/// ★ §4 THE OWNERSHIP LEDGER — the cold-exit half. Where the handoff sweep
+/// records the rows that CROSSED (`adopted`), this records the rows that die
+/// with the daemon. Called at each serve loop's exit commitment — after the
+/// accept loop has broken on a shutdown outcome or the idle gate, before
+/// `run_end` — the process is past every preserving path (a `HotUpdateHandoff`
+/// response keeps that loop alive, so this writer can never fire while the
+/// daemon still serves the rows it names; the post-handoff `AllMoved` exit
+/// writes nothing for the same reason). Every agent row still held live here
+/// loses its PTY master with the process, so each earns a `died_with_me`
+/// record: the next resume for it reads the ledger and spawns the resume
+/// immediately instead of burning the /proc wait behind the banner. The
+/// writer's earlier `adopted` records for rows NOT dying here are carried
+/// forward — those rows live on the successor, and their witness must outlive
+/// this process too.
+fn record_dying_rows_in_ownership_ledger(home_dir: &Path, runtime: &Arc<Mutex<DaemonRuntime>>) {
+    let identity: Vec<(String, SessionKind, String, Vec<String>)> = {
+        let rt = lock_daemon_runtime(runtime, "exit_ownership_ledger");
+        let owned: HashSet<String> = rt.terminals.session_keys().into_iter().collect();
+        if owned.is_empty() {
+            Vec::new()
+        } else {
+            rt.server
+                .live_sessions()
+                .iter()
+                .filter_map(|session| {
+                    match session.kind {
+                        SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
+                            return None;
+                        }
+                        _ => {}
+                    }
+                    let runtime_key = rt.terminal_runtime_key_for_path(&session.session_path);
+                    if !owned.contains(&runtime_key) {
+                        // Not a PTY this process holds — nothing dies with us.
+                        return None;
+                    }
+                    let resume_argv =
+                        yggterm_core::agent_cli::agent_cli_descriptor(session.kind)
+                            .map(|descriptor| descriptor.resume_selector_token())
+                            .filter(|token| !token.is_empty())
+                            .map(|token| vec![token.to_string(), session.id.clone()])
+                            .unwrap_or_default();
+                    Some((runtime_key, session.kind, session.id.clone(), resume_argv))
+                })
+                .collect()
+        }
+    };
+    if identity.is_empty() {
+        return;
+    }
+    let dying = crate::ownership_ledger::died_with_me_records(
+        &identity,
+        crate::ownership_ledger::now_ms(),
+        std::process::id(),
+        SERVER_PROTOCOL_VERSION,
+    );
+    let records = crate::ownership_ledger::merge_exit_records(
+        crate::ownership_ledger::load(home_dir),
+        dying,
+        std::process::id(),
+    );
+    match crate::ownership_ledger::record_handoff(home_dir, records) {
+        Ok(()) => append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "reattach_ledger_died_with_me_written",
+            serde_json::json!({
+                "dying_rows": identity.len(),
+                "pid": std::process::id(),
+            }),
+        ),
+        Err(error) => append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "reattach_ledger_died_with_me_write_failed",
+            serde_json::json!({
+                "error": error.to_string(),
+                "pid": std::process::id(),
+            }),
+        ),
+    }
+}
+
 /// Progressive per-session migration: default ON, with a kill switch.
 ///
 /// It was shipped dormant "until live-verified through a controlled two-deploy
@@ -26053,6 +26138,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 Err(error) => return Err(error).context("accepting daemon client"),
             }
         }
+        // ★ §4 cold-exit ledger write — see the writer's doc: past every
+        // preserving path, so anything still owned here dies with us.
+        record_dying_rows_in_ownership_ledger(&home_dir, &runtime);
         // ⛔ BEFORE `drop(listener)` and before the unlink below: from here on
         // this daemon's own name belongs to whoever binds it next, and the
         // reclaim thread must stop competing for it.
@@ -26202,6 +26290,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     Err(error) => return Err(error).context("accepting daemon client"),
                 }
             }
+            // ★ §4 cold-exit ledger write — see the writer's doc: past every
+            // preserving path, so anything still owned here dies with us.
+            record_dying_rows_in_ownership_ledger(&home_dir, &runtime);
             let restart_executable = restart_after_exit.take();
             append_trace_event(
                 &home_dir,
