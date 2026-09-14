@@ -119,13 +119,13 @@
     },
     "kimi": {
       "store_globs": [
-        ".kimi-code/sessions/*/*/state.json"
+        ".kimi/sessions/*/*/wire.jsonl"
       ],
       "icon_kind": "kimi",
-      "transcript": ".kimi-code/sessions/*/{id}/state.json",
-      "format": null,
+      "transcript": ".kimi/sessions/*/{id}/wire.jsonl",
+      "format": "jsonl",
       "verified_on_disk": true,
-      "note": "store_globs restored 2026-09-08 (the dormant fleet lock had let this drift). The session id is the whole session_<uuid> directory name, read by read_kimi_code_store_entry from path.parent(); verified 2026-09-08 by substituting the real id session_f25e941b-4a38-4d6d-9f95-135cf9a2a6af and matching its state.json exactly."
+      "note": "kimi 1.50.0 moved the store BACK to ~/.kimi (md5-of-cwd buckets, bare-uuid session dirs, NO state.json) — the 0.27-era .kimi-code/state.json glob here was dead and the gate test failed until this row caught up ([11.104]; registry owner: session_store_globs = .kimi/sessions/*/*/wire.jsonl per the 11.6.6-a c-tail landing, context.jsonl deliberately unmatched). The session id is the bare-uuid directory; verified 2026-09-14 against a live store by substituting the real id 373af60b-0dc8-42e6-848a-23c5ee8a31c1 into this template and matching its wire.jsonl exactly."
     },
     "zcode-tui": {
       "store_globs": [
