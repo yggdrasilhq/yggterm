@@ -45523,6 +45523,17 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
     {
         return Some(row);
     }
+    // A session the daemon already knows but the rendered sidebar has not
+    // promoted yet (fresh scratch row, just-spawned terminal) used to fall
+    // through to the full expansion rebuild below — seven expanding merge
+    // passes plus remote projection pulls, measured stalling the UI thread
+    // 10.5 s on the first drag of a batch ([11.114] cold-drag arm). The
+    // synthesized row is the same answer that path ended on, so answer with
+    // it first; the rebuild stays as the fallback for rows synthesis cannot
+    // produce (groups, documents, stored-but-not-live rows).
+    if let Some(row) = synthesize_app_control_row(shell, session_path) {
+        return Some(row);
+    }
     let stored_rows = shell.browser.search_rows();
     let stored_projection_rows = shell.browser.all_rows();
     let expanded_paths = search_expanded_paths(
