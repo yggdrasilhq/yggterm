@@ -22694,11 +22694,28 @@ fn spawn_disk_binary_version_poll(
             // run, including the byte-identical same-version copies the fleet
             // CI ships every few minutes. Only DIFFERENT bytes on disk retire
             // this daemon — see the helper for the measured incident.
+            // ⛔ [11.106] The gate is no longer deleted-link-only: a daemon
+            // whose exe is NOT a deploy target (the direct-store generations)
+            // never sees its own file unlinked, so the only honest update
+            // question is the byte comparison itself — against the in-place
+            // replacement when our exe was deleted, against the canonical
+            // managed build when it was not. The helper answers "nothing could
+            // have replaced us" for every other live-exe class, and a managed
+            // build equal to our bytes still answers NOT-replaced.
             let exe_link = fs::read_link("/proc/self/exe")
                 .map(|link| link.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let mut binary_replaced = exe_link.ends_with(" (deleted)")
-                && disk_replacement_differs_from_running_bytes(&exe_link, &home_dir);
+            let mut binary_replaced =
+                disk_replacement_differs_from_running_bytes(&exe_link, &home_dir);
+            // [11.106] WHICH shape armed (or would have): an in-place unlink of
+            // our own exe, or the managed build moving ahead of a live exe the
+            // deploys never touch. Recorded on every rotation/defer event so
+            // the next prover can tell the two classes apart in one trace.
+            let arming = if exe_link.ends_with(" (deleted)") {
+                "in_place"
+            } else {
+                "managed_ahead"
+            };
             // Same-version handoff hysteresis: within the cooldown window —
             // seeded at this process's BIRTH and re-armed by each of its own
             // handoffs — a replacement that reports OUR OWN version string is
@@ -22756,6 +22773,7 @@ fn spawn_disk_binary_version_poll(
                             "lifecycle",
                             "disk_binary_handoff_cooldown_deferred",
                             serde_json::json!({
+                                "arming": arming,
                                 "cooldown_ms": SAME_VERSION_HANDOFF_COOLDOWN_MS,
                                 "ms_since_last_same_version_handoff":
                                     now_ms.saturating_sub(last),
@@ -22913,6 +22931,7 @@ fn spawn_disk_binary_version_poll(
                 "daemon_self_retire",
                 serde_json::json!({
                     "retire_trigger": retire_trigger,
+                    "arming": arming,
                     "exe_link": exe_link,
                     "newer_daemon_version": newer_daemon_version,
                     "current_version": SERVER_PROTOCOL_VERSION,
@@ -23698,28 +23717,89 @@ fn canonical_name_behind_deploy_backup(file_name: &str) -> Option<&str> {
 ///
 /// Returns empty when the link is not a replaced-binary link at all (so the
 /// handoff is skipped and the caller cold-shuts-down, as before).
+///
+/// ⛔ [11.106] A LIVE (un-replaced) link used to mean "empty, always", and that
+/// blinded every daemon whose exe is NOT a deploy target. A direct-store
+/// generation (`~/.local/share/yggterm/direct/versions/<ver>/yggterm-headless`)
+/// is never unlinked by a deploy — the fleet deploys write `~/.yggterm/bin/` —
+/// so such a daemon never armed this trigger and served stale bytes through
+/// deploy after deploy (measured: the muse lab host's daemon born 2026-09-11 through five
+/// deploys, the managed build a generation ahead on disk the whole time). A
+/// live exe therefore answers with the canonical managed binary WHEN the
+/// running binary is the direct install's own generation — the one class whose
+/// exe the deploy chain will never touch in place. A hand-run dev/raw binary
+/// (a `target/debug` build, a `~/.local/bin` copy) stays outside: adopting the
+/// managed build over a deliberate dev install is exactly the guess this
+/// helper must not make. The byte-differ gate upstream still decides
+/// "update" — a managed build equal to our own bytes answers NOT-replaced.
 #[cfg(target_os = "linux")]
 fn disk_replace_handoff_candidates(exe_link: &str) -> Vec<PathBuf> {
-    let Some(path) = exe_link.strip_suffix(" (deleted)") else {
-        return Vec::new();
-    };
-    if path.is_empty() {
-        return Vec::new();
-    }
-    let replaced_in_place = PathBuf::from(path);
-    let installed_beside_the_backup = replaced_in_place
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(canonical_name_behind_deploy_backup)
-        .map(|canonical| replaced_in_place.with_file_name(canonical));
-    [Some(replaced_in_place), installed_beside_the_backup]
-        .into_iter()
-        .flatten()
-        .collect()
+    let direct_root = yggterm_core::direct_install_root().ok();
+    let managed = managed_daemon_binary_path();
+    disk_replace_handoff_candidates_resolved(
+        exe_link,
+        direct_root.as_deref(),
+        managed.as_deref(),
+    )
 }
 
-/// Does the file now sitting where our deleted exe lived hold DIFFERENT bytes
-/// from the binary this process is running?
+/// Pure core of [`disk_replace_handoff_candidates`] — the resolved direct
+/// install root and managed binary path arrive as parameters so the candidate
+/// order (the same list "differs here", the version probe, and the spawn all
+/// consume) stays testable without a host's install state.
+#[cfg(target_os = "linux")]
+fn disk_replace_handoff_candidates_resolved(
+    exe_link: &str,
+    direct_root: Option<&Path>,
+    managed: Option<&Path>,
+) -> Vec<PathBuf> {
+    if let Some(path) = exe_link.strip_suffix(" (deleted)") {
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let replaced_in_place = PathBuf::from(path);
+        let installed_beside_the_backup = replaced_in_place
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(canonical_name_behind_deploy_backup)
+            .map(|canonical| replaced_in_place.with_file_name(canonical));
+        return [Some(replaced_in_place), installed_beside_the_backup]
+            .into_iter()
+            .flatten()
+            .collect();
+    }
+    // Live exe — the [11.106] arm; see the caller's doc for the class line.
+    let Some(direct_root) = direct_root else {
+        return Vec::new();
+    };
+    let exe = Path::new(exe_link);
+    // `Path::starts_with` compares components, so `…/direct/versions-evac/`
+    // cannot impersonate `…/direct/versions/`.
+    if !exe.starts_with(direct_root.join("versions")) {
+        return Vec::new();
+    }
+    match managed {
+        // The managed build is the only place an update could have landed for
+        // this class; a candidate equal to our own exe is no update at all.
+        Some(managed) if managed != exe => vec![managed.to_path_buf()],
+        _ => Vec::new(),
+    }
+}
+
+/// The canonical managed install of THIS binary — `<yggterm home>/bin/<exe
+/// file name>`, the path every fleet deploy rewrites (`deploy-fleet.sh`'s
+/// install root).
+#[cfg(target_os = "linux")]
+fn managed_daemon_binary_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_name()?;
+    Some(crate::resolve_yggterm_home().ok()?.join("bin").join(name))
+}
+
+/// Does the file the deploy chain could have replaced us with hold DIFFERENT
+/// bytes from the binary this process is running? For a deleted exe link that
+/// is the file now sitting where our exe lived; for a live direct-store exe it
+/// is the canonical managed build ([11.106] — see the candidates helper).
 ///
 /// The `disk_binary_replaced` trigger used to mean "the `/proc/self/exe` link
 /// says `(deleted)`" — which is not an update signal, it is a WRITE signal. The
@@ -24797,6 +24877,11 @@ fn attempt_self_retire_preserving_handoff(
                 "daemon_self_retire_handoff_ok",
                 serde_json::json!({
                     "new_exe": new_exe.display().to_string(),
+                    // [11.106] The binary THIS process was serving from — beside
+                    // `new_exe`, so a cross-path rotation (the direct-store
+                    // generation adopting the managed build) reads as a
+                    // predecessor→successor pair without external inference.
+                    "exe_link": exe_link,
                     // The field whose absence made this path a no-op that
                     // reported success. Present even when unreadable, so a
                     // future reader can tell "we did not ask" from "we asked
@@ -39183,13 +39268,86 @@ mod tests {
             ),
             vec![PathBuf::from("/home/user/.yggterm/bin/yggterm-headless")],
         );
-        // A live (un-replaced) link must NOT trigger a handoff.
+        // A live (un-replaced) link that is NOT a direct-store generation must
+        // NOT trigger a handoff — a hand-run dev/raw binary adopts nothing.
+        // (The direct-store live-exe arm is [11.106] below.)
         assert!(
             super::disk_replace_handoff_candidates("/home/user/.yggterm/bin/yggterm-headless")
                 .is_empty()
         );
         // Defensive: a bare suffix yields no usable path.
         assert!(super::disk_replace_handoff_candidates(" (deleted)").is_empty());
+    }
+
+    /// ⛔ [11.106] A LIVE direct-store exe adopts the canonical managed build.
+    /// The muse-lab daemon (born 2026-09-11, direct-store generation) sat
+    /// through five deploys because a live exe never produced a candidate: its
+    /// own file is never a deploy target, so it is never unlinked, so the
+    /// deleted-suffix arm never fired. A live exe UNDER the direct install's
+    /// versions root now answers with the managed binary — and nothing else
+    /// does: a dev/raw build keeps today's never-arm behavior, and a candidate
+    /// equal to our own exe is no update at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_direct_store_exe_adopts_the_managed_build() {
+        use std::path::{Path, PathBuf};
+
+        let direct_root = Path::new("/home/user/.local/share/yggterm/direct");
+        let managed = Path::new("/home/user/.yggterm/bin/yggterm-headless");
+        let running = Path::new(
+            "/home/user/.local/share/yggterm/direct/versions/3.2.113/yggterm-headless",
+        );
+
+        // The measured defect class: live direct-store exe → managed build.
+        assert_eq!(
+            super::disk_replace_handoff_candidates_resolved(
+                running.to_str().unwrap(),
+                Some(direct_root),
+                Some(managed),
+            ),
+            vec![PathBuf::from(managed)],
+        );
+
+        // A dev/raw build (target/debug, a ~/.local/bin copy) stays outside —
+        // adopting the managed build over a deliberate dev install is the
+        // guess this helper must not make.
+        for dev_exe in [
+            "/home/user/gh/yggterm/target/debug/yggterm-headless",
+            "/home/user/.local/bin/yggterm-headless",
+        ] {
+            assert!(super::disk_replace_handoff_candidates_resolved(
+                dev_exe,
+                Some(direct_root),
+                Some(managed),
+            )
+            .is_empty());
+        }
+
+        // Component-aware containment: a sibling directory that merely shares
+        // a prefix (`versions-evac`) is NOT the direct versions root.
+        assert!(super::disk_replace_handoff_candidates_resolved(
+            "/home/user/.local/share/yggterm/direct/versions-evac/yggterm-headless",
+            Some(direct_root),
+            Some(managed),
+        )
+        .is_empty());
+
+        // A candidate equal to our own exe is not an update.
+        assert!(super::disk_replace_handoff_candidates_resolved(
+            managed.to_str().unwrap(),
+            Some(direct_root),
+            Some(managed),
+        )
+        .is_empty());
+
+        // No direct-install root resolved (the env seam unset on a foreign
+        // layout): the live-exe arm answers nothing, like before [11.106].
+        assert!(super::disk_replace_handoff_candidates_resolved(
+            running.to_str().unwrap(),
+            None,
+            Some(managed),
+        )
+        .is_empty());
     }
 
     /// ⛔ THE 55-PTY CASE. A deploy that renames the OLD binary away
