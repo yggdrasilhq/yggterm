@@ -403,6 +403,8 @@ one live daemon row; probe rows despawned; measured on the GUI host):
 
 #### 11.6.3 measured decode (wave-1 seat E, 2026-09-10, dev)
 
+> ⚠ **UPDATE 2026-09-15:** the install this section measured is GONE — ynpm now serves `@opencode/cli` 2.0.3 on the fleet (`@opencode-ai/cli` went dead upstream 2026-09-07; channel map and client/server-skew facts in hub door sitting-2026-09-15-opencode-v2-channel-migration). Everything below is last-generation (beta-19271) lineage: treat as history, and run the owed re-decode (c) against 2.0.3 before reusing any of it. A 2.0.3 TUI client was measured RENDERING against a beta-19271 service (skew tolerated); the store keeps `session_v2` and gains worktree/workspace/session_inbox/session_pending/session_message tables.
+
 The server-side session-truth decode the family table asks for, measured
 against the INSTALLED service on dev (`opencode2 serve --service`, pid
 2996638, version 0.0.0-beta-19271; registration
