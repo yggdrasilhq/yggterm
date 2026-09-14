@@ -96,12 +96,24 @@ const ARM_SESSION_ID: &str = "11111111-2222-3333-4444-555555555555";
 /// service mints. (Same fix rides `lane/dev/mirror-tick-rebind`; whichever
 /// lane lands second drops its copy.)
 const OPENCODE_ARM_SESSION_ID: &str = "ses_arm0000000000000000000001";
+/// The sess_-shaped fixture id the ZcodeTui arm resumes with.
+///
+/// Same law as OPENCODE_ARM_SESSION_ID above, measured on zcode-tui's own
+/// wire: the runtime mints `sess_<uuid>` ids — the rollout file NAMES are
+/// `model-io-sess_<uuid>.jsonl` (the name is the identity, per the
+/// descriptor's session_store_globs) and the NativeAnnounce emitter's own
+/// test fixtures speak `sess_` ids — so a bare-uuid `--resume` would name a
+/// session the runtime never held. The arm exercises the id shape the CLI
+/// actually accepts.
+const ZCODE_TUI_ARM_SESSION_ID: &str = "sess_arm0000000000000000000002";
 
 /// The session id each arm's RESUME composition must be exercised with: the
 /// id shape that arm's CLI actually accepts (see OPENCODE_ARM_SESSION_ID).
 fn arm_resume_session_id(kind: SessionKind) -> &'static str {
     if kind == SessionKind::OpenCode {
         OPENCODE_ARM_SESSION_ID
+    } else if kind == SessionKind::ZcodeTui {
+        ZCODE_TUI_ARM_SESSION_ID
     } else {
         ARM_SESSION_ID
     }
@@ -296,7 +308,10 @@ const ARMS: &[Arm] = &[
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
         // ⛔ EMPTY = declared gap (md5(cwd) buckets), see the descriptor.
-        store_globs: &[".kimi-code/sessions/*/*/state.json"],
+        // 11.6.6-a moved the store twice (kimi 1.50.0: `~/.kimi`, md5(cwd)
+        // buckets, `wire.jsonl` per session — the descriptor carries the
+        // measured glob); the matrix keeps both copies byte-identical.
+        store_globs: &[".kimi/sessions/*/*/wire.jsonl"],
     },
     Arm {
         kind: SessionKind::Kimi,
@@ -309,7 +324,9 @@ const ARMS: &[Arm] = &[
         binary: "kimi",
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
-        store_globs: &[".kimi-code/sessions/*/*/state.json"],
+        // Same layout as the Local twin by construction — the transport
+        // differs, the store does not (11.6.6-a measured glob).
+        store_globs: &[".kimi/sessions/*/*/wire.jsonl"],
     },
     Arm {
         kind: SessionKind::Muse,
@@ -416,6 +433,54 @@ const ARMS: &[Arm] = &[
         // Same layout as the Local twin by construction — the transport differs,
         // the store does not. The matrix asserts this pair agrees.
         store_globs: &[".grok/sessions/*/*/summary.json"],
+    },
+    // ── The 11.6.11 fill (2026-09-14, lane/integration/zcode-tui). ZcodeTui
+    // joined the registry in the 2026-09-08 intake and left these two rows
+    // empty — the arm-matrix red seat B measured on main. Every cell below is
+    // transcribed from the descriptor's MEASURED fields; the remote wrapper
+    // went live 2026-09-08 (the shell-arm matrix carries the same record:
+    // wrapper_slug zcode-tui, remote-zcode-tui:// rows, zcode-tui-runtime://
+    // runtime keys), so the remote cells assert the same machinery every
+    // other remote arm uses.
+    Arm {
+        kind: SessionKind::ZcodeTui,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "zcode-tui",
+        // MEASURED off the TUI's own entrypoint (0.5.1, added for exactly this
+        // launch/resume contract): `--resume <sessionId>` boots straight into
+        // a resumed session; the flag rides the descriptor's
+        // `ResumeSelector::Flag("--resume")`.
+        resume_selector_token: "--resume",
+        // The TUI resumes from the shared store and inherits the session's own
+        // workspace from it — re-rooting would be a no-op.
+        re_roots_with_cwd: false,
+        // The rollout directory, where the file NAME is the identity
+        // (`model-io-sess_<uuid>.jsonl`) — byte-identical to the descriptor's
+        // `session_store_globs`, which is what the scan test locks.
+        store_globs: &[".zcode/cli/rollout/model-io-*.jsonl"],
+    },
+    Arm {
+        kind: SessionKind::ZcodeTui,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-zcode-tui://"),
+        runtime_scheme: Some("zcode-tui-runtime://"),
+        // Generated from the descriptor's wrapper_slug, same as every remote
+        // arm — the cells are what `resume_subcommand()`/`start_subcommand()`
+        // derive, and the drift test below fails if the slug ever moves.
+        remote_resume_subcommand: Some("resume-zcode-tui"),
+        remote_start_subcommand: Some("start-zcode-tui"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "zcode-tui",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        // Same layout as the Local twin by construction — the transport
+        // differs, the store does not. The matrix asserts this pair agrees.
+        store_globs: &[".zcode/cli/rollout/model-io-*.jsonl"],
     },
 ];
 

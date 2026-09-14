@@ -42,22 +42,46 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.8 | grok | C | phrase drift FIXED in the descriptor (measured 1.0.24 needles + Ctrl+c footer swap + send-to-bg hint — entry below); active_sessions.json tenancy registry documented on the descriptor; events.jsonl event-fed classifier OPEN |
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
-| 11.6.11 | zcode-tui | B | OPEN (native announce LANDED on `lane/integration/zcode-tui` — emitter commit zcode-tui 0bd590f + daemon `announce` verb with fresh-phase precedence; arm-matrix gap open, see the entry below; live PTY proof owed) |
+| 11.6.11 | zcode-tui | B | OPEN (native announce LANDED — emitter commit zcode-tui 0bd590f + daemon `announce` verb; ARM-MATRIX GAP FILLED IN CODE on `lane/integration/zcode-tui` — both launch arms, sess_ fixture law, kimi glob twins ride-along, all 10 matrix tests green; live PTY proof owed) |
 
-### ⛔ 11.6.11 defect — ZCODE-TUI IS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` IS RED ON MAIN (found by wave-1 seat B, 2026-09-10)
+### ⛔ 11.6.11 defect — ZCODE-TUI WAS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` RED (found by wave-1 seat B, 2026-09-10; FIXED IN CODE 2026-09-14)
 
-Open, and blocks no lane: the descriptor fill it belongs to queues behind 11.6.0's schema-v2 conversion.
+FIXED IN CODE (the 11.6.11 fill seat, `lane/integration/zcode-tui`) — the
+descriptor fill it belongs to was unblocked when 11.6.0's schema-v2
+conversion landed (ee876a66).
 
-Measured on origin/main (e2ccb9dc9): `cargo test -p yggterm-server --lib
-agent_arm_matrix` fails — "ZcodeTui on Local must appear EXACTLY once in the
-arm matrix — a CLI registered without arms is a CLI whose harness decisions
-nothing checks (spec §6 A6, the new-CLI drill)". The ARMS table carries 20
-arms for 11 of the 12 registered CLIs; zcode-tui joined the registry in the
-2026-09-08 intake without its Local+Remote arms. Measured facts for the LOCAL
-arm already exist (zcode-tui's own entrypoint parses `--resume <sessionId>`;
-binary `zcode-tui`); the REMOTE arm's wrapper facts are UNMEASURED — do not
-half-fill cells to green a drill. Filed by seat B with the failing test named;
-fix belongs with the zcode-tui descriptor fill.
+Seat B's original measurement, for the record: on origin/main (e2ccb9dc9)
+`cargo test -p yggterm-server --lib agent_arm_matrix` failed — "ZcodeTui on
+Local must appear EXACTLY once in the arm matrix"; the ARMS table carried 20
+arms and zcode-tui joined the 2026-09-08 intake without its Local+Remote
+rows, with the warning that the REMOTE arm's wrapper facts were unmeasured
+and must not be half-filled to green a drill.
+
+Both arms are now in the matrix, every cell transcribed from the
+descriptor's MEASURED fields: local `zcode-tui --resume '<id>'` (the 0.5.1
+entrypoint contract), selector `--resume`, re-rooting false (the shared
+store carries the session's workspace), store
+`.zcode/cli/rollout/model-io-*.jsonl` byte-identical to
+`session_store_globs`; remote `remote-zcode-tui://` + `zcode-tui-runtime://`
++ the generated `resume-zcode-tui`/`start-zcode-tui` verbs — the wrapper
+slug went live 2026-09-08 (the shell-arm matrix carries the same record),
+so the remote cells assert the same machinery every other remote arm uses,
+and `every_remote_arm_names_its_wrapper_subcommands` locks the derivation.
+One measured lesson joined the table: the resume fixture id is sess_-shaped
+(`ZCODE_TUI_ARM_SESSION_ID`, the OpenCode ses_ law's second instance) — the
+runtime mints `sess_<uuid>` ids, the rollout FILE NAMES are
+`model-io-sess_<uuid>.jsonl`, so a bare uuid would be a phantom the runtime
+never held.
+
+Proof: `cargo test -p yggterm-server --lib agent_arm_matrix` = 10/10 on the
+lane. The run's ride-along: the kimi matrix cells still carried the DEAD
+pre-1.50 glob (`.kimi-code/…/state.json`) against the [11.6.6-a]
+descriptor — the c-tail-fill seat moved the descriptor and not its matrix
+twins, so `every_arm_scans_the_store_its_descriptor_declares` had been red
+on main since that landing — both kimi cells fixed byte-identical
+(`.kimi/sessions/*/*/wire.jsonl`) in the same commit. Not yet owed-proof:
+the live PTY proof (a real remote zcode-tui row resumed through the
+wrapper) stays with the family's live-proof debt.
 
 #### 11.6.1+11.6.2 measured baseline (wave-1 seat F, 2026-09-10, dev)
 
@@ -589,6 +613,12 @@ system prompt ("current working directory is `<path>`", measured; home
 fallback when the wording drifts), mtime of wire.jsonl as the session clock.
 Future hardening noted, not this lane: verify the scraped cwd against
 md5(cwd) == bucket-name (core carries no md5 dependency yet).
+Ride-along (2026-09-14, the 11.6.11 fill seat): the server arm-matrix's two
+kimi cells still named the dead `.kimi-code/…/state.json` glob — the
+descriptor moved, its matrix twins did not, and
+`every_arm_scans_the_store_its_descriptor_declares` had been red on main
+since this landing — both cells now byte-identical to the descriptor
+(`.kimi/sessions/*/*/wire.jsonl`).
 
 **Title authority flipped Store → Generated (split-brain fix).** The 1.50
 store holds NO title key anywhere, so the 2026-09-05 owner-law premise
