@@ -29894,8 +29894,10 @@ incidents for 10 min while ytrace shows the normal snapshot cadence.
 
 ## ⛔ [11.111] ZCODE-TUI DESCRIPTOR SCREEN PHRASES DRIFTED OFF MAIN'S OWN 0.5.9 RELEASE — `streaming…`/`● running` NEVER DRAW AND `○ idle` IS GONE; THE MEASURED WORKING CHROME IS `working · working…` + THE `esc cancel` FOOTER SWAP (measured 2026-09-14 on origin/main zcode-tui 0.5.9 (5b97267), lane/integration/zcode-tui-battery)
 
-**Status:** OPEN — descriptor data fill owed (the zcode-tui seat; the
-measured source and the re-measure instrument both exist now). The battery
+**Status:** OPEN
+
+Descriptor data fill owed (the zcode-tui seat; the measured source and the
+re-measure instrument both exist now). The battery
 suite landed green first (`tools/probe-battery/suites/zcode-tui.js`, 6/6
 against the real 0.5.9 binary through a real pty) precisely so this fill
 edits against a live measurement, not against the seat that guessed.
