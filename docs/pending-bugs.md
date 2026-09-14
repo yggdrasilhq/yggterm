@@ -31,7 +31,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN (rotation AllMoved → reattach_ledger_written; consumer widened before the saved-session gate); schema v2 + battery + wrapper-level SLA run OPEN (3.3.0) |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa). OPEN: per-CLI battery suites + the died_with_me writers |
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | OPEN (server truth DECODED 2026-09-10 — see the seat E section; descriptor v2 fills queue behind 11.6.0) |
@@ -463,15 +463,32 @@ a self-minting CLI (codex) is asked about yggterm's ROW id — its store has
 never heard of it, so the old gate read false for exactly the rows the
 ledger can vouch for.
 
+LANDED 2026-09-14 (lane/integration/probe-battery, zcode seat
+sess_8cfd41e8 on jojo): **the wrapper-level ledger-served run exists as a CI
+test** — `crates/yggterm-server/tests/reattach_sla_integration.rs`
+(410b4c60). Half A: a real `adopted` record (written through the real
+`handoff_ownership_records` + `record_handoff` verbs) makes
+`run_remote_resume_codex` trace `reattach_ledger_served {adopted}` with
+`external_active_wait` ABSENT and a fast clean refusal at the ensure tail
+(9.2 s to the no-daemon error on a scratch home; the gate itself is instant).
+Half B (the counterfactual, ledger empty): the same state announces
+`external_active_wait` against a real fd-arm holder, burns the
+env-shortened deadline (1.5 s; default 120 s unchanged, override via
+`YGGTERM_EXTERNAL_ACTIVE_WAIT_DEADLINE_MS` — battery/harness-only), and
+refuses. That contrast is the SLA measurement; the sub-second adopted window
+no longer needs an ad-hoc drive to hit. The battery runner also landed:
+`tools/probe-battery/` (700351aa, T2 drive engine — node-pty + vendored
+xterm.js + CPR answering; mock-tui reference suite green).
+
 Still owed:
 
-- a wrapper-level ledger-served run (`reattach_ledger_served` in the trace
-  with `external_active_wait` ABSENT for that session) — the adopted firing
-  window is the sub-second handoff race, so this wants the probe battery's
-  harness rather than an ad-hoc drive;
 - the `died_with_me` WRITERS (force-retire / cold-exit paths) so the
-  re-resume SLA (≤2 s) becomes measurable;
-- schema v2 + probe battery (the rest of the 11.6.0 family work).
+  re-resume SLA (≤2 s) becomes measurable (the ledger types exist; only
+  the `adopted` writer is wired);
+- per-CLI battery suites (zcode-tui reference in CI per stone §9 —
+  the runner + a skeleton suite are in tools/probe-battery; the 11.6.11
+  seat pins the needles) and the composite real-rotation ledger-served run
+  riding a fleet rotation.
 
 #### 11.6.6 + 11.6.8 measured groundwork, and the 11.6.7/.9/.10 availability record (batch seat, 2026-09-10, the muse lab host)
 
