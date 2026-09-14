@@ -31,7 +31,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa). OPEN: per-CLI battery suites + the died_with_me writers |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). OPEN: per-CLI battery suites + the composite real-rotation ledger-served run |
 | 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
@@ -686,9 +686,6 @@ xterm.js + CPR answering; mock-tui reference suite green).
 
 Still owed:
 
-- the `died_with_me` WRITERS (force-retire / cold-exit paths) so the
-  re-resume SLA (≤2 s) becomes measurable (the ledger types exist; only
-  the `adopted` writer is wired);
 - per-CLI battery suites — the zcode-tui §9 reference suite is LANDED
   (green 6/6 on main 0.5.9, 2026-09-14); remaining: the other CLIs' suites
   (kimi's exists) and the composite real-rotation ledger-served run

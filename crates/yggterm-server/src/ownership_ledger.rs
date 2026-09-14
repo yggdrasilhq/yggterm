@@ -319,6 +319,75 @@ pub fn handoff_ownership_records(
         .collect()
 }
 
+/// Build the records one cold exit owes, from what the exiting daemon knows.
+///
+/// `identity` is one quadruple per agent row the daemon still holds a live
+/// PTY for at its exit point: `(runtime_key, kind, session_id, resume_argv)`.
+/// Every row named here dies with the writer — the PTY master closes with the
+/// process — so each record carries the resume that replaces the 120 s /proc
+/// wait. The caller composes `resume_argv` from the row's descriptor (selector
+/// token + id); an empty argv is honest — the record still names the store
+/// session a resume asks for. A daemon taking a PRESERVING path never reaches
+/// this writer (it keeps serving its rows), which is what keeps a
+/// `died_with_me` from ever being written for a row its writer still serves —
+/// the lie the staleness law exists to kill.
+pub fn died_with_me_records(
+    identity: &[(String, SessionKind, String, Vec<String>)],
+    now_ms: u64,
+    writer_pid: u32,
+    from_version: &str,
+) -> Vec<OwnershipRecord> {
+    identity
+        .iter()
+        .map(
+            |(runtime_key, kind, session_id, resume_argv)| OwnershipRecord {
+                kind: *kind,
+                session_id: session_id.clone(),
+                runtime_key: runtime_key.clone(),
+                disposition: OwnershipDisposition::DiedWithMe {
+                    store_session_id: session_id.clone(),
+                    resume_argv: resume_argv.clone(),
+                },
+                written_at_ms: now_ms,
+                written_by_pid: writer_pid,
+                from_version: from_version.to_string(),
+            },
+        )
+        .collect()
+}
+
+/// The writer's final statement at a cold exit: the `died_with_me` records for
+/// the rows dying now, PLUS this writer's still-standing `adopted` records for
+/// rows NOT dying here — a progressive-migration predecessor may have recorded
+/// adoptions earlier in its life, those rows live on the successor, and they
+/// must not lose their witness just because the writer is also dying with
+/// other rows. Records by OTHER writers pass through untouched (one witness
+/// per record, never rewritten); feed the result through [`record_handoff`],
+/// which keeps exactly this pid's final statement and every other writer's.
+pub fn merge_exit_records(
+    existing: Vec<OwnershipRecord>,
+    dying: Vec<OwnershipRecord>,
+    writer_pid: u32,
+) -> Vec<OwnershipRecord> {
+    let dying_keys: Vec<(SessionKind, String)> = dying
+        .iter()
+        .map(|record| (record.kind, record.session_id.clone()))
+        .collect();
+    let mut merged: Vec<OwnershipRecord> = existing
+        .into_iter()
+        .filter(|record| {
+            record.written_by_pid != writer_pid
+                || !dying_keys
+                    .iter()
+                    .any(|(kind, session_id)| {
+                        *kind == record.kind && *session_id == record.session_id
+                    })
+        })
+        .collect();
+    merged.extend(dying);
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +400,92 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn died_record_full(now: u64, session_id: &str, resume_argv: Vec<String>) -> OwnershipRecord {
+        OwnershipRecord {
+            kind: SessionKind::Codex,
+            session_id: session_id.to_string(),
+            runtime_key: format!("codex://{session_id}"),
+            disposition: OwnershipDisposition::DiedWithMe {
+                store_session_id: session_id.to_string(),
+                resume_argv,
+            },
+            written_at_ms: now,
+            written_by_pid: 424_242,
+            from_version: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_dying_row_is_recorded_and_answers_with_its_resume() {
+        let home = scratch_home("died-with-me-built");
+        let records = died_with_me_records(
+            &[(
+                "codex://abc".to_string(),
+                SessionKind::Codex,
+                "abc".to_string(),
+                vec!["resume".to_string(), "abc".to_string()],
+            )],
+            now_ms(),
+            std::process::id(),
+            "test",
+        );
+        assert_eq!(records.len(), 1);
+        save(&home, &records).unwrap();
+        match lookup(&home, SessionKind::Codex, "abc") {
+            LedgerAnswer::DiedWithMe {
+                store_session_id,
+                resume_argv,
+            } => {
+                assert_eq!(store_session_id, "abc");
+                assert_eq!(resume_argv, vec!["resume".to_string(), "abc".to_string()]);
+            }
+            other => panic!("expected died_with_me, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exit_merge_keeps_the_writers_adopted_rows_and_drops_superseded_ones() {
+        // `adopted_record` pins written_by_pid 111, so this test pins its own
+        // writer identity explicitly: 424_242 is the exiting writer.
+        let mut mine_adopted_surviving = adopted_record(now_ms(), 999);
+        mine_adopted_surviving.written_by_pid = 424_242;
+        mine_adopted_surviving.session_id = "surviving".to_string();
+        mine_adopted_surviving.runtime_key = "codex://surviving".to_string();
+        let mut mine_adopted_superseded = adopted_record(now_ms(), 998);
+        mine_adopted_superseded.written_by_pid = 424_242;
+        mine_adopted_superseded.session_id = "dying".to_string();
+        mine_adopted_superseded.runtime_key = "codex://dying".to_string();
+        let mut foreign = adopted_record(now_ms(), 777);
+        foreign.session_id = "theirs".to_string();
+        foreign.runtime_key = "codex://theirs".to_string();
+        let dying = died_record_full(now_ms(), "dying", vec!["resume".to_string(), "dying".to_string()]);
+        let merged = merge_exit_records(
+            vec![
+                mine_adopted_surviving.clone(),
+                mine_adopted_superseded.clone(),
+                foreign.clone(),
+            ],
+            vec![dying],
+            424_242,
+        );
+        // The writer's adopted record for a row NOT dying here survives.
+        assert!(merged.contains(&mine_adopted_surviving));
+        // Another writer's record always passes through untouched.
+        assert!(merged.contains(&foreign));
+        // The writer's own record for the dying row is superseded by its
+        // death statement — never both.
+        assert!(!merged.contains(&mine_adopted_superseded));
+        let dying_statements: Vec<&OwnershipRecord> = merged
+            .iter()
+            .filter(|record| record.session_id == "dying")
+            .collect();
+        assert_eq!(dying_statements.len(), 1);
+        assert!(matches!(
+            dying_statements[0].disposition,
+            OwnershipDisposition::DiedWithMe { .. }
+        ));
     }
 
     fn adopted_record(now: u64, by_pid: u32) -> OwnershipRecord {
