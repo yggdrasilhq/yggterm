@@ -30028,6 +30028,23 @@ timeout — the report carries start/end overhead floors as the load proxy.
 Re-run quiet before tuning any single stage; the ladder is the map of
 where the seconds live. Campaign door: `campaign-ux-speed.md` §BASELINES.
 
+**⛔ CORRECTION (2026-09-15 quiet window, instrument-grade — the stage
+names above were load-window artifacts):** with the desktop quiet
+(cli floor 73 ms) the daemon is NOT a cost: `terminal new` daemon work
+10-170 ms, `terminal_ensure` handled in ~2-10 ms, birth+runtime spawn
+during the verb. The real ladder, verb→paint, on a quiet desktop:
+~0.6 s verb round trip → ~140-360 ms schedule→attempt (fine) →
+~40 ms ensure RPC → **~0.9 s UI-plane starvation** (interactive_request
+dispatch hole 390 ms after worker_finish; FOUR full 776-row sidebar
+merges in 212 ms — `merge_rows_breakdown` traced at +1010/+1012/+1220/
++1222; ui/block spans interleaved) → mount_open → **~0.7 s xterm settle**
+→ and **+1.5-2 s cold WebKit** on the FIRST mount of a batch (the 2.9 s
+mount_open vs 0.6-1.0 s warm). The seconds live in UI-plane congestion
+(the [11.87]/[11.115] pathology at spawn scale), redundant full merges
+([11.117]), the xterm settle, and the cold web-process tax — NOT in the
+daemon. The original queued-gap reading above is superseded by this
+paragraph.
+
 ## ⛔ [11.115] UNTHROTTLED BUILD STORMS ON THE GUI HOST STARVE THE UI PLANE — cpu some 40-52%, THE SHELL WEBVIEW RUNNABLE-STALLED 6.4s OF EVERY 10s, AND ui/block p95 LANDED 45× OVER THE BAR WHILE TWO CAMPAIGNS COMPILED ON THE DESKTOP HOST (caught live 2026-09-15 ~00:10-01:00 IST, GUI host)
 
 **Status:** OPEN
@@ -30150,3 +30167,33 @@ Fix shape: per-row failure counter with a long floor (or give-up until
 the row's transcript actually changes), and the failure emit must carry
 the error kind. Falsifier: 6 h of trace with a permanently-failing row
 shows ≤2 `ok:false` spans for it and every span names its reason.
+
+> Renumber note: this entry was drafted as [11.116] the same hour the switch-plane-vocab lane filed its own [11.116] (row-title retries) — renumbered to [11.117] per the defect-id law; main landed theirs first.
+## ⛔ [11.117] EVERY SPAWN PAYS FOUR FULL 776-ROW SIDEBAR MERGES IN 212 ms ON THE SERVE/UI PATH — `resolve_app_control_row`'S FAST PATH MISSES BRAND-NEW ROWS AND EVERY SNAPSHOT APPLY RE-MERGES FROM SCRATCH (measured 2026-09-15 quiet window, trace-grade, the ux-speed spawn-ladder lane)
+
+**Status:** OPEN
+
+The corrected [11.114] ladder shows the mount completions are starved
+~0.9 s behind UI-plane work, and the biggest named item is redundant
+merging: `merge_rows_breakdown` events at +1010/+1012/+1220/+1222 after
+a `terminal new` — FOUR full merges (100-200 ms each at 776 rows; the
+breakdown tracer itself only fires at ≥200 rows/20 live/100 expanded,
+so every one of these was expensive by construction) inside 212 ms.
+Two independent causes, both fixable:
+
+1. `resolve_app_control_row` checks a cached-rows fast path first, but a
+   BRAND-NEW session is not in any cache yet, so its very first
+   resolution — the one on the spawn-critical path — pays the full
+   `merged_sidebar_rows` rebuild + live-title enrichment.
+2. The snapshot-apply path re-runs the full merge on every changed
+   apply ("snapshot" source), and row resolution right after it
+   re-merges again — no generation key, no memoization, no
+   invalidation-based reuse.
+
+Fix direction: a generation-keyed merged-rows cache (bump on
+live_sessions/browser/row_arrangement epochs; serve app-control row
+resolution and the post-apply re-merge from it), or an incremental
+merge. Until then every spawn, every row-resolving verb, and every
+agent's `server app rows` poll taxes the UI plane on large desktops —
+and the pollers multiply it. Evidence: ux-speed door §BASELINES
+(`campaign-ux-speed.md`), trace window of the 2026-09-15 spawn probe.
