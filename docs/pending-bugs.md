@@ -29744,7 +29744,48 @@ grows back.
 
 ## ⛔ [11.106] SAME-LABEL DEPLOYS ARE NOT REACHING THE RUNNING DAEMONS — THE MUSE LAB HOST HAS SERVED A SEP-11 BUILD THROUGH FIVE DEPLOYS, DEV SAT OUT THE SECOND DEPLOY OF THE MORNING (measured 2026-09-14, lane/integration/opencode-v2)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+(lane/integration/deploy-rotation, 2026-09-14; consulted gpt-6-astra LOW +
+gemini-3.8-flash medium — both accept, chain
+lores/chain-of-thought/2026-09-14-deploy-rotation-managed-ahead.md)
+
+**Root cause (two halves, only one was a rotation defect):**
+1. **The real half — the direct-store generation never arms.** The
+   `disk_binary_replaced` trigger required `/proc/self/exe` to end " (deleted)"
+   (the in-place deploy's unlink signature), and
+   `disk_replace_handoff_candidates` returned EMPTY for a live exe. A
+   direct-store daemon (`~/.local/share/yggterm/direct/versions/<ver>/…`) is
+   never a deploy target, so its exe is never unlinked and it can never arm —
+   measured live on the muse lab host: pid 11310 born 2026-09-11 23:09:34,
+   through five deploys, while `~/.yggterm/bin/yggterm-headless` (the deploy
+   target) sat a generation ahead on disk. FIX: a live exe UNDER the direct
+   install's versions root now answers candidates = [the canonical managed
+   binary]; the same helper feeds the byte-differ gate, the replacement
+   --version probe (same-version hysteresis applies unchanged) and the
+   successor spawn — so the first rotation migrates the daemon onto the
+   managed build and the generation heals. Dev/raw installs (target/debug,
+   ~/.local/bin) keep today's never-arm behavior, and `Path::starts_with`
+   keeps `versions-evac` from impersonating `versions`.
+2. **The non-defect half — dev's morning "stuck" daemon was hysteresis working
+   as designed.** dev's event-trace today shows `daemon_self_retire` +
+   `daemon_self_retire_handoff_ok` every ~30.0 min through four same-label
+   deploys; the 08:20 no-rotation was the birth-seeded 30-min
+   same-version cooldown (2026-09-03 storm law, KEPT), and the daemon did
+   rotate long before evening. `hot_restart_pending: false` during a defer is
+   misleading to a live-prover, but the status already carries
+   `same_version_handoff_cooldown_remaining_ms` — visibility exists.
+
+**Observability added:** `arming: "in_place" | "managed_ahead"` on
+`daemon_self_retire` + `disk_binary_handoff_cooldown_deferred`; `exe_link`
+(predecessor path) now rides `daemon_self_retire_handoff_ok` beside `new_exe`
+so a cross-path rotation reads as a pair.
+
+**Acceptance (owed):** after the next integration build deploys, the muse lab
+host's direct-store daemon rotates onto the managed build (birth-seeded
+cooldown long expired → first armed poll), `/proc/<pid>/exe` reads the managed
+path, and the 25 live rows survive the handoff. That proof also unblocks the
+sibling lanes' owed live proofs (11.6.3 production-daemon, 11.6.4 GUI-path
+half, muse consuming_input).
 
 Measured while landing [11.6.3-a]+[11.6.3-b] (the live-proof half):
 
