@@ -5911,6 +5911,52 @@ JSON.stringify({{
         );
     }
 
+    // A row that has served the whole one-minute ladder and is STILL absent is
+    // a plain shell or a remote row that will never host an app. Measured
+    // 2026-09-15 ([11.87] remainder): 28 such paths asked once a minute
+    // each, forever — 852 absent asks in 45 idle minutes, each fanning a batch
+    // verdict, a trace line and render work beside. After eight absent asks
+    // (~4.3 minutes of coverage, ~50x the five-second lateness the ladder
+    // exists for) the schedule settles to a ten-minute ceiling; a genuine
+    // handover restarts the fast asks.
+    #[test]
+    fn a_many_times_absent_row_settles_to_the_late_ceiling() {
+        assert_eq!(
+            (9..=11)
+                .map(app_surface_restore_retry_ms)
+                .collect::<Vec<_>>(),
+            vec![600_000, 600_000, 600_000],
+            "the ladder's one-minute contract is per schedule, not forever"
+        );
+        assert_eq!(
+            app_surface_restore_retry_ms(8),
+            60_000,
+            "the eighth ask still rides the one-minute ceiling"
+        );
+        let shell = shell_with_live_rows(&["local://alpha"], "local://alpha");
+        let mut attempts = HashMap::new();
+        let token = restore_targets_at(&shell, 0, 8)[0].runtime_token.clone();
+        for ask in 0..9 {
+            mark_app_surface_restore_attempted(
+                &mut attempts,
+                "local://alpha",
+                token.clone(),
+                ask * 100,
+            );
+        }
+        // Nine asks recorded ⇒ the next window is ten minutes past the last
+        // ask (800ms).
+        assert!(
+            restore_targets_with(&shell, &attempts, 800 + 599_999, 8).is_empty(),
+            "the late window has not elapsed: a never-declaring row is not re-asked"
+        );
+        assert_eq!(
+            restore_targets_with(&shell, &attempts, 800 + 600_000, 8).len(),
+            1,
+            "…and even the late schedule still asks eventually"
+        );
+    }
+
     // A handover restarts the SCHEDULE, not just the token: the re-resumed app
     // is a fresh app and deserves the fast asks, not the tail of the minute-long
     // window the dead one earned.

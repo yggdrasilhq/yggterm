@@ -29231,6 +29231,27 @@ tests lock both. STILL OWED: (a) the bootstrap-churn dedup (the agy row took
 live multi-MB switch-back repro before touching), (d) the re-measure below
 after the roll.
 
+LANDED 2026-09-15 ~01:20 IST (lane/uxspeed/switch-storm-remainder, ux-speed
+campaign, zcode sess_9169397e on the GUI host): (d) RE-MEASURED on the live 3.2.113 —
+the 10-15 s freezes are GONE (6 h natural traffic: 147 ui/block incidents,
+17 over 1 s, max 2.96 s; 30-min window p50 390 ms / p95 2035 ms) so the
+falsifier still FAILS but 5x closer; the churn treadmill behind the remaining
+gaps is named via the render-cause stream (component_window causes):
+declare-absent chain ~7.6 renders/min, background live-session snapshot
+~3.7/min, remote-machine refresh ~2.6/min, working-flags ~5/min, `app`
+component 51 s render time in 30 min. FIRST CUT of (a)-family: the
+surface-restore ask schedule grows a late ceiling — a row still absent after
+8 consecutive asks (~4.3 min) settles to one ask per TEN minutes instead of
+riding the 60 s ceiling forever (measured: 28 never-declaring paths, 852
+absent asks in 45 idle minutes, `daemon_declare_absent` 19/min feeding the
+treadmill); genuine handovers still restart the fast schedule. New tests
+a_many_times_absent_row_settles_to_the_late_ceiling + the existing
+flicker/handover contracts green. STILL OWED after this: (b) retained-replay
+pacing, the snapshot-apply identity gate (background snapshots apply ~20
+unconditional mutations each — the 5.8/min snapshot responses ride ~26
+renders/min), the working-flags write gate, and the live post-deploy
+re-probe of this fix.
+
 **Falsifier:** the next owner switch between agent rows on a busy desktop
 shows ui/block p95 under 100 ms for the switch leg and no gap over 1 s; the
 drag leg shows no gap over 250 ms.
