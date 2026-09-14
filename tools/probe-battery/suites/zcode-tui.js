@@ -44,11 +44,17 @@ module.exports = {
     const rolloutDir = path.join(
       process.env.HOME || '', '.zcode', 'cli', 'rollout',
     );
-    const storeTop = (n = 8) => fs.readdirSync(rolloutDir)
-      .filter((f) => f.startsWith('model-io-') && f.endsWith('.jsonl'))
-      .map((f) => ({ f, m: fs.statSync(path.join(rolloutDir, f)).mtimeMs }))
-      .sort((a, b) => b.m - a.m)
-      .slice(0, n);
+    // The store is home-scoped and SHARED: any other live zcode session on
+    // this host (the seat running this battery, a sibling seat) bumps its
+    // own rollout's mtime continuously, so "newest mtime after t0" picks
+    // the WRONG file. The drive's rollout is identified by NAME instead:
+    // baseline the existing set now (before the turn) and require a NEW
+    // filename — the lazy-birth law makes that exact (born at first
+    // model-io write, never at launch).
+    const rolloutBaseline = new Set(
+      fs.readdirSync(rolloutDir)
+        .filter((f) => f.startsWith('model-io-') && f.endsWith('.jsonl')),
+    );
 
     // 1. launch → first paint + settled idle chrome.
     await ctx.probe('launch-first-paint', async () => {
@@ -91,41 +97,72 @@ module.exports = {
       return `caret drawn: ${caretLine.trim().slice(0, 60)}`;
     });
 
-    // 3. the turn. Pass bar = the model's reply lands. Working-state phrases
-    //    are REPORTED as measured (0.5.9 draws `working · working…` + swaps
-    //    the footer to `esc cancel · enter send`; the descriptor's
-    //    `streaming…`/`● running` did NOT appear across measured turns).
+    // 3. the turn. Pass bar = the model's reply lands. The declared table
+    //    below IS the [11.111] fill (descriptor `working_screen_phrases`):
+    //    0.5.9 draws `working · working…` on the status line and swaps the
+    //    footer to `esc cancel · enter send`. Declared==observed is the
+    //    regression net — a miss means the chrome moved again; re-measure
+    //    before touching the descriptor.
     await ctx.probe('turn-and-working-phrases', async () => {
       drive.write('\r');
-      const needles = ['working', 'streaming\u2026', '\u25CF running', 'esc cancel', SENTINEL];
+      const needles = ['working', 'working · working…', 'esc cancel', 'streaming\u2026', '\u25CF running', SENTINEL];
       const frames = await drive.phrasePoll(needles, { maxPolls: 400, pollMs: 120, settlePolls: 25 });
       const seen = new Set(frames.flatMap((f) => f.phrases));
       drive.snap('turn-settled');
       ctx.facts.turn = {
         reply_landed: seen.has(SENTINEL),
         working_phrase_frames: frames.filter((f) => f.phrases.includes('working')).length,
-        streaming_ellipsis_seen: seen.has('streaming\u2026'),
-        running_dot_seen: seen.has('\u25CF running'),
+        status_needle_seen: seen.has('working · working…'),
         esc_cancel_footer_seen: seen.has('esc cancel'),
-        declared_phrases_observed: ['streaming\u2026', '\u25CF running'].map((p) => ({ phrase: p, seen: seen.has(p) })),
+        declared_phrases_observed: ['working · working…', 'esc cancel'].map((p) => ({ phrase: p, seen: seen.has(p) })),
+        retired_0_5x_needles: ['streaming\u2026', '\u25CF running'].map((p) => ({ phrase: p, seen: seen.has(p) })),
       };
       if (!ctx.facts.turn.reply_landed) throw new Error(`no ${SENTINEL} reply within the turn window`);
-      return `reply landed; working frames: ${ctx.facts.turn.working_phrase_frames}, streaming… seen: ${ctx.facts.turn.streaming_ellipsis_seen}`;
+      // Pass bar: the reply landed AND at least one declared working arm was
+      // seen. A very fast turn can complete between polls, so ONE arm may be
+      // missed by sampling — but real chrome drift retires BOTH arms (they
+      // are independent needles on independent rows), and that is the drift
+      // this net exists to catch.
+      const seenDeclared = ctx.facts.turn.declared_phrases_observed.filter((d) => d.seen);
+      if (seenDeclared.length === 0) {
+        throw new Error('no declared working phrase ever drew — chrome drifted; re-measure before any descriptor edit');
+      }
+      return `reply landed; working frames: ${ctx.facts.turn.working_phrase_frames}, declared arms seen: ${seenDeclared.map((d) => `"${d.phrase}"`).join(' + ')}`;
     });
 
     // 4. the rollout-store law: this drive minted `model-io-sess_<uuid>.jsonl`
     //    (runtime mints sess_<uuid>; the FILE NAME is the identity). MEASURED:
     //    the file is born LAZILY at the first model-io write (turn time), not
     //    at launch — poll for it instead of checking once.
+    //    Selection is three-stage because the store is home-scoped and SHARED:
+    //    (a) NEW name vs the baseline (mtime recency alone is wrong — any
+    //    concurrent live zcode session bumps its own file); (b) a sibling's
+    //    idle-pruned jsonl can be REBORN mid-poll, so (c) candidates must
+    //    carry THIS drive's turn sentinel in their content (the rollout's
+    //    model-io rows embed the request body, sentinel included — the drive's
+    //    only model call is probe 3's turn, so its file is the sentinel's
+    //    file; sibling sessions never contain it).
+    const driveOwnsRollout = (f) => {
+      try {
+        return fs.readFileSync(path.join(rolloutDir, f), 'utf8').includes(SENTINEL);
+      } catch { return false; }
+    };
     await ctx.probe('store-session-id-law', async () => {
       let fresh = null;
       const end = Date.now() + 30000;
       while (Date.now() < end && !fresh) {
-        fresh = storeTop().find((x) => x.m > drive.t0) || null;
+        fresh = fs.readdirSync(rolloutDir)
+          .filter((f) => f.startsWith('model-io-') && f.endsWith('.jsonl') && !rolloutBaseline.has(f))
+          .filter((f) => /^model-io-sess_[0-9a-f-]{36}\.jsonl$/.test(f))
+          .filter(driveOwnsRollout)
+          .map((f) => ({ f, m: fs.statSync(path.join(rolloutDir, f)).mtimeMs }))
+          .sort((a, b) => b.m - a.m)[0] || null;
         if (!fresh) await new Promise((r) => setTimeout(r, 1000));
       }
       ctx.facts.store = {
         glob: '.zcode/cli/rollout/model-io-*.jsonl',
+        baseline_size: rolloutBaseline.size,
+        selection: 'new-name + sentinel-in-content',
         new_rollout: fresh ? fresh.f : null,
         sess_shaped: fresh ? /^model-io-sess_[0-9a-f-]{36}\.jsonl$/.test(fresh.f) : null,
       };
@@ -149,13 +186,17 @@ module.exports = {
       });
       ctx.drive2 = drive2;
       const painted = await drive2.waitFor(() => drive2.screen().trim().length > 0, 60000);
-      await new Promise((r) => setTimeout(r, 4500));
+      // Rederivation is the pass bar — POLL for it, never a fixed settle:
+      // under host load the resumed TUI can hold `Resuming session… · idle
+      // · opening` well past any fixed sleep (measured 2026-09-14/15).
+      const rederived = await drive2.waitFor(() => drive2.screen().includes(SENTINEL), 60000);
+      await new Promise((r) => setTimeout(r, 1000));
       drive2.snap('resumed');
       const rs = drive2.screen();
       ctx.facts.resume = {
         session_id: sid,
         painted: !!painted,
-        content_rederived: rs.includes(SENTINEL),
+        content_rederived: !!rederived && rs.includes(SENTINEL),
         footer_has_mode_hints: rs.includes('i type') || rs.includes('i to type'),
       };
       if (!ctx.facts.resume.content_rederived) throw new Error(`resume of ${sid} did not rederive the conversation`);

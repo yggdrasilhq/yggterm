@@ -3611,16 +3611,19 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("zcode-tui"),
         remote_row_scheme: Some("remote-zcode-tui://"),
         runtime_key_scheme: Some("zcode-tui-runtime://"),
-        // MEASURED off the TUI's own status bar and composer indicator (the
-        // only working chrome it draws): "streaming…" during a turn, "●
-        // running" on the composer's second row.
+        // MEASURED off 0.5.9 chrome through a real pty (the §9 battery drive,
+        // 2026-09-14; [11.111]): during a turn the status line reads
+        // `<cwd> · working · working…` and the footer swaps to
+        // `esc cancel · enter send`. The duplicated-word shape is the tight
+        // needle — transcript text never produces it. The earlier-0.5.x
+        // needles ("streaming…", "● running", "○ idle") never draw on 0.5.9.
         working_screen_phrases: &[
             ScreenWorkingPhrase {
-                needle: "streaming…",
+                needle: "working · working…",
                 also_any: &[],
             },
             ScreenWorkingPhrase {
-                needle: "● running",
+                needle: "esc cancel",
                 also_any: &[],
             },
         ],
@@ -3655,8 +3658,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // typing; nothing else marks the input head.
         composer_marker: '\u{258f}',
         composer_region_label: None,
-        composer_footer_hints: &["i to type", "○ idle", "zcode-tui"],
-        working_footer_hints: &["● running", "streaming"],
+        // MEASURED 0.5.9 ([11.111]): `○ idle` never draws (idle status is
+        // bare `idle · N sessions …`); `i to type` draws in the composer
+        // mode-hint footer states (`i type …` fresh, `i to type · enter
+        // sends` post-resume); `zcode-tui` holds (idle status tail).
+        composer_footer_hints: &["i to type", "zcode-tui"],
+        // MEASURED 0.5.9 ([11.111]): the working footer swap is
+        // `esc cancel · enter send` (idle is `esc shortcuts …`).
+        working_footer_hints: &["esc cancel"],
         // The TUI takes NO launch posture flags — permissions are owned
         // in-app (its own y/a/n permission banner per tool use), so every
         // posture launches identically and the real gate is the in-app ask.
