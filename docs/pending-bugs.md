@@ -368,13 +368,31 @@ openapi at `/openapi.json` — 119 paths):
    the trailing escapes is the tell) and eats all input until ESC.
 
 **2026-09-14, lane/integration/opencode-v2 (claim ACK-948e30a78b): defects
-[11.6.3-a] + [11.6.3-b] FIXED IN CODE — LIVE PROOF OWED.** The falsifying
-observations: after a deploy riding this lane, an IDLE opencode fleet's
-mirror tick (`opencode_mirror/tick_state` in the trace) must report
-`active_tabs` = the store's listed-session count with rows persisting
-between turns (not blinking with the working set), and a live TUI's anchor
-row must carry `Viewing Tab Session Id` bound from its own `OC | <title>`
-window title while no turn runs; the `/view` verb must answer 200. Landed:
+[11.6.3-a] + [11.6.3-b] FIXED IN CODE — LIVE PROOF OWED.** Landed main
+218da40b, deployed inside the same-morning integration build that also
+merged the probe-battery lane. The falsifying observations, with
+measured state: an IDLE opencode fleet's mirror tick
+(`opencode_mirror/tick_state`) must report `active_tabs` = the store's
+listed-session count with rows persisting between turns, and a live TUI's
+anchor row must carry `Viewing Tab Session Id` bound from its own
+`OC | <title>` while no turn runs; the `/view` verb must answer success.
+PROVEN SO FAR (isolated scratch-home daemon on the muse lab host, live beta-19271
+service, idle fleet of 5 store sessions): `tick_state {"active_tabs": 5,
+"plan_spawn": 5}` → `tab_sync spawned=1 retired=0` per tick → all FIVE
+store sessions seated as titled `opencode-runtime://ses_*` projection rows
+and persisting — the exact measurement that reads `active_tabs: 0` on a
+pre-fix build. `/view` contract proven against the live service: body
+`{"idle": 0}` → success (204) while the old `{}` body → HTTP 400
+(reproduced); NOTE the server substitutes CURRENT time for a 0 idle value
+(the 09-10 "persisted verbatim" reading holds for non-zero values), so the
+probe's store write was restored to NULL after the measurement. STILL OWED
+for the live-proof half: a PRODUCTION daemon generation running 218da40b+
+(blocked by [11.106] — muse-lab-host and dev daemons predate it), the anchor OSC-
+title binding under a real TUI (PTY law), and tab-mirror follow-proof
+(falsifier (b)). Owed observability debt found while proving: the mirror's
+fetch-None and empty-list paths are SILENT (the §7 sin in mirror form —
+this seat burned an hour unable to distinguish "no tabs" from "fetch
+failed"); a named trace on both paths is the fix. Landed:
 `opencode_service::service_sessions` (renamed from `active_sessions` — the
 STORE list is the mirror's universe, the working set is a per-session
 `running` status, ordering is turn recency; the empty-active-set early
@@ -29647,3 +29665,38 @@ urgent: the shell is internally consistent today. But the crate only prevents
 the defect it names if its birthplace obeys it — every session the shell
 grows a new glyph by hand, the second encoding the crate exists to kill
 grows back.
+
+## ⛔ [11.106] SAME-LABEL DEPLOYS ARE NOT REACHING THE RUNNING DAEMONS — THE MUSE LAB HOST HAS SERVED A SEP-11 BUILD THROUGH FIVE DEPLOYS, DEV SAT OUT THE SECOND DEPLOY OF THE MORNING (measured 2026-09-14, lane/integration/opencode-v2)
+
+**Status:** OPEN
+
+Measured while landing [11.6.3-a]+[11.6.3-b] (the live-proof half):
+
+- **The muse lab host:** the daemon (pid 11310) started Fri 2026-09-11 23:09:34 and its
+  exe is the DIRECT-STORE generation
+  (`~/.local/share/yggterm/direct/versions/3.2.113/yggterm-headless`),
+  label `3.2.113` — equal to every deploy label since. It has not rotated
+  through FIVE main deploys (09-12 8154ab69, 09-12 eve 9f5209a3, 09-13
+  60e6af57, 09-14 f863c4f0, 09-14 the probe-battery-carrying integration build). It holds 25 live rows
+  (the owner's conversations and sibling seats' proof rows), so the
+  zero-row-retire precedent from the 09-12 oc heal does NOT apply and a
+  hand kill is off the table.
+- **dev:** the daemon rotated for the 08:12:36 deploy (pid 1609152,
+  started 08:12:06) but did NOT rotate for the 08:20:44 deploy that
+  carried 218da40b: 30+ minutes later `/proc/<pid>/exe` still pointed at
+  the DELETED inode of the 08:12 build, `hot_restart_pending: false`, no
+  blockers, and the status answer surfaced no cooldown field.
+- Consequence for every campaign: a "deployed" sha on origin/main does
+  NOT mean a running daemon executes it — any live-proof claim must first
+  verify the DAEMON generation (`/proc/<pid>/exe` + start time), not the
+  binary on disk. This seat's own first proof attempt silently measured a
+  stale-daemon behavior (two scratch runs against the canonical binary
+  answered `active_tabs: 0` while the same logic in a fresh build of the
+  same commit answered 5 — the anomaly is consistent with a pre-fix
+  binary and unresolved).
+- Owner question already on file (09-12, oc heal): booter path selection
+  can re-spawn a daemon from the direct store on reboot — the muse lab host's
+  direct-store exe is the same class. The ROTATION gap is the new half:
+  an equal-label deploy does not trigger a same-label daemon's
+  self-replacement, and neither the linger/fast-fail work ([11.97]) nor
+  the hot-restart gate schedules one.
