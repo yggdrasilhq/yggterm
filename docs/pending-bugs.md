@@ -29998,7 +29998,7 @@ measurement session and found the felt-symptom half live and attributable:
 past the campaign bar.** The GUI host is also a workstation — build storms
 and UX latency share the same 16 cores.
 
-Measured (jojo, system PSI + GUI cgroup PSI + /proc schedstat + ytrace ui/block):
+Measured (the GUI host: system PSI + GUI cgroup PSI + /proc schedstat + ytrace ui/block):
 
 - **Generators observed back-to-back, two different campaigns:** the
   mac-kvm campaign's `ninja` build of qemu 11.0.1 (17 cc1 workers, load
