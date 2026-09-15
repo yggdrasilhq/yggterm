@@ -31,12 +31,12 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); remaining: claude, opencode, agy, muse, qwen, pi, codex-litellm, devin |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); muse LANDED (suites/muse.js, 2026-09-15, 8/8 live, re-measured 1.3.0); remaining: claude, opencode, agy, qwen, pi, codex-litellm, devin |
 | 11.6.1 | codex | A | Battery suite LANDED 2026-09-15 (lane/integration/codex-battery, suites/codex.js 8/8 twice live on 0.154.0): every declared fact HOLDS (trust-gate needles verbatim — its warning text grew; `• Working (Ns • esc to interrupt)`; `›` marker; rollout filename-uuid law; resume id-reuse PROVEN by a follow-up turn appending to the SAME rollout; help surface holds, `resume --last` additive). Titling drift MEASURED + READER FIXED: 0.154.0 names threads eagerly (footer `renaming…` spinner → title; `session_index.jsonl` appended instantly) but the sqlite catalog received NO row for either probe session (~40 min checked) — `read_codex_live_store_title` gained arm 1.5 reading `session_index.jsonl` (test `codex_session_index_names_the_thread_the_footer_shows`), keeping the SSOT equality (CLI display beats first-prompt). STILL OPEN: ledger reattach in the resume wrapper; kill the 12s /proc poll |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
 | 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107]); [11.96] store half resolved upstream on 1.2.2, fallback half fixed in code; baseline below |
-| 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
+| 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); RE-MEASURED 1.3.0 live via the new battery suite (8/8) — every hard declared fact holds (gate needles, U+276F, `esc to interrupt`, resume banner + rederive, `--yolo`); 1.3.0 drift recorded (spinner ◇◈◆ are frames of ONE line, `.session.lock` gained `host=`, subagent locks shadow the session lock, session-index.db diverges from the day dirs); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
 | 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer FIXED IN CODE — region-label composer shape in the readiness gate (entry below); working phrases still login-gated-unverified |
 | 11.6.7 | qwen | C | OPEN |
 | 11.6.8 | grok | C | RE-MEASURED 1.0.30 live (suites/grok.js LANDED 2026-09-15, 8/8): 09-11 needle surgery HOLDS (spinner line + [stop] + Ctrl+c swap); post-turn `ctrl+b:send to bg` MEASURED GONE (bg-hint table emptied) and idle chrome re-measured (Shift+Tab:mode \| Ctrl+x:shortcuts); tenancy registry re-verified incl. stale-entry-after-kill; events.jsonl event-fed classifier OPEN |
@@ -640,6 +640,46 @@ pty drive renders nothing. Lab + raw byte captures:
    if forks are the story, a forked child’s live lock can outlive the
    parent conversation’s and id-discovery must read the fork chain,
    not just recency.
+
+### [11.6.5] muse battery suite LANDED — 1.3.0 re-measure, spinner glyphs are frames not states (muse-battery lane, 2026-09-15, lane/integration/muse-battery)
+
+`tools/probe-battery/suites/muse.js` (8/8 green live on Muse Code 1.3.0,
+1.3.0-R3057.1, the muse lab host): launch gate (both declared needles hit,
+own-line), composer shape (❯ U+276F drawn, ⟩ U+27E9 zero), one real authed
+turn (needle `esc to interrupt` observed mid-turn, GONE post-turn), store
+side-car (day-dir session selected by the DIRECT `.session.lock` pid),
+`--help` surface (`resume` subcommand, `--approval-mode`, `--approval-judge`,
+`--trust-workspace`, `--yolo`), resume rederive (banner `resumed session
+<uuid>` + sentinel rederive + the abnormal-run self-report), `resume --last`
+picks the crashed session, panic falsifier (SIGKILL surfaces as pty exit;
+the lock LINGERS with a dead pid — the /proc-verification law re-proven).
+
+HOLDS on 1.3.0 (no descriptor edits forced): every hard declared fact of the
+09-14 fill re-proved live.
+
+1.3.0 drift facts recorded (suite `capabilities`, not descriptor changes):
+- The live turn line's leading glyph is a SPINNER — ◇ ◈ ◆ are frames of the
+  SAME line (all three observed on "Thinking"/"Double"/"Running" within one
+  turn). The needle stays the `esc to interrupt` fragment; a glyph needle
+  would flicker with the animation. New turn state seen: "Double".
+- The tool-running line carries its own needle: `◆ Running command · … ·
+  running (0s · esc to interrupt)`; it settles to `◆ Ran command · … · ✓ ·
+  <N>s · ctrl+o` and PERSISTS post-turn (the false-working trap, re-proven).
+- `.session.lock` gained a second line: `host=<hostname>` (was `pid=<pid>`
+  only). A SUBAGENT lock (`<uuid>/subagent/<sub-uuid>/.session.lock`, same
+  pid) now shadows the session lock — 465 nested locks accumulated on the
+  lab host; store selection must match the DIRECT lock only.
+- The sessions tree carries FILE artifacts beside the year dirs (measured:
+  an empty `.prior-crash-telemetry-markers-v1`) — walkers must filter
+  isDirectory at every level (the suite's first live run died ENOTDIR on
+  exactly this).
+- ⛔ `session-index.db` DIVERGES from the day-dir tree: a SIGKILLed
+  session's dir has NO index row (writes never committed) and a later
+  `muse resume <uuid>` does not repair it — yet resume (by uuid AND
+  `--last`) finds it via the day dirs. The index is NOT the resume
+  universe; store readers must not treat index completeness as session
+  existence. Also seen: the 1.1.1-era idle hint `Start a message with ! …`
+  is GONE on 1.3.0 (idle draws composer + status footer only).
 
 ### [11.6.5] muse descriptor v2 fill LANDED — every queued fix re-measured on the DRIFTED binary first (muse lane, 2026-09-14, lane/integration/muse)
 
