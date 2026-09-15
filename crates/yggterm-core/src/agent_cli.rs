@@ -1796,6 +1796,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // prompt; the db is ABSENT on dev/oc, so the reader fails open to the
         // cached/rollout chain). yggterm READS the thread name and never
         // generates over it.
+        //
+        // RE-MEASURED on 0.154.0 (2026-09-15, the muse-lab host): titling is
+        // now EAGER and visible — the footer runs a `renaming…` spinner while
+        // the first turn names the thread, then carries the title beside the
+        // cwd, and the name lands in `~/.codex/session_index.jsonl` in the
+        // same breath. The sqlite catalog is no longer the live surface: it
+        // did NOT receive either probe session's row (re-checked ~40 min
+        // later). The reader's arm 1.5 reads the index (measured, in-code).
         title_authority: TitleAuthority::Store,
         // Codex launches bare and discovers its ULID later, so the synthesized
         // `local://<uuid4>` has to be rebound once the transcript appears.
@@ -1827,7 +1835,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // ⭐ MEASURED 2026-08-22 from a real codex row spawned into a directory this
         // CLI had never opened. The gate asks `Do you trust the contents of this
         // directory?` over `› 1. Yes, continue` / `2. No, quit`, with `Press enter
-        // to continue` beneath.
+        // to continue` beneath. RE-MEASURED 0.154.0 (2026-09-15): the warning
+        // grew a second sentence ("Working with untrusted contents comes with
+        // higher risk of prompt injection. Trusting the directory allows
+        // project-local config, hooks, and exec policies to load.") — both
+        // needles below still match verbatim, and Enter on the default
+        // `1. Yes, continue` clears it (persisting per-cwd trust into
+        // `~/.codex/config.toml`).
         //
         // ⛔⛔ THIS EMPTY LIST HAD A CAUSAL CHAIN BEHIND IT, WATCHED END TO END.
         // Unrecognised, the gate classified as `ready` with `may_type: true`, so a
@@ -1860,13 +1874,23 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         composer_marker: '\u{203a}',
         composer_region_label: None,
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
-        // ⛔ UNMEASURED. Codex's in-flight phrase has never been observed on a
-        // live working row, so this stays empty and the activity verdict for a
-        // codex row is `Unknown` rather than a guess. Fill it from a screen,
-        // not from memory.
+        // MEASURED-EMPTY (2026-09-15, 0.154.0 — supersedes the old
+        // "unmeasured" note). The working indicator is a BODY line —
+        // `• Working (0s • esc to interrupt)` — which the
+        // working_screen_phrases above already classify; the footer carries
+        // no stable working hint. The only working-phase footer signal is
+        // the transient `renaming… ⠋` titling spinner, and a SECOND turn in
+        // the same session never repeats it (the thread is already named) —
+        // too intermittent to classify on. Stays empty; the suite
+        // (tools/probe-battery/suites/codex.js) re-asks all of it.
         working_footer_hints: &[],
         // Read off `codex --help` on codex-cli 0.144.6 (2026-08-06), not from
-        // memory. Codex has NO plan mode and no edits-only approval — its
+        // memory. RE-VERIFIED on 0.154.0 (2026-09-15): `-m, --model`,
+        // `-a, --ask-for-approval`, `-s, --sandbox`,
+        // `--dangerously-bypass-approvals-and-sandbox` and the SEPARATE
+        // `--dangerously-bypass-hook-trust` all still spell that way; `resume`
+        // gained `--last` (picker by default) — additive, nothing declared
+        // breaks. Codex has NO plan mode and no edits-only approval — its
         // vocabulary is `--ask-for-approval {untrusted,on-request,never}` plus
         // `--sandbox {read-only,workspace-write,danger-full-access}`, which is a
         // different axis from Claude Code's. Approximating `accept-edits` as
@@ -4607,6 +4631,26 @@ fn read_codex_live_store_title(home: &Path, session_id: &str) -> Option<String> 
             return Some(title);
         }
     }
+    // 1.5 THE EAGER-TITLING INDEX — `session_index.jsonl` beside the sessions
+    // root. Measured 2026-09-15 on codex-cli 0.154.0 (the muse-lab host): the
+    // CLI names a thread the moment the first turn settles (the footer runs a
+    // `renaming…` spinner, then carries the title beside the cwd) and appends
+    // `{id, thread_name, updated_at}` to this log in the same breath — but
+    // the sqlite catalog NEVER received either probe session's row (checked
+    // again ~40 min later), so the catalog arm misses every fresh CLI session
+    // on this generation. Skipping this arm would drop the reader to the
+    // first-prompt arm below and break the SSOT equality the owner set
+    // (2026-09-06): the row title must equal what the CLI itself displays,
+    // and 0.154.0 DISPLAYS "Count to twelve" while the rollout's first real
+    // prompt is the whole sentence that prompted it. Append-order log, so the
+    // LAST matching line wins; torn lines skip.
+    for (_sessions_root, codex_home) in &homes {
+        if let Some(title) =
+            title_without_fallbacks(codex_session_index_title(codex_home, session_id))
+        {
+            return Some(title);
+        }
+    }
     // 2. THE ROLLOUT'S FIRST REAL USER PROMPT — the metadata SSOT (owner law,
     // 2026-09-06): the row title must EQUAL what the CLI itself displays, and
     // an old codex install's picker renders exactly this prompt (measured
@@ -4723,6 +4767,31 @@ fn codex_first_real_user_prompt(path: &Path) -> Option<String> {
 /// One codex Thread name, read from the catalog projection codex itself
 /// maintains. Read-only with the fleet's WAL hardening (busy timeout, fail
 /// open to `None` — never a partial answer).
+/// The eager-titling index (`<codex home>/session_index.jsonl`) — arm 1.5 of
+/// the codex reader. Measured 2026-09-15 on codex-cli 0.154.0: the CLI
+/// appends `{id, thread_name, updated_at}` here the instant it names a
+/// thread (the same moment the footer's `renaming…` spinner settles), while
+/// the sqlite catalog never received either probe session's row. The
+/// CLI's own word, in the form the 2026-09-05 catalog arm was written for.
+fn codex_session_index_title(codex_home: &Path, session_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(codex_home.join("session_index.jsonl")).ok()?;
+    let mut title = None;
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue; // torn line — the log is appended mid-write by the CLI
+        };
+        if entry.get("id").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        if let Some(name) = entry.get("thread_name").and_then(|v| v.as_str()) {
+            if !name.trim().is_empty() {
+                title = Some(name.to_string());
+            }
+        }
+    }
+    title
+}
+
 fn codex_thread_catalog_title(codex_home: &Path, thread_id: &str) -> Option<String> {
     let db_path = codex_home.join("sqlite").join("codex-dev.db");
     if !db_path.exists() {
@@ -10653,6 +10722,54 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The eager-titling index (measured 2026-09-15 on 0.154.0): the CLI
+    /// appends `{id, thread_name, updated_at}` to `session_index.jsonl` the
+    /// moment it names a thread — the same instant the footer's `renaming…`
+    /// spinner settles — while the sqlite catalog may NEVER receive the row
+    /// (neither probe session's did, re-checked ~40 min later). Arm 1.5
+    /// serves that name — the CLI's own display — OVER the rollout's first
+    /// real prompt, keeping the SSOT equality the owner set (2026-09-06):
+    /// 0.154.0's footer shows "Count to twelve", not the whole sentence that
+    /// prompted it. Torn lines and other sessions' rows skip; the LAST line
+    /// for the id wins.
+    #[test]
+    fn codex_session_index_names_the_thread_the_footer_shows() {
+        let home = std::env::temp_dir().join(format!("ygg-codex-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // A rollout whose FIRST REAL PROMPT differs from the CLI's own name —
+        // the index must win, or the SSOT law is violated on every fresh
+        // 0.154.0 session (the catalog arm misses; without this arm the
+        // prompt would answer).
+        let day = codex_home.join("sessions/2026/09/15");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join("rollout-2026-09-15T10-00-00-test-codex-idx-1.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"test-codex-idx-1\",\"cwd\":\"/tmp/x\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"text\":\"Count slowly from one to twelve, one number per line, then say DONE\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"some-other-thread\",\"thread_name\":\"Not Mine\",\"updated_at\":\"2026-09-15T10:00:00Z\"}\n",
+                "{\"id\":\"test-codex-idx-1\",\"thread_na", // torn line — the CLI appends mid-write
+                "{\"id\":\"test-codex-idx-1\",\"thread_name\":\"first name\",\"updated_at\":\"2026-09-15T10:00:01Z\"}\n",
+                "{\"id\":\"test-codex-idx-1\",\"thread_name\":\"Count to twelve\",\"updated_at\":\"2026-09-15T10:00:02Z\"}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_live_store_title(&home, "test-codex-idx-1").as_deref(),
+            Some("Count to twelve"),
+            "the index name the CLI displays beats the rollout's first prompt",
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The SSOT law over both codex homes (2026-09-06): the litellm fork's
