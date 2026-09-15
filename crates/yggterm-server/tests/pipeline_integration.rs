@@ -854,8 +854,17 @@ fn a_consumed_web_surface_open_never_replays_verbatim_on_attach() {
 
     let mut mgr = TerminalManager::new();
     let key = "test://web-declare-replay";
-    mgr.ensure_session(key, &launch("--scenario web-declare --hold-ms 30000"), None)
-        .expect("ensure_session");
+    // The [11.60] provenance gate retains web-surface declares only from
+    // surface-capable launch commands; this fixture predates that gate and
+    // was missed by its lane (its other fixture was re-launched, this one
+    // was not). Same `command -v ychrome` capability marker that fixture
+    // uses — states the class in the launch string, harmless to run.
+    mgr.ensure_session(
+        key,
+        &format!("command -v ychrome; {}", launch("--scenario web-declare --hold-ms 30000")),
+        None,
+    )
+    .expect("ensure_session");
     let first = wait_for_text(&mgr, key, "MOCK_WEB_DECLARE_0_open", Duration::from_secs(5));
     // The just-launched sliver: the record's latest action is still `open`, so
     // the replayed open IS the current declare and serves verbatim — the same
@@ -920,6 +929,7 @@ fn a_consumed_web_surface_open_never_replays_verbatim_on_attach() {
 // proof is that the daemon LIFTS the frames off a live PTY.
 #[test]
 fn a_native_announce_frame_lands_as_a_retained_record_and_answers_the_gate() {
+    use yggterm_core::descriptor_v2::AgentPhase;
     use yggterm_server::app_declare::{announce_working_signal, fresh_agent_announce};
 
     fn now_unix_ms() -> u64 {
@@ -929,7 +939,7 @@ fn a_native_announce_frame_lands_as_a_retained_record_and_answers_the_gate() {
             .unwrap_or_default()
     }
 
-    fn fresh_phase(mgr: &TerminalManager, key: &str) -> Option<(String, bool)> {
+    fn fresh_phase(mgr: &TerminalManager, key: &str) -> Option<(AgentPhase, bool)> {
         let records = mgr.session_app_declares(key)?;
         let announce = fresh_agent_announce(&records, now_unix_ms())?;
         let working = announce_working_signal(&records, now_unix_ms())?;
@@ -953,7 +963,7 @@ fn a_native_announce_frame_lands_as_a_retained_record_and_answers_the_gate() {
     while Instant::now() < deadline {
         if let Some((phase, working)) = fresh_phase(&mgr, key) {
             assert_eq!(
-                phase, "Working",
+                phase, AgentPhase::Working,
                 "the first frame must land as the retained announce"
             );
             assert!(working, "a Working announce must answer the gate Some(true)");
@@ -975,7 +985,7 @@ fn a_native_announce_frame_lands_as_a_retained_record_and_answers_the_gate() {
     let mut saw_idle = false;
     while Instant::now() < deadline {
         if let Some((phase, working)) = fresh_phase(&mgr, key) {
-            if phase == "Idle" {
+            if phase == AgentPhase::Idle {
                 assert!(
                     !working,
                     "an Idle announce must answer the gate Some(false), not fall through"
