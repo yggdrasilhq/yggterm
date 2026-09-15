@@ -672,10 +672,11 @@ fn integrated_npm_dist_tag(package: &str) -> Option<&'static str> {
 }
 
 fn fetch_package_manifest(package: &str, pin: Option<&str>) -> anyhow::Result<Manifest> {
-    // Integrated package policy is part of the core descriptor. In
-    // particular, opencode2 is the beta-tagged v2 TUI; the package's npm
-    // `latest` tag is an older beta and would make both ynpm and ynpx appear
-    // successful while silently leaving opencode2 behind.
+    // Integrated package policy is part of the core descriptor. The
+    // opencode2 history is the reason this hook exists: a beta-tag pin that
+    // was right in August read as "current forever" once its package stopped
+    // publishing (2026-09-07); the live `@opencode/cli` needs no tag — its
+    // `latest` IS the v2 stable line.
     fetch_manifest(package, pin.or_else(|| integrated_npm_dist_tag(package)))
 }
 
@@ -6245,7 +6246,11 @@ mod tests {
 
     #[test]
     fn the_integrated_opencode2_package_uses_the_beta_tag() {
-        assert_eq!(integrated_npm_dist_tag("@opencode-ai/cli"), Some("beta"));
+        // The live opencode package carries NO tag pin (latest = the v2
+        // stable line); the dead preview package must never resolve to beta
+        // again.
+        assert_eq!(integrated_npm_dist_tag("@opencode/cli"), None);
+        assert_eq!(integrated_npm_dist_tag("@opencode-ai/cli"), None);
         assert_eq!(integrated_npm_dist_tag("@openai/codex"), None);
     }
 
