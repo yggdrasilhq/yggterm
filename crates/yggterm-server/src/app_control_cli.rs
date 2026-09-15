@@ -246,7 +246,7 @@ pub fn server_app_usage_block(binary: &str) -> String {
     the pointer hit-tests in the sidebar). This is how an agent verifies a
     reorder without touching the screen — read `server app rows` before/after and
     `drag_paths`/`drag_hover_target` in `server app state`.
-  {binary} server app pointer <move|down|up|click|drag|scroll> [--x <px> --y <px>] [--start-x <px> --start-y <px> --end-x <px> --end-y <px>] [--button left|right|middle] [--count n] [--steps n] [--step-delay-ms n]
+  {binary} server app pointer <move|press|release|click|double-click|drag|scroll> [--x <px> --y <px>] [--start-x <px> --start-y <px> --end-x <px> --end-y <px>] [--button left|right|middle] [--count n] [--steps n] [--step-delay-ms n]
     synthetic pointer gesture for Wayland/KWin where OS-level `xdotool`/`wtype`
     cannot be trusted (and where a real pointer would steal focus). Prefer `drag`
     for row-sets — this is the low-level fallback for pixel work and for probes

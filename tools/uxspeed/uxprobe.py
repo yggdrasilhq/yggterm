@@ -9,6 +9,11 @@ this run are never mutated; teardown removes exactly what the run spawned.
 Actions:
   spawn  — server app terminal new → wait first_frame in ytrace
   drag   — server app drag begin/hover/drop reorder of two scratch rows
+  felt   — the REAL input-plane drag: pointer down on a scratch row, dwell
+           under the 6px threshold, cross it, hover across rows, release on
+           the target (server app pointer + dom-eval rects); asserts the
+           felt-path falsifiers from the trace (no merges pre-begin/in-drag),
+           the reorder, and records app-render counts for [11.129]
   group  — server app row-set --into / --out on two scratch rows
   menu   — server app terminal probe-context-menu on a scratch row
   modal  — the delete-confirm dialog on a scratch row, opened through the
@@ -477,6 +482,122 @@ class Probe:
             self.wait_order(b_path, a_path)
         return summarize(out, key="commit_ms")
 
+    def _row_rects(self, paths: list[str]) -> dict:
+        """Sidebar DOM rects for row paths, via one dom-eval. The sidebar
+        virtualizes — the caller must `tree select` first so nodes exist."""
+        js = """const out = {};
+for (const p of __PATHS__) {
+  let el = null;
+  for (const n of document.querySelectorAll('[data-sidebar-row-path]')) {
+    if (n.getAttribute('data-sidebar-row-path') === p) { el = n; break; }
+  }
+  if (!el) { out[p] = null; continue; }
+  const r = el.getBoundingClientRect();
+  out[p] = { x: r.x, y: r.y, w: r.width, h: r.height };
+}
+dioxus.send(out);
+""".replace("__PATHS__", json.dumps(paths))
+        r = self.verb("dom-eval", js, timeout=15)
+        reply = r.get("json") or {}
+        return (reply.get("data") or {}).get("result") or {}
+
+    def _events_between(self, t0: int, t1: int) -> list[dict]:
+        return [e for e in self.ytrace_events(t0) if e.get("ts_ms", 0) <= t1]
+
+    def action_felt(self, iters: int) -> dict:
+        """The felt drag: real pointer events, not the drag verbs. A FRESH
+        scratch pair per iteration (no drag-back restore to go wrong): press
+        on A, DWELL under the 6px threshold (sub-threshold moves — must merge
+        nothing and not begin), cross the threshold (tree_drag_begin fires
+        here), hover across row boundaries, release on B's lower half (the
+        After band) — then assert the reorder and the trace falsifiers. All
+        spawned rows close in the shared teardown."""
+        out = {"iterations": []}
+        for i in range(iters):
+            rows = [self.spawn_scratch_row(i * 2 + k) for k in range(2)]
+            paths = [r.get("path") for r in rows if "path" in r]
+            if len(paths) < 2:
+                out["iterations"].append({"accuracy_failures": [
+                    "spawn failed: %s" % [r.get("error") for r in rows
+                                          if "error" in r]]})
+                continue
+            a_path, b_path = paths
+            time.sleep(0.4)  # let the spawn-promotion apply settle first
+            self.verb("tree", "select", a_path)
+            self.verb("tree", "select", b_path)
+            time.sleep(0.2)
+            rects = self._row_rects([a_path, b_path])
+            ra, rb = rects.get(a_path), rects.get(b_path)
+            acc = []
+            if not ra or not rb:
+                out["iterations"].append({"accuracy_failures": [
+                    "row node not rendered (virtualized out?) — rects missing"]})
+                continue
+            ax = ra["x"] + min(ra["w"] / 2, 120.0)
+            ay = ra["y"] + ra["h"] / 2
+            ux = rb["x"] + min(rb["w"] / 2, 120.0)
+            uy = rb["y"] + rb["h"] * 0.75
+            it = {"dwell_steps": 0, "hover_steps": 0}
+            t_down = now_ms()
+            rd = self.verb("pointer", "press", "--x", str(int(ax)),
+                           "--y", str(int(ay)))
+            it["down_ms"] = rd["wall_ms"]
+            dwell_t0 = now_ms()
+            for dy in (2, 1, -1):
+                self.verb("pointer", "move", "--x", str(int(ax + 2)),
+                          "--y", str(int(ay + dy)))
+                time.sleep(0.12)
+                it["dwell_steps"] += 1
+            dwell = {e.get("name") for e in self._events_between(
+                dwell_t0, now_ms())}
+            it["dwell_merge_events"] = sorted(
+                e for e in dwell if e == "merge_rows_breakdown")
+            it["dwell_drag_events"] = sorted(
+                e for e in dwell if e and "drag" in e.lower())
+            cross_t = now_ms()
+            self.verb("pointer", "move", "--x", str(int(ax)),
+                      "--y", str(int(ay + 40)))
+            for s_i in range(1, 5):
+                y = ay + 40 + (uy - ay - 40) * s_i / 4
+                self.verb("pointer", "move", "--x", str(int(ux)),
+                          "--y", str(int(y)))
+                time.sleep(0.05)
+                it["hover_steps"] += 1
+            self.verb("pointer", "release")
+            flipped, flip_ms = self.wait_order(b_path, a_path)
+            it["felt_ms"] = now_ms() - t_down
+            it["reorder_settle_ms"] = flip_ms
+            evs = self._events_between(t_down, now_ms())
+            names = [e.get("name") for e in evs]
+            begins = [e["ts_ms"] for e in evs
+                      if e.get("name") == "tree_drag_begin"]
+            it["drag_events"] = sorted({n for n in names
+                                        if n and "drag" in n.lower()})
+            it["merge_events_in_drag"] = sum(
+                1 for n in names if n == "merge_rows_breakdown")
+            it["merges_in_drag_detail"] = [
+                {"ts_offset_ms": e.get("ts_ms", 0) - t_down,
+                 "rows": (e.get("payload", {}).get("payload",
+                          e.get("payload", {})) or {}).get("merged_row_count"),
+                 "total_ms": round((e.get("payload", {}).get("payload",
+                                    e.get("payload", {})) or {})
+                                   .get("total_ms") or 0, 1)}
+                for e in evs if e.get("name") == "merge_rows_breakdown"]
+            it["begin_within_cross_step"] = bool(begins)
+            if not begins:
+                acc.append("no tree_drag_begin in the gesture window")
+            if it["dwell_merge_events"]:
+                acc.append("merges fired during the sub-threshold dwell: %s"
+                           % it["dwell_merge_events"])
+            if it["dwell_drag_events"]:
+                acc.append("drag events fired during the dwell (began early?):"
+                           " %s" % it["dwell_drag_events"])
+            if not flipped:
+                acc.append("drop did not land A after B within timeout")
+            it["accuracy_failures"] = acc
+            out["iterations"].append(it)
+        return summarize(out, key="felt_ms")
+
     def action_group(self, iters: int) -> dict:
         rows_ready = self.ensure_two_scratch_rows()
         if len(rows_ready) < 2:
@@ -727,7 +848,7 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close")
+                    default="spawn,drag,group,menu,modal,close,felt")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -759,6 +880,8 @@ def main() -> int:
                 report["actions"]["spawn"] = probe.action_spawn(args.iters)
             elif action == "drag":
                 report["actions"]["drag"] = probe.action_drag(args.iters)
+            elif action == "felt":
+                report["actions"]["felt"] = probe.action_felt(args.iters)
             elif action == "group":
                 report["actions"]["group"] = probe.action_group(args.iters)
             elif action == "menu":
