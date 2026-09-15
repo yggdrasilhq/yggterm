@@ -30835,29 +30835,13 @@ checks the threshold FIRST (pure math), and begins from the stored row — zero
 row-list work per move, at any tree size. Regression lock:
 `the_felt_drag_path_pays_no_sidebar_merge_per_pointer_event` (source half + behavioral half).
 
-## ⛔ [11.128] EVERY ACCEPTED DRAG HOVER REBUILDS THE FULL MERGED SIDEBAR ROW LIST ON THE UI THREAD — `set_drag_hover_target` RAN `merged_sidebar_rows` PER 8px/TARGET-CHANGE STEP (~220 ms UNCACHED AT 2583 ROWS) TO ANSWER ONE `resolve_drag_drop_target` QUESTION (code-located 2026-09-15 ~18:30 IST on main 33b5e89b, GUI host, the ux-speed drag-feel lane; probe under-feels it — scratch trees are 18-422 rows where the same merge is ~5 ms)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Falsifier: on the adopted build, one drag across N targets issues at most ONE `merge_rows_breakdown` pair attributable to the hover path (the begin window's own apply tail excepted, [11.117]); the drop indicator tracks the pointer at owner-scale tree size without per-step stalls.
-
-`set_drag_hover_target` unconditionally rebuilt `merged_sidebar_rows(...)`
-(browser rows + remote machines + ssh targets + live sessions + expansion set —
-the full sidebar, 2583 rows live) to pass `resolve_drag_drop_target`, which only
-needs the flattened order for validity (no own-subtree drops) and placement.
-The felt drag fires it per accepted hover (pointer ≥8px since last record, or
-target changed) — dozens per second during a real drag, each a full merge on the
-UI thread: the drop indicator and ghost visibly trail the pointer — the owner's
-"laggy". The verb probe measured hover walls 175-214 ms and could not see the
-merge because its scratch trees are small ([11.125]'s crawl measurement supplies
-the owner-scale number). FIX (lane/uxspeed/drag-feel): the merged rows are
-cached for the LIFETIME of the drag — filled on first hover, reused for every
-subsequent hover, cleared by `begin_drag` (fresh gesture) and
-`clear_drag_state` (gesture end). A drag resolves drops against the same
-snapshot the user is looking at; staleness during a seconds-long drag is
-WYSIWYG, not a defect. Regression lock: the behavioral half of
-`the_felt_drag_path_pays_no_sidebar_merge_per_pointer_event` (same Vec pointer
-across hovers; `None` after clear).
+PROVEN SO FAR (2026-09-15 ~19:45 IST, rotated build 337590a219f7): the source
+lock is green on main, and the live trace shows ZERO `merge_rows_breakdown`
+pairs inside any `tree_drag_begin`..`tree_drag_ended` window across 5 synthetic
+drags (walls steady, reorder accuracy 4/4). Still owed: the FELT mouse-path
+observation — the verb probe never crosses the pre-begin window, so the
+crawl-free start is pinned by the source lock until a human drag (or a
+pointer-injection driver) confirms felt start on the owner-scale tree.
 
 ## ⛔ [11.129] EVERY DRAG-POINTER STATE WRITE RE-RENDERS THE WHOLE SHELL — `ShellState` IS ONE DIOXUS SIGNAL, SO THE GHOST CARD'S 8px STEP (window-level move handler → `update_drag_pointer` → full-state write) PAIRS WITH A FULL `app` COMPONENT RENDER WHOSE COST SCALES WITH THE TREE THE GHOST CROSSES (measured 2026-09-15 ~18:40 IST, live build 33b5e89b, the ux-speed drag-feel lane; trace `dioxus_render/component_window`)
 
