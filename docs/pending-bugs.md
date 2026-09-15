@@ -406,6 +406,60 @@ one live daemon row; probe rows despawned; measured on the GUI host):
 
 > ⚠ **UPDATE 2026-09-15:** the install this section measured is GONE — ynpm now serves `@opencode/cli` 2.0.3 on the fleet (`@opencode-ai/cli` went dead upstream 2026-09-07; channel map and client/server-skew facts in hub door sitting-2026-09-15-opencode-v2-channel-migration). Everything below is last-generation (beta-19271) lineage: treat as history, and run the owed re-decode (c) against 2.0.3 before reusing any of it. A 2.0.3 TUI client was measured RENDERING against a beta-19271 service (skew tolerated); the store keeps `session_v2` and gains worktree/workspace/session_inbox/session_pending/session_message tables.
 
+#### [11.123] pipeline_integration test target does not compile on main (pre-existing)
+
+**Status:** OPEN
+
+Found 2026-09-15 (zcode sess_352af865) while gating
+lane/cli/opencode-package-v2: `cargo check -p yggterm-server --test
+pipeline_integration` fails with E0308 at
+`tests/pipeline_integration.rs:936` — `Some((announce.phase, working))`
+returns `AgentPhase` where `fresh_phase`'s signature says `String`
+(introduced by 5d770880's NativeAnnounce lock test). Invisible to ygg-ci
+because the build gate is bin-only (`cargo build --release --bin ...`),
+which never compiles test targets. Fix is one line
+(`announce.phase.to_string()` or widen the tuple type) + consider a
+`cargo check --tests` step in the gate so test targets cannot rot again.
+
+#### 11.6.3 re-decode (opencode 2.0.3, zcode sess_352af865, 2026-09-15, dev/jojo)
+
+The owed re-decode (c), run live against the installed 2.0.3 (`@opencode/cli`;
+the descriptor repin landed as lane/cli/opencode-package-v2 → main 6a1f5919,
+deployed same hour):
+
+1. **Service registration UNCHANGED** — `service.json` shape identical
+   (id/version/url/pid/password, Basic `opencode:<pw>`); yggterm's
+   `opencode_service.rs` reader works as-is. Measured on jojo's live 2.0.3
+   service.
+2. **`/api/session/active` UNCHANGED** — idle `{"data":{}}`, same
+   working-set semantics.
+3. **View verb contract HALF-CHANGED.** `POST /api/session/{id}/view` still
+   REQUIRES `{"idle": <epoch-ms>}` (missing key → 400), success → 204 — the
+   landed [11.6.3-b] fix stays syntactically correct. ⚠ But the write NO
+   LONGER LANDS: `session_v2.time_viewed` stays NULL after a 204 and the GET
+   session object's `time` has no `viewed` field at all (measured twice, rw
+   sqlite + API). The verb is accepted-and-ignored on 2.0.3. Consequence:
+   yggterm's focus-verb write is a harmless no-op; any tab-mirror follow
+   proof that expects time_viewed to move (the door's Owed (b)) can never
+   see it. Viewing from OSC title alone remains the only valid source —
+   the door's 2026-09-10 conclusion HOLDS, now for a second reason.
+4. **Store: session_v2 intact + additive columns** — new: `time_idle`,
+   `idle_outcome`, `workspace_id`, `parent_id`, `fork_session_id`,
+   `fork_boundary`, `time_suspended`, `resume_attempts`. New tables:
+   worktree, workspace, session_inbox, session_pending, session_message.
+   The StoreIndex recency reader (max(time_viewed, time_updated)) still
+   works; time_viewed just stays NULL so recency = time_updated.
+5. **API surface: 119 → 123 paths** (+ /api/workspace POST/DELETE,
+   /api/worktree GET/POST/DELETE, /api/worktree/refresh) and responses are
+   ENVELOPED `{"data": ...}` with camelCase keys and nested
+   `time:{created,updated}` on session objects — any API-parse path needs
+   the envelope; store-authoritative readers are unaffected.
+6. **OSC title** still generic (`OpenCode`) at idle; title_authority=Store
+   unchanged. ⚠ OWED: the working-phrase needle "esc interrupt" showed 0
+   hits in the IDLE render — a live-turn capture must re-verify the needle
+   before the descriptor's working_screen_phrases can be trusted on 2.0.3.
+
+
 The server-side session-truth decode the family table asks for, measured
 against the INSTALLED service on dev (`opencode2 serve --service`, pid
 2996638, version 0.0.0-beta-19271; registration
