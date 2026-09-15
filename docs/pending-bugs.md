@@ -31,11 +31,11 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); muse LANDED (suites/muse.js, 2026-09-15, 8/8 live, re-measured 1.3.0); claude LANDED (suites/claude.js, 2026-09-15, 6/6 twice live on 2.1.272 — turn/resume honest nulls: fleet subscription access is DEAD, see the 11.6.2 row); opencode LANDED (suites/opencode.js, 2026-09-15, 10/10 twice live on 2.0.3 — turns are REAL: 2.0.3 ships a free built-in model, no auth needed); remaining: agy, qwen, pi, codex-litellm, devin |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); muse LANDED (suites/muse.js, 2026-09-15, 8/8 live, re-measured 1.3.0); claude LANDED (suites/claude.js, 2026-09-15, 6/6 twice live on 2.1.272 — turn/resume honest nulls: fleet subscription access is DEAD, see the 11.6.2 row); opencode LANDED (suites/opencode.js, 2026-09-15, 10/10 twice live on 2.0.3 — turns are REAL: 2.0.3 ships a free built-in model, no auth needed); agy LANDED (suites/agy.js, 2026-09-15, 9/9 live on 1.2.3 — the first 11.6.4 battery: trust gate re-verified verbatim behind a NEW launch sign-in phase, dead working needles retired, the picker's dead same-line shape fixed, resume rederive + presence lock proven); remaining: qwen, pi, codex-litellm, devin |
 | 11.6.1 | codex | A | Battery suite LANDED 2026-09-15 (lane/integration/codex-battery, suites/codex.js 8/8 twice live on 0.154.0): every declared fact HOLDS (trust-gate needles verbatim — its warning text grew; `• Working (Ns • esc to interrupt)`; `›` marker; rollout filename-uuid law; resume id-reuse PROVEN by a follow-up turn appending to the SAME rollout; help surface holds, `resume --last` additive). Titling drift MEASURED + READER FIXED: 0.154.0 names threads eagerly (footer `renaming…` spinner → title; `session_index.jsonl` appended instantly) but the sqlite catalog received NO row for either probe session (~40 min checked) — `read_codex_live_store_title` gained arm 1.5 reading `session_index.jsonl` (test `codex_session_index_names_the_thread_the_footer_shows`), keeping the SSOT equality (CLI display beats first-prompt). STILL OPEN: ledger reattach in the resume wrapper; kill the 12s /proc poll |
 | 11.6.2 | claude | A | Battery suite LANDED 2026-09-15 (lane/integration/claude-battery, suites/claude.js 6/6 twice live on 2.1.272 — the FIRST 11.6.2 measurement): ❯ marker holds; idle footer `⏸ manual mode on · ? for shortcuts · ← for agents`; working footer hint `esc to interrupt` re-confirmed in the spinner-phase footer (swap law holds); trust gate did NOT fire on a fresh /tmp cwd on either host (needles stay declared); help surface re-verified incl. `--session-id`/`--resume`; unauthed session writes NO rollout bucket (measured negative). ⛔ TURNS ARE CREDENTIAL-DEAD FLEET-WIDE, OWNER ACTION: muse-lab host's `~/.claude/.credentials.json` OAuth tokens EMPTIED since 2026-09-08 (access+refresh empty, TUI says `Not logged in · Run /login`); CI host's tokens present but the ORG has disabled Claude subscription access for Claude Code (`claude -p` refuses: "Use an Anthropic API key instead, or ask your admin to enable access"). Turn/resume facts are honest nulls until auth returns — the suite un-nulls itself on re-run. STILL OPEN: ledger reattach; the turn working needles on a REAL turn |
 | 11.6.3 | opencode | B | 2.0.3 RE-DECODE DONE + battery suite LANDED 2026-09-15 (lane/integration/opencode-battery, suites/opencode.js 10/10 twice live on 2.0.3). HOLDS: working needle `esc interrupt` (verbatim, progress-squares prefixed), `--session`/`--auto` flags, store session_v2 + async auto-titling, service.json handshake, view-verb 204/400. DRIFT LANDED IN CODE: model_flag became Option — opencode None (the 2.0.3 parser REJECTS any unknown top-level flag: help + exit 1, TUI never launches; `--model` survives only on run/mini; launch_tokens refuses, test `a_model_pin_on_a_cli_without_a_top_level_model_flag_refuses`); content_rederives_on_resume flipped true (resume re-renders the transcript); composer/working footer hints re-measured. FILED OPEN: [11.133] (composer ❯ marker dead — needs the gate shape), [11.134] (unknown --session silently falls back to the latest session). ⚠ DEPLOYMENT HAZARD: managed port 49374 is host-global — a foreign opencode service holding it wedges every 2.0.3 TUI at "Starting background server..." forever; the muse-lab-host bin re-point has REVERTED (a ynpm sync restored the dead-generation link), so production rows still spawn beta-19271 and 2.0.3 is launch-blocked until the beta service exits |
-| 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107]); [11.96] store half resolved upstream on 1.2.2, fallback half fixed in code; baseline below |
+| 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107], on main via the re-merged tip 8cf1396d; the d0a34240 merge failed its build and was reset); [11.96] store half resolved upstream + LIVE on 1.2.3 (authored titles in conversation_summaries.db; the daemon title-follow tick reads it — store_silent correctly for conversation-less rows); battery suite LANDED 2026-09-15 (suites/agy.js 9/9 live on 1.2.3): 1.2.0-era dead working needles RETIRED (esc to cancel + generating... hold), the question picker's same-line shape FALSIFIED and fixed (1.2.3 draws the two lines apart — a question row classified as Working), launch now has a SIGN-IN PHASE that eats typed input, resume of a COMPLETED conversation rederives then exits 0 (below); [11.107] GUI-path proof re-rides the next GUI-host rotation |
 | 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); RE-MEASURED 1.3.0 live via the new battery suite (8/8) — every hard declared fact holds (gate needles, U+276F, `esc to interrupt`, resume banner + rederive, `--yolo`); 1.3.0 drift recorded (spinner ◇◈◆ are frames of ONE line, `.session.lock` gained `host=`, subagent locks shadow the session lock, session-index.db diverges from the day dirs); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
 | 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer FIXED IN CODE — region-label composer shape in the readiness gate (entry below); working phrases still login-gated-unverified |
 | 11.6.7 | qwen | C | OPEN |
@@ -181,6 +181,16 @@ naming.
 this fix — raw wire on a lane-built scratch daemon; GUI path on the next
 GUI-host daemon rotation.
 
+**2026-09-15 STATUS (11.6.4 battery seat):** the fix IS on main — via the
+RE-MERGED tip 8cf1396d (merge a3bb77c4, 09-14 09:28); the memory-recorded
+merge d0a34240 (tip 51dca412) FAILED ITS BUILD, was quarantined and main was
+reset at 09:16 — it never reached origin/main, which is why ancestry greps
+against it miss. The GUI-host daemon build in place on 2026-09-15 night
+(ac12a6da) contains the fix; the first GUI-path attempt spawned a wrapper agy
+row whose runtime produced ZERO bytes (no process, row lingering, gate verdict
+empty) on the churn-night dirty daemon — row evicted, proof re-rides the next
+rotation onto a fresh build.
+
 ## ⛔ [11.94] AGY'S WORKSPACE-TRUST GATE IS UNDECLARED AND EATS SUBMITTED INPUT — A PROGRAMMATIC SEND INTO IT IS LOST AND ITS OWN ENTER CONFIRMS THE GATE (filed 2026-09-10)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -325,6 +335,54 @@ the fallback half FIXED IN CODE:**
   `humanized_title_for_copy_target_uses_home_user_shell_title` stays
   green). Falsifier: no agent-kind row may wear a `… Shell` recovered
   label — `an_agent_row_never_gets_a_shell_fallback_name` locks it.
+
+#### 11.6.4 battery re-measure (2026-09-15, the GUI host — agy 1.2.3, suites/agy.js 9/9 live)
+
+Three live drives (two full-green). What 1.2.3 changed, all measured:
+
+1. **Launch sign-in phase (NEW).** agy now opens "Welcome to the Antigravity
+   CLI. You are currently not signed in." → "⣾ Signing in..." (spinner) → the
+   signed-in composer, ~8-15s warm. ⛔ Input typed during the phase is
+   DISCARDED SILENTLY — the [11.94] eat mechanism one phase earlier; the
+   battery's pass 1 lost its whole turn to it. The suite waits for a `>`
+   composer line before touching the keyboard.
+2. **Trust gate re-verified verbatim** ("Do you trust the contents of this
+   project?" / "> Yes, I trust this folder" / "No, exit"), firing AFTER the
+   sign-in phase on a fresh folder; Enter on the highlighted row clears it and
+   lands the folder in agy's own `settings.json → trustedWorkspaces` (never
+   written by yggterm).
+3. **Working needles: 2 of 5 dead.** `esc to cancel` + `generating...` hold
+   (spinner line "⣯  Generating..." inside the footer window); `esc to
+   interrupt`, `thinking...`, `working...` never sampled across two full
+   turns — RETIRED from the descriptor tables ([11.111] precedent).
+   `Thought for Ns`/`Running command...` are false-working candidates
+   (transcript persists) and stay OUT.
+4. **Question picker geometry FALSIFIED.** 1.2.3 draws `Requesting permission
+   for:` and `Run this command?` on SEPARATE lines (label / command / blank /
+   question / numbered options), so the descriptor's same-line also_any could
+   never match and a question row classified as Working — the busy-forever
+   failure the 09-10 note warns about. Fixed: both strings are standalone
+   needles. (Measured on the untrusted-folder drive; under a trusted folder
+   the same ask neither picker'd nor ran in 180s twice — recorded honestly.)
+5. **Resume of a COMPLETED conversation rederives then EXITS 0 in ~3s**
+   (twice, `--conversation <id>`: transcript rederives, composer paints, then
+   clean exit — the panic falsifier had nothing to kill twice). Wrapper
+   resume of a done row therefore dies after replay on 1.2.3; candidate
+   upstream behavior change, unfiled as a defect pending a healthy-daemon
+   retest. Pass 1 also measured ONE exit-0 right after the first tool
+   approval on an untrusted folder, with a crash log flashing in `crashes/`
+   and auto-removed within minutes (single observation, confounded).
+6. **Store + title ([11.96] live).** The conversation db flushes DURING a
+   live turn (pass 1's crash case flushed only at exit); sentinel-in-content
+   attribution is mandatory (sibling live rows on the lab host create dbs
+   concurrently — mtime lies). `conversation_summaries.db` carries AUTHORED
+   titles again on 1.2.3 (e.g. "Counting To Thirty" for a battery turn), and
+   the daemon's row_title_follow_tick reads it live — `store_silent`
+   correctly for a conversation-less row. Resume rederives + re-creates the
+   presence lock. 1.2.3 help adds --effort, --input-format/--output-format
+   (stream-json), --json-schema, --print, --prompt-interactive, --add-dir,
+   --agent, --project, --new-project + agent/mcp/plugin/remote-control
+   subcommands; all six declared flags spell the same.
 
 #### 11.6.4 measured baseline (wave-1 seat C, 2026-09-10, guihost — agy 1.2.0)
 
