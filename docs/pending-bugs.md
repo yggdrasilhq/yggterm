@@ -30404,7 +30404,34 @@ carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 
 ## ⛔ [11.121] ON A DIRECT-CHANNEL HOST THE HOURLY ROLL IS A DEAD WRITE FOR THE LIVE STACK — THE GUI AND DAEMON RUN A SEP-11 DIRECT BUILD WHILE THREE LANDED UX FIXES SIT EXECUTED-NEVER IN THE MANAGED LAYOUT, AND BOTH RESTART DOORS ARE BLIND TO SAME-VERSION REBUILDS (traced 2026-09-15 ~02:00 IST, GUI host, the drag-cold lane's re-probe)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+> **LANDED 2026-09-15** (lane/uxspeed/direct-channel-deploy, the ux-speed
+> campaign): deploy-fleet.sh now adopts the direct channel per host, in the
+> channel's own shape. After the managed copies, a host whose install-state
+> reads channel=direct gets the four binaries staged into the direct root and
+> the install-state flipped atomically (tmp + os.replace, other fields
+> preserved): a strictly-newer VERSION stages versions/<v>/ and flips
+> active_version/active_executable/icon_revision (dev's channel, frozen at
+> 3.2.105 since the outage, is the live example); a same-version rebuild stages
+> builds/<commit>/ and flips ONLY active_executable — a path outside versions/
+> makes no version claim (install_path_declared_version returns None), so the
+> record's word stands, handoff_target_is_usable passes, and the pending
+> update becomes visible to BOTH doors that could not see it: the GUI update
+> workflow and server app update restart (which the deploy then fires,
+> unforced — the agent-lease guard still refuses a mid-flow restart, and a
+> refusal is reported as staged/deferred, never as adopted). The flip is
+> one-shot by construction (preferred == current once adopted), which is the
+> 2026-09-04 same-version convergence-loop property any rebuild-adopter must
+> have; convergence itself is untouched. Firing is skipped when the live
+> /proc/*/exe md5s already match the staged build, or when nothing yggterm is
+> running. Also fixed while here: the census and the stale-GUI warning
+> classified the direct root as "sandbox", so the ONE GUI that runs the
+> install was invisible to the staleness report on exactly the host [11.121]
+> is about. Sandbox-tested end-to-end (flip semantics, field preservation,
+> KEEP sentinel, corrupt-state failure, sed read-back) and dry-run-proven
+> against dev (release arm) and jojo (rebuild arm). The staged builds prune to
+> the newest three, never the active one.
 
 The deploy plane and the install plane diverge on the GUI host, and the
 gap silently strands every GUI/daemon-side fix the roll lands:
