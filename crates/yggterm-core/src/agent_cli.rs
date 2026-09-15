@@ -3400,6 +3400,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("grok"),
         remote_row_scheme: Some("remote-grok://"),
         runtime_key_scheme: Some("grok-runtime://"),
+        // ✓ RE-VERIFIED on 1.0.30 (2026-09-15, suites/grok.js): the same
+        // spinner line (`⠙ Waiting for response… <N>s … ⇣<bytes> [stop]`)
+        // and the same footer swap; the dead-needle alarm did not fire.
         // ⛔ THE 1.0.3-ERA NEEDLES ARE GONE (measured 2026-09-10 on grok
         // 1.0.24, two live turns incl. one tool call): `esc to cancel`,
         // `esc to interrupt`, `thinking...` and `working...` NEVER appear.
@@ -3428,13 +3431,18 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `Ctrl+b:send to bg` to the hint bar — the background-agent
         // affordance this table exists for (hint-present + working-false is a
         // healthy idle row, never a work signal).
-        background_agent_hint_screen_phrases: &[ScreenWorkingPhrase {
-            needle: "ctrl+b:send to bg",
-            also_any: &[],
-        }],
+        // ⛔ MEASURED GONE on 1.0.30 (2026-09-15, probe-battery
+        // suites/grok.js, three live turns, full-screen windowed search):
+        // the settled post-turn footer is `Shift+Tab:mode │
+        // Ctrl+x:shortcuts` and the bg hint is never drawn. Empty is the
+        // honest table: the arm answers false, and nothing may claim a
+        // background agent from chrome alone.
+        background_agent_hint_screen_phrases: &[],
         startup_gate_screen_phrases: &[],
         plan_limit_choice_screen_phrases: &[],
-        // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`.
+        // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`. 1.0.30's help
+        // (2026-09-15) also spells `--continue` as an alias of the same
+        // selector; the declared flag stays `--resume`.
         resume_selector: ResumeSelector::Flag("--resume"),
         // grok takes the process cwd (`--cwd <CWD>` exists but the launch
         // command already `cd`s), and `--resume` scopes title matching to the
@@ -3456,7 +3464,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // adjacent to the same status line in the binary and could belong to
         // either the idle composer or the in-flight footer, and a hint in the
         // wrong half makes a working row read as a prompt.
-        composer_footer_hints: &["/help for commands", "ctrl", "grok"],
+        // ⛔ RE-MEASURED 2026-09-15 on 1.0.30: `/help for commands` is not
+        // drawn; the idle bar under the composer box is `Shift+Tab:mode │
+        // Ctrl+x:shortcuts` beneath an upgrade tip line. The in-flight bar
+        // swaps in `Ctrl+c:cancel` (working_footer_hints).
+        composer_footer_hints: &["shift+tab:mode", "ctrl+x:shortcuts"],
         // MEASURED 2026-09-10 on 1.0.24: the hint bar swaps to
         // `Ctrl+c:cancel` for the turn's duration; idle has NO Ctrl+c. This
         // is the row plane's honest work signal now that the old footer
@@ -3553,10 +3565,15 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // pid-liveness-checked from one file. It is deliberately NOT in
         // `durable_store_files` (it holds live sessions only, not history);
         // the declared StoreIndex rebind chain (descriptor_v2 §2.2) already
-        // names it. Also measured: `events.jsonl` carries machine phase
+        // names it. Re-measured 2026-09-15 on 1.0.30: the registry still
+        // answers (and a SIGKILLed session's entry LINGERS with a dead pid —
+        // the rebind chain's liveness check is what makes that harmless).
+        // Also measured: `events.jsonl` carries machine phase
         // events (`phase_changed` → `streaming_text`, `turn_ended
-        // outcome=completed`) — the wire-grade phase source for a future
-        // event-fed classifier; `--resume <id>` REUSES the session id and
+        // outcome=completed`; reasoning models also emit
+        // `streaming_reasoning`, measured 2026-09-15 on 1.0.30) — the
+        // wire-grade phase source for a future event-fed classifier;
+        // `--resume <id>` REUSES the session id and
         // re-registers it under the new pid (forking only via
         // `--fork-session`).
         // The `.lock` siblings are not matched by the glob, so nothing to exclude.
