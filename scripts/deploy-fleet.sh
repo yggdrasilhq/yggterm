@@ -838,33 +838,69 @@ $open_exe_paths
   # live process still runs different bytes; after adoption the door is a
   # no-op and re-firing it every roll would be noise wearing a ✅.
   if [ "$DIRECT_RESTART" = 1 ]; then
-    livemd5s=$(run_on "$host" 'for p in $(pgrep -x yggterm 2>/dev/null) $(pgrep -f "yggterm-headless server daemon" 2>/dev/null); do
+    # ⛔ ROTATION IS PER PLANE. The GUI door and the daemon handoff are
+    # different processes with different gates; a roll that fired one because
+    # the other was stale (or skipped both because one was current) misreports
+    # both. Probe the two planes separately and rotate each only when ITS
+    # bytes differ from the staged build.
+    guimd5s=$(run_on "$host" 'for p in $(pgrep -x yggterm 2>/dev/null); do
                   [ -r "/proc/$p/exe" ] && md5sum "/proc/$p/exe" 2>/dev/null | cut -d" " -f1
                 done | sort -u' 2>/dev/null || true)
-    if [ -z "$livemd5s" ]; then
+    dmonmd5s=$(run_on "$host" 'for p in $(pgrep -f "yggterm-headless server daemon" 2>/dev/null); do
+                  [ -r "/proc/$p/exe" ] && md5sum "/proc/$p/exe" 2>/dev/null | cut -d" " -f1
+                done | sort -u' 2>/dev/null || true)
+    gui_stale=1; dmon_stale=1
+    case "
+$guimd5s
+" in *"
+$GUI_SUM
+"*) gui_stale=0 ;; esac
+    case "
+$dmonmd5s
+" in *"
+$HL_SUM
+"*) dmon_stale=0 ;; esac
+    if [ -z "$guimd5s" ] && [ -z "$dmonmd5s" ]; then
       echo "  · $host: no live yggterm process to rotate — the staged build is what the next launch execs"
     else
-      case "
-$livemd5s
-" in
-        *"
-$GUI_SUM
-"**"
-$HL_SUM
-"*) echo "  ✅ $host: direct stack already executes this build — restart door not fired"; continue ;;
-      esac
-      resp=$(run_on "$host" '"$HOME/.yggterm/bin/yggterm-headless" server app update restart --timeout-ms 20000' 2>&1 || true)
-      case "$resp" in
-        *'"error": null'*)
-          echo "  ✅ $host: direct restart requested through the guarded door — sessions ride the handover" ;;
-        "")
-          echo "  ⚠ $host: no GUI answered the restart door — build stays staged; the next start adopts it" ;;
-        *)
-          echo "  ⚠ $host: restart door did not adopt ($(printf '%s' "$resp" | tr '\n' ' ' | head -c 220)) — build stays staged; the next deploy or GUI start retries" ;;
-      esac
+      if [ "$gui_stale" = 1 ]; then
+        resp=$(run_on "$host" '"$HOME/.yggterm/bin/yggterm-headless" server app update restart --timeout-ms 20000' 2>&1 || true)
+        case "$resp" in
+          *'"error": null'*)
+            echo "  ✅ $host: GUI restart requested through the guarded door — sessions ride the handover" ;;
+          "")
+            echo "  ⚠ $host: no GUI answered the restart door — build stays staged; the next start adopts it" ;;
+          *)
+            echo "  ⚠ $host: restart door did not adopt ($(printf '%s' "$resp" | tr '\n' ' ' | head -c 220)) — build stays staged; the next deploy or GUI start retries" ;;
+        esac
+      else
+        echo "  ✅ $host: GUI already executes this build"
+      fi
+      if [ "$dmon_stale" = 1 ]; then
+        # The daemon half of the roll. Unforced: the daemon's own idle gates
+        # and session-preserving handoff decide (measured live on dev for
+        # weeks — the successor adopts the PTYs, the predecessor retires).
+        # The CLI passes ITS OWN exe as the handoff target, and this is the
+        # fresh managed headless this deploy just verified — so a direct-host
+        # daemon that has sat on a Sep-class build for days finally rotates.
+        # Measured 2026-09-15: jojo's daemon ignored four days of rolls
+        # (nothing ever triggered its rotation; the [11.122] pin flip only
+        # gave it eyes, not a trigger).
+        dresp=$(run_on "$host" '"$HOME/.yggterm/bin/yggterm-headless" server daemon restart --reason deploy-roll-daemon-rotation' 2>&1 || true)
+        case "$dresp" in
+          *restarting*)
+            echo "  ✅ $host: daemon rotation requested — session-preserving handoff onto the staged headless" ;;
+          "")
+            echo "  · $host: daemon restart unanswered — no daemon running here" ;;
+          *)
+            echo "  ⚠ $host: daemon rotation deferred/refused ($(printf '%s' "$dresp" | tr '\n' ' ' | head -c 200)) — it keeps serving until a quieter pass" ;;
+        esac
+      else
+        echo "  ✅ $host: daemon already executes this build"
+      fi
     fi
   else
-    echo "  · $host: direct build staged; restart door skipped (--no-direct-restart)"
+    echo "  · $host: direct build staged; restart doors skipped (--no-direct-restart)"
   fi
     # Keep the last three staged builds; never the one install-state points at.
   run_on "$host" 'cd "$HOME/.local/share/yggterm/direct/builds" 2>/dev/null || exit 0
