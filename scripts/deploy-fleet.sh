@@ -890,10 +890,17 @@ $HL_SUM
         case "$dresp" in
           *restarting*)
             echo "  ✅ $host: daemon rotation requested — session-preserving handoff onto the staged headless" ;;
+          *"different target daemon version"*)
+            # The daemon's own law, measured live 2026-09-15: with live
+            # terminal runtimes, a handoff to a SAME-VERSION rebuild is
+            # refused — only a version bump, an empty runtime set, or
+            # --force (the dev/agent-deploy override) rotates it. No
+            # quieter pass changes this; report the law, not a retry.
+            echo "  · $host: daemon stays on its build — same-version handoff is refused while terminal runtimes are live (rotates at the next version bump; --force is the explicit override)" ;;
           "")
             echo "  · $host: daemon restart unanswered — no daemon running here" ;;
           *)
-            echo "  ⚠ $host: daemon rotation deferred/refused ($(printf '%s' "$dresp" | tr '\n' ' ' | head -c 200)) — it keeps serving until a quieter pass" ;;
+            echo "  ⚠ $host: daemon rotation refused ($(printf '%s' "$dresp" | tr '\n' ' ' | head -c 200))" ;;
         esac
       else
         echo "  ✅ $host: daemon already executes this build"
