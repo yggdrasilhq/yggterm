@@ -30686,7 +30686,7 @@ the newer one.
 
 ## ⛔ [11.125] A FRESH ROW'S FIRST `server app drag begin` PAYS ~1.5-1.7 s QUEUING BEHIND THE SPAWN-PROMOTION SNAPSHOT APPLY'S TAIL — SIX BACK-TO-BACK UNCACHED FULL SIDEBAR MERGES (~220 ms EACH, `push_remote_ms` ≈ 220 DOMINANT, EXPANSION CRAWLING 111→288 PATHS / 855→2583 ROWS) RUN ON THE UI THREAD INSIDE ONE APPLY AND THE VERB'S HANDLER QUEUE BEHIND ALL OF THEM (traced live 2026-09-15 ~17:27 IST, GUI host, the ux-speed drag-cold-residual lane)
 
-**Status:** FIXED IN CODE — LIVE-PROVEN (falsifier met 2026-09-15 ~18:05 IST; nothing owed on the verb path; the sibling apply-tail merge storm stays under [11.117])
+**Status:** OPEN
 
 The [11.114] synthesis fix works — this is NOT the resolve's rebuild. Trace of a
 cold begin (fresh scratch row, spawn→begin gap ~2 s, build 67914705ea37):
@@ -30753,3 +30753,60 @@ end-to-end with the full event family live (`tree_drag_begin` →
 `tree_drag_hover` → `live_session_reorder_succeeded` → `tree_drag_ended` →
 `live_session_reorder_persisted`), drag-back restores, teardown left zero
 rows. Falsifier satisfied.
+> Nothing is owed on the verb path after this proof — the entry stays for
+> the falsifier record and for its instrument note; the sibling apply-tail
+> merge storm (one uncached ~220 ms merge per spawn apply) and the
+> multi-anchor/select-all crawl remain under [11.117]. (docs-ssot
+> vocabulary correction 2026-09-15 ~18:50: the status line must be a bare
+> vocabulary word; the proof text lives here in the body.)
+
+## ⛔ [11.126] THE DAEMON LEAKS UNREAPED ssh CHILDREN — 265 `ssh <defunct>` CORPSES ALL PARENTED TO yggterm-headless, THE OLDEST AS OLD AS THE DAEMON (measured 2026-09-15 ~18:10 IST, GUI host, jojo)
+
+**Status:** OPEN
+
+`ps -eo ppid,stat,comm` on jojo: every zombie on the box (265) has ppid
+11310 (yggterm-headless, up 3.8 days), comm `ssh`, and the oldest carries
+etimes 326578 s — the daemon's exact lifetime. Bursts of ~2.9/hour match a
+scan/projection cadence, not user traffic. Exactly 4 live `ssh -tt`
+children exist and are the owner's real remote rows (verified by cmdline:
+`ControlMaster=no -o ControlPath=none`, ages 13-34 h) — the leak is purely
+EXITED-NEVER-WAITED children, not held connections.
+
+Rust drops a `Child` without reaping; every kill path sampled in the
+server's ssh sites (daemon.rs/lib.rs 20034-45, 20384-91, 20632-33) waits
+properly, so the leak is a path that spawns and abandons (timeout-task
+dropped mid-run, or an early `?` between spawn and wait). A 25-minute
+`strace -f -p 11310 -e trace=clone,execve,wait4` capture is running to name
+the exact site; the fix is reap-at-site (join the kill/wait discipline) or
+a daemon-side waitid reaper scoped to adopted ssh children — NEVER a
+`waitpid(-1)` loop, which would steal exits from the daemon's live session
+children.
+
+Falsifier for the fix: after the fixed build rotates onto the daemon, a
+24-hour `ps -eo ppid,stat,comm | grep -c defunct` against the new daemon
+pid stays at zero through several scan cycles. Also: when the CURRENT
+daemon retires, its 265 zombies reparent to init and vanish — count after
+rotation is the new baseline, not zero-evidence.
+
+Impact: pid-table pressure and a forensic smell (265 fake ssh processes in
+every `ps`), not CPU — noticed while attributing "why is jojo hot" (it
+isn't yggterm's heat; the ZCode desktop app's zygote is spinning 0.4-1.1
+cores since 12:09). Filed by zcode sess_1e4cd6d6, lane
+lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
+>
+> **CORRECTION 2026-09-15 ~18:40 (same sitting, evidence over the first
+> theory):** the leak is HISTORICAL, not ongoing. Zombie etimes
+> distribution: ALL 265 are ≥ 3.4 days old — the whole burst happened in
+> the daemon's first ~5 hours (Sep 11 23:09 → Sep 12 ~04:00, ≈53/hour —
+> the startup/restore-churn era), and ZERO new corpses since. A 7-minute
+> `strace -f -p 11310 -e trace=clone,execve,wait4` over the remote-projection
+> scans (17 distinct ssh execs, `run_remote_python_lines`-shaped,
+> ConnectTimeout=5 BatchMode) shows every spawn reaped — the parent polls
+> `wait4(pid)` per child. The "2.9/hour sustained" in the filing above was
+> a 265÷3.8-days average, not a cadence; the first watcher's "269 live
+> ssh" also over-counted (zombies share comm=ssh; only 4 live `-tt` rows
+> are real). Remaining action is therefore narrower: identify nothing, fix
+> nothing urgent — the corpses reparent to init and vanish whenever this
+> daemon finally rotates onto a post-[11.121] build. The defensive
+> spawn-and-reap primitive stays as a dream (dreams/features
+> ACK-02191b62c8): one abandoned Child on a bad day re-opens this.
