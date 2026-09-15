@@ -2226,6 +2226,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // option line is kept as a second, independent witness so a reworded
         // heading cannot blind the classifier silently.
         //
+        // RE-MEASURED 2026-09-15 on 2.1.272: the gate did NOT fire on a fresh
+        // /tmp cwd on either fleet host that runs claude. The needles stay
+        // declared — whatever screen raises them appears only under other
+        // trust/onboarding states — and the battery suite records
+        // fired/answered honestly either way.
+        //
         // ⛔ Neither phrase takes an `also_any` guard, deliberately. The gate
         // paints each of these on its OWN visible row, so a same-line
         // conjunction would demand an adjacency the screen does not have.
@@ -2289,8 +2295,19 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // an idle row's the same WITHOUT `esc to interrupt`. The owner's paused
         // row proved it: it carried `← 1 agent` and no interrupt hint, and I
         // had called it "grinding" off a liveness probe.
+        // RE-CONFIRMED 2026-09-15 on 2.1.272: the idle footer reads
+        // `⏸ manual mode on · ? for shortcuts · ← for agents` (no interrupt
+        // hint) and the spinner-phase footer swaps to
+        // `⏸ manual mode on · esc to interrupt · ← for agents` — the swap
+        // law holds verbatim, observed even on an auth-gated turn attempt
+        // (fleet subscription access is dead owner-side; the battery suite
+        // logs the refusal surface).
         working_footer_hints: &["esc to interrupt"],
-        // Read off `claude --help` on Claude Code 2.1.223 (2026-08-06). Its
+        // Read off `claude --help` on Claude Code 2.1.223 (2026-08-06).
+        // RE-VERIFIED on 2.1.272 (2026-09-15): `--resume <session-id>`,
+        // `--session-id <uuid>`, `--model`, `--permission-mode` (choices
+        // acceptEdits, auto, …) and the standalone
+        // `--dangerously-skip-permissions` all still spell that way. Its
         // `--permission-mode` choices are acceptEdits, auto, bypassPermissions,
         // manual, dontAsk, plan — note there is no longer a `default` value,
         // which is exactly why `Default` emits NOTHING instead of naming one.
