@@ -256,11 +256,17 @@ class Probe:
                 return row
         return None
 
-    def rows_order_index(self, path: str) -> int | None:
+    def rows_order_indices(self, paths: tuple[str, ...]) -> dict[str, int | None]:
+        """One listing fetch serves every lookup. wait_order used to make one
+        full `rows --json` call PER PATH per poll — two ~1-4 s calls on a
+        424-row sidebar ate its whole 5 s budget and produced false accuracy
+        failures ([11.125]'s instrument note)."""
+        out: dict[str, int | None] = {path: None for path in paths}
         for i, row in enumerate(self.rows()):
-            if row.get("full_path") == path:
-                return i
-        return None
+            fp = row.get("full_path")
+            if fp in out and out[fp] is None:
+                out[fp] = i
+        return out
 
     def dump_artifact(self, name: str, payload) -> None:
         if not self.artifacts:
@@ -663,7 +669,8 @@ class Probe:
                    timeout_s: float = 5.0) -> tuple[bool, int | None]:
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < timeout_s:
-            ia, ib = self.rows_order_index(a_path), self.rows_order_index(b_path)
+            idx = self.rows_order_indices((a_path, b_path))
+            ia, ib = idx[a_path], idx[b_path]
             if ia is not None and ib is not None and ib - ia == 1:
                 return True, int((time.perf_counter() - t0) * 1000)
             time.sleep(0.3)
