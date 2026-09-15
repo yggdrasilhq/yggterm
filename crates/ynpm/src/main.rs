@@ -2283,6 +2283,34 @@ fn install_npm_package(
         .map(str::to_string)
         .unwrap_or_else(|| package_storage_key(package));
 
+    // Discovery is not choice: an `@latest` (or bare) resolve must never pin
+    // the host backwards — the 2026-09-15 zcode-tui deviation was exactly
+    // this, the managed-CLI provisioner's periodic `@latest` resolving an
+    // older registry build over a newer local one and repointing the fleet's
+    // cli link on a timer. A concrete `pkg@version` stays authoritative: the
+    // operator asked for that exact build.
+    if !pin_is_explicit(pin)
+        && let Some(existing) = state.packages.get(&key)
+        && let Some(note) = downgrade_refusal_note(&existing.current, &version)
+    {
+        println!("ynpm: {note}");
+        ynpm_trace(
+            paths,
+            "install.downgrade_refused",
+            serde_json::json!({
+                "package": package,
+                "installed": existing.current,
+                "registry_resolve": version,
+            }),
+        );
+        return Ok(InstallOutcome {
+            name: package.to_string(),
+            version: existing.current.clone(),
+            previous: None,
+            bins: existing.bins.keys().cloned().collect(),
+        });
+    }
+
     // An already-published generation is immutable and was health-checked
     // before it became live. Avoid reinstalling an identical npm version on
     // every `ynpx` invocation; a new registry version gets a new generation.
@@ -2294,6 +2322,9 @@ fn install_npm_package(
             .keys()
             .all(|bin| run_version(&dest.join(bin)).is_ok())
     {
+        if !pin_is_explicit(pin) {
+            converge_cli_links_to_newer_dev(paths, &state, &existing.bins, &version);
+        }
         for note in dev_channel_supersedence_notes(&state, &version, &existing.bins) {
             println!("ynpm: {note}");
         }
@@ -2446,6 +2477,9 @@ fn install_npm_package(
         }
         let installed_bins = package_state.bins.clone();
         paths.save_state(&state)?;
+        if !pin_is_explicit(pin) {
+            converge_cli_links_to_newer_dev(paths, &state, &installed_bins, &version);
+        }
         sync_app_registration(paths, package, previous_integration.as_ref(), app_manifest)?;
         ynpm_trace(
             paths,
@@ -2994,6 +3028,98 @@ fn converge_cli_links_to_dev(
             }),
         );
     }
+}
+
+/// A concrete `pkg@1.2.3` pin is the operator's choice; `pkg`, `pkg@latest`
+/// and any other dist-tag resolve through the registry and are discovery.
+fn pin_is_explicit(pin: Option<&str>) -> bool {
+    pin.is_some_and(|pin| SemVer::parse(pin).is_ok())
+}
+
+/// The honest downgrade refusal: when the registry resolve is OLDER than the
+/// version this host already serves from the same channel, a discovery
+/// install must not run — the managed-CLI provisioner would otherwise churn
+/// a new generation and repoint links backwards on every tick. Returns the
+/// note line to print.
+fn downgrade_refusal_note(installed: &str, resolved: &str) -> Option<String> {
+    let (Ok(have), Ok(want)) = (SemVer::parse(installed), SemVer::parse(resolved)) else {
+        return None;
+    };
+    (SemVer::cmp_semver(&have, &want) == std::cmp::Ordering::Greater).then(|| {
+        format!(
+            "refusing to downgrade to registry {resolved}: {installed} is already installed — pin the older version explicitly to force it"
+        )
+    })
+}
+
+/// The npm-install-side mirror of the dev-publish convergence: a
+/// discovery-driven npm install that lands OLDER than a dev build of the same
+/// bin must not hand the cli link back to the registry build — repoint it at
+/// the dev generation instead, so every lookup path keeps answering alike and
+/// the periodic provisioner refresh heals a drifted link instead of
+/// deepening it. Returns the number of links converged.
+fn converge_cli_links_to_newer_dev(
+    paths: &Paths,
+    state: &State,
+    bins: &BTreeMap<String, String>,
+    npm_version: &str,
+) -> usize {
+    let cli_dir = paths.root().join("bin");
+    let Ok(npm_semver) = SemVer::parse(npm_version) else {
+        return 0;
+    };
+    let mut converged = 0usize;
+    for bin in bins.keys() {
+        let Some(serves) = state.packages.iter().find_map(|(key, entry)| {
+            if entry.dev.is_none() || !entry.bins.contains_key(bin) {
+                return None;
+            }
+            let dev_semver = SemVer::parse(&entry.current).ok()?;
+            let generation = entry
+                .dev_generation
+                .as_deref()
+                .or_else(|| entry.dev.as_ref().and_then(|dev| dev.generation.as_deref()))?;
+            Some((
+                dev_semver,
+                entry.package_name.clone().unwrap_or_else(|| key.to_string()),
+                entry.current.clone(),
+                paths.generation_dir(key, generation),
+            ))
+        }) else {
+            continue;
+        };
+        let (dev_semver, dev_package, dev_version, dev_generation) = serves;
+        if SemVer::cmp_semver(&dev_semver, &npm_semver) != std::cmp::Ordering::Greater {
+            continue;
+        }
+        let source = generation_binary(&dev_generation, bin);
+        if !source.is_file() {
+            continue;
+        }
+        let cli_link = cli_dir.join(bin);
+        if fs::read_link(&cli_link).map(|target| target == source).unwrap_or(false) {
+            continue;
+        }
+        if let Err(error) = publish_link(&source, &cli_link) {
+            eprintln!("ynpm: ⛔ could not converge {bin}: {error:#}");
+            continue;
+        }
+        converged += 1;
+        println!(
+            "ynpm: {bin} keeps serving {dev_package} {dev_version} (dev) — npm {npm_version} installed to the inventory only"
+        );
+        ynpm_trace(
+            paths,
+            "install.dev_link_kept",
+            serde_json::json!({
+                "bin": bin,
+                "dev_package": dev_package,
+                "dev_version": dev_version,
+                "npm_version": npm_version,
+            }),
+        );
+    }
+    converged
 }
 
 /// The honest mirror of convergence: an explicit npm-channel install keeps the
@@ -4071,6 +4197,30 @@ fn sync_integrated(paths: &Paths) -> anyhow::Result<()> {
                 );
                 failures.push(format!("{}: {error:#}", descriptor.slug))
             }
+        }
+    }
+    // Dev generations must survive an integrated re-sync: the link
+    // materialization above serves the npm channel and would hand every cli
+    // bin back to the registry build on each sync (the 2026-09-15 zcode-tui
+    // 0.6.x → 0.5.7 reversion). The dev-publish convergence applied to every
+    // dev record keeps an integrated sync convergence-preserving.
+    if let Ok(state) = paths.load_state() {
+        for (key, entry) in state.packages.iter() {
+            if entry.dev.is_none() {
+                continue;
+            }
+            let Some(destination) = entry.destination.clone() else {
+                continue;
+            };
+            let package = entry.package_name.clone().unwrap_or_else(|| key.clone());
+            converge_cli_links_to_dev(
+                paths,
+                &state,
+                &package,
+                &entry.current.clone(),
+                &std::path::PathBuf::from(destination),
+                &entry.bins.clone(),
+            );
         }
     }
     println!(
@@ -6922,6 +7072,87 @@ mod tests {
 
         assert!(dev_channel_serves_bin(&state, "zcode-tui", "0.6.4"));
         assert!(!dev_channel_serves_bin(&state, "zcode-tui", "0.5.7"));
+    }
+
+    #[test]
+    fn a_discovery_install_refuses_to_downgrade_an_installed_version() {
+        assert!(
+            downgrade_refusal_note("0.6.6", "0.5.7").is_some(),
+            "registry 0.5.7 over installed 0.6.6 must be refused"
+        );
+        assert_eq!(downgrade_refusal_note("0.5.7", "0.6.6"), None);
+        assert_eq!(downgrade_refusal_note("0.5.7", "0.5.7"), None);
+        assert_eq!(downgrade_refusal_note("not-a-version", "0.5.7"), None);
+    }
+
+    #[test]
+    fn only_a_concrete_pin_is_explicit() {
+        assert!(pin_is_explicit(Some("0.5.7")));
+        assert!(!pin_is_explicit(Some("latest")));
+        assert!(!pin_is_explicit(None));
+    }
+
+    #[test]
+    fn a_discovery_npm_install_converges_the_cli_link_to_a_newer_dev_build() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test home")
+            .join(".yggterm/scratchpad/ynpm")
+            .join(format!("converge-npm-side-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let (paths, cli_dir, dev_dir) = converge_fixture(&home);
+        let mut state = converge_state(&cli_dir);
+        let dev_generation = paths.generation_dir("zcode-tui", "dev-123");
+        fs::create_dir_all(dev_generation.join("bin")).expect("dev generation");
+        fs::write(dev_generation.join("bin/tool"), "dev-bytes").expect("dev bin");
+        state.packages.insert(
+            "zcode-tui".to_string(),
+            Package {
+                package_name: Some("@ygghq/zcode-tui".to_string()),
+                current: "0.6.6".to_string(),
+                versions: vec!["0.6.6".to_string()],
+                bins: BTreeMap::from([("tool".to_string(), "bin/tool".to_string())]),
+                external_prev: None,
+                destination: Some(dev_dir.display().to_string()),
+                dev: Some(DevMarker {
+                    built_at_ms: 0,
+                    commit: None,
+                    host: None,
+                    watch: None,
+                    supersedes: None,
+                    supersedes_fingerprint: None,
+                    dev_fingerprint: None,
+                    generation: Some("dev-123".to_string()),
+                }),
+                dev_generation: Some("dev-123".to_string()),
+                channel: Some("dev".to_string()),
+                source: None,
+                integration: None,
+            },
+        );
+        let bins = BTreeMap::from([("tool".to_string(), "bin/tool".to_string())]);
+
+        // npm 0.5.7 under a dev 0.6.6: the cli link converges to the dev build.
+        let converged = converge_cli_links_to_newer_dev(&paths, &state, &bins, "0.5.7");
+        assert_eq!(converged, 1, "the cli link must serve the newer dev build");
+        assert_eq!(
+            fs::read_link(cli_dir.join("tool")).expect("converged link"),
+            dev_generation.join("bin/tool"),
+            "a discovery npm install must not hand the cli link back to the registry build"
+        );
+        // Idempotent: the next refresh finds its own link.
+        assert_eq!(
+            converge_cli_links_to_newer_dev(&paths, &state, &bins, "0.5.7"),
+            0,
+            "convergence is idempotent"
+        );
+        // A newer npm resolve is authoritative: no convergence, link untouched.
+        assert_eq!(
+            converge_cli_links_to_newer_dev(&paths, &state, &bins, "0.7.0"),
+            0,
+            "an npm build newer than the dev build is not converged away"
+        );
+        fs::remove_dir_all(&home).expect("test cleanup");
     }
 }
 

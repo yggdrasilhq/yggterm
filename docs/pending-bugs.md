@@ -30728,6 +30728,16 @@ NOT downgrade a newer installed generation; or (code-side) point the registry di
 at an older version than a locally imported production generation and show sync keeps
 the newer one.
 
+**Update 2026-09-15, later (lane/ynpm/dev-converge-guard, [11.132]):** the
+stopgap above died exactly as its own risk predicted, by a different hand than
+feared: `install_npm_package`'s fresh-publish path sets `dev = None` on the
+record, so the refresh's next `@latest` install on the shared storage key
+ERASED the dev marker and repointed the agent bin to 0.5.7 on every host
+(measured the same night: record shows dev False, versions
+[0.5.7, 0.6.6, 0.5.7]). [11.132] refuses that install outright, so the dev
+record survives and the refresh re-bridges it. This entry's production-arm
+relink guard stays the filer's to land.
+
 ## ⛔ [11.125] A FRESH ROW'S FIRST `server app drag begin` PAYS ~1.5-1.7 s QUEUING BEHIND THE SPAWN-PROMOTION SNAPSHOT APPLY'S TAIL — SIX BACK-TO-BACK UNCACHED FULL SIDEBAR MERGES (~220 ms EACH, `push_remote_ms` ≈ 220 DOMINANT, EXPANSION CRAWLING 111→288 PATHS / 855→2583 ROWS) RUN ON THE UI THREAD INSIDE ONE APPLY AND THE VERB'S HANDLER QUEUE BEHIND ALL OF THEM (traced live 2026-09-15 ~17:27 IST, GUI host, the ux-speed drag-cold-residual lane)
 
 **Status:** OPEN
@@ -30877,3 +30887,46 @@ cannot promise at any tree size. Instrument note: `component_window` aggregates
 per ~2.5 s window (window_ms 2506) — per-render attribution exists in its
 `components` array; a per-write render counter would make drag-window
 measurement exact (the [11.113] instrument family).
+
+## ⛔ [11.132] THE MANAGED-CLI PROVISIONER'S `@latest` INSTALL DOWNGRADES A NEWER LOCAL BUILD AND WIPES THE DEV MARKER ON THE SHARED STORAGE KEY — THE FLEET'S zcode-tui ROWS KEEP GETTING DRAGGED BACK TO npm 0.5.7 ON A TIMER (traced live 2026-09-15 ~22:15 IST, the trace-fixing campaign's ynpm lane; continues [11.123], explains why its stopgap died)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+**Measured (all live, one sitting):** the provisioner (managed-CLI ensure per
+row spawn + the periodic background refresh) runs
+`ynpm install @avikalpa/zcode-tui@latest`; npm latest is frozen at 0.5.7 (the
+[11.123] publish-rights corpse), so every tick re-pins the integrated agent
+bin (`~/.yggterm/ynpm/bin`, FIRST on a row's PATH) to 0.5.7 — two fresh
+0.5.7 installs traced in a single sitting, one right after a row spawn. The
+npm record's version list reads [0.5.7, 0.6.6, 0.5.7] on all three hosts: the
+0.6.6 dev pushes were DOWNgraded in place. A live zcode-tui row was caught
+running 0.5.7 while its host's `~/.local/bin` answered 0.6.6. The 0.6.6
+elfs are byte-identical across the fleet (one canonical build, only links and
+records scrambled).
+
+**Root chain (three defects, one symptom):** (1) `install_npm_package`'s
+fresh-publish path unconditionally sets `dev = None` / `dev_generation = None`
+— ANY npm-channel install on a storage key ERASES a dev marker recorded under
+it, which is how the [11.123] stopgap's dev 0.6.6 record was hollowed out;
+(2) the npm path keeps the cli link authoritative by design ([11.110]'s
+converge fires only on `install --dev` publishes) and merely prints a
+supersedence note — but the caller here is a background provisioner, not an
+operator choice, and the note goes nowhere; (3) the descriptor resolves
+`@avikalpa/zcode-tui` while the 2026-09-08-era dev record lives under the
+`@ygghq/zcode-tui` key, so the sync dev-bridge never sees it.
+
+**Fix (lane/ynpm/dev-converge-guard):** a discovery resolve (`pkg`,
+`pkg@latest`) never pins the host backwards — when it resolves older than the
+record's current, the install is refused (`install.downgrade_refused`) and
+the dev marker survives; after ANY discovery install,
+`converge_cli_links_to_newer_dev` repoints the cli link at a strictly newer
+dev generation (`install.dev_link_kept`), turning the periodic refresh into
+the healer of a drifted link instead of its cause; and `sync_integrated` now
+runs the [11.110] convergence over every dev record at its tail, so an
+integrated re-sync cannot undo a dev serve either. A concrete `pkg@version`
+pin stays authoritative. Three new tests + the docs/ynpm.md downgrade law.
+
+**Falsifier:** with the deployed ynpm, re-land the dev 0.6.6 generation
+fleet-wide, force a managed-CLI refresh foreground, and the agent bin must
+still answer 0.6.6 afterwards — trace shows `install.downgrade_refused` or
+`install.dev_link_kept`, never a 0.5.7 repoint.

@@ -438,6 +438,15 @@ different destinations (`zcode-tui` served 0.6.4 from `~/.local/bin` while the
 integrated cli dir still served npm's 0.5.7 — the 2026-09-14 fleet split, where
 hosts answered differently by lookup path until one was healed by hand). The
 manager therefore converges on publish:
+**The downgrade law (2026-09-15):** discovery resolves (`pkg`, `pkg@latest` —
+the managed-CLI provisioner's periodic refresh among them) never pin a host
+backwards. When the resolve is older than the installed version, ynpm refuses
+the install (`install.downgrade_refused`); when a dev build of the same bin is
+strictly newer than the resolved npm version, the cli link converges to the
+dev build (`install.dev_link_kept`) on every install and on every
+`sync --integrated`. Only a concrete `pkg@version` pin overrides — the
+operator asked for that exact build.
+
 
 - A dev publish (local or fleet-imported) that is STRICTLY NEWER than the
   npm-channel entry owning the same-named link in `~/.yggterm/ynpm/bin`
