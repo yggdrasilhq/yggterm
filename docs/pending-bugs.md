@@ -30981,3 +30981,92 @@ named and fixed, the felt driver proves the drag's start and merge
 behavior but NOT its drop, and any felt-accuracy claim from it is
 invalid. Family: [11.113] instrument gaps; the pointer-verb help line
 also still lies about its action spellings (fixed this lane).
+## ⛔ [11.133] COLD RESTORE NEVER ASKS THE TOMBSTONE PLANE — EVERY CLOSED ROW IN A STALE server-state.json RESURRECTS AT EVERY DAEMON/GUI BIRTH, AND ITS RE-ENTRY CLEARS ITS OWN TOMBSTONE (measured live on jojo 2026-09-15 ~22:30-23:25 IST, the trace-fixing campaign; owner symptom: "on restart my row setup is nuked to an old form — I delete rows, launch a ychrome row, restart, and the old set comes back")
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED (lane/trace/restore-vets-tombstones)
+
+Filed 2026-09-15 ~23:45.
+
+**Measured, all from one evening on jojo (ytrace.jsonl + the state files):**
+
+- The owner deleted rows in bursts (22:29:49, 22:44-22:47, 23:15) served by the
+  canonical daemon 3491650 (`yggterm-headless server daemon`, owner of
+  `server-3-2-113.sock` since 22:01, still owner at 23:20). Every removal wrote
+  a tombstone: `live_session_row_tombstoned` tc 96→133.
+- At every GUI relaunch (22:47:57 pid 3533563, 23:06:54 pid 3545820) the
+  daemon-component `restore_persisted_state` brought back — BY NAME — the six
+  opencode rows the owner had tombstoned TWICE (`ses_fd10/fc34/fbb6/fb82/f63b/
+  f5b9`), plus remote-cc rows deleted in the same bursts. Old form, every time.
+- The tombstone count went BACKWARDS twice (108→103 at 22:30:03, 112→107 at
+  22:40:02): rows re-entering the live order clear their own tombstones at the
+  persist reconcile chokepoint — the deny-list itself erodes as the resurrect
+  loop runs.
+- ROOT HOLE: `restore_persisted_state_with_launch_policy`
+  (yggterm-server/src/lib.rs) filtered `state.live_sessions` by
+  recoverability + dedupe ONLY. The tombstone plane is asked by the
+  cross-daemon IMPORT admission and the app-restore verb
+  (`live_row_closes_remembered_among`), but never by this door — the one door
+  a stale `server-state.json` feeds at every birth.
+
+**Fix (this lane):** `tombstoned_persisted_live_rows` — the restore door of the
+same read-only plane, asked once per restore for the whole batch, before any
+row lands; vetoed rows are skipped before `restore_live_session`, so the
+persist reconcile never sees them and never clears their closes. The restore
+span carries `tombstone_vetoed` + the vetoed keys. Lock tests:
+`a_closed_row_in_a_stale_snapshot_does_not_restore_and_keeps_its_tombstone`
+(end-to-end through `restore_persisted_state` against a temp `YGGTERM_HOME`,
+asserts the close SURVIVES the restore) and
+`restore_persisted_state_asks_the_tombstone_plane_before_any_row_lands`
+(structural: the ask must sit before the first `restore_live_session`).
+
+**Falsifier (live):** on the next natural GUI relaunch with at least one
+user-deleted row in the state file, `restore_persisted_state` traces
+`tombstone_vetoed ≥ 1`, the deleted row does NOT reappear in the sidebar, and
+`removed-rows.json` still holds its entry afterwards.
+
+**Half that remains open → [11.134].** This fix makes closed rows safe from
+stale files; it cannot make NEW rows survive a stale file that predates them.
+
+## ⛔ [11.134] server-state.json HAS SEVERAL WRITERS WITH STALE VIEWS — LAST WRITER WINS, SO NEW ROWS MADE AFTER A WRITER'S VIEW FROZE ARE LOST AT THE NEXT RESTORE, AND ONE RE-ENTRY VECTOR THAT CLEARS TOMBSTONES IS STILL UNNAMED (measured live on jojo 2026-09-15, same sitting as [11.133]; this is the writer-law half of the owner's "row setup is hard locked to an old form")
+
+**Status:** OPEN
+
+Filed 2026-09-15 ~23:45.
+
+**What is measured:**
+
+- The canonical socket owner (3491650, 22:01) routinely persists
+  (`daemon_persist` spans, pid-attributed) and its memory held the owner's
+  deletes — yet by the 22:47:57 restore the shared file held rows it had
+  removed twice. SOME writer with a stale view wrote between the deletes and
+  the restore. Candidates, none yet convicted: (a) the
+  `PrepareUpdateRestart` snapshot write — `write_persisted_state`, the
+  UNCONDITIONAL primitive, fired at every GUI relaunch (5+ this evening) from
+  whatever instance answers it; (b) a non-canonical server instance born from
+  a GUI relaunch that restored the file and later persisted its restored
+  (stale) view; (c) an import/takeover arm re-adding rows into the serving
+  daemon's live order.
+- A tombstone-CLEARING re-entry fired at 22:30:03 (tc 108→103) with NO restore
+  event nearby — an import, takeover or re-ensure path put closed rows back
+  into the serving daemon's live order, and the persist reconcile honoured it
+  as a legitimate re-entry. The import admission asks the tombstone plane; the
+  arm that did this did not (or asked after it landed).
+
+**Consequence:** even with [11.133] landed, a stale writer can still drop NEW
+rows (created after its view froze — the owner's fresh ychrome row) from the
+next restore. The closed-row half is dead; the new-row half is not.
+
+**Fix shapes to weigh ON THAT LANE:** (1) a freshness gate on
+`write_persisted_state` — refuse to write over a file whose (len, mtime,
+content-hash) fingerprint moved past the writer's own boot restore (the
+fingerprint machinery already exists for the change-check); (2) one-writer law
+— a non-canonical server instance never persists live_sessions while a
+canonical owner is alive; (3) name the re-entry vector that cleared tombstones
+at 22:30:03 and make it ask the plane; (4) `may_cold_restore_live_sessions`
+counts only LOCAL terminal runtimes (the July finding called it toothless for
+remote rows — this host's rows are nearly all remote and the guard has never
+fired) — count owned runtime sessions of ALL kinds.
+
+**Instrument for the conviction:** pid-attribute the writers — a perf span on
+`write_persisted_state` (the unconditional primitive has none today; only the
+routine halves do) would have named the stale writer in one evening.
