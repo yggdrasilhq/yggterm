@@ -30857,7 +30857,15 @@ lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
 
 ## ⛔ [11.129] EVERY DRAG-POINTER STATE WRITE RE-RENDERS THE WHOLE SHELL — `ShellState` IS ONE DIOXUS SIGNAL, SO THE GHOST CARD'S 8px STEP (window-level move handler → `update_drag_pointer` → full-state write) PAIRS WITH A FULL `app` COMPONENT RENDER WHOSE COST SCALES WITH THE TREE THE GHOST CROSSES (measured 2026-09-15 ~18:40 IST, live build 33b5e89b, the ux-speed drag-feel lane; trace `dioxus_render/component_window`)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Falsifier: on the adopted build, a felt drag's `component_window` shows
+`app` renders only at the gesture's real edges (press select, begin,
+hover-target change, drop/clear) — the per-8px move stream contributes
+~zero `app` renders, the ghost leaf re-renders instead (before, on
+337590a219f7: `app` rendered 2-11x per ~2.5s window DURING felt drags,
+mean 8-101 ms, max spikes 157-223 ms — measured with the felt driver,
+2026-09-15 ~21:50 IST).
 
 The ghost card and the drag pointer live in the ONE `Signal<ShellState>`
 (`with_mut_counted` = `Signal::with_mut` — every write marks all subscribers).

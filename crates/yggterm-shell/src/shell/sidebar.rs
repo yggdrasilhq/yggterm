@@ -3342,8 +3342,14 @@ fn machine_label_text(label: &str) -> Option<String> {
     })
 }
 #[component]
-fn DragGhost(snapshot: SharedSnapshot) -> Element {
-    let Some((x, y)) = snapshot.drag_pointer else {
+fn DragGhost(
+    snapshot: SharedSnapshot,
+    /// [11.129]: the ghost's live position, written by the pointer-move
+    /// stream. Reading it HERE (and only here) is the whole fix — a pointer
+    /// step subscribes and re-renders this leaf, never the shell.
+    ghost_pointer: ReadOnlySignal<Option<(f64, f64)>>,
+) -> Element {
+    let Some((x, y)) = ghost_pointer.cloned() else {
         return rsx! {};
     };
     let dragged_rows = snapshot
@@ -3387,6 +3393,27 @@ fn DragGhost(snapshot: SharedSnapshot) -> Element {
                 accent: snapshot.palette.accent,
                 accent_soft: snapshot.palette.accent_soft,
             },
+        }
+    }
+}
+#[component]
+fn RowDragGhost(
+    label: String,
+    target_hint: Option<String>,
+    palette: DragGhostPalette,
+    ghost_pointer: ReadOnlySignal<Option<(f64, f64)>>,
+) -> Element {
+    let Some((x, y)) = ghost_pointer.cloned() else {
+        return rsx! {};
+    };
+    rsx! {
+        DragGhostCard {
+            x: x,
+            y: y,
+            primary_label: label,
+            extra_count: 0,
+            target_hint: target_hint,
+            palette: palette,
         }
     }
 }

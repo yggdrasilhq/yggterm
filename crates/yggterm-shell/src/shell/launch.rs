@@ -2826,6 +2826,13 @@ fn app() -> Element {
             });
             claim_sidebar_focus_by_path(Some(&focus_path));
         });
+    // [11.129]: the ghost card's position is the ONE per-pointer-move hot
+    // state in a drag. It lives in this small signal, read by the ghost leaf
+    // components alone — a pointer step re-renders the ghost, never the
+    // shell. The big ShellState keeps the drag's LOGIC pointer (begin,
+    // hover-target, clear); only the 8px move stream stopped paying the
+    // whole-shell render tax.
+    let mut drag_ghost_pointer = use_signal(|| None::<(f64, f64)>);
     let sidebar_on_start_drag = use_callback(move |(row, pointer): (BrowserRow, (f64, f64))| {
         state.with_mut_counted(|shell| shell.update_tree_drag_pointer(&row, pointer))
     });
@@ -2840,17 +2847,30 @@ fn app() -> Element {
         },
     );
     let sidebar_on_drag_move = use_callback(move |pointer: (f64, f64)| {
-        if state.read().drag_pointer_update_needed(pointer) {
-            state.with_mut_counted(|shell| shell.update_drag_pointer(pointer))
+        if !state.read().drag_paths.is_empty() {
+            let jumped = drag_ghost_pointer
+                .cloned()
+                .map(|(gx, gy)| (gx - pointer.0).abs() >= 8.0 || (gy - pointer.1).abs() >= 8.0)
+                .unwrap_or(true);
+            if jumped {
+                drag_ghost_pointer.set(Some(pointer));
+            }
         } else if state.read().pending_tree_drag.is_some() {
-            state.with_mut_counted(|shell| shell.update_pending_tree_drag_pointer(pointer))
+            let began = state.with_mut_counted(|shell| {
+                shell.update_pending_tree_drag_pointer(pointer)
+            });
+            if began {
+                drag_ghost_pointer.set(Some(pointer));
+            }
         }
     });
     let sidebar_on_drag_leave = use_callback(move |_row: BrowserRow| {});
     let sidebar_on_drop_into_row =
         use_callback(move |_: ()| queue_drop_current_drag_target(state));
-    let sidebar_on_end_drag =
-        use_callback(move |_: ()| state.with_mut_counted(|shell| shell.clear_drag_state()));
+    let sidebar_on_end_drag = use_callback(move |_: ()| {
+        drag_ghost_pointer.set(None);
+        state.with_mut_counted(|shell| shell.clear_drag_state());
+    });
     let sidebar_on_begin_rename = use_callback(move |row: BrowserRow| {
         state.with_mut_counted(|shell| shell.begin_tree_rename(&row));
         sync_active_terminal_input_policy(state);
@@ -3139,6 +3159,7 @@ fn app() -> Element {
                 }
             },
             onmouseup: move |_| {
+                drag_ghost_pointer.set(None);
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
                     state.with_mut_counted(|shell| shell.clear_drag_state());
@@ -3162,17 +3183,27 @@ fn app() -> Element {
                 let pointer = evt.client_coordinates();
                 let primary_down = evt.held_buttons().contains(MouseButton::Primary);
                 let drag_active = !state.read().drag_paths.is_empty();
-                if drag_active
-                    && state
-                        .read()
-                        .drag_pointer_update_needed((pointer.x, pointer.y))
-                {
-                    state.with_mut_counted(|shell| shell.update_drag_pointer((pointer.x, pointer.y)));
+                if drag_active {
+                    // [11.129]: the ghost's move stream writes the small
+                    // signal — a pointer step re-renders the ghost leaf, not
+                    // the shell. No ShellState write happens on a move.
+                    let jumped = drag_ghost_pointer
+                        .cloned()
+                        .map(|(gx, gy)| {
+                            (gx - pointer.x).abs() >= 8.0 || (gy - pointer.y).abs() >= 8.0
+                        })
+                        .unwrap_or(true);
+                    if jumped {
+                        drag_ghost_pointer.set(Some((pointer.x, pointer.y)));
+                    }
                 }
                 if !drag_active && primary_down && state.read().pending_tree_drag.is_some() {
-                    state.with_mut_counted(|shell| {
+                    let began = state.with_mut_counted(|shell| {
                         shell.update_pending_tree_drag_pointer((pointer.x, pointer.y))
                     });
+                    if began {
+                        drag_ghost_pointer.set(Some((pointer.x, pointer.y)));
+                    }
                 }
                 if state.read().sidebar_resize_drag.is_some() {
                     state.with_mut_counted(|shell| {
@@ -3187,9 +3218,27 @@ fn app() -> Element {
                 // always tracked from the window root, and a ghost that froze
                 // at the list edge would read as a dropped drag.
                 if primary_down && state.read().row_drag.is_some() {
-                    state.with_mut_counted(|shell| {
-                        shell.track_row_drag_pointer((pointer.x, pointer.y));
+                    let began = state.with_mut_counted(|shell| {
+                        shell.track_row_drag_pointer((pointer.x, pointer.y))
                     });
+                    if began {
+                        drag_ghost_pointer.set(Some((pointer.x, pointer.y)));
+                    } else if state
+                        .read()
+                        .row_drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.begun)
+                    {
+                        let jumped = drag_ghost_pointer
+                            .cloned()
+                            .map(|(gx, gy)| {
+                                (gx - pointer.x).abs() >= 8.0 || (gy - pointer.y).abs() >= 8.0
+                            })
+                            .unwrap_or(true);
+                        if jumped {
+                            drag_ghost_pointer.set(Some((pointer.x, pointer.y)));
+                        }
+                    }
                 }
             },
             onkeydown: move |evt| {
@@ -3199,6 +3248,7 @@ fn app() -> Element {
                 // modal state: nothing else should read this key.
                 if evt.key() == Key::Escape && state.read().row_drag.is_some() {
                     evt.prevent_default();
+                    drag_ghost_pointer.set(None);
                     state.with_mut_counted(|shell| shell.clear_app_pane_row_drag());
                     return;
                 }
@@ -5095,6 +5145,7 @@ fn app() -> Element {
                 if !snapshot.drag_paths.is_empty() {
                     DragGhost {
                         snapshot: snapshot.clone(),
+                        ghost_pointer: drag_ghost_pointer,
                     }
                 }
                 // The SAME ghost the cwd tree has always drawn, for the row
@@ -5103,15 +5154,12 @@ fn app() -> Element {
                 // ghost would be a third card that could drift from the other
                 // two, and the pointer leaves the list long before the drop.
                 if let Some(drag) = snapshot.row_drag.as_ref().filter(|drag| drag.begun) {
-                    DragGhostCard {
-                        x: drag.pointer.0,
-                        y: drag.pointer.1,
-                        primary_label: if drag.label.is_empty() {
+                    RowDragGhost {
+                        label: if drag.label.is_empty() {
                             "Move row".to_string()
                         } else {
                             drag.label.clone()
                         },
-                        extra_count: 0,
                         target_hint: drag.target.as_ref().map(row_drop_target_hint),
                         palette: DragGhostPalette {
                             text: snapshot.palette.text,
@@ -5119,6 +5167,7 @@ fn app() -> Element {
                             accent: snapshot.palette.accent,
                             accent_soft: snapshot.palette.accent_soft,
                         },
+                        ghost_pointer: drag_ghost_pointer,
                     }
                 }
             }
