@@ -136,6 +136,11 @@
       "format": "jsonl",
       "verified_on_disk": true,
       "note": "The file NAME is the id, whole: model-io-<session-uuid>.jsonl. One rollout file per session; the session title lives in the shared store (.zcode/cli/db/db.sqlite session.title). Measured 2026-09-07 against the zcode-tui campaign sessions on a fleet host."
+    },
+    "devin": {
+      "store_globs": [],
+      "icon_kind": "devin",
+      "note": "REGISTERED UNMEASURED 2026-09-15 - installed on no fleet host and no store template has ever been resolved against a real session. The registry declares a scan gap, not globs: vendor docs name only ~/.config/devin (config) and ~/.local/share/devin (XDG data namespace), and a session-history layout on top of that is undocumented. First install: locate the store, verify a template against a REAL session id on disk, then fill this row and the registry globs together."
     }
   }
 }

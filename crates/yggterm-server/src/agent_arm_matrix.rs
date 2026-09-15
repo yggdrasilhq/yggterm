@@ -482,6 +482,40 @@ const ARMS: &[Arm] = &[
         // differs, the store does not. The matrix asserts this pair agrees.
         store_globs: &[".zcode/cli/rollout/model-io-*.jsonl"],
     },
+    // ── The 11.6.12 registration (2026-09-15, lane/integration/devin).
+    // Devin is REGISTERED UNMEASURED (installed on no fleet host), so both
+    // arms carry the availability-record posture: the resume token is
+    // docs-sourced (`devin --resume <id>`), the remote cells are generated
+    // from the descriptor's wrapper_slug like every remote arm, and the
+    // store cells are EMPTY — byte-identical to the descriptor's declared
+    // scan gap. The first install's measurement pass fills both twins
+    // together, the way the 11.6.11 fill did.
+    Arm {
+        kind: SessionKind::Devin,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "devin",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::Devin,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-devin://"),
+        runtime_scheme: Some("devin-runtime://"),
+        remote_resume_subcommand: Some("resume-devin"),
+        remote_start_subcommand: Some("start-devin"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "devin",
+        resume_selector_token: "--resume",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
 ];
 
 /// A §7 divergence that is STILL REAL, recorded so it is a decision rather than

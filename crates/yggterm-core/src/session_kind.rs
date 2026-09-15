@@ -26,6 +26,12 @@ pub enum SessionKind {
     /// `zcode-tui` — avikalpa/zcode-tui, GPL-3.0-or-later. The house's own
     /// TUI client for the ZCode runtime (@avikalpa/zcode-tui on npm).
     ZcodeTui,
+    /// `devin` — Cognition's Devin CLI, closed source. A local REPL coding
+    /// agent (curl-bash / brew-cask install) with resumable sessions.
+    /// REGISTERED UNMEASURED (2026-09-15): installed on no fleet host, so its
+    /// store layout is unknown and its descriptor carries availability-record
+    /// posture only — the qwen/pi precedent.
+    Devin,
     Shell,
     SshShell,
     Document,
@@ -48,6 +54,7 @@ impl SessionKind {
         SessionKind::Antigravity,
         SessionKind::GrokBuild,
         SessionKind::ZcodeTui,
+        SessionKind::Devin,
         SessionKind::Shell,
         SessionKind::SshShell,
         SessionKind::Document,
@@ -124,13 +131,14 @@ mod tests {
                 SessionKind::Antigravity => 8,
                 SessionKind::GrokBuild => 9,
                 SessionKind::ZcodeTui => 10,
-                SessionKind::Shell => 11,
-                SessionKind::SshShell => 12,
-                SessionKind::Document => 13,
+                SessionKind::Devin => 11,
+                SessionKind::Shell => 12,
+                SessionKind::SshShell => 13,
+                SessionKind::Document => 14,
             };
             assert_eq!(index, slot, "{kind:?} is listed out of order in ALL");
         }
-        assert_eq!(SessionKind::ALL.len(), 14);
+        assert_eq!(SessionKind::ALL.len(), 15);
     }
 
     // The rendered-view question, answered once. Before this, a plain shell

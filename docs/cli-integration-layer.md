@@ -30,16 +30,20 @@ metadata layer may ask for and what reattach owes.
 
 | class | shape | roster | survival | metadata truth |
 |---|---|---|---|---|
-| **A** | store-authoritative, turn-based | codex, claude | PTY handoff preferred; resume-by-id otherwise | the CLI's own store + identity at birth |
+| **A** | store-authoritative, turn-based | codex, claude, codex-litellm | PTY handoff preferred; resume-by-id otherwise | the CLI's own store + identity at birth |
 | **B** | server/client switchable viewer | opencode, zcode-tui | PTY handoff (near-always survives) | **the SERVER's active-session answer**, never the TUI screen |
-| **C** | TUI with a local store | agy, muse, kimi, qwen, grok, pi, codex-litellm | PTY handoff; resume via store-id discovery | store + measured screen phrases |
+| **C** | TUI with a local store | agy, muse, kimi, qwen, grok, pi, devin* | PTY handoff; resume via store-id discovery | store + measured screen phrases |
 | **D** | no-store TUI | (none today — class exists so the registry can be total) | PTY handoff only | screen only, and the row says so |
 
 Roster notes: zcode-tui is FIRST-PARTY — it must become the reference
 implementation of the native announce (§3), the cheapest integration in the
 fleet. The `gemini` CLI is not a managed session kind (it runs inside shell
 rows); "there is no gemini CLI" refers to consultants — agy is the Gemini
-route there too.
+route there too. \*devin (2026-09-15) is REGISTERED UNMEASURED — installed on
+no fleet host, so its store is unverified and its screen tables are empty by
+declaration; class C is its shape (a local REPL with resumable sessions), not
+a measurement. First install runs the probe battery before any consumer
+trusts its descriptor.
 
 ## 2. Descriptor schema v2 — five orthogonal capabilities
 
@@ -199,6 +203,7 @@ The cli-integration family owns the bugbath. Family id **11.6**; members are
 | 11.6.9 | pi | C |
 | 11.6.10 | codex-litellm | A |
 | 11.6.11 | zcode-tui | B (first-party) |
+| 11.6.12 | devin | C (registered unmeasured 2026-09-15 — installed on no fleet host; store unverified, screen tables empty by declaration; first install owes the measurement pass) |
 
 Multi-session law (owner 2026-09-10): he runs SEVERAL sessions per CLI in
 parallel; each claims one `11.6.<n>`, works a lane `lane/integration/<cli>`,

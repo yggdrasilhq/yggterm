@@ -220,12 +220,18 @@ pub fn rebind_chain(kind: SessionKind) -> &'static [RebindStrategy] {
         }
         // Class C — TUI with a local store; id discovery is store work
         // (the 11.6.4/11.6.5 doors carry the measured store layouts).
+        // Devin joins the class by SHAPE (a local REPL with resumable
+        // sessions), but it is REGISTERED UNMEASURED (2026-09-15, installed
+        // on no fleet host): the StoreIndex arm is the declared intent, and
+        // the store reader that would make the arm true is exactly what the
+        // first install owes.
         SessionKind::Antigravity
         | SessionKind::Muse
         | SessionKind::Kimi
         | SessionKind::QwenCode
         | SessionKind::GrokBuild
-        | SessionKind::Pi => {
+        | SessionKind::Pi
+        | SessionKind::Devin => {
             const CHAIN: &[RebindStrategy] = &[RebindStrategy::StoreIndex];
             CHAIN
         }
@@ -245,6 +251,12 @@ pub fn rebind_chain(kind: SessionKind) -> &'static [RebindStrategy] {
 /// FIRST CLI that breaks under an fd move has a place to say so by name,
 /// and so §9 can demand an answer from every kind instead of an implicit
 /// global guess.
+///
+/// Devin answers true on the KERNEL-level evidence — the fd move is
+/// daemon-side and invisible to whatever child holds the slave — not on a
+/// devin-specific measurement (it is installed on no fleet host,
+/// 2026-09-15). If devin is ever the first CLI that breaks under an fd
+/// move, this arm is where its `false` gets named.
 pub fn supports_pty_fd_handoff(kind: SessionKind) -> bool {
     match kind {
         SessionKind::Codex
@@ -258,6 +270,7 @@ pub fn supports_pty_fd_handoff(kind: SessionKind) -> bool {
         | SessionKind::QwenCode
         | SessionKind::GrokBuild
         | SessionKind::Pi
+        | SessionKind::Devin
         | SessionKind::Shell
         | SessionKind::SshShell
         | SessionKind::Document => true,

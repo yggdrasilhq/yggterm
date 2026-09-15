@@ -263,6 +263,28 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         legacy: false,
         example: "zcode-tui-runtime://00000000-0000-4000-8000-000000000033",
     },
+    // ── The 2026-09-15 intake. devin is REGISTERED UNMEASURED (installed on
+    // no fleet host), but the descriptor declares both arms, so the schemes
+    // land with the registration — the lock above keeps the two tables
+    // honest about each other.
+    SchemeDescriptor {
+        prefix: "remote-devin://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Devin),
+        agent: true,
+        legacy: false,
+        example: "remote-devin://devhost/00000000-0000-4000-8000-00000000d300",
+    },
+    SchemeDescriptor {
+        prefix: "devin-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::Devin),
+        agent: true,
+        legacy: false,
+        example: "devin-runtime://00000000-0000-4000-8000-00000000d301",
+    },
     // ── Non-agent (registered so shared predicates can be locked too) ──────
     SchemeDescriptor {
         prefix: "live::",
