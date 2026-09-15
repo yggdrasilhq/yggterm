@@ -1274,6 +1274,30 @@ pub(crate) fn persisted_live_row_identity(live: &PersistedLiveSession) -> String
     )
 }
 
+/// **The restore door of the tombstone plane.** The shared server-state.json
+/// has several writers (the update-restart snapshot write, GUI-relaunch
+/// restores, routine persists on the serving daemon), so the file can hold
+/// rows the user closed after a given writer's view froze. Cold restore is
+/// the one admission path such a row could still slip through:
+/// `restore_live_session` re-adds whatever the file holds, and the persist
+/// reconcile then CLEARS the row's own tombstone on re-entry — the close
+/// would be forgotten. Measured on the GUI host 2026-09-15: six opencode rows
+/// the owner had deleted TWICE resurrected at every GUI relaunch from exactly
+/// this door, and the deny-list count went backwards. The same read-only door
+/// the import and app-restore admission ask is asked here — once for the
+/// whole batch, before any row lands. Restoring a LIST is not the
+/// user-intent `open` verb; it stays vetoed.
+pub(crate) fn tombstoned_persisted_live_rows(
+    home: &std::path::Path,
+    lives: &[PersistedLiveSession],
+) -> Vec<String> {
+    let landing_keys: Vec<String> = lives
+        .iter()
+        .map(|live| restored_live_row_key(live).unwrap_or_else(|| live.key.clone()))
+        .collect();
+    live_row_closes_remembered_among(home, landing_keys.iter().map(String::as_str))
+}
+
 fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) -> bool {
     if is_local_codex_storage_session_path(key)
         || is_local_codex_storage_session_path(&session.session_path)
@@ -9329,6 +9353,19 @@ impl YggtermServer {
             }));
         }
         let mut restored_live_keys = HashSet::<String>::new();
+        // A row the user closed must not ride a stale snapshot back into the
+        // live set — see `tombstoned_persisted_live_rows`. The veto runs before
+        // any row lands, so the persist reconcile never sees a resurrected row
+        // and can never clear its tombstone.
+        let tombstoned_keys: HashSet<String> = perf_home
+            .as_deref()
+            .map(|home| {
+                tombstoned_persisted_live_rows(home, &state.live_sessions)
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tombstone_vetoed_rows = Vec::<String>::new();
         for live in state.live_sessions {
             if !persisted_live_session_is_recoverable(&live) || is_legacy_demo_live_session(&live) {
                 continue;
@@ -9337,6 +9374,10 @@ impl YggtermServer {
             // `restore_live_session`'s own key, or the three disagree about
             // what one row is called.
             let dedupe_key = restored_live_row_key(&live).unwrap_or_else(|| live.key.clone());
+            if tombstoned_keys.contains(&dedupe_key) {
+                tombstone_vetoed_rows.push(dedupe_key);
+                continue;
+            }
             if !restored_live_keys.insert(dedupe_key) {
                 continue;
             }
@@ -9485,6 +9526,8 @@ impl YggtermServer {
                 "sessions": self.sessions.len(),
                 "remote_machines": self.remote_machines.len(),
                 "live_sessions": self.live_session_order.len(),
+                "tombstone_vetoed": tombstone_vetoed_rows.len(),
+                "tombstone_vetoed_rows": tombstone_vetoed_rows,
             }));
         }
     }
@@ -49389,6 +49432,135 @@ terminal_window_id: None,
             .find(|live| live.key == "local://old-shell")
             .expect("restored shell rides normal persistence (first-class)");
         assert!(!shell.keep_alive);
+    }
+
+    /// ⛔ A CLOSED ROW MUST NOT RIDE A STALE SNAPSHOT BACK INTO THE LIVE SET
+    /// (the GUI host, 2026-09-15).
+    ///
+    /// server-state.json has several writers (the update-restart snapshot
+    /// write, GUI-relaunch restores, routine persists on the serving daemon),
+    /// so the file can hold rows the user closed after a given writer's view
+    /// froze. Restore is the one admission path such a row could slip through:
+    /// `restore_live_session` re-adds whatever the file holds, and the persist
+    /// reconcile then CLEARS the row's own tombstone on re-entry — the close
+    /// would be forgotten. Measured live: six opencode rows the owner had
+    /// deleted TWICE resurrected at every GUI relaunch from this door, and the
+    /// deny-list count went BACKWARDS (108→103). The veto must fire before any
+    /// row lands, and the tombstone must survive the restore.
+    #[test]
+    fn a_closed_row_in_a_stale_snapshot_does_not_restore_and_keeps_its_tombstone() {
+        use crate::live_row_tombstones::{LiveRowTombstones, now_secs};
+
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-restore-veto-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+
+        let closed = crate::remote_cc_session_path("dev", "closed-row");
+        let kept = crate::remote_cc_session_path("dev", "kept-row");
+        let row = |key: String| PersistedLiveSession {
+            app_launch: None,
+            key,
+            id: "row-id".to_string(),
+            title: "a row".to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/user".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+        LiveRowTombstones::default()
+            .record_close(&home, &closed, now_secs())
+            .expect("record the close the way remove_session does");
+
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                last_known_app_declares: Default::default(),
+                active_session_path: None,
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: Vec::new(),
+                stored_sessions: Vec::new(),
+                live_sessions: vec![row(closed.clone()), row(kept.clone())],
+                session_pty_grids: Vec::new(),
+            },
+            None,
+        );
+
+        assert!(
+            !server.live_session_order.iter().any(|key| *key == closed),
+            "the closed row must not re-enter the live set from a stale snapshot"
+        );
+        assert!(
+            server.live_session_order.iter().any(|key| *key == kept),
+            "the row that was never closed must still restore"
+        );
+        let remembered = crate::live_row_closes_remembered_among(&home, [closed.as_str()]);
+        assert_eq!(
+            remembered,
+            vec![closed.clone()],
+            "the restore must not clear the row's own tombstone — a resurrected              row that clears its close makes the next stale snapshot permanent"
+        );
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// LOCK: the restore door keeps asking the tombstone plane. A working veto
+    /// is invisible (the row is simply absent), so a refactor that drops the
+    /// ask would ship silently — the 2026-09-15 resurrection storm is what an
+    /// unasked door looks like. Both orderings compile; only one vetoes.
+    #[test]
+    fn restore_persisted_state_asks_the_tombstone_plane_before_any_row_lands() {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("pub fn restore_persisted_state_with_launch_policy")
+            .nth(1)
+            .expect("restore_persisted_state_with_launch_policy exists")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of the restore fn");
+        let veto = body
+            .find("tombstoned_persisted_live_rows(")
+            .expect("restore must ask the tombstone plane");
+        let first_restore = body
+            .find("self.restore_live_session(")
+            .expect("restore must still restore rows");
+        assert!(
+            veto < first_restore,
+            "the tombstone ask must sit before the first restore_live_session —              a veto that runs after a row landed is too late, the reconcile has              already cleared the close"
+        );
+        assert!(
+            body.contains("\"tombstone_vetoed\""),
+            "the veto must be counted in the restore span, or a silent veto              cannot be told from a broken one"
+        );
     }
 
     /// B4 live-row adoption must only ADD. A row this daemon already holds is
