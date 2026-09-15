@@ -30521,6 +30521,26 @@ today it does not, and no restart door fires.
 > environ and flips those state files as well; the pinned file was
 > hand-flipped to builds/9a933b24b4f8 in the same hour (backup kept), so the
 > next door fire or supervisor launch completes the adoption.
+>
+> **LIVE-PROVEN 2026-09-15 12:32:42** (main 893178b42d51, deployed 12:33):
+> the roll staged builds/893178b42d51, flipped BOTH state files, fired the
+> door — and this time the full chain ran inside one second: the live GUI
+> derived pending Some, the daemon took `prepare_update_restart` (64 ms,
+> 30-row protected snapshot written), and a successor GUI launched exec'ing
+> `builds/893178b42d51/yggterm` (pid 3097192). [11.121]'s falsifier is
+> satisfied: the handled pid's exe postdates the merge. What remains open
+> here is only the instrument gap: the flow's per-step trace emits (pending
+> derived / prepare sent / successor launched) still do not exist — today's
+> proof came from the deploy-side fix plus generic request spans, not from
+> the flow speaking for itself. The ux-speed re-probe on the adopted build:
+> drag warm begin 169-175 ms (bar-adjacent) with 4/4 accuracy and
+> tree_drag_begin/ended/hover events now present ([11.113]'s zero-events
+> gap is closed on the live build); drag cold begin a uniform ~1.46 s (the
+> 11 s and 2.3 s cliffs are gone; the residual is the next lane's target);
+> scratch-row close now leaves the live order in ~450 ms (was 4.3-8.2 s)
+> with rows_left_behind 0 — but the `session remove` VERB's own
+> `verified` field answers false while the row demonstrably leaves: an
+> instrument-semantics lead for the [11.113] family, not a lost row.
 
 The [11.121] deploy fix worked end-to-end up to the door and then hit a
 silent wall — the first time in fleet history the door was ever reachable
