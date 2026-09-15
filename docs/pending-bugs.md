@@ -30501,6 +30501,27 @@ today it does not, and no restart door fires.
 
 **Status:** OPEN
 
+> **ROOT CAUSE 2026-09-15 ~12:40:** the live stack never read the file the
+> [11.121] deploy flips. `/proc/<pid>/environ` of BOTH live planes (GUI
+> 3059999, daemon 11310) carries `YGGTERM_DIRECT_INSTALL_ROOT=/home/pi/.yggterm`
+> + `YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1` + `YGGTERM_SUPERVISED=1` — and
+> `direct_install_state_for_executable` checks that env var BEFORE the
+> ancestry walk, so every install-state read inside the pinned processes
+> resolves to `~/.yggterm/install-state.json`, a SHADOW of the channel-default
+> file at `~/.local/share/yggterm/direct/`. The shadow still named the old
+> build, so pending derivation inside the live processes answered `None`:
+> the door no-op'd (10:52, 11:09), the startup workflow answered
+> `installed: false` (perf span 11:33:00.718, 1465 ms — it fell through to
+> the ynpm round trip, which is itself the tell: a derived-pending return is
+> instantaneous). The owner's 11:32 manual restart landed on the old build
+> because the SUPERVISOR reads the pinned file too, and the pin forbids the
+> binary from handoff-exec'ing on launch. Every observation in the original
+> filing is explained; no app-plane restart-flow defect is (yet) needed.
+> Fix: the deploy discovers supervised pins from the live processes' own
+> environ and flips those state files as well; the pinned file was
+> hand-flipped to builds/9a933b24b4f8 in the same hour (backup kept), so the
+> next door fire or supervisor launch completes the adoption.
+
 The [11.121] deploy fix worked end-to-end up to the door and then hit a
 silent wall — the first time in fleet history the door was ever reachable
 on a direct host, so this flow ran for the first time too:
