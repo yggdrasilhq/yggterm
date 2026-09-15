@@ -538,7 +538,9 @@ pipe_run() {  # host, command words…
 # (channel/repo/asset_label ride through) — the binary's own
 # write_direct_install_state does tmp+rename the same way.
 FLIP_PY='import json, os, sys
-p = os.path.expanduser("~/.local/share/yggterm/direct/install-state.json")
+# argv[3] (optional) names the state file: the channel-default one, or a
+# SUPERVISED PIN (see the pin pass below) — the same flip, different file.
+p = os.path.expandvars(sys.argv[3]) if len(sys.argv) > 3 else os.path.expanduser("~/.local/share/yggterm/direct/install-state.json")
 with open(p) as f:
     s = json.load(f)
 ver, exe = os.path.expandvars(sys.argv[1]), os.path.expandvars(sys.argv[2])
@@ -547,13 +549,16 @@ if ver == "KEEP":
 if ver:
     s["active_version"] = ver
     s["icon_revision"] = ver
-s["active_executable"] = exe
-tmp = p + ".deploy-tmp"
-with open(tmp, "w") as f:
-    json.dump(s, f, indent=2)
-    f.write("\n")
-os.replace(tmp, p)
-print("flipped")'
+if s.get("active_executable") == exe and (not ver or s.get("active_version") == ver):
+    print("already names this build")
+else:
+    s["active_executable"] = exe
+    tmp = p + ".deploy-tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, p)
+    print("flipped")'
 
 
 # ⛔ SAY IT ONCE, AND SAY WHAT IT MIGHT MEAN. Four identical copy failures read
@@ -717,6 +722,7 @@ $open_exe_paths
     echo "  · $host: direct channel is at $dactive, NEWER than this roll ($VERSION) — direct install left untouched."
     continue
   fi
+  need_flip=1
   if [ "$VERSION" = "$dactive" ]; then
     # SAME-VERSION REBUILD — stage by build identity, never into the running dir.
     bid=${BUILD_COMMIT:-}
@@ -724,11 +730,15 @@ $open_exe_paths
     ddest="\$HOME/.local/share/yggterm/direct/builds/$bid"
     dnewexe='$HOME/.local/share/yggterm/direct/builds/'"$bid"'/yggterm'
     dver=""
-    label="direct: same-version rebuild staged at builds/$bid"
     activemd5=$(run_on "$host" "md5sum '$dexe' 2>/dev/null" | awk '{print $1}')
     if [ "$activemd5" = "$GUI_SUM" ]; then
-      echo "  ✅ $host: direct channel already executes this exact build ($dexe)"
-      continue
+      # The state file already names THIS build's bytes. Nothing to stage or
+      # flip — but the RUNNING stack may still be on older bytes, so the door
+      # decision below still runs: rotation is a process fact, not a file fact.
+      need_flip=0
+      label="direct: state already names this build ($dexe)"
+    else
+      label="direct: same-version rebuild staged at builds/$bid"
     fi
   else
     ddest="\$HOME/.local/share/yggterm/direct/versions/$VERSION"
@@ -737,41 +747,91 @@ $open_exe_paths
     label="direct: release $VERSION staged (channel was $dactive)"
   fi
   if [ "$DRY" = 1 ]; then
-    echo "  · $host: DRY — $label; install-state flip: active_executable → $dnewexe; restart door: $([ "$DIRECT_RESTART" = 1 ] && echo 'would fire, unforced' || echo 'skipped (--no-direct-restart)')"
+    drypins=$(run_on "$host" 'for p in $(pgrep -x yggterm 2>/dev/null) $(pgrep -f "yggterm-headless server daemon" 2>/dev/null); do
+           [ -r "/proc/$p/environ" ] && tr "\000" "\n" < "/proc/$p/environ" 2>/dev/null \
+             | sed -n "s/^YGGTERM_DIRECT_INSTALL_ROOT=//p"
+         done | sort -u' 2>/dev/null || true)
+    drypins=$(printf '%s' "$drypins" | grep -v "^$HOME/.local/share/yggterm/direct$" | tr '\n' ' ')
+    echo "  · $host: DRY — $label; flip needed: $need_flip; supervised pins: ${drypins:-none}; restart door: $([ "$DIRECT_RESTART" = 1 ] && echo 'would fire if live bytes differ, unforced' || echo 'skipped (--no-direct-restart)')"
     continue
   fi
   DIRECT_TOUCHED=1
-  dstage_fail=0
-  for pair in "yggterm:GUI" "yggterm-headless:HL" "ynpm:YNPM" "ynpx:YNPM"; do
-    bin=${pair%%:*}; kind=${pair##*:}
-    case "$kind" in
-      GUI)  src="$GUI";  want="$GUI_SUM"  ;;
-      HL)   src="$HL";   want="$HL_SUM"   ;;
-      YNPM) src="$YNPM"; want="$YNPM_SUM" ;;
-    esac
-    push_one "$host" "$src" "$ddest/$bin" "$want" || { dstage_fail=1; break; }
-  done
-  # ⛔ FAILED is the fleet-wide accumulator; a copy that failed on ANY host must
-  # not silently skip the direct block of every host after it — a per-host local
-  # flag decides the skip, FAILED only decides the exit code.
-  if [ "$dstage_fail" != 0 ]; then FAILED=1; continue; fi
-  # dnewexe carries an expanded /home/pi path ON PURPOSE: it was read from the
-  # host's own install-state-shaped layout and this fleet is single-user — the
-  # same expansion the activemd5 probe above already relies on.
-  fb64=$(printf '%s' "$FLIP_PY" | base64 | tr -d '\n')
-  # ⛔ the flip command is a PIPELINE, so it goes to ssh as ONE command string —
-  # pipe_run's "$*" join would let the remote shell re-split `bash -c` around
-  # the pipes. Same explicit is_self/ssh split the census below uses.
-  fcmd="echo $fb64 | base64 -d | python3 - '${dver:-KEEP}' '$dnewexe'"
-  flip_ok=0
-  if is_self "$host"; then bash -c "$fcmd" >/dev/null 2>&1 && flip_ok=1
-  else ssh "$host" "$fcmd" >/dev/null 2>&1 && flip_ok=1; fi
-  if [ "$flip_ok" != 1 ]; then
-    echo "  ⛔ $host: direct install-state flip FAILED — staged bytes at builds/versions are NOT adopted; the live stack still runs $dexe" >&2
-    FAILED=1
-    continue
+  if [ "$need_flip" = 1 ]; then
+    dstage_fail=0
+    for pair in "yggterm:GUI" "yggterm-headless:HL" "ynpm:YNPM" "ynpx:YNPM"; do
+      bin=${pair%%:*}; kind=${pair##*:}
+      case "$kind" in
+        GUI)  src="$GUI";  want="$GUI_SUM"  ;;
+        HL)   src="$HL";   want="$HL_SUM"   ;;
+        YNPM) src="$YNPM"; want="$YNPM_SUM" ;;
+      esac
+      push_one "$host" "$src" "$ddest/$bin" "$want" || { dstage_fail=1; break; }
+    done
+    # ⛔ FAILED is the fleet-wide accumulator; a copy that failed on ANY host
+    # must not silently skip the direct block of every host after it — a
+    # per-host local flag decides the skip, FAILED only decides the exit code.
+    if [ "$dstage_fail" != 0 ]; then FAILED=1; continue; fi
+    # dnewexe carries an expanded /home/pi path ON PURPOSE: it was read from
+    # the host's own install-state-shaped layout and this fleet is single-user
+    # — the same expansion the activemd5 probe above already relies on.
+    fb64=$(printf '%s' "$FLIP_PY" | base64 | tr -d '\n')
+    # ⛔ the flip command is a PIPELINE, so it goes to ssh as ONE command
+    # string — pipe_run's "$*" join would let the remote shell re-split
+    # `bash -c` around the pipes. Same explicit is_self/ssh split the census
+    # below uses.
+    fcmd="echo $fb64 | base64 -d | python3 - '${dver:-KEEP}' '$dnewexe'"
+    flip_ok=0
+    if is_self "$host"; then flip_out=$(bash -c "$fcmd" 2>&1) && flip_ok=1
+    else flip_out=$(ssh "$host" "$fcmd" 2>&1) && flip_ok=1; fi
+    if [ "$flip_ok" != 1 ]; then
+      echo "  ⛔ $host: direct install-state flip FAILED — staged bytes at builds/versions are NOT adopted; the live stack still runs $dexe" >&2
+      FAILED=1
+      continue
+    fi
+    echo "  ✅ $host: $label — install-state flipped ($flip_out); the guarded restart doors can now see the update"
+  else
+    echo "  · $host: $label — nothing to stage or flip"
+    fb64=$(printf '%s' "$FLIP_PY" | base64 | tr -d '\n')
   fi
-  echo "  ✅ $host: $label — install-state flipped; the guarded restart doors can now see the update"
+  # ⛔ SUPERVISED PINS: THE FILE ABOVE MAY NOT BE THE ONE THE LIVE STACK READS.
+  # A supervised install (YGGTERM_SUPERVISED=1) is LAUNCHED with
+  # YGGTERM_DIRECT_INSTALL_ROOT naming another root, and
+  # direct_install_state_for_executable checks that env var FIRST — every
+  # install-state read inside the pinned processes resolves there, and
+  # YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1 means the binary will not even
+  # self-upgrade on launch. Measured 2026-09-15 on the GUI host: both live
+  # planes pinned to ~/.yggterm whose state still named the OLD build, so the
+  # channel-root flip above was invisible to them — the door no-op'd, the
+  # startup workflow answered installed:false, and the owner's manual restart
+  # landed on the pinned file's OLD target ([11.122]). The supervisor reads
+  # the pinned file too, so flipping IT is what the next launch adopts.
+  # Discover the pins from the live processes' OWN environment — a pin nobody
+  # carries needs no flip, and one somebody carries must not be guessed.
+  # Runs on EVERY direct host pass (need_flip or not): a pin missed by an
+  # earlier roll is exactly the state this pass exists to heal.
+  pins=$(run_on "$host" 'for p in $(pgrep -x yggterm 2>/dev/null) $(pgrep -f "yggterm-headless server daemon" 2>/dev/null); do
+           [ -r "/proc/$p/environ" ] && tr "\000" "\n" < "/proc/$p/environ" 2>/dev/null \
+             | sed -n "s/^YGGTERM_DIRECT_INSTALL_ROOT=//p"
+         done | sort -u' 2>/dev/null || true)
+  for proot in $pins; do
+    [ -n "$proot" ] || continue
+    case "$proot" in "$HOME/.local/share/yggterm/direct") continue ;; esac
+    pfile="$proot/install-state.json"
+    if ! run_on "$host" "test -f '$pfile'" 2>/dev/null; then
+      echo "  · $host: pinned root $proot has no install-state — not guessed at"
+      continue
+    fi
+    fcmd="echo $fb64 | base64 -d | python3 - '${dver:-KEEP}' '$dnewexe' '$pfile'"
+    pin_ok=0
+    if is_self "$host"; then pin_out=$(bash -c "$fcmd" 2>&1) && pin_ok=1
+    else pin_out=$(ssh "$host" "$fcmd" 2>&1) && pin_ok=1; fi
+    if [ "$pin_ok" = 1 ]; then
+      echo "  ✅ $host: supervised pin $pfile: $pin_out (live stack reads it via YGGTERM_DIRECT_INSTALL_ROOT)"
+    else
+      echo "  ⛔ $host: supervised-pin flip FAILED for $pfile — the pinned live stack still reads the old target" >&2
+      FAILED=1
+    fi
+  done
   # Fire the restart door UNFORCED: it refuses on its own while an agent holds
   # a live web-surface lease, and defers are honest — the staged build is
   # adopted by the next deploy or the GUI's own next start. Fired only when a
@@ -806,7 +866,7 @@ $HL_SUM
   else
     echo "  · $host: direct build staged; restart door skipped (--no-direct-restart)"
   fi
-  # Keep the last three staged builds; never the one install-state points at.
+    # Keep the last three staged builds; never the one install-state points at.
   run_on "$host" 'cd "$HOME/.local/share/yggterm/direct/builds" 2>/dev/null || exit 0
     active=$(sed -n "s/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$HOME/.local/share/yggterm/direct/install-state.json" 2>/dev/null | head -n1)
     activedir=$(dirname "$active" 2>/dev/null)
