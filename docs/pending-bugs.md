@@ -30787,3 +30787,20 @@ every `ps`), not CPU — noticed while attributing "why is jojo hot" (it
 isn't yggterm's heat; the ZCode desktop app's zygote is spinning 0.4-1.1
 cores since 12:09). Filed by zcode sess_1e4cd6d6, lane
 lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
+>
+> **CORRECTION 2026-09-15 ~18:40 (same sitting, evidence over the first
+> theory):** the leak is HISTORICAL, not ongoing. Zombie etimes
+> distribution: ALL 265 are ≥ 3.4 days old — the whole burst happened in
+> the daemon's first ~5 hours (Sep 11 23:09 → Sep 12 ~04:00, ≈53/hour —
+> the startup/restore-churn era), and ZERO new corpses since. A 7-minute
+> `strace -f -p 11310 -e trace=clone,execve,wait4` over the remote-projection
+> scans (17 distinct ssh execs, `run_remote_python_lines`-shaped,
+> ConnectTimeout=5 BatchMode) shows every spawn reaped — the parent polls
+> `wait4(pid)` per child. The "2.9/hour sustained" in the filing above was
+> a 265÷3.8-days average, not a cadence; the first watcher's "269 live
+> ssh" also over-counted (zombies share comm=ssh; only 4 live `-tt` rows
+> are real). Remaining action is therefore narrower: identify nothing, fix
+> nothing urgent — the corpses reparent to init and vanish whenever this
+> daemon finally rotates onto a post-[11.121] build. The defensive
+> spawn-and-reap primitive stays as a dream (dreams/features
+> ACK-02191b62c8): one abandoned Child on a bad day re-opens this.
