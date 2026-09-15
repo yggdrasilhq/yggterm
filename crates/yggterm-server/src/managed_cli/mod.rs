@@ -2387,18 +2387,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.home);
     }
 
-    /// The v2 preview package (`@opencode-ai/cli`) carries the same
-    /// entry-bin trap under a scoped path and a new bin name — the health
-    /// check must follow the package the descriptor names, or a broken 2.0
-    /// install satisfies the fast path forever.
+    /// The opencode npm packages carry the same entry-bin trap under a
+    /// scoped path and a new bin name — the health check must follow the
+    /// package the descriptor names, or a broken install satisfies the fast
+    /// path forever. Exercised on the LIVE package (`@opencode/cli`); the
+    /// retired names stay in the map above so older hosts keep healing.
     #[test]
-    fn the_opencode2_preview_shim_is_checked_under_its_scoped_path() {
+    fn the_opencode2_shim_is_checked_under_its_scoped_path() {
         let paths = provision_test_paths("opencode2-shim");
         let prefix = &paths.prefix;
         let shim_dir = prefix
             .join("lib")
             .join("node_modules")
-            .join("@opencode-ai")
+            .join("@opencode")
             .join("cli")
             .join("bin");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
@@ -2407,12 +2408,12 @@ mod tests {
         std::fs::write(&shim, "echo \"Error: postinstall script was not run.\"\n")
             .expect("write shim");
         assert!(
-            !direct_install_shim_is_healthy(prefix, "@opencode-ai/cli"),
+            !direct_install_shim_is_healthy(prefix, "@opencode/cli"),
             "the scoped package's error shim must not satisfy the fast path"
         );
         std::fs::write(&shim, b"\x7fELF\x02\x01\x01\x00rest-of-binary").expect("write elf");
         assert!(
-            direct_install_shim_is_healthy(prefix, "@opencode-ai/cli"),
+            direct_install_shim_is_healthy(prefix, "@opencode/cli"),
             "a real binary must satisfy the fast path"
         );
         let _ = std::fs::remove_dir_all(&paths.home);
@@ -5197,6 +5198,7 @@ fn direct_install_shim_is_healthy(prefix: &Path, package: &str) -> bool {
     let entry_bin = match package {
         "opencode-ai" => ("opencode-ai", "opencode.exe"),
         "@opencode-ai/cli" => ("@opencode-ai/cli", "opencode2.exe"),
+        "@opencode/cli" => ("@opencode/cli", "opencode2.exe"),
         _ => return true,
     };
     let shim = prefix

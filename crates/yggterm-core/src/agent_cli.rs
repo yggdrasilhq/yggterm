@@ -1756,18 +1756,22 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
 /// impossible by construction: [`SessionKind::is_agent`] is derived from this
 /// table (see `session_kind.rs`).
 /// The npm dist-tag a CLI installs from, when the vendor's `latest` is not
-/// the line the owner chose. OpenCode's v2 binary ships as `@opencode-ai/cli`
-/// on the `beta` tag (build-numbered versions) while `latest` there stays one
-/// step behind and the UNSCOPED `opencode-ai@beta` is the abandoned v1 line
-/// (owner directive 2026-08-26; wrong-package pin fixed 2026-08-28), so the
-/// provisioner must resolve the tag against THIS package, not assume the word
+/// the line the owner chose. OpenCode is the cautionary history: its line has
+/// shipped under three package names (`opencode-ai` abandoned v1,
+/// `@opencode-ai/cli` preview, dead since 2026-09-07, and the live
+/// `@opencode/cli`), and a beta-tag pin that was right in August read as
+/// "current forever" once its package died (measured 2026-09-15). Resolve
 /// "latest" nor that the tag exists on every package that ever carried it. A
 /// fn over [`SessionKind`] rather than a descriptor field: it is provisioning
 /// policy (revisable in one place) and adding a descriptor field would ripple
 /// through every registry literal.
 pub fn npm_dist_tag(kind: SessionKind) -> Option<&'static str> {
     match kind {
-        SessionKind::OpenCode => Some("beta"),
+        // The 2026-08-26 beta pin existed because the dead preview package's
+        // `latest` trailed its `beta`; the successor package (`@opencode/cli`)
+        // graduated — `latest` IS the v2 line now (2.0.x), and its `beta`
+        // tag is semver-LOWER (0.0.0-beta-*) and would hold rows below stable.
+        SessionKind::OpenCode => None,
         _ => None,
     }
 }
@@ -2494,15 +2498,18 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         session_metadata_label: "OpenCode Session",
         slug: "opencode",
         binary_name: "opencode2",
-        // ⛔ TWO packages, ONE tag name: `opencode-ai@beta` is the ABANDONED
-        // v1-line beta (date-stamped versions, frozen upstream); the v2 line
-        // the owner directed (2026-08-26) ships as `@opencode-ai/cli@beta`
-        // (build-numbered versions) and installs the binary `opencode2`.
-        // Pinning the right tag on the wrong package is how the managed
-        // install served a frozen August beta while every terminal ran the
-        // 2.0 preview. Naming the wrong one is how provisioning silently
-        // installs nothing.
-        install: CliInstall::Npm("@opencode-ai/cli"),
+        // ⛔ THREE packages have carried this binary line; only ONE is alive.
+        // `opencode-ai` is the abandoned v1 line; `@opencode-ai/cli` (owner
+        // directive 2026-08-26, the 2026-08-28 wrong-package fix) stopped
+        // publishing upstream on 2026-09-07 at beta-19271, so a pin on it
+        // reads as "current" forever while the product moves on. The v2 line
+        // now ships as `@opencode/cli` and installs the binary `opencode2`
+        // (measured 2026-09-15: latest 2.0.3; update.opencode.ai's own beta
+        // channel serves the same stable line). Pinning the right tag on the
+        // wrong package is how the managed install served a frozen August
+        // beta while every terminal ran the 2.0 preview; naming the wrong one
+        // is how provisioning silently installs nothing.
+        install: CliInstall::Npm("@opencode/cli"),
         update: CliUpdate::Reinstall,
         icon_glyph: "OC_",
         // Nearest available (7.90:1).
@@ -10982,22 +10989,24 @@ mod tests {
         assert!(!crate::looks_like_low_signal_generated_copy(&chosen));
     }
 
-    /// Regression lock for the 2026-08-28 wrong-package fix: OpenCode's v2
-    /// line ships as `@opencode-ai/cli` under the `beta` tag and installs the
-    /// binary `opencode2`. The tag NAME alone is not the decision — the same
-    /// word exists on the abandoned unscoped v1 package — so both halves of
-    /// the pin are asserted here, and a future edit that restores either half
-    /// of the frozen-August drift fails this instead of every opencode row.
+    /// Regression lock for the package-lineage fixes (2026-08-28 wrong-package
+    /// pin, 2026-09-15 dead-package pin): OpenCode's live line ships as
+    /// `@opencode/cli` (no dist-tag pin: `latest` is the v2 stable line) and
+    /// installs the binary `opencode2`. `@opencode-ai/cli` stopped publishing
+    /// 2026-09-07 and must never come back — a pin on it reads as "current"
+    /// forever while the product moves on — so both the package and the
+    /// no-beta-tag halves are asserted here, and a future edit that restores
+    /// either half of the drift fails this instead of every opencode row.
     #[test]
-    fn opencode_installs_the_v2_preview_package_not_the_abandoned_v1_beta() {
+    fn opencode_installs_the_live_v2_package_not_a_dead_line() {
         let descriptor = agent_cli_descriptor(SessionKind::OpenCode)
             .expect("OpenCode is a registered agent CLI");
         assert_eq!(descriptor.binary_name, "opencode2");
         match descriptor.install {
-            CliInstall::Npm(package) => assert_eq!(package, "@opencode-ai/cli"),
+            CliInstall::Npm(package) => assert_eq!(package, "@opencode/cli"),
             other => panic!("OpenCode must install from npm, got {other:?}"),
         }
-        assert_eq!(npm_dist_tag(SessionKind::OpenCode), Some("beta"));
+        assert_eq!(npm_dist_tag(SessionKind::OpenCode), None);
     }
 }
 
