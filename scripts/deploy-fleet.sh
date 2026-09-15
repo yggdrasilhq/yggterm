@@ -11,7 +11,7 @@
 #
 #   scripts/deploy-fleet.sh [--from <dir>] [--hosts "dev guihost oc"] [--dry-run]
 #                           [--allow-behind] [--preflight] [--no-pin]
-#                           [--allow-downgrade]
+#                           [--allow-downgrade] [--no-direct-restart]
 #
 # ⛔⛔ A DEPLOY MAY NEVER TAKE A HOST BACKWARDS — 2026-08-27, MEASURED TWICE IN
 # ONE HOUR. The hourly roll put 3.1.61 fleet-wide and restarted the GUI host;
@@ -63,6 +63,11 @@ PREFLIGHT=0
 HOSTS_EXPLICIT=0
 NO_PIN=0
 ALLOW_DOWNGRADE=0
+# The direct-channel restart door fires by default (staged, unforced — see the
+# DIRECT CHANNEL block for why default-on is the honest behavior). `--no-direct-restart`
+# stages the build and flips the install-state but leaves the live stack alone.
+DIRECT_RESTART=1
+DIRECT_TOUCHED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="$2"; shift 2;;
@@ -72,6 +77,7 @@ while [ $# -gt 0 ]; do
     --allow-behind) ALLOW_BEHIND=1; shift;;
     --preflight) PREFLIGHT=1; shift;;
     --allow-downgrade) ALLOW_DOWNGRADE=1; shift;;
+    --no-direct-restart) DIRECT_RESTART=0; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -516,6 +522,40 @@ discover_copies() {  # host  → prints "abs_path KIND" per line
 FAILED=0
 for host in $HOSTS; do classify_host "$host"; done
 
+# Like run_on, but THIS function's stdin is forwarded — the direct-channel
+# block pipes the flip program and JSON through it. run_on deliberately closes
+# stdin ("< /dev/null"); a forwarded stdin must be a separate verb or every
+# existing call site would have to re-close it by hand.
+pipe_run() {  # host, command words…
+  local host="$1"; shift
+  if is_self "$host"; then "$@"
+  else ssh "$host" "$*"; fi
+}
+
+# The direct install-state flip, fed on stdin: `python3 - <ver> <new_exe>`.
+# Empty <ver> keeps active_version (same-version rebuild adoption) and only
+# repoints active_executable. Atomic (tmp + os.replace) and field-preserving
+# (channel/repo/asset_label ride through) — the binary's own
+# write_direct_install_state does tmp+rename the same way.
+FLIP_PY='import json, os, sys
+p = os.path.expanduser("~/.local/share/yggterm/direct/install-state.json")
+with open(p) as f:
+    s = json.load(f)
+ver, exe = os.path.expandvars(sys.argv[1]), os.path.expandvars(sys.argv[2])
+if ver == "KEEP":
+    ver = ""  # same-version rebuild: the sentinel rode through "$*" where an empty arg cannot
+if ver:
+    s["active_version"] = ver
+    s["icon_revision"] = ver
+s["active_executable"] = exe
+tmp = p + ".deploy-tmp"
+with open(tmp, "w") as f:
+    json.dump(s, f, indent=2)
+    f.write("\n")
+os.replace(tmp, p)
+print("flipped")'
+
+
 # ⛔ SAY IT ONCE, AND SAY WHAT IT MIGHT MEAN. Four identical copy failures read
 # as a partial deploy; one named refusal reads as what it is.
 for host in $HOSTS; do
@@ -624,6 +664,160 @@ $open_exe_paths
     done' 2>/dev/null | sed 's/^/  /'
 
   unset DEST_KIND
+
+  # ⛔⛔ THE DIRECT CHANNEL IS A SECOND INSTALL PLANE, AND EVERYTHING ABOVE IS
+  # A DEAD WRITE FOR IT — [11.121], measured 2026-09-15 on the GUI host. A host
+  # whose live stack runs the DIRECT channel (~/.local/share/yggterm/direct/
+  # install-state names the executable the daemon and GUI actually exec) never
+  # reads a byte of the managed layout this script writes: the roll printed
+  # four ✅ and claimed "deployed" while three landed UX fixes sat
+  # executed-never on disk, and both restart doors were blind to it — GUI
+  # convergence restarts only on a version-STRING bump (equal versions never
+  # restart, per the 2026-09-04 loop fix), and `server app update restart`
+  # derives its pending update from the direct install-state, whose
+  # active_executable the deploy never touched, so preferred == current → None.
+  #
+  # ⇒ ADOPT THE CHANNEL'S OWN SHAPE. The direct channel updates itself by
+  # writing versions/<v>/ and flipping install-state; that flip IS the pending
+  # update — every launched binary re-execs to active_executable, and the GUI
+  # update workflow + `server app update restart` restart into it through the
+  # guarded machinery (agent-lease refusal, draft defers, session-preserving
+  # daemon handover). A same-version rebuild (the roll reuses one VERSION
+  # inside a release window) stages under builds/<commit>/: a path OUTSIDE
+  # versions/ makes no version claim (install_path_declared_version), so the
+  # record's word stands and the pending-restart door opens — and the door is
+  # one-shot by construction (preferred == current once adopted), exactly the
+  # property the 2026-09-04 same-version convergence loop taught this repo to
+  # demand before anything may restart a GUI on a rebuild. NEVER repoint
+  # active_executable back into the RUNNING versions/<v>/ directory: the path
+  # would not change, the pending update would stay invisible, and the defect
+  # would reopen under a green report line.
+  direct_state=$(run_on "$host" 'cat "$HOME/.local/share/yggterm/direct/install-state.json" 2>/dev/null' 2>/dev/null || true)
+  case "$direct_state" in
+    *'"channel": "direct"'*|*'"channel":"direct"'*) ;;
+    *) continue ;;  # managed-channel host: the write + convergence machinery above already owns it
+  esac
+  # ⛔ THE PARSE IS LOCAL, ON PURPOSE. direct_state is already a shell variable
+  # on THIS machine; a `python3 -c` program cannot cross ssh inside "$*" (the
+  # remote shell strips its quoting and python reads `import` as the program —
+  # measured: jojo answered "unreadable" while the identical probe in a bare
+  # ssh line matched). Local sed on the flat machine-written JSON, no second
+  # round trip.
+  dactive=$(printf '%s' "$direct_state" | sed -n 's/.*"active_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+  dexe=$(printf '%s' "$direct_state" | sed -n 's/.*"active_executable"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+  if [ -z "$dactive" ] || [ -z "$dexe" ]; then
+    echo "  ⚠ $host: direct install-state unreadable — the direct channel is left untouched rather than guessed at." >&2
+    continue
+  fi
+  # The channel may have self-updated PAST this roll. A deploy never takes a
+  # host backwards — the same law as the managed downgrade guard above, applied
+  # to the plane that guard cannot see.
+  if [ "$VERSION" != "$dactive" ] &&
+     [ "$(printf '%s\n%s\n' "$VERSION" "$dactive" | sort -V | head -1)" = "$VERSION" ]; then
+    echo "  · $host: direct channel is at $dactive, NEWER than this roll ($VERSION) — direct install left untouched."
+    continue
+  fi
+  if [ "$VERSION" = "$dactive" ]; then
+    # SAME-VERSION REBUILD — stage by build identity, never into the running dir.
+    bid=${BUILD_COMMIT:-}
+    case "$bid" in ""|*[!A-Za-z0-9._-]*) bid=${GUI_SUM:0:12} ;; esac
+    ddest="\$HOME/.local/share/yggterm/direct/builds/$bid"
+    dnewexe='$HOME/.local/share/yggterm/direct/builds/'"$bid"'/yggterm'
+    dver=""
+    label="direct: same-version rebuild staged at builds/$bid"
+    activemd5=$(run_on "$host" "md5sum '$dexe' 2>/dev/null" | awk '{print $1}')
+    if [ "$activemd5" = "$GUI_SUM" ]; then
+      echo "  ✅ $host: direct channel already executes this exact build ($dexe)"
+      continue
+    fi
+  else
+    ddest="\$HOME/.local/share/yggterm/direct/versions/$VERSION"
+    dnewexe='$HOME/.local/share/yggterm/direct/versions/'"$VERSION"'/yggterm'
+    dver="$VERSION"
+    label="direct: release $VERSION staged (channel was $dactive)"
+  fi
+  if [ "$DRY" = 1 ]; then
+    echo "  · $host: DRY — $label; install-state flip: active_executable → $dnewexe; restart door: $([ "$DIRECT_RESTART" = 1 ] && echo 'would fire, unforced' || echo 'skipped (--no-direct-restart)')"
+    continue
+  fi
+  DIRECT_TOUCHED=1
+  dstage_fail=0
+  for pair in "yggterm:GUI" "yggterm-headless:HL" "ynpm:YNPM" "ynpx:YNPM"; do
+    bin=${pair%%:*}; kind=${pair##*:}
+    case "$kind" in
+      GUI)  src="$GUI";  want="$GUI_SUM"  ;;
+      HL)   src="$HL";   want="$HL_SUM"   ;;
+      YNPM) src="$YNPM"; want="$YNPM_SUM" ;;
+    esac
+    push_one "$host" "$src" "$ddest/$bin" "$want" || { dstage_fail=1; break; }
+  done
+  # ⛔ FAILED is the fleet-wide accumulator; a copy that failed on ANY host must
+  # not silently skip the direct block of every host after it — a per-host local
+  # flag decides the skip, FAILED only decides the exit code.
+  if [ "$dstage_fail" != 0 ]; then FAILED=1; continue; fi
+  # dnewexe carries an expanded /home/pi path ON PURPOSE: it was read from the
+  # host's own install-state-shaped layout and this fleet is single-user — the
+  # same expansion the activemd5 probe above already relies on.
+  fb64=$(printf '%s' "$FLIP_PY" | base64 | tr -d '\n')
+  # ⛔ the flip command is a PIPELINE, so it goes to ssh as ONE command string —
+  # pipe_run's "$*" join would let the remote shell re-split `bash -c` around
+  # the pipes. Same explicit is_self/ssh split the census below uses.
+  fcmd="echo $fb64 | base64 -d | python3 - '${dver:-KEEP}' '$dnewexe'"
+  flip_ok=0
+  if is_self "$host"; then bash -c "$fcmd" >/dev/null 2>&1 && flip_ok=1
+  else ssh "$host" "$fcmd" >/dev/null 2>&1 && flip_ok=1; fi
+  if [ "$flip_ok" != 1 ]; then
+    echo "  ⛔ $host: direct install-state flip FAILED — staged bytes at builds/versions are NOT adopted; the live stack still runs $dexe" >&2
+    FAILED=1
+    continue
+  fi
+  echo "  ✅ $host: $label — install-state flipped; the guarded restart doors can now see the update"
+  # Fire the restart door UNFORCED: it refuses on its own while an agent holds
+  # a live web-surface lease, and defers are honest — the staged build is
+  # adopted by the next deploy or the GUI's own next start. Fired only when a
+  # live process still runs different bytes; after adoption the door is a
+  # no-op and re-firing it every roll would be noise wearing a ✅.
+  if [ "$DIRECT_RESTART" = 1 ]; then
+    livemd5s=$(run_on "$host" 'for p in $(pgrep -x yggterm 2>/dev/null) $(pgrep -f "yggterm-headless server daemon" 2>/dev/null); do
+                  [ -r "/proc/$p/exe" ] && md5sum "/proc/$p/exe" 2>/dev/null | cut -d" " -f1
+                done | sort -u' 2>/dev/null || true)
+    if [ -z "$livemd5s" ]; then
+      echo "  · $host: no live yggterm process to rotate — the staged build is what the next launch execs"
+    else
+      case "
+$livemd5s
+" in
+        *"
+$GUI_SUM
+"**"
+$HL_SUM
+"*) echo "  ✅ $host: direct stack already executes this build — restart door not fired"; continue ;;
+      esac
+      resp=$(run_on "$host" '"$HOME/.yggterm/bin/yggterm-headless" server app update restart --timeout-ms 20000' 2>&1 || true)
+      case "$resp" in
+        *'"error": null'*)
+          echo "  ✅ $host: direct restart requested through the guarded door — sessions ride the handover" ;;
+        "")
+          echo "  ⚠ $host: no GUI answered the restart door — build stays staged; the next start adopts it" ;;
+        *)
+          echo "  ⚠ $host: restart door did not adopt ($(printf '%s' "$resp" | tr '\n' ' ' | head -c 220)) — build stays staged; the next deploy or GUI start retries" ;;
+      esac
+    fi
+  else
+    echo "  · $host: direct build staged; restart door skipped (--no-direct-restart)"
+  fi
+  # Keep the last three staged builds; never the one install-state points at.
+  run_on "$host" 'cd "$HOME/.local/share/yggterm/direct/builds" 2>/dev/null || exit 0
+    active=$(sed -n "s/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$HOME/.local/share/yggterm/direct/install-state.json" 2>/dev/null | head -n1)
+    activedir=$(dirname "$active" 2>/dev/null)
+    n=0
+    for d in $(ls -1t 2>/dev/null); do
+      [ -d "$d" ] || continue
+      [ "$PWD/$d" = "$activedir" ] && continue
+      n=$((n+1))
+      [ "$n" -gt 3 ] || continue
+      rm -rf "$d" && echo "  · pruned direct builds/$d (older staged build, not active)"
+    done' 2>/dev/null | sed 's/^/  /'
 done
 
 [ "$DRY" = 1 ] && exit 0
@@ -717,7 +911,7 @@ for host in $HOSTS; do
          x=$(readlink /proc/$g/exe 2>/dev/null)
          m=$(md5sum /proc/$g/exe 2>/dev/null | cut -c1-10)
          case "$x" in
-           "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*|"$HOME/.cargo/bin/"*|"$HOME/bin/"*) k="installed";;
+           "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*|"$HOME/.cargo/bin/"*|"$HOME/bin/"*|"$HOME/.local/share/yggterm/direct/"*) k="installed";;
            *) k="sandbox";;
          esac
          printf "    gui      pid %-8s %-11s %-10s %s\n" \
@@ -737,7 +931,7 @@ for host in $HOSTS; do
   # Only INSTALLED GUIs are claiming to be this deploy; see the note in the census.
   probe='for g in $(pgrep -x yggterm 2>/dev/null); do
            x=$(readlink /proc/$g/exe 2>/dev/null)
-           case "$x" in "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*|"$HOME/.cargo/bin/"*|"$HOME/bin/"*)
+           case "$x" in "$HOME/.local/bin/"*|"$HOME/.yggterm/bin/"*|"$HOME/.cargo/bin/"*|"$HOME/bin/"*|"$HOME/.local/share/yggterm/direct/"*)
              md5sum /proc/$g/exe 2>/dev/null | cut -c1-10;; esac
          done'
   if is_self "$host"; then running=$(bash -c "$probe"); else running=$(ssh "$host" bash -c "'$probe'"); fi
@@ -753,6 +947,7 @@ done
 
 if [ "$FAILED" != 0 ]; then echo "⛔ deploy-fleet: at least one copy did not read back"; exit 1; fi
 echo "deploy-fleet: every copy on every host reads back at $VERSION ($BUILD_COMMIT)"
+[ "${DIRECT_TOUCHED:-0}" = 1 ] && echo "  Direct-channel hosts staged this build into their own install plane (their lines above say adopted / deferred / untouched — a deferred one is honest, not green)."
 echo "  Ask a FILE which source it is:    yggterm --build-commit"
 echo "  Ask the RUNNING processes:        yggterm-headless server daemons   (BUILD column)"
 echo "⚠ The daemons do NOT swap here. Each retires onto the new binary on its own"
