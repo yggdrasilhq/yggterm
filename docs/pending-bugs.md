@@ -30886,16 +30886,15 @@ stands (one big signal ⇒ any subscriber re-renders per ghost write; the
 probe-scale win is NOT demonstrated — the falsifier above needs the
 quiet-window gesture-scoped run, ideally with a natural (human) drag.
 
-Same lane, SECOND defect fixed here (the drop flake the felt driver
-caught on 4835284c: 3 of 5 synthetic drags landed the wrong placement):
-`drag_hover_update_needed` gated on 8px pointer travel BEFORE comparing
-the target/placement, so a Before->After band flip inside 8px of the
-last accepted hover was dropped and the release committed the STALE
-placement. [11.129]'s signal split made the gate's re-anchor rarer
-(only accepted hovers re-anchor now), which is what surfaced it — but
-the ordering was wrong on every build before this too. Placement /
-target change now wins over the travel gate; a band flip can no longer
-be swallowed.
+Same lane, a gate-ordering hardening shipped here: `drag_hover_update_needed`
+checked 8px pointer travel BEFORE comparing target/placement, so a
+Before->After band flip inside the travel bubble could never reach
+`set_drag_hover_target`. Placement/target change wins first now.
+⚠ CORRECTED same sitting: the drop failures the felt driver caught on
+4835284c were NOT this — they are [11.130] (the synthetic hover chain
+never fires at all; the run5 "passes" that motivated the first
+attribution were wait_order false positives). The ordering fix stands on
+its own correctness.
 
 The ghost card and the drag pointer live in the ONE `Signal<ShellState>`
 (`with_mut_counted` = `Signal::with_mut` — every write marks all subscribers).
@@ -30958,3 +30957,27 @@ pin stays authoritative. Three new tests + the docs/ynpm.md downgrade law.
 fleet-wide, force a managed-CLI refresh foreground, and the agent bin must
 still answer 0.6.6 afterwards — trace shows `install.downgrade_refused` or
 `install.dev_link_kept`, never a 0.5.7 repoint.
+
+## ⛔ [11.130] A SYNTHETIC-POINTER FELT DRAG NEVER SETS THE DROP TARGET — EVERY `server app pointer` GESTURE ENDS `tree_drop_ignored/no_drag_hover_target` ON EVERY BUILD TESTED, SO THE FELT DRIVER CANNOT PROVE DROPS AND THE HOVER SIDE OF THE FELT PATH IS UNMEASURABLE (found 2026-09-15 ~23:20 IST, GUI host builds d2502162 and 337590a2, the ux-speed drag-felt lane)
+
+**Status:** OPEN
+
+The felt driver (tools/uxspeed/uxprobe.py `felt`) presses, dwells,
+crosses the threshold, and hovers across rows with real synthetic
+pointer events; `tree_drag_begin`/`tree_drag_ended` fire, but ZERO
+`tree_drag_hover` events ever do, and every release records
+`tree_drop_ignored {reason: no_drag_hover_target}` — measured on
+337590a219f7 (BEFORE this lane's changes, run5) and on d2502162e852
+(after), so it is not a regression of the ghost-signal split. The rows'
+hover wiring is `onmousemove -> on_drag_hover` (sidebar.rs ~2556, gated
+on the drag_active prop), and the pointer verb dispatches
+mousemove+pointermove with `buttons: 0` (DOM capture probe) — the
+synthetic event reduction either never wakes the rows' drag_active
+render, never satisfies a gate upstream of `set_drag_hover_target`, or
+misses an event type a real mouse produces (mouseover/mouseenter,
+button-carrying moves, drag capture). Real-mouse drags work (the owner
+uses them daily); verb-path drags work (explicit hover verb). Until
+named and fixed, the felt driver proves the drag's start and merge
+behavior but NOT its drop, and any felt-accuracy claim from it is
+invalid. Family: [11.113] instrument gaps; the pointer-verb help line
+also still lies about its action spellings (fixed this lane).
