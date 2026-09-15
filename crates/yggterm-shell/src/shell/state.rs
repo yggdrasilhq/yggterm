@@ -34979,13 +34979,22 @@ impl ShellState {
         if self.drag_paths.is_empty() {
             return false;
         }
-        if self.drag_pointer_update_needed(pointer) {
-            return true;
-        }
-        self.drag_hover_target
+        // A target or PLACEMENT change must win over the 8px travel throttle:
+        // the release commits the STORED target, so a Before->After band flip
+        // swallowed by the travel gate would drop on the wrong side. Since
+        // [11.129] the move stream no longer re-anchors drag_pointer (it
+        // feeds the ghost signal), and the hover gate re-anchors only on
+        // accepted hovers — without this ordering every sub-8px band flip
+        // inside one row was droppable stale.
+        if self
+            .drag_hover_target
             .as_ref()
             .map(|target| target.path != row.full_path || target.placement != placement)
             .unwrap_or(true)
+        {
+            return true;
+        }
+        self.drag_pointer_update_needed(pointer)
     }
     fn set_drag_hover_target(
         &mut self,

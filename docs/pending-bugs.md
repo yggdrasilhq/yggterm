@@ -30859,13 +30859,33 @@ lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-Falsifier: on the adopted build, a felt drag's `component_window` shows
-`app` renders only at the gesture's real edges (press select, begin,
-hover-target change, drop/clear) — the per-8px move stream contributes
-~zero `app` renders, the ghost leaf re-renders instead (before, on
-337590a219f7: `app` rendered 2-11x per ~2.5s window DURING felt drags,
-mean 8-101 ms, max spikes 157-223 ms — measured with the felt driver,
-2026-09-15 ~21:50 IST).
+Falsifier: on a QUIET window (floor <100 ms), gesture-scoped render
+attribution — `app` renders inside `tree_drag_begin..ended` — shows the
+per-8px move stream contributing ~zero `app` renders, the ghost leaf
+re-rendering instead.
+
+⚠ MEASUREMENT HONESTY (2026-09-15 ~22:55 IST): the first before/after was
+INCONCLUSIVE, and the entry's original before-numbers over-attributed.
+`app` renders of 2-11x per ~2.5s run window (max spikes 157-223 ms) are
+dominated by spawn-promotion/teardown churn, not pointer moves; inside
+the actual `tree_drag_begin..ended` windows the before-build measured 0
+`app` renders across 3 windows (the per-move write is throttled to 8px
+and the synthetic gesture windows are short). The architecture claim
+stands (one big signal ⇒ any subscriber re-renders per ghost write; the
+≤1-frame drag bar cannot be promised at owner-scale trees), but the
+probe-scale win is NOT demonstrated — the falsifier above needs the
+quiet-window gesture-scoped run, ideally with a natural (human) drag.
+
+Same lane, SECOND defect fixed here (the drop flake the felt driver
+caught on 4835284c: 3 of 5 synthetic drags landed the wrong placement):
+`drag_hover_update_needed` gated on 8px pointer travel BEFORE comparing
+the target/placement, so a Before->After band flip inside 8px of the
+last accepted hover was dropped and the release committed the STALE
+placement. [11.129]'s signal split made the gate's re-anchor rarer
+(only accepted hovers re-anchor now), which is what surfaced it — but
+the ordering was wrong on every build before this too. Placement /
+target change now wins over the travel gate; a band flip can no longer
+be swallowed.
 
 The ghost card and the drag pointer live in the ONE `Signal<ShellState>`
 (`with_mut_counted` = `Signal::with_mut` — every write marks all subscribers).
