@@ -30404,9 +30404,7 @@ carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 
 ## ⛔ [11.121] ON A DIRECT-CHANNEL HOST THE HOURLY ROLL IS A DEAD WRITE FOR THE LIVE STACK — THE GUI AND DAEMON RUN A SEP-11 DIRECT BUILD WHILE THREE LANDED UX FIXES SIT EXECUTED-NEVER IN THE MANAGED LAYOUT, AND BOTH RESTART DOORS ARE BLIND TO SAME-VERSION REBUILDS (traced 2026-09-15 ~02:00 IST, GUI host, the drag-cold lane's re-probe)
 
-**Status:** OPEN — fix LANDED 2026-09-15 (deploy tooling, this entry owns the
-close): the defect closes only on the falsifier's live proof after the first
-roll that carries the fix, not on the merge.
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 > **LANDED 2026-09-15** (lane/uxspeed/direct-channel-deploy, the ux-speed
 > campaign): deploy-fleet.sh now adopts the direct channel per host, in the
