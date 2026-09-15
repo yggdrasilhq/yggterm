@@ -43,7 +43,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
 | 11.6.11 | zcode-tui | B | OPEN (native announce LANDED — emitter commit zcode-tui 0bd590f + daemon `announce` verb; arm matrix FILLED — all 10 tests green; §9 battery suite LANDED on `lane/integration/zcode-tui-battery` — 6/6 green against true main 0.5.9 through a real pty: paint, U+258F caret byte-exact, turn, sess_ store law, resume rederive, panic; the SCREEN-side live proof is delivered, the announce-WIRE proof rides the daemon listener; descriptor screen-phrase fill LANDED ([11.111] deleted per the verified-fix law — table matches 0.5.9 chrome, the §9 suite asserts declared==observed)) |
-| 11.6.12 | devin | C (unmeasured) | REGISTERED UNMEASURED 2026-09-15 (lane/integration/devin): SessionKind::Devin + descriptor at the availability-record posture, managed-CLI row, remote-devin:// registry kind, cli-stores.json scan-gap row, stone-doc roster — every contract docs-sourced (docs.devin.ai/cli/reference/commands), NOTHING measured. OPEN, owner-gated: install on a fleet host (curl -fsSL https://cli.devin.ai/install.sh), then measure BEFORE consumers trust the descriptor — composer glyph, screen phrases, trust-gate screen (--respect-workspace-trust implies one), session-store layout (verify a template against a REAL session id), resume arm (--resume/-r unprobed), permission spellings (normal/dangerous/bypass unprobed) |
+| 11.6.12 | devin | C (unmeasured) | REGISTERED UNMEASURED 2026-09-15 (lane/integration/devin): SessionKind::Devin + descriptor at the availability-record posture, managed-CLI row, remote-devin:// registry kind, cli-stores.json scan-gap row, stone-doc roster — every contract docs-sourced (docs.devin.ai/cli/reference/commands), NOTHING measured. INSTALLED on jojo 2026-09-15 evening (v3000.10.27, curl-bash install.sh) and FIRST LIVE LAUNCH PROVEN through the real request path — row parsed by the serving daemon, runtime spawned, login TUI renders (auth is the owner's; the login screen is the measured first screen), and the resume arm is EXERCISED: the first unauthenticated spawn line is `devin --resume <session-id>`. Remaining OPEN, measure before consumers trust the descriptor — composer glyph, screen phrases, trust-gate screen (--respect-workspace-trust implies one), session-store layout (verify a template against a REAL session id), permission spellings (normal/dangerous/bypass unprobed). The launch detour that surfaced two defects is [11.130]+[11.131] |
 
 ### ⛔ 11.6.11 defect — ZCODE-TUI WAS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` RED (found by wave-1 seat B, 2026-09-10; FIXED IN CODE 2026-09-14)
 
@@ -30842,6 +30842,49 @@ drags (walls steady, reorder accuracy 4/4). Still owed: the FELT mouse-path
 observation — the verb probe never crosses the pre-begin window, so the
 crawl-free start is pinned by the source lock until a human drag (or a
 pointer-injection driver) confirms felt start on the owner-scale tree.
+
+## ⛔ [11.130] AFTER A DIRECT-CHANNEL ROTATION THE WINDOWS KEEP THE PREDECESSOR CHANNEL — NEW-SESSION CREATES FOR KINDS THE OLD DAEMON CANNOT PARSE QUEUE AS SILENT GHOST ROWS (jojo live 2026-09-15 evening, zcode seat sess_e61dd292; trace `daemon_declare_absent` via batch, `live_session_birth {kind: Devin, ssh_target: localhost}`)
+
+**Status:** OPEN
+
+The 19:49 deploy carried the devin merge; the window half re-exec'd onto it at
+19:50, but the serving daemon (born Sep 11 from the direct-store generation)
+never followed — same 3.2.113 label, so no string bump ever armed anything, and
+the owner's devin click hit the old daemon's request enum (the "cannot parse"
+toast). After the natural arm (in-place replace of the direct-versions exe →
+same-version cold swap → successor bound the canonical), the WINDOW kept its
+predecessor channel: every new Devin create declared to the daemon that cannot
+represent the kind. Result: the row EXISTS in the tree with a devin icon while
+`daemon_declare_absent` repeats every ~5 s forever — NO toast, NO state a menu
+shows; an open of the row answers "active_session_path is set without an
+active_session" and only the trace names it. The row came alive only when a
+window whose daemon IS the successor activated it (the `restart_before_read`
+missing-runtime arm spawned the PTY and the login TUI painted; PTY proof via
+`server screen`, pixel proof via shadow capture). Fix direction: windows
+re-target their daemon channel when the canonical endpoint's owning pid changes
+(the fact is already on disk in the socket + registry), and a create whose
+declare stays absent past N retries surfaces a user-visible state instead of a
+permanent ghost. Related: the one-shot `server app update restart` door cannot
+restart a window whose exe == active_executable (the common same-build case),
+so the sanctioned restart path is closed exactly when it is needed.
+
+## ⛔ [11.131] YNPM DEV SUPERSEDE/GC LEAVES `~/.local/bin` LINKS DANGLING — 4 OF 6 LIBYGGTERM APPS VANISHED FROM EVERY MENU WITHOUT ANYONE DELETING ANYTHING (jojo 2026-09-15 evening, zcode seat sess_e61dd292; daemon log `ynpm app registrations whose binary is not currently resolvable missing=[ychrome,ydesign,yfiles,ymacs]`)
+
+**Status:** OPEN
+
+All six app REGISTRATIONS in `~/.yggterm/apps/` were intact the whole time —
+the manifests point at `~/.local/bin/<name>`, and ynpm's dev-generation churn
+(supersede without `--watch`, then generation GC) removed the directories the
+links name (`ychrome -> generations/ychrome/dev-1789155929610-3532581/bin/…`,
+gone). The registry contract ("the daemon validates that binary still resolves;
+a missing binary is omitted from the live menu") then hides the app from the
+titlebar `+`, the start page, and every right-click menu — the owner reads it
+as "some agent nuked my apps". Repaired live by repointing the four links at
+each app's newest generation (the `missing=` scan line has not returned since).
+Fix direction: ynpm relinks `~/.local/bin` on every supersede and BEFORE a
+generation GC that would orphan a link (or refuses that GC), and grows a `ynpm
+repair`/relink verb — `ynpm doctor` today is a platform preflight only and
+checks none of this.
 
 ## ⛔ [11.129] EVERY DRAG-POINTER STATE WRITE RE-RENDERS THE WHOLE SHELL — `ShellState` IS ONE DIOXUS SIGNAL, SO THE GHOST CARD'S 8px STEP (window-level move handler → `update_drag_pointer` → full-state write) PAIRS WITH A FULL `app` COMPONENT RENDER WHOSE COST SCALES WITH THE TREE THE GHOST CROSSES (measured 2026-09-15 ~18:40 IST, live build 33b5e89b, the ux-speed drag-feel lane; trace `dioxus_render/component_window`)
 
