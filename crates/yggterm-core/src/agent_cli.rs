@@ -3838,13 +3838,13 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     },
     // ── The 2026-09-15 intake. Cognition's Devin CLI: a local REPL coding
     // agent (Rust binary, curl-bash / brew-cask install) with resumable
-    // sessions and a cloud-handoff command. REGISTERED UNMEASURED — installed
-    // on no fleet host (dev/jojo/oc probed 2026-09-15), so every contract
-    // below is the availability-record posture: flags come from the vendor's
-    // own reference (docs.devin.ai/cli/reference/commands, read 2026-09-15),
-    // store paths from nothing at all. The first install owes the measurement
-    // pass (the qwen/pi precedent): probe the binary, drive a real session,
-    // fill the screen tables and the store, THEN let consumers trust them.
+    // sessions and a cloud-handoff command. MEASURED 2026-09-16 on the muse
+    // lab host's 3000.10.27 install — the only fleet install — by the
+    // devin-battery seat (tools/probe-battery/suites/devin.js, 8/8 twice
+    // live): trust gate, composer, working line, store, resume and print
+    // mode all driven through a real pty. The registration's docs-sourced
+    // guesses that survived are marked as such; the ones that died are
+    // recorded where they stood (permission spellings, the composer glyph).
     AgentCliDescriptor {
         kind: SessionKind::Devin,
         display_name: "Devin",
@@ -3864,96 +3864,196 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         brand_color: "#111827",
         menu_hint: 'd',
         // The owner titling law's default: Store — yggterm reads the CLI's
-        // own title and never generates over it. With no store reader yet the
-        // read answers None and the row keeps its birth name; `Generated`
-        // would need to be a MEASURED exception (kimi is the only one), and
-        // nothing about devin is measured.
+        // own title and never generates over it. MEASURED 2026-09-16: the
+        // store self-titles eagerly (sessions.title = the first prompt's
+        // text) and the reader below answers it, so the authority is real
+        // rather than nominal. `Generated` would need to be a MEASURED
+        // exception (kimi is the only one).
         title_authority: TitleAuthority::Store,
-        // The CLI mints its own session ids (`devin --resume <id>`; the docs
-        // show `abc12345` and word-word shapes) — the row id is not the
-        // session id at birth.
+        // The CLI mints its own session ids — MEASURED shape: word-word
+        // SLUGS (`scythe-snowplow`); the docs' `abc12345` shape never
+        // appeared on the binary. The row id is not the session id at
+        // birth.
         id_assigned_at_birth: false,
         wrapper_slug: Some("devin"),
         remote_row_scheme: Some("remote-devin://"),
         runtime_key_scheme: Some("devin-runtime://"),
-        // ⛔ UNMEASURED — every screen table below is empty BY DECLARATION
-        // (the schema-v2 unmeasured law), not because the CLI is quiet.
-        working_screen_phrases: &[],
+        // ⛔ Every screen needle below is MEASURED on 3000.10.27
+        // (suites/devin.js, 2026-09-16): the working line is
+        // `⣠⠀ Thinking · <N>s (esc twice to interrupt)` — the braille glyph
+        // is a spinner FRAME of one live line (muse lesson), so the needles
+        // are the stable text around it. The interrupt contract is genuinely
+        // two distinct escape presses (a single "\x1b\x1b" write reads as
+        // one event and the turn keeps running — measured).
+        working_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "thinking · ",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "esc twice to interrupt",
+                also_any: &[],
+            },
+        ],
         working_screen_negations: &[],
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
-        // The vendor docs name a `--respect-workspace-trust` flag, so a trust
-        // gate almost certainly exists — but its screen is unmeasured, and
-        // the [11.107] lesson is that a guessed gate phrase false-positives
-        // the draft guard. Empty until captured from a real row.
-        startup_gate_screen_phrases: &[],
+        // MEASURED: a fresh (untrusted) cwd arms a picker gate before any
+        // composer exists — `Do you trust the authors of this directory?` /
+        // `Yes, trust` (highlighted default; Enter grants) / `No, exit`, esc
+        // quits. The grant is durable in
+        // ~/.local/share/devin/cli/trusted_workspaces.json
+        // (`{"trusted_paths": [...]}`), and a trusted cwd never sees the
+        // gate again. Print mode cannot show the gate and refuses an
+        // untrusted workspace by name instead.
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "do you trust the authors of this directory?",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "yes, trust",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "no, exit",
+                also_any: &[],
+            },
+        ],
         plan_limit_choice_screen_phrases: &[],
-        // Docs-sourced (`devin --resume <id>` / `-r <id>`; `--continue`
-        // resumes the cwd's most recent session), NOT probed against a real
-        // binary — the qwen --help lesson applies in both directions.
+        // MEASURED: `-r/--resume [<SESSION_ID>]` resumes by slug (the bare
+        // form opens an interactive picker), `-c/--continue` resumes the
+        // cwd's most recent session. The exit farewell names the contract
+        // back: `Resume this session with `devin -r <slug>``.
         resume_selector: ResumeSelector::Flag("--resume"),
-        // UNMEASURED. `--continue` being cwd-scoped hints a cwd-bucketed
-        // store; no claim is made here either way.
+        // MEASURED: sessions are keyed by working_directory in the store
+        // (one row per cwd's sessions), and `devin list` is cwd-scoped.
         resume_re_roots_with_cwd: false,
-        // Docs-sourced (`--model <id>`).
+        // Docs-sourced (`--model <id>`), and the store row confirms the
+        // model slug shape (`swe-1-6-slow` where the footer draws
+        // `SWE-1.6 Slow`).
         model_flag: Some("--model"),
-        // UNMEASURED: the ecosystem-typical `❯` is a PLACEHOLDER — devin's
-        // real composer glyph is unknown (no fleet install to capture). The
-        // readiness gate cannot fire on it truthfully until measured; if
-        // devin draws no glyph at all, the kimi fix ([11.6.6-b],
-        // region-label anchor) is the shape the repair takes.
-        composer_marker: '\u{276f}',
+        // MEASURED (2026-09-16): the composer glyph is U+276D `❭` — read
+        // off the RENDERED buffer (the raw byte stream is lossy through
+        // partial writes; the rendered cell is the contract). The
+        // registration's `❯` U+276F was an ecosystem-typical PLACEHOLDER
+        // and is falsified: one codepoint off.
+        composer_marker: '\u{276d}',
         composer_region_label: None,
-        composer_footer_hints: &[],
+        composer_footer_hints: &["ctrl+v to paste image in clipboard"],
+        // The footer does NOT swap mid-turn (unlike grok's ctrl+c swap);
+        // the interrupt contract rides the working line itself.
         working_footer_hints: &[],
-        // The vendor reference names `--permission-mode` values
-        // (`normal|dangerous|bypass`), but they are UNPROBED — a value we do
-        // not need to send is a value that cannot rot, so every posture
-        // emits no tokens until a real binary confirms the spellings.
+        // MEASURED from the installed 3000.10.27 `--help` (2026-09-16):
+        // `--permission-mode` spells `auto` (default: auto-approves
+        // read-only tools), `accept-edits`, `smart` (auto-runs actions a
+        // fast model judges safe), `dangerous` (auto-approves all tools);
+        // env DEVIN_PERMISSION_MODE. The registration's docs-sourced
+        // `normal|dangerous|bypass` is DEAD — `normal` and `bypass` do not
+        // exist on the binary (the qwen --help-is-not-a-contract lesson,
+        // paid forward). The default tier emits NO tokens (the lock law):
+        // `auto` is what devin already does when nobody passes the flag.
+        // `smart` has no enum slot yet and stays unwired; the store row's
+        // agent_mode for a default session reads `normal` — a DIFFERENT
+        // axis (agent mode, not permission mode), unwired.
         permission_modes: &[
             (AgentPermissionMode::Default, &[]),
             (AgentPermissionMode::Plan, &[]),
-            (AgentPermissionMode::AcceptEdits, &[]),
-            (AgentPermissionMode::Bypass, &[]),
+            (
+                AgentPermissionMode::AcceptEdits,
+                &["--permission-mode", "accept-edits"],
+            ),
+            (
+                AgentPermissionMode::Bypass,
+                &["--permission-mode", "dangerous"],
+            ),
         ],
-        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--permission-mode",
+                FlagArity::TakesValue,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
         extra_args_slug: "devin",
-        permission_presets: &[],
-        permission_provenance: PermissionProvenance::Unmeasured(
-            "vendor docs name --permission-mode normal|dangerous|bypass; not \
-             probed against a real binary (installed on no fleet host) — \
-             presets stay unwired until measured",
-        ),
-        // UNMEASURED: nothing is known about whether a resume replays the
-        // conversation. Conservative false assumes scrollback loss.
-        content_rederives_on_resume: false,
-        // ⛔ NO STORE IS DECLARED — none has ever been seen. The vendor docs
-        // name a config dir (`~/.config/devin`) and an XDG data namespace
-        // (`~/.local/share/devin`), but session-history layout is
-        // undocumented and unverifiable without an install. The scan gap is
-        // the declaration; a plausible glob is the failure this area keeps
-        // repeating.
+        // MEASURED tiers — the help's own words for each, so the modal and
+        // the binary say the same contract. `smart` is the middle tier the
+        // enum cannot name yet; it ships as a preset because a delegate
+        // launch can still ASK for it by spelling.
+        permission_presets: &[
+            PermissionPreset {
+                id: "auto",
+                label: "Auto (read-only tools)",
+                args: "--permission-mode auto",
+                explanation: "Devin's own default: auto-approves read-only tools and asks \
+                              before anything that writes.",
+                is_default: true,
+            },
+            PermissionPreset {
+                id: "accept-edits",
+                label: "Accept edits",
+                args: "--permission-mode accept-edits",
+                explanation: "Also auto-approves workspace edits on top of the read-only \
+                              tier.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "smart",
+                label: "Smart",
+                args: "--permission-mode smart",
+                explanation: "Additionally auto-runs actions a fast model judges safe.",
+                is_default: false,
+            },
+            PermissionPreset {
+                id: "dangerous",
+                label: "Dangerous: approve all tools",
+                args: "--permission-mode dangerous",
+                explanation: "Auto-approves ALL tools — the unattended-delegate posture. \
+                              Devin's own spelling, not a yggterm coinage.",
+                is_default: false,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
+        // MEASURED: `devin -r <slug>` repaints the history (prompt echo +
+        // replies) above a fresh composer.
+        content_rederives_on_resume: true,
+        // MEASURED (2026-09-16): the store is ONE SQLite database —
+        // ~/.local/share/devin/cli/sessions.db (WAL mode; tables sessions,
+        // prompt_history, message_nodes, rendered_commits, tool_call_state,
+        // subagent_heads, app_state) — not a per-session file tree, so
+        // there are no session globs by SHAPE (the opencode posture), not
+        // by gap. `sessions` carries id, working_directory, backend_type,
+        // model, agent_mode, created_at, last_activity_at, title,
+        // main_chain_id, cogs_json, workspace_dirs, hidden, metadata.
+        // Session ids are CLI-minted word-word SLUGS (`scythe-snowplow`,
+        // `shell-meeting` — the docs' `abc12345` shape never appeared).
+        // A row is written when a turn COMPLETES; an interrupted or
+        // turnless session leaves only
+        // session_locks/<slug>.lock (content = the pid) — locks persist
+        // after exit, so they are NOT a live-tenancy registry (grok's
+        // active_sessions.json is the contrast), and the resume universe
+        // is wider than the sessions table (a farewell-named turnless
+        // slug still resumes with no row to find).
         session_store_globs: &[],
         store_excluded_name_fragments: &[],
-        durable_store_files: &[],
-        store_scan_gap: Some(
-            "installed on no fleet host (2026-09-15 availability record): \
-             session-store layout unknown — vendor docs name only \
-             ~/.config/devin (config) and ~/.local/share/devin (data \
-             namespace). First install: locate the session store, verify a \
-             template against a REAL session id on disk, fill globs + the \
-             cli-stores.json row, then write the recency reader",
-        ),
+        durable_store_files: &[".local/share/devin/cli/sessions.db"],
+        store_scan_gap: None,
         store_home_env_override: None,
         read_store_entry: read_no_store_entry,
-        store_membership_index: None,
-        // Docs show no launch-time session flag (sessions resume post-launch
-        // via --resume).
-        live_session_argv_flag: None,
+        store_membership_index: Some(devin_store_holds_session),
+        // MEASURED: a live devin row carries its session in argv
+        // (`devin --resume <session-id>` is a spawn's first line — the
+        // launch-rotation sitting's PTY proof, and this suite's `-r`
+        // drives).
+        live_session_argv_flag: Some("--resume"),
         live_session_marker: None,
-        read_live_store_title: None,
-        remote_live_store_title: None,
+        // MEASURED: the store self-titles eagerly — `title` is the first
+        // prompt's text, present the moment a turn completes (the codex
+        // eager-titling law, third instance).
+        read_live_store_title: Some(read_devin_live_store_title),
+        remote_live_store_title: Some(DEVIN_REMOTE_TITLE_PROBE),
     },
 ];
 
@@ -5105,6 +5205,29 @@ pub fn store_candidate_session_for_directory(
             let title: Option<String> = row.get(1).ok();
             Some((id, title_without_fallbacks(title)))
         }
+        // MEASURED 2026-09-16 (devin-battery suite): devin keys its sessions
+        // by working_directory in one SQLite store, and titles eagerly —
+        // so one query answers id AND title, zcode-tui's shape at devin's
+        // own path. Recency is last_activity_at (INTEGER epoch-seconds).
+        // ⚠ Only COMPLETED-turn sessions have rows here; a turnless or
+        // interrupted session leaves a lock but no row, and this arm must
+        // answer None rather than guess (the row that IS here is the one
+        // the store can speak for).
+        SessionKind::Devin => {
+            let conn = open_cli_index_readonly(&home.join(".local/share/devin/cli/sessions.db"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title FROM sessions \
+                     WHERE working_directory = ?1 \
+                     ORDER BY last_activity_at DESC LIMIT 1",
+                )
+                .ok()?;
+            let mut rows = stmt.query(rusqlite::params![cwd]).ok()?;
+            let row = rows.next().ok()??;
+            let id: String = row.get(0).ok()?;
+            let title: Option<String> = row.get(1).ok();
+            Some((id, title_without_fallbacks(title)))
+        }
         // muse's session index: workspace_root is the cwd, session_name the
         // CLI's own word, session_dir the id.
         SessionKind::Muse => {
@@ -5266,6 +5389,83 @@ fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<Strin
     }
     None
 }
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Devin: the shared
+/// sessions.db `title` column, which the CLI fills eagerly with the first
+/// prompt's text (measured 2026-09-16 on 3000.10.27). One table, one row
+/// per session id — the opencode reader's shape at devin's own path. A
+/// turnless session has no row, so the read answers None and the row keeps
+/// its birth name: honest, not silent-by-bug.
+fn read_devin_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let db_path = home.join(".local/share/devin/cli/sessions.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let Ok(mut stmt) = conn.prepare("SELECT title FROM sessions WHERE id = ?1 LIMIT 1") else {
+        return None;
+    };
+    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+    if let Ok(Some(row)) = rows.next() {
+        let title: Option<String> = row.get(0).ok();
+        if let Some(title) = title
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|s| !crate::looks_like_generated_fallback_title(s))
+            .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+        {
+            return Some(title);
+        }
+    }
+    None
+}
+
+/// Devin's remote twin: the shared sessions.db's own `title` column
+/// (measured 2026-09-16: eager first-prompt titling). The db path is fixed
+/// relative to $HOME — the descriptor declares no store globs, so the
+/// locators list is empty and this script never uses argv's locator half,
+/// exactly like OpenCode's probe.
+const DEVIN_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+ids = [v for v in argv[argv.index('--') + 1:] if v.strip()]
+if not ids:
+    sys.exit(0)
+db = os.path.expanduser('~/.local/share/devin/cli/sessions.db')
+if not os.path.exists(db):
+    sys.exit(0)
+conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+cur = conn.cursor()
+for sid in ids:
+    try:
+        cur.execute('SELECT title FROM sessions WHERE id = ?', (sid,))
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    if row and row[0] and str(row[0]).strip():
+        print(json.dumps({'session_id': sid, 'candidates': [str(row[0]).strip()]}, ensure_ascii=False))
+conn.close()
+"#;
+
+/// The remote probe wiring for the script above (the opencode shape: fixed
+/// db path resolved against the remote home, first non-empty candidate
+/// wins).
+const DEVIN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: DEVIN_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::HomeRelative(".local/share/devin/cli/sessions.db"),
+    choose: first_non_empty_candidate,
+};
 
 /// [`AgentCliDescriptor::read_live_store_title`] for Pi: the session jsonl's
 /// own store entry (header id == file name uuid — measured 2026-08-30), whose
@@ -6699,6 +6899,28 @@ pub fn opencode_store_index_holds_session(home: &Path, session_id: &str) -> Opti
         }
     }
     Some(false)
+}
+
+/// Devin's sessions.db holds one row per COMPLETED-turn session
+/// (measured 2026-09-16): a turnless or interrupted session leaves only a
+/// `session_locks/<slug>.lock` behind, so a `false` here is the store's
+/// own answer about this id, not a claim that the session does not exist —
+/// the resume universe is wider than the sessions table. Absent db = the
+/// host cannot answer (`None`), never a verdict.
+pub fn devin_store_holds_session(home: &Path, session_id: &str) -> Option<bool> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let conn = open_cli_index_readonly(&home.join(".local/share/devin/cli/sessions.db"))?;
+    match conn.query_row(
+        "SELECT 1 FROM sessions WHERE id = ?1;",
+        rusqlite::params![session_id],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Some(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// The newest resumable OpenCode session for `directory` in opencode's own
@@ -9583,13 +9805,14 @@ mod tests {
                 descriptor.title_is_store_authoritative()
                     && descriptor.read_live_store_title.is_none()
                     // The declared-gap escape: a CLI whose store is a DECLARED
-                    // unknown (devin, registered unmeasured 2026-09-15) claims
-                    // no store at all, so there is nothing to wire a reader to
-                    // and nothing this lock could demand — its rows keep birth
-                    // names until the first install measures the store. A CLI
-                    // that CLAIMS a store (globs or durable files, no declared
-                    // gap) without a reader is still exactly the deadlock this
-                    // lock exists to kill.
+                    // unknown claims no store at all, so there is nothing to
+                    // wire a reader to and nothing this lock could demand —
+                    // its rows keep birth names until the first install
+                    // measures the store (devin did exactly that on
+                    // 2026-09-16: sessions.db measured, reader wired, escape
+                    // exited). A CLI that CLAIMS a store (globs or durable
+                    // files, no declared gap) without a reader is still
+                    // exactly the deadlock this lock exists to kill.
                     && descriptor.store_scan_gap.is_none()
             })
             .map(|descriptor| descriptor.slug)

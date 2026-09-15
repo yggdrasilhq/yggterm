@@ -98,10 +98,13 @@ pub fn kind_has_dedicated_scanner(kind: crate::SessionKind) -> bool {
     // History: the old `scan_kimi_sessions` read the then-dead `~/.kimi/`
     // home; kimi-code 0.27 moved to `~/.kimi-code/.../state.json`; 1.50.0
     // moved BACK to `~/.kimi/` with md5-of-cwd buckets — still
-    // glob-expressible, so no scanner revival.
+    // glob-expressible, so no scanner revival. Devin joined 2026-09-16
+    // (measured): one SQLite db at a fixed path, the opencode posture.
     matches!(
         kind,
-        crate::SessionKind::OpenCode | crate::SessionKind::Antigravity
+        crate::SessionKind::OpenCode
+            | crate::SessionKind::Antigravity
+            | crate::SessionKind::Devin
     )
 }
 
@@ -292,6 +295,10 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
             scan_antigravity_sessions(home, &mut out, &mut seen_paths);
             continue;
         }
+        if descriptor.kind == crate::SessionKind::Devin {
+            scan_devin_sessions(home, &mut out);
+            continue;
+        }
         if descriptor.session_store_globs.is_empty() {
             continue;
         }
@@ -476,6 +483,103 @@ fn scan_opencode_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
             effective_title,
             detail: None,
             kind: crate::SessionKind::OpenCode,
+            modified_epoch_ms: epoch_ms,
+            storage_path: db_path.display().to_string(),
+            display_path,
+        });
+    }
+}
+
+/// Devin's durable projection: one SQLite db at a fixed path (the opencode
+/// posture, measured 2026-09-16 on 3000.10.27). `sessions` carries the id
+/// (word-word slug), the cwd (`working_directory`), the eager self-title
+/// (the first prompt's text) and epoch-SECONDS timestamps (devin is not
+/// opencode: no v2/v1 split, no millisecond columns, no parent_id — a
+/// turnless session has no row at all, so nothing to filter here).
+fn scan_devin_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
+    let db_path = home.join(".local/share/devin/cli/sessions.db");
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+    let Ok(mut stmt) =
+        conn.prepare("SELECT id, working_directory, title, last_activity_at, created_at FROM sessions")
+    else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let directory: String = row.get(1)?;
+        let title: Option<String> = row.get(2)?;
+        let last_activity: i64 = row.get(3)?;
+        let created: i64 = row.get(4)?;
+        Ok((id, directory, title, last_activity, created))
+    }) else {
+        return;
+    };
+    for row in rows.flatten() {
+        let (session_id, directory, raw_title, last_activity, created) = row;
+        if session_id.trim().is_empty() {
+            continue;
+        }
+        let cwd = if directory.trim().is_empty() {
+            home.display().to_string()
+        } else {
+            directory.clone()
+        };
+        // Seconds on both columns (measured against the live store:
+        // 1789498050 ≈ 2026-09-16 00:57 IST). Guard the ms math anyway.
+        let epoch_ms = if last_activity > 0 {
+            (last_activity as u128).saturating_mul(1000)
+        } else if created > 0 {
+            (created as u128).saturating_mul(1000)
+        } else {
+            0
+        };
+        let title = raw_title.as_deref().unwrap_or("").trim();
+        let filtered_title = if title.is_empty()
+            || crate::looks_like_generated_fallback_title(title)
+            || crate::looks_like_low_signal_generated_copy(title)
+        {
+            None
+        } else {
+            Some(title.to_string())
+        };
+        let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::Devin);
+        let is_store_auth = descriptor.map(|d| d.title_is_store_authoritative()).unwrap_or(false);
+        let generated_title = if is_store_auth && filtered_title.is_some() {
+            None
+        } else {
+            StartpageDurableRow::load_generated_title(&session_id)
+        };
+        let filtered_gen = generated_title.clone().filter(|s| {
+            !crate::looks_like_generated_fallback_title(s)
+                && !crate::looks_like_low_signal_generated_copy(s)
+        });
+        let effective_title = if is_store_auth {
+            filtered_title.clone().or(filtered_gen.clone())
+        } else {
+            filtered_gen.clone().or(filtered_title.clone())
+        };
+        let display_path = descriptor
+            .and_then(|d| d.remote_row_scheme)
+            .map(|s| format!("{}{}", s, session_id))
+            .unwrap_or_else(|| db_path.display().to_string());
+        out.push(StartpageDurableRow {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            title: filtered_title,
+            generated_title: filtered_gen,
+            effective_title,
+            detail: None,
+            kind: crate::SessionKind::Devin,
             modified_epoch_ms: epoch_ms,
             storage_path: db_path.display().to_string(),
             display_path,

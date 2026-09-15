@@ -483,13 +483,13 @@ const ARMS: &[Arm] = &[
         store_globs: &[".zcode/cli/rollout/model-io-*.jsonl"],
     },
     // ── The 11.6.12 registration (2026-09-15, lane/integration/devin).
-    // Devin is REGISTERED UNMEASURED (installed on no fleet host), so both
-    // arms carry the availability-record posture: the resume token is
-    // docs-sourced (`devin --resume <id>`), the remote cells are generated
-    // from the descriptor's wrapper_slug like every remote arm, and the
-    // store cells are EMPTY — byte-identical to the descriptor's declared
-    // scan gap. The first install's measurement pass fills both twins
-    // together, the way the 11.6.11 fill did.
+    // MEASURED 2026-09-16 (devin-battery suite, 8/8 twice on 3000.10.27):
+    // the resume token is live-proven (`devin -r <slug>` rederives the
+    // history; the exit farewell names the contract), and the store is ONE
+    // SQLite db (sessions.db) — so the store_globs cells stay EMPTY BY
+    // SHAPE (a single-db store has no per-session globs; the opencode
+    // posture), not by declared gap. The descriptor's store truth moved to
+    // durable_store_files + the sqlite readers.
     Arm {
         kind: SessionKind::Devin,
         locality: Locality::Local,
