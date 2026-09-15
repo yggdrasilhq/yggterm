@@ -30981,9 +30981,9 @@ named and fixed, the felt driver proves the drag's start and merge
 behavior but NOT its drop, and any felt-accuracy claim from it is
 invalid. Family: [11.113] instrument gaps; the pointer-verb help line
 also still lies about its action spellings (fixed this lane).
-## ⛔ [11.133] COLD RESTORE NEVER ASKS THE TOMBSTONE PLANE — EVERY CLOSED ROW IN A STALE server-state.json RESURRECTS AT EVERY DAEMON/GUI BIRTH, AND ITS RE-ENTRY CLEARS ITS OWN TOMBSTONE (measured live on jojo 2026-09-15 ~22:30-23:25 IST, the trace-fixing campaign; owner symptom: "on restart my row setup is nuked to an old form — I delete rows, launch a ychrome row, restart, and the old set comes back")
+## ⛔ [11.133] COLD RESTORE NEVER ASKS THE TOMBSTONE PLANE — EVERY DELETED ROW A STALE server-state.json HOLDS COMES BACK AT EVERY DAEMON/GUI BIRTH, AND ITS RE-ENTRY CLEARS ITS OWN TOMBSTONE (measured live on jojo 2026-09-15 ~22:30-23:25 IST, the trace-fixing campaign; owner symptom: "on restart my row setup is nuked to an old form — I delete rows, launch a ychrome row, restart, and the old set comes back")
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (lane/trace/restore-vets-tombstones)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-09-15 ~23:45.
 
