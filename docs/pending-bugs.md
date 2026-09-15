@@ -30599,3 +30599,48 @@ daemon prepare event in ytrace — the same bar [11.121]'s falsifier
 names. Until then the fleet's landed fixes adopt only via the startup
 update workflow at the GUI's next real restart (which the same staged
 state satisfies — startup auto-restarts into the pending build).
+
+
+## [11.123] ynpm sync --integrated downgrades the agent bin to npm latest with no semver guard (ynpm)
+
+**Status:** OPEN
+
+**Component:** `crates/ynpm/src/main.rs` `sync_integrated` (production arm) + the daemon
+background managed-CLI refresh that runs it.
+
+**Measured 2026-09-15 (jojo, live trace + a fresh zcode-tui row):** the daemon refresh
+tick runs `ynpm sync --integrated`, which for every npm-backed integrated CLI installs
+`<package>@latest` from the registry and republishes the agent-bin link
+(`~/.yggterm/ynpm/bin`) — with NO comparison against the installed generation. With
+@avikalpa/zcode-tui npm latest frozen at 0.5.7 (every `ynpm-publish` workflow run since
+tag v0.5.8 fails: npm PUT returns E404 — the repo NPM_TOKEN secret lost publish rights;
+runs 3445095932/34501613876/34951532930), the refresh auto-DOWNGRADED a newer locally
+installed zcode-tui back to 0.5.7. The owner spawned a fresh zcode-tui row and got the
+0.5.x UI ("pre-historic"): the launch arm
+(`terminal_spec_resolved`, trace g1789454667760 ts 1789463157498, session
+eb5088d9-b081-4048-a78b-5bd110cc2d3d) sets PATH with `~/.yggterm/ynpm/bin` FIRST, so the
+agent bin decides what rows run. Trace: `ynpm sync.integrated.package cli=zcode-tui
+result=updated version=0.5.7` (ts 1789464242330).
+
+**Why it violates the spec:** docs/ynpm.md rule 6 allows a production handback to
+replace a generation only when production is NEWER. The sync production arm re-links an
+OLDER registry version over a NEWER installed generation.
+
+**What shipped meanwhile (2026-09-15, zcode sess_b3f6d8ca):** zcode-tui 0.6.6 (paste
+fix + exitOnCtrlC, lane/zcode-tui/paste-input) is installed as a DEV generation on
+jojo/dev/oc — the sync DEV arm keeps it ("cli zcode-tui is on a dev generation;
+keeping it", force-verified on all three hosts) and bridges it into the agent bin, so
+rows get 0.6.6 and stop self-downgrading. This is a STOPGAP: the dev record shadows the
+registry flow, so after the NPM_TOKEN secret is fixed and a v0.6.7+ tag publishes,
+each host needs `ynpm prod @avikalpa/zcode-tui` to hand back to production flow.
+
+**Fix direction:** in the sync production arm, skip the install (or only relink) when
+the registry dist-tag version is not newer than the installed generation — the same
+rule-6 guard `dev_handback` already implements. Secondary coherence defect, same
+component: a pre-rename `@ygghq/zcode-tui` ghost slot (dev 0.6.5 recorded at
+~/.local/bin) still sits in ynpm state beside the canonical @avikalpa slot.
+
+**Falsifier:** fix the NPM_TOKEN secret, publish any version, and watch a refresh tick
+NOT downgrade a newer installed generation; or (code-side) point the registry dist-tag
+at an older version than a locally imported production generation and show sync keeps
+the newer one.
