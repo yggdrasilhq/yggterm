@@ -30686,7 +30686,7 @@ the newer one.
 
 ## ⛔ [11.125] A FRESH ROW'S FIRST `server app drag begin` PAYS ~1.5-1.7 s QUEUING BEHIND THE SPAWN-PROMOTION SNAPSHOT APPLY'S TAIL — SIX BACK-TO-BACK UNCACHED FULL SIDEBAR MERGES (~220 ms EACH, `push_remote_ms` ≈ 220 DOMINANT, EXPANSION CRAWLING 111→288 PATHS / 855→2583 ROWS) RUN ON THE UI THREAD INSIDE ONE APPLY AND THE VERB'S HANDLER QUEUE BEHIND ALL OF THEM (traced live 2026-09-15 ~17:27 IST, GUI host, the ux-speed drag-cold-residual lane)
 
-**Status:** FIXED IN CODE — LIVE-PROVEN (falsifier met 2026-09-15 ~18:05 IST; nothing owed on the verb path; the sibling apply-tail merge storm stays under [11.117])
+**Status:** OPEN
 
 The [11.114] synthesis fix works — this is NOT the resolve's rebuild. Trace of a
 cold begin (fresh scratch row, spawn→begin gap ~2 s, build 67914705ea37):
@@ -30753,6 +30753,12 @@ end-to-end with the full event family live (`tree_drag_begin` →
 `tree_drag_hover` → `live_session_reorder_succeeded` → `tree_drag_ended` →
 `live_session_reorder_persisted`), drag-back restores, teardown left zero
 rows. Falsifier satisfied.
+> Nothing is owed on the verb path after this proof — the entry stays for
+> the falsifier record and for its instrument note; the sibling apply-tail
+> merge storm (one uncached ~220 ms merge per spawn apply) and the
+> multi-anchor/select-all crawl remain under [11.117]. (docs-ssot
+> vocabulary correction 2026-09-15 ~18:50: the status line must be a bare
+> vocabulary word; the proof text lives here in the body.)
 
 ## ⛔ [11.126] THE DAEMON LEAKS UNREAPED ssh CHILDREN — 265 `ssh <defunct>` CORPSES ALL PARENTED TO yggterm-headless, THE OLDEST AS OLD AS THE DAEMON (measured 2026-09-15 ~18:10 IST, GUI host, jojo)
 
