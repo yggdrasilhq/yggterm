@@ -31,10 +31,10 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); muse LANDED (suites/muse.js, 2026-09-15, 8/8 live, re-measured 1.3.0); claude LANDED (suites/claude.js, 2026-09-15, 6/6 twice live on 2.1.272 — turn/resume honest nulls: fleet subscription access is DEAD, see the 11.6.2 row); remaining: opencode, agy, qwen, pi, codex-litellm, devin |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); muse LANDED (suites/muse.js, 2026-09-15, 8/8 live, re-measured 1.3.0); claude LANDED (suites/claude.js, 2026-09-15, 6/6 twice live on 2.1.272 — turn/resume honest nulls: fleet subscription access is DEAD, see the 11.6.2 row); opencode LANDED (suites/opencode.js, 2026-09-15, 10/10 twice live on 2.0.3 — turns are REAL: 2.0.3 ships a free built-in model, no auth needed); remaining: agy, qwen, pi, codex-litellm, devin |
 | 11.6.1 | codex | A | Battery suite LANDED 2026-09-15 (lane/integration/codex-battery, suites/codex.js 8/8 twice live on 0.154.0): every declared fact HOLDS (trust-gate needles verbatim — its warning text grew; `• Working (Ns • esc to interrupt)`; `›` marker; rollout filename-uuid law; resume id-reuse PROVEN by a follow-up turn appending to the SAME rollout; help surface holds, `resume --last` additive). Titling drift MEASURED + READER FIXED: 0.154.0 names threads eagerly (footer `renaming…` spinner → title; `session_index.jsonl` appended instantly) but the sqlite catalog received NO row for either probe session (~40 min checked) — `read_codex_live_store_title` gained arm 1.5 reading `session_index.jsonl` (test `codex_session_index_names_the_thread_the_footer_shows`), keeping the SSOT equality (CLI display beats first-prompt). STILL OPEN: ledger reattach in the resume wrapper; kill the 12s /proc poll |
 | 11.6.2 | claude | A | Battery suite LANDED 2026-09-15 (lane/integration/claude-battery, suites/claude.js 6/6 twice live on 2.1.272 — the FIRST 11.6.2 measurement): ❯ marker holds; idle footer `⏸ manual mode on · ? for shortcuts · ← for agents`; working footer hint `esc to interrupt` re-confirmed in the spinner-phase footer (swap law holds); trust gate did NOT fire on a fresh /tmp cwd on either host (needles stay declared); help surface re-verified incl. `--session-id`/`--resume`; unauthed session writes NO rollout bucket (measured negative). ⛔ TURNS ARE CREDENTIAL-DEAD FLEET-WIDE, OWNER ACTION: muse-lab host's `~/.claude/.credentials.json` OAuth tokens EMPTIED since 2026-09-08 (access+refresh empty, TUI says `Not logged in · Run /login`); CI host's tokens present but the ORG has disabled Claude subscription access for Claude Code (`claude -p` refuses: "Use an Anthropic API key instead, or ask your admin to enable access"). Turn/resume facts are honest nulls until auth returns — the suite un-nulls itself on re-run. STILL OPEN: ledger reattach; the turn working needles on a REAL turn |
-| 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
+| 11.6.3 | opencode | B | 2.0.3 RE-DECODE DONE + battery suite LANDED 2026-09-15 (lane/integration/opencode-battery, suites/opencode.js 10/10 twice live on 2.0.3). HOLDS: working needle `esc interrupt` (verbatim, progress-squares prefixed), `--session`/`--auto` flags, store session_v2 + async auto-titling, service.json handshake, view-verb 204/400. DRIFT LANDED IN CODE: model_flag became Option — opencode None (the 2.0.3 parser REJECTS any unknown top-level flag: help + exit 1, TUI never launches; `--model` survives only on run/mini; launch_tokens refuses, test `a_model_pin_on_a_cli_without_a_top_level_model_flag_refuses`); content_rederives_on_resume flipped true (resume re-renders the transcript); composer/working footer hints re-measured. FILED OPEN: [11.133] (composer ❯ marker dead — needs the gate shape), [11.134] (unknown --session silently falls back to the latest session). ⚠ DEPLOYMENT HAZARD: managed port 49374 is host-global — a foreign opencode service holding it wedges every 2.0.3 TUI at "Starting background server..." forever; the muse-lab-host bin re-point has REVERTED (a ynpm sync restored the dead-generation link), so production rows still spawn beta-19271 and 2.0.3 is launch-blocked until the beta service exits |
 | 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107]); [11.96] store half resolved upstream on 1.2.2, fallback half fixed in code; baseline below |
 | 11.6.5 | muse | C | v2 fill LANDED 2026-09-14 (re-measured on the drifted 1.2.1 — entry below); RE-MEASURED 1.3.0 live via the new battery suite (8/8) — every hard declared fact holds (gate needles, U+276F, `esc to interrupt`, resume banner + rederive, `--yolo`); 1.3.0 drift recorded (spinner ◇◈◆ are frames of ONE line, `.session.lock` gained `host=`, subagent locks shadow the session lock, session-index.db diverges from the day dirs); question/approval pickers stay UNMEASURED (need a judge-refused call); live-rotation reattach proof rides 11.6.0's SLA run |
 | 11.6.6 | kimi | C | [11.6.6-a] store re-drift FIXED in code for the 1.50 layout + title flipped to Generated (entry below); [11.6.6-b] glyphless composer FIXED IN CODE — region-label composer shape in the readiness gate (entry below); working phrases still login-gated-unverified |
@@ -550,6 +550,47 @@ StoreIndex-recency viewing strategy as dead for this CLI; (b) PTY-law proof
 for a tab-mirror row following a switch (row title + pane, one tick);
 (c) re-run this decode on the next ynpm channel bump — the checkout says
 the view endpoint may vanish.
+#### 11.6.3 battery + descriptor lane (opencode 2.0.3, 2026-09-15, lane/integration/opencode-battery)
+
+`suites/opencode.js` 10/10 green TWICE live on 2.0.3 (scratch-home +
+`opencode service set port <free>` isolation — see the suite header). The
+full drift set, measured:
+
+1. **Top-level parser rejects `--model`** — ANY unknown top-level flag prints
+   help and exits 1; the TUI never launches (`--model bogus` and a
+   `--bogus-flag` control behave identically; `--auto --session ses_x` still
+   launches). `--model, -m` survives on `run`/`mini` only. LANDED: the
+   descriptor's `model_flag` became `Option` (kimi `composer_region_label`
+   precedent), opencode `None`, and `launch_tokens` refuses a model pin with
+   the named cause instead of composing a help-exit launch.
+2. **`❯` marker dead** — the composer is a ┃ (U+2503) ruled box; placeholder
+   text ROTATES ("Fix a TODO in the codebase" / "Fix broken tests" …), mode
+   row `Build auto · <model> OpenCode Zen` sits BELOW the input row, border
+   `╹▀▀▀` (U+2579/U+2580). Filed [11.133].
+3. **Resume re-renders** — `--session <real-id>` replays the prior transcript
+   (beta-era TUI did not): `content_rederives_on_resume` flipped true.
+4. **Unknown `--session` falls back** — no refusal; the latest session of the
+   project resumes silently. Filed [11.134].
+5. **Turns need NO auth** — 2.0.3 ships a free built-in model
+   (`Muse Spark 1.3 Free`): real turn probes, working needle `esc interrupt`
+   verbatim (progress squares `■■⬝⬝⬝⬝` prefix), turn summary
+   `Build · <model> · Ns · tok/s` persists.
+6. **Port wedge** — managed port 49374 is host-global; a foreign service
+   holding it wedges the TUI at "Starting background server..." forever
+   (client retries `serve --service` indefinitely, named in the log).
+   Escape: `opencode service set port <free>` per HOME.
+7. **CORRECTION to the re-decode above (point 3, append-only):** `time_viewed`
+   DOES persist on 2.0.3 — the suite measured view `{"idle": <now-ms>}` → 204
+   with `session_v2.time_viewed` non-null, three runs running. The
+   accepted-and-ignored claim likely probed `idle: 0` (the beta server
+   substituted current time for 0; 2.0.3 appears to store nothing for 0).
+   Non-zero idle persists; the door's OSC-title-only conclusion is
+   nonetheless unchanged in practice — recency still = time_updated because
+   nothing but an explicit view write ever touches time_viewed.
+8. **The re-decode point-6 OWED is answered:** the working needle
+   `esc interrupt` was captured live DURING a real turn (the free model
+   makes that possible without auth) — it holds; the phrase fill stands.
+
 #### 11.6.5 muse measured baseline (wave-1 seat D, 2026-09-10, the muse lab host)
 
 Probe battery on Muse Code 1.1.1 (1.1.1-R2514.1) via the xterm-harness
@@ -30914,6 +30955,53 @@ cannot promise at any tree size. Instrument note: `component_window` aggregates
 per ~2.5 s window (window_ms 2506) — per-render attribution exists in its
 `components` array; a per-write render counter would make drag-window
 measurement exact (the [11.113] instrument family).
+
+## ⛔ [11.134] OPENCODE 2.0.3 SILENTLY FALLS BACK TO THE LATEST SESSION ON AN UNKNOWN `--session` ID — THE BETA-ERA OUTRIGHT REFUSAL IS GONE, SO A CALLER THAT MINTS IDS OUT-OF-BAND CAN BIND THE WRONG SESSION AND NEVER LEARN IT (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
+
+**Status:** OPEN — consumer review owed
+
+Beta-era law (descriptor comment, now corrected): "the CLI REFUSES an unknown
+`--session <id>` outright; a caller must mint the session over opencode's own
+RPC first." Measured on 2.0.3: `opencode2 --auto --session ses_bogus…` opens
+the MOST RECENT session of the project and renders its transcript — no
+refusal, no virgin composer, no error anywhere. The safe order (mint over the
+RPC, then launch with the id it returned) still works and stays the rule;
+what changed is that the mistake no longer fails loudly. Any yggterm path
+that launches `--session` with an id it did not just read back from the
+service (or a stale/cross-project id) binds whatever session happens to be
+newest. Regression net: suites/opencode.js `bogus-session-fallback`.
+
+## ⛔ [11.133] OPENCODE 2.0.3 KILLED THE `❯` COMPOSER MARKER — THE READINESS GATE AND DRAFT GUARD HAVE NO OPENCODE SHAPE, AND THE NAIVE ┃ SWAP FALSE-POSITIVES THE DRAFT GUARD ON THE MODE ROW (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
+
+**Status:** OPEN — needs the gate/draft-guard box shape (the [11.6.6-b] kimi
+region-label precedent: measure, add the shape, rewire consumers, land
+together)
+
+The 2.0.3 composer is a box, not a glyph row: `┃` (U+2503) left rules on
+every row, the input/placeholder row (`┃  Ask anything… "<task>"`), an EMPTY
+`┃` row, the mode row (`┃  Build auto · <model> OpenCode Zen`), then the
+`╹▀▀▀` (U+2579/U+2580) border. Facts that constrain the fix:
+
+- The declared `❯` (U+276F) paints NOWHERE on any screen (idle, drafting,
+  working, settled) — `composer_row_holds_text` answers None (protected, but
+  never-ready).
+- A naive `composer_marker: '\u{2503}'` is WRONG: the bottom-up scan anchors
+  the MODE row (it is the lowest ┃ row above the border) and reads
+  `Build auto · …` as held text — a permanent pending_draft false-positive,
+  the [11.107] agy picker-row class.
+- The placeholder text ROTATES ("Fix a TODO in the codebase" / "Fix broken
+  tests" / …) — never anchor on it.
+- Typed text renders on the SAME row the placeholder occupied, rule-anchored
+  (measured via the draft probe); backspace restores the placeholder.
+- The border row is not in `composer_row_is_chrome`'s trim set
+  (U+2579/U+2580 missing), so today it reads as composer content.
+
+Shape sketch for the fixing seat: teach the chrome trimmer U+2579/U+2580,
+anchor on the ┃ row ABOVE the mode row (bottom-up: border → chrome, mode row
+→ skip-by-shape, next ┃ row = input), or add a region mechanism keyed on the
+box structure. Regression net: suites/opencode.js `composer-idle-shape` +
+`draft-shape` (they assert the measured box and will fail when the shape
+moves again).
 
 ## ⛔ [11.132] THE MANAGED-CLI PROVISIONER'S `@latest` INSTALL DOWNGRADES A NEWER LOCAL BUILD AND WIPES THE DEV MARKER ON THE SHARED STORAGE KEY — THE FLEET'S zcode-tui ROWS KEEP GETTING DRAGGED BACK TO npm 0.5.7 ON A TIMER (traced live 2026-09-15 ~22:15 IST, the trace-fixing campaign's ynpm lane; continues [11.123], explains why its stopgap died)
 

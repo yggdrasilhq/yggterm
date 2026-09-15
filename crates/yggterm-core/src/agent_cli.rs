@@ -345,7 +345,15 @@ impl AgentLaunchOptions {
                         .to_string(),
                 );
             }
-            tokens.push(descriptor.model_flag.to_string());
+            let Some(flag) = descriptor.model_flag else {
+                return Err(format!(
+                    "{} takes no top-level model flag: the launch would print help and exit \
+                     instead of starting the CLI (opencode 2.0.3 measured 2026-09-15). \
+                     Launch without a model pin.",
+                    descriptor.display_name
+                ));
+            };
+            tokens.push(flag.to_string());
             tokens.push(model.trim().to_string());
         }
         if let Some(mode) = self.permission_mode {
@@ -783,7 +791,14 @@ pub struct AgentCliDescriptor {
     ///
     /// Data, not a branch, for the same reason [`ResumeSelector`] is: the next
     /// CLI to arrive spells it in its own row instead of in an `is_claude`.
-    pub model_flag: &'static str,
+    ///
+    /// `None` is a MEASURED shape, not an omission: opencode 2.0.3 dropped the
+    /// top-level `--model` — any unknown top-level flag prints help and exits
+    /// 1 and the TUI never launches; `--model, -m` survives only on
+    /// `opencode run` / `opencode mini` (measured 2026-09-15 against 2.0.3,
+    /// muse lab host). A launch pinning a model on such a CLI refuses in
+    /// [`AgentLaunchOptions::launch_tokens`] instead of help-exiting there.
+    pub model_flag: Option<&'static str>,
     /// The glyph this CLI draws at the head of its input composer — codex `›`,
     /// Claude Code `❯`.
     ///
@@ -1870,7 +1885,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // re-rooted; the cwd tree's whole promise is that a row opens where the
         // tree says it lives.
         resume_re_roots_with_cwd: true,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_marker: '\u{203a}',
         composer_region_label: None,
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
@@ -2065,7 +2080,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // phase. Recorded for phase 2's four-arm matrix to settle.
         resume_re_roots_with_cwd: false,
         // Same binary family as codex, so the same flag vocabulary.
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_marker: '\u{203a}',
         composer_region_label: None,
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
@@ -2278,7 +2293,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         ],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_marker: '\u{276f}',
         composer_region_label: None,
         composer_footer_hints: &[
@@ -2448,7 +2463,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
         // relocates STORAGE, not the working directory.
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_marker: '\u{203a}',
         composer_region_label: None,
         composer_footer_hints: &["esc", "ctrl", "/help", "tab"],
@@ -2562,9 +2577,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         title_authority: TitleAuthority::Store, // OWNER TITLING LAW (2026-09-05): every
         // CLI except codex and muse code self-titles; yggterm READS this CLI's title and
         // never generates over it. opencode2 auto-titles in session_v2.title for the life of the session (measured 2026-09-02; the Generated label was the Issue 29 descriptor drift).
-        // ⛔ The CLI REFUSES an unknown `--session <id>` outright; a caller
-        // must mint the session over opencode's own RPC first. So yggterm may
-        // not assume a birth id.
+        // ⛔ BETA-ERA LAW DEAD (re-measured 2026-09-15 on 2.0.3): the CLI no
+        // longer refuses an unknown `--session <id>` outright — it SILENTLY
+        // falls back to the most recent session of the project (filed
+        // [11.134]: a caller that mints ids out-of-band can bind the WRONG
+        // session and never learn it). Minting over the RPC first is still
+        // the only safe order, and yggterm may still not assume a birth id.
         id_assigned_at_birth: false,
         wrapper_slug: Some("opencode"),
         remote_row_scheme: Some("remote-opencode://"),
@@ -2581,11 +2599,34 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        // ⛔ MEASURED DRIFT (2026-09-15, 2.0.3): the top-level parser REJECTS
+        // `--model` — ANY unknown top-level flag prints help and exits 1 with
+        // the TUI never launching; `--model, -m` survives only on
+        // `opencode run` / `opencode mini`. `None` turns a model-pinned
+        // opencode launch into a named refusal here instead of a silent
+        // help-exit there (regression net: suites/opencode.js
+        // `help-flag-surface`).
+        model_flag: None,
+        // ⛔ MEASURED DRIFT (2026-09-15, 2.0.3): the `❯` marker NO LONGER
+        // PAINTS — the composer is a ┃ (U+2503) ruled box with the placeholder
+        // row (text ROTATES: "Ask anything… \"Fix a TODO in the codebase\" /
+        // \"Fix broken tests\" …"), a mode row (`Build auto · <model>
+        // OpenCode Zen`) BELOW the input row, and a `╹▀▀▀`
+        // (U+2579/U+2580) border. Keeping the beta-era marker here until the
+        // gate/draft-guard grow the box shape: a naive swap to ┃ anchors the
+        // MODE row bottom-up and false-positives the draft guard (the
+        // [11.107] class). Filed [11.133] with the measurements; regression
+        // net: suites/opencode.js `composer-idle-shape` + `draft-shape`.
         composer_marker: '\u{276f}',
         composer_region_label: None,
-        composer_footer_hints: &["esc", "interrupt", "ctrl", "tab"],
-        working_footer_hints: &["esc interrupt", "again to interrupt"],
+        // 2.0.3 idle footer: `<cwd>  shift+tab agents  ctrl+p commands` —
+        // `esc`/`interrupt` belong to the WORKING phase now (measured
+        // 2026-09-15).
+        composer_footer_hints: &["ctrl", "tab", "shift+tab", "ctrl+p", "agents", "commands"],
+        // Working footer verbatim: `■■⬝⬝⬝⬝⬝⬝ esc interrupt` (progress
+        // squares prefix the needle; `again to interrupt` never observed on
+        // 2.0.3 — dropped).
+        working_footer_hints: &["esc interrupt"],
         // `--auto` re-measured on the installed binary 2026-08-13: "auto-approve
         // permissions that are not explicitly denied (dangerous!)" — opencode's
         // own words. It was absent from this table while the flag existed, so
@@ -2629,10 +2670,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         permission_provenance: PermissionProvenance::Measured,
-        // ⚠ The default TUI owns the screen and repaints via opentui; there is
-        // no scrollback transcript to re-derive. `--mini` is the streaming
-        // variant that does replay.
-        content_rederives_on_resume: false,
+        // ⛔ FLIPPED (re-measured 2026-09-15 on 2.0.3): `--session <id>`
+        // resume RE-RENDERS the prior transcript (prompt, reply, summary
+        // line) — the beta-era TUI did not replay, 2.0.3's does.
+        // suites/opencode.js `resume-session-flag` is the regression net.
+        content_rederives_on_resume: true,
         session_store_globs: &[],
         store_excluded_name_fragments: &[],
         // The ONE durable store file — every session lives in this sqlite db,
@@ -2687,7 +2729,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_marker: '\u{276f}',
         composer_region_label: None,
         composer_footer_hints: &["esc", "ctrl", "qwen", "tab"],
@@ -2878,7 +2920,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `kimi -w <dir>` is how a new session is rooted; resume takes the id
         // and re-derives the work dir from its own metadata.
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         // ⛔ [11.6.6-b] FIXED 2026-09-14 (measured live on 1.50.0, muse lab
         // host, node-pty + vendored xterm — tools/probe-battery
         // suites/kimi.js): kimi's composer is a labeled rule region
@@ -3065,7 +3107,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // is the product; a guessed resume selector breaks exactly that.
         resume_selector: ResumeSelector::Subcommand("resume"),
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_footer_hints: &["esc", "ctrl", "enter", "tab"],
         // ⭐ MEASURED 2026-09-14 on Muse Code 1.2.1 (byte-exact pty capture:
         // U+276F `❯` present, U+27E9 `⟩` ZERO in fresh AND resumed composer),
@@ -3245,7 +3287,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
         resume_selector: ResumeSelector::Flag("--conversation"),
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         composer_marker: '>',
         composer_region_label: None,
         composer_footer_hints: &["shortcuts", "esc", "ctrl", "enter", "tab", "gemini", "?"],
@@ -3490,7 +3532,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // current directory — so re-rooting on the command line would be a
         // second encoding of the cd we already did.
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         // ⭐ MEASURED off a LIVE ROW 2026-08-13, and it is why the field was
         // declared unknown first: neither `❯` nor `›` occurs anywhere in the
         // shipped executable's strings, so a static read said "not one of the
@@ -3718,7 +3760,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // The TUI resumes from the shared store; the session's own workspace
         // is inherited from that store, so re-rooting would be a no-op.
         resume_re_roots_with_cwd: false,
-        model_flag: "--model",
+        model_flag: Some("--model"),
         // The composer renders the draft with a U+258F left-bar caret while
         // typing; nothing else marks the input head.
         composer_marker: '\u{258f}',
@@ -3836,7 +3878,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // store; no claim is made here either way.
         resume_re_roots_with_cwd: false,
         // Docs-sourced (`--model <id>`).
-        model_flag: "--model",
+        model_flag: Some("--model"),
         // UNMEASURED: the ecosystem-typical `❯` is a PLACEHOLDER — devin's
         // real composer glyph is unknown (no fleet install to capture). The
         // readiness gate cannot fire on it truthfully until measured; if
@@ -8203,6 +8245,34 @@ mod tests {
 
     // ---- per-launch model + permission mode (delegate launch) -------------
 
+    // opencode 2.0.3 dropped the top-level `--model` (any unknown top-level
+    // flag help-exits, measured 2026-09-15): the launch must refuse HERE,
+    // named, never help-exit there. suites/opencode.js `help-flag-surface`
+    // is the live regression net for the parser half.
+    #[test]
+    fn a_model_pin_on_a_cli_without_a_top_level_model_flag_refuses() {
+        let options = AgentLaunchOptions {
+            model: Some("anthropic/claude-sonnet-4".to_string()),
+            permission_mode: None,
+        };
+        let err = options
+            .launch_tokens(SessionKind::OpenCode)
+            .expect_err("a model pin on opencode 2.0.3 must refuse, not compose a help-exit launch");
+        assert!(
+            err.contains("no top-level model flag"),
+            "the refusal must name the cause: {err}"
+        );
+        // and the same launch WITHOUT the pin stays expressible
+        let options = AgentLaunchOptions {
+            model: None,
+            permission_mode: Some(AgentPermissionMode::Bypass),
+        };
+        assert_eq!(
+            options.launch_tokens(SessionKind::OpenCode).unwrap(),
+            vec!["--auto".to_string()]
+        );
+    }
+
     #[test]
     fn a_model_becomes_the_cli_s_own_model_flag() {
         let options = AgentLaunchOptions {
@@ -8442,12 +8512,14 @@ mod tests {
                 .iter()
                 .map(|(flag, _, _)| *flag)
                 .collect();
-            assert!(
-                strippable.contains(&descriptor.model_flag),
-                "{}: model_flag {} is not in overridden_flags",
-                descriptor.display_name,
-                descriptor.model_flag
-            );
+            if let Some(model_flag) = descriptor.model_flag {
+                assert!(
+                    strippable.contains(&model_flag),
+                    "{}: model_flag {} is not in overridden_flags",
+                    descriptor.display_name,
+                    model_flag
+                );
+            }
             for (mode, tokens) in descriptor.permission_modes {
                 if let Some(flag) = tokens.first() {
                     assert!(
