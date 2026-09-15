@@ -30686,7 +30686,7 @@ the newer one.
 
 ## ⛔ [11.125] A FRESH ROW'S FIRST `server app drag begin` PAYS ~1.5-1.7 s QUEUING BEHIND THE SPAWN-PROMOTION SNAPSHOT APPLY'S TAIL — SIX BACK-TO-BACK UNCACHED FULL SIDEBAR MERGES (~220 ms EACH, `push_remote_ms` ≈ 220 DOMINANT, EXPANSION CRAWLING 111→288 PATHS / 855→2583 ROWS) RUN ON THE UI THREAD INSIDE ONE APPLY AND THE VERB'S HANDLER QUEUE BEHIND ALL OF THEM (traced live 2026-09-15 ~17:27 IST, GUI host, the ux-speed drag-cold-residual lane)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE-PROVEN (falsifier met 2026-09-15 ~18:05 IST; nothing owed on the verb path; the sibling apply-tail merge storm stays under [11.117])
 
 The [11.114] synthesis fix works — this is NOT the resolve's rebuild. Trace of a
 cold begin (fresh scratch row, spawn→begin gap ~2 s, build 67914705ea37):
@@ -30741,3 +30741,15 @@ the diagnostic rerun passed 4/4 on first polls. The probe's accuracy check
 needs a cheaper order read (or a longer budget) — instrument fix owed in the
 [11.113] family. Filed 2026-09-15 by zcode sess_1e4cd6d6 on jojo, lane
 lane/uxspeed/drag-cold-residual (claim ACK-c90c5895cf).
+
+**LIVE-PROVEN 2026-09-15 ~18:05 IST** (main 95b2cb6c, GUI rotated onto
+builds/95b2cb6cf93e at 17:52 via the automated roll→door→rotation flow):
+fresh-row cold `drag begin` wall **171 ms** (was 1589-1671 ms across three
+measurements on two builds), `accepted:true` with `drag_paths` exactly the
+anchor; begin window shows ONE uncached `merge_rows_breakdown` pair (the
+spawn-promotion apply's own tail — [11.117] territory) where six ran
+before; `tree_drag_begin` at +93 ms from verb start; reorder accuracy PASS
+end-to-end with the full event family live (`tree_drag_begin` →
+`tree_drag_hover` → `live_session_reorder_succeeded` → `tree_drag_ended` →
+`live_session_reorder_persisted`), drag-back restores, teardown left zero
+rows. Falsifier satisfied.
