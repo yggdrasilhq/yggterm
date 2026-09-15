@@ -15206,6 +15206,10 @@ fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
         // under their own kind — the Shell bucket here used to be justified by
         // "local-only, no remote rows exist", which is no longer true.
         SessionKind::ZcodeTui => RemoteRuntimeKind::ZcodeTui,
+        // Registered unmeasured (no fleet install), but the descriptor
+        // declares the remote arm (remote-devin://), so a remote devin
+        // runtime is a real registry row by the same law as zcode-tui's.
+        SessionKind::Devin => RemoteRuntimeKind::Devin,
         SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
             RemoteRuntimeKind::Shell
         }

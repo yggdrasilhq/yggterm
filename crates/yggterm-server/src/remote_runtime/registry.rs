@@ -40,6 +40,11 @@ pub enum RemoteRuntimeKind {
     // answer only while the CLI was local-only — the registry would have lied
     // about which CLI owns the PTY, the exact lie this enum exists to stop.
     ZcodeTui,
+    // devin (2026-09-15): registered unmeasured (installed on no fleet host),
+    // but the descriptor already declares the remote arm (remote-devin://),
+    // so the variant lands with the registration — the
+    // additive-on-the-wire law above covers it.
+    Devin,
 }
 
 impl RemoteRuntimeKind {
@@ -62,6 +67,7 @@ impl RemoteRuntimeKind {
             Self::Antigravity => "antigravity",
             Self::GrokBuild => "grok_build",
             Self::ZcodeTui => "zcode_tui",
+            Self::Devin => "devin",
         }
     }
 
@@ -77,6 +83,7 @@ impl RemoteRuntimeKind {
             "antigravity" => Self::Antigravity,
             "grok_build" => Self::GrokBuild,
             "zcode_tui" => Self::ZcodeTui,
+            "devin" => Self::Devin,
             // Unrecognized values stay codex: a row written by a NEWER daemon
             // than this one must still read back as *something*, and codex is
             // the value this column held for its whole history.

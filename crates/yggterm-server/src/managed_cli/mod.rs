@@ -131,6 +131,12 @@ pub enum ManagedCliTool {
     // The 2026-09-08 intake: the house's own ZCode TUI client
     // (@avikalpa/zcode-tui, GPL-3.0-or-later).
     ZcodeTui,
+    // The 2026-09-15 intake: Cognition's Devin CLI, registered unmeasured
+    // (installed on no fleet host). Its VendorScript install is
+    // provisionable by contract, so it holds a row here like every other
+    // registered CLI; the version probe is the first thing the first
+    // install exercises.
+    Devin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +242,7 @@ impl ManagedCliTool {
             Self::Antigravity => SessionKind::Antigravity,
             Self::GrokBuild => SessionKind::GrokBuild,
             Self::ZcodeTui => SessionKind::ZcodeTui,
+            Self::Devin => SessionKind::Devin,
         }
     }
 
@@ -262,6 +269,7 @@ impl ManagedCliTool {
             SessionKind::Antigravity => Self::Antigravity,
             SessionKind::GrokBuild => Self::GrokBuild,
             SessionKind::ZcodeTui => Self::ZcodeTui,
+            SessionKind::Devin => Self::Devin,
             SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => return None,
         })
     }

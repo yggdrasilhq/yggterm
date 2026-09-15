@@ -3710,6 +3710,125 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         read_live_store_title: Some(read_zcode_tui_live_store_title),
         remote_live_store_title: Some(ZCODE_TUI_REMOTE_TITLE_PROBE),
     },
+    // ── The 2026-09-15 intake. Cognition's Devin CLI: a local REPL coding
+    // agent (Rust binary, curl-bash / brew-cask install) with resumable
+    // sessions and a cloud-handoff command. REGISTERED UNMEASURED — installed
+    // on no fleet host (dev/jojo/oc probed 2026-09-15), so every contract
+    // below is the availability-record posture: flags come from the vendor's
+    // own reference (docs.devin.ai/cli/reference/commands, read 2026-09-15),
+    // store paths from nothing at all. The first install owes the measurement
+    // pass (the qwen/pi precedent): probe the binary, drive a real session,
+    // fill the screen tables and the store, THEN let consumers trust them.
+    AgentCliDescriptor {
+        kind: SessionKind::Devin,
+        display_name: "Devin",
+        session_metadata_label: "Devin Session",
+        slug: "devin",
+        binary_name: "devin",
+        // The vendor's curl-bash installer (user-local `~/.local/bin`, no
+        // sudo) — matches the VendorScript contract. A Homebrew cask exists
+        // for macOS; the fleet is Linux.
+        install: CliInstall::VendorScript("https://cli.devin.ai/install.sh"),
+        // The CLI ships its own updater (`devin update`; the Homebrew installs
+        // are told to `brew upgrade` instead, which is the cask's problem).
+        update: CliUpdate::SelfCommand(&["update"]),
+        icon_glyph: "D_",
+        // Provisional — Devin's product chrome is near-monochrome; this is
+        // the docs' neutral dark, not a hex sampled from the running product.
+        brand_color: "#111827",
+        menu_hint: 'd',
+        // The owner titling law's default: Store — yggterm reads the CLI's
+        // own title and never generates over it. With no store reader yet the
+        // read answers None and the row keeps its birth name; `Generated`
+        // would need to be a MEASURED exception (kimi is the only one), and
+        // nothing about devin is measured.
+        title_authority: TitleAuthority::Store,
+        // The CLI mints its own session ids (`devin --resume <id>`; the docs
+        // show `abc12345` and word-word shapes) — the row id is not the
+        // session id at birth.
+        id_assigned_at_birth: false,
+        wrapper_slug: Some("devin"),
+        remote_row_scheme: Some("remote-devin://"),
+        runtime_key_scheme: Some("devin-runtime://"),
+        // ⛔ UNMEASURED — every screen table below is empty BY DECLARATION
+        // (the schema-v2 unmeasured law), not because the CLI is quiet.
+        working_screen_phrases: &[],
+        working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
+        // The vendor docs name a `--respect-workspace-trust` flag, so a trust
+        // gate almost certainly exists — but its screen is unmeasured, and
+        // the [11.107] lesson is that a guessed gate phrase false-positives
+        // the draft guard. Empty until captured from a real row.
+        startup_gate_screen_phrases: &[],
+        plan_limit_choice_screen_phrases: &[],
+        // Docs-sourced (`devin --resume <id>` / `-r <id>`; `--continue`
+        // resumes the cwd's most recent session), NOT probed against a real
+        // binary — the qwen --help lesson applies in both directions.
+        resume_selector: ResumeSelector::Flag("--resume"),
+        // UNMEASURED. `--continue` being cwd-scoped hints a cwd-bucketed
+        // store; no claim is made here either way.
+        resume_re_roots_with_cwd: false,
+        // Docs-sourced (`--model <id>`).
+        model_flag: "--model",
+        // UNMEASURED: the ecosystem-typical `❯` is a PLACEHOLDER — devin's
+        // real composer glyph is unknown (no fleet install to capture). The
+        // readiness gate cannot fire on it truthfully until measured; if
+        // devin draws no glyph at all, the kimi fix ([11.6.6-b],
+        // region-label anchor) is the shape the repair takes.
+        composer_marker: '\u{276f}',
+        composer_region_label: None,
+        composer_footer_hints: &[],
+        working_footer_hints: &[],
+        // The vendor reference names `--permission-mode` values
+        // (`normal|dangerous|bypass`), but they are UNPROBED — a value we do
+        // not need to send is a value that cannot rot, so every posture
+        // emits no tokens until a real binary confirms the spellings.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &[]),
+            (AgentPermissionMode::AcceptEdits, &[]),
+            (AgentPermissionMode::Bypass, &[]),
+        ],
+        overridden_flags: &[("--model", FlagArity::TakesValue, OverriddenBy::Model)],
+        extra_args_slug: "devin",
+        permission_presets: &[],
+        permission_provenance: PermissionProvenance::Unmeasured(
+            "vendor docs name --permission-mode normal|dangerous|bypass; not \
+             probed against a real binary (installed on no fleet host) — \
+             presets stay unwired until measured",
+        ),
+        // UNMEASURED: nothing is known about whether a resume replays the
+        // conversation. Conservative false assumes scrollback loss.
+        content_rederives_on_resume: false,
+        // ⛔ NO STORE IS DECLARED — none has ever been seen. The vendor docs
+        // name a config dir (`~/.config/devin`) and an XDG data namespace
+        // (`~/.local/share/devin`), but session-history layout is
+        // undocumented and unverifiable without an install. The scan gap is
+        // the declaration; a plausible glob is the failure this area keeps
+        // repeating.
+        session_store_globs: &[],
+        store_excluded_name_fragments: &[],
+        durable_store_files: &[],
+        store_scan_gap: Some(
+            "installed on no fleet host (2026-09-15 availability record): \
+             session-store layout unknown — vendor docs name only \
+             ~/.config/devin (config) and ~/.local/share/devin (data \
+             namespace). First install: locate the session store, verify a \
+             template against a REAL session id on disk, fill globs + the \
+             cli-stores.json row, then write the recency reader",
+        ),
+        store_home_env_override: None,
+        read_store_entry: read_no_store_entry,
+        store_membership_index: None,
+        // Docs show no launch-time session flag (sessions resume post-launch
+        // via --resume).
+        live_session_argv_flag: None,
+        live_session_marker: None,
+        read_live_store_title: None,
+        remote_live_store_title: None,
+    },
 ];
 
 fn modified_epoch_ms_of(path: &Path) -> u128 {
@@ -9262,6 +9381,15 @@ mod tests {
             .filter(|descriptor| {
                 descriptor.title_is_store_authoritative()
                     && descriptor.read_live_store_title.is_none()
+                    // The declared-gap escape: a CLI whose store is a DECLARED
+                    // unknown (devin, registered unmeasured 2026-09-15) claims
+                    // no store at all, so there is nothing to wire a reader to
+                    // and nothing this lock could demand — its rows keep birth
+                    // names until the first install measures the store. A CLI
+                    // that CLAIMS a store (globs or durable files, no declared
+                    // gap) without a reader is still exactly the deadlock this
+                    // lock exists to kill.
+                    && descriptor.store_scan_gap.is_none()
             })
             .map(|descriptor| descriptor.slug)
             .collect::<Vec<_>>();
@@ -9269,7 +9397,8 @@ mod tests {
             unreachable.is_empty(),
             "a CLI is store-authoritative with no reader, so its rows can never \
              be titled at all: {unreachable:?} — either measure its store and \
-             wire a reader, or stop claiming its store is authoritative",
+             wire a reader, declare the store gap (the unmeasured law), or stop \
+             claiming its store is authoritative",
         );
     }
 

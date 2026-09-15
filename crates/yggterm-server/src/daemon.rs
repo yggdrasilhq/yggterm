@@ -37369,6 +37369,16 @@ mod tests {
         // row and the SkippedNoReader outcome is unreachable by construction.
         // (The original pinned GrokBuild, then Kimi; both got readers.)
         for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
+            // The declared-gap escape (mirrors the core reader lock): a CLI
+            // whose store is a DECLARED unknown (devin, registered unmeasured
+            // 2026-09-15) claims no store, so there is nothing to read yet —
+            // its rows keep birth names until the first install measures the
+            // store and wires the reader. A CLI that CLAIMS a store without a
+            // reader is still exactly the silence this contract kills (kimi
+            // is red here on main for precisely that).
+            if descriptor.store_scan_gap.is_some() {
+                continue;
+            }
             assert!(
                 descriptor.read_live_store_title.is_some(),
                 "{}: no local title reader — its live rows would wear their birth \
