@@ -30683,3 +30683,61 @@ component: a pre-rename `@ygghq/zcode-tui` ghost slot (dev 0.6.5 recorded at
 NOT downgrade a newer installed generation; or (code-side) point the registry dist-tag
 at an older version than a locally imported production generation and show sync keeps
 the newer one.
+
+## ⛔ [11.125] A FRESH ROW'S FIRST `server app drag begin` PAYS ~1.5-1.7 s QUEUING BEHIND THE SPAWN-PROMOTION SNAPSHOT APPLY'S TAIL — SIX BACK-TO-BACK UNCACHED FULL SIDEBAR MERGES (~220 ms EACH, `push_remote_ms` ≈ 220 DOMINANT, EXPANSION CRAWLING 111→288 PATHS / 855→2583 ROWS) RUN ON THE UI THREAD INSIDE ONE APPLY AND THE VERB'S HANDLER QUEUE BEHIND ALL OF THEM (traced live 2026-09-15 ~17:27 IST, GUI host, the ux-speed drag-cold-residual lane)
+
+**Status:** OPEN
+
+The [11.114] synthesis fix works — this is NOT the resolve's rebuild. Trace of a
+cold begin (fresh scratch row, spawn→begin gap ~2 s, build 67914705ea37):
+
+- `t0+90ms` `app_control/request_begin`; `t0+92ms` a CACHED `merge_rows`
+  `source=snapshot` (an apply is starting); `t0+1499ms`
+  `response_complete_begin`; `t0+1500ms` `tree_drag_begin` + `request_end`.
+- Between those: SIX uncached `merge_rows_breakdown` pairs at +362, +584,
+  +806, +1029, +1275, +1497 — back-to-back ~222 ms apart (the gap IS the
+  merge), each dominated by `push_remote_ms` 217-260 ms (4 machines,
+  14 ssh targets, 1556 remote sessions, 835 stored rows), with
+  `expanded_path_count` crawling 111→123→155→264→286→288 and
+  `merged_row_count` 855→1143→1621→2228→2581→2583 (a per-step expansion
+  fixpoint crawl — the cache key changes every step, so every tail merge
+  misses), and a second `source=snapshot` merge at +1502 bracketing the
+  storm: the whole storm is the spawn-promotion SNAPSHOT APPLY's tail work,
+  and the drag-begin handler (UI thread) queued behind it.
+- Warm begin (no apply in flight): 162-167 ms verb wall, cached merge.
+- Measured cold walls across the day on two builds: 1.46 s (893178b42d51,
+  12:32 re-probe), 1.67 s / 1.59 s (67914705ea37, 17:07 / 17:27) — uniform,
+  build-independent, ≈ the 1200 ms `LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS`
+  + the storm.
+
+Mechanism chain: agent spawns a scratch row → daemon knows instantly but the
+GUI's live view lags by the trigger-debounce + apply; the apply's tail steps
+re-merge with a freshly grown expansion set each time (six uncached ~220 ms
+full merges on the UI thread); ANY row_path app_control verb landing in that
+window queues behind all of it; once the thread frees, resolve answers
+instantly (snapshot fast-path or synthesis now hits — the apply promoted the
+row). The verb's felt cost is the promotion cascade, not its own work.
+
+Fix directions (a) is the surgical one: (a) inside the apply tail, hoist ALL
+expansion growth (seed/ensure/visible family) ABOVE the steps that merge, so
+the tail's merges share one expansion set — first merge uncached, the rest
+become cache hits (six uncached → one; ~1.3 s → ~0.2 s per apply for EVERY
+spawn, not just drags); (b) the [11.117] incremental/generation-keyed merge,
+which subsumes this; (c) offload tail merges off the UI thread (largest
+blast radius). Cross-refs: [11.117] (the same uncached-merge disease at
+spawn), [11.114] (the synthesis fix this lanes measured GOOD), [11.87]
+(UI-thread starvation family).
+
+Falsifier: with the fix live, a cold `server app drag begin` on a row spawned
+seconds earlier shows AT MOST ONE uncached `merge_rows_breakdown` in the
+request window, and the verb wall drops to ≈ promotion-debounce + one merge
+(~1.4-1.6 s → target ≤ ~400 ms beyond the unavoidable promotion wait;
+re-probe per the ux-speed paint-truth bar). Probe-instrument note from this
+lane, so nobody files a false accuracy bug: `uxprobe.py --actions drag`
+reported 0/4 order accuracy at 17:07 while drops demonstrably apply — its
+`wait_order` polls a 424-row `rows --json` (1-4 s per call, two calls per
+poll) inside a 5 s budget, so the check can time out purely on poll cost;
+the diagnostic rerun passed 4/4 on first polls. The probe's accuracy check
+needs a cheaper order read (or a longer budget) — instrument fix owed in the
+[11.113] family. Filed 2026-09-15 by zcode sess_1e4cd6d6 on jojo, lane
+lane/uxspeed/drag-cold-residual (claim ACK-c90c5895cf).
