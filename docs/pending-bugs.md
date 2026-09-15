@@ -30448,6 +30448,19 @@ carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 > workflow), but this entry's falsifier (handled_by_pid exe postdating
 > the merge) stays owed until [11.122] lands or a real GUI restart
 > completes the adoption.
+>
+> **DAEMON HALF, 2026-09-15 ~14:40:** the GUI half closed at 12:32; the
+> daemon never followed — jojo's daemon is still the Sep-11 build through
+> four days of rolls, because nothing ever TRIGGERED its rotation
+> (`prepare_update_restart` at 12:32 only wrote its protected snapshot; the
+> pin flip only gave it eyes). dev's daemon churns only because CI restarts
+> it; oc runs none. Fix: the deploy's direct-host pass now rotates per
+> plane — the GUI door fires only when live GUI bytes differ, and
+> `server daemon restart` (unforced; the daemon's own idle gates and
+> session-preserving handoff decide) fires only when the live daemon's
+> bytes differ from the staged headless. On the direct hosts every roll
+> then carries the daemon onto the current build at the next quiet moment,
+> instead of never.
 
 The deploy plane and the install plane diverge on the GUI host, and the
 gap silently strands every GUI/daemon-side fix the roll lands:
