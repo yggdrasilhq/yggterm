@@ -31,8 +31,8 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 
 | id | member | class | open work |
 |---|---|---|---|
-| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); remaining: codex, claude, opencode, agy, muse, qwen, pi, codex-litellm, devin |
-| 11.6.1 | codex | A | OPEN (ledger reattach; kill the 12s /proc poll) |
+| 11.6.0 | the family: schema v2 + handoff ledger + probe battery | — | ledger LANDED + WRITER LIVE-PROVEN; schema v2 LANDED (ee876a66); wrapper-level ledger-served SLA run LANDED IN CI (reattach_sla_integration, lane/integration/probe-battery 410b4c60); battery runner LANDED (tools/probe-battery, mock-tui reference green, 700351aa); died_with_me writers LANDED + COLD-EXIT LIVE-PROVEN (lane/integration/died-with-me-writers: both serve loops write the dying rows at the exit commitment; retire_daemon cold exit with one owned agent row recorded the death + resume_argv, trace reattach_ledger_died_with_me_written). COMPOSITE REAL-ROTATION RUN PROVEN LIVE (2026-09-15, see the acceptance entry: hot-restart cold exit wrote died_with_me records for 2 real rows; both resumes traced reattach_ledger_served instantly, ledger consumed to []). OPEN: per-CLI battery suites — grok LANDED (suites/grok.js, 2026-09-15, re-measured 1.0.30); codex LANDED (suites/codex.js, 2026-09-15, 8/8 twice live, re-measured 0.154.0); remaining: claude, opencode, agy, muse, qwen, pi, codex-litellm, devin |
+| 11.6.1 | codex | A | Battery suite LANDED 2026-09-15 (lane/integration/codex-battery, suites/codex.js 8/8 twice live on 0.154.0): every declared fact HOLDS (trust-gate needles verbatim — its warning text grew; `• Working (Ns • esc to interrupt)`; `›` marker; rollout filename-uuid law; resume id-reuse PROVEN by a follow-up turn appending to the SAME rollout; help surface holds, `resume --last` additive). Titling drift MEASURED + READER FIXED: 0.154.0 names threads eagerly (footer `renaming…` spinner → title; `session_index.jsonl` appended instantly) but the sqlite catalog received NO row for either probe session (~40 min checked) — `read_codex_live_store_title` gained arm 1.5 reading `session_index.jsonl` (test `codex_session_index_names_the_thread_the_footer_shows`), keeping the SSOT equality (CLI display beats first-prompt). STILL OPEN: ledger reattach in the resume wrapper; kill the 12s /proc poll |
 | 11.6.2 | claude | A | OPEN (ledger reattach) |
 | 11.6.3 | opencode | B | [11.6.3-a]+[11.6.3-b] FIXED IN CODE — LIVE PROOF OWED (lane/integration/opencode-v2: store-list mirror universe, OSC-title viewing, view verb body; see the seat E section); probe battery + phrase fills still OPEN |
 | 11.6.4 | agy | C | [11.94] RE-FIXED IN CODE after live falsification — guard order + refusal naming ([11.107]); [11.96] store half resolved upstream on 1.2.2, fallback half fixed in code; baseline below |
@@ -728,9 +728,13 @@ xterm.js + CPR answering; mock-tui reference suite green).
 
 Still owed:
 
-- per-CLI battery suites — the zcode-tui §9 reference suite is LANDED
-  (green 6/6 on main 0.5.9, 2026-09-14); remaining: the other CLIs' suites
-  (kimi's exists).
+- per-CLI battery suites — LANDED: zcode-tui §9 reference (green 6/6 on main
+  0.5.9, 2026-09-14), grok (suites/grok.js 8/8 on 1.0.30, 2026-09-15), codex
+  (suites/codex.js 8/8 twice on 0.154.0, 2026-09-15 — trust gate, `›`
+  marker, working needles, rollout filename-uuid law, Store titling via
+  `session_index.jsonl`, help surface, resume id-reuse, panic); kimi's
+  exists (auth turn credential-gated); remaining: claude, opencode, agy,
+  muse, qwen, pi, codex-litellm, devin.
 
 #### THE COMPOSITE REAL-ROTATION LEDGER-SERVED RUN — PROVEN LIVE (2026-09-15 ~00:29-01:10 IST, a fleet host's production daemon; proof-only lane `lane/integration/composite-rotation`)
 
