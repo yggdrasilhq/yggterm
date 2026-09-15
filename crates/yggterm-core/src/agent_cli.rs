@@ -3238,26 +3238,22 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         wrapper_slug: Some("agy"),
         remote_row_scheme: Some("remote-agy://"),
         runtime_key_scheme: Some("agy-runtime://"),
-        // Measured from agy TUI: shows "esc to cancel", "esc to interrupt", "generating...", "thinking...", "working..."
+        // ⭐ MEASURED 2026-09-15, agy 1.2.3, the 11.6.4 battery suite
+        // (tools/probe-battery/suites/agy.js, two live drives): of the five
+        // needles read off the 1.2.0 TUI, only "esc to cancel" and
+        // "generating..." still hold — the turn draws a spinner line
+        // ("⣯  Generating...") plus the esc-to-cancel footer; "esc to
+        // interrupt", "thinking..." and "working..." were never sampled and
+        // are RETIRED per the measured-table law (the [11.111] zcode-tui
+        // precedent). "Thought for Ns" persists in the transcript after the
+        // thought ends, so it is a false-working candidate and stays OUT.
         working_screen_phrases: &[
             ScreenWorkingPhrase {
                 needle: "esc to cancel",
                 also_any: &[],
             },
             ScreenWorkingPhrase {
-                needle: "esc to interrupt",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
                 needle: "generating...",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "thinking...",
-                also_any: &[],
-            },
-            ScreenWorkingPhrase {
-                needle: "working...",
                 also_any: &[],
             },
         ],
@@ -3268,16 +3264,37 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // shell command parks the TUI on this picker while the footer still
         // reads "esc to cancel" — the QuestionPrompt phase must outrank
         // Working for agy or a question reads as busy forever.
-        question_picker_screen_phrases: &[ScreenWorkingPhrase {
-            needle: "requesting permission for:",
-            also_any: &["run this command?"],
-        }],
+        // ⭐ RE-MEASURED 2026-09-15, agy 1.2.3 (battery pass-1 snap): the
+        // picker draws "Requesting permission for:" and "Run this command?"
+        // on SEPARATE lines ("Requesting permission for:" / the command /
+        // blank / "Run this command?" / the numbered options), so the old
+        // same-line also_any could NEVER match again and a question row
+        // classified as Working — the exact busy-forever failure the
+        // 09-10 note warns about. Both strings are now standalone needles;
+        // each is picker-specific on its own.
+        question_picker_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "requesting permission for:",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "run this command?",
+                also_any: &[],
+            },
+        ],
         background_agent_hint_screen_phrases: &[],
         // ⭐ MEASURED 2026-09-10, agy 1.2.0, guihost (11.6.4 seat C): a
         // first-run folder parks the TUI on this picker BEFORE any composer —
         // typed input during it is discarded and the trailing Enter CONFIRMS
         // trust (pending-bugs [11.94]). Declared so a programmatic send can be
         // refused by name instead of eaten.
+        // ⭐ RE-MEASURED 2026-09-15, agy 1.2.3 (battery): the needle holds
+        // verbatim ("Do you trust the contents of this project?" with
+        // "> Yes, I trust this folder" / "No, exit"), and the gate now fires
+        // AFTER a launch sign-in phase ("You are currently not signed in." →
+        // "⣾ Signing in..." → composer) that can outlast 15s — input typed
+        // during THE SIGN-IN PHASE dies silently the same way (the battery's
+        // pass-1 trap; the suite waits for the composer before typing).
         startup_gate_screen_phrases: &[ScreenWorkingPhrase {
             needle: "do you trust the contents of this project?",
             also_any: &[],
@@ -3285,19 +3302,21 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         plan_limit_choice_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
+        // ⭐ RE-VERIFIED 2026-09-15 on 1.2.3 (battery help probe): all six
+        // declared flags spell the same; 1.2.3 adds --effort,
+        // --input-format/--output-format (stream-json), --json-schema,
+        // --print/-p, --prompt-interactive/-i, --add-dir, --agent,
+        // --project, --new-project and agent/mcp/plugin/remote-control
+        // subcommands (drift evidence in the battery report).
         resume_selector: ResumeSelector::Flag("--conversation"),
         resume_re_roots_with_cwd: false,
         model_flag: Some("--model"),
         composer_marker: '>',
         composer_region_label: None,
         composer_footer_hints: &["shortcuts", "esc", "ctrl", "enter", "tab", "gemini", "?"],
-        working_footer_hints: &[
-            "esc to cancel",
-            "esc to interrupt",
-            "generating...",
-            "thinking...",
-            "working...",
-        ],
+        // 1.2.3 battery re-measure: the footer carries "esc to cancel"; the
+        // Generating... spinner line lands inside the footer window.
+        working_footer_hints: &["esc to cancel", "generating..."],
         // `--dangerously-skip-permissions` is documented in `agy --help` as
         // "Auto-approve all tool permission requests without prompting", and
         // `--mode <accept-edits|plan>` was measured on the same help 2026-08-13
