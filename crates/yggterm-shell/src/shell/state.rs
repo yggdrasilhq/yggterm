@@ -6181,11 +6181,18 @@ mod app_pane_reorder_tests {
             "a contributed row's title must reach the shared ghost:\n{row}"
         );
         // The root tracks the pointer, so the card does not freeze at the edge
-        // of the list that owns the gesture.
-        shell.track_row_drag_pointer((400.0, 320.0));
+        // of the list that owns the gesture. Since [11.129] the LIVE position
+        // stream is the ghost pointer signal written by the window handler —
+        // the state layer only reports the begin transition and never needs
+        // the post-begin pointer.
+        assert!(
+            !shell.track_row_drag_pointer((400.0, 320.0)),
+            "the gesture is already begun; tracking returns false"
+        );
         assert_eq!(
             shell.row_drag.as_ref().expect("gesture").pointer,
-            (400.0, 320.0)
+            (10.0 + DRAG_BEGIN_THRESHOLD_PX, 10.0),
+            "post-begin moves belong to the ghost signal, not the gesture"
         );
 
         let source = product_source();
@@ -6196,6 +6203,10 @@ mod app_pane_reorder_tests {
         assert!(
             root.contains("snapshot.row_drag.as_ref().filter(|drag| drag.begun)"),
             "the row lists' ghost is drawn beside the tree's, at the same root:\n{root}"
+        );
+        assert!(
+            root.contains("ghost_pointer: drag_ghost_pointer"),
+            "both ghosts read the ONE pointer signal — [11.129]'s leaf split:\n{root}"
         );
         assert_eq!(
             source.matches("DragGhostCard {").count(),
@@ -27156,9 +27167,17 @@ impl ShellState {
     /// Keep the ghost under the pointer wherever the pointer goes. Called from
     /// the shell ROOT, so the ghost does not freeze at the edge of the list
     /// that owns the gesture.
-    fn track_row_drag_pointer(&mut self, pointer: (f64, f64)) {
-        if let Some(drag) = self.row_drag.as_mut() {
-            drag.maybe_begin(pointer);
+    /// Feed the row-drag gesture a pointer move. Returns whether the gesture
+    /// JUST crossed its begin threshold — the moment the ghost's position
+    /// signal is born. Once begun, the pointer stream feeds only the ghost
+    /// signal (the caller's [11.129] split); the gesture needs no more of it.
+    fn track_row_drag_pointer(&mut self, pointer: (f64, f64)) -> bool {
+        match self.row_drag.as_mut() {
+            Some(drag) if !drag.begun => {
+                drag.maybe_begin(pointer);
+                drag.begun
+            }
+            _ => false,
         }
     }
 
@@ -34916,22 +34935,24 @@ impl ShellState {
         }
         self.arm_tree_drag(row, pointer);
     }
-    fn update_pending_tree_drag_pointer(&mut self, pointer: (f64, f64)) {
+    fn update_pending_tree_drag_pointer(&mut self, pointer: (f64, f64)) -> bool {
         if !self.drag_paths.is_empty() {
             self.update_drag_pointer(pointer);
-            return;
+            return false;
         }
         // Threshold first — it is pure math. Everything below it runs at most
         // once per gesture, on the move that actually crosses 6px; the row was
         // already in hand at arm time, so no move ever pays a sidebar merge.
+        // The bool tells the pointer handler whether the gesture just began,
+        // so the ghost's position signal can be born at the begin point.
         let Some(pending) = self.pending_tree_drag.as_ref() else {
-            return;
+            return false;
         };
         if !drag_threshold_reached(pending.pointer, pointer) {
-            return;
+            return false;
         }
         let row = pending.row.clone();
-        let _ = self.maybe_begin_tree_drag(&row, pointer);
+        self.maybe_begin_tree_drag(&row, pointer)
     }
     fn update_drag_pointer(&mut self, pointer: (f64, f64)) {
         if !self.drag_paths.is_empty() {
