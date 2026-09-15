@@ -30432,6 +30432,21 @@ carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 > KEEP sentinel, corrupt-state failure, sed read-back) and dry-run-proven
 > against dev (release arm) and jojo (rebuild arm). The staged builds prune to
 > the newest three, never the active one.
+>
+> **FIRST ROLL LIVE 2026-09-15 10:52** (main edfbbf713fc6): the deploy
+> staged dev's frozen channel through the release arm (3.2.105 ->
+> versions/3.2.113, full flip) and jojo's through the rebuild arm
+> (builds/edfbbf713fc6 + active_executable flip, on-disk verified), then
+> fired the restart door unforced — and the live GUI RECEIVED and
+> ANSWERED it (trace: request f387e39c, has_error false). The restart
+> itself then stalled silently inside the GUI: no PrepareUpdateRestart
+> reached the daemon, no successor appeared — filed as [11.122] with the
+> full timeline; the flow's zero-trace silence is its own instrument
+> gap. Net: the dead-write defect IS dead (the channel now carries the
+> fleet build and every future GUI start auto-adopts it via the startup
+> workflow), but this entry's falsifier (handled_by_pid exe postdating
+> the merge) stays owed until [11.122] lands or a real GUI restart
+> completes the adoption.
 
 The deploy plane and the install plane diverge on the GUI host, and the
 gap silently strands every GUI/daemon-side fix the roll lands:
@@ -30481,3 +30496,51 @@ through the roll; within one hour, `server status`/`server app drag clear`
 must report a handled_by_pid whose /proc exe mtime postdates the merge —
 today it does not, and no restart door fires.
 (docs(pending-bugs): [11.120] direct-channel hosts never execute the roll's bundle — deploy/install-plane divergence strands landed fixes; both restart doors blind to same-version rebuilds)
+
+## ⛔ [11.122] THE GUI ACCEPTS `restart_pending_update` ON A DIRECT HOST AND THE FLOW THEN VANISHES — NO `PrepareUpdateRestart` EVER REACHES THE DAEMON, NO SUCCESSOR PROCESS EVER APPEARS, AND NOT ONE STEP OF THE FLOW EMITS A TRACE (measured live 2026-09-15 ~10:52-11:05 IST, GUI host, the direct-channel-deploy lane's first roll)
+
+**Status:** OPEN
+
+The [11.121] deploy fix worked end-to-end up to the door and then hit a
+silent wall — the first time in fleet history the door was ever reachable
+on a direct host, so this flow ran for the first time too:
+
+- 10:52:19 the roll's deploy (with the [11.121] fix, main edfbbf713fc6)
+  staged `~/.local/share/yggterm/direct/builds/edfbbf713fc6/` on the GUI
+  host and flipped install-state `active_executable` to it (verified on
+  disk).
+- 10:52:59.388 the deploy fired `server app update restart` (unforced);
+  the live GUI (pid 2259301, 3.2.113 from versions/3.2.113) received
+  `restart_pending_update` and answered 70 ms later with
+  `has_error: false` — not a lease refusal, not an error (ytrace
+  `ui/app_control request_begin/request_end`, request f387e39c).
+- The flow then produced NOTHING: no `PrepareUpdateRestart` ever arrived
+  at the daemon (its request stream — ~500 begins per 10 min — has zero
+  in the window), no successor GUI process ever appeared (no fresh
+  `gui/startup/main_enter` from an exec; the only new pids in the window
+  are the deploy's own census CLIs), the old GUI and the Sep-11 daemon
+  kept running the old build, and no "Update Restart Blocked"
+  notification was ever raised (app-state notification history is clean
+  of it; `last_action` shows unrelated text).
+- Reading `restart_into_pending_update`, only the `pending == None`
+  early-return is consistent with ALL of those observations at once —
+  yet re-deriving the same `pending_restart_from_active_install_state`
+  chain on paper against the on-disk state at that moment yields
+  `Some` (finder walks ancestors to the direct root; target is_file;
+  no version claim outside versions/ so the record's word passes;
+  paths differ). The branch that swallowed it cannot be named from
+  code alone.
+
+**Instrument gap (the [11.113] family):** the update-restart flow emits
+NOTHING at any step — not "pending derived: Some/None", not
+"prepare sent/failed", not "successor launched". A silent stall in a
+session-preserving restart flow is unobservable by construction. The
+flow owes one trace emit per step (kind, version, exe, error).
+
+Falsifier for the fix: with a direct-host install-state pointing at a
+build the live GUI is not executing, `server app update restart` ends
+with a successor GUI whose /proc/<pid>/exe is the staged build and a
+daemon prepare event in ytrace — the same bar [11.121]'s falsifier
+names. Until then the fleet's landed fixes adopt only via the startup
+update workflow at the GUI's next real restart (which the same staged
+state satisfies — startup auto-restarts into the pending build).
