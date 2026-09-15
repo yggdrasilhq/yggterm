@@ -30373,6 +30373,51 @@ Re-measure the pair when (a)/(b) land.
 
 **Status:** OPEN
 
+**NAMED (2026-09-15 ~18:45 + ~00:05-00:30 IST, the uxspeed clock-storm lane,
+claim ACK-effa741bbd): the untraced burn is a CLOCK-QUERY STORM in the
+glib/WebKit dispatch plane.** Three perf captures (GUI process at 18:41 on
+build 3.2.113-era, GUI process at ~00:05 on b787d688, WebKitWebProcess at
+~00:30 on 497eb34e; data `/tmp/metronome-perf.data`, `/tmp/clockstorm-perf.data`
+(192 MB, dwarf), `/tmp/lbr-perf.data` (LBR), `/tmp/wp2-perf.data`):
+
+- **~40-45% of GUI-process cycles + ~25% of WebKitWebProcess cycles are
+  clock_gettime syscall machinery** — `_copy_to_user` (timespec copy-out)
+  ~30%, `entry_SYSRETQ` ~7-9.5%, `read_hpet` ~3.4-7%.
+- **Why every read is a full syscall (answers the old fix-direction (b)):
+  the box's clocksource is `hpet` (available: hpet, acpi_pm — the TSC was
+  marked unstable 2026-09-11, see yggterm-core/src/clock.rs), and the x86
+  vDSO has no hpet path — so glibc's `clock_gettime` falls back to a real
+  syscall every call.** No app code can read any clock cheaply here today.
+- **The callers are the dependency plane, not yggterm:** LBR branch-history
+  stacks run JSC/WebKit -> glib main-loop dispatch internals (the statics
+  around `g_get_monotonic_time_ns`, `g_source_ref`, `g_source_get_name`)
+  -> `clock_gettime@plt`, in BOTH the GUI process (in-process webkit2gtk UI
+  plane) and the WebKitWebProcess children (eventfd ping-pong + ~20%
+  scheduler churn). yggterm's own DSO is 2.35% of GUI cycles; its raw
+  `Instant::now()` sites (~200, incl. ~14 per sidebar merge) are noise at
+  storm scale.
+- **Fix re-ranked:** (a) coalescing yggterm's own reads FALSIFIED as the
+  primary lever (2.35% share). The levers now: (i) OWNER-LEVEL — rehabilitate
+  the TSC (`tsc=reliable` or a re-sync/newer kernel/microcode; the 2026-09-11
+  warp risk makes this the owner's call): every read drops from ~1.3 us
+  syscall to ~25 ns vDSO and the storm evaporates globally; (ii) the
+  DISPATCH-RATE driver — name which webkit/glib source floods (~1e5
+  dispatches/s during phases); first experiment, blocked tonight by the
+  live stack refusing uxprobe spawns (verb timeout ~00:20, floor 96 ms,
+  mid rotation-churn): A/B stream a scratch row (`yes | head -n 1000000`)
+  while capturing — if the storm scales with PTY output, the DOM-write/IPC
+  path is the driver and render-path batching work shrinks it directly.
+  The trace plane's own amortized stamp (clock.rs) is already correct and
+  stays.
+- Main-thread census: the storm's center of mass IS the GUI main thread
+  (comm `yggterm` non-tokio ~80% of process samples) — the metronome's
+  337 ms lockstep burn is this flood's main-thread face.
+
+Falsifier (unchanged): with the burning site fixed,
+`ui_wait_ms` p50 of `background_live_session_snapshot` returns to ~30ms
+during all phases and ui/block counts in the 337ms class drop to the
+quiet-window floor (<5/min).
+
 Attribution complete to the trace-plane limit; naming needs L4 (owner-gated perf install).
 
 The ux-speed PSI lane's handoff (ACK-76fa459c21) promised attribution of the
