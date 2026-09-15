@@ -39,11 +39,16 @@ Roster notes: zcode-tui is FIRST-PARTY — it must become the reference
 implementation of the native announce (§3), the cheapest integration in the
 fleet. The `gemini` CLI is not a managed session kind (it runs inside shell
 rows); "there is no gemini CLI" refers to consultants — agy is the Gemini
-route there too. \*devin (2026-09-15) is REGISTERED UNMEASURED — installed on
-no fleet host, so its store is unverified and its screen tables are empty by
-declaration; class C is its shape (a local REPL with resumable sessions), not
-a measurement. First install runs the probe battery before any consumer
-trusts its descriptor.
+route there too. \*devin (registered unmeasured 2026-09-15) was MEASURED
+2026-09-16 on the muse lab host's 3000.10.27 install by the devin-battery
+suite (8/8 twice live): class C confirmed in the flesh — trust gate
+(`Do you trust the authors of this directory?` → `Yes, trust`/`No, exit`,
+durable in `~/.local/share/devin/cli/trusted_workspaces.json`), composer
+glyph `❭` U+276D (the registered `❯` was a placeholder, one codepoint off),
+working line `Thinking · <N>s (esc twice to interrupt)`, and ONE SQLite
+store (`~/.local/share/devin/cli/sessions.db`: word-word slug ids, eager
+first-prompt titles, rows only for completed turns — the resume universe is
+wider than the sessions table).
 
 ## 2. Descriptor schema v2 — five orthogonal capabilities
 
@@ -203,7 +208,7 @@ The cli-integration family owns the bugbath. Family id **11.6**; members are
 | 11.6.9 | pi | C |
 | 11.6.10 | codex-litellm | A |
 | 11.6.11 | zcode-tui | B (first-party) |
-| 11.6.12 | devin | C (registered unmeasured 2026-09-15 — installed on no fleet host; store unverified, screen tables empty by declaration; first install owes the measurement pass) |
+| 11.6.12 | devin | C (MEASURED 2026-09-16 on 3000.10.27 — trust gate + trusted_workspaces.json, composer U+276D, Thinking·/esc-twice, sessions.db single-sqlite store with slug ids + eager first-prompt titles; suite suites/devin.js 8/8 twice live) |
 
 Multi-session law (owner 2026-09-10): he runs SEVERAL sessions per CLI in
 parallel; each claims one `11.6.<n>`, works a lane `lane/integration/<cli>`,

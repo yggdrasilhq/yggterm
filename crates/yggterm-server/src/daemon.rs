@@ -37542,21 +37542,23 @@ mod tests {
     /// remote half by narrowing the local one would trade one silence for
     /// another.
     #[test]
-    #[test]
     fn a_local_row_of_a_cli_with_no_measured_reader_says_so() {
         // RETIRED AS A GAP TEST 2026-08-30 and promoted to the full-coverage
         // contract it was reaching for: every registered CLI now carries a
         // measured local reader, so the local chore serves EVERY local agent
         // row and the SkippedNoReader outcome is unreachable by construction.
-        // (The original pinned GrokBuild, then Kimi; both got readers.)
+        // (The original pinned GrokBuild, then Kimi; both got readers. Devin
+        // joined the measured side 2026-09-16 — its sessions.db store and
+        // title reader landed together, so the escape below has no current
+        // tenant and stays only for the NEXT unmeasured registration.)
         for descriptor in yggterm_core::agent_cli::AGENT_CLIS {
             // The declared-gap escape (mirrors the core reader lock): a CLI
-            // whose store is a DECLARED unknown (devin, registered unmeasured
-            // 2026-09-15) claims no store, so there is nothing to read yet —
-            // its rows keep birth names until the first install measures the
-            // store and wires the reader. A CLI that CLAIMS a store without a
-            // reader is still exactly the silence this contract kills (kimi
-            // is red here on main for precisely that).
+            // whose store is a DECLARED unknown claims no store, so there is
+            // nothing to read yet — its rows keep birth names until the
+            // first install measures the store and wires the reader. A CLI
+            // that CLAIMS a store without a reader is still exactly the
+            // silence this contract kills (kimi is red here on main for
+            // precisely that).
             if descriptor.store_scan_gap.is_some() {
                 continue;
             }

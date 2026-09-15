@@ -140,7 +140,10 @@
     "devin": {
       "store_globs": [],
       "icon_kind": "devin",
-      "note": "REGISTERED UNMEASURED 2026-09-15 - installed on no fleet host and no store template has ever been resolved against a real session. The registry declares a scan gap, not globs: vendor docs name only ~/.config/devin (config) and ~/.local/share/devin (XDG data namespace), and a session-history layout on top of that is undocumented. First install: locate the store, verify a template against a REAL session id on disk, then fill this row and the registry globs together."
+      "transcript": null,
+      "format": null,
+      "verified_on_disk": false,
+      "note": "MEASURED 2026-09-16 (devin-battery suite on 3000.10.27, 8/8 twice live): the store is ONE SQLite db, ~/.local/share/devin/cli/sessions.db (WAL; tables sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state). Session ids are word-word SLUGS (scythe-snowplow); sessions.title = the first prompt (eager self-titling); a row exists only for a COMPLETED turn - a turnless session leaves session_locks/<slug>.lock (pid) and no row. Transcripts live inside the db (message_nodes), so there is no per-session transcript PATH to declare - empty globs are the SHAPE (opencode posture), not a gap."
     }
   }
 }
