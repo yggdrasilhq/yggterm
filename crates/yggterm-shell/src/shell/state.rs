@@ -34824,13 +34824,23 @@ impl ShellState {
             self.selection_anchor = Some(row.full_path.clone());
             self.browser.select_path(row.full_path.clone());
         }
-        let mut seen_paths = HashSet::new();
-        self.drag_paths = self
-            .selected_tree_drag_rows()
-            .into_iter()
-            .map(|candidate| candidate.full_path)
-            .filter(|path| seen_paths.insert(path.clone()))
-            .collect();
+        // ⛔ Single-anchor selection IS {row} at this point (the ensure block
+        // above), so the drag set is exactly the anchor — answer from the row
+        // in hand instead of `selected_tree_drag_rows`, whose
+        // `all_sidebar_rows_for_selection` runs the expansion fixpoint crawl
+        // (up to 8 full sidebar merges; six uncached ~220 ms rounds measured
+        // on the UI thread as the entire cold first drag of a batch,
+        // [11.125]). Multi-anchor drags still resolve through the crawl.
+        self.drag_paths = if self.selected_tree_paths.len() == 1 {
+            vec![row.full_path.clone()]
+        } else {
+            let mut seen_paths = HashSet::new();
+            self.selected_tree_drag_rows()
+                .into_iter()
+                .map(|candidate| candidate.full_path)
+                .filter(|path| seen_paths.insert(path.clone()))
+                .collect()
+        };
         self.drag_hover_target = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
