@@ -2405,13 +2405,13 @@ mod tests {
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
         let shim = shim_dir.join("opencode2.exe");
 
-        std::fs::write(&shim, "echo \\"Error: postinstall script was not run.\\"\\n")
+        std::fs::write(&shim, "echo \"Error: postinstall script was not run.\"\n")
             .expect("write shim");
         assert!(
             !direct_install_shim_is_healthy(prefix, "@opencode/cli"),
             "the scoped package's error shim must not satisfy the fast path"
         );
-        std::fs::write(&shim, b"\\x7fELF\\x02\\x01\\x01\\x00rest-of-binary").expect("write elf");
+        std::fs::write(&shim, b"\x7fELF\x02\x01\x01\x00rest-of-binary").expect("write elf");
         assert!(
             direct_install_shim_is_healthy(prefix, "@opencode/cli"),
             "a real binary must satisfy the fast path"
