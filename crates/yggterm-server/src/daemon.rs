@@ -15266,6 +15266,92 @@ fn background_copy_error_is_rate_limit(error: &anyhow::Error) -> bool {
     rate_limited
 }
 
+/// Per-(session, kind) consecutive copy-generation failures — the give-up
+/// floor [11.116] asked for. The unchanged-source gate can only protect rows
+/// that HAVE a source stamp; a candidate with none (`source_updated_at` is
+/// None — measured on two remote rows: 38+38 consecutive ~456 ms failures,
+/// 2026-09-15) bypassed it every tick, because
+/// `copy_generation_can_differ_from_last_attempt` answers "let it run" when
+/// there is nothing to compare. Five consecutive failures put the
+/// (session, kind) pair on a 30-minute cooldown; any success clears it.
+/// Process-local by design — a fresh daemon grants fresh patience, same law
+/// as `preserved_owner_consecutive_misses`.
+const COPY_GENERATION_FAILURE_FLOOR: u32 = 5;
+const COPY_GENERATION_FAILURE_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+fn copy_generation_failure_streaks()
+-> std::sync::MutexGuard<'static, HashMap<(String, &'static str), (std::time::Instant, u32)>> {
+    static STREAKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(String, &'static str), (std::time::Instant, u32)>>,
+    > = std::sync::OnceLock::new();
+    STREAKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn copy_generation_backoff_active(session_id: &str, kind: &'static str) -> bool {
+    copy_generation_failure_streaks()
+        .get(&(session_id.to_string(), kind))
+        .is_some_and(|(last_failure, failures)| {
+            *failures >= COPY_GENERATION_FAILURE_FLOOR
+                && last_failure.elapsed() < COPY_GENERATION_FAILURE_COOLDOWN
+        })
+}
+
+/// Coarse reason class for a failed attempt — `ok:false` used to carry NO
+/// reason at all, which is how two permanently-failing rows hid inside a
+/// healthy-looking sweep ([11.116]).
+fn background_copy_failure_kind(error: &anyhow::Error) -> &'static str {
+    // The raw predicate, not `background_copy_error_is_rate_limit` — that one
+    // emits `rate_limited_backoff` per call and the Err arms already call it.
+    if yggterm_core::error_is_endpoint_refusal(error) {
+        "endpoint_refusal"
+    } else {
+        "other"
+    }
+}
+
+fn background_copy_record_failure(
+    session_path: &str,
+    session_id: &str,
+    kind: &'static str,
+    error_kind: &'static str,
+    detail: String,
+) {
+    let failures = {
+        let mut streaks = copy_generation_failure_streaks();
+        let entry = streaks
+            .entry((session_id.to_string(), kind))
+            .or_insert((std::time::Instant::now(), 0));
+        entry.1 += 1;
+        entry.0 = std::time::Instant::now();
+        entry.1
+    };
+    if let Ok(home) = crate::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "daemon",
+            "title_trigger",
+            "attempt_failed",
+            serde_json::json!({
+                "session_path": session_path,
+                "kind": kind,
+                "error_kind": error_kind,
+                "consecutive_failures": failures,
+                "cooldown_active": failures >= COPY_GENERATION_FAILURE_FLOOR,
+                "detail": detail.chars().take(200).collect::<String>(),
+            }),
+        );
+    }
+}
+
+fn background_copy_record_success(session_id: &str, kind: &'static str) {
+    copy_generation_failure_streaks()
+        .remove(&(session_id.to_string(), kind));
+}
+
 fn build_background_copy_updates(
     store: &SessionStore,
     settings: &AppSettings,
@@ -15390,6 +15476,19 @@ fn build_background_copy_updates(
             continue;
         }
 
+        // ⛔ The failure-streak floor ([11.116]). A candidate with no source
+        // stamp sails through the unchanged-source gate above forever, so a
+        // row the endpoint/systematically fails on burned an attempt every
+        // tick. After five consecutive failures a (session, kind) pair sits
+        // out a cooldown; the streak clears on success.
+        let title_missing = title_missing
+            && !copy_generation_backoff_active(&candidate.session_id, "title");
+        let summary_missing = summary_missing
+            && !copy_generation_backoff_active(&candidate.session_id, "summary");
+        if !title_missing && !summary_missing {
+            continue;
+        }
+
         if rate_limited_this_tick
             || llm_generations_this_tick >= BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK
         {
@@ -15433,41 +15532,83 @@ fn build_background_copy_updates(
         }
 
         let maybe_context = copy_target_context(&candidate, ssh_targets)?;
-        let (title, summary) = if let Some(context) = maybe_context {
-            let title = if title_missing {
-                match store.generate_title_for_context(
-                    settings,
-                    &candidate.session_id,
-                    &candidate.cwd,
-                    &context,
-                    false,
-                ) {
-                    Ok(title) => title,
-                    Err(error) => {
-                        rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
-                        None
+            let (title, summary) = if let Some(context) = maybe_context {
+                let title = if title_missing {
+                    match store.generate_title_for_context(
+                        settings,
+                        &candidate.session_id,
+                        &candidate.cwd,
+                        &context,
+                        false,
+                    ) {
+                        Ok(Some(title)) => {
+                            background_copy_record_success(&candidate.session_id, "title");
+                            Some(title)
+                        }
+                        Ok(None) => {
+                            background_copy_record_failure(
+                                &candidate.session_path,
+                                &candidate.session_id,
+                                "title",
+                                "returned_none",
+                                "the generator returned no copy".to_string(),
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            rate_limited_this_tick |=
+                                background_copy_error_is_rate_limit(&error);
+                            background_copy_record_failure(
+                                &candidate.session_path,
+                                &candidate.session_id,
+                                "title",
+                                background_copy_failure_kind(&error),
+                                format!("{error:#}"),
+                            );
+                            None
+                        }
                     }
-                }
-            } else {
-                None
-            };
-            let summary = if summary_missing && !rate_limited_this_tick {
-                match store.generate_summary_for_context(
-                    settings,
-                    &candidate.session_id,
-                    &candidate.cwd,
-                    &context,
-                    summary_force_refresh,
-                ) {
-                    Ok(summary) => summary,
-                    Err(error) => {
-                        rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
-                        None
+                } else {
+                    None
+                };
+                let summary = if summary_missing && !rate_limited_this_tick {
+                    match store.generate_summary_for_context(
+                        settings,
+                        &candidate.session_id,
+                        &candidate.cwd,
+                        &context,
+                        summary_force_refresh,
+                    ) {
+                        Ok(Some(summary)) => {
+                            background_copy_record_success(&candidate.session_id, "summary");
+                            Some(summary)
+                        }
+                        Ok(None) => {
+                            background_copy_record_failure(
+                                &candidate.session_path,
+                                &candidate.session_id,
+                                "summary",
+                                "returned_none",
+                                "the generator returned no copy".to_string(),
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            rate_limited_this_tick |=
+                                background_copy_error_is_rate_limit(&error);
+                            background_copy_record_failure(
+                                &candidate.session_path,
+                                &candidate.session_id,
+                                "summary",
+                                background_copy_failure_kind(&error),
+                                format!("{error:#}"),
+                            );
+                            None
+                        }
                     }
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             if let Some(machine) = candidate.remote_machine.as_ref() {
                 if title.is_some() || summary.is_some() {
                     persist_remote_generated_copy(
@@ -15501,9 +15642,29 @@ fn build_background_copy_updates(
                     source_path,
                     false,
                 ) {
-                    Ok(title) => title,
+                    Ok(Some(title)) => {
+                        background_copy_record_success(&candidate.session_id, "title");
+                        Some(title)
+                    }
+                    Ok(None) => {
+                        background_copy_record_failure(
+                            &candidate.session_path,
+                            &candidate.session_id,
+                            "title",
+                            "returned_none",
+                            "the generator returned no copy".to_string(),
+                        );
+                        None
+                    }
                     Err(error) => {
                         rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
+                        background_copy_record_failure(
+                            &candidate.session_path,
+                            &candidate.session_id,
+                            "title",
+                            background_copy_failure_kind(&error),
+                            format!("{error:#}"),
+                        );
                         None
                     }
                 }
@@ -15548,9 +15709,29 @@ fn build_background_copy_updates(
                     source_path,
                     summary_force_refresh,
                 ) {
-                    Ok(summary) => summary,
+                    Ok(Some(summary)) => {
+                        background_copy_record_success(&candidate.session_id, "summary");
+                        Some(summary)
+                    }
+                    Ok(None) => {
+                        background_copy_record_failure(
+                            &candidate.session_path,
+                            &candidate.session_id,
+                            "summary",
+                            "returned_none",
+                            "the generator returned no copy".to_string(),
+                        );
+                        None
+                    }
                     Err(error) => {
                         rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
+                        background_copy_record_failure(
+                            &candidate.session_path,
+                            &candidate.session_id,
+                            "summary",
+                            background_copy_failure_kind(&error),
+                            format!("{error:#}"),
+                        );
                         None
                     }
                 }

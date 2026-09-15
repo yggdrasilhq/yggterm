@@ -30753,3 +30753,37 @@ end-to-end with the full event family live (`tree_drag_begin` →
 `tree_drag_hover` → `live_session_reorder_succeeded` → `tree_drag_ended` →
 `live_session_reorder_persisted`), drag-back restores, teardown left zero
 rows. Falsifier satisfied.
+
+## ⛔ [11.126] THE DAEMON LEAKS UNREAPED ssh CHILDREN — 265 `ssh <defunct>` CORPSES ALL PARENTED TO yggterm-headless, THE OLDEST AS OLD AS THE DAEMON (measured 2026-09-15 ~18:10 IST, GUI host, jojo)
+
+**Status:** OPEN
+
+`ps -eo ppid,stat,comm` on jojo: every zombie on the box (265) has ppid
+11310 (yggterm-headless, up 3.8 days), comm `ssh`, and the oldest carries
+etimes 326578 s — the daemon's exact lifetime. Bursts of ~2.9/hour match a
+scan/projection cadence, not user traffic. Exactly 4 live `ssh -tt`
+children exist and are the owner's real remote rows (verified by cmdline:
+`ControlMaster=no -o ControlPath=none`, ages 13-34 h) — the leak is purely
+EXITED-NEVER-WAITED children, not held connections.
+
+Rust drops a `Child` without reaping; every kill path sampled in the
+server's ssh sites (daemon.rs/lib.rs 20034-45, 20384-91, 20632-33) waits
+properly, so the leak is a path that spawns and abandons (timeout-task
+dropped mid-run, or an early `?` between spawn and wait). A 25-minute
+`strace -f -p 11310 -e trace=clone,execve,wait4` capture is running to name
+the exact site; the fix is reap-at-site (join the kill/wait discipline) or
+a daemon-side waitid reaper scoped to adopted ssh children — NEVER a
+`waitpid(-1)` loop, which would steal exits from the daemon's live session
+children.
+
+Falsifier for the fix: after the fixed build rotates onto the daemon, a
+24-hour `ps -eo ppid,stat,comm | grep -c defunct` against the new daemon
+pid stays at zero through several scan cycles. Also: when the CURRENT
+daemon retires, its 265 zombies reparent to init and vanish — count after
+rotation is the new baseline, not zero-evidence.
+
+Impact: pid-table pressure and a forensic smell (265 fake ssh processes in
+every `ps`), not CPU — noticed while attributing "why is jojo hot" (it
+isn't yggterm's heat; the ZCode desktop app's zygote is spinning 0.4-1.1
+cores since 12:09). Filed by zcode sess_1e4cd6d6, lane
+lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
