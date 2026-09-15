@@ -30958,7 +30958,9 @@ measurement exact (the [11.113] instrument family).
 
 ## ⛔ [11.134] OPENCODE 2.0.3 SILENTLY FALLS BACK TO THE LATEST SESSION ON AN UNKNOWN `--session` ID — THE BETA-ERA OUTRIGHT REFUSAL IS GONE, SO A CALLER THAT MINTS IDS OUT-OF-BAND CAN BIND THE WRONG SESSION AND NEVER LEARN IT (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
 
-**Status:** OPEN — consumer review owed
+**Status:** OPEN
+
+Consumer review owed by any path that launches `--session` with an id it did not just read back from the service.
 
 Beta-era law (descriptor comment, now corrected): "the CLI REFUSES an unknown
 `--session <id>` outright; a caller must mint the session over opencode's own
@@ -30973,9 +30975,10 @@ newest. Regression net: suites/opencode.js `bogus-session-fallback`.
 
 ## ⛔ [11.133] OPENCODE 2.0.3 KILLED THE `❯` COMPOSER MARKER — THE READINESS GATE AND DRAFT GUARD HAVE NO OPENCODE SHAPE, AND THE NAIVE ┃ SWAP FALSE-POSITIVES THE DRAFT GUARD ON THE MODE ROW (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
 
-**Status:** OPEN — needs the gate/draft-guard box shape (the [11.6.6-b] kimi
-region-label precedent: measure, add the shape, rewire consumers, land
-together)
+**Status:** OPEN
+
+Needs the gate/draft-guard box shape — the [11.6.6-b] kimi region-label
+precedent: measure, add the shape, rewire consumers, land together.
 
 The 2.0.3 composer is a box, not a glyph row: `┃` (U+2503) left rules on
 every row, the input/placeholder row (`┃  Ask anything… "<task>"`), an EMPTY
