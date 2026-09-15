@@ -406,21 +406,6 @@ one live daemon row; probe rows despawned; measured on the GUI host):
 
 > ⚠ **UPDATE 2026-09-15:** the install this section measured is GONE — ynpm now serves `@opencode/cli` 2.0.3 on the fleet (`@opencode-ai/cli` went dead upstream 2026-09-07; channel map and client/server-skew facts in hub door sitting-2026-09-15-opencode-v2-channel-migration). Everything below is last-generation (beta-19271) lineage: treat as history, and run the owed re-decode (c) against 2.0.3 before reusing any of it. A 2.0.3 TUI client was measured RENDERING against a beta-19271 service (skew tolerated); the store keeps `session_v2` and gains worktree/workspace/session_inbox/session_pending/session_message tables.
 
-## [11.124] pipeline_integration test target does not compile on main (pre-existing)
-
-**Status:** OPEN
-
-Renumbered from [11.123] at push time — the id was double-claimed in parallel (the ynpm downgrade entry). Found 2026-09-15 (zcode sess_352af865) while gating
-lane/cli/opencode-package-v2: `cargo check -p yggterm-server --test
-pipeline_integration` fails with E0308 at
-`tests/pipeline_integration.rs:936` — `Some((announce.phase, working))`
-returns `AgentPhase` where `fresh_phase`'s signature says `String`
-(introduced by 5d770880's NativeAnnounce lock test). Invisible to ygg-ci
-because the build gate is bin-only (`cargo build --release --bin ...`),
-which never compiles test targets. Fix is one line
-(`announce.phase.to_string()` or widen the tuple type) + consider a
-`cargo check --tests` step in the gate so test targets cannot rot again.
-
 #### 11.6.3 re-decode (opencode 2.0.3, zcode sess_352af865, 2026-09-15, dev/jojo)
 
 The owed re-decode (c), run live against the installed 2.0.3 (`@opencode/cli`;
@@ -28225,7 +28210,7 @@ for as long as it owns the foreground.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-**Fix (2026-09-05, `lane/trace/declare-provenance-gate`):** the daemon now retains web-surface declares only when the session's launch command is surface-capable (`launch_command_declares_web_surfaces`); a plain shell emitting the OSC is refused by name — trace `app_declare/provenance_refused`, once per (session, verb, action) per 30 s so the refusal cannot become the drumbeat it prevents. Non-surface verbs (sidebar, the [11.48] picker family) keep their retention for every row. The end-to-end fixture (`pty_runtime_retains_an_app_declare_with_no_client_attached`) is now launched as a capable row. The residual accepted-risk class is unchanged and honest: a forger who execs the real app binary has crossed from output to running the app.
+**Fix (2026-09-05, `lane/trace/declare-provenance-gate`):** the daemon now retains web-surface declares only when the session's launch command is surface-capable (`launch_command_declares_web_surfaces`); a plain shell emitting the OSC is refused by name — trace `app_declare/provenance_refused`, once per (session, verb, action) per 30 s so the refusal cannot become the drumbeat it prevents. Non-surface verbs (sidebar, the [11.48] picker family) keep their retention for every row. The end-to-end fixture (`pty_runtime_retains_an_app_declare_with_no_client_attached`) is now launched as a capable row. The residual accepted-risk class is unchanged and honest: a forger who execs the real app binary has crossed from output to running the app. Follow-up (2026-09-15, `lane/trace/11.124-test-target-compile`): the gate's lane had missed the pipeline_integration web-declare replay fixture — it kept launching bare mock-tui, so the replay wiring lock failed deterministically from the day this landed (hidden behind the [11.124] compile break from 09-10). That fixture now carries the same `command -v ychrome` capable-row launch and the full target is green.
 
 Found during a scheduled adversarial pass against the live 3.2.61 fleet
 (2026-09-05 ~04:50-05:00, full log in journal-papers/ytrace notes). Every step
