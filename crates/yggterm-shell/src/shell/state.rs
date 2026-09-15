@@ -18447,6 +18447,11 @@ struct ShellState {
     /// begin/hover telemetry lacked.
     drag_started_at_ms: u64,
     pending_tree_drag: Option<PendingTreeDrag>,
+    /// The merged sidebar rows as of `begin_drag`, reused for every hover of
+    /// ONE drag. A drag resolves its drop targets against the snapshot the
+    /// user is looking at; rebuilding the full merge per hover step was the
+    /// felt drag lag ([11.128]).
+    drag_merged_rows_cache: Option<Vec<BrowserRow>>,
     suppress_tree_click_until_ms: u64,
     suppress_sidebar_autoscroll_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
@@ -18620,6 +18625,11 @@ const TERMINAL_SELECTION_CLIPBOARD_MAX_BYTES: usize = 8 * 1024 * 1024;
 struct PendingTreeDrag {
     path: String,
     pointer: (f64, f64),
+    /// The drag-source row itself, held from arm time. The pointer-move path
+    /// must never re-resolve it through a sidebar merge: mouse-move events
+    /// arrive far faster than any merge can answer, and the pre-threshold
+    /// moves used to pay the full selection crawl per move ([11.127]).
+    row: BrowserRow,
 }
 struct DaemonSpawnLock {
     path: Option<PathBuf>,
@@ -20893,6 +20903,7 @@ impl ShellState {
             drag_pointer: None,
             drag_started_at_ms: 0,
             pending_tree_drag: None,
+            drag_merged_rows_cache: None,
             suppress_tree_click_until_ms: 0,
             suppress_sidebar_autoscroll_until_ms: 0,
             pending_delete: None,
@@ -34842,6 +34853,7 @@ impl ShellState {
                 .collect()
         };
         self.drag_hover_target = None;
+        self.drag_merged_rows_cache = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
         self.drag_pointer = Some(pointer);
@@ -34866,6 +34878,7 @@ impl ShellState {
         self.pending_tree_drag = Some(PendingTreeDrag {
             path: row.full_path.clone(),
             pointer,
+            row: row.clone(),
         });
         self.refresh_tree_debug("arm_tree_drag");
     }
@@ -34908,20 +34921,17 @@ impl ShellState {
             self.update_drag_pointer(pointer);
             return;
         }
-        let Some(pending_path) = self
-            .pending_tree_drag
-            .as_ref()
-            .map(|pending| pending.path.clone())
-        else {
+        // Threshold first — it is pure math. Everything below it runs at most
+        // once per gesture, on the move that actually crosses 6px; the row was
+        // already in hand at arm time, so no move ever pays a sidebar merge.
+        let Some(pending) = self.pending_tree_drag.as_ref() else {
             return;
         };
-        let rows = self.all_sidebar_rows_for_selection();
-        if let Some(row) = rows
-            .into_iter()
-            .find(|row| row.full_path == pending_path && is_tree_drag_source_row(row))
-        {
-            let _ = self.maybe_begin_tree_drag(&row, pointer);
+        if !drag_threshold_reached(pending.pointer, pointer) {
+            return;
         }
+        let row = pending.row.clone();
+        let _ = self.maybe_begin_tree_drag(&row, pointer);
     }
     fn update_drag_pointer(&mut self, pointer: (f64, f64)) {
         if !self.drag_paths.is_empty() {
@@ -34965,15 +34975,22 @@ impl ShellState {
         if self.drag_pointer_update_needed(pointer) {
             self.drag_pointer = Some(pointer);
         }
-        let rows = merged_sidebar_rows(
-            self.browser.rows(),
-            self.server.remote_machines(),
-            self.server.ssh_targets(),
-            &self.server.live_sessions(),
-            &self.browser.expanded_path_set(),
-        );
-        let next_target =
-            resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, placement);
+        let next_target = {
+            if self.drag_merged_rows_cache.is_none() {
+                self.drag_merged_rows_cache = Some(merged_sidebar_rows(
+                    self.browser.rows(),
+                    self.server.remote_machines(),
+                    self.server.ssh_targets(),
+                    &self.server.live_sessions(),
+                    &self.browser.expanded_path_set(),
+                ));
+            }
+            let rows = self
+                .drag_merged_rows_cache
+                .as_deref()
+                .expect("drag row cache just filled");
+            resolve_drag_drop_target(rows, self.drag_paths.as_slice(), row, placement)
+        };
         let target_changed = next_target != self.drag_hover_target;
         self.drag_hover_target = next_target;
         self.optimistic_drag_target = self.drag_hover_target.clone();
@@ -35006,6 +35023,7 @@ impl ShellState {
         self.pending_tree_drag = None;
         self.drag_paths.clear();
         self.drag_hover_target = None;
+        self.drag_merged_rows_cache = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
         self.drag_pointer = None;

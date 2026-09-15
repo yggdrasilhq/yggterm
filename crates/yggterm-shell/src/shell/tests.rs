@@ -32654,6 +32654,102 @@ console.log('ok');
     }
 
     #[test]
+    fn the_felt_drag_path_pays_no_sidebar_merge_per_pointer_event() {
+        // Two locks on the drag gesture's felt path:
+        //
+        // (A) START — every mouse-move before the 6px threshold crosses used to
+        // run `all_sidebar_rows_for_selection` (the [11.125]-class selection
+        // crawl) just to re-find a row `arm_tree_drag` already held, and the
+        // threshold was checked only after that crawl. The move path must do
+        // NO row-list resolution at all, and must not begin below the
+        // threshold.
+        //
+        // (B) LAG — `set_drag_hover_target` rebuilt the FULL merged sidebar
+        // list per accepted hover step. One merge per DRAG (filled on first
+        // hover, reused, retired with the gesture) is the law.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/shell/state.rs"
+        ))
+        .expect("state.rs readable");
+        let pending_start = source
+            .find("fn update_pending_tree_drag_pointer(")
+            .expect("update_pending_tree_drag_pointer moved — move this lock with it");
+        let pending_end = source[pending_start..]
+            .find("fn update_drag_pointer(")
+            .map(|offset| pending_start + offset)
+            .expect("update_pending_tree_drag_pointer has no successor — move this lock with it");
+        let pending_body = &source[pending_start..pending_end];
+        assert!(
+            !pending_body.contains("all_sidebar_rows_for_selection"),
+            "the pre-begin pointer-move path must never resolve rows through a \
+             sidebar merge — the arm already holds the row ([11.127])"
+        );
+        let threshold = pending_body
+            .find("drag_threshold_reached(")
+            .expect("the move path must check the 6px threshold itself");
+        let begin = pending_body
+            .find("maybe_begin_tree_drag(")
+            .expect("the move path must begin through maybe_begin_tree_drag");
+        assert!(
+            threshold < begin,
+            "the threshold must be checked BEFORE any begin work, else sub-threshold \
+             moves still pay for gesture resolution"
+        );
+
+        // Behavioral half: cache lifecycle + reuse across hovers of one drag.
+        let mut shell =
+            ShellState::new(test_shell_bootstrap_with_active_session("local://drag-a"));
+        let row_a = test_sidebar_row("local://drag-a");
+        let row_b = test_sidebar_row("local://drag-b");
+
+        shell.update_tree_drag_pointer(&row_a, (10.0, 10.0));
+        shell.update_tree_drag_pointer(&row_a, (13.0, 10.0));
+        assert!(
+            shell.drag_paths.is_empty(),
+            "sub-threshold travel is still a click"
+        );
+        assert!(
+            shell.drag_merged_rows_cache.is_none(),
+            "a pre-begin move must not fill the drag row cache"
+        );
+
+        shell.update_tree_drag_pointer(&row_a, (30.0, 10.0));
+        assert_eq!(
+            shell.drag_paths,
+            vec!["local://drag-a".to_string()],
+            "crossing the threshold begins the row held from arm time"
+        );
+        assert!(
+            shell.drag_merged_rows_cache.is_none(),
+            "a single-anchor begin merges nothing ([11.125]'s law, still in force)"
+        );
+
+        shell.set_drag_hover_target(&row_b, (200.0, 10.0), DragDropPlacement::Before);
+        let first = shell
+            .drag_merged_rows_cache
+            .as_ref()
+            .expect("the first hover fills the drag row cache")
+            .as_ptr() as usize;
+        shell.set_drag_hover_target(&row_a, (200.0, 40.0), DragDropPlacement::After);
+        let second = shell
+            .drag_merged_rows_cache
+            .as_ref()
+            .map(|rows| rows.as_ptr() as usize)
+            .expect("a later hover keeps the cache");
+        assert_eq!(
+            first, second,
+            "a second hover must REUSE the drag-lifetime merge, not rebuild it ([11.128])"
+        );
+
+        shell.clear_drag_state();
+        assert!(
+            shell.drag_merged_rows_cache.is_none(),
+            "the cache belongs to the gesture, not the shell — clear_drag_state retires it"
+        );
+    }
+
+    #[test]
     fn sidebar_group_label_click_selects_instead_of_toggling() {
         let group = test_sidebar_group_row("__remote_folder__/dev/home/user/gh/yggterm");
 
