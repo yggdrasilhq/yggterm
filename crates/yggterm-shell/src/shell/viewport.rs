@@ -8154,15 +8154,32 @@ fn TerminalCanvas(
                                         host_surface_text,
                                     )
                                 {
-                                    let _ = safe_shell_mut(
+                                    // Idle samples are common. Do not dirty the
+                                    // whole shell when the optimistic busy hint
+                                    // is already absent; that no-op write used
+                                    // to re-render the WebKit-backed root on
+                                    // every idle health sample.
+                                    let busy_hint_present = safe_shell_read(
                                         state,
-                                        "terminal_attach_host_health_idle_activity",
+                                        "terminal_attach_host_health_idle_precheck",
                                         |shell| {
                                             shell
                                                 .terminal_busy_hint_until_ms
-                                                .remove(&session_path);
+                                                .contains_key(&session_path)
                                         },
-                                    );
+                                    )
+                                    .unwrap_or(true);
+                                    if busy_hint_present {
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_attach_host_health_idle_activity",
+                                            |shell| {
+                                                shell
+                                                    .terminal_busy_hint_until_ms
+                                                    .remove(&session_path);
+                                            },
+                                        );
+                                    }
                                 }
                                 let prompt_gap_looks_stale =
                                     remote_prompt_gap_resize_nudge_allowed(
