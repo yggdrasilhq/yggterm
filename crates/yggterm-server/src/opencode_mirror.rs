@@ -232,6 +232,26 @@ fn directory_display_name(directory: Option<&String>) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The spawn door of the tombstone plane for the opencode mirror. The
+/// service is a PEER that keeps a user-closed session alive in its tab list,
+/// and the mirror's universe is that tab list — so without this ask the
+/// mirror re-spawned the row on every tick after the user closed it
+/// (measured on the GUI host 2026-09-16: owner deletes, next tick
+/// plan_spawn: 6, owned back to 6 within minutes; the [11.135] ghost
+/// factory's third door). The same read-only door the import, restore,
+/// recovery and adoption doors ask — one load for the whole batch. The
+/// deliberate re-open stays permissive: the open verb clears the tombstone.
+pub(crate) fn tombstoned_opencode_mirror_spawns(
+    home: &std::path::Path,
+    sessions: &[OpencodeServiceSession],
+) -> Vec<String> {
+    let keys: Vec<String> = sessions
+        .iter()
+        .map(|ses| format!("opencode-runtime://{}", ses.id))
+        .collect();
+    crate::live_row_closes_remembered_among(home, keys.iter().map(String::as_str))
+}
+
 impl YggtermServer {
     /// Apply one mirror tick UNDER THE DAEMON LOCK. All service IO happened
     /// before this call (`fetch` in the chore, which holds no lock).
@@ -242,7 +262,29 @@ impl YggtermServer {
         terminal_titles: &std::collections::HashMap<String, String>,
     ) {
         let owned = owned_tabs_from(&self.sessions);
-        let plan = plan_tab_sync(sessions, &owned);
+        let mut plan = plan_tab_sync(sessions, &owned);
+        // THE CLOSE OUTRANKS THE TAB. A service tab whose row the user closed
+        // must not re-project — see `tombstoned_opencode_mirror_spawns`.
+        if let Ok(home_dir) = crate::resolve_yggterm_home() {
+            let vetoed: std::collections::HashSet<String> =
+                tombstoned_opencode_mirror_spawns(&home_dir, &plan.spawn)
+                    .into_iter()
+                    .collect();
+            if !vetoed.is_empty() {
+                plan.spawn.retain(|ses| {
+                    !vetoed.contains(&format!("opencode-runtime://{}", ses.id))
+                });
+                yggterm_core::append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "opencode_mirror",
+                    "spawn_vetoed_closed_rows",
+                    serde_json::json!({
+                        "vetoed": vetoed,
+                    }),
+                );
+            }
+        }
         // ⛔ A tick whose silence is indistinguishable from not having run is
         // the §7 sin in mirror form: report EVERY tick — counts, not contents
         // (no ids, no titles) — so "why did nothing happen" is answerable
@@ -906,6 +948,72 @@ mod tests {
                 engaged,
             },
         )
+    }
+
+    #[test]
+    fn tombstoned_opencode_mirror_spawns_blocks_the_closed_tab_only() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-mirror-veto-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+
+        let closed = "ses_closed00000000000000000001";
+        let open = "ses_opened00000000000000000001";
+        // Production records the FOLDED identity (remove_session folds before
+        // record_close); the ask folds through the same door, so the test
+        // must record through the same fold.
+        let closed_key = format!("opencode-runtime://{closed}");
+        crate::live_row_tombstones::LiveRowTombstones::default()
+            .record_close(
+                &home,
+                &crate::normalized_live_row_identity(&closed_key),
+                crate::live_row_tombstones::now_secs(),
+            )
+            .expect("record the close the way remove_session does");
+
+        let blocked = super::tombstoned_opencode_mirror_spawns(
+            &home,
+            &[ses(closed, 100), ses(open, 100)],
+        );
+        assert_eq!(
+            blocked,
+            vec![closed_key.clone()],
+            "the service keeps the closed session as a tab; the mirror must not              re-project it — this is the peer-re-offer case the tombstone plane              was built for"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// LOCK: the mirror's apply keeps asking the tombstone plane before it
+    /// spawns. A working veto is invisible (the row simply never appears), so
+    /// a refactor that drops the ask would ship silently — the 2026-09-16
+    /// ghost reports are what an unasked door looks like.
+    #[test]
+    fn apply_opencode_tab_mirror_asks_the_tombstone_plane_before_spawning() {
+        let source = include_str!("opencode_mirror.rs");
+        let body = source
+            .split("pub fn apply_opencode_tab_mirror")
+            .nth(1)
+            .expect("apply_opencode_tab_mirror exists")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of the apply fn");
+        let veto = body
+            .find("tombstoned_opencode_mirror_spawns(")
+            .expect("the mirror apply must ask the tombstone plane");
+        let spawn_loop = body
+            .find("for ses in plan.spawn.iter()")
+            .expect("the spawn loop must still exist");
+        assert!(
+            veto < spawn_loop,
+            "the tombstone ask must sit before the spawn loop — a veto that              runs after the row landed is too late"
+        );
+        assert!(
+            body.contains("\"spawn_vetoed_closed_rows\""),
+            "the veto must be traced, or a silent veto cannot be told from a              broken one"
+        );
     }
 
     #[test]
