@@ -63368,6 +63368,12 @@ mod webtabs_menu_switcher_locks {
                 .any(|line| line.trim() == "&& !modal_over_viewport;"),
             "…and the per-surface visibility decision must honour it"
         );
+        assert!(
+            product
+                .iter()
+                .any(|line| line.contains("|| !shell_ref.effective_window_focused()")),
+            "an unfocused GUI must stash native WebKit pages so background timers do not keep the host hot"
+        );
     }
 
     /// A surface with one GROUPED tab, i.e. the only state in which the classic
