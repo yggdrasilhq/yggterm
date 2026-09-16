@@ -7300,7 +7300,12 @@ const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
 /// page hole + reveal ride the FIRST post-switch tick instead of one up to
 /// a full tick later (chrome mounts render-time; the page swap waits on
 /// this loop — the visible lag on session switch).
-const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 16;
+// This beat is also the cadence of a Dioxus task waker.  A 16 ms sleep kept
+// the GTK event loop non-blocking for every native page even when no geometry
+// or session switch was pending, which is disproportionately expensive on
+// hosts whose monotonic clock falls back to HPET.  100 ms keeps a switch under
+// one tenth of a second while removing the permanent 60 Hz wake source.
+const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 100;
 /// Idle poll cadence when no surfaces exist and none are applied.
 const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
 /// How long a tab's loading light may claim the sidebar dot. Generous for a real
