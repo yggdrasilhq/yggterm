@@ -57412,6 +57412,20 @@ Updated at   Branch  Conversation\n\
             "copy generation should be considered on every scheduler tick, even during the long startup background-refresh defer; its own gates keep it bounded"
         );
     }
+
+    #[test]
+    fn passive_copy_generation_obeys_the_focused_terminal_quiet_gate() {
+        let source = SHELL_SOURCE;
+        let body = source
+            .split("fn maybe_spawn_background_copy_generation")
+            .nth(1)
+            .and_then(|body| body.split("fn remote_scanned_session_context").next())
+            .expect("passive copy-generation function should be present");
+        assert!(
+            body.contains("background_refreshes_deferred(&shell)"),
+            "passive copy work must defer while a focused terminal owns the viewport"
+        );
+    }
     #[test]
     fn app_control_request_end_trace_summarizes_state_without_terminal_buffers() {
         let data = json!({
