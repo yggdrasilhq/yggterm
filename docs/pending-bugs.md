@@ -31358,3 +31358,43 @@ loop is self-referential (bug report → seat spawns → seat keeps the daemon
 old → owner still sees the bug → report). This strengthens the starvation
 bound: politeness toward fleet seats must not starve the fleet own fixes;
 the fix shapes above stand, with (b) as the likely answer.
+
+## ⛔ [11.137] THE HOT-RESTART GATE DEFERS ON REMOTE-BRIDGED AGENT ROWS WHOSE TURNS LIVE ON THE REMOTE HOST AND SURVIVE EVERY LOCAL SWAP — AND `working` IS EXEMPT FROM THE 30-MINUTE FORCED-SWAP DEADLINE, SO ONE ENDLESS REMOTE TURN STOPS EVERY DAEMON-SIDE FIX FLEET-WIDE (measured on jojo 2026-09-16 15:26→19:00, the trace-fixing campaign; the reason the owner kept seeing ghost rows "fixed" bugs all afternoon)
+
+**Status:** OPEN
+
+Filed 2026-09-16 ~19:05.
+
+**Measured:** jojo's daemon (born 15:26 on b0aafc158b88) did not rotate past
+four+ deploy rotations (16:21, 16:35, 16:45, 18:41 GUI relaunches each firing
+prepare_update_restart + hot_restart). `server status` names the single
+blocker: `remote-session://dev/f9850…` kind `working`. `server gate-screen`
+on that row shows the turn is REAL — a codex seat mid-turn, at one check
+"Waiting for background terminal (18m 26s • esc to interrupt)" on its own
+ygg-ci tick — so the screen classifier is honest. The defect is the GATE'S
+SCOPE, two halves:
+
+1. **A remote-bridged row is not interruptible-here, so it must not block
+   here.** The row's agent turn runs in the CLI on the REMOTE host; the local
+   daemon holds only the bridge. A local hot restart re-establishes the
+   bridge and the turn continues — proven all day: the six ghost rows are
+   themselves remote projections and their service turns survived every
+   rotation. Deferring the local swap to "protect" a remote turn protects
+   nothing and starves everything.
+2. **`working` is deadline-exempt** (`hot_restart_blocker_is_deadline_exempt`
+   matches HOT_RESTART_BLOCKER_WORKING), so the owner-ruled 30-minute forced
+   swap ("after 30 minutes of waiting, force the swap, stalling the working
+   sessions") never applies to the one blocker class that has no natural
+   end. The §6 pricing that motivated the exemption — a cold shutdown
+   orphans local delegates — does not reach a turn that lives on another
+   host.
+
+**Fix shape:** in the blocker collection, rows whose runtime is remote
+(`remote-*` schemes — the turn lives on the peer) are either not blockers at
+all or a NON-exempt kind, so the existing 30-minute deadline applies. Local
+agent rows keep today's protection. The §8 interrupted-list machinery is
+untouched.
+
+**Owner-visible symptom chain today:** ghost-row fixes landed at
+00:17/16:22/17:10 while the only daemon that needed them stayed four builds
+behind; the owner re-reported the same ghosts three times.
