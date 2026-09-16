@@ -819,6 +819,22 @@ pub struct AgentCliDescriptor {
     /// then reads the rows under it. Anchoring is glyph-FIRST, label-fallback,
     /// so a CLI that reintroduces a glyph keeps working unchanged.
     pub composer_region_label: Option<&'static str>,
+    /// Lowercase fragments of the placeholder this CLI paints INSIDE its
+    /// composer box while the input is EMPTY — opencode 2.0.3 rules a ┃-gutter
+    /// box whose placeholder row reads `┃  Ask anything… "<rotating task>"`.
+    ///
+    /// ⛔ [11.133] MEASURED SHAPE, TWO CONSUMERS, ONE FIELD (the kimi
+    /// `composer_region_label` precedent). The placeholder text ROTATES (the
+    /// quoted task suffix changes), so the stable measured PREFIX is what is
+    /// declarable, and both consumers derive the box from it:
+    /// `composer_row_holds_text` treats a gutter row carrying only placeholder
+    /// text as EMPTY — the vendor's suggestion must never read as an unsent
+    /// draft — and its non-emptiness ALSO declares the composer MULTI-ROW: the
+    /// draft scan walks past empty gutter rows instead of anchoring the
+    /// bottom-most one (the 2.0.3 box paints an empty ┃ row UNDER the input
+    /// row and grows one ABOVE it while drafting — measured live 2026-09-16,
+    /// the muse lab host). `&[]` for every glyph- or label-anchored CLI.
+    pub composer_placeholder_needles: &'static [&'static str],
     /// Lowercase fragments of the chrome this CLI legitimately draws BELOW its
     /// composer — codex's model/shortcut hints, Claude Code's permission-mode
     /// footer.
@@ -1888,6 +1904,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: Some("--model"),
         composer_marker: '\u{203a}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
         // MEASURED-EMPTY (2026-09-15, 0.154.0 — supersedes the old
         // "unmeasured" note). The working indicator is a BODY line —
@@ -2083,6 +2100,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: Some("--model"),
         composer_marker: '\u{203a}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &["gpt-", "claude", "tab to ", "ctrl", "esc"],
         // ⛔ UNMEASURED. Codex's in-flight phrase has never been observed on a
         // live working row, so this stays empty and the activity verdict for a
@@ -2296,6 +2314,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: Some("--model"),
         composer_marker: '\u{276f}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &[
             "claude",
             "permissions",
@@ -2466,6 +2485,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: Some("--model"),
         composer_marker: '\u{203a}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &["esc", "ctrl", "/help", "tab"],
         working_footer_hints: &["to interrupt"],
         // ⛔⛔ pi HAS NO PERMISSION GATE AT ALL, and that is its DOCUMENTED
@@ -2607,22 +2627,36 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // help-exit there (regression net: suites/opencode.js
         // `help-flag-surface`).
         model_flag: None,
-        // ⛔ MEASURED DRIFT (2026-09-15, 2.0.3): the `❯` marker NO LONGER
-        // PAINTS — the composer is a ┃ (U+2503) ruled box with the placeholder
-        // row (text ROTATES: "Ask anything… \"Fix a TODO in the codebase\" /
-        // \"Fix broken tests\" …"), a mode row (`Build auto · <model>
-        // OpenCode Zen`) BELOW the input row, and a `╹▀▀▀`
-        // (U+2579/U+2580) border. Keeping the beta-era marker here until the
-        // gate/draft-guard grow the box shape: a naive swap to ┃ anchors the
-        // MODE row bottom-up and false-positives the draft guard (the
-        // [11.107] class). Filed [11.133] with the measurements; regression
-        // net: suites/opencode.js `composer-idle-shape` + `draft-shape`.
-        composer_marker: '\u{276f}',
+        // ⛔ [11.133] CLOSED (2026-09-16, live 2.0.3 on the muse lab host):
+        // the beta-era `❯` paints NOWHERE (idle, drafting, working, settled),
+        // so the marker is now the BOX GUTTER ┃ (U+2503) — and both consumers
+        // grew the box shape with it, which disarms the naive-swap trap this
+        // comment used to warn about: the draft guard's gutter-box arm scans
+        // EVERY ┃ row in reach (the mode row is chrome by the `opencode zen`
+        // hint below; empty and placeholder gutter rows never answer
+        // "draft"), and the readiness gate's below-chrome rule tolerates the
+        // box's gutter/border rows. Measured geometry: `┃  Ask anything…
+        // "<task>"` (placeholder ROTATES), an empty `┃` row, `┃  Build auto ·
+        // <model> OpenCode Zen`, then the `╹▀▀▀` (U+2579/U+2580) border;
+        // drafting REPLACES the placeholder on its row and GROWS an empty ┃
+        // row above; backspace restores the placeholder. Regression net:
+        // suites/opencode.js `composer-idle-shape` + `draft-shape`; fixtures
+        // in core (`the_composer_is_a_row_and_a_delivered_message_is_not_one`,
+        // `the_gutter_box_answers_for_the_measured_screens`) and shell
+        // (`opencode_gutter_box_anchors_the_readiness_gate`).
+        composer_marker: '\u{2503}',
         composer_region_label: None,
+        composer_placeholder_needles: &["ask anything"],
         // 2.0.3 idle footer: `<cwd>  shift+tab agents  ctrl+p commands` —
         // `esc`/`interrupt` belong to the WORKING phase now (measured
-        // 2026-09-15).
-        composer_footer_hints: &["ctrl", "tab", "shift+tab", "ctrl+p", "agents", "commands"],
+        // 2026-09-15). `opencode zen` is the MODE ROW, which sits INSIDE the
+        // box under the input row (`┃  Build auto · <model> OpenCode Zen`) and
+        // must read as chrome to both consumers; the model name rotates (Muse
+        // Spark 1.3 Free / Union Alpha Free both measured), the product suffix
+        // does not.
+        composer_footer_hints: &[
+            "ctrl", "tab", "shift+tab", "ctrl+p", "agents", "commands", "opencode zen",
+        ],
         // Working footer verbatim: `■■⬝⬝⬝⬝⬝⬝ esc interrupt` (progress
         // squares prefix the needle; `again to interrupt` never observed on
         // 2.0.3 — dropped).
@@ -2732,6 +2766,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: Some("--model"),
         composer_marker: '\u{276f}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &["esc", "ctrl", "qwen", "tab"],
         working_footer_hints: &["esc to cancel"],
         // ⛔ THESE FLAGS ARE HIDDEN FROM `qwen --help`, and the first pass filed
@@ -2933,6 +2968,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // on screen — a screen-level id source.
         composer_marker: '\u{276f}',
         composer_region_label: Some("input"),
+        composer_placeholder_needles: &[],
         // `context:` is kimi's measured status footer under the region
         // (`context: 0.0%`); `ctrl` matches the `ctrl-o: editor` hints row.
         composer_footer_hints: &["ctrl", "kimi", "/help", "tab", "context:"],
@@ -3122,6 +3158,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // did it to Claude Code on 2026-08-06.
         composer_marker: '\u{276f}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         // `esc to cancel` dropped: measured ZERO frames on 1.2.1 (it never
         // appears anywhere on screen, working or idle).
         working_footer_hints: &["esc to interrupt"],
@@ -3313,6 +3350,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         model_flag: Some("--model"),
         composer_marker: '>',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &["shortcuts", "esc", "ctrl", "enter", "tab", "gemini", "?"],
         // 1.2.3 battery re-measure: the footer carries "esc to cancel"; the
         // Generating... spinner line lands inside the footer window.
@@ -3560,6 +3598,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // renderer composes; the screen settles it and nothing else does.
         composer_marker: '\u{276f}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         // MEASURED from the executable's own strings plus one live screen:
         // `/help for commands` is composer chrome, and the row's footer names
         // the model (`Grok 4`). ⚠ `esc cancel` is NOT listed here: it sits
@@ -3784,6 +3823,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // typing; nothing else marks the input head.
         composer_marker: '\u{258f}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         // MEASURED 0.5.9 ([11.111]): `○ idle` never draws (idle status is
         // bare `idle · N sessions …`); `i to type` draws in the composer
         // mode-hint footer states (`i type …` fresh, `i to type · enter
@@ -3941,6 +3981,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // and is falsified: one codepoint off.
         composer_marker: '\u{276d}',
         composer_region_label: None,
+        composer_placeholder_needles: &[],
         composer_footer_hints: &["ctrl+v to paste image in clipboard"],
         // The footer does NOT swap mid-turn (unlike grok's ctrl+c swap);
         // the interrupt contract rides the working line itself.
@@ -10424,6 +10465,12 @@ Antigravity CLI requires permission to read, edit, and execute files here.
                 "\u{203a} Run /review on my current changes",
             ),
             (SessionKind::ClaudeCode, "\u{276f} Try \"write a test\""),
+            // [11.133]: 2.0.3 killed ❯; the composer is the ┃ box whose first
+            // row is the rotating placeholder (captured live 2026-09-16).
+            (
+                SessionKind::OpenCode,
+                "\u{2503}  Ask anything\u{2026} \"Fix broken tests\"",
+            ),
         ] {
             let d = agent_cli_descriptor(kind).expect("registered");
             assert!(

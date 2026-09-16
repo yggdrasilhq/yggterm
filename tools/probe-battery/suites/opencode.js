@@ -213,6 +213,18 @@ module.exports = {
           : null,
         placeholder_line: placeholderLine?.trim() ?? null,
         mode_row_below_input: modeLine > placeholderIdx && placeholderIdx >= 0,
+        // [11.133] the box facts the descriptor + consumers now declare:
+        // mode row carries the ┃ gutter and the stable `OpenCode Zen` suffix
+        // (the model name before it rotates), an EMPTY ┃ row sits between the
+        // input row and the mode row, and the border is ╹ (U+2579) + ▀ (U+2580).
+        mode_row_guttered: modeLine >= 0 && lines[modeLine].trim().startsWith('\u2503'),
+        mode_row_opencode_zen: modeLine >= 0 && /OpenCode Zen/i.test(lines[modeLine] ?? ''),
+        empty_gutter_row_below_input:
+          placeholderIdx >= 0 &&
+          lines
+            .slice(placeholderIdx + 1, modeLine < 0 ? undefined : modeLine)
+            .some((l) => l.trim() === '\u2503'),
+        border_row_seen: lines.some((l) => l.includes('\u2579')),
         declared_footer_hints_seen: phraseHits(screen, declaredHints),
         measured_footer_hints_seen: phraseHits(screen, measuredHints),
         footer_line: nonEmpty.find((l) => /agents|commands/.test(l) && l.length < 160) ?? null,
@@ -222,6 +234,12 @@ module.exports = {
       }
       if (!placeholderLine || ruleCodepoint === undefined) {
         throw new Error('composer box shape not found (no ┃ rule / no placeholder) — re-measure');
+      }
+      if (!ctx.facts.composer_idle.mode_row_guttered || !ctx.facts.composer_idle.mode_row_opencode_zen) {
+        throw new Error('mode row lost the ┃ gutter or the OpenCode Zen suffix — the declared chrome hint is dead; re-measure [11.133]');
+      }
+      if (!ctx.facts.composer_idle.empty_gutter_row_below_input || !ctx.facts.composer_idle.border_row_seen) {
+        throw new Error('box structure moved (no empty ┃ row / no ╹ border) — re-measure [11.133]');
       }
       return `rule ${ctx.facts.composer_idle.box_rule_codepoint.codepoint}; no ❯ (2.0.3 shape); hints seen: ${ctx.facts.composer_idle.measured_footer_hints_seen.filter((h) => h.observed).map((h) => h.needle).join(',') || 'NONE'}`;
     });
@@ -237,6 +255,7 @@ module.exports = {
       const screen = drive.screen();
       const lines = screen.split('\n');
       const draftLine = lines.find((l) => l.includes(draft)) ?? null;
+      const draftIdx = lines.findIndex((l) => l.includes(draft));
       const rule = ctx.facts.composer_idle.box_rule_codepoint?.char;
       const draftTrimmed = draftLine?.trim() ?? '';
       ctx.facts.draft = {
@@ -244,6 +263,12 @@ module.exports = {
         draft_row_leading_char: draftTrimmed[0] ?? null,
         draft_row_anchored_by_rule: !!rule && draftTrimmed.startsWith(rule),
         placeholder_gone_while_drafting: !screen.includes('Ask anything'),
+        // Measured 2026-09-16: the box GROWS an empty ┃ row above the draft
+        // (and keeps one below) — the draft guard's gutter-box arm scans past
+        // empty gutter rows because of this. Recorded, not hard-asserted: the
+        // guard answers correctly for both geometries.
+        empty_gutter_row_above_draft:
+          draftIdx > 0 && lines[draftIdx - 1].trim() === '\u2503',
       };
       for (let i = 0; i < 40; i++) drive.write('\x7f');
       await new Promise((r) => setTimeout(r, 1500));

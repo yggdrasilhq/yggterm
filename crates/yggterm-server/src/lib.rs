@@ -42758,6 +42758,78 @@ mod tests {
     }
 
     #[test]
+    fn opencode_vouch_is_three_valued_and_a_phantom_re_births_without_an_id() {
+        // [11.134] consumer half: 2.0.3 no longer REFUSES an unknown
+        // `--session` — it silently resumes the LATEST session of the project
+        // — so the only protection is the store vouch upstream of the launch.
+        // The membership reader itself is locked in core; this locks opencode's
+        // vouch CONTRACT through the server predicate (present / consulted-and-
+        // absent / absent-store) and that a re-birth composes NO id (opencode
+        // mints its own).
+        let present = "ses_realv2id0000000000000001";
+        let absent = "ses_missing000000000000000001x";
+        static FIXTURE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!("yggterm-oc-vouch-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/opencode")).expect("fixture dirs");
+        let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
+            .expect("fixture db");
+        conn.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, \
+             directory TEXT, title TEXT, time_updated INTEGER, time_created INTEGER);",
+            [],
+        )
+        .expect("fixture schema");
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, title, \
+             time_updated, time_created) VALUES (?1, 'p1', NULL, '/tmp/workspace', 't', 1, 1);",
+            rusqlite::params![present],
+        )
+        .expect("fixture row");
+
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&home, SessionKind::OpenCode, present),
+            Some(true),
+            "a session the store holds is vouched for"
+        );
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&home, SessionKind::OpenCode, absent),
+            Some(false),
+            "a store that was read and lacks the id says so — 2.0.3 would              silently bind the LATEST session, so this arm must re-birth"
+        );
+
+        let bare = std::env::temp_dir().join(format!("yggterm-oc-nostore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            local_agent_store_vouches_for_session_in(&bare, SessionKind::OpenCode, present),
+            None,
+            "an absent store cannot testify that a session does not exist"
+        );
+
+        let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(SessionKind::OpenCode)
+            .expect("opencode is registered");
+        assert!(
+            !descriptor.id_assigned_at_birth,
+            "opencode mints its own session id; if that changes, this guard changes with it"
+        );
+        let rebirth = agent_launch_command_with_options(
+            SessionKind::OpenCode,
+            Some("/tmp/workspace"),
+            None,
+            &AgentLaunchOptions::default(),
+        );
+        assert!(
+            !rebirth.contains(absent),
+            "a re-birth must not carry the phantom id: {rebirth}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
     fn a_store_that_cannot_answer_is_not_the_same_as_a_store_that_says_no() {
         // ⛔ The three-valued contract, which is the whole safety property: only
         // `Some(false)` may trigger a re-birth. If "I could not check" collapsed
