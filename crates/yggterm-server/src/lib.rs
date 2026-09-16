@@ -6003,6 +6003,33 @@ impl YggtermServer {
             return;
         }
 
+        // An attach seed is runtime plumbing, not a viewport action. Live
+        // rows already have their runtime identity, so prepare the row
+        // directly without the old activate-then-restore detour. That detour
+        // was observable in the activation trace and made the GUI repeatedly
+        // stash/reveal native WebKit surfaces during background attaches.
+        if let Some(resolved_path) = self.resolve_session_storage_key(path).map(str::to_string)
+            && self.sessions.get(&resolved_path).is_some_and(|session| {
+                matches!(session.source, SessionSource::LiveLocal | SessionSource::LiveSsh)
+            })
+        {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "request_terminal_launch_preserving_active_direct",
+                    serde_json::json!({
+                        "path": path,
+                        "resolved_key": resolved_path,
+                        "preserved_active": preserved_active_path,
+                    }),
+                );
+            }
+            self.request_terminal_launch_for_resolved_path(path, &resolved_path);
+            return;
+        }
+
         self.request_terminal_launch_for_path(
             path,
             ActivationOrigin::internal("request_terminal_launch_preserving_active"),
@@ -13367,6 +13394,15 @@ impl YggtermServer {
         else {
             return;
         };
+        self.request_terminal_launch_for_resolved_path(&raw_path, &path);
+    }
+
+    /// Prepare one known session's terminal runtime without consulting or
+    /// mutating the daemon's active-session pointer. The active wrapper above
+    /// supplies the pointer for ordinary user-driven launches; attach seeds
+    /// use this direct path so background runtime plumbing cannot publish a
+    /// transient activation that makes every GUI stash/reveal its WebKit page.
+    fn request_terminal_launch_for_resolved_path(&mut self, raw_path: &str, path: &str) {
         if let Ok(home) = resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -13381,7 +13417,7 @@ impl YggtermServer {
         }
         let remote_stored_session =
             parse_remote_agent_session_path(&path).and_then(|(machine_key, session_id)| {
-                self.sessions.get(&path).and_then(|session| {
+                self.sessions.get(path).and_then(|session| {
                     (session.source == SessionSource::Stored).then(|| {
                         (
                             machine_key.to_string(),
@@ -13439,7 +13475,7 @@ impl YggtermServer {
             self.open_local_cc_session(&path);
             return;
         }
-        let cached_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
+        let cached_live_ssh_launch = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
                 return None;
             }
@@ -13458,7 +13494,7 @@ impl YggtermServer {
         // the session sat at remote_deploy_state=Planned forever with an empty
         // viewport and no user-visible hint about the version mismatch.
         let mut resolved_live_ssh_launch_error: Option<(String, String)> = None;
-        let resolved_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
+        let resolved_live_ssh_launch = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
                 return None;
             }
@@ -13495,7 +13531,7 @@ impl YggtermServer {
             }
         });
         let mut recovered_remote_live_session: Option<String> = None;
-        let missing_remote_live_session = self.sessions.get(&path).and_then(|session| {
+        let missing_remote_live_session = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session)
                 || !is_remote_scanned_live_session_path(&session.session_path)
                 || remote_live_session_starts_new_codex(session)
@@ -13595,7 +13631,7 @@ impl YggtermServer {
         }
         if self
             .sessions
-            .get(&path)
+            .get(path)
             .is_some_and(|session| session.source == SessionSource::Stored)
             && self
                 .focus_or_create_live_runtime_for_stored_session(&path)
@@ -13603,7 +13639,7 @@ impl YggtermServer {
         {
             return;
         }
-        let Some(session) = self.sessions.get_mut(&path) else {
+        let Some(session) = self.sessions.get_mut(path) else {
             return;
         };
         let mut promote_active_remote_launch =
