@@ -11516,6 +11516,26 @@ console.log('ok');
             "watchdog must be cleared on cleanup (no leaked intervals)"
         );
     }
+
+    #[test]
+    fn terminal_eval_script_adapts_session_switch_focus_poll_to_input_gate() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("let sessionSwitchFocusPollTimer = null;")
+                && script.contains("inputEnabled ? 320 : 1000")
+                && script.contains("wakeSessionSwitchFocusPoll = () => {"),
+            "the mounted host must adapt its session-switch focus poll to the input gate"
+        );
+        assert!(
+            script.contains("window.clearTimeout(sessionSwitchFocusPollTimer);")
+                && script.contains("wakeSessionSwitchFocusPoll();"),
+            "input-policy changes must cancel and immediately re-arm the adaptive poll"
+        );
+        assert!(
+            !script.contains("const sessionSwitchFocusPoll = window.setInterval(() => {")
+        );
+    }
     /// ⛔⛔ AN EXPIRY THAT ONLY FIRES WHEN SOMEONE ASKS AGAIN IS NOT AN EXPIRY.
     ///
     /// The 1,500 ms full-refresh deadline is a term INSIDE the grant condition,

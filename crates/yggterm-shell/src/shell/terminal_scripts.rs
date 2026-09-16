@@ -279,6 +279,8 @@ fn terminal_eval_script_with_canvas_renderer(
     let terminal_passive_focus_watchdog_ms = TERMINAL_PASSIVE_FOCUS_WATCHDOG_MS;
     let terminal_input_dead_trace_ms = TERMINAL_INPUT_DEAD_TRACE_MS;
     let terminal_input_dead_trace_interval_ms = TERMINAL_INPUT_DEAD_TRACE_INTERVAL_MS;
+    let terminal_session_switch_focus_poll_ms = TERMINAL_SESSION_SWITCH_FOCUS_POLL_MS;
+    let terminal_session_switch_focus_idle_poll_ms = TERMINAL_SESSION_SWITCH_FOCUS_IDLE_POLL_MS;
     let constructed_debug = if cfg!(debug_assertions) {
         "sendTerminalEvent({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
@@ -8587,22 +8589,34 @@ fn terminal_eval_script_with_canvas_renderer(
             focusTerminal();
         }}, {terminal_passive_focus_watchdog_ms});
         let lastSeenActiveSessionPathForFocus = activeTerminalSessionPath();
-        const sessionSwitchFocusPoll = window.setInterval(() => {{
+        let sessionSwitchFocusPollTimer = null;
+        let wakeSessionSwitchFocusPoll = () => {{}};
+        const sessionSwitchFocusPoll = () => {{
+            sessionSwitchFocusPollTimer = null;
             try {{
                 const cur = activeTerminalSessionPath();
-                if (cur === lastSeenActiveSessionPathForFocus) {{
-                    return;
-                }}
-                lastSeenActiveSessionPathForFocus = cur;
-                if (!hostOwnsActiveTerminalInput() || !inputEnabled) {{
-                    return;
-                }}
-                const st = passiveFocusRecoveryState();
-                if (st === 'foreign_active_element' || st === 'recoverable') {{
-                    focusTerminal();
+                if (cur !== lastSeenActiveSessionPathForFocus) {{
+                    lastSeenActiveSessionPathForFocus = cur;
+                    if (hostOwnsActiveTerminalInput() && inputEnabled) {{
+                        const st = passiveFocusRecoveryState();
+                        if (st === 'foreign_active_element' || st === 'recoverable') {{
+                            focusTerminal();
+                        }}
+                    }}
                 }}
             }} catch (_error) {{}}
-        }}, 320);
+            sessionSwitchFocusPollTimer = window.setTimeout(
+                sessionSwitchFocusPoll,
+                inputEnabled ? {terminal_session_switch_focus_poll_ms} : {terminal_session_switch_focus_idle_poll_ms}
+            );
+        }};
+        wakeSessionSwitchFocusPoll = () => {{
+            if (sessionSwitchFocusPollTimer !== null) {{
+                window.clearTimeout(sessionSwitchFocusPollTimer);
+            }}
+            sessionSwitchFocusPollTimer = window.setTimeout(sessionSwitchFocusPoll, 0);
+        }};
+        wakeSessionSwitchFocusPoll();
         // Screen-restore (vacuum fix): periodically persist the rendered transcript
         // to localStorage so a full GUI+daemon restart can restore it. The
         // event-driven persists (scroll/intent/snapshot) never fire for an IDLE
@@ -8823,6 +8837,7 @@ fn terminal_eval_script_with_canvas_renderer(
             lastInputPolicyReason = inputPolicyUnchanged ? 'focus_repair' : 'changed';
             inputEnabled = nextInputEnabled;
             programmaticFocusEnabled = nextProgrammaticFocusEnabled;
+            wakeSessionSwitchFocusPoll();
             if (inputEnabled && rustInputGateOpen) {{
                 promoteRetainedReplaySourceForTrustedInput('input_policy_changed');
             }}
@@ -12709,6 +12724,12 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             try {{
                 window.clearInterval(inputDriftWatchdog);
+            }} catch (_error) {{}}
+            try {{
+                if (sessionSwitchFocusPollTimer !== null) {{
+                    window.clearTimeout(sessionSwitchFocusPollTimer);
+                    sessionSwitchFocusPollTimer = null;
+                }}
             }} catch (_error) {{}}
             try {{
                 window.clearInterval(screenRestorePersistTimer);

@@ -1899,6 +1899,12 @@ const DEBUG_REQUEST_DELAY_ENV: &str = "YGGTERM_DEBUG_REQUEST_DELAY_MS";
 const APP_CONTROL_ACTIVE_POLL_MS: u64 = 100;
 const APP_CONTROL_IDLE_POLL_MS: u64 = 1_000;
 const APP_CONTROL_WATCHDOG_IDLE_POLL_MS: u64 = 15_000;
+/// A mounted terminal only needs this poll at fast cadence while its input gate
+/// is open. Native web surfaces commonly keep the terminal host mounted but
+/// input-disabled; on jojo's HPET clock, polling that idle host every 320 ms is
+/// needless WebKit/tokio wake pressure.
+const TERMINAL_SESSION_SWITCH_FOCUS_POLL_MS: u64 = 320;
+const TERMINAL_SESSION_SWITCH_FOCUS_IDLE_POLL_MS: u64 = 1_000;
 const APP_CONTROL_DRAIN_STUCK_MS: u64 = 2_500;
 const TERMINAL_PASSIVE_FOCUS_WATCHDOG_MS: u64 = 3_000;
 /// How long the active terminal may sit input-enabled WITHOUT holding keyboard
