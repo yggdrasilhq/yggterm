@@ -1732,6 +1732,44 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
     // `None` — cannot say, which keeps the row protected.
     let descriptor = kind.and_then(|kind| agent_cli::agent_cli_descriptor(kind))?;
     let marker = descriptor.composer_marker;
+    // ⛔ [11.133] THE GUTTER-BOX ARM — opencode 2.0.3's composer is a ┃-ruled
+    // BOX, not a glyph row: the placeholder/input row, an EMPTY gutter row
+    // under it, the mode row (`┃  Build auto · … OpenCode Zen` — chrome by its
+    // footer hint), then the `╹▀▀▀` border. Anchoring the bottom-most gutter
+    // row answers from the WRONG row — the measured box paints an empty gutter
+    // row UNDER the input row and GROWS one above it while drafting — so the
+    // scan asks EVERY gutter row in reach, and a gutter row carrying only
+    // placeholder text answers EMPTY (the placeholder rotates; the vendor's
+    // suggestion is never an unsent draft).
+    if !descriptor.composer_placeholder_needles.is_empty() {
+        let mut anchored = false;
+        for index in (floor..end).rev() {
+            let text = rows[index]
+                .trim()
+                .trim_start_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
+            if text.starts_with(marker) {
+                anchored = true;
+                let head = text[marker.len_utf8()..].trim();
+                let lowered = head.to_ascii_lowercase();
+                let is_placeholder = descriptor
+                    .composer_placeholder_needles
+                    .iter()
+                    .any(|needle| lowered.contains(needle));
+                if !head.is_empty() && !is_placeholder {
+                    return Some(true);
+                }
+                continue;
+            }
+            if anchored {
+                // Past the top of the box: everything up there is transcript.
+                return Some(false);
+            }
+            // The box is not on this screen (no gutter row above the chrome):
+            // cannot say, which keeps the row protected.
+            return None;
+        }
+        return anchored.then_some(false);
+    }
     let mut content = String::new();
     for index in (floor..end).rev() {
         let text = rows[index]
@@ -1783,6 +1821,11 @@ fn composer_row_is_chrome(row: &str) -> bool {
     if text.is_empty() {
         return true;
     }
+    // A bare version stamp is vendor chrome, not composer content (opencode
+    // paints `2.0.3` bottom-right on a fresh screen — [11.133] measured).
+    if !text.is_empty() && text.chars().all(|ch: char| ch.is_ascii_digit() || ch == '.') {
+        return true;
+    }
     if text
         .trim_matches(|ch: char| {
             matches!(
@@ -1790,6 +1833,8 @@ fn composer_row_is_chrome(row: &str) -> bool {
                 '\u{2500}'
                     | '\u{2501}'
                     | '\u{2502}'
+                    | '\u{2579}'
+                    | '\u{2580}'
                     | '\u{256d}'
                     | '\u{256e}'
                     | '\u{2570}'
@@ -3647,6 +3692,78 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// ⛔ [11.133] THE GUTTER-BOX ANSWERS FOR THE MEASURED SCREENS — captured
+    /// live 2026-09-16 (the muse lab host, opencode 2.0.3, node-pty + vendored
+    /// xterm, suites/opencode.js probe session): idle (placeholder + empty
+    /// gutter row), drafting (the draft row with an empty gutter row grown
+    /// ABOVE it and one kept below), settled after a turn (three empty gutter
+    /// rows, no placeholder), and a screen with no box at all.
+    #[test]
+    fn the_gutter_box_answers_for_the_measured_screens() {
+        let rows = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>()
+        };
+        let border = format!("\u{2579}{}", "\u{2580}".repeat(47));
+        let footer = "/tmp/probe-ws            shift+tab agents  ctrl+p commands";
+        let mode_row = "\u{2503}  Build auto \u{b7} Union Alpha Free OpenCode Zen";
+
+        // Idle: the placeholder is the vendor's suggestion, never a draft.
+        let idle = rows(&[
+            "\u{2503}  Ask anything\u{2026} \"Fix broken tests\"",
+            "\u{2503}",
+            mode_row,
+            &border,
+            &footer,
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &idle),
+            Some(false),
+            "the rotating placeholder must not read as an unsent draft"
+        );
+
+        // Drafting: the text replaces the placeholder on its row, and the box
+        // grows an empty gutter row ABOVE it (measured) while keeping one
+        // below — anchoring the bottom-most gutter row would miss the draft.
+        let drafting = rows(&[
+            "\u{2503}",
+            "\u{2503}  unsent draft f0k7d",
+            "\u{2503}",
+            mode_row,
+            &border,
+            &footer,
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &drafting),
+            Some(true),
+            "a draft one gutter row ABOVE the bottom-most empty one is held text"
+        );
+
+        // Settled after a turn: empty box, placeholder does not return.
+        let settled = rows(&[
+            "  Build \u{b7} Union Alpha Free \u{b7} 46.4s \u{b7} 2.5 tok/s",
+            "\u{2503}",
+            "\u{2503}",
+            "\u{2503}",
+            mode_row,
+            &border,
+            &footer,
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &settled),
+            Some(false)
+        );
+
+        // No box on screen (mid-turn, box hidden): cannot say — protected.
+        let no_box = rows(&["  running the sweep", "  Ran 1 shell command"]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &no_box),
+            None
+        );
+    }
+
     /// ⛔⛔ THE JAM THIS LOCKS OUT, measured 2026-08-21 across 19 rows and 434
     /// consecutive refusals: the agent CLI prefixes every DELIVERED message in
     /// its transcript with the SAME glyph the composer uses. Every reader that
@@ -3655,9 +3772,12 @@ mod tests {
     /// content — and nothing clears a transcript, so a row was made permanently
     /// unwakeable by each wake it had successfully accepted.
     ///
-    /// ⚠ Every fixture is INVENTED. What is taken from life is the SHAPE: a
-    /// delivered message with a reply under it, then the border, the composer,
-    /// the border, the footer.
+    /// ⚠ The opencode fixtures below are the MEASURED 2.0.3 box (the muse lab
+    /// host, 2026-09-16): placeholder / empty gutter / mode row inside the ┃
+    /// box, the `╹▀▀▀` border, the footer — the beta-era invented ❯ fixtures
+    /// died with the glyph. The codex and agy fixtures stay invented; what is
+    /// taken from life there is the SHAPE: a delivered message with a reply
+    /// under it, then the border, the composer, the border, the footer.
     #[test]
     fn the_composer_is_a_row_and_a_delivered_message_is_not_one() {
         let rows = |lines: &[&str]| {
@@ -3666,17 +3786,22 @@ mod tests {
                 .map(|line| (*line).to_string())
                 .collect::<Vec<_>>()
         };
-        let border = "\u{2500}".repeat(48);
-        let footer = "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} 1 agent";
+        // The measured 2.0.3 box: `╹` + `▀`-repeat border, footer hints, and
+        // the mode row INSIDE the box (chrome by its `opencode zen` hint).
+        let border = format!("\u{2579}{}", "\u{2580}".repeat(47));
+        let footer = "/tmp/probe-ws            shift+tab agents  ctrl+p commands";
+        let mode_row = "\u{2503}  Build auto \u{b7} Union Alpha Free OpenCode Zen";
+        let placeholder_row = "\u{2503}  Ask anything\u{2026} \"Fix broken tests\"";
 
-        // A delivered message still on screen, and an EMPTY composer under it.
+        // A delivered message still on screen, and an EMPTY box under it.
         let delivered = rows(&[
             "  some earlier output",
-            "\u{276f} continue, the watcher woke you \u{2014} keep going",
+            "  continue, the watcher woke you \u{2014} keep going",
             "",
             "  and the reply the row already gave to it",
-            &border,
-            "\u{276f}",
+            placeholder_row,
+            "\u{2503}",
+            mode_row,
             &border,
             &footer,
         ]);
@@ -3686,12 +3811,14 @@ mod tests {
             "a delivered message in the transcript is not composer content"
         );
 
-        // The composer's own content, including when the line wraps.
+        // The box's own content, including when the input wraps onto more
+        // gutter rows.
         let wrapped = rows(&[
             "  some earlier output",
-            &border,
-            "\u{276f} please hold this thought about the",
-            "  ledger until tomorrow",
+            "\u{2503}  please hold this thought about the",
+            "\u{2503}  ledger until tomorrow",
+            "\u{2503}",
+            mode_row,
             &border,
             &footer,
         ]);

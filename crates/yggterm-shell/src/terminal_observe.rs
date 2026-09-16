@@ -3566,13 +3566,9 @@ pub(crate) fn terminal_chunk_has_agent_composer_row(data: &str) -> bool {
         // prompt at that surface is what the gate exists to prevent.
         (descriptor.composer_region_label.is_none()
             && terminal_chunk_has_wrapped_codex_input_region(&lines, prompt_index))
-            || lines[prompt_index + 1..].iter().all(|line| {
-                let lower = line.to_ascii_lowercase();
-                descriptor
-                    .composer_footer_hints
-                    .iter()
-                    .any(|hint| lower.contains(hint))
-            })
+            || lines[prompt_index + 1..]
+                .iter()
+                .all(|line| composer_below_line_is_chrome(line, descriptor))
     })
 }
 
@@ -3593,6 +3589,50 @@ fn composer_anchor_line(lines: &[&str], descriptor: &yggterm_core::agent_cli::Ag
                     .rposition(|line| line.eq_ignore_ascii_case(label))
             })
         })
+}
+
+/// Whether ONE screen line below the composer anchor is this CLI's own chrome.
+/// Hint fragments first ([`AgentCliDescriptor::composer_footer_hints`]); then
+/// the shape rules the ┃-box CLIs need ([11.133]): a line made only of
+/// gutter/border rules (opencode's empty `┃` row and its `╹▀▀▀` border sit
+/// between the input row and the footer), and a bare version stamp — opencode
+/// paints `2.0.3` bottom-right, and a number that rotates with every release
+/// is the one below-composer line no hint table can declare.
+fn composer_below_line_is_chrome(
+    line: &str,
+    descriptor: &yggterm_core::agent_cli::AgentCliDescriptor,
+) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if descriptor
+        .composer_footer_hints
+        .iter()
+        .any(|hint| lower.contains(hint))
+    {
+        return true;
+    }
+    if !line.is_empty()
+        && line
+            .chars()
+            .all(|ch: char| ch.is_ascii_digit() || ch == '.')
+    {
+        return true;
+    }
+    line.chars().all(|ch: char| {
+        matches!(
+            ch,
+            '\u{2500}'
+                | '\u{2501}'
+                | '\u{2502}'
+                | '\u{2503}'
+                | '\u{256d}'
+                | '\u{256e}'
+                | '\u{2570}'
+                | '\u{256f}'
+                | '\u{2579}'
+                | '\u{2580}'
+                | ' '
+        )
+    })
 }
 
 /// Screen text as the composer predicates read it: control sequences stripped,
@@ -6070,6 +6110,55 @@ Best thing to improve in the meantime:
             .collect();
         assert_eq!(markers.len(), yggterm_core::AGENT_CLIS.len());
         assert!(markers.iter().all(|marker| !marker.is_whitespace()));
+    }
+
+    /// ⛔ [11.133] opencode 2.0.3 killed the `❯` marker — the composer is a
+    /// ┃-ruled BOX (placeholder row, an empty gutter row, the mode row
+    /// `┃  Build auto · <model> OpenCode Zen` INSIDE the box, then the
+    /// `╹▀▀▀` border), and the glyph-first anchor landed on the dead `❯`, so
+    /// an opencode row was never-ready forever. Fixtures captured live
+    /// 2026-09-16 (the muse lab host, opencode 2.0.3, node-pty + vendored
+    /// xterm — suites/opencode.js `composer-idle-shape` + `draft-shape`).
+    #[test]
+    fn opencode_gutter_box_anchors_the_readiness_gate() {
+        let d = yggterm_core::agent_cli::agent_cli_descriptor(yggterm_core::SessionKind::OpenCode)
+            .expect("registered");
+        assert_eq!(d.composer_marker, '\u{2503}');
+        assert_eq!(d.composer_placeholder_needles, &["ask anything"]);
+        let idle = "\
+\u{2503}  Ask anything\u{2026} \"Fix broken tests\"
+\u{2503}
+\u{2503}  Build auto \u{b7} Union Alpha Free OpenCode Zen
+\u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}
+/tmp/probe-ws            shift+tab agents  ctrl+p commands
+2.0.3";
+        assert!(
+            terminal_chunk_has_agent_composer_row(idle),
+            "an opencode row at its ┃ box must read READY — the dead ❯ anchor              left it never-ready forever"
+        );
+
+        // The box with a draft held is still THE COMPOSER — the gate answers
+        // "may a prompt be submitted here"; the DRAFT GUARD is the layer that
+        // refuses the send while the draft stands.
+        let drafting = "\
+\u{2503}
+\u{2503}  unsent draft f0k7d
+\u{2503}
+\u{2503}  Build auto \u{b7} Union Alpha Free OpenCode Zen
+\u{2579}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}
+/tmp/probe-ws            shift+tab agents  ctrl+p commands";
+        assert!(terminal_chunk_has_agent_composer_row(drafting));
+
+        // An OLD composer line with real output scrolled beneath it stays
+        // not-ready — the below-chrome rule is what separates them.
+        let old_prompt = "\
+\u{2503}  earlier prompt that finished
+  and the reply the row already gave
+  more transcript output under it";
+        assert!(
+            !terminal_chunk_has_agent_composer_row(old_prompt),
+            "transcript output under a gutter row is not composer chrome"
+        );
     }
 
     /// ⛔ [11.6.6-b] kimi 1.50.0 draws NO composer glyph — the composer is the
