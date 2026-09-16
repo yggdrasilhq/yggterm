@@ -8047,6 +8047,20 @@ fn web_surface_tab_background_hold_ms() -> Option<u64> {
     web_surface_tab_background_hold_ms_from(web_surface_config_raw().as_deref())
 }
 
+/// The unfocused GUI is not a user-visible browsing surface. Keep the normal
+/// comfortable-host hold while focused (instant switch-back), but cap an
+/// unfocused stash so a hidden WebKit content process cannot keep its timer and
+/// HPET workload alive for ten minutes after the user left Yggterm.
+const WEB_SURFACE_UNFOCUSED_BACKGROUND_HOLD_MS: u64 = 60_000;
+
+fn web_surface_unfocused_background_hold_ms(configured: Option<u64>) -> Option<u64> {
+    Some(
+        configured
+            .unwrap_or(WEB_SURFACE_UNFOCUSED_BACKGROUND_HOLD_MS)
+            .min(WEB_SURFACE_UNFOCUSED_BACKGROUND_HOLD_MS),
+    )
+}
+
 /// The engine's live "is this page playing audio" answer, as the reclaim plan
 /// sees it.
 ///
@@ -10430,6 +10444,19 @@ mod web_surface_reclaim_locks {
         assert_eq!(
             web_surface_background_hold_ms_for(Some(42_000), ReclaimPosture::Pressured, 0),
             Some(WEB_SURFACE_PRESSURED_BACKGROUND_HOLD_MS)
+        );
+
+        // An unfocused GUI gets a bounded clock even when the comfortable
+        // posture would otherwise keep an unstated page forever. Explicitly
+        // shorter holds remain exact; longer holds are capped for cooling.
+        assert_eq!(
+            web_surface_unfocused_background_hold_ms(None),
+            Some(60_000)
+        );
+        assert_eq!(web_surface_unfocused_background_hold_ms(Some(0)), Some(0));
+        assert_eq!(
+            web_surface_unfocused_background_hold_ms(Some(600_000)),
+            Some(60_000)
         );
 
         // ...and the adapters the loop actually calls are wired to the ONE file
@@ -14294,13 +14321,24 @@ async fn web_surface_native_reconcile_loop(
                 trace_home: trace_home.as_path(),
                 state,
             };
+            let window_focused = state.peek().effective_window_focused();
+            let configured_hold_ms = web_surface_background_hold_ms();
+            let configured_tab_hold_ms = web_surface_tab_background_hold_ms();
             web_surface_reclaim_background_pass(
                 now_ms,
                 under_glass,
                 &read_memory_pressure_snapshot(),
                 web_surface_force_background_pressure(),
-                web_surface_background_hold_ms(),
-                web_surface_tab_background_hold_ms(),
+                if window_focused {
+                    configured_hold_ms
+                } else {
+                    web_surface_unfocused_background_hold_ms(configured_hold_ms)
+                },
+                if window_focused {
+                    configured_tab_hold_ms
+                } else {
+                    web_surface_unfocused_background_hold_ms(configured_tab_hold_ms)
+                },
                 &backgrounded,
                 &mut applied,
                 &|key| web_surface_lease_until_ms(&state, &key.0, key.1),
