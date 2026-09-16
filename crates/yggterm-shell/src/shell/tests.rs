@@ -22002,11 +22002,12 @@ console.log('ok');
         let gap_tick = script
             .split("const rafGapTick = () => {")
             .nth(1)
-            .and_then(|body| {
-                body.split("window.requestAnimationFrame(rafGapTick);")
-                    .next()
-            })
+            .and_then(|body| body.split("const scheduleRafGapTick").next())
             .expect("the rAF gap monitor tick should be present");
+        assert!(
+            script.contains("window.setTimeout(rafGapTick, 250);"),
+            "an unfocused shell must use a low-power watchdog instead of a permanent rAF loop"
+        );
         assert!(
             gap_tick.contains("clearTextureAtlas"),
             "the gap monitor must clear every host's atlas the moment the throttle ends, \
