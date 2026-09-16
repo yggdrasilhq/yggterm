@@ -31349,3 +31349,12 @@ interrupt it, or force"). The existing
 
 **Immediate unblock for the owner:** press `esc` on the named row (or let
 it idle past 5 min) and the next deploy tick rotates the daemon.
+
+**Update 2026-09-16 ~18:45:** still blocked THREE hours later — and the
+blocker row is titled "continue the trace fixing campaign memory and
+ultrafast UX c…": a trace-campaign seat mid-turn is what keeps the daemon
+from ever reaching the trace-campaign fixes. idle_ms 13 at check time. The
+loop is self-referential (bug report → seat spawns → seat keeps the daemon
+old → owner still sees the bug → report). This strengthens the starvation
+bound: politeness toward fleet seats must not starve the fleet own fixes;
+the fix shapes above stand, with (b) as the likely answer.
