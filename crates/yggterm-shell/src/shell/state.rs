@@ -14076,7 +14076,15 @@ async fn web_surface_native_reconcile_loop(
             // without the covers would make every modal a click-through
             // window — they are ONE work item by design.
             let modal_over_viewport = shell_ref.has_modal_over_viewport() && !under_glass;
-            let active_visible_sessions = if modal_over_viewport {
+            // A native page can sit above the shell DOM even while the Yggterm
+            // window is unfocused.  That is not an interactive surface: it is
+            // an invisible-to-the-user WebKit workload, and on jojo its timer
+            // clock reads are HPET-backed.  Treat the focus edge like the other
+            // backgrounding gates so WebKit's document/rAF/timer throttling
+            // applies until the user returns to this window.
+            let active_visible_sessions = if modal_over_viewport
+                || !shell_ref.effective_window_focused()
+            {
                 std::collections::HashSet::new()
             } else {
                 shell_ref
