@@ -5076,6 +5076,26 @@ JSON.stringify({{
     }
 
     #[test]
+    fn viewport_deadline_clock_uses_the_amortized_wall_clock() {
+        let viewport = include_str!("viewport.rs");
+        let start = viewport
+            .find("fn current_millis() -> u64 {")
+            .expect("viewport deadline clock must exist");
+        let body = &viewport[start..]
+            .split_once("\n}")
+            .expect("viewport deadline clock must have a body")
+            .0;
+        assert!(
+            body.contains("yggterm_core::clock::amortized_unix_ms()"),
+            "hot viewport timing must use the amortized clock"
+        );
+        assert!(
+            !body.contains("SystemTime::now()"),
+            "hot viewport timing must not pay the hpet clock syscall per read"
+        );
+    }
+
+    #[test]
     fn healthy_remote_input_does_not_publish_a_transient_attention_status() {
         let viewport = include_str!("viewport.rs");
         let input_start = viewport

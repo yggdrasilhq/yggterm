@@ -19724,10 +19724,9 @@ fn native_web_surface_visible(shell: &ShellState) -> bool {
         })
 }
 fn current_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
+    yggterm_core::clock::amortized_unix_ms()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 fn terminal_read_cursor_rewound(previous_cursor: u64, next_cursor: u64) -> bool {
     previous_cursor > 0 && next_cursor < previous_cursor
