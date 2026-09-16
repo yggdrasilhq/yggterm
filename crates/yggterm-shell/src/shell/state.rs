@@ -53004,7 +53004,61 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     if (!open) { ktLastSignature = ''; }
     ktLastOverlayOpen = open;
   }
-  window.setInterval(function(){ ktFollowTick(); ktSurfaceTick(); ktFormFocusTick(); ktPaint(); }, 90);
+  // The bridge used to keep a 90 ms timer alive forever.  That was invisible
+  // on a TSC host, but on jojo every timer wake reaches HPET-backed
+  // clock_gettime in WebKit.  Only the open/follow/modal states need the fast
+  // cadence; an idle focused window can tolerate a quarter second, and a
+  // hidden/unfocused window has no human-visible keytip deadline.
+  function keytipBridgeWindowFocused(){
+    if (document.hidden) { return false; }
+    try {
+      if (document.querySelector('[data-terminal-window-focused="true"]')) { return true; }
+      return typeof document.hasFocus === 'function' && document.hasFocus();
+    } catch (_e) {
+      return false;
+    }
+  }
+  function keytipBridgeDelayMs(){
+    if (overlayOpen() || modalOpen() || Number(window.__yggtermFollowNextModal || 0) > 0) {
+      return 90;
+    }
+    return keytipBridgeWindowFocused() ? 250 : 1000;
+  }
+  var ktBridgeTimer = null;
+  function ktBridgeTick(){
+    ktBridgeTimer = null;
+    ktFollowTick();
+    ktSurfaceTick();
+    ktFormFocusTick();
+    ktPaint();
+    ktBridgeTimer = window.setTimeout(ktBridgeTick, keytipBridgeDelayMs());
+  }
+  function wakeKeytipBridge(){
+    if (ktBridgeTimer !== null) {
+      window.clearTimeout(ktBridgeTimer);
+      ktBridgeTimer = null;
+    }
+    ktBridgeTick();
+  }
+  window.addEventListener('focus', wakeKeytipBridge, true);
+  window.addEventListener('blur', wakeKeytipBridge, true);
+  document.addEventListener('visibilitychange', wakeKeytipBridge, true);
+  try {
+    var ktBridgeWakeObserver = new MutationObserver(function(records){
+      for (var i = 0; i < records.length; i += 1) {
+        if (records[i].attributeName === 'data-terminal-window-focused') {
+          wakeKeytipBridge();
+          return;
+        }
+      }
+    });
+    ktBridgeWakeObserver.observe(document.documentElement, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-terminal-window-focused'],
+    });
+  } catch (_e) {}
+  ktBridgeTick();
 })();"#;
 /// The accelerator intercept set as a JS array literal `[{ctrl,alt,shift,meta,key},…]`,
 /// generated from the EFFECTIVE accelerators (shipping defaults + the user's
