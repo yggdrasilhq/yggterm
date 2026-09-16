@@ -6003,6 +6003,33 @@ impl YggtermServer {
             return;
         }
 
+        // An attach seed is runtime plumbing, not a viewport action. Live
+        // rows already have their runtime identity, so prepare the row
+        // directly without the old activate-then-restore detour. That detour
+        // was observable in the activation trace and made the GUI repeatedly
+        // stash/reveal native WebKit surfaces during background attaches.
+        if let Some(resolved_path) = self.resolve_session_storage_key(path).map(str::to_string)
+            && self.sessions.get(&resolved_path).is_some_and(|session| {
+                matches!(session.source, SessionSource::LiveLocal | SessionSource::LiveSsh)
+            })
+        {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "request_terminal_launch_preserving_active_direct",
+                    serde_json::json!({
+                        "path": path,
+                        "resolved_key": resolved_path,
+                        "preserved_active": preserved_active_path,
+                    }),
+                );
+            }
+            self.request_terminal_launch_for_resolved_path(path, &resolved_path);
+            return;
+        }
+
         self.request_terminal_launch_for_path(
             path,
             ActivationOrigin::internal("request_terminal_launch_preserving_active"),
@@ -13340,6 +13367,15 @@ impl YggtermServer {
         else {
             return;
         };
+        self.request_terminal_launch_for_resolved_path(&raw_path, &path);
+    }
+
+    /// Prepare one known session's terminal runtime without consulting or
+    /// mutating the daemon's active-session pointer. The active wrapper above
+    /// supplies the pointer for ordinary user-driven launches; attach seeds
+    /// use this direct path so background runtime plumbing cannot publish a
+    /// transient activation that makes every GUI stash/reveal its WebKit page.
+    fn request_terminal_launch_for_resolved_path(&mut self, raw_path: &str, path: &str) {
         if let Ok(home) = resolve_yggterm_home() {
             append_trace_event(
                 &home,
