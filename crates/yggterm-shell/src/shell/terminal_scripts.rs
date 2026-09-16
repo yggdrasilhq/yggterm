@@ -6993,6 +6993,35 @@ fn terminal_eval_script_with_canvas_renderer(
                     gapCount: 0,
                 }};
                 window.__yggtermRafGapMonitor = rafGapMonitor;
+                // A page-global rAF monitor is itself a permanent WebKit/JSC
+                // workload.  Keep frame cadence only while an active terminal
+                // is actually in a focused Yggterm window; an unfocused shell
+                // has no human-visible frame deadline, so a quarter-second
+                // watchdog is enough to notice the end of an occlusion gap
+                // without paying HPET-backed clock reads sixty times a second.
+                const scheduleRafGapTick = () => {{
+                    const now = Date.now();
+                    if (now >= Number(rafGapMonitor.nextCadenceCheckAtMs || 0)) {{
+                        rafGapMonitor.nextCadenceCheckAtMs = now + 250;
+                        let focusedActiveHost = false;
+                        try {{
+                            for (const candidate of document.querySelectorAll(
+                                '[data-terminal-window-focused="true"][data-active-session-host="true"]'
+                            )) {{
+                                if (candidate.getAttribute('data-terminal-app-control-backgrounded') !== 'true') {{
+                                    focusedActiveHost = true;
+                                    break;
+                                }}
+                            }}
+                        }} catch (_error) {{}}
+                        rafGapMonitor.fastCadence = focusedActiveHost && !document.hidden;
+                    }}
+                    if (rafGapMonitor.fastCadence) {{
+                        window.requestAnimationFrame(rafGapTick);
+                    }} else {{
+                        window.setTimeout(rafGapTick, 250);
+                    }}
+                }};
                 const rafGapTick = () => {{
                     const now = Date.now();
                     const gap = now - rafGapMonitor.lastTickAtMs;
@@ -7062,9 +7091,9 @@ fn terminal_eval_script_with_canvas_renderer(
                         }} catch (_error) {{}}
                     }}
                     rafGapMonitor.lastTickAtMs = now;
-                    window.requestAnimationFrame(rafGapTick);
+                    scheduleRafGapTick();
                 }};
-                window.requestAnimationFrame(rafGapTick);
+                scheduleRafGapTick();
             }}
         }} catch (_error) {{}}
         const clearTerminalTextureAtlas = () => {{
