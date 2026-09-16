@@ -912,9 +912,9 @@ const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
 // Active terminal reads are also driven by a Dioxus task waker.  On a host
 // whose monotonic clock is HPET-backed, a 16 ms idle/read cadence keeps the
 // GTK event loop hot even when the PTY has no user-visible bytes.  Input echo
-// has its own 8 ms burst cadence below; 50 ms keeps ordinary output under one
+// has its own 8 ms burst cadence below; 100 ms keeps ordinary output under one
 // frame of perceptible latency without making the whole GUI a 60 Hz poller.
-const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 50;
+const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 100;
 const TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS: u64 = 16_000;
 const TERMINAL_UNFOCUSED_TUI_DROP_READ_POLL_MS: u64 = 15_000;
 /// How often a bridge whose paint is suspended for a daemon handover looks
@@ -7308,9 +7308,9 @@ const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
 // This beat is also the cadence of a Dioxus task waker.  A 16 ms sleep kept
 // the GTK event loop non-blocking for every native page even when no geometry
 // or session switch was pending, which is disproportionately expensive on
-// hosts whose monotonic clock falls back to HPET.  100 ms keeps a switch under
-// one tenth of a second while removing the permanent 60 Hz wake source.
-const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 100;
+// hosts whose monotonic clock falls back to HPET.  150 ms keeps a switch well
+// below a quarter second while removing the permanent 60 Hz wake source.
+const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 150;
 /// Idle poll cadence when no surfaces exist and none are applied.
 const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
 /// How long a tab's loading light may claim the sidebar dot. Generous for a real
