@@ -7308,9 +7308,12 @@ const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
 // This beat is also the cadence of a Dioxus task waker.  A 16 ms sleep kept
 // the GTK event loop non-blocking for every native page even when no geometry
 // or session switch was pending, which is disproportionately expensive on
-// hosts whose monotonic clock falls back to HPET.  150 ms keeps a switch well
-// below a quarter second while removing the permanent 60 Hz wake source.
-const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 150;
+// hosts whose monotonic clock falls back to HPET.  The reconciler already
+// targets a 300 ms normal tick; making the beat equal to that tick removes a
+// redundant mid-tick HPET wake.  The switch edge retains its 150 ms settle
+// sleep below, so only steady-state timer pressure changes.
+const WEB_SURFACE_RECONCILE_BEAT_MS: u64 = 300;
+const WEB_SURFACE_RECONCILE_SWITCH_SETTLE_MS: u64 = 150;
 /// Idle poll cadence when no surfaces exist and none are applied.
 const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
 /// How long a tab's loading light may claim the sidebar dot. Generous for a real
@@ -15914,7 +15917,7 @@ async fn web_surface_native_reconcile_loop(
                     || shell.server.active_session_path() != baseline_session.as_deref()
             };
             if switched {
-                sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_BEAT_MS)).await;
+                sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_SWITCH_SETTLE_MS)).await;
                 break;
             }
         }

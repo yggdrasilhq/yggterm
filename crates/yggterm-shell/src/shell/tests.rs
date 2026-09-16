@@ -24056,9 +24056,9 @@ console.log('ok');
             "a renewal every {WEB_SURFACE_MEDIA_HEARTBEAT_MS}ms cannot keep a \
              {WEB_SURFACE_MEDIA_MAX_MS}ms claim alive across a slow tick",
         );
-        // ...and far above the reconcile beat, or a playing tab writes shell
-        // state sixty times a second and repaints the rail with it.
-        assert!(WEB_SURFACE_MEDIA_HEARTBEAT_MS > WEB_SURFACE_RECONCILE_BEAT_MS * 10);
+        // ...and comfortably above the reconcile beat, or a playing tab writes
+        // shell state on every geometry wake and repaints the rail with it.
+        assert!(WEB_SURFACE_MEDIA_HEARTBEAT_MS > WEB_SURFACE_RECONCILE_BEAT_MS * 6);
     }
 
     /// The media dot is the SAME dot, so it must obey the same two laws the
