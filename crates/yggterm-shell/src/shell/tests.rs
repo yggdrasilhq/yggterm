@@ -66096,6 +66096,28 @@ mod keytips_inversion_locks {
         );
     }
 
+    #[test]
+    fn keytip_bridge_sleeps_when_idle_or_unfocused() {
+        let script = keytip_bridge_js(&KeymapConfig::default());
+        assert!(
+            script.contains("function keytipBridgeDelayMs(){")
+                && script.contains("return keytipBridgeWindowFocused() ? 250 : 1000;")
+                && script.contains(
+                    "ktBridgeTimer = window.setTimeout(ktBridgeTick, keytipBridgeDelayMs());",
+                ),
+            "the keytip bridge must use adaptive timeout cadence instead of a permanent fast interval"
+        );
+        assert!(
+            script.contains("window.addEventListener('focus', wakeKeytipBridge, true);")
+                && script.contains("document.addEventListener('visibilitychange', wakeKeytipBridge, true);")
+                && script.contains("attributeFilter: ['data-terminal-window-focused'],"),
+            "focus and visibility changes must wake the bridge immediately"
+        );
+        assert!(!script.contains(
+            "window.setInterval(function(){ ktFollowTick(); ktSurfaceTick(); ktFormFocusTick(); ktPaint(); }, 90);"
+        ));
+    }
+
     /// LOCK 6e — §8 holds on the START PAGE too: an unbounded list's per-row
     /// affordances are not badged. Measured before this stamp: a 283-row start
     /// page derived 1,135 letters in one scope — more elements than the whole
