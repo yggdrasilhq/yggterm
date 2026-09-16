@@ -16143,10 +16143,12 @@ fn run_background_copy_chore(
             }
         }
         if let Some(summary) = update.summary.as_deref() {
-            runtime
+            if runtime
                 .server
-                .set_session_summary_hint(&update.session_path, summary);
-            applied += 1;
+                .set_session_summary_hint(&update.session_path, summary)
+            {
+                applied += 1;
+            }
         }
     }
     // Nothing changed ⇒ nothing to write. `persist` serializes the whole
@@ -37656,6 +37658,27 @@ mod tests {
             Some("3.1 [lane]: the owner's own name"),
             "and the owner's title still stands"
         );
+    }
+
+    #[test]
+    fn summary_hint_reports_noop_as_not_applied() {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            crate::SessionKind::ClaudeCode,
+            Some("/home/user"),
+            Some("home/pi claude"),
+        );
+
+        assert!(server.set_session_summary_hint(&path, "first summary"));
+        assert!(
+            !server.set_session_summary_hint(&path, "first summary"),
+            "an identical summary must not keep the background chore hot"
+        );
+        assert!(server.set_session_summary_hint(&path, "changed summary"));
     }
 
     #[test]

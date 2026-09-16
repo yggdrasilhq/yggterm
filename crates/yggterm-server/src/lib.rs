@@ -7536,8 +7536,8 @@ impl YggtermServer {
 
     pub fn set_session_precis_hint(&mut self, _session_path: &str, _precis: &str) {}
 
-    pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) {
-        self.apply_session_summary_hint(session_path, Some(summary));
+    pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) -> bool {
+        self.apply_session_summary_hint(session_path, Some(summary))
     }
 
     /// Set a session's cached summary, or CLEAR it when the store has none.
@@ -7559,7 +7559,11 @@ impl YggtermServer {
     /// that carries no summary really does mean "this view does not carry one",
     /// and treating that as an authoritative absence would wipe a good summary
     /// on every refresh. Only a store scan knows the difference.
-    pub fn apply_session_summary_hint(&mut self, session_path: &str, summary: Option<&str>) {
+    pub fn apply_session_summary_hint(
+        &mut self,
+        session_path: &str,
+        summary: Option<&str>,
+    ) -> bool {
         let row_key = self
             .resolve_session_storage_key(session_path)
             .map(str::to_string);
@@ -7567,10 +7571,13 @@ impl YggtermServer {
             .as_ref()
             .and_then(|key| self.sessions.get(key))
             .map(|session| session.session_path.clone());
+        let mut applied = false;
         if let Some(session) = row_key
             .as_ref()
             .and_then(|key| self.sessions.get_mut(key))
         {
+            let previous_summary = session.preview.summary.clone();
+            let previous_metadata = session.metadata.clone();
             match summary {
                 Some(summary) => {
                     upsert_session_metadata(
@@ -7585,6 +7592,8 @@ impl YggtermServer {
                     session.metadata.retain(|entry| entry.label != "Summary");
                 }
             }
+            applied |= session.preview.summary != previous_summary
+                || session.metadata != previous_metadata;
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
@@ -7593,11 +7602,16 @@ impl YggtermServer {
                         .as_deref()
                         .is_some_and(|path| scanned.session_path == path)
                 {
-                    scanned.cached_summary = summary.map(ToOwned::to_owned);
-                    return;
+                    let next = summary.map(ToOwned::to_owned);
+                    if scanned.cached_summary != next {
+                        scanned.cached_summary = next;
+                        applied = true;
+                    }
+                    return applied;
                 }
             }
         }
+        applied
     }
 
     pub fn restore_session_preview_if_empty(
