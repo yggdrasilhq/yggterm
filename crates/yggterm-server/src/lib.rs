@@ -6177,6 +6177,7 @@ impl YggtermServer {
     /// process. A generic temporary title is intentional: the normal background
     /// title copier replaces it from the CLI store, while an invented transcript
     /// title here would become a second title authority.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn recover_owned_agent_runtime_row(
         &mut self,
         runtime_key: &str,
@@ -6185,6 +6186,7 @@ impl YggtermServer {
         launch_command: &str,
         cwd: Option<&str>,
         storage_path: Option<&Path>,
+        home: &Path,
     ) -> Option<(String, &'static str)> {
         let descriptor = agent_cli_descriptor(kind)?;
         let birth_id = local_runtime_id_from_key(runtime_key)?;
@@ -6315,6 +6317,31 @@ impl YggtermServer {
         }
 
         if self.represents_terminal_runtime_key(runtime_key) {
+            return None;
+        }
+        // THE CLOSE OUTRANKS THE HELD RUNTIME. The daemon can own (or have
+        // spawned) the CLI's serve process while the user has closed the row
+        // for that very session: the opencode service keeps its closed
+        // sessions in its store and tabs, so this recovery re-birthed the row
+        // on every sweep (measured on the GUI host 2026-09-16: the same
+        // tombstoned session re-born at 15:33:19 and 15:44:42, ~11.5 min
+        // apart). The tombstone law says a close sticks "even when the peer
+        // legitimately owns the runtime it is offering back" — the read-only
+        // door is asked here for the BIRTH half only; the repair of an
+        // existing row above is not a resurrection. A deliberate re-open goes
+        // through the permissive open verb, which clears the tombstone.
+        if !crate::live_row_closes_remembered_among(home, [runtime_key]).is_empty() {
+            append_trace_event(
+                home,
+                "server",
+                "recovery",
+                "recovery_vetoed_closed_row",
+                serde_json::json!({
+                    "runtime_key": runtime_key,
+                    "kind": format!("{kind:?}"),
+                    "detail": "the user closed this row; the held runtime does not resurrect it",
+                }),
+            );
             return None;
         }
         self.restore_live_session(PersistedLiveSession {
@@ -48634,6 +48661,63 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn a_closed_session_with_a_held_runtime_is_never_re_birthed_by_the_sweep() {
+        use crate::live_row_tombstones::{LiveRowTombstones, now_secs};
+
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-recovery-veto-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let runtime_key = "agy-runtime://00000000-0000-4000-8000-000000000061";
+        let real_id = "00000000-0000-4000-8000-000000000062";
+        let launch = "agy --conversation 00000000-0000-4000-8000-000000000062";
+        // Production records the FOLDED identity (remove_session folds before
+        // record_close); the test must ask about the same identity the sweep
+        // will be asked about.
+        LiveRowTombstones::default()
+            .record_close(
+                &home,
+                &crate::normalized_live_row_identity(runtime_key),
+                now_secs(),
+            )
+            .expect("record the close the way remove_session does");
+
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let outcome = server.recover_owned_agent_runtime_row(
+            runtime_key,
+            SessionKind::Antigravity,
+            Some(real_id),
+            launch,
+            Some("/home/user/project"),
+            None,
+            &home,
+        );
+        assert!(
+            outcome.is_none(),
+            "the sweep holds the serve runtime, the user closed the row — the              close must outrank the runtime or every sweep resurrects the ghost              (measured live 2026-09-16: re-births ~11.5 min apart)"
+        );
+        assert!(
+            !server
+                .live_session_order_keys()
+                .iter()
+                .any(|key| key == runtime_key),
+            "no row may land for the closed session"
+        );
+        // The tombstone SURVIVES the vetoed sweep, so the denial is durable.
+        let remembered = crate::live_row_closes_remembered_among(&home, [runtime_key]);
+        assert_eq!(remembered, vec![runtime_key.to_string()]);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn adopted_agent_runtime_without_a_row_recovers_presence_without_launching() {
         let runtime_key = "agy-runtime://00000000-0000-4000-8000-000000000051";
         let real_id = "00000000-0000-4000-8000-000000000052";
@@ -48652,6 +48736,7 @@ terminal_window_id: None,
                 launch,
                 Some("/home/user/project"),
                 None,
+                std::path::Path::new("/nonexistent-yggterm-home-test"),
             )
             .expect("an adopted agent PTY must regain a row");
         assert_eq!(row_key, runtime_key);
@@ -48677,6 +48762,7 @@ terminal_window_id: None,
                     launch,
                     Some("/home/user/project"),
                     None,
+                    std::path::Path::new("/nonexistent-yggterm-home-test"),
                 )
                 .is_none(),
             "recovery is additive and idempotent"
@@ -48702,6 +48788,7 @@ terminal_window_id: None,
                 "exec /bin/bash -i",
                 Some("/home/user/project"),
                 None,
+                std::path::Path::new("/nonexistent-yggterm-home-test"),
             )
             .expect("fixture begins as the synthetic wrong-kind row");
         assert_eq!(first_repair, "recovered");
@@ -48724,6 +48811,7 @@ terminal_window_id: None,
                 launch,
                 Some("/home/user/project"),
                 None,
+                std::path::Path::new("/nonexistent-yggterm-home-test"),
             )
             .expect("the handoff must repair a persisted synthetic placeholder");
         assert_eq!(second_repair, "reclassified");
@@ -48773,6 +48861,7 @@ terminal_window_id: None,
                     "agy --conversation 00000000-0000-4000-8000-000000000073",
                     Some("/home/user/project"),
                     None,
+                    std::path::Path::new("/nonexistent-yggterm-home-test"),
                 )
                 .is_none(),
             "a normal owner-titled row is not a recovery placeholder"
