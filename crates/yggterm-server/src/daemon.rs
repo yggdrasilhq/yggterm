@@ -11364,15 +11364,22 @@ impl DaemonRuntime {
                             )),
                         });
                     }
-                    if same_version_target && !force {
-                        // The long-standing rule for an UNFORCED request stands:
-                        // a handoff requires a different target version when
-                        // live terminal runtimes are present.
-                        return Ok(ServerResponse::Error {
-                            message: "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string(),
-                        });
-                    }
                     if same_version_target {
+                        // ⛔ THE UNFORCED REFUSAL IS GONE ([11.137], measured
+                        // on the GUI host 2026-09-16): the old rule — an
+                        // unforced same-version handoff with live terminal
+                        // runtimes is refused, "pass --force" — pinned the
+                        // daemon on stale builds all day, because the DEPLOY
+                        // fires this door unforced by design and every
+                        // same-version lane merge is therefore refused while
+                        // runtimes live (and on this fleet, runtimes always
+                        // live). The refusal predates the socket bequest: the
+                        // preserving arm below DESTROYS NOTHING — this process
+                        // keeps its PTY fds and lingers as the preserved owner
+                        // while the successor adopts the streams — so there is
+                        // nothing left that needs a force flag. The idle gate
+                        // still guards the cold-shutdown arm, which is the
+                        // only path that kills PTYs.
                         // ⛔ OWNER DIRECTIVE 2026-09-03: A SAME-VERSION NEWER
                         // BUILD IS AN UPDATE. It used to defer here — "the
                         // self-retire poll retries at the next quiet window" —
@@ -35918,6 +35925,30 @@ mod tests {
         assert!(
             restored.iter().any(|key| key == &kept_path),
             "the row that was never closed must still adopt"
+        );
+    }
+
+    /// LOCK: the unforced same-version refusal stays dead. The refusal pinned
+    /// the GUI-host daemon on stale builds all day (measured 2026-09-16: four
+    /// deploy rotations, each answered with "requires a different target
+    /// daemon version") because the deploy fires this door unforced by design
+    /// and same-version lane merges are the common deploy shape. The
+    /// preserving arm destroys nothing, so there is nothing a force flag is
+    /// protecting; if the refusal text ever reappears in the handler, this
+    /// lock fails.
+    #[test]
+    fn the_unforced_same_version_handoff_refusal_never_returns() {
+        let source = include_str!("daemon.rs");
+        // Assembled from parts: a literal here would trip this very assert.
+        let refusal = format!("requires a different target daemon {}", "version");
+        assert!(
+            !source.contains(&refusal),
+            "an unforced same-version handoff must reach the preserving bequest \
+             arm — the refusal pinned deployed fixes out of the daemon for hours"
+        );
+        assert!(
+            source.contains("same_version_target {"),
+            "the same-version bequest arm must remain reachable"
         );
     }
 
