@@ -2910,12 +2910,14 @@ fn restore_preserved_owner_live_sessions_from_snapshot(
     server: &mut YggtermServer,
     owner_snapshot: &ServerUiSnapshot,
     runtime_keys: &HashSet<String>,
+    home: &Path,
 ) -> Vec<String> {
     restore_preserved_owner_live_sessions_from_snapshot_with_policy(
         server,
         owner_snapshot,
         runtime_keys,
         false,
+        home,
     )
 }
 
@@ -2924,6 +2926,7 @@ fn restore_preserved_owner_live_sessions_from_snapshot_with_policy(
     owner_snapshot: &ServerUiSnapshot,
     runtime_keys: &HashSet<String>,
     require_recoverable_metadata: bool,
+    home: &Path,
 ) -> Vec<String> {
     let mut restored = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
@@ -2931,6 +2934,7 @@ fn restore_preserved_owner_live_sessions_from_snapshot_with_policy(
         .live_sessions
         .iter()
         .chain(owner_snapshot.active_session.iter());
+    let mut candidates = Vec::<(crate::PersistedLiveSession, String)>::new();
     for session in owner_sessions {
         if !seen.insert(session.session_path.clone()) {
             continue;
@@ -2950,6 +2954,42 @@ fn restore_preserved_owner_live_sessions_from_snapshot_with_policy(
         let Some(live) = persisted_live_session_from_preserved_owner_snapshot(session) else {
             continue;
         };
+        candidates.push((live, runtime_key));
+    }
+    // THE CLOSE OUTRANKS THE HANDOVER. A preserved owner legitimately holds
+    // the runtime of a row the user CLOSED on this side — the predecessor
+    // never saw the close — and adopting it undid the close on every
+    // handover. This is the exact case the tombstone plane was built for
+    // ("the memory that makes a close STICK even when the peer legitimately
+    // owns the runtime it is offering back"), so the batch asks the same
+    // read-only door the import admission asks, once, before any row lands.
+    let tombstoned: HashSet<String> =
+        crate::live_row_closes_remembered_among(
+            home,
+            candidates.iter().map(|(live, _)| live.key.as_str()),
+        )
+        .into_iter()
+        .collect();
+    let vetoed_rows: Vec<String> = candidates
+        .iter()
+        .filter(|(live, _)| tombstoned.contains(&live.key))
+        .map(|(live, _)| live.key.clone())
+        .collect();
+    if !vetoed_rows.is_empty() {
+        crate::append_trace_event(
+            home,
+            "daemon",
+            "hot_update",
+            "preserved_owner_adoption_vetoed_closed_rows",
+            serde_json::json!({
+                "vetoed": vetoed_rows,
+            }),
+        );
+    }
+    for (live, runtime_key) in candidates {
+        if tombstoned.contains(&live.key) {
+            continue;
+        }
         server.restore_live_session(live);
         restored.push(runtime_key);
     }
@@ -8021,6 +8061,7 @@ impl DaemonRuntime {
                 &mut self.server,
                 &owner_snapshot,
                 &missing_keys,
+                self.store.home_dir(),
             );
             if restored_runtime_keys.is_empty() {
                 continue;
@@ -8151,6 +8192,7 @@ impl DaemonRuntime {
                     &owner_snapshot,
                     &missing_keys,
                     false,
+                    self.store.home_dir(),
                 );
             if restored_runtime_keys.is_empty() {
                 continue;
@@ -8607,6 +8649,7 @@ impl DaemonRuntime {
                             &owner_snapshot,
                             &stale_runtime_key_set,
                             false,
+                            self.store.home_dir(),
                         );
                     for runtime_key in &restored_running_runtime_keys {
                         if let Err(error) = self.preserved_terminal_owners.upsert_runtime_owner(
@@ -19504,6 +19547,11 @@ fn recover_missing_row_for_adopted_agent_runtime(
         }),
     };
     let cwd = metadata.cwd.as_deref().or(identity_cwd.as_deref());
+    // No resolvable home, no recovery: the tombstone ask must be answerable,
+    // and an unanswerable close-veto must fail CLOSED (no row born) — a
+    // daemon that cannot read its own home has bigger problems than a
+    // missing row.
+    let home = crate::resolve_yggterm_home().ok()?;
     let (row_key, row_repair) = runtime.server.recover_owned_agent_runtime_row(
         &metadata.runtime_key,
         kind,
@@ -19511,6 +19559,7 @@ fn recover_missing_row_for_adopted_agent_runtime(
         &metadata.launch_command,
         cwd,
         storage_path.as_deref(),
+        &home,
     )?;
     Some((row_key, kind, kind_origin, id_origin, row_repair))
 }
@@ -35818,6 +35867,61 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_row_in_a_preserved_owner_snapshot_is_not_adopted_back() {
+        use crate::live_row_tombstones::{LiveRowTombstones, now_secs};
+
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-adopt-veto-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let closed_path = remote_scanned_session_path("practice", "closed-aaaa");
+        let kept_path = remote_scanned_session_path("practice", "kept-bbbbb");
+        LiveRowTombstones::default()
+            .record_close(&home, &closed_path, now_secs())
+            .expect("record the close the way remove_session does");
+
+        let mk = |path: &String| {
+            let mut s = daemon_test_snapshot_session(path, SessionSource::LiveSsh);
+            s.ssh_target = Some("practice".to_string());
+            s
+        };
+        let owner_snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![mk(&closed_path), mk(&kept_path)],
+        };
+        let runtime_keys = HashSet::from([closed_path.clone(), kept_path.clone()]);
+
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let restored = super::restore_preserved_owner_live_sessions_from_snapshot(
+            &mut server,
+            &owner_snapshot,
+            &runtime_keys,
+            &home,
+        );
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(
+            !restored.iter().any(|key| key == &closed_path),
+            "the predecessor never saw the close; adopting its snapshot must not              undo it — this is the case the tombstone plane was built for"
+        );
+        assert!(
+            restored.iter().any(|key| key == &kept_path),
+            "the row that was never closed must still adopt"
+        );
+    }
+
+    #[test]
     fn preserved_owner_snapshot_restores_missing_live_session_row() {
         let mut server = YggtermServer::new(
             false,
@@ -35858,6 +35962,7 @@ mod tests {
             &mut server,
             &owner_snapshot,
             &runtime_keys,
+            std::path::Path::new("/nonexistent-yggterm-home-test"),
         );
         let focused = server.focus_live_session_without_launch_if_active_missing(&session_path);
 
@@ -35948,6 +36053,7 @@ mod tests {
             &owner_snapshot,
             &runtime_keys,
             true,
+            std::path::Path::new("/nonexistent-yggterm-home-test"),
         );
 
         assert_eq!(restored, vec![kept_path.clone(), update_path.clone()]);
@@ -39280,6 +39386,7 @@ mod tests {
             &owner_snapshot,
             &runtime_keys,
             false,
+            std::path::Path::new("/nonexistent-yggterm-home-test"),
         );
 
         assert_eq!(restored, vec![running_path.clone()]);

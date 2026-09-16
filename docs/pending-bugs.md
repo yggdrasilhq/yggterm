@@ -31264,3 +31264,46 @@ fired) — count owned runtime sessions of ALL kinds.
 **Instrument for the conviction:** pid-attribute the writers — a perf span on
 `write_persisted_state` (the unconditional primitive has none today; only the
 routine halves do) would have named the stale writer in one evening.
+
+**Update 2026-09-16:** the unnamed re-entry vector of this entry is now NAMED
+and fixed as [11.135] (the owned-runtime recovery sweep + the preserved-owner
+adoption walk birthing closed rows back). The writer-law half above stays
+open.
+
+## ⛔ [11.135] THE OWNED-RUNTIME RECOVERY SWEEP AND THE PRESERVED-OWNER ADOPTION WALK RE-BIRTH ROWS THE USER DELETED WITHOUT ASKING THE TOMBSTONE PLANE — THE GHOST FACTORY (caught live on jojo 2026-09-16 15:33+15:44, the trace-fixing campaign; owner confirm after the [11.133] deploy: "nuking stopped, ghost dead rows coming alive")
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Filed 2026-09-16 ~16:00.
+
+**Measured:** the six opencode rows the owner keeps deleting (tombstones
+re-recorded at 23:53, 09:45, 13:41, 15:32 — tc up to 152) re-birth through
+`recover_owned_agent_runtime_row` (called from the daemon's owned-runtime
+reconciliation sweep, daemon.rs): `cli birth` → `live_session_birth` for the
+same tombstoned session at 15:33:19 AND 15:44:42 (~11.5 min cadence),
+`launch_now: false, activate: false`, and the title chore renames the newborn
+from the opencode store seconds later (`inserted_birth_title` at 15:33:20).
+The daemon owns the `opencode2 serve` process it spawned; the service keeps
+the closed sessions in its store and tabs; the sweep sees "a held runtime with
+no row" and synthesizes the row — the tombstone plane is never asked. The
+handover door does the same: `restore_preserved_owner_live_sessions_from_
+snapshot_with_policy` adopts a predecessor's rows for runtimes it holds,
+also without asking — and the predecessor never saw the close. The import
+door already asks (`peer_live_row_is_adoptable`), and the persisted-state
+restore door asks since [11.133]; these two were the remaining gaps, and the
+reconcile chokepoint then CLEARED the tombstones of every re-born row, so the
+owner's closes kept evaporating.
+
+**Fix (this lane):** both doors ask the same read-only tombstone door before
+any row lands — the birth half of `recover_owned_agent_runtime_row` (the
+repair half of an existing row is not a resurrection and stays veto-free) and
+the preserved-owner adoption walk (one batch ask; vetoed keys traced as
+`preserved_owner_adoption_vetoed_closed_rows`, single asks as
+`recovery_vetoed_closed_row`). The deliberate re-open stays permissive: the
+open verb clears the tombstone as before.
+
+**Falsifier (live):** on the deployed build, with the opencode serve process
+still holding the closed sessions, the sweep must NOT re-birth them — no new
+`live_session_birth` for a tombstoned key across ≥ 2 sweep ticks, the
+`recovery_vetoed_closed_row` trace naming them instead, and the sidebar stays
+at the user's curated set after restarts.
