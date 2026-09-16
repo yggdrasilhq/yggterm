@@ -49474,6 +49474,11 @@ fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
             || PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
             || shell.passive_copy_suspended
             || yggterm_core::copy_generation_is_paused()
+            // Passive title/summary work is idle work. The existing quiet
+            // policy already defers browser and remote refreshes while the
+            // focused terminal owns the viewport; applying the same gate here
+            // stops a scan from dirtying the WebKit-backed root mid-command.
+            || background_refreshes_deferred(&shell)
             || !shell.title_requests_in_flight.is_empty()
             || !shell.summary_requests_in_flight.is_empty()
             || shell.next_background_copy_scan_after_ms > now
