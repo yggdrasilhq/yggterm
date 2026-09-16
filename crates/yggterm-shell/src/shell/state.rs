@@ -909,7 +909,12 @@ const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
 // visible latency on top of the frame flush. Only the focused session uses this
 // fast cadence (unfocused sessions use TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS),
 // so the extra reads cost is one session's worth.
-const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 16;
+// Active terminal reads are also driven by a Dioxus task waker.  On a host
+// whose monotonic clock is HPET-backed, a 16 ms idle/read cadence keeps the
+// GTK event loop hot even when the PTY has no user-visible bytes.  Input echo
+// has its own 8 ms burst cadence below; 50 ms keeps ordinary output under one
+// frame of perceptible latency without making the whole GUI a 60 Hz poller.
+const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 50;
 const TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS: u64 = 16_000;
 const TERMINAL_UNFOCUSED_TUI_DROP_READ_POLL_MS: u64 = 15_000;
 /// How often a bridge whose paint is suspended for a daemon handover looks
