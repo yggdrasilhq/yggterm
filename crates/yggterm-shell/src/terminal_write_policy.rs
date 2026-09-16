@@ -19,6 +19,23 @@ pub(crate) fn terminal_write_should_frame_budget(
         && !terminal_output_contains_interactive_codex_surface(data)
 }
 
+/// Re-sending an identical libyggterm OSC heartbeat/control batch cannot change
+/// the terminal surface: the daemon already retains the latest declaration,
+/// while xterm would only parse the same protocol bytes again and repaint the
+/// same canvas. Keep this guard narrow: only exact duplicate protocol batches
+/// carrying the OSC 7717 channel are suppressible; ordinary terminal control
+/// sequences may be stateful even when repeated.
+pub(crate) fn terminal_protocol_only_duplicate_should_skip(
+    data: &str,
+    protocol_only_output: bool,
+    previous_protocol_batch: &str,
+) -> bool {
+    protocol_only_output
+        && !data.is_empty()
+        && data == previous_protocol_batch
+        && data.contains("\x1b]7717;")
+}
+
 pub(crate) fn terminal_output_is_high_volume_frame_like(data: &str) -> bool {
     !terminal_output_is_inline_status_rewrite_frame(data)
         && (terminal_output_has_synchronized_repaint_frame(data)
@@ -247,4 +264,31 @@ fn terminal_frame_anchors() -> [&'static str; 5] {
 
 pub(crate) fn terminal_csi_count_at_least(data: &str, threshold: usize) -> bool {
     data.match_indices("\x1b[").take(threshold).count() >= threshold
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_protocol_only_duplicate_should_skip;
+
+    #[test]
+    fn duplicate_libyggterm_protocol_batch_is_suppressible() {
+        let batch = "\x1b]7717;web-surface;heartbeat;abc\x07\x1b]7717;sidebar;declare;def\x07";
+        assert!(terminal_protocol_only_duplicate_should_skip(batch, true, batch));
+    }
+
+    #[test]
+    fn changed_or_non_protocol_batch_is_not_suppressible() {
+        let batch = "\x1b]7717;web-surface;heartbeat;abc\x07";
+        assert!(!terminal_protocol_only_duplicate_should_skip(
+            batch,
+            true,
+            "\x1b]7717;web-surface;heartbeat;old\x07"
+        ));
+        assert!(!terminal_protocol_only_duplicate_should_skip(
+            "\x1b[?25l",
+            true,
+            "\x1b[?25l"
+        ));
+        assert!(!terminal_protocol_only_duplicate_should_skip(batch, false, batch));
+    }
 }

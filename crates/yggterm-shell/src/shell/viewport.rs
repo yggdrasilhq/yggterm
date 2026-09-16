@@ -6451,6 +6451,13 @@ fn TerminalCanvas(
             let mut inline_status_animation_started_at_ms = 0_u64;
             let mut last_forward_protocol_only_trace_ms = 0_u64;
             let mut suppressed_forward_protocol_only_trace_count = 0_u64;
+            // A libyggterm heartbeat is protocol-only and often byte-identical
+            // from one PTY read to the next. The daemon has already retained
+            // the declaration; forwarding the same OSC batch again only makes
+            // xterm parse it and repaint. Keep the previous batch per mounted
+            // terminal so a changed declaration still lands immediately.
+            let mut last_forwarded_protocol_batch = String::new();
+            let mut suppressed_duplicate_protocol_batch_count = 0_u64;
             // Last time real (non-protocol-only) PTY output was forwarded to
             // xterm — the recent-output gate for the screen reconcile.
             let mut last_forwarded_output_at_ms = 0_u64;
@@ -12387,10 +12394,12 @@ fn TerminalCanvas(
                                                         "cursor": cursor,
                                                         "bytes": data.len(),
                                                         "suppressed_since_last": suppressed_forward_protocol_only_trace_count,
+                                                        "duplicate_suppressed_since_last": suppressed_duplicate_protocol_batch_count,
                                                     }),
                                                 );
                                                 last_forward_protocol_only_trace_ms = now_ms;
                                                 suppressed_forward_protocol_only_trace_count = 0;
+                                                suppressed_duplicate_protocol_batch_count = 0;
                                             } else {
                                                 suppressed_forward_protocol_only_trace_count =
                                                     suppressed_forward_protocol_only_trace_count
@@ -12518,40 +12527,60 @@ fn TerminalCanvas(
                                                     }
                                                 }
                                             } else {
-                                            for write in terminal_write_bridge.stage_or_immediate(
-                                                data.clone(),
-                                                current_millis(),
-                                                false,
-                                            ) {
-                                                // ytrace input latency: PTY render (bytes about to be painted)
-                                                yggterm_core::perf::ytrace_emit_event(
-                                                    "shell",
-                                                    "input",
-                                                    "render",
-                                                    serde_json::json!({
-                                                        "session_path": session_path.clone(),
-                                                        "data_len": data.len(),
-                                                        "staged_len": data.len(),
-                                                    }),
-                                                );
-                                                record_terminal_forward_sample(
-                                                    &trace_home,
-                                                    write.len(),
-                                                    current_millis(),
-                                                );
-                                                let write_len = write.len();
-                                                if eval
-                                                    .send(TerminalJsCommand::Write { data: write, protocol_only: forward_terminal_protocol_only_output })
-                                                    .is_err()
-                                                {
-                                                    trace_terminal_write_send_failure(
-                                                        &trace_home,
-                                                        &session_path,
-                                                        write_len,
-                                                        &mut last_write_send_failure_trace_ms,
+                                                let duplicate_protocol_batch =
+                                                    terminal_protocol_only_duplicate_should_skip(
+                                                        data,
+                                                        forward_terminal_protocol_only_output,
+                                                        &last_forwarded_protocol_batch,
                                                     );
+                                                if duplicate_protocol_batch {
+                                                    suppressed_duplicate_protocol_batch_count =
+                                                        suppressed_duplicate_protocol_batch_count
+                                                            .saturating_add(1);
+                                                } else {
+                                                    if forward_terminal_protocol_only_output
+                                                        && data.contains("\x1b]7717;")
+                                                    {
+                                                        last_forwarded_protocol_batch =
+                                                            data.to_string();
+                                                    }
+                                                    for write in terminal_write_bridge
+                                                        .stage_or_immediate(
+                                                            data.clone(),
+                                                            current_millis(),
+                                                            false,
+                                                        )
+                                                    {
+                                                        // ytrace input latency: PTY render (bytes about to be painted)
+                                                        yggterm_core::perf::ytrace_emit_event(
+                                                            "shell",
+                                                            "input",
+                                                            "render",
+                                                            serde_json::json!({
+                                                                "session_path": session_path.clone(),
+                                                                "data_len": data.len(),
+                                                                "staged_len": data.len(),
+                                                            }),
+                                                        );
+                                                        record_terminal_forward_sample(
+                                                            &trace_home,
+                                                            write.len(),
+                                                            current_millis(),
+                                                        );
+                                                        let write_len = write.len();
+                                                        if eval
+                                                            .send(TerminalJsCommand::Write { data: write, protocol_only: forward_terminal_protocol_only_output })
+                                                            .is_err()
+                                                        {
+                                                            trace_terminal_write_send_failure(
+                                                                &trace_home,
+                                                                &session_path,
+                                                                write_len,
+                                                                &mut last_write_send_failure_trace_ms,
+                                                            );
+                                                        }
+                                                    }
                                                 }
-                                            }
                                             }
                                             set_signal_if_changed(
                                                 terminal_resume_surface_staged,
