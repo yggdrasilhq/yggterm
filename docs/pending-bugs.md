@@ -31389,11 +31389,26 @@ SCOPE, two halves:
    orphans local delegates — does not reach a turn that lives on another
    host.
 
-**Fix shape:** in the blocker collection, rows whose runtime is remote
-(`remote-*` schemes — the turn lives on the peer) are either not blockers at
-all or a NON-exempt kind, so the existing 30-minute deadline applies. Local
-agent rows keep today's protection. The §8 interrupted-list machinery is
-untouched.
+**ROOT CAUSE (refined 2026-09-16 ~19:30, same sitting):** the gate was the
+SURFACE, not the mechanism. The deploy fires the restart door UNFORCED
+(`server app update restart` without --force, deploy-fleet.sh), and the
+daemon's HotRestart handler REFUSED unforced same-version handoffs when live
+terminal runtimes exist ("requires a different target daemon version … pass
+--force"). Same-version lane merges are the common deploy shape and this
+fleet's runtimes always live, so the daemon was pinned by that refusal all
+day — the gate blockers in `server status` were merely what WOULD have
+blocked the cold arm. The 2026-09-03 owner directive ("a same-version newer
+build is an update") already moved the FORCED path to the preserving bequest
+arm, which destroys nothing (the daemon keeps its PTY fds and lingers as the
+preserved owner while the successor adopts) — the force requirement simply
+outlived its rationale.
+
+**Fix (lane/trace/137-bequest-unforced):** the unforced same-version refusal
+is deleted — an unforced same-version handoff now reaches the preserving
+bequest arm like a version bump does. The idle gate still guards the
+cold-shutdown arm untouched. Lock:
+`the_unforced_same_version_handoff_refusal_never_returns` (structural; the
+needle is assembled from parts so the lock cannot trip itself).
 
 **Owner-visible symptom chain today:** ghost-row fixes landed at
 00:17/16:22/17:10 while the only daemon that needed them stayed four builds
