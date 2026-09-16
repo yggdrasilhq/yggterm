@@ -13390,7 +13390,7 @@ impl YggtermServer {
         }
         let remote_stored_session =
             parse_remote_agent_session_path(&path).and_then(|(machine_key, session_id)| {
-                self.sessions.get(&path).and_then(|session| {
+                self.sessions.get(path).and_then(|session| {
                     (session.source == SessionSource::Stored).then(|| {
                         (
                             machine_key.to_string(),
@@ -13448,7 +13448,7 @@ impl YggtermServer {
             self.open_local_cc_session(&path);
             return;
         }
-        let cached_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
+        let cached_live_ssh_launch = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
                 return None;
             }
@@ -13467,7 +13467,7 @@ impl YggtermServer {
         // the session sat at remote_deploy_state=Planned forever with an empty
         // viewport and no user-visible hint about the version mismatch.
         let mut resolved_live_ssh_launch_error: Option<(String, String)> = None;
-        let resolved_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
+        let resolved_live_ssh_launch = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
                 return None;
             }
@@ -13504,7 +13504,7 @@ impl YggtermServer {
             }
         });
         let mut recovered_remote_live_session: Option<String> = None;
-        let missing_remote_live_session = self.sessions.get(&path).and_then(|session| {
+        let missing_remote_live_session = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session)
                 || !is_remote_scanned_live_session_path(&session.session_path)
                 || remote_live_session_starts_new_codex(session)
@@ -13604,7 +13604,7 @@ impl YggtermServer {
         }
         if self
             .sessions
-            .get(&path)
+            .get(path)
             .is_some_and(|session| session.source == SessionSource::Stored)
             && self
                 .focus_or_create_live_runtime_for_stored_session(&path)
@@ -13612,7 +13612,7 @@ impl YggtermServer {
         {
             return;
         }
-        let Some(session) = self.sessions.get_mut(&path) else {
+        let Some(session) = self.sessions.get_mut(path) else {
             return;
         };
         let mut promote_active_remote_launch =
