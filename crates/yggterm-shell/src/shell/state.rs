@@ -79,7 +79,8 @@ use crate::terminal_write_policy::{
 };
 use crate::terminal_write_policy::{
     terminal_inline_status_animation_budget_state, terminal_output_is_high_volume_frame_like,
-    terminal_output_is_inline_status_rewrite_frame, terminal_write_should_frame_budget,
+    terminal_output_is_inline_status_rewrite_frame, terminal_protocol_only_duplicate_should_skip,
+    terminal_write_should_frame_budget,
 };
 use crate::theme_contract::{
     linux_compositor_blur_active_for_app_control, shell_css_backdrop_filter_enabled,
