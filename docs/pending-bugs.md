@@ -31307,3 +31307,45 @@ still holding the closed sessions, the sweep must NOT re-birth them — no new
 `live_session_birth` for a tombstoned key across ≥ 2 sweep ticks, the
 `recovery_vetoed_closed_row` trace naming them instead, and the sidebar stays
 at the user's curated set after restarts.
+
+**Update 2026-09-16, later (same lane family):** a THIRD door was caught
+live after the recovery fix deployed — the opencode MIRROR's spawn arm
+(`apply_opencode_tab_mirror` → `plan_tab_sync.spawn`): with the owner's rows
+deleted, the next tick planned `plan_spawn: 6` and re-projected the closed
+sessions (16:44:44, `owned: 6` again by 16:51). The service is exactly the
+"peer that legitimately holds the runtime" the tombstone plane was built
+for. Same lane: `tombstoned_opencode_mirror_spawns` (one batch ask before
+the spawn loop, traced as `spawn_vetoed_closed_rows`), lock
+`tombstoned_opencode_mirror_spawns_blocks_the_closed_tab_only` +
+`apply_opencode_tab_mirror_asks_the_tombstone_plane_before_spawning`.
+
+## ⛔ [11.136] THE HOT-RESTART GATE DEFERS ON ANY WORKING AGENT ROW, AND THIS FLEET'S AGENT ROWS ARE ALWAYS WORKING — DAEMON-SIDE FIXES SIT DEPLOYED-BUT-UNEXECUTED FOR HOURS (measured on jojo 2026-09-16 16:2x-17:0x, the trace-fixing campaign; the reason the [11.133]/[11.135] fixes were "deployed" while the ghost rows kept winning)
+
+**Status:** AWAITING A DECISION
+
+Filed 2026-09-16 ~17:15.
+
+**Measured:** jojo's daemon (pid 4044535, born 15:26 on build b0aafc158b88)
+survived FOUR deploy rotations (16:21, 16:35, 16:45 GUI relaunches, each
+firing prepare_update_restart + hot_restart ~780 ms) and never handed over.
+`server status` names the blocker:
+`hot_restart_block_reason: "remote-session://dev/f9850… is working (esc to
+interrupt)"` — kind `working`, threshold 300 s, `permanent: false`. The
+gate is doing what the [11.92]-era law wants (never interrupt a live agent
+turn), but this fleet's rows are LONG agent turns: at every attempt window
+some row reads working, so the daemon can defer indefinitely while newer
+builds pile up — the owner experiences "deployed" fixes not working because
+the binary that must run them never turns over. The GUI rotates every
+relaunch; only the daemon is stuck.
+
+**Fix shapes to weigh ON THAT LANE:** (a) trace the deferral per attempt
+(absence is not evidence — today the only witness was a manual `server
+status`); (b) a starvation bound — e.g. after N consecutive deferrals or M
+minutes past staged, rotate at the next row-idle boundary with the row
+preserved (the PTY-preserving handover already exists); (c) an owner-visible
+surface ("your daemon is N builds behind; blocked by row X working — esc to
+interrupt it, or force"). The existing
+`same_version_handoff_cooldown_remaining_ms` machinery is the natural home.
+
+**Immediate unblock for the owner:** press `esc` on the named row (or let
+it idle past 5 min) and the next deploy tick rotates the daemon.
