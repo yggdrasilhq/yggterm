@@ -31456,7 +31456,7 @@ behind; the owner re-reported the same ghosts three times.
 
 ## ⛔ [11.138] THE WORKING-RECENCY METRONOME — BRIDGED KEEPALIVE FRAMES RESTAMP THE ACTIVITY CLOCKS AND AN IDLE CODEX ROW RIDES THE WORKING VERDICT EVERY ~305s FOR HOURS, HOLDING BOTH HOSTS' ROTATIONS (measured live 2026-09-17 09:49→11:31 on the GUI host + the dev headless, trace-fixing campaign)
 
-**Status:** FIXED IN CODE (lane/trace/gui-thrash-freeze)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Owner report: "codex sitting in a wedged state with amber light … usually
 goes away, but sometimes codex sessions sit with amber light on." The row:
@@ -31507,7 +31507,7 @@ repaints (the deaf-row family).
 
 ## ⚠ [11.139] THE OWNER-VISIBLE CODEX AMBER IS A STUCK REMOTE ATTACH — `ghost_frame` + `transport_degraded` + `remote_attach_pending` OUTLIVES THE MOUNT RACE THAT CAUSED IT, WITH NO TIMEOUT AND NO RETRY THAT COMPLETES (measured live 2026-09-17 on the GUI host, same sitting as [11.138])
 
-**Status:** OPEN (characterized; fix not started)
+**Status:** OPEN
 
 The amber the owner sees is NOT the working dot: `server app rows` for the
 codex row shows `ghost_frame: true`, `terminal_transport_degraded: true`,
