@@ -31559,8 +31559,22 @@ on success). The missing wire is the ONE call at the superseded break. ⛔ Do
 not wire it blind: the superseding owner may be mid-fresh-mount with its own
 `terminal_attach_in_flight`, and an invalidation that ignores that would
 kill the winner's attach (the exact double-mount the cold-remount resolver's
-settling guard exists to prevent). REPRO IS CHEAP: a cold remote row's
-ensure takes seconds of ssh — switch to another row during it and back, and
-you land in this break on demand. Prove the circuit there, wire it behind
-that guard, then the falsifier above must pass on the live row.
+settling guard exists to prevent).
+
+**REPRO ATTEMPT (same sitting, on-demand):** two live drives against a
+stored remote row (cold restore + `app open`, and a cold restore with a
+`terminal write` fired inside the ensure window) did NOT reproduce — the
+bootstrap lease serialized every challenger
+(`bootstrap_spawn_skipped_existing_lease`), three write-triggered
+`bootstrap_reset`+`spawn_scheduled` cycles inside 4s all recovered healthy,
+and no `bootstrap_owner_superseded_after_ensure` fired. The lease IS the
+existing guard; the measured orphan needed the incident's exact
+interleaving (owner typing 10:38:27, begin 10:38:32, superseded 10:38:34 —
+2s later). Consequence: at the moment the break fires there IS a newer
+lease holder whose own attach is in flight, so wiring the invalidation at
+the break WOULD threaten the winner's mount — the in-flight guard the next
+seat must prove is real, not hypothetical. The instrumented reason
+(`attach_superseded_owner_lost`) makes the next natural occurrence
+immediately visible in `server app rows` and ytrace; the falsifier stands
+on that occurrence.
 
