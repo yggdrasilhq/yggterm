@@ -64,6 +64,16 @@ const BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK: usize = 2;
 // A session that produced PTY output within this window counts as "working"
 // for the title trigger even if the esc-to-interrupt footer just cleared.
 const BACKGROUND_COPY_WORKING_RECENT_MS: u64 = 30_000;
+// Output recency only counts as working while the row has ALSO shown the
+// working screen inside this window. A bridged runtime's keepalive/poll
+// frames reset the activity clocks with no payload (measured live 2026-09-17:
+// a codex row pulsed `working` on every ~305s chore tick for hours — screen
+// never working, zero pty bytes written by either side, both hosts' rotations
+// blocked, row amber the whole time). A genuinely mid-turn agent paints the
+// esc-to-interrupt screen within a beat of its first output, so the window
+// costs nothing real; a row that never matches its CLI's working phrase
+// (phrase drift) keeps the forced-swap deadline as its backstop.
+const WORKING_RECENCY_SCREEN_WINDOW_MS: u64 = 600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentAttachmentState {
@@ -6796,8 +6806,24 @@ impl DaemonRuntime {
             // A drafted input line is protected separately and deliberately
             // (`session_has_pending_input_draft`), so this does not expose an
             // unsent prompt.
+            //
+            // [11.138] and OUTPUT idle itself needs the working-screen
+            // qualifier on bridged runtimes: their keepalive/poll frames
+            // restamp the output clock with no payload. Measured 2026-09-17 —
+            // one idle codex row pulsed this exact blocker on every ~305s tick
+            // for hours (screen never working, zero pty bytes written by
+            // either side, strace-proven) and held BOTH hosts' rotations. The
+            // row's own per-kind `working` verdict above is the semantic half;
+            // output recency only rides while that verdict (or its 10-minute
+            // shadow) says the agent was seen working.
             if let Some(idle_ms) = self.terminals.session_output_idle_for_ms(&runtime_path)
                 && idle_ms < threshold_ms
+                && working_recency_screen_qualified(
+                    key,
+                    now_unix_ms(),
+                    working == Some(true),
+                    true,
+                )
             {
                 blockers.push(HotRestartBlocker {
                     session_key: key.clone(),
@@ -15957,6 +15983,44 @@ fn collect_agent_attachment_sweep(runtime: &mut DaemonRuntime) -> serde_json::Va
     })
 }
 
+/// [11.138] Output recency, qualified by working-screen evidence.
+///
+/// Raw "the PTY moved in the last 30s" cannot answer "is an agent mid-turn"
+/// on bridged runtimes: their keepalive/poll frames restamp the activity and
+/// output clocks with no payload, so an idle-at-prompt row reads as endlessly
+/// recently-active and rides every consumer of the working verdict (the amber
+/// dot, background-copy generation, rotation deferral). The working screen is
+/// the semantic half of the signal, so raw recency counts only while the row
+/// has shown that screen inside `WORKING_RECENCY_SCREEN_WINDOW_MS`.
+///
+/// The observation map is process-global (the chore runs on one thread, so a
+/// plain Mutex has no contention) and pruned to the window every call — a row
+/// that has not shown the working screen within the window carries no state.
+fn working_recency_screen_qualified(
+    path: &str,
+    now_ms: u64,
+    screen_working_now: bool,
+    raw_recent: bool,
+) -> bool {
+    static SCREEN_WORKING_SEEN: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, u64>>,
+    > = std::sync::OnceLock::new();
+    let mutex = SCREEN_WORKING_SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    // A poisoned lock means a holder panicked mid-update; the map's data is
+    // still structurally valid (single-field inserts), so use it rather than
+    // degrading every future verdict to screen-only.
+    let mut seen = mutex
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    seen.retain(
+        |_, last_seen| now_ms.saturating_sub(*last_seen) <= WORKING_RECENCY_SCREEN_WINDOW_MS,
+    );
+    if screen_working_now {
+        seen.insert(path.to_string(), now_ms);
+    }
+    raw_recent && (screen_working_now || seen.contains_key(path))
+}
+
 fn run_background_copy_chore(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     generation_enabled: bool,
@@ -15990,7 +16054,11 @@ fn run_background_copy_chore(
         // Working-indicator trigger: a live session counts as "working" when
         // its vt100 screen shows the agent working (esc-to-interrupt SSOT) or
         // its PTY produced output within the recent window — generation rides
-        // real turns, never idle sessions.
+        // real turns, never idle sessions. [11.138]: output recency is further
+        // qualified by working-screen evidence inside
+        // `WORKING_RECENCY_SCREEN_WINDOW_MS`, because bridged keepalive frames
+        // restamp the clocks with no payload and held an idle codex row amber
+        // (and both hosts' rotations blocked) for hours.
         //
         // ⭐ The two halves are collected SEPARATELY as well, because they
         // answer different questions and one consumer needs the stricter one.
@@ -16013,10 +16081,16 @@ fn run_background_copy_chore(
                 .terminals
                 .session_screen_snapshot(&runtime_path)
                 .is_some_and(|screen| yggterm_core::screen_text_shows_agent_working(&screen));
-            let recently_active = runtime
+            let raw_recent = runtime
                 .terminals
                 .session_idle_for_ms(&runtime_path)
                 .is_some_and(|idle_ms| idle_ms < BACKGROUND_COPY_WORKING_RECENT_MS);
+            let recently_active = working_recency_screen_qualified(
+                &session.session_path,
+                crate::current_millis_u64(),
+                screen_working,
+                raw_recent,
+            );
             if screen_working {
                 mid_turn_paths.insert(session.session_path.clone());
             }
@@ -35625,6 +35699,36 @@ mod tests {
             "the wait must be measured in MICROseconds: as integer milliseconds \
              93.9 % of real waits recorded as exactly 0, so the instrument built \
              to measure contention was blind to nearly all of it"
+        );
+    }
+
+    #[test]
+    fn keepalive_output_recency_rides_the_verdict_only_while_the_working_screen_window_is_open() {
+        // [11.138] The metronome row: keepalive/poll frames restamp the
+        // activity clocks with no payload, so raw output recency is true
+        // forever. With no working-screen observation the verdict must refuse
+        // to ride — this is the path that held an idle codex row amber for
+        // hours and blocked rotation on two hosts.
+        let path = "test://138-metronome-keepalive-row";
+        let now = crate::current_millis_u64();
+        assert!(
+            !super::working_recency_screen_qualified(path, now, false, true),
+            "raw output recency without any working-screen evidence must not count as working"
+        );
+
+        // A real turn: the screen shows working, so recency rides — and keeps
+        // riding for a beat after the spinner clears, which is the politeness
+        // the old raw-recency behaviour provided to real turns.
+        assert!(super::working_recency_screen_qualified(path, now + 1, true, true));
+        assert!(super::working_recency_screen_qualified(path, now + 2_000, false, true));
+
+        // Once the window closes with no fresh working-screen observation, the
+        // recency stops riding again: a poll-stamped clock cannot hold the
+        // verdict open by itself.
+        let after_window = now + super::WORKING_RECENCY_SCREEN_WINDOW_MS + 5_000;
+        assert!(
+            !super::working_recency_screen_qualified(path, after_window, false, true),
+            "a stale working-screen observation must not qualify recency past the window"
         );
     }
 
