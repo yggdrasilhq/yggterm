@@ -31536,3 +31536,31 @@ resume-timeout ceiling in either branch. Minimal version: a watchdog that
 re-arms the attach when `remote_attach_pending` has held longer than the
 resume ceiling. The deep version: make `mount_epoch_reused` carry the
 pending flag to the new owner explicitly.
+
+**Addendum same sitting — the orphan point named precisely, observability
+landed:** the break at the `terminal_ensure_apply` branch
+(viewport.rs `bootstrap_owner_superseded_after_ensure`) discards a
+SUCCESSFUL ensure round trip and dies without touching the surface status,
+so `remote_attach_pending` (set at mount begin) is frozen forever; the dot's
+amber is `needs_attention() = transport_degraded || ghost_frame`
+(state.rs `TerminalSurfaceStatus`), so both halves stay true and the amber
+sits for the life of the session. Writes still work (they ride the daemon
+request path, not the dead mount loop) — a HALF-DEAD mount: typable, never
+reading, amber forever. Shipped here: the break now retitles the status to
+`attach_superseded_owner_lost` (flag stays honest, the lie — "pending" — is
+gone) and carries `attach_status` in the trace event.
+
+**The re-arm circuit, mapped for the next seat:** the sanctioned recovery
+already exists — `invalidate_retained_remote_non_prompt_surface(path, Some
+(reason))` registers the fault, and the retained-fault-recovery starter then
+bumps `latest_open_request_id` ("retained_fault_recovery" attempt), which
+re-runs the mount-key effect as a FRESH mount (attach retried, amber clears
+on success). The missing wire is the ONE call at the superseded break. ⛔ Do
+not wire it blind: the superseding owner may be mid-fresh-mount with its own
+`terminal_attach_in_flight`, and an invalidation that ignores that would
+kill the winner's attach (the exact double-mount the cold-remount resolver's
+settling guard exists to prevent). REPRO IS CHEAP: a cold remote row's
+ensure takes seconds of ssh — switch to another row during it and back, and
+you land in this break on demand. Prove the circuit there, wire it behind
+that guard, then the falsifier above must pass on the live row.
+
