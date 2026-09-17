@@ -7197,6 +7197,7 @@ version = "3.2.113"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
+ "libc",
  "libloading 0.8.9",
  "md5",
  "reqwest",

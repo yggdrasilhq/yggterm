@@ -30116,6 +30116,16 @@ reclaim-stall storms instead of slow swap absorption.
 (<300M) and PSI memory full <2%; or a bounded/trimmed shell (canvas /
 scrollback virtualization) that survives the owner's normal day.
 
+**Addendum 2026-09-17 (the GUI host, same defect live; trace-fixing takeover
+sitting):** the shell webview here (pid 246077, 10h22m) measured 364→488MB
+RSS in 35 min mid-morning, then 856MB `mem_kb` + 316MB VmSwap with
+`committed_kb` 1.33GB in the `render/web_content` perf samples — which
+attribute `hot_pid: 246077` with 7.3 hot CPU-s per 60s interval sustained.
+The sustained webkit burner the owner attributes to the heavy web-app content is
+LARGELY THE SHELL RENDERER ITSELF: the heat and the swap-thrash are the
+same defect. Box carried 9.5G/15G swap through the morning. The growth
+feeder remains unprofiled; the falsifier stands unchanged.
+
 ## ⚠ [11.109] ui/block FILES SEVERE 2s "STALLS" ON A HEALTHY IDLE GUI — INTER-EVENT GAPS CONFUSE PARKED-IDLE WITH STALLED (measured 2026-09-14, same sitting as [11.108])
 
 **Status:** OPEN
@@ -31443,3 +31453,114 @@ needle is assembled from parts so the lock cannot trip itself).
 **Owner-visible symptom chain today:** ghost-row fixes landed at
 00:17/16:22/17:10 while the only daemon that needed them stayed four builds
 behind; the owner re-reported the same ghosts three times.
+
+## ⛔ [11.138] THE WORKING-RECENCY METRONOME — BRIDGED KEEPALIVE FRAMES RESTAMP THE ACTIVITY CLOCKS AND AN IDLE CODEX ROW RIDES THE WORKING VERDICT EVERY ~305s FOR HOURS, HOLDING BOTH HOSTS' ROTATIONS (measured live 2026-09-17 09:49→11:31 on the GUI host + the dev headless, trace-fixing campaign)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Owner report: "codex sitting in a wedged state with amber light … usually
+goes away, but sometimes codex sessions sit with amber light on." The row:
+`remote-session://dev/b1c11…` "New dev Codex" (keep-alive, NO rollout
+file, codex process 0.0% CPU — idle at its prompt all morning).
+
+Evidence chain (ytrace + /proc + strace; no code reasoning):
+
+- the GUI host daemon pulsed `working_edge` `recency_signal=true` for ~60s every
+  ~305s from 09:49:34 through 11:25:52, `screen_signal=false` throughout —
+  a metronome locked to the background-copy chore's max-idle tick (300s
+  sleep + ~3-5s of chore work). dev's headless twin
+  (`codex-runtime://b1c11…`) pulsed on its own ~305s phase (11:00:02,
+  11:05:00, 11:10:11, 11:15:15, 11:25:30, 11:30:41).
+- Because the pulse lands inside every 300s idle window, the row held
+  `hot_restart_block_reason` on BOTH hosts all morning ("… was active 99s
+  ago (idle window 300s)") — [11.136]'s rotation starvation, now with its
+  concrete mechanism.
+- ⭐ syscall proof the activity is fabricated: strace of the headless daemon
+  (430s covering dev's 11:10:11 tick) shows ZERO writes to any pty and only
+  TCGETS2/TIOCGPGRP ioctls; strace of codex itself (380s covering dev's
+  11:30:41 tick) shows ZERO writes to its pty — yet that tick pulsed
+  `working` on both observers. The transport does carry content-free frames
+  (strace of the start-codex bridge caught a 77-byte paint frame: `ESC[?2026h`
+  sync bracket + cursor positioning + cursor shape) — paint housekeeping
+  restamps the clocks while the screen never shows a working phrase.
+- Consumers harmed: the amber working verdict, background-copy generation
+  (rode every tick), and the gate's `recently_active` blocker (the rotation
+  starvation).
+
+**Fix:** `working_recency_screen_qualified` — output recency counts only
+while the row has ALSO shown its working screen inside
+`WORKING_RECENCY_SCREEN_WINDOW_MS` (10 min), applied at BOTH consumers (the
+chore verdict and the gate's `recently_active` blocker); the observation map
+is process-global and pruned per call. A genuinely mid-turn agent paints the
+esc-to-interrupt screen within a beat of its first output, so real turns
+keep the politeness; a row whose CLI's working phrase never matches (phrase
+drift) falls back to the forced-swap deadline as backstop.
+Lock: `keepalive_output_recency_rides_the_verdict_only_while_the_working_screen_window_is_open`.
+
+**Residual (OPEN, next seat):** (a) the clock-stamping itself — content-free
+paint frames still restamp `last_activity_ms`/`last_output_ms`; filtering
+them at the reader (screen_state.process but no stamp when the frame carries
+no text) would heal every future consumer, not just these two; (b) the
+observed `ESC[?2026h` bracket with no matching `2026l` in the same frame —
+worth one probe whether long-lived synchronized-output brackets stall
+repaints (the deaf-row family).
+
+## ⚠ [11.139] THE OWNER-VISIBLE CODEX AMBER IS A STUCK REMOTE ATTACH — `ghost_frame` + `transport_degraded` + `remote_attach_pending` OUTLIVES THE MOUNT RACE THAT CAUSED IT, WITH NO TIMEOUT AND NO RETRY THAT COMPLETES (measured live 2026-09-17 on the GUI host, same sitting as [11.138])
+
+**Status:** OPEN
+
+The amber the owner sees is NOT the working dot: `server app rows` for the
+codex row shows `ghost_frame: true`, `terminal_transport_degraded: true`,
+`terminal_attention: true`, reason `remote_attach_pending` — while
+`busy: false`, `session.working` screen-scraped false, `cached_input_bytes:
+0`. `remote_attach_pending` is set DELIBERATELY at terminal-mount begin
+(viewport.rs ~5962: mark amber at the start of the attach so the light turns
+during the first slow SSH/ensure round trip) and is supposed to clear when
+the attach completes.
+
+The row's mount timeline (the GUI host ytrace 10:38:24-36, right after the owner
+typed at the wedged row): `begin` → `js_wait_begin` → `ensure_begin` →
+`bootstrap_owner_superseded_after_ensure` → `mount_epoch_reused` →
+`resume_gate_ceiling` — and NO attach-complete event. Two bootstraps raced;
+the loser was superseded after its ensure round trip; nobody owns the attach
+completion, the pending flag never clears, and the held ghost frame keeps
+the row amber indefinitely. "Usually goes away" = a later clean reveal runs
+a full mount cycle; "sometimes sits" = the superseded race leaves the state
+machine orphaned.
+
+**Falsifier for the fix:** a row driven through `bootstrap_owner_superseded_
+after_ensure` must either hand the attach to the superseding owner (state
+carried, flag still true only until THAT attach completes) or re-arm a fresh
+attach attempt — `terminal_attention` must return to false within one
+resume-timeout ceiling in either branch. Minimal version: a watchdog that
+re-arms the attach when `remote_attach_pending` has held longer than the
+resume ceiling. The deep version: make `mount_epoch_reused` carry the
+pending flag to the new owner explicitly.
+
+**Addendum same sitting — the orphan point named precisely, observability
+landed:** the break at the `terminal_ensure_apply` branch
+(viewport.rs `bootstrap_owner_superseded_after_ensure`) discards a
+SUCCESSFUL ensure round trip and dies without touching the surface status,
+so `remote_attach_pending` (set at mount begin) is frozen forever; the dot's
+amber is `needs_attention() = transport_degraded || ghost_frame`
+(state.rs `TerminalSurfaceStatus`), so both halves stay true and the amber
+sits for the life of the session. Writes still work (they ride the daemon
+request path, not the dead mount loop) — a HALF-DEAD mount: typable, never
+reading, amber forever. Shipped here: the break now retitles the status to
+`attach_superseded_owner_lost` (flag stays honest, the lie — "pending" — is
+gone) and carries `attach_status` in the trace event.
+
+**The re-arm circuit, mapped for the next seat:** the sanctioned recovery
+already exists — `invalidate_retained_remote_non_prompt_surface(path, Some
+(reason))` registers the fault, and the retained-fault-recovery starter then
+bumps `latest_open_request_id` ("retained_fault_recovery" attempt), which
+re-runs the mount-key effect as a FRESH mount (attach retried, amber clears
+on success). The missing wire is the ONE call at the superseded break. ⛔ Do
+not wire it blind: the superseding owner may be mid-fresh-mount with its own
+`terminal_attach_in_flight`, and an invalidation that ignores that would
+kill the winner's attach (the exact double-mount the cold-remount resolver's
+settling guard exists to prevent). REPRO IS CHEAP: a cold remote row's
+ensure takes seconds of ssh — switch to another row during it and back, and
+you land in this break on demand. Prove the circuit there, wire it behind
+that guard, then the falsifier above must pass on the live row.
+

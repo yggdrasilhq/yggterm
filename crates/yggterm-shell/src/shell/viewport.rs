@@ -6805,6 +6805,28 @@ fn TerminalCanvas(
                                         "terminal_bootstrap_release_superseded_after_ensure",
                                     );
                                     clear_superseded_task_latch();
+                                    // [11.139] This break is the orphan point of
+                                    // the attach: a SUCCESSFUL ensure is thrown
+                                    // away and the mount loop dies while the
+                                    // surface status still reads
+                                    // "remote_attach_pending" from mount begin —
+                                    // nothing will ever update it again, so the
+                                    // row's amber (needs_attention = degraded ||
+                                    // ghost) sits for the life of the session and
+                                    // the reason keeps promising progress that no
+                                    // longer exists. Name the real state instead:
+                                    // the flag stays honest (the transport IS
+                                    // down and the frame IS held) but the tooltip
+                                    // now says the attach lost its owner, which
+                                    // is the one thing a reader can act on.
+                                    update_terminal_surface_status(
+                                        state,
+                                        &session_path,
+                                        true,
+                                        true,
+                                        0,
+                                        "attach_superseded_owner_lost",
+                                    );
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
@@ -6814,6 +6836,7 @@ fn TerminalCanvas(
                                             "session_path": session_path.clone(),
                                             "host_id": host_id.clone(),
                                             "owner": bootstrap_owner_identity.clone(),
+                                            "attach_status": "attach_superseded_owner_lost",
                                         }),
                                     );
                                     break;

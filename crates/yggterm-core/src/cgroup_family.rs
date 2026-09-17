@@ -424,8 +424,139 @@ pub fn spawn_family_sweep(home: std::path::PathBuf) {
                         );
                     }
                 }
+                maybe_recycle_web_child(&home, self_pid);
             }
         });
+}
+
+/// [11.108] The web child's committed footprint that earns its WebKit
+/// renderers a recycle. Committed = `memory.current` + `memory.swap.current`:
+/// RSS alone reads flat while the footprint climbs into swap (the 6.7 trap in
+/// the module header). The bound above (`memory.high`, ~1.84GiB live) only
+/// THROTTLES — a growth defect converts the throttle into a reclaim-storm and
+/// the desktop into swap-thrash (measured 2026-09-14: 1.2G RSS + 621M swap in
+/// ONE renderer, PSI memory full 17.8%, 5,814 ui/block incidents over 12h;
+/// measured again on the GUI host 2026-09-17 at 856MB + 316MB swap / 1.33GB committed
+/// in the 10h shell renderer). Past this watermark the shell is already
+/// unusable, so the proven remediation — SIGKILL of the bloated renderer,
+/// webkit respawns it, view-plane only, every PTY row untouched — is applied
+/// deliberately instead of suffered accidentally. Sits BELOW the kernel
+/// throttle on purpose: the recycle must win the race against the storm.
+pub const WEB_RECYCLE_COMMITTED_BYTES: u64 = 1_610_612_736; // 1.5 GiB
+
+/// The breach must hold this many consecutive sweep ticks (10s each) before
+/// the recycle fires — one spike from a page that is about to free itself
+/// must not kill anything.
+pub const WEB_RECYCLE_SUSTAINED_TICKS: u32 = 3;
+
+/// Minimum spacing between recycles. A fresh renderer re-grows slowly
+/// (10h to 1.8GB on the measured defect); a second recycle inside this window
+/// would mean the growth is NOT slow, which is a different defect that must
+/// stay visible instead of being silently reset every half hour.
+pub const WEB_RECYCLE_MIN_INTERVAL_MS: u64 = 30 * 60_000;
+
+/// Kill switch for the recycle: `YGGTERM_DISABLE_WEB_RECYCLE=1` (or `true`).
+pub fn web_recycle_disabled_from_env(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// The members of the web child the recycle may signal: ONLY WebKit content
+/// renderers, matched by the truncated-comm prefix (15-byte kernel limit —
+/// `WebKitWebProcess` arrives as `WebKitWebProces`). Never the GUI itself
+/// (it sits in `gui`), never the network/GPU processes (webkit respawns a
+/// content renderer cleanly; killing support processes widens the outage for
+/// every surface for no reason).
+pub fn web_recycle_renderers(child_procs: &[(i32, String)]) -> Vec<i32> {
+    child_procs
+        .iter()
+        .filter(|(_, comm)| comm.starts_with("WebKitWebProc"))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// The [11.108] half of the sweep: watch the web child's committed footprint
+/// and recycle its renderers past the watermark. Silence on any unreadable
+/// file — a probe that cannot see must not act.
+fn maybe_recycle_web_child(home: &std::path::PathBuf, self_pid: i32) {
+    let flag = std::env::var("YGGTERM_DISABLE_WEB_RECYCLE").ok();
+    if web_recycle_disabled_from_env(flag.as_deref()) {
+        return;
+    }
+    if !family_armed() {
+        return;
+    }
+    static BREACH_TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static LAST_RECYCLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MONOTONIC_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now_ms = MONOTONIC_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+
+    let Some(web) = own_cgroup_path(self_pid).and_then(|own| sweep_target_path(&own, WEB_CHILD))
+    else {
+        return;
+    };
+    let web_path = std::path::Path::new(&web);
+    let read_u64 = |name: &str| -> u64 {
+        std::fs::read_to_string(web_path.join(name))
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let committed = read_u64("memory.current").saturating_add(read_u64("memory.swap.current"));
+    if committed < WEB_RECYCLE_COMMITTED_BYTES {
+        BREACH_TICKS.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let ticks = BREACH_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if ticks < WEB_RECYCLE_SUSTAINED_TICKS {
+        return;
+    }
+    if now_ms.saturating_sub(LAST_RECYCLE_MS.load(std::sync::atomic::Ordering::Relaxed))
+        < WEB_RECYCLE_MIN_INTERVAL_MS
+    {
+        return;
+    }
+    let child_procs: Vec<(i32, String)> = std::fs::read_to_string(web_path.join("cgroup.procs"))
+        .ok()
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.trim().parse::<i32>().ok())
+                .map(|pid| {
+                    let comm =
+                        std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                    (pid, comm)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let renderers = web_recycle_renderers(&child_procs);
+    if renderers.is_empty() {
+        // The bound is being eaten by something that is not a renderer. Never
+        // blind-kill the child — leave the breach visible on the next tick.
+        return;
+    }
+    for pid in &renderers {
+        // The renderer already wedged the desktop at this point; a failed
+        // signal has nothing better to do than leave the breach visible.
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+    LAST_RECYCLE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    BREACH_TICKS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let _ = crate::trace::append_trace_event(
+        home,
+        "gui",
+        "memory",
+        "web_recycled",
+        serde_json::json!({
+            "committed_bytes": committed,
+            "breach_ticks": ticks,
+            "pids": renderers,
+        }),
+    );
 }
 
 /// Migrate ONE misplaced member into the child its comm names. The threaded
@@ -740,5 +871,49 @@ mod tests {
             "a process NOT inside the gui child is not running an armed family: \
              the sweep must refuse to guess a scope root"
         );
+    }
+
+    #[test]
+    fn web_recycle_watermark_engages_before_the_kernel_throttle_on_a_14gb_host() {
+        // The measured deployment host: MemTotal 14.8 GB → the web child's
+        // resident bound is MemTotal/8 = 1856 MB, swap max half that. The
+        // recycle watermark counts COMMITTED (resident + swap), so the only
+        // ordering that matters is: the recycle must fire before the
+        // resident-only throttle can grow a reclaim storm — the exact shape
+        // [11.108] measured twice (2026-09-14 on the lab host, 2026-09-17 on the GUI host).
+        let bound = web_child_bound(Some(14_800 * 1024));
+        assert!(
+            WEB_RECYCLE_COMMITTED_BYTES < bound.high_bytes,
+            "watermark {} must sit below the web child's resident bound {} \
+             — past the bound the kernel throttle, not us, answers the growth",
+            WEB_RECYCLE_COMMITTED_BYTES,
+            bound.high_bytes
+        );
+    }
+
+    #[test]
+    fn web_recycle_kills_only_webkit_content_renderers() {
+        // comm is TRUNCATED TO 15 BYTES by the kernel — the prefix match must
+        // survive the truncation and must refuse every support process: the
+        // network/GPU processes respawn-fine but killing them widens the
+        // outage to every surface, and the GUI itself lives in `gui`.
+        let procs = vec![
+            (100, "WebKitWebProces\n".to_string()),
+            (101, "WebKitNetworkPro\n".to_string()),
+            (102, "WebKitGPUProces\n".to_string()),
+            (103, "yggterm\n".to_string()),
+            (104, String::new()),
+        ];
+        assert_eq!(web_recycle_renderers(&procs), vec![100]);
+    }
+
+    #[test]
+    fn web_recycle_env_switch_reads_only_the_explicit_on_values() {
+        assert!(web_recycle_disabled_from_env(Some("1")));
+        assert!(web_recycle_disabled_from_env(Some("true")));
+        assert!(web_recycle_disabled_from_env(Some("TRUE")));
+        assert!(!web_recycle_disabled_from_env(Some("0")));
+        assert!(!web_recycle_disabled_from_env(Some("")));
+        assert!(!web_recycle_disabled_from_env(None));
     }
 }
