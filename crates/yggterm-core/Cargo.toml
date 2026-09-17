@@ -18,6 +18,10 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 semver = "1"
 md5 = "0.7.0"
+# The family sweep's web recycle signals a bloated renderer with SIGKILL — the
+# same syscall the proven live remediation used (view-plane only, no process
+# games).
+libc = "0.2"
 yggui-contract.workspace = true
 ytrace.workspace = true
 
