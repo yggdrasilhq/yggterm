@@ -6750,6 +6750,13 @@ fn TerminalCanvas(
                             "owner": bootstrap_owner_identity.clone(),
                         }),
                     );
+                    // [11.139] The begin's `remote_attach_pending` now has no
+                    // writer. Arm the re-arm watchdog before dying.
+                    spawn_attach_supersede_rearm_watchdog(
+                        state.clone(),
+                        trace_home.clone(),
+                        session_path.clone(),
+                    );
                     break;
                 }
                 let still_active = {
@@ -6839,6 +6846,15 @@ fn TerminalCanvas(
                                             "attach_status": "attach_superseded_owner_lost",
                                         }),
                                     );
+                                    // [11.139] The label is honest but nobody
+                                    // owns it. Arm the re-arm watchdog before
+                                    // dying so the amber cannot outlive its
+                                    // owner.
+                                    spawn_attach_supersede_rearm_watchdog(
+                                        state.clone(),
+                                        trace_home.clone(),
+                                        session_path.clone(),
+                                    );
                                     break;
                                 }
                                 let still_active = {
@@ -6897,6 +6913,15 @@ fn TerminalCanvas(
                                             "host_id": host_id.clone(),
                                             "owner": bootstrap_owner_identity.clone(),
                                         }),
+                                    );
+                                    // [11.139] Same orphan as the Ok arm:
+                                    // begin's `remote_attach_pending` has no
+                                    // writer left. Arm the re-arm watchdog
+                                    // before dying.
+                                    spawn_attach_supersede_rearm_watchdog(
+                                        state.clone(),
+                                        trace_home.clone(),
+                                        session_path.clone(),
                                     );
                                     break;
                                 }
@@ -18455,6 +18480,135 @@ async fn terminal_write_async(
 /// the observable fields actually changed. This keeps the amber indicator from
 /// becoming another high-frequency render source while still making a held
 /// frame and queued input inspectable by app-control.
+/// [11.139] One re-arm attempt, one resume ceiling after an orphan break.
+///
+/// A mount loop that dies at a superseded break (`bootstrap_owner_superseded_
+/// during_loop` / `_after_ensure` / `_after_ensure_error`) leaves the surface
+/// status it set at mount begin -- or the break's own
+/// `attach_superseded_owner_lost` label -- with no writer left in the
+/// process: every other status writer lives inside the loop that just broke.
+/// The challenger that caused the supersede may mount (it publishes its own
+/// timeline and the flag hands off), may skip
+/// (`bootstrap_spawn_skipped_inactive_retained_host`), or may reuse the epoch
+/// and stall at the resume gate -- in two of the three outcomes NOTHING will
+/// ever touch the flag again. Measured live 2026-09-17 23:27 on the GUI
+/// host: a search row held `attach_superseded_owner_lost` amber for 14.5h
+/// until an unrelated surface restore rebuilt it.
+///
+/// The falsifier this closes: after a superseded bootstrap the flag must
+/// hand off OR re-arm, with `terminal_attention` false within one resume
+/// ceiling. This watchdog is the re-arm of last resort: after
+/// [`ATTACH_SUPERSEDE_REARM_AFTER_MS`] it asks the state who owns the flag
+/// NOW, hands the attach to the guarded recovery door when it can, and
+/// publishes the background truth when the row is a backgrounded row whose
+/// ensure had already succeeded. A visible row the door cannot re-arm keeps
+/// its amber -- that one is honest.
+const ATTACH_SUPERSEDE_REARM_AFTER_MS: u64 = 15_000;
+/// The second look's delay: a first-fire deferral to a live settling attempt
+/// gets exactly one more observation, inside one resume ceiling.
+const ATTACH_SUPERSEDE_REARM_SECOND_LOOK_AFTER_MS: u64 = 60_000;
+
+fn spawn_attach_supersede_rearm_watchdog(
+    mut state: Signal<ShellState>,
+    trace_home: PathBuf,
+    session_path: String,
+) {
+    spawn(async move {
+        // Two looks at most: the first at the re-arm grace, the second only
+        // when the first fire deferred to a LIVE settling attempt (a
+        // challenger mount that began late) -- a stall past the settle budget
+        // is visible to the second look, still within one resume ceiling.
+        for attempt_index in 0..2 {
+        if attempt_index == 1 {
+            sleep(Duration::from_millis(
+                ATTACH_SUPERSEDE_REARM_SECOND_LOOK_AFTER_MS,
+            ))
+            .await;
+        } else {
+            sleep(Duration::from_millis(ATTACH_SUPERSEDE_REARM_AFTER_MS)).await;
+        }
+        let fired_at_ms = current_millis();
+        let action =
+            state.with(|shell| shell.attach_supersede_watchdog_action(&session_path));
+        let mut outcome = match action {
+            AttachSupersedeWatchdogAction::OwnedElsewhere => {
+                if attempt_index == 0 && state.with(|shell| {
+                    shell.live_mount_attempt_still_settling(&session_path)
+                }) {
+                    // A live challenger mount is settling; give it its budget
+                    // and look once more before standing down.
+                    continue;
+                }
+                "owned_elsewhere"
+            }
+            AttachSupersedeWatchdogAction::KeepAttentiveActive => "kept_attentive_active",
+            AttachSupersedeWatchdogAction::ReleaseBackground => {
+                let released = state.with_mut_counted(|shell| {
+                    shell.release_attach_supersede_attention_if_still_orphaned(&session_path)
+                });
+                if released {
+                    clear_terminal_resume_notification(state, &session_path);
+                }
+                if released {
+                    "released_background"
+                } else {
+                    "release_refused"
+                }
+            }
+            AttachSupersedeWatchdogAction::Rearm => {
+                let rearmed = state.with_mut_counted(|shell| {
+                    shell.rearm_attach_supersede_via_recovery_door(&session_path)
+                });
+                if rearmed {
+                    "rearmed_via_recovery_door"
+                } else {
+                    // The door refused -- its guards spoke (an attempt settled
+                    // in between, a latch, a non-retained background row).
+                    // Fall through to the release arm with the same guards;
+                    // a refused door plus a releasable background row is the
+                    // not-retained-but-alive shape.
+                    let released = state.with_mut_counted(|shell| {
+                        shell.release_attach_supersede_attention_if_still_orphaned(&session_path)
+                    });
+                    if released {
+                        clear_terminal_resume_notification(state, &session_path);
+                    }
+                    if released {
+                        "rearm_refused_released_background"
+                    } else {
+                        "rearm_refused"
+                    }
+                }
+            }
+        };
+        if outcome == "release_refused" || outcome == "rearm_refused" {
+            // Re-read the owner question once: between the decision and the
+            // mutation a mount may have taken the flag (its begin would have
+            // flipped the reason or inserted the in-flight marker).
+            let now_owned =
+                state.with(|shell| shell.attach_supersede_watchdog_action(&session_path));
+            if now_owned == AttachSupersedeWatchdogAction::OwnedElsewhere {
+                outcome = "owned_elsewhere_after_refusal";
+            }
+        }
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "attach_supersede_watchdog",
+            json!({
+                "session_path": session_path,
+                "action": outcome,
+                "look": attempt_index,
+                "after_ms": ATTACH_SUPERSEDE_REARM_AFTER_MS,
+                "fired_at_ms": fired_at_ms,
+            }),
+        );
+        break;
+        }
+    });
+}
+
 fn update_terminal_surface_status(
     state: Signal<ShellState>,
     session_path: &str,

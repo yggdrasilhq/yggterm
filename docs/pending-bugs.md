@@ -31507,7 +31507,7 @@ repaints (the deaf-row family).
 
 ## ⚠ [11.139] THE OWNER-VISIBLE CODEX AMBER IS A STUCK REMOTE ATTACH — `ghost_frame` + `transport_degraded` + `remote_attach_pending` OUTLIVES THE MOUNT RACE THAT CAUSED IT, WITH NO TIMEOUT AND NO RETRY THAT COMPLETES (measured live 2026-09-17 on the GUI host, same sitting as [11.138])
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The amber the owner sees is NOT the working dot: `server app rows` for the
 codex row shows `ghost_frame: true`, `terminal_transport_degraded: true`,
@@ -31577,4 +31577,42 @@ seat must prove is real, not hypothetical. The instrumented reason
 (`attach_superseded_owner_lost`) makes the next natural occurrence
 immediately visible in `server app rows` and ytrace; the falsifier stands
 on that occurrence.
+
+**FIXED IN CODE (2026-09-18, trace-fixing seat, lane/trace/attach-supersede-
+rearm):** the natural occurrence arrived overnight and was measured end to
+end. The GUI-host trace generation: a local web row (`local://0729f322`, the
+search.brave surface) traced `bootstrap_owner_superseded_after_ensure`
+with `attach_status: attach_superseded_owner_lost` at 23:27:34; 4s later the
+challenger took `bootstrap_spawn_skipped_inactive_retained_host` (the
+sanctioned skip -- the row had gone inactive); then ZERO attach/mount events
+for 14.5h (last `attach_ready` 23:11:56). The row recovered only via the
+next day ~14:02 `app_surface_restore` (`web: rebuilt`). The falsifier
+FAILED on the natural unit exactly as filed: the flag neither handed off
+nor re-armed, and attention never went false within any ceiling.
+
+The fix is the re-arm of last resort, wired at ALL THREE orphan breaks
+(`_during_loop`, `_after_ensure`, `_after_ensure_error`): each arms
+`spawn_attach_supersede_rearm_watchdog`, which fires once at 15s (second
+look at +60s only if the first fire deferred to a live settling attempt) and
+decides by measurement, in `attach_supersede_watchdog_action`:
+`OwnedElsewhere` -- a completing mount published its own timeline, or a LIVE
+attempt is settling (`live_mount_attempt_still_settling`: Pending/Recovering
+inside the family's own settle budget -- the bare `terminal_attach_in_flight`
+set CANNOT be the ownership test, because the orphan breaks leave their own
+stale marker in it forever, and reading it as an owner would make the orphan
+defer to its own corpse); `Rearm` -- remote row, nobody owns the flag: hand
+the attach through `invalidate_retained_remote_non_prompt_surface`, the
+guarded recovery door this filing mapped, whose settle/latch guards are the
+in-flight-owner protection the repro addendum demanded; `ReleaseBackground`
+-- a backgrounded row whose ensure SUCCEEDED (daemon still owns the runtime):
+the amber is noise, publish the background truth (status entry cleared --
+healthy is absence -- stale marker reaped, surface request finished, resume
+notification cleared); `KeepAttentiveActive` -- a visible row the door cannot
+re-arm keeps its amber, because that one is honest. Structural lock pins all
+three arming sites + the constants; behavioral locks cover each decision arm
+including the stale-marker corpse case. LIVE PROOF OWED: next natural
+occurrence must trace `attach_supersede_watchdog` with action
+`rearmed_via_recovery_door` or `released_background`, and `terminal_attention`
+false within one resume ceiling; the instrumented unit above (search row)
+will re-verify if it ever recurs.
 

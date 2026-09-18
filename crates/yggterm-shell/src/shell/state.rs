@@ -20660,6 +20660,23 @@ struct TerminalSurfaceStatus {
     reason: String,
 }
 
+/// [11.139] The orphan-attach watchdog's decision for one superseded mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachSupersedeWatchdogAction {
+    /// A completing mount, a fresh begin, or a live in-flight owner owns the
+    /// flag -- the hand-off half of the falsifier happened on its own.
+    OwnedElsewhere,
+    /// Remote row, nobody owns the flag: hand the attach to the guarded
+    /// recovery door (the retained-fault family's re-drive).
+    Rearm,
+    /// Background row, daemon still owns the runtime, nobody owns the flag:
+    /// the amber is noise -- publish the background truth.
+    ReleaseBackground,
+    /// The amber is honest (visible row the door cannot re-arm, or the
+    /// runtime is gone): keep it.
+    KeepAttentiveActive,
+}
+
 impl TerminalSurfaceStatus {
     fn needs_attention(&self) -> bool {
         // A healthy writer can have a short in-flight queue on every ordinary
@@ -31883,6 +31900,132 @@ impl ShellState {
             attempt.last_observed_reason = Some(fault_reason.to_string());
             attempt.last_surface_problem = Some(fault_reason.to_string());
         }
+        true
+    }
+    /// [11.139] WHAT THE ORPHAN-ATTACH WATCHDOG DOES, decided read-only.
+    ///
+    /// When a superseded mount loop dies at one of the orphan breaks
+    /// (`bootstrap_owner_superseded_during_loop` / `_after_ensure` /
+    /// `_after_ensure_error`), the surface status it leaves behind --
+    /// `remote_attach_pending` from mount begin, or the break's own
+    /// `attach_superseded_owner_lost` -- has NO owner left: every other
+    /// writer of that status lives inside the loop that just broke, and the
+    /// challenger that caused the supersede may legitimately decide to skip
+    /// (`bootstrap_spawn_skipped_inactive_retained_host`). Measured live
+    /// 2026-09-17 23:27 on the GUI host: a search row sat amber for 14.5h
+    /// until an unrelated restore rebuilt it.
+    /// [11.139] Is a LIVE mount attempt settling for this session right now?
+    ///
+    /// `terminal_attach_in_flight` alone cannot answer this question: the
+    /// superseded breaks leave their OWN marker in the set forever (the honest
+    /// `superseded` branch removes it; the superseded breaks die before any
+    /// cleanup), so a bare `contains` reads a dead attach as a live one and an
+    /// orphan would defer to its own corpse. A marker is live only when the
+    /// latest open attempt is still Pending/Recovering inside the SAME settle
+    /// budget the retained-fault family grants its own attempts -- a Pending
+    /// attempt past that budget is a hang by the family's own definition, and
+    /// the recovery door may re-drive it.
+    fn live_mount_attempt_still_settling(&self, session_path: &str) -> bool {
+        self.terminal_attach_in_flight.contains(session_path)
+            && self
+                .latest_terminal_open_attempt_for_path(session_path)
+                .is_some_and(|attempt| {
+                    attempt.latched_failure_reason.is_none()
+                        && matches!(
+                            attempt.state,
+                            TerminalOpenAttemptState::Pending
+                                | TerminalOpenAttemptState::Recovering
+                        )
+                        && current_millis().saturating_sub(attempt.started_at_ms)
+                            < retained_fault_recovery_rearm_after_ms(attempt)
+                })
+    }
+    fn attach_supersede_watchdog_action(
+        &self,
+        session_path: &str,
+    ) -> AttachSupersedeWatchdogAction {
+        let Some(status) = self.terminal_surface_status_for_path(session_path) else {
+            return AttachSupersedeWatchdogAction::OwnedElsewhere;
+        };
+        let reason_is_orphaned_attach = status.reason == "attach_superseded_owner_lost"
+            || status.reason == "remote_attach_pending";
+        if !status.transport_degraded || !reason_is_orphaned_attach {
+            // A completing mount publishes its own timeline
+            // (fresh_frame_pending / input_cached / transport_degraded from a
+            // REAL read error) -- the flag moved on, the orphan is over.
+            return AttachSupersedeWatchdogAction::OwnedElsewhere;
+        }
+        if self.live_mount_attempt_still_settling(session_path) {
+            // A newer owner's attempt is settling -- its completion paths own
+            // the flag now, the deep half of the falsifier ("the flag must
+            // hand off"). A STALE marker (the orphan's own, or a hung attempt
+            // past the family's settle budget) does NOT count as an owner.
+            return AttachSupersedeWatchdogAction::OwnedElsewhere;
+        }
+        if self.terminal_session_uses_remote_runtime(session_path) {
+            // Hand the attach to the guarded recovery door: it carries every
+            // settle/in-flight/latch guard the retained-fault family
+            // measured, and its attempt re-drives the mount through the
+            // open-request bump. [11.139]'s original unit
+            // (mount_epoch_reused then resume_gate_ceiling, nothing
+            // following) is exactly this arm.
+            return AttachSupersedeWatchdogAction::Rearm;
+        }
+        let active = self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path);
+        if !active && self.daemon_owns_session_runtime(session_path) {
+            // A background row whose ensure SUCCEEDED (the daemon still owns
+            // the runtime) and whose bridge nobody owns: the amber is noise
+            // -- every other background row reads healthy, and the reveal
+            // door re-attaches on the next open. Publish the background
+            // truth.
+            return AttachSupersedeWatchdogAction::ReleaseBackground;
+        }
+        // Visible row the door cannot re-arm (or a runtime the daemon no
+        // longer owns): the amber is honest. Say so and leave it.
+        AttachSupersedeWatchdogAction::KeepAttentiveActive
+    }
+    /// [11.139] The rearm arm: re-drive the attach through the SAME guarded
+    /// door the retained-fault watchdog uses. Returns the door's verdict --
+    /// a refusal is not an error, it is the door's guards speaking (an
+    /// attempt settled in between, a latch, a non-retained background row).
+    fn rearm_attach_supersede_via_recovery_door(&mut self, session_path: &str) -> bool {
+        self.invalidate_retained_remote_non_prompt_surface(
+            session_path,
+            Some("attach_superseded_owner_lost"),
+        )
+    }
+    /// [11.139] The release arm: publish the background truth IF the orphan
+    /// is still exactly the orphan -- the status reason unchanged, no attach
+    /// in flight, the row backgrounded, the daemon still owning the runtime.
+    /// Also reaps the orphan's own stale `terminal_attach_in_flight` marker:
+    /// the orphan break leaves it set forever (the honest `superseded`
+    /// branch removes it; the superseded breaks do not), and it would poison
+    /// the cold-remount candidates for the life of the session.
+    fn release_attach_supersede_attention_if_still_orphaned(&mut self, session_path: &str) -> bool {
+        let Some(status) = self.terminal_surface_status_for_path(session_path) else {
+            return false;
+        };
+        let reason_is_orphaned_attach = status.reason == "attach_superseded_owner_lost"
+            || status.reason == "remote_attach_pending";
+        let orphaned = status.transport_degraded && reason_is_orphaned_attach;
+        if !orphaned || self.live_mount_attempt_still_settling(session_path) {
+            return false;
+        }
+        let active = self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path);
+        if active || !self.daemon_owns_session_runtime(session_path) {
+            return false;
+        }
+        self.set_terminal_surface_status(
+            session_path,
+            false,
+            false,
+            0,
+            "attach_supersede_watchdog_released",
+        );
+        self.terminal_attach_in_flight.remove(session_path);
+        self.maybe_finish_terminal_surface_request_for_session(session_path);
         true
     }
     fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
