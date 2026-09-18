@@ -187,6 +187,115 @@ pub fn plan_tab_sync(
     }
 }
 
+/// The bind verdict the TUI's own client-side tab maps answer for a pinned
+/// session id under a row's cwd — the [11.134] closer's raw material
+/// ([`yggterm_core::opencode_service::tui_tabs_across_instances`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TuiBindVerdict {
+    /// Some instance dir names the pinned id under the cwd.
+    Verified,
+    /// An instance dir answers for the cwd with OTHER ids only — the window
+    /// is rendering a different session than the row pins. Positive evidence
+    /// only: a cwd nothing names is never divergence (a beta-era or
+    /// other-shaped tabs.json must not cry wolf).
+    Diverged(Vec<String>),
+    /// No instance answers for this cwd yet; the entry lands within the
+    /// launch's first seconds, so the check stays open for a later tick.
+    Unknown,
+}
+
+pub(crate) fn tui_bind_verdict(
+    instances: &[(String, std::collections::BTreeMap<String, Vec<String>>)],
+    cwd: &str,
+    pinned: &str,
+) -> TuiBindVerdict {
+    let mut others: Vec<String> = Vec::new();
+    for (_, map) in instances {
+        let Some(ids) = map.get(cwd) else {
+            continue;
+        };
+        if ids.iter().any(|id| id == pinned) {
+            return TuiBindVerdict::Verified;
+        }
+        for id in ids {
+            if !others.contains(id) {
+                others.push(id.clone());
+            }
+        }
+    }
+    if others.is_empty() {
+        TuiBindVerdict::Unknown
+    } else {
+        TuiBindVerdict::Diverged(others)
+    }
+}
+
+/// The once-per-daemon-generation record of bind verdicts already delivered.
+/// Per-process = per-generation: a restored row re-verifies after a daemon
+/// restart, per [11.134]'s design.
+fn tui_bind_checks_done() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    DONE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn tui_bind_check_key(row_key: &str, ses: &str) -> String {
+    format!("{row_key}|{ses}")
+}
+
+#[cfg(test)]
+pub(crate) fn tui_bind_check_was_delivered(row_key: &str, ses: &str) -> bool {
+    tui_bind_checks_done()
+        .lock()
+        .map(|done| done.contains(&tui_bind_check_key(row_key, ses)))
+        .unwrap_or(false)
+}
+
+/// The bind checks a tick owes: live local opencode rows carrying a pinned
+/// ses id — not yet verdict-checked this generation — whose cwd the service
+/// list can name. Non-local rows are skipped (`SessionSource::LiveLocal` is
+/// the law — local births still carry `ssh_target: Some("localhost")`, so
+/// the ssh field is not the discriminator): a remote row's tabs.json lives
+/// on the remote home and this daemon cannot read it, so it must not invent
+/// a verdict.
+pub(crate) fn plan_tui_bind_checks(
+    owned: &std::collections::HashMap<String, OwnedTab>,
+    sessions: &std::collections::BTreeMap<String, crate::ManagedSessionView>,
+    service_sessions: &[OpencodeServiceSession],
+    screen_live: &std::collections::HashSet<String>,
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (ses, tab) in owned {
+        if tui_bind_checks_done()
+            .lock()
+            .map(|done| done.contains(&tui_bind_check_key(&tab.key, ses)))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(row) = sessions.get(&tab.key) else {
+            continue;
+        };
+        if row.source != crate::SessionSource::LiveLocal {
+            continue;
+        }
+        if !YggtermServer::anchor_row_is_live(row, screen_live) {
+            continue;
+        }
+        let Some(directory) = service_sessions
+            .iter()
+            .find(|s| &s.id == ses)
+            .and_then(|s| s.directory.as_ref())
+            .map(String::as_str)
+            .filter(|d| !d.trim().is_empty())
+        else {
+            continue;
+        };
+        out.push((tab.key.clone(), ses.clone(), directory.to_string()));
+    }
+    out
+}
+
 /// The honest display title for a mirrored session. The v2 preview writes
 /// the placeholder `New session - <iso>` until the first prompt lands, which
 /// reads as a generic weird row name (owner, 2026-08-30) — for those, the
@@ -262,6 +371,64 @@ pub(crate) fn tombstoned_opencode_mirror_spawns(
 impl YggtermServer {
     /// Apply one mirror tick UNDER THE DAEMON LOCK. All service IO happened
     /// before this call (`fetch` in the chore, which holds no lock).
+    /// The [11.134] closer: once per daemon generation, ask every live pinned
+    /// opencode row's TUI tab maps which session its window REALLY binds, and
+    /// name the verdict on the trace plane. A verdict plane, not an actor —
+    /// the anchor `diverged` posture: no rebind on this build. Unknown keeps
+    /// the check open (a later tick retries); Verified/Diverged speak once
+    /// per row per generation.
+    pub(crate) fn run_tui_bind_checks(
+        &self,
+        home: &std::path::PathBuf,
+        owned: &std::collections::HashMap<String, OwnedTab>,
+        service_sessions: &[OpencodeServiceSession],
+        screen_live: &std::collections::HashSet<String>,
+    ) {
+        for (row_key, ses, cwd) in
+            plan_tui_bind_checks(owned, &self.sessions, service_sessions, screen_live)
+        {
+            let instances = yggterm_core::opencode_service::tui_tabs_across_instances(home);
+            match tui_bind_verdict(&instances, &cwd, &ses) {
+                TuiBindVerdict::Unknown => {}
+                TuiBindVerdict::Verified => {
+                    if let Ok(mut done) = tui_bind_checks_done().lock() {
+                        done.insert(tui_bind_check_key(&row_key, &ses));
+                    }
+                    #[cfg(not(test))]
+                    yggterm_core::append_trace_event(
+                        home,
+                        "daemon",
+                        "opencode_mirror",
+                        "opencode_bind_verified",
+                        serde_json::json!({
+                            "row": row_key,
+                            "pinned": ses,
+                            "cwd": cwd,
+                        }),
+                    );
+                }
+                TuiBindVerdict::Diverged(_tui_ids) => {
+                    if let Ok(mut done) = tui_bind_checks_done().lock() {
+                        done.insert(tui_bind_check_key(&row_key, &ses));
+                    }
+                    #[cfg(not(test))]
+                    yggterm_core::append_trace_event(
+                        home,
+                        "daemon",
+                        "opencode_mirror",
+                        "opencode_bind_diverged",
+                        serde_json::json!({
+                            "row": row_key,
+                            "pinned": ses,
+                            "cwd": cwd,
+                            "tui_ids": _tui_ids,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
     pub fn apply_opencode_tab_mirror(
         &mut self,
         sessions: &[OpencodeServiceSession],
@@ -751,6 +918,12 @@ impl YggtermServer {
                 }
             }
         }
+        // The [11.134] closer rides the same tick: once per generation, every
+        // live pinned row's TUI tab map is asked which session it really
+        // binds; the verdict speaks on the trace plane by name.
+        if let Ok(home_dir) = crate::resolve_yggterm_home() {
+            self.run_tui_bind_checks(&home_dir, &owned, sessions, screen_live);
+        }
         let mut focused = None;
         if let Some(ses_id) = &plan.focus {
             // Follow the human's tab switch only while they are already in
@@ -955,6 +1128,258 @@ mod tests {
                 engaged,
             },
         )
+    }
+
+    // ---- [11.134] bind-divergence check fixtures ----------------------------
+
+    fn server_with_live_pinned_row() -> (crate::YggtermServer, String) {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("Remote OpenCode bindvrfy"),
+        );
+        let row = server.sessions.get_mut(&key).expect("the row exists");
+        row.launch_phase = crate::TerminalLaunchPhase::Running;
+        row.terminal_process_id = Some(4242);
+        row.source = crate::SessionSource::LiveLocal;
+        let mut row = server.sessions.remove(&key).expect("the row exists");
+        let new_key = format!("opencode-runtime://{}", row.id);
+        row.session_path = new_key.clone();
+        server.sessions.insert(new_key.clone(), row);
+        (server, new_key)
+    }
+
+    #[test]
+    fn tui_bind_verdict_reads_positive_evidence_only_across_siblings() {
+        let pinned = "ses_bindpin00000000000000000001";
+        let other = "ses_bindoth00000000000000000001";
+        let beta: std::collections::BTreeMap<String, Vec<String>> = [(
+            "/home/user/proj".to_string(),
+            vec![other.to_string()],
+        )]
+        .into_iter()
+        .collect();
+        let latest: std::collections::BTreeMap<String, Vec<String>> = [(
+            "/home/user/proj".to_string(),
+            vec![pinned.to_string(), other.to_string()],
+        )]
+        .into_iter()
+        .collect();
+        let instances = vec![
+            ("beta".to_string(), beta),
+            ("latest".to_string(), latest),
+        ];
+        assert_eq!(
+            tui_bind_verdict(&instances, "/home/user/proj", pinned),
+            TuiBindVerdict::Verified,
+            "a sibling instance naming the pinned id under the cwd is a bind — \
+             latest/ being empty or stale must not veto it"
+        );
+        let only_other = vec![(
+            "latest".to_string(),
+            [(
+                "/home/user/proj".to_string(),
+                vec![other.to_string()],
+            )]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<String, Vec<String>>>(),
+        )];
+        assert_eq!(
+            tui_bind_verdict(&only_other, "/home/user/proj", pinned),
+            TuiBindVerdict::Diverged(vec![other.to_string()]),
+            "a cwd named with OTHER ids only is divergence — positive evidence"
+        );
+        assert_eq!(
+            tui_bind_verdict(&only_other, "/home/user/other-cwd", pinned),
+            TuiBindVerdict::Unknown,
+            "a cwd no instance names is Unknown — absence is never divergence"
+        );
+        assert_eq!(
+            tui_bind_verdict(&Vec::new(), "/home/user/proj", pinned),
+            TuiBindVerdict::Unknown,
+            "an absent plane is Unknown, never a verdict"
+        );
+    }
+
+    #[test]
+    fn plan_tui_bind_checks_skips_dead_remote_and_already_done_rows() {
+        let ses_id = "ses_bindpln00000000000000000001";
+        let dead_ses = "ses_binddead0000000000000000001";
+        let remote_ses = "ses_bindrem00000000000000000001";
+        let done_ses = "ses_binddone0000000000000000001";
+        let (mut server, live_key) = server_with_live_pinned_row();
+        let rekey = |server: &mut crate::YggtermServer, key: &str| {
+            let mut row = server.sessions.remove(key).expect("the row exists");
+            let new_key = format!("opencode-runtime://{}", row.id);
+            row.session_path = new_key.clone();
+            server.sessions.insert(new_key.clone(), row);
+            new_key
+        };
+        let dead_key = {
+            let key = server.start_local_session(
+                crate::SessionKind::OpenCode,
+                Some("/home/user/proj"),
+                Some("Remote OpenCode binddead"),
+            );
+            let row = server.sessions.get_mut(&key).expect("the row exists");
+            row.launch_phase = crate::TerminalLaunchPhase::Queued;
+            row.terminal_process_id = None;
+            rekey(&mut server, &key)
+        };
+        let remote_key = {
+            let key = server.start_local_session(
+                crate::SessionKind::OpenCode,
+                Some("/home/user/proj"),
+                Some("Remote OpenCode bindremote"),
+            );
+            let row = server.sessions.get_mut(&key).expect("the row exists");
+            row.launch_phase = crate::TerminalLaunchPhase::Running;
+            row.terminal_process_id = Some(4243);
+            // The ssh FIELD is not the discriminator (local births carry
+            // Some("localhost") — measured in the scratch pass); the SOURCE
+            // is.
+            row.ssh_target = Some("localhost".to_string());
+            row.source = crate::SessionSource::LiveSsh;
+            rekey(&mut server, &key)
+        };
+        let owned_map = std::collections::HashMap::from([
+            (
+                ses_id.to_string(),
+                OwnedTab {
+                    key: live_key.clone(),
+                    viewed_epoch_ms: 100,
+                    engaged: true,
+                },
+            ),
+            (
+                dead_ses.to_string(),
+                OwnedTab {
+                    key: dead_key.clone(),
+                    viewed_epoch_ms: 100,
+                    engaged: true,
+                },
+            ),
+            (
+                remote_ses.to_string(),
+                OwnedTab {
+                    key: remote_key.clone(),
+                    viewed_epoch_ms: 100,
+                    engaged: true,
+                },
+            ),
+            (
+                done_ses.to_string(),
+                OwnedTab {
+                    key: live_key.clone(),
+                    viewed_epoch_ms: 100,
+                    engaged: true,
+                },
+            ),
+        ]);
+        if let Ok(mut done) = tui_bind_checks_done().lock() {
+            done.insert(tui_bind_check_key(&live_key, done_ses));
+        }
+        let service = vec![
+            ses(ses_id, 100),
+            ses(dead_ses, 100),
+            ses(remote_ses, 100),
+            ses(done_ses, 100),
+        ];
+        assert_eq!(
+            plan_tui_bind_checks(&owned_map, &server.sessions, &service, &empty_screen_live()),
+            vec![(live_key.clone(), ses_id.to_string(), "/home/user/proj".to_string())],
+            "only the live local not-yet-checked row with a service cwd owes a check"
+        );
+    }
+
+    #[test]
+    fn the_bind_check_delivers_once_and_keeps_unknown_open() {
+        let ses_id = "ses_bindstate000000000000000001";
+        let (server, row_key) = server_with_live_pinned_row();
+        let owned_map = std::collections::HashMap::from([(
+            ses_id.to_string(),
+            OwnedTab {
+                key: row_key.clone(),
+                viewed_epoch_ms: 100,
+                engaged: true,
+            },
+        )]);
+        let service = vec![ses(ses_id, 100)];
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-bind-check-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".local/state/opencode/latest/tui")).expect("tabs dir");
+        let tabs_path = home.join(".local/state/opencode/latest/tui/tabs.json");
+
+        // Unknown: the plane has not painted yet — no verdict, the check
+        // stays open for a later tick.
+        server.run_tui_bind_checks(&home, &owned_map, &service, &empty_screen_live());
+        assert!(
+            !tui_bind_check_was_delivered(&row_key, ses_id),
+            "absence is never a verdict"
+        );
+
+        // The TUI paints the pinned id under the row cwd -> verified, once.
+        std::fs::write(
+            &tabs_path,
+            format!(
+                r#"{{"cwd":{{"/home/user/proj":{{"tabs":[{{"sessionID":"{ses_id}","title":"t"}}],"unread":{{}}}}}}}}"#
+            ),
+        )
+        .expect("write tabs");
+        server.run_tui_bind_checks(&home, &owned_map, &service, &empty_screen_live());
+        assert!(tui_bind_check_was_delivered(&row_key, ses_id));
+
+        // The once law: a later divergence (a legal in-TUI switch) does not
+        // re-judge the row this generation.
+        std::fs::write(
+            &tabs_path,
+            r#"{"cwd":{"/home/user/proj":{"tabs":[{"sessionID":"ses_bindsw0000000000000000001","title":"t"}],"unread":{}}}}"#,
+        )
+        .expect("rewrite tabs");
+        server.run_tui_bind_checks(&home, &owned_map, &service, &empty_screen_live());
+        assert!(
+            tui_bind_check_was_delivered(&row_key, ses_id),
+            "already-delivered rows are never re-checked this generation"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// LOCK: the bind check rides the apply tick and names its verdicts —
+    /// a silent verdict plane is indistinguishable from a missing one.
+    #[test]
+    fn the_bind_check_rides_the_apply_tick_and_names_its_verdicts() {
+        let source = include_str!("opencode_mirror.rs");
+        let body = source
+            .split("pub fn apply_opencode_tab_mirror")
+            .nth(1)
+            .expect("apply_opencode_tab_mirror exists")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of the apply fn");
+        assert!(
+            body.contains("run_tui_bind_checks("),
+            "the apply tick must run the bind check"
+        );
+        assert!(
+            source.contains("\"opencode_bind_verified\""),
+            "the verified verdict must be traced by name"
+        );
+        assert!(
+            source.contains("\"opencode_bind_diverged\""),
+            "the diverged verdict must be traced by name — divergence the trace never names is [11.134] unfixed"
+        );
+        assert!(
+            source.contains("\"tui_ids\""),
+            "the diverged payload must carry BOTH ids — the pinned one and what the TUI really renders"
+        );
     }
 
     #[test]
