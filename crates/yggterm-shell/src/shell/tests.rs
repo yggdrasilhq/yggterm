@@ -67507,6 +67507,63 @@ mod resume_gate_wiring_locks {
 mod terminal_loop_input_starvation_locks {
     /// The in-flight latch must not be able to stick.
     ///
+    /// [11.142] The render-confirm matcher: the line a CLI actually read
+    /// arrives decoration-different — hard-wrapped mid-token, gutters
+    /// repainted per row — but content-equal, and an empty expected line
+    /// never confirms by render.
+    #[test]
+    fn a_render_confirm_names_the_line_through_wraps_and_gutters() {
+        use super::{composer_render_names_line};
+
+        // The clean exact row.
+        assert!(composer_render_names_line(
+            "❭ delivery-11142-probe",
+            "delivery-11142-probe"
+        ));
+        // An unrelated composer row (the placeholder) does not name it.
+        assert!(!composer_render_names_line(
+            "❭ Ask Devin…",
+            "delivery-11142-probe"
+        ));
+        // Wrapped across rows inside a gutter box: same characters.
+        assert!(composer_render_names_line(
+            "┌──┐\n│ delivery\n│ -11142-wrap\n└──┘",
+            "delivery-11142-wrap"
+        ));
+        // A long head falls outside the tail window; the tail still matches.
+        let long = format!("{}tail-marker-11142", "x".repeat(300));
+        assert!(composer_render_names_line(&long, &long));
+        // An unrelated screen never confirms.
+        assert!(!composer_render_names_line(
+            "some transcript row",
+            "needle-11142"
+        ));
+        // Empty expected: the atomic guard's question alone, never a render.
+        assert!(!composer_render_names_line("anything", ""));
+    }
+
+    /// [11.142] `refused_render` is a NAMED non-delivery: the accepted-side
+    /// flags must read it as the Enter never having been pressed.
+    #[test]
+    fn a_refused_render_submit_report_is_not_delivered() {
+        use super::AppControlTerminalWriteReport;
+
+        let report = AppControlTerminalWriteReport {
+            chunk_count: 2,
+            line_chunk_count: 0,
+            interrupt_chunk_count: 0,
+            interline_read_nudge_count: 0,
+            last_chunk_tail: "\\r".to_string(),
+            refused: None,
+            submit: Some("refused_render"),
+            conditional_submit: true,
+        };
+        assert!(!report.delivered());
+        let json = report.to_json();
+        assert_eq!(json["submit"], "refused_render");
+        assert_eq!(json["conditional_submit"], true);
+    }
+
     /// ⛔ **A STUCK LATCH IS WORSE THAN THE STALL THIS HOIST REMOVES.** The latch
     /// is the only thing that re-enables the read branch, so a completion that is
     /// never delivered would stop the session reading FOREVER — a terminal that
