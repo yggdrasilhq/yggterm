@@ -86852,24 +86852,61 @@ async fn process_pending_app_control_requests(
                     sleep(Duration::from_millis(80)).await;
                 }
                 let enter = if let Some(expected) = submit_expected {
-                    terminal_conditional_submit_async(
-                        endpoint.clone(),
-                        runtime_session_path.clone(),
-                        expected,
-                        trace_home.as_path(),
-                    )
-                    .await
-                    .map(|message| {
-                        let slug = conditional_submit_outcome(&message);
-                        (
-                            slug,
+                    // ⛔ [11.142] The submit verb takes the same decode-confirm
+                    // gate the one-shot send carries: the RENDER must name the
+                    // line before Enter, or the answer is the NAMED
+                    // `refused_render` non-delivery (the text is already typed
+                    // and stands in the composer — a caller retries with the
+                    // two-step recipe, never by re-sending blind).
+                    let render_confirmed = expected.is_empty()
+                        || wait_for_composer_to_name_the_line(
+                            endpoint.clone(),
+                            runtime_session_path.clone(),
+                            &expected,
+                            trace_home.as_path(),
+                        )
+                        .await;
+                    if render_confirmed {
+                        terminal_conditional_submit_async(
+                            endpoint.clone(),
+                            runtime_session_path.clone(),
+                            expected,
+                            trace_home.as_path(),
+                        )
+                        .await
+                        .map(|message| {
+                            let slug = conditional_submit_outcome(&message);
+                            (
+                                slug,
+                                json!({
+                                    "conditional_submit": true,
+                                    "submit": slug,
+                                    "render_confirmed": true,
+                                    "message": message,
+                                }),
+                            )
+                        })
+                    } else {
+                        append_trace_event(
+                            trace_home.as_path(),
+                            "ui",
+                            "terminal_submit",
+                            "terminal_submit_render_unconfirmed",
+                            json!({
+                                "session_path": session_path,
+                                "expected_line_chars": expected.chars().count(),
+                            }),
+                        );
+                        Ok((
+                            "refused_render",
                             json!({
                                 "conditional_submit": true,
-                                "submit": slug,
-                                "message": message,
+                                "submit": "refused_render",
+                                "render_confirmed": false,
+                                "message": "the rendered composer never named the expected line within the confirm window; Enter was not pressed",
                             }),
-                        )
-                    })
+                        ))
+                    }
                 } else {
                     terminal_write_app_control_input_async(
                         endpoint.clone(),

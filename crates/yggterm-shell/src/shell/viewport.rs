@@ -18171,6 +18171,20 @@ const TERMINAL_INPUT_CONSUMING_RAW_MODE_RESIDUE_REASON: &str =
     "the session rendered the probe marker into its composer (composer-delta confirm — it IS reading input) but Ctrl+U and backspaces did not clear the line; the probe text may remain in the composer";
 const TERMINAL_INPUT_WEDGED_RAW_MODE_REASON: &str =
     "session never rendered the probe marker into its composer within the timeout (raw-mode posture: confirmed by composer delta, not pty echo) — the row is WEDGED: alive, idle-looking, and not reading its PTY";
+/// [11.142] The probe's marker write itself was refused — no marker was ever
+/// sent, so "never rendered" would be a lie and WEDGED is unavailable.
+const TERMINAL_INPUT_PROBE_WRITE_REFUSED_REASON: &str =
+    "the probe marker write was refused by the daemon's own guard, so no marker was ever sent to render — the row cannot be called WEDGED on a probe that never went out";
+/// The window a submit-own-chunk composer gets to RENDER the text chunk before
+/// the contract presses Enter ([11.142]), and the poll cadence. The raw-mode
+/// posture's confirm window ([`TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS`]) is
+/// the measured precedent for the scale.
+const TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_WINDOW_MS: u64 = 2_400;
+const TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_POLL_MS: u64 = 120;
+/// How much of the expected line's TAIL must appear in the rendered screen for
+/// the confirm. The head is where CLIs decorate (`❭ `, gutter boxes) and where
+/// single-row composers truncate; the tail is what survives both.
+const TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_TAIL_CHARS: usize = 120;
 /// The patient window a raw-mode composer gets to render the probe marker.
 /// The echo posture's single 180 ms shot exists because an echo is immediate
 /// or never; a raw-mode TUI repaints on its own schedule, so the delta is
@@ -18258,7 +18272,14 @@ async fn probe_input_consumption_by_composer_delta(
             },
         };
     }
-    let _ = terminal_write_app_control_input_async(
+    // ⛔ [11.142] THE MARKER WRITE IS EVIDENCE, NOT A SIDE EFFECT. This used
+    // to discard the write report: a marker REFUSED by the daemon's own guard
+    // — the draft refusal, on exactly the draft-holding row this posture
+    // exists to protect — left the probe watching the whole window for a
+    // marker that never went out and then answering WEDGED on a demonstrably
+    // healthy row. A probe that never went out cannot prove a row is not
+    // reading.
+    let marker_write_refusal = terminal_write_app_control_input_async(
         endpoint.clone(),
         runtime_session_path.clone(),
         session_path.clone(),
@@ -18267,7 +18288,32 @@ async fn probe_input_consumption_by_composer_delta(
         false,
         trace_home,
     )
-    .await;
+    .await
+    .ok()
+    .and_then(|report| report.refused);
+    if let Some(reason) = marker_write_refusal {
+        // The draft refusal slug names the union's positive reading — the row
+        // holds a sentence and the DRAFT refusal is the honest verdict. (The
+        // slug literal is the daemon-side write-guard's; there is no
+        // cross-crate const for it yet.)
+        let draft_held = reason == "pending_draft";
+        return TerminalInputProbeVerdict {
+            consuming_input: false,
+            composer_shown: true,
+            composer_held_draft: if draft_held {
+                Some(true)
+            } else {
+                composer_draft_now
+            },
+            activity,
+            waited_ms: started.elapsed().as_millis() as u64,
+            reason: if draft_held {
+                TERMINAL_INPUT_DRAFT_REASON
+            } else {
+                TERMINAL_INPUT_PROBE_WRITE_REFUSED_REASON
+            },
+        };
+    }
     let confirm_deadline = started + timeout.min(Duration::from_millis(
         TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS,
     ));
@@ -18292,13 +18338,25 @@ async fn probe_input_consumption_by_composer_delta(
         }
     }
     if !rendered {
+        // ⛔ [11.142] WEDGED IS A POSITIVE CLAIM AND NEEDS A CONFIDENT READING.
+        // The last draft answer decides the verdict: a draft seen during the
+        // window is a held sentence (the DRAFT refusal), an unreadable one is
+        // exactly the case where being wrong is least affordable — only a
+        // confident "the composer is drawn and empty" may say the row is
+        // alive-looking and not reading. Answering WEDGED over Some(true) or
+        // None is how a healthy draft-holding row collected a restart remedy.
+        let reason = match fresh_draft {
+            Some(true) => TERMINAL_INPUT_DRAFT_REASON,
+            None => TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON,
+            Some(false) => TERMINAL_INPUT_WEDGED_RAW_MODE_REASON,
+        };
         return TerminalInputProbeVerdict {
             consuming_input: false,
             composer_shown: true,
             composer_held_draft: fresh_draft,
             activity,
             waited_ms: started.elapsed().as_millis() as u64,
-            reason: TERMINAL_INPUT_WEDGED_RAW_MODE_REASON,
+            reason,
         };
     }
     // Cleanup: Ctrl+U clears the daemon's reconstructed line even where the
@@ -19038,7 +19096,9 @@ struct AppControlTerminalWriteReport {
     refused: Option<&'static str>,
     /// ⛔ [11.141] The outcome of the contract's conditional-submit chunk, when
     /// one was issued: "submitted" · "refused_line" · "startup_gate_shown" ·
-    /// "unknown". `None` = no conditional submit rode this write. THE POINT OF
+    /// "refused_render" ([11.142]: the render never named the line, so no
+    /// Enter was pressed) · "unknown". `None` = no conditional submit rode
+    /// this write. THE POINT OF
     /// THE FIELD: `accepted:true` must mean DELIVERED, and for a
     /// submit-own-chunk CLI the delivery is the Enter — a text chunk that
     /// rendered while the submit refused is the measured half-delivery that
@@ -19112,6 +19172,65 @@ async fn terminal_conditional_submit_async(
     .await
 }
 
+/// Does the rendered screen NAME the expected composer line?
+///
+/// ⛔ DECORATION-IS-REMOVED containment, not whitespace-collapsed containment:
+/// a composer hard-wraps long lines MID-TOKEN (the wrap inserts whitespace
+/// inside a word, where a collapse would keep it) and repaints box-drawing
+/// gutters on every wrapped row. Both are decoration around the characters
+/// the CLI actually read, so both sides are reduced to their content
+/// characters — non-whitespace, outside the box-drawing blocks — and the
+/// match is containment of the expected line's tail. [11.142]'s falsifier
+/// drives real turns through this gate, so both a false CONFIRM (pressing
+/// Enter over a line the CLI never read) and a false REFUSAL (a working send
+/// called undelivered) are expensive; the expected text is the caller's own
+/// fresh payload, so a screen containing it in order is a render of it.
+fn composer_render_names_line(screen: &str, expected_line: &str) -> bool {
+    fn content(s: &str) -> String {
+        s.chars()
+            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '\u{2500}'..='\u{257F}'))
+            .collect()
+    }
+    let content_needle = content(expected_line);
+    if content_needle.is_empty() {
+        // An empty expected line confirms by the atomic guard alone, never by
+        // a render — every non-empty composer "contains" empty.
+        return false;
+    }
+    let tail_start = content_needle
+        .char_indices()
+        .rev()
+        .nth(TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_TAIL_CHARS - 1)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let needle = &content_needle[tail_start..];
+    content(screen).contains(needle)
+}
+
+/// [11.142] Poll the daemon's rendered screen until it names the expected line
+/// (see [`composer_render_names_line`]) or the confirm window closes.
+async fn wait_for_composer_to_name_the_line(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    expected_line: &str,
+    trace_home: &Path,
+) -> bool {
+    let deadline = Instant::now()
+        + Duration::from_millis(TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_WINDOW_MS);
+    loop {
+        if let Ok((screen, ..)) =
+            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await
+            && composer_render_names_line(&screen, expected_line)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_POLL_MS)).await;
+    }
+}
+
 async fn terminal_write_app_control_input_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -19143,10 +19262,58 @@ async fn terminal_write_app_control_input_async(
         // presses Enter only if the line it forwarded still reads exactly the
         // text this write laid down. A refusal is a NAMED non-delivery and
         // ends the write — there is nothing after the submit to send.
+        //
+        // ⛔ [11.142] AND THE SUBMIT DOES NOT FOLLOW THE TEXT BLINDLY. The
+        // write-side split hands the pty two writes microseconds apart, and a
+        // raw-mode CLI's reader coalesces by READ, not by write — measured
+        // live (devin, the muse lab host): `text\r` in two chunks still
+        // arrived as ONE paste+newline, the composer grew the empty row, no
+        // turn ever ran, while this report said submitted/accepted:true. So
+        // before pressing Enter, the RENDER must name the line: the composer
+        // painting the text is the one proof the CLI already read it, and an
+        // Enter typed then is necessarily a LATER read than the text. The
+        // window is bounded and honest both ways — a confirm presses the
+        // guarded Enter; a timeout returns the NAMED `refused_render`
+        // non-delivery and the text stays standing in the composer (the
+        // proven two-step recipe — plain text, then a bare submit — is the
+        // caller's fallback). An empty expected line is a submit-only send
+        // (the recipe's second half): there is no text of ours to confirm, so
+        // the atomic guard alone decides, exactly as when that recipe was
+        // proven.
         if submit_byte_own_chunk
             && chunks.peek().is_none()
             && chunk == "\r"
         {
+            if !line_in_flight.is_empty()
+                && !wait_for_composer_to_name_the_line(
+                    endpoint.clone(),
+                    session_path.clone(),
+                    &line_in_flight,
+                    trace_home,
+                )
+                .await
+            {
+                append_trace_event(
+                    trace_home,
+                    "ui",
+                    "terminal_input",
+                    "terminal_input_submit_render_unconfirmed",
+                    json!({
+                        "session_path": session_path,
+                        "expected_line_chars": line_in_flight.chars().count(),
+                    }),
+                );
+                return Ok(AppControlTerminalWriteReport {
+                    chunk_count,
+                    line_chunk_count,
+                    interrupt_chunk_count,
+                    interline_read_nudge_count,
+                    last_chunk_tail,
+                    refused: None,
+                    submit: Some("refused_render"),
+                    conditional_submit: true,
+                });
+            }
             let message = terminal_conditional_submit_async(
                 endpoint.clone(),
                 session_path.clone(),
