@@ -57625,6 +57625,176 @@ Updated at   Branch  Conversation\n\
             "focus-time generation is disabled, so stale-summary checks must not do render-time store IO"
         );
     }
+    // =========================================================================
+    // [11.139] THE ORPHAN-ATTACH WATCHDOG. A superseded mount loop dies at one
+    // of three breaks and leaves the surface status with NO writer: everything
+    // else that writes that status lives inside the loop that just broke, and
+    // the challenger may legitimately skip. Measured live 2026-09-17 23:27 on
+    // the GUI host: a search row held `attach_superseded_owner_lost` amber for
+    // 14.5h until an unrelated restore rebuilt it. The falsifier: after a
+    // superseded bootstrap the flag must hand off OR re-arm, with
+    // terminal_attention false within one resume ceiling.
+    // =========================================================================
+
+    fn orphan_attach_status(shell: &mut ShellState, path: &str, reason: &str) {
+        shell.set_terminal_surface_status(path, true, true, 0, reason);
+        // The superseded breaks leave their own in-flight marker behind —
+        // reproduce it exactly; the watchdog must see through the corpse.
+        shell.terminal_attach_in_flight.insert(path.to_string());
+    }
+
+    #[test]
+    fn attach_supersede_watchdog_releases_orphaned_background_row() {
+        // The measured natural occurrence: a non-remote (local web) row,
+        // backgrounded, whose ensure had succeeded — the skip branch cancelled
+        // the user's open attempt and nothing else ever touched the flag.
+        let path = "local://search-row";
+        let active = "local://another-row";
+        let bootstrap = test_shell_bootstrap_with_active_session(active);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        orphan_attach_status(&mut shell, path, "attach_superseded_owner_lost");
+        shell.begin_terminal_open_attempt(path, "req-1", 1, "startup_restore");
+        assert!(
+            shell.cancel_terminal_open_attempt_for_inactive_session(
+                path,
+                "the reveal was cancelled: this session stopped being the active terminal"
+            ),
+            "test setup: the skip branch's cancel must land on a background row"
+        );
+
+        let action = shell.attach_supersede_watchdog_action(path);
+        assert_eq!(
+            action,
+            AttachSupersedeWatchdogAction::ReleaseBackground,
+            "background + orphaned flag + daemon-owned runtime must release"
+        );
+        assert!(shell.release_attach_supersede_attention_if_still_orphaned(path));
+        assert!(
+            shell.terminal_surface_status_for_path(path).is_none(),
+            "healthy is the ABSENCE of a status entry -- the amber must be gone (falsifier: attention false)"
+        );
+        assert!(
+            !shell.terminal_attach_in_flight.contains(path),
+            "the orphan's stale in-flight marker must die with the orphan"
+        );
+    }
+
+    #[test]
+    fn attach_supersede_watchdog_defers_to_a_live_settling_attempt() {
+        let path = "local://mounting-row";
+        let bootstrap = test_shell_bootstrap_with_active_session(path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        orphan_attach_status(&mut shell, path, "remote_attach_pending");
+        shell.begin_terminal_open_attempt(path, "req-2", 2, "hot_open_row");
+        assert!(
+            shell.live_mount_attempt_still_settling(path),
+            "test setup: a fresh pending attempt must read as settling"
+        );
+        assert_eq!(
+            shell.attach_supersede_watchdog_action(path),
+            AttachSupersedeWatchdogAction::OwnedElsewhere,
+            "a live challenger mount owns the flag -- hand-off, not re-arm"
+        );
+        assert!(
+            !shell.release_attach_supersede_attention_if_still_orphaned(path),
+            "release must refuse while an attempt is genuinely settling"
+        );
+    }
+
+    #[test]
+    fn attach_supersede_watchdog_rearms_remote_row_through_recovery_door() {
+        // [11.139]'s original unit shape: a remote row, orphaned flag, no
+        // attempt alive -- the flag must RE-ARM through the same guarded door
+        // the retained-fault family uses, and the door's attempt must begin.
+        let path = "remote-session://dev/rearm-row";
+        let bootstrap = test_shell_bootstrap_with_active_session(path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(path);
+        orphan_attach_status(&mut shell, path, "attach_superseded_owner_lost");
+
+        assert_eq!(
+            shell.attach_supersede_watchdog_action(path),
+            AttachSupersedeWatchdogAction::Rearm,
+            "remote row with nobody owning the flag must re-arm"
+        );
+        assert!(
+            shell.rearm_attach_supersede_via_recovery_door(path),
+            "the guarded recovery door must accept a retained remote orphan"
+        );
+        let attempt = shell
+            .latest_terminal_open_attempt_for_path(path)
+            .expect("the re-drive must begin an open attempt");
+        assert_eq!(attempt.source, "retained_fault_recovery");
+    }
+
+    #[test]
+    fn attach_supersede_watchdog_keeps_honest_amber_on_active_row() {
+        // A visible row the door cannot re-arm keeps its amber: that one is
+        // honest -- the bridge is dead and the user is looking at it.
+        let path = "local://visible-row";
+        let bootstrap = test_shell_bootstrap_with_active_session(path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        orphan_attach_status(&mut shell, path, "attach_superseded_owner_lost");
+
+        assert_eq!(
+            shell.attach_supersede_watchdog_action(path),
+            AttachSupersedeWatchdogAction::KeepAttentiveActive,
+            "an active row with a dead bridge deserves its amber"
+        );
+        assert!(
+            !shell.release_attach_supersede_attention_if_still_orphaned(path),
+            "release must refuse on the row the user is looking at"
+        );
+    }
+
+    #[test]
+    fn attach_supersede_watchdog_release_reaps_nothing_once_the_flag_moved() {
+        // A completing mount publishes its own timeline; the watchdog must
+        // then stand down instead of clearing a REAL attention state.
+        let path = "local://recovered-row";
+        let active = "local://elsewhere";
+        let bootstrap = test_shell_bootstrap_with_active_session(active);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.set_terminal_surface_status(path, true, true, 0, "input_cached");
+
+        assert_eq!(
+            shell.attach_supersede_watchdog_action(path),
+            AttachSupersedeWatchdogAction::OwnedElsewhere,
+            "a moved-on flag is owned by the mount that published it"
+        );
+        assert!(
+            !shell.release_attach_supersede_attention_if_still_orphaned(path),
+            "release must not touch a flag that is no longer the orphan's"
+        );
+    }
+
+    #[test]
+    fn attach_supersede_watchdog_is_armed_at_every_orphan_break() {
+        // Structural lock: the three superseded breaks (during_loop,
+        // after_ensure Ok, after_ensure_error) all leave the status orphaned,
+        // so all three MUST arm the watchdog before they die. One match is
+        // the definition; three more are the arming sites.
+        let armed = SHELL_SOURCE.matches("spawn_attach_supersede_rearm_watchdog(").count();
+        assert_eq!(
+            armed, 4,
+            "the watchdog must be defined once and armed at all three orphan breaks"
+        );
+        assert!(
+            SHELL_SOURCE.contains("const ATTACH_SUPERSEDE_REARM_AFTER_MS: u64 = 15_000;")
+                && SHELL_SOURCE
+                    .contains("const ATTACH_SUPERSEDE_REARM_SECOND_LOOK_AFTER_MS: u64 = 60_000;"),
+            "the re-arm grace + second look constants must stay inside one resume ceiling"
+        );
+        assert!(
+            SHELL_SOURCE.contains("\"attach_supersede_watchdog\","),
+            "the firing must be trace-named so the falsifier is measurable on live bytes"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -69361,4 +69531,5 @@ mod web_surface_immersion_locks {
             "the disarm path must remove the wheel handler with the MATCHING capture flag — a capture/bubble mismatch leaks the listener forever"
         );
     }
+
 }
