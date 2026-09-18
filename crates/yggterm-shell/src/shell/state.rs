@@ -86856,8 +86856,11 @@ async fn process_pending_app_control_requests(
                     // gate the one-shot send carries: the RENDER must name the
                     // line before Enter, or the answer is the NAMED
                     // `refused_render` non-delivery (the text is already typed
-                    // and stands in the composer — a caller retries with the
-                    // two-step recipe, never by re-sending blind).
+                    // and stands in the composer — a caller recovers by
+                    // re-sending the SAME one-shot payload [11.143]; a bare
+                    // submit-only follow-up cannot submit it: its empty
+                    // expected line means the atomic guard only presses Enter
+                    // over an EMPTY composer, so it answers `refused_line`).
                     let render_confirmed = expected.is_empty()
                         || wait_for_composer_to_name_the_line(
                             endpoint.clone(),
