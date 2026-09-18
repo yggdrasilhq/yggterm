@@ -19275,11 +19275,13 @@ async fn terminal_write_app_control_input_async(
         // window is bounded and honest both ways — a confirm presses the
         // guarded Enter; a timeout returns the NAMED `refused_render`
         // non-delivery and the text stays standing in the composer (the
-        // proven two-step recipe — plain text, then a bare submit — is the
-        // caller's fallback). An empty expected line is a submit-only send
-        // (the recipe's second half): there is no text of ours to confirm, so
-        // the atomic guard alone decides, exactly as when that recipe was
-        // proven.
+        // caller's fallback is re-sending the SAME one-shot payload [11.143]
+        // — NOT the old two-step recipe: a bare submit-only send carries an
+        // EMPTY expected line, so the atomic guard only presses Enter over an
+        // empty composer and answers `refused_line` on a draft-holding row,
+        // measured live 2026-09-19). An empty expected line is a submit-only
+        // send: there is no text of ours to confirm, so the atomic guard
+        // alone decides.
         if submit_byte_own_chunk
             && chunks.peek().is_none()
             && chunk == "\r"
