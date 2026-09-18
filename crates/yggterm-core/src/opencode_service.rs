@@ -381,12 +381,8 @@ fn opencode_live_service_fetch() {
 /// windows should read every sibling instance dir, not just `latest`.
 /// `None` = absent or unparseable — the plane is simply not there, never an
 /// error.
-pub fn tui_tabs(home: &PathBuf) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
-    let text = std::fs::read_to_string(
-        home.join(".local/state/opencode/latest/tui/tabs.json"),
-    )
-    .ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
+fn parse_tui_tabs(text: &str) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    let value: Value = serde_json::from_str(text).ok()?;
     let cwd = value.get("cwd")?.as_object()?;
     let mut map = std::collections::BTreeMap::new();
     for (directory, entry) in cwd {
@@ -406,6 +402,43 @@ pub fn tui_tabs(home: &PathBuf) -> Option<std::collections::BTreeMap<String, Vec
     Some(map)
 }
 
+pub fn tui_tabs(home: &PathBuf) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    parse_tui_tabs(
+        &std::fs::read_to_string(home.join(".local/state/opencode/latest/tui/tabs.json")).ok()?,
+    )
+}
+
+/// Every instance dir's tab map — `.local/state/opencode/*/tui/tabs.json` —
+/// sorted by instance name. `latest/` is last-writer-wins across concurrent
+/// TUIs, so a bind verdict that must survive several windows reads every
+/// sibling, not just the newest pointer (measured on the muse lab host
+/// 2026-09-18: `beta/tui` held the only tabs.json while `latest/tui` sat
+/// empty — a latest-only read answers from the wrong generation there). A
+/// malformed or unreadable instance is skipped, never an error; an empty
+/// Vec = the plane is not there at all.
+pub fn tui_tabs_across_instances(
+    home: &PathBuf,
+) -> Vec<(String, std::collections::BTreeMap<String, Vec<String>>)> {
+    let root = home.join(".local/state/opencode");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("tui/tabs.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let text =
+                std::fs::read_to_string(root.join(&name).join("tui/tabs.json")).ok()?;
+            parse_tui_tabs(&text).map(|map| (name, map))
+        })
+        .collect()
+}
+
 /// The service session id embedded in a mirror tab row's path, if it is one.
 ///
 /// Mirror tab rows are keyed `opencode-runtime://<ses_id>` — the id is the
@@ -418,7 +451,7 @@ pub fn tab_session_id(session_path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tui_tabs_tests {
-    use super::tui_tabs;
+    use super::{tui_tabs, tui_tabs_across_instances};
 
     /// The measured 2.0.3 file, verbatim shape (the muse lab host,
     /// /tmp/opencode-suite-home-8ynxD7, 2026-09-17): cwd-keyed tabs with
@@ -463,6 +496,41 @@ mod tui_tabs_tests {
         .unwrap();
         assert_eq!(tui_tabs(&bad), None, "unparseable = cannot say");
         let _ = std::fs::remove_dir_all(&bad);
+    }
+
+    /// The sibling law (measured muse lab host 2026-09-18): every instance
+    /// dir speaks, a broken sibling is skipped rather than fatal, and an
+    /// absent plane is an empty answer — never an error.
+    #[test]
+    fn the_sibling_reader_reads_every_instance_dir_and_skips_a_broken_one() {
+        let home = std::env::temp_dir().join(format!("ygg-oc-tabs-sib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(
+            tui_tabs_across_instances(&home).is_empty(),
+            "no state dir at all = the plane is not there"
+        );
+        std::fs::create_dir_all(home.join(".local/state/opencode/beta/tui")).unwrap();
+        std::fs::write(
+            home.join(".local/state/opencode/beta/tui/tabs.json"),
+            r#"{"cwd":{"/tmp/ws-beta":{"tabs":[{"sessionID":"ses_beta00000000000000000001","title":"b"}],"unread":{}}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join(".local/state/opencode/latest/tui")).unwrap();
+        std::fs::create_dir_all(home.join(".local/state/opencode/broken/tui")).unwrap();
+        std::fs::write(
+            home.join(".local/state/opencode/broken/tui/tabs.json"),
+            "{not json",
+        )
+        .unwrap();
+        let read = tui_tabs_across_instances(&home);
+        assert_eq!(read.len(), 1, "only the parseable instance speaks");
+        assert_eq!(read[0].0, "beta");
+        assert_eq!(
+            read[0].1.get("/tmp/ws-beta"),
+            Some(&vec!["ses_beta00000000000000000001".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
