@@ -1,6 +1,6 @@
 # Spec: ygg-ci — the fleet single-build plane & compile optimization
 
-**Status:** COMPILE-CACHE LANDED 2026-09-18 (all four build hosts wired + measured); §4 cache telemetry SPEC'D, implementation open
+**Status:** COMPILE-CACHE + CACHE TELEMETRY LANDED 2026-09-18 (all four build hosts wired, measured; ygg-ci carries the telemetry)
 **Directive:** owner, 2026-09-18 — *"write these optimization techniques in docs/ ygg-ci spec in yggterm repo; the ygg onboarding skill should steer the agent to create optimization techniques based on the ci spec of their own; wire dev first, then jojo, oc, practice, jyas-webapp"*
 **Owner surfaces:** `.agents/skills/yggterm-agent-fleet/ygg-ci.py` + SKILL.md §3c (how to DRIVE it — verbs, subscribe, conflicts), `~/.yggterm/relay/ci/ci.json` (the recipes), this file (the build-plane BEHAVIOR contract + the optimization techniques).
 
@@ -65,7 +65,8 @@ sccache v0.18.0, upstream static musl binary (checksum-verified at install; **pr
 - **Per-host local disk ONLY.** dev builds host/test targets; practice builds wasm/android/release — disjoint target mixes mean a shared backend (redis, NFS on the fleet ZFS pool) buys almost nothing and adds lock hazards. No sccache-dist compile farm at this fleet size.
 - **CI stays incremental.** Integration builds merge fresh content; workspace crates would get ~zero cache hits, so `CARGO_INCREMENTAL=0` would only slow main's warm loop.
 - **Deps stay at `opt-level=2` in dev profiles** (e.g. practice-rs): runtime-relevant (argon2, serde), and sccache makes their compile cost one-time.
-- **sccache does NOT cover:** wasm-opt (dx pipeline — separate knob, currently SIGABRT-falls-back per web deploy on practice), NDK C dependencies (would need a CC wrapper — skipped, small loss), incremental workspace crates (by design).
+- **sccache does NOT cover dx-driven builds — by necessity, measured 2026-09-18:** dx 0.7.x installs itself as cargo's RUSTC shim, so cargo invokes `sccache <dx> rustc -vV` and sccache cannot classify the dx binary → hard `Compiler not supported` error, 100% of dx builds (web AND android) die under the wrapper. dx builds therefore run with `CARGO_BUILD_RUSTC_WRAPPER=""` (practice-rs `scripts/build-android-armv8.sh`, `scripts/ship-next-beta.sh`, and the CLAUDE.md web command); every DIRECT cargo path (tests, host builds, wasm32 release, service rebuilds) stays wrapped and hits 100%. Revisit only if sccache gains a passthrough or dx drops the shim.
+- **sccache also does NOT cover:** wasm-opt (dx pipeline — no disable knob exists in dx 0.7.9, verified in source; its binaryen aborts on practice's app wasm and dx falls back to unoptimized output), NDK C dependencies (would need a CC wrapper — skipped, small loss), incremental workspace crates (by design).
 
 ### 2.4 Deriving a project's own optimization plan (what onboarding points at)
 
@@ -84,11 +85,10 @@ An agent onboarding ANY project derives its plan from this section, in order:
 - Lane conflicts are explicit (`conflicts` in the build record + ci.log); the conflicted lane is excluded for that build only and retries after rebase.
 - Builds inherit the watcher's environment; anything the build NEEDS must therefore live in files the build reads (cargo config, recipes, scripts) — not in some seat's shell profile. This is why §2 wires through `~/.cargo/config.toml`.
 
-## 4. Cache telemetry (SPEC'D 2026-09-18 — implementation open, take it as a lane)
+## 4. Cache telemetry (LANDED 2026-09-18)
 
-sccache fails silently into un-cached builds (daemon death, unparseable flags) — without instrumentation a dead cache is invisible. ygg-ci therefore owes its recipes:
+sccache fails silently into un-cached builds (daemon death, unparseable flags) — without instrumentation a dead cache is invisible. All four mechanisms below are in `ygg-ci.py`:
 
-1. Each `builds/<project>--<ts>--<sha>.json` record gains a `sccache` block (hit rate, requests executed, cache size) captured around the build command.
-2. An assertion that `(hits + misses)` grows across a build that compiles anything — growth stops ⇒ loudly record `cache: STALE` in the build record.
-3. A `ygg-ci.py cache` verb: per-host cache health (hit rate over last N builds, size, `--show-stats` digest) for the fleet.
-4. `tune`-time provisioning check: a project tuned onto a host without a working sccache wire gets a warning naming §2.1 as the fix.
+1. **Delta verdict per build.** `builds/<project>--<ts>--<sha>.json` records (success AND failure) carry a `sccache` block: `{verdict, requests, hits, misses, hit_rate}` where verdict is `ok` (cache served the compiles), `idle` (nothing compiled — docs-only ticks), `STALE` (cargo printed `Compiling` but the cache saw zero requests — bypassed or broken wire; this also fires a `cache_stale` CI event), or `absent` (no readable sccache on the build host). Deltas come from `--show-stats` snapshots before/after the build — never `--zero-stats`, which would stomp parallel seats sharing the host cache.
+2. **`ygg-ci.py cache [--host h1,h2] [--tail N] [--json]`** — per-host cache health (counters, hit rate, size, location) plus the verdict digest of the last N build records. Hosts default to dev, oc, jojo, practice; remote probes run over ssh. Note: cumulative counters reset when the idle sccache server restarts — per-build deltas are the truth; the verb's value is the digest and the absent/size check.
+3. **`tune`-time provisioning check** — after any `ygg-ci.py tune`, the target host is probed for the §2.1 wire (`rustc-wrapper` in `~/.cargo/config.toml`, sccache binary reachable); an incomplete wire logs a warning naming §2.1. A MISSING BINARY with the wrapper line present is a hard build failure for wrapped builds, so it warns loudly.
