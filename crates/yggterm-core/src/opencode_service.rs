@@ -363,6 +363,49 @@ fn opencode_live_service_fetch() {
     }
 }
 
+/// The TUI's own client-side tab state — `.local/state/opencode/latest/tui/
+/// tabs.json` — as `cwd → [sessionID]`, the window/cwd keys flattened.
+///
+/// ⛔ MEASURED 2026-09-17 (2.0.3, the muse lab host, [11.134] residual work):
+/// this client state file is the ONE surface that names which session a
+/// window BINDS without OSC parsing — the 2026-09-10 decode found no SERVER
+/// surface for it (still true), and the OSC route title barely paints (three
+/// drives captured only the generic `OpenCode`). Measured shape:
+/// `{"global":{"tabs":[],…},"cwd":{"/abs/cwd":{"tabs":[{"sessionID":"ses_…",
+/// "title":"…"}],"unread":{}}}}`. The entry lands within the launch's first
+/// seconds, persists after the TUI exits, and a `--session <id>` resume from
+/// a DIFFERENT project's cwd writes the pinned id under THAT cwd (measured —
+/// a vouch-passing cross-project resume binds correctly, which falsifies the
+/// mis-bind class [11.134]'s residual feared). The `latest/` dir is
+/// last-writer-wins across TUIs; a bind verdict that must survive concurrent
+/// windows should read every sibling instance dir, not just `latest`.
+/// `None` = absent or unparseable — the plane is simply not there, never an
+/// error.
+pub fn tui_tabs(home: &PathBuf) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    let text = std::fs::read_to_string(
+        home.join(".local/state/opencode/latest/tui/tabs.json"),
+    )
+    .ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let cwd = value.get("cwd")?.as_object()?;
+    let mut map = std::collections::BTreeMap::new();
+    for (directory, entry) in cwd {
+        let Some(tabs) = entry.get("tabs").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        let ids: Vec<String> = tabs
+            .iter()
+            .filter_map(|t| t.get("sessionID").and_then(|s| s.as_str()))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !ids.is_empty() {
+            map.insert(directory.clone(), ids);
+        }
+    }
+    Some(map)
+}
+
 /// The service session id embedded in a mirror tab row's path, if it is one.
 ///
 /// Mirror tab rows are keyed `opencode-runtime://<ses_id>` — the id is the
@@ -371,6 +414,56 @@ fn opencode_live_service_fetch() {
 pub fn tab_session_id(session_path: &str) -> Option<&str> {
     let rest = session_path.strip_prefix("opencode-runtime://")?;
     rest.starts_with("ses_").then_some(rest)
+}
+
+#[cfg(test)]
+mod tui_tabs_tests {
+    use super::tui_tabs;
+
+    /// The measured 2.0.3 file, verbatim shape (the muse lab host,
+    /// /tmp/opencode-suite-home-8ynxD7, 2026-09-17): cwd-keyed tabs with
+    /// sessionID each, a global bucket the reader must skip.
+    #[test]
+    fn the_tui_tabs_reader_reads_the_measured_client_state() {
+        let home = std::env::temp_dir().join(format!("ygg-oc-tabs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/state/opencode/latest/tui")).unwrap();
+        std::fs::write(
+            home.join(".local/state/opencode/latest/tui/tabs.json"),
+            r#"{"global":{"tabs":[],"unread":{}},"cwd":{"/tmp/oc-probe-ws3":{"tabs":[{"sessionID":"ses_f546febb5ffeFdsMXaTv5cRZ6X","title":"New session"}],"unread":{}},"/tmp/bindB":{"tabs":[{"sessionID":"ses_f546febb5ffeFdsMXaTv5cRZ6X","title":"New session"}],"unread":{}}}}"#,
+        )
+        .unwrap();
+        let map = tui_tabs(&home).expect("readable");
+        assert_eq!(
+            map.get("/tmp/oc-probe-ws3"),
+            Some(&vec!["ses_f546febb5ffeFdsMXaTv5cRZ6X".to_string()])
+        );
+        // The cross-project resume wrote the SAME pinned id under the OTHER
+        // cwd — the measured bind-correct fact, locked.
+        assert_eq!(
+            map.get("/tmp/bindB"),
+            Some(&vec!["ses_f546febb5ffeFdsMXaTv5cRZ6X".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_absent_or_malformed_tui_tabs_is_none_never_an_error() {
+        let bare = std::env::temp_dir().join(format!("ygg-oc-tabs-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(tui_tabs(&bare), None, "absent file = the plane is not there");
+        let bad = std::env::temp_dir().join(format!("ygg-oc-tabs-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bad);
+        std::fs::create_dir_all(bad.join(".local/state/opencode/latest/tui")).unwrap();
+        std::fs::write(
+            bad.join(".local/state/opencode/latest/tui/tabs.json"),
+            "{not json",
+        )
+        .unwrap();
+        assert_eq!(tui_tabs(&bad), None, "unparseable = cannot say");
+        let _ = std::fs::remove_dir_all(&bad);
+    }
 }
 
 #[cfg(test)]

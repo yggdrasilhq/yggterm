@@ -433,6 +433,81 @@ module.exports = {
       return `--session ${resumedId} re-rendered the prior transcript (measured TRUE on 2.0.3); exit ${code}`;
     });
 
+    // 7b. THE BIND TRUTH — what session did the resumed window actually
+    //     BIND? Measured 2026-09-17 ([11.134] residual work): the TUI writes
+    //     a client-side cwd-keyed tab map at
+    //     `$HOME/.local/state/opencode/latest/tui/tabs.json` naming each
+    //     tab's sessionID — a direct bind signal (the OSC route title
+    //     captured only the generic `OpenCode` across three drives). A
+    //     `--session <id>` resume must name the pinned id under the drive's
+    //     own cwd, and a FRESH birth must name its birth id (the id yggterm
+    //     may not assume). Landed as core `opencode_service::tui_tabs`.
+    await ctx.probe('bind-tabs-truth', async () => {
+      const tabsPath = path.join(scratchHome, '.local/state/opencode/latest/tui/tabs.json');
+      const tabs = JSON.parse(fs.readFileSync(tabsPath, 'utf8'));
+      const byCwd = tabs.cwd ?? {};
+      const freshId = ctx.facts.store.session_for_probe_cwd?.id ?? null;
+      const freshTabs = byCwd[ctx.cwd]?.tabs?.map((t) => t.sessionID) ?? [];
+      const resumeTabs = byCwd[ctx.cwd]?.tabs?.map((t) => t.sessionID) ?? [];
+      ctx.facts.bind = {
+        tabs_file: '.local/state/opencode/latest/tui/tabs.json',
+        fresh_birth_id_listed: freshId ? freshTabs.includes(freshId) : null,
+        resumed_id_listed: resumedId ? resumeTabs.includes(resumedId) : null,
+        cwds_named: Object.keys(byCwd),
+      };
+      if (freshId && !ctx.facts.bind.fresh_birth_id_listed) {
+        throw new Error('the fresh session id is not in the cwd tab map — the bind-truth surface moved, re-measure');
+      }
+      if (resumedId && !ctx.facts.bind.resumed_id_listed) {
+        throw new Error('the resumed id is not in the cwd tab map — the resume bound something else, re-measure [11.134]');
+      }
+      return `cwd tab map names the birth id and the resumed id (${ctx.facts.bind.cwds_named.length} cwd keys)`;
+    });
+
+    // 7c. CROSS-PROJECT resume — the vouch-passing case ([11.134]): the id
+    //     lives in the store, so yggterm's vouch says yes, but the launch
+    //     cwd belongs to a DIFFERENT project. Measured 2026-09-17: 2.0.3
+    //     binds the PINNED session correctly (transcript re-renders and the
+    //     cwd tab map names the pinned id under the NEW cwd) — the mis-bind
+    //     class is falsified for this case; the store-only silent fallback
+    //     (unknown id) remains the vouch-guarded hazard.
+    await ctx.probe('cross-project-resume', async () => {
+      if (!resumedId) throw new Error('no resumed id — resume probe must run first');
+      const otherCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-crossproj-'));
+      const d4 = new ctx.Drive({
+        command: bin,
+        args: ['--auto', '--session', resumedId],
+        cwd: otherCwd,
+        artifactsDir: ctx.artifactsDir,
+        label: 'opencode-crossproj',
+      });
+      const reRendered = await d4.waitFor(
+        () => d4.screen().includes('tok/s') || d4.screen().includes('Build ·'),
+        90000,
+        400,
+      );
+      await new Promise((r) => setTimeout(r, 2500));
+      d4.snap('crossproj');
+      const tabsPath = path.join(scratchHome, '.local/state/opencode/latest/tui/tabs.json');
+      const tabs = JSON.parse(fs.readFileSync(tabsPath, 'utf8'));
+      const otherTabs = (tabs.cwd?.[otherCwd]?.tabs ?? []).map((t) => t.sessionID);
+      const code = await d4.killChild();
+      ctx.facts.cross_project_resume = {
+        cwd: otherCwd,
+        pinned_id: resumedId,
+        transcript_re_rendered: reRendered,
+        pinned_id_listed_for_new_cwd: otherTabs.includes(resumedId),
+        exit_code: code,
+      };
+      if (!ctx.facts.cross_project_resume.transcript_re_rendered) {
+        throw new Error('cross-project resume rendered NO prior transcript — re-measure [11.134]');
+      }
+      if (!ctx.facts.cross_project_resume.pinned_id_listed_for_new_cwd) {
+        throw new Error('cross-project resume did NOT list the pinned id under the new cwd — the silent mis-bind is REAL, re-open [11.134]');
+      }
+      return `cross-project resume bound the PINNED id (mis-bind falsified); exit ${code}`;
+    });
+
     // 8. bogus session id — the beta-era law ("refuses an unknown --session
     //    outright") is DEAD: 2.0.3 silently falls back to the most recent
     //    session of the project. Recorded as the measured hazard it is.
