@@ -31440,7 +31440,7 @@ behind; the owner re-reported the same ghosts three times.
 
 ## ⛔ [11.141] NO WRAPPER PATH DELIVERS A TURN TO A LIVE DEVIN ROW — TEXT+ENTER SHIPS AS ONE COALESCED WRITE THE CLI READS AS PASTE, THE SUBMIT VERB'S ECHO GATE NEVER CONFIRMS ON A RAW-MODE TUI, AND INPUT-CHECK FALSE-NEGATIVES THE DRAFT IT CLAIMS TO CLEAR (measured live 2026-09-18, the [11.140] acceptance leg, the muse lab host, devin v3000.10.31, daemon+GUI direct build e66ee38f3104 — the [11.140] fix build)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The [11.140] rotation arrived (daemon exe + GUI client both on direct build
 e66ee38f3104), the owed acceptance leg ran through the production wrapper, and
@@ -31492,6 +31492,40 @@ shell rows must not change), and the echo-confirm gate needs a raw-mode posture
 can actually answer — not by pty echo). Until then [11.140]'s `accepted:true`
 delivery stays owed, and any automator that trusts the send verb's
 `accepted:true` silently half-delivers to devin rows.
+
+**Fixed in the same sitting it was named (lane/integration/11141-wrapper-input,
+2026-09-18):** the input contract is now descriptor data — two measured fields
+on the CLI descriptor, `submit_byte_own_chunk` and `pty_echo_confirms_input`,
+both true to the measured devin posture and defaulted to today's behavior for
+every other CLI (shell rows byte-for-byte unchanged; a lock test refuses a
+second CLI claiming the contract without its own live measurement). (1) THE
+SEND: for a contract CLI the trailing `\r` is split into its own chunk and
+delivered as the daemon's ATOMIC CONDITIONAL SUBMIT — press Enter iff the
+line the daemon forwarded still reads exactly the text just sent — which
+cannot be refused by the draft guard (it carries no data; the line-match IS
+the guard) and cannot splice a human's keystrokes (the comparison and the
+Enter run under one lock). The write report grew `submit` /
+`conditional_submit` and a `delivered()` gate, and the send verb now answers
+`accepted:false, reason:submit_line_mismatch_refusal` when the submit refuses
+— `accepted:true` means the TURN STARTED, not merely that bytes were counted.
+(2) THE PROBE: a raw-mode CLI confirms consumption by COMPOSER DELTA on the
+decoded screen — the marker typed once, polled for ~2.4 s to land in the
+rendered composer (the render, never the forwarded-byte flag: a wedged row
+must not confirm from its own queued bytes) — then cleared with Ctrl+U plus
+one backspace per marker char, residue named honestly in the reason when the
+line refuses to clear. One attempt, no retry barrage; every other CLI keeps
+the 180 ms echo-confirm loop unchanged. (3) THE DRAFT DESYNC: the composer
+box-arm now walks PAST an empty row below the input row instead of answering
+cannot-say — the grown box (devin's coalesced Enter; opencode paints one by
+design) was the screen on which input-check said "no draft" while the send
+guard refused the same pixels. Fixture-locked both ways. Tests: core +3
+(grown-box fixture, contract-uniqueness lock, chunker contract), shell +3
+(chunker, conditional-submit outcome classifier, probe-posture selector);
+full-suite red set byte-identical to a clean-main stash run. LIVE PROOF OWED:
+the `accepted:true` delivery leg on a real devin row rides the next jojo
+daemon rotation onto this build (the [11.106]/[11.140] law) — fresh trusted
+cwd, `terminal send` a one-line prompt, and a sessions.db row proving the turn
+completed.
 
 ## ⛔ [11.138] THE WORKING-RECENCY METRONOME — BRIDGED KEEPALIVE FRAMES RESTAMP THE ACTIVITY CLOCKS AND AN IDLE CODEX ROW RIDES THE WORKING VERDICT EVERY ~305s FOR HOURS, HOLDING BOTH HOSTS' ROTATIONS (measured live 2026-09-17 09:49→11:31 on the GUI host + the dev headless, trace-fixing campaign)
 

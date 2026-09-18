@@ -86557,7 +86557,7 @@ async fn process_pending_app_control_requests(
             data,
             allow_multiline,
         } => {
-            let (endpoint, runtime_session_path, trace_home, target_is_agent_cli) =
+            let (endpoint, runtime_session_path, trace_home, target_is_agent_cli, submit_byte_own_chunk) =
                 state.with(|shell| {
                     (
                         shell.bootstrap.server_endpoint.clone(),
@@ -86565,6 +86565,9 @@ async fn process_pending_app_control_requests(
                         perf_home_dir(&shell.bootstrap.settings_path),
                         live_session_kind_for_path(shell, &session_path)
                             .is_some_and(SessionKind::is_agent),
+                        live_session_kind_for_path(shell, &session_path)
+                            .and_then(|kind| yggterm_core::agent_cli::agent_cli_descriptor(kind))
+                            .is_some_and(|descriptor| descriptor.submit_byte_own_chunk),
                     )
                 });
             // ⛔ The refusal. A payload with interior line breaks reaches an agent
@@ -86605,6 +86608,7 @@ async fn process_pending_app_control_requests(
                 session_path.clone(),
                 data.clone(),
                 read_nudge_reason,
+                submit_byte_own_chunk,
                 trace_home.as_path(),
             )
             .await
@@ -86668,6 +86672,42 @@ async fn process_pending_app_control_requests(
                             })),
                             error: None,
                         }
+                    } else if !write_report.delivered() {
+                        // ⛔ [11.141] The text landed but the contract's
+                        // conditional submit did not. Reporting `accepted: true`
+                        // here is the measured lie this defect exists for: an
+                        // automator believes a turn started, devin's composer
+                        // holds half a delivery, and the store (which writes a
+                        // row only on a COMPLETED turn) is the only witness.
+                        let (reason, detail) = match write_report.submit {
+                            Some("refused_line") => (
+                                "submit_line_mismatch",
+                                "the submit was guarded and refused: the composer's line does not read what was just sent — a person's keystrokes interleaved, or the text never landed. Nothing was submitted; clear the row's input and resend.",
+                            ),
+                            Some("startup_gate_shown") => (
+                                "startup_gate_shown",
+                                "the row is parked on its CLI's startup gate. Answer it interactively in the row, then resend.",
+                            ),
+                            _ => (
+                                "submit_unconfirmed",
+                                "the submit's outcome could not be confirmed from the daemon's answer. Nothing is claimed delivered; re-check the row's screen before assuming the turn started.",
+                            ),
+                        };
+                        AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: Some(json!({
+                                "accepted": false,
+                                "session_path": session_path,
+                                "reason": format!("{reason}_refusal"),
+                                "detail": detail,
+                                "bytes": data.len(),
+                                "write": write_report.to_json(),
+                            })),
+                            error: None,
+                        }
                     } else {
                         let read_nudge = dispatch_terminal_external_input_read_nudge(
                             &session_path,
@@ -86717,14 +86757,18 @@ async fn process_pending_app_control_requests(
             // which recognizes EVERY registered agent CLI's composer glyph (codex
             // `›`, Claude Code `❯`). With only codex's, a claude-code row was never
             // ready and its prompt was never sent (live, guihost 2026-08-06).
-            let (endpoint, runtime_session_path, session_kind, trace_home) = state.with(|shell| {
-                (
-                    shell.bootstrap.server_endpoint.clone(),
-                    app_control_terminal_input_write_path(shell, &session_path),
-                    live_session_kind_for_path(shell, &session_path),
-                    perf_home_dir(&shell.bootstrap.settings_path),
-                )
-            });
+            let (endpoint, runtime_session_path, session_kind, trace_home, submit_byte_own_chunk) =
+                state.with(|shell| {
+                    (
+                        shell.bootstrap.server_endpoint.clone(),
+                        app_control_terminal_input_write_path(shell, &session_path),
+                        live_session_kind_for_path(shell, &session_path),
+                        perf_home_dir(&shell.bootstrap.settings_path),
+                        live_session_kind_for_path(shell, &session_path)
+                            .and_then(|kind| yggterm_core::agent_cli::agent_cli_descriptor(kind))
+                            .is_some_and(|descriptor| descriptor.submit_byte_own_chunk),
+                    )
+                });
             let timeout = Duration::from_millis(if timeout_ms == 0 { 30_000 } else { timeout_ms });
             let started = Instant::now();
             // A displayed prompt does NOT mean codex is reading input — a just-resumed
@@ -86787,6 +86831,13 @@ async fn process_pending_app_control_requests(
                 } else {
                     text
                 };
+                // ⛔ [11.141] For a submit-own-chunk CLI the Enter cannot ride a
+                // glued write NOR a plain follow-up `\r` (the draft guard sees
+                // the line the wrapper itself just typed and refuses it). It
+                // rides the atomic conditional submit: the daemon presses Enter
+                // iff the line it forwarded still reads exactly this text.
+                let submit_expected = submit_byte_own_chunk
+                    .then(|| app_control_terminal_input_payload_for_pty(&text));
                 if !text.is_empty() {
                     let _ = terminal_write_app_control_input_async(
                         endpoint.clone(),
@@ -86794,22 +86845,58 @@ async fn process_pending_app_control_requests(
                         session_path.clone(),
                         text,
                         "submit_text",
+                        false,
                         trace_home.as_path(),
                     )
                     .await;
                     sleep(Duration::from_millis(80)).await;
                 }
-                match terminal_write_app_control_input_async(
-                    endpoint.clone(),
-                    runtime_session_path.clone(),
-                    session_path.clone(),
-                    "\r".to_string(),
-                    read_nudge_reason,
-                    trace_home.as_path(),
-                )
-                .await
-                {
-                    Ok(write_report) => {
+                let enter = if let Some(expected) = submit_expected {
+                    terminal_conditional_submit_async(
+                        endpoint.clone(),
+                        runtime_session_path.clone(),
+                        expected,
+                        trace_home.as_path(),
+                    )
+                    .await
+                    .map(|message| {
+                        let slug = conditional_submit_outcome(&message);
+                        (
+                            slug,
+                            json!({
+                                "conditional_submit": true,
+                                "submit": slug,
+                                "message": message,
+                            }),
+                        )
+                    })
+                } else {
+                    terminal_write_app_control_input_async(
+                        endpoint.clone(),
+                        runtime_session_path.clone(),
+                        session_path.clone(),
+                        "\r".to_string(),
+                        read_nudge_reason,
+                        false,
+                        trace_home.as_path(),
+                    )
+                    .await
+                    .map(|report| {
+                        // ⛔ "NOT REFUSED" IS NOT SUBMITTED — the same law the
+                        // conditional submit carries. An honest `submitted` is
+                        // the report's delivered(), nothing weaker.
+                        let slug = if report.delivered() {
+                            "submitted"
+                        } else if report.refused.is_some() {
+                            "refused"
+                        } else {
+                            "unconfirmed"
+                        };
+                        (slug, report.to_json())
+                    })
+                };
+                match enter {
+                    Ok((submit_slug, write_json)) => {
                         let _ = safe_shell_mut(
                             state,
                             "app_control_submit_terminal_prompt_schedule_live_snapshot_refresh",
@@ -86832,12 +86919,13 @@ async fn process_pending_app_control_requests(
                             completed_at_ms: current_millis() as u128,
                             output_path: None,
                             data: Some(json!({
-                                "submitted": true,
+                                "submitted": submit_slug == "submitted",
+                                "submit": submit_slug,
                                 "session_path": session_path,
                                 "bytes": data.len(),
                                 "waited_ms": waited_ms,
                                 "read_nudge": read_nudge,
-                                "write": write_report.to_json(),
+                                "write": write_json,
                             })),
                             error: None,
                         }

@@ -862,6 +862,38 @@ pub struct AgentCliDescriptor {
     /// Which permission postures this CLI can express, and the tokens for each.
     /// A mode absent from this table is refused by name — see
     /// [`AgentPermissionMode`].
+    /// ⛔ [11.141] THE SUBMIT CONTRACT — the CLI reads one coalesced write as
+    /// ONE input event (its input parser treats a single read as a paste), so a
+    /// trailing `\r` glued to the text inserts a newline in the composer
+    /// instead of submitting. Measured live 2026-09-18 (the [11.140]
+    /// acceptance leg, devin 3000.10.31 on the muse lab host): `terminal send
+    /// --data 'text\r'` answered `accepted:true`, the text rendered, and the
+    /// Enter landed IN the composer (the box grew an empty row) — no turn ever
+    /// started, and the store agreed (zero sessions.db rows; devin writes one
+    /// only on a COMPLETED turn).
+    ///
+    /// `true` ⇒ the wrapper delivers the submit byte as its OWN write — via the
+    /// daemon's atomic conditional submit (press Enter iff the line still reads
+    /// what was typed), never as a glued tail. `false` (default) ⇒ today's
+    /// behavior, unchanged: the trailing `\r` rides with the text, which is
+    /// correct for line-discipline readers (shell rows, codex) and must not
+    /// change.
+    pub submit_byte_own_chunk: bool,
+    /// ⛔ [11.141] THE CONSUMPTION-CONFIRM POSTURE — whether this CLI ECHOES
+    /// programmatic input back onto the pty the way a line-discipline reader
+    /// does. The readiness probe confirms a row is consuming input by waiting
+    /// for its marker to echo onto the decoded screen inside a fixed window;
+    /// a raw-mode TUI never echoes on that clock, so the gate answered WEDGED
+    /// ("alive, idle-looking, and not reading its PTY") for a row that
+    /// demonstrably renders typed text (measured live 2026-09-18, devin —
+    /// 31 s of gate, the marker rendered in the composer the whole time).
+    ///
+    /// `false` ⇒ the probe confirms by COMPOSER DELTA on the decoded screen —
+    /// the signal a raw-mode TUI actually gives: the marker shows up as
+    /// composer content (the draft reader flips) and is erased again with
+    /// backspaces, the one editing key every composer binds. `true` (default)
+    /// ⇒ today's echo confirm, unchanged.
+    pub pty_echo_confirms_input: bool,
     pub permission_modes: &'static [(AgentPermissionMode, &'static [&'static str])],
     /// Every flag that SETS a model or permission posture for this CLI —
     /// including spellings yggterm never emits (codex's `-m`, `--sandbox`).
@@ -2031,6 +2063,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // first (the CLI's own word), then the cached title, then the rollout's
         // first real user prompt (the wrappers skipped).
         read_live_store_title: Some(read_codex_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(CODEX_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
@@ -2166,6 +2204,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // ⛔ Codex-LiteLLM has no remote arm — its remote-*:// rows never
         // exist, so a probe here would be dead weight the coverage lock
         // rightly refuses.
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: None,
     },
     AgentCliDescriptor {
@@ -2429,6 +2473,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         live_session_argv_flag: None,
         live_session_marker: None,
         read_live_store_title: Some(read_claude_code_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(CLAUDE_CODE_REMOTE_TITLE_PROBE),
     },
     // ── The 2026-08-08 intake. Every field below was read off the CLI's own
@@ -2566,6 +2616,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // The 12-second title chore serves live pi rows from the session's
         // own jsonl (header id == file name uuid — measured 2026-08-30).
         read_live_store_title: Some(read_pi_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(PI_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
@@ -2724,6 +2780,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // opencode2 self-titles prompted sessions in session_v2 (the scanner
         // reads the same column); the chore reads it for live rows too.
         read_live_store_title: Some(read_opencode_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(OPENCODE_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
@@ -2859,6 +2921,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         live_session_argv_flag: None,
         live_session_marker: None,
         read_live_store_title: Some(read_qwen_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(QWEN_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
@@ -3065,6 +3133,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // it: a probe with no local reader is the exact drift its own gate
         // test exists to refuse.
         read_live_store_title: None,
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: None,
     },
     AgentCliDescriptor {
@@ -3251,6 +3325,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             file_name: ".session.lock",
         }),
         read_live_store_title: Some(read_muse_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(MUSE_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
@@ -3475,6 +3555,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             extension: "lock",
         }),
         read_live_store_title: Some(read_antigravity_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(ANTIGRAVITY_REMOTE_TITLE_PROBE),
     },
     // ── The 2026-08-13 intake. Every field below was read off the installed
@@ -3731,6 +3817,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Grok keeps summary.json per session directory; the chore reads the
         // session's own summary for live rows.
         read_live_store_title: Some(read_grok_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(GROK_REMOTE_TITLE_PROBE),
     },
     // ── The 2026-09-08 intake. The house's own client: zcode-tui
@@ -3874,6 +3966,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Live rows take their title from the shared store's own session
         // table (the desktop's generated titles — title_authority Store).
         read_live_store_title: Some(read_zcode_tui_live_store_title),
+        // Input contract: line-discipline defaults — a trailing \r rides with
+        // the text and the pty echoes it back. The shell-row behavior and the
+        // echo-confirmed probe both depend on these; flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
         remote_live_store_title: Some(ZCODE_TUI_REMOTE_TITLE_PROBE),
     },
     // ── The 2026-09-15 intake. Cognition's Devin CLI: a local REPL coding
@@ -4111,6 +4209,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // prompt's text, present the moment a turn completes (the codex
         // eager-titling law, third instance).
         read_live_store_title: Some(read_devin_live_store_title),
+        // ⛔ [11.141] MEASURED (2026-09-18, the [11.140] acceptance leg, devin
+        // 3000.10.31, muse lab host): a coalesced `text\r` write inserts the
+        // Enter INTO the composer (paste-coalescing — the battery \x1b\x1b
+        // law, third instance), so the submit byte must ride its own write;
+        // and the row renders typed text without ever echoing it on the
+        // probe's clock, so consumption confirms by composer delta, not echo.
+        submit_byte_own_chunk: true,
+        pty_echo_confirms_input: false,
         remote_live_store_title: Some(DEVIN_REMOTE_TITLE_PROBE),
     },
 ];
@@ -9663,6 +9769,34 @@ mod tests {
     }
 
     #[test]
+    /// [11.141] The input-contract fields are MEASURED, never defaulted into
+    /// existence: the two halves are one posture (a CLI that pastes its input
+    /// is exactly the CLI that never echoes it), and until a second live
+    /// measurement lands, exactly one CLI carries them.
+    #[test]
+    fn the_raw_mode_input_contract_is_declared_only_where_it_was_measured() {
+        for descriptor in AGENT_CLIS.iter() {
+            if descriptor.submit_byte_own_chunk || !descriptor.pty_echo_confirms_input {
+                assert_eq!(
+                    descriptor.kind,
+                    SessionKind::Devin,
+                    "{} declares the raw-mode input contract; only devin has the                      live measurement behind it ([11.141], 2026-09-18)",
+                    descriptor.display_name
+                );
+                assert!(
+                    descriptor.submit_byte_own_chunk,
+                    "{}: echo-off without own-chunk submit is a half posture —                      the probe would pass and the glued Enter would still paste",
+                    descriptor.display_name
+                );
+                assert!(
+                    !descriptor.pty_echo_confirms_input,
+                    "{}: own-chunk submit without the raw-mode probe posture                      leaves the echo gate refusing every submit forever",
+                    descriptor.display_name
+                );
+            }
+        }
+    }
+
     fn descriptors_are_unique_per_kind_and_name_a_binary() {
         let mut kinds: Vec<SessionKind> = AGENT_CLIS.iter().map(|d| d.kind).collect();
         let before = kinds.len();

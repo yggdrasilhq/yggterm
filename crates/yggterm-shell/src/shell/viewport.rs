@@ -18160,6 +18160,22 @@ const TERMINAL_INPUT_DRAFT_REASON: &str =
     "the composer holds an unsent draft — refusing to probe, because the probe types a marker and clears the line with Ctrl+U and would destroy it";
 const TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON: &str =
     "the composer could not be read, so whether a human is mid-sentence is unknown — refusing to probe, because being wrong here costs somebody their line";
+/// [11.141] Raw-mode verdicts. A raw-mode TUI never echoes on the pty, so
+/// "echo-confirmed" is not just wrong vocabulary for it — the fixed echo
+/// window measurably refused every submit forever (devin, 31 s of gate while
+/// the marker sat rendered in the composer). The posture answers by composer
+/// delta instead, and its reasons must say which posture ran.
+const TERMINAL_INPUT_CONSUMING_REASON_RAW_MODE: &str =
+    "the session rendered the probe marker into its composer and it was erased again (composer-delta confirm — raw-mode TUI, no pty echo)";
+const TERMINAL_INPUT_CONSUMING_RAW_MODE_RESIDUE_REASON: &str =
+    "the session rendered the probe marker into its composer (composer-delta confirm — it IS reading input) but Ctrl+U and backspaces did not clear the line; the probe text may remain in the composer";
+const TERMINAL_INPUT_WEDGED_RAW_MODE_REASON: &str =
+    "session never rendered the probe marker into its composer within the timeout (raw-mode posture: confirmed by composer delta, not pty echo) — the row is WEDGED: alive, idle-looking, and not reading its PTY";
+/// The patient window a raw-mode composer gets to render the probe marker.
+/// The echo posture's single 180 ms shot exists because an echo is immediate
+/// or never; a raw-mode TUI repaints on its own schedule, so the delta is
+/// polled instead of sampled once.
+const TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS: u64 = 2_400;
 
 /// How long to wait before the probe tries again, and the ceiling it climbs to.
 ///
@@ -18186,6 +18202,151 @@ fn probe_write_is_permitted(composer_holds_draft: Option<bool>) -> bool {
 /// The next retry interval, doubling to a fixed ceiling.
 fn probe_retry_backoff(previous: Duration) -> Duration {
     (previous * 2).min(TERMINAL_INPUT_PROBE_RETRY_CEILING)
+}
+
+/// Does this CLI confirm input consumption by pty echo? Descriptor-declared
+/// ([`AgentCliDescriptor::pty_echo_confirms_input`], [11.141]); a session
+/// without a descriptor keeps today's echo posture.
+fn input_consumption_confirms_by_echo(session_kind: Option<SessionKind>) -> bool {
+    // ⛔ THE DEFAULT IS THE ECHO POSTURE: a session without a kind, or with a
+    // kind that has no descriptor, keeps today's behavior exactly. Only a
+    // descriptor that MEASURES raw-mode (devin, [11.141]) may opt out of echo.
+    match session_kind {
+        None => true,
+        Some(kind) => yggterm_core::agent_cli::agent_cli_descriptor(kind)
+            .is_none_or(|descriptor| descriptor.pty_echo_confirms_input),
+    }
+}
+
+/// The raw-mode posture: confirm consumption by COMPOSER DELTA, not echo.
+///
+/// The probe marker is typed once and polled for patiently — the signal a
+/// raw-mode TUI actually gives is the marker showing up as composer content
+/// (the draft reading flips, or the rendered screen simply names the marker).
+/// On confirm, the line is erased the way a composer can always undo it:
+/// Ctrl+U first (which also clears the daemon's reconstructed input line, so
+/// the probe cannot read as a person's draft afterwards), then one backspace
+/// per marker character for the CLIs that never bound Ctrl+U at all.
+///
+/// ⛔ ONE ATTEMPT, and no cleanup write on failure: the marker of an
+/// unread-probe may still be travelling toward a slow repaint, and both a
+/// second probe and a cleanup would stack bytes into a buffer nobody is
+/// reading. One honest verdict instead — that is the difference from the echo
+/// posture's retry loop, which exists precisely because an echo CLI's buffer
+/// is drained.
+async fn probe_input_consumption_by_composer_delta(
+    endpoint: ServerEndpoint,
+    runtime_session_path: String,
+    session_path: String,
+    trace_home: &Path,
+    timeout: Duration,
+    started: Instant,
+    composer_held_draft: Option<bool>,
+    activity: AgentRowActivity,
+) -> TerminalInputProbeVerdict {
+    let mut composer_draft_now = composer_held_draft;
+    if !probe_write_is_permitted(composer_draft_now) {
+        return TerminalInputProbeVerdict {
+            consuming_input: false,
+            composer_shown: true,
+            composer_held_draft: composer_draft_now,
+            activity,
+            waited_ms: started.elapsed().as_millis() as u64,
+            reason: match composer_draft_now {
+                Some(true) => TERMINAL_INPUT_DRAFT_REASON,
+                _ => TERMINAL_INPUT_UNREADABLE_COMPOSER_REASON,
+            },
+        };
+    }
+    let _ = terminal_write_app_control_input_async(
+        endpoint.clone(),
+        runtime_session_path.clone(),
+        session_path.clone(),
+        TERMINAL_INPUT_ECHO_PROBE.to_string(),
+        "submit_probe",
+        false,
+        trace_home,
+    )
+    .await;
+    let confirm_deadline = started + timeout.min(Duration::from_millis(
+        TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS,
+    ));
+    let mut rendered = false;
+    let mut fresh_draft = composer_held_draft;
+    while Instant::now() < confirm_deadline {
+        sleep(Duration::from_millis(150)).await;
+        if let Ok((screen, .., draft)) =
+            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await
+        {
+            fresh_draft = draft;
+            // ⛔ THE DELTA IS THE RENDER, NOT THE QUEUED BYTES. The walk arm of
+            // the daemon's draft union flips true the moment the marker is
+            // FORWARDED — a wedged row would confirm instantly if that were
+            // the test. The marker must show in the rendered composer (the
+            // grid arm, or the screen text itself), which only happens when
+            // the CLI actually consumed and painted it.
+            if screen.contains(TERMINAL_INPUT_ECHO_PROBE) {
+                rendered = true;
+                break;
+            }
+        }
+    }
+    if !rendered {
+        return TerminalInputProbeVerdict {
+            consuming_input: false,
+            composer_shown: true,
+            composer_held_draft: fresh_draft,
+            activity,
+            waited_ms: started.elapsed().as_millis() as u64,
+            reason: TERMINAL_INPUT_WEDGED_RAW_MODE_REASON,
+        };
+    }
+    // Cleanup: Ctrl+U clears the daemon's reconstructed line even where the
+    // CLI ignores it; the backspaces then erase the marker from a composer
+    // that never bound Ctrl+U. One write, one chunk — the walk processes both.
+    let mut clear = String::from(TERMINAL_INPUT_CLEAR_LINE);
+    for _ in 0..TERMINAL_INPUT_ECHO_PROBE.chars().count() {
+        clear.push('\u{7f}');
+    }
+    let _ = terminal_write_app_control_input_async(
+        endpoint.clone(),
+        runtime_session_path.clone(),
+        session_path.clone(),
+        clear,
+        "submit_probe",
+        false,
+        trace_home,
+    )
+    .await;
+    sleep(Duration::from_millis(120)).await;
+    let cleanup_reading =
+        terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
+            .await
+            .ok();
+    let (clean, cleaned_draft) = cleanup_reading
+        .as_ref()
+        .map_or((false, None), |(screen, .., draft)| {
+            (
+                *draft != Some(true) && !screen.contains(TERMINAL_INPUT_ECHO_PROBE),
+                *draft,
+            )
+        });
+    TerminalInputProbeVerdict {
+        consuming_input: true,
+        composer_shown: true,
+        composer_held_draft: if clean {
+            cleaned_draft
+        } else {
+            fresh_draft
+        },
+        activity,
+        waited_ms: started.elapsed().as_millis() as u64,
+        reason: if clean {
+            TERMINAL_INPUT_CONSUMING_REASON_RAW_MODE
+        } else {
+            TERMINAL_INPUT_CONSUMING_RAW_MODE_RESIDUE_REASON
+        },
+    }
 }
 
 /// One verdict on one question: **is this row consuming input right now?**
@@ -18234,6 +18395,15 @@ struct TerminalInputProbeVerdict {
 /// as the daemon-side twin `submit_prompt_echo_verified_with` already does it —
 /// a caller that wants the text sent gets a NAMED refusal and stops. ⛔ It must
 /// not retry: a second attempt is a second barrage.
+///
+/// ⛔ [11.141] AND THE ECHO IS NOT THE ONLY CONSUMPTION SIGNAL. A raw-mode TUI
+/// (descriptor declares `pty_echo_confirms_input: false`) never echoes on any
+/// clock — the echo posture's fixed window answered WEDGED for a row that was
+/// demonstrably rendering typed text (measured live 2026-09-18, devin 3000.10.31:
+/// 31 s of gate, `submitted:false`, while the launch probe's own marker sat in
+/// the composer as proof the row reads everything). Such a CLI takes the
+/// raw-mode posture in [`probe_input_consumption_by_composer_delta`]: confirm
+/// by composer DELTA on the decoded screen, clean with backspaces.
 async fn probe_terminal_input_consumption(
     endpoint: ServerEndpoint,
     runtime_session_path: String,
@@ -18287,6 +18457,19 @@ async fn probe_terminal_input_consumption(
             reason: TERMINAL_INPUT_NO_COMPOSER_REASON,
         };
     }
+    if !input_consumption_confirms_by_echo(session_kind) {
+        return probe_input_consumption_by_composer_delta(
+            endpoint,
+            runtime_session_path,
+            session_path,
+            trace_home,
+            timeout,
+            started,
+            composer_held_draft,
+            activity,
+        )
+        .await;
+    }
     // The freshest reading of "is somebody mid-sentence in there", carried across
     // iterations so every write is authorised by a reading taken AFTER the last
     // one. `Some(false)` is the only value that lets a write through.
@@ -18315,6 +18498,7 @@ async fn probe_terminal_input_consumption(
             session_path.clone(),
             TERMINAL_INPUT_ECHO_PROBE.to_string(),
             "submit_probe",
+            false,
             trace_home,
         )
         .await;
@@ -18336,6 +18520,7 @@ async fn probe_terminal_input_consumption(
                 session_path.clone(),
                 TERMINAL_INPUT_CLEAR_LINE.to_string(),
                 "submit_probe",
+                false,
                 trace_home,
             )
             .await;
@@ -18375,6 +18560,7 @@ async fn probe_terminal_input_consumption(
             session_path.clone(),
             TERMINAL_INPUT_CLEAR_LINE.to_string(),
             "submit_probe",
+            false,
             trace_home,
         )
         .await;
@@ -18777,6 +18963,21 @@ fn app_control_terminal_input_read_nudge_reason(data: &str) -> &'static str {
 }
 
 fn app_control_terminal_input_write_chunks(data: &str) -> Vec<String> {
+    app_control_terminal_input_write_chunks_with_submit_contract(data, false)
+}
+
+/// The chunker with the per-CLI submit contract applied
+/// ([`AgentCliDescriptor::submit_byte_own_chunk`], [11.141]). For such a CLI a
+/// coalesced `text\r` write is read as ONE paste event — the Enter inserts in
+/// the composer instead of submitting — so the trailing `\r` is split into its
+/// own final chunk, which the writer then delivers as the daemon's atomic
+/// conditional submit. Interior Enters keep today's per-line pacing, and a
+/// bracketed-paste block is still ONE chunk (its `\r` are composer content by
+/// definition).
+fn app_control_terminal_input_write_chunks_with_submit_contract(
+    data: &str,
+    submit_byte_own_chunk: bool,
+) -> Vec<String> {
     let data = app_control_terminal_input_payload_for_pty(data);
     // A bracketed-paste block is ONE chunk. The per-line split exists to pace
     // Enters, and there are no Enters inside a paste — the receiver is in paste
@@ -18809,6 +19010,17 @@ fn app_control_terminal_input_write_chunks(data: &str) -> Vec<String> {
     if chunks.is_empty() {
         chunks.push(data.to_string());
     }
+    if submit_byte_own_chunk
+        && let Some(last) = chunks.last()
+        && last.ends_with('\r')
+    {
+        let last = chunks.pop().expect("just checked");
+        let head = &last[..last.len() - '\r'.len_utf8()];
+        if !head.is_empty() {
+            chunks.push(head.to_string());
+        }
+        chunks.push("\r".to_string());
+    }
     chunks
 }
 
@@ -18824,12 +19036,25 @@ struct AppControlTerminalWriteReport {
     /// trailing Enter would have ANSWERED the gate; measured agy 1.2.0,
     /// pending-bugs [11.94]). Carries the refusal reason slug.
     refused: Option<&'static str>,
+    /// ⛔ [11.141] The outcome of the contract's conditional-submit chunk, when
+    /// one was issued: "submitted" · "refused_line" · "startup_gate_shown" ·
+    /// "unknown". `None` = no conditional submit rode this write. THE POINT OF
+    /// THE FIELD: `accepted:true` must mean DELIVERED, and for a
+    /// submit-own-chunk CLI the delivery is the Enter — a text chunk that
+    /// rendered while the submit refused is the measured half-delivery that
+    /// let an automator believe a turn had started that never did.
+    submit: Option<&'static str>,
+    /// Whether the submit rode the atomic conditional submit (line-match
+    /// guarded) rather than a plain glued write.
+    conditional_submit: bool,
 }
 
 impl AppControlTerminalWriteReport {
     fn to_json(&self) -> Value {
         json!({
             "refused": self.refused,
+            "submit": self.submit,
+            "conditional_submit": self.conditional_submit,
             "chunk_count": self.chunk_count,
             "line_chunk_count": self.line_chunk_count,
             "interrupt_chunk_count": self.interrupt_chunk_count,
@@ -18837,6 +19062,54 @@ impl AppControlTerminalWriteReport {
             "last_chunk_tail": self.last_chunk_tail,
         })
     }
+
+    /// Did every byte of this write land, INCLUDING the submit? A write is
+    /// delivered only when nothing refused it and its conditional submit —
+    /// when the contract issued one — says submitted. This, not "no error",
+    /// is what an `accepted` flag is allowed to be built from.
+    fn delivered(&self) -> bool {
+        self.refused.is_none()
+            && matches!(self.submit, None | Some("submitted"))
+    }
+}
+
+/// Classify a conditional submit's Ack message into the report's submit slug.
+fn conditional_submit_outcome(message: &Option<String>) -> &'static str {
+    if yggterm_server::terminal_submit_landed(message.as_deref()) {
+        "submitted"
+    } else if yggterm_server::terminal_submit_was_refused_for_line(message.as_deref()) {
+        "refused_line"
+    } else if yggterm_server::terminal_write_was_refused_for_startup_gate(message.as_deref()) {
+        "startup_gate_shown"
+    } else {
+        "unknown"
+    }
+}
+
+/// The daemon's atomic conditional submit: press Enter IFF the composer's
+/// line — reconstructed under one lock from the bytes the daemon forwarded —
+/// still reads exactly `expected_line`. No data travels; the write IS the
+/// Enter. This is the submit half of the [11.141] contract: for a
+/// submit-own-chunk CLI a glued `\r` cannot be used (it pastes), and a plain
+/// follow-up `\r` write would walk into the draft guard holding the text the
+/// wrapper itself just typed. The comparison is the guard here — a human's
+/// keystrokes interleaving answers `refused_line`, a NAMED non-delivery.
+async fn terminal_conditional_submit_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    expected_line: String,
+    trace_home: &Path,
+) -> Result<Option<String>> {
+    run_dedicated_terminal_io("terminal_conditional_submit", trace_home, move || {
+        yggterm_server::terminal_write_guarded_full(
+            &endpoint,
+            &session_path,
+            "",
+            false,
+            Some(expected_line),
+        )
+    })
+    .await
 }
 
 async fn terminal_write_app_control_input_async(
@@ -18845,18 +19118,53 @@ async fn terminal_write_app_control_input_async(
     visible_session_path: String,
     data: String,
     read_nudge_reason: &'static str,
+    submit_byte_own_chunk: bool,
     trace_home: &Path,
 ) -> Result<AppControlTerminalWriteReport> {
-    let chunks = app_control_terminal_input_write_chunks(&data);
+    let chunks = app_control_terminal_input_write_chunks_with_submit_contract(
+        &data,
+        submit_byte_own_chunk,
+    );
     let chunk_count = chunks.len();
     let multiline_send = read_nudge_reason == APP_CONTROL_TERMINAL_MULTILINE_SEND_REASON;
     let mut line_chunk_count = 0_usize;
     let mut interrupt_chunk_count = 0_usize;
     let mut interline_read_nudge_count = 0_usize;
     let mut last_chunk_tail = String::new();
+    // The daemon's reconstructed input line, tracked chunk-by-chunk — the
+    // `expected` the final conditional submit asserts. An interior Enter or a
+    // Ctrl+C chunk clears it (the walk clears too); a text chunk extends it.
+    let mut line_in_flight = String::new();
     let mut chunks = chunks.into_iter().peekable();
     while let Some(chunk) = chunks.next() {
         last_chunk_tail = terminal_tail_chars(&chunk, 80);
+        // ⛔ [11.141] THE SUBMIT CHUNK IS NOT A WRITE. For a submit-own-chunk
+        // CLI the final `\r` rides the atomic conditional submit: the daemon
+        // presses Enter only if the line it forwarded still reads exactly the
+        // text this write laid down. A refusal is a NAMED non-delivery and
+        // ends the write — there is nothing after the submit to send.
+        if submit_byte_own_chunk
+            && chunks.peek().is_none()
+            && chunk == "\r"
+        {
+            let message = terminal_conditional_submit_async(
+                endpoint.clone(),
+                session_path.clone(),
+                line_in_flight.clone(),
+                trace_home,
+            )
+            .await?;
+            return Ok(AppControlTerminalWriteReport {
+                chunk_count,
+                line_chunk_count,
+                interrupt_chunk_count,
+                interline_read_nudge_count,
+                last_chunk_tail,
+                refused: None,
+                submit: Some(conditional_submit_outcome(&message)),
+                conditional_submit: true,
+            });
+        }
         let ack_message = terminal_write_guarded_with_local_runtime_retry_async(
             endpoint.clone(),
             session_path.clone(),
@@ -18877,7 +19185,17 @@ async fn terminal_write_app_control_input_async(
                 interline_read_nudge_count,
                 last_chunk_tail,
                 refused: Some(reason),
+                submit: None,
+                conditional_submit: false,
             });
+        }
+        // Track the walk's line for the submit's `expected` (see above): an
+        // interior Enter or Ctrl+C clears it; anything else extends it.
+        if chunk.contains('\r') || chunk.contains('\u{3}') {
+            line_in_flight.clear();
+        }
+        if !chunk.ends_with('\r') && !chunk.contains('\u{3}') {
+            line_in_flight.push_str(&chunk);
         }
         if chunk.ends_with('\u{3}') && chunks.peek().is_some() {
             interrupt_chunk_count = interrupt_chunk_count.saturating_add(1);
@@ -18907,6 +19225,8 @@ async fn terminal_write_app_control_input_async(
         interline_read_nudge_count,
         last_chunk_tail,
         refused: None,
+        submit: None,
+        conditional_submit: false,
     })
 }
 
