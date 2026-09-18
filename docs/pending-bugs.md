@@ -31428,7 +31428,9 @@ behind; the owner re-reported the same ghosts three times.
 
 ## ⛔ [11.140] EVERY WRAPPER SEND TO A LIVE DEVIN ROW WAS REFUSED `pending_draft` FOREVER — THE COMPOSER PLACEHOLDER SITS ON THE ❭ GLYPH ROW AND THE DRAFT GUARD READ THE VENDOR'S SUGGESTION AS AN UNSENT DRAFT (found live 2026-09-18, the 11.6.12 wrapper-proof pass, the muse lab host, devin v3000.10.31, daemon direct build 7e816ff3)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (the `accepted:true` send rides the next daemon rotation)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+(The `accepted:true` send rides the next daemon rotation.)
 
 **The proof that found it (the owed 11.6.12 live-row pass, run at last):**
 `server app terminal new --kind devin` on a fresh cwd → the trust gate painted and the daemon's own classifier called it `startup_gate` → a `
