@@ -50548,6 +50548,94 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn the_submit_contract_splits_the_trailing_enter_into_its_own_chunk() {
+        // [11.141]: devin reads a coalesced `text\r` write as ONE paste event —
+        // the text lands and the Enter inserts IN the composer. With the
+        // contract declared, the trailing `\r` must be a chunk of its own so
+        // the writer can deliver it as the atomic conditional submit.
+        assert_eq!(
+            app_control_terminal_input_write_chunks_with_submit_contract(
+                "Reply with exactly: PONG\r",
+                true,
+            ),
+            vec!["Reply with exactly: PONG".to_string(), "\r".to_string()],
+        );
+        // A bare submit stays one chunk (expected line "" — the daemon's
+        // line-match guard then decides whether the composer is clear).
+        assert_eq!(
+            app_control_terminal_input_write_chunks_with_submit_contract("\r", true),
+            vec!["\r".to_string()],
+        );
+        // Multiline: the interior per-line pacing is unchanged; only the FINAL
+        // Enter leaves its line.
+        assert_eq!(
+            app_control_terminal_input_write_chunks_with_submit_contract(
+                "line one\rline two\r",
+                true,
+            ),
+            vec![
+                "line one\r".to_string(),
+                "line two".to_string(),
+                "\r".to_string(),
+            ],
+        );
+        // A bracketed-paste block is still ONE chunk — its \r are composer
+        // content by definition, and the contract must not cut one open.
+        let pasted = format!(
+            "{}line one\rline two{}",
+            yggterm_core::terminal_input::BRACKETED_PASTE_BEGIN,
+            yggterm_core::terminal_input::BRACKETED_PASTE_END
+        );
+        assert_eq!(
+            app_control_terminal_input_write_chunks_with_submit_contract(&pasted, true),
+            vec![pasted],
+        );
+        // And the default posture is byte-for-byte today's chunking.
+        assert_eq!(
+            app_control_terminal_input_write_chunks_with_submit_contract("echo ok\r", false),
+            vec!["echo ok\r".to_string()],
+        );
+    }
+
+    #[test]
+    fn the_conditional_submit_outcome_is_named_and_never_assumed() {
+        assert_eq!(
+            conditional_submit_outcome(&Some(
+                "submitted: local://abc line matched".to_string(),
+            )),
+            "submitted"
+        );
+        assert_eq!(
+            conditional_submit_outcome(&Some(
+                "refused: composer line does not match: local://abc holds 5 bytes, expected 7"
+                    .to_string(),
+            )),
+            "refused_line"
+        );
+        assert_eq!(
+            conditional_submit_outcome(&Some(format!(
+                "{}: local://abc is parked on its startup gate",
+                yggterm_server::STARTUP_GATE_REFUSAL_MESSAGE
+            ))),
+            "startup_gate_shown",
+        );
+        assert_eq!(
+            conditional_submit_outcome(&Some("wrote 0 bytes".to_string())),
+            "unknown",
+            "an unrelated ack is NOT a submission — unknown is a non-delivery"
+        );
+    }
+
+    #[test]
+    fn the_probe_posture_follows_the_descriptor_not_a_guess() {
+        // [11.141]: devin is the measured raw-mode CLI — no pty echo, composer
+        // delta confirm. Echo CLIs and unknown sessions keep today's posture.
+        assert!(!input_consumption_confirms_by_echo(Some(SessionKind::Devin)));
+        assert!(input_consumption_confirms_by_echo(Some(SessionKind::Codex)));
+        assert!(input_consumption_confirms_by_echo(None));
+    }
+
+    #[test]
     fn app_control_terminal_input_splits_interrupt_from_following_bytes() {
         assert_eq!(
             app_control_terminal_input_write_chunks("\u{3}\u{5}\u{15}"),

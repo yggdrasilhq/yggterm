@@ -1764,6 +1764,20 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
                 // Past the top of the box: everything up there is transcript.
                 return Some(false);
             }
+            // ⛔ [11.141] AN EMPTY ROW BELOW THE COMPOSER IS NOT "CANNOT SAY".
+            // The box GROWS: devin (measured live 2026-09-18) holds its
+            // half-delivered send with an empty row under the input row, and
+            // opencode 2.0.3 paints one there by design — this scan walks
+            // bottom-up, met the empty row FIRST, answered cannot-say, and the
+            // caller"s union collapsed that to "no draft" while the composer
+            // visibly held text. Two readers, two answers, one screen. Empty
+            // rows are walked past; the first NON-empty, non-marker row while
+            // unanchored still answers cannot-say (a transcript row is the
+            // false-anchor risk, and a false "draft" only ever refuses a
+            // send — the safe direction).
+            if text.is_empty() {
+                continue;
+            }
             // The box is not on this screen (no gutter row above the chrome):
             // cannot say, which keeps the row protected.
             return None;
@@ -3805,6 +3819,48 @@ mod tests {
             super::composer_row_holds_text(Some(SessionKind::Devin), &midturn),
             Some(false),
             "the mid-turn guide placeholder is also vendor suggestion, not a draft"
+        );
+    }
+
+    /// ⛔ [11.141] THE GROWN BOX IS A DRAFT, NOT "CANNOT SAY" — the coalesced
+    /// Enter inserted a newline IN the composer, so the box grew an empty row
+    /// under the input row (measured live 2026-09-18, the [11.140] acceptance
+    /// leg: `❭ Reply with exactly: …` over an empty row, and `input-check`
+    /// answered `composer_held_draft:false` on that exact screen while the
+    /// send guard refused the same screen — two readers, two answers, one
+    /// screen). The scan walks bottom-up, so it must walk PAST the empty row
+    /// to find the input row.
+    #[test]
+    fn devin_grown_box_below_the_input_row_is_a_draft() {
+        let rule = "\u{2500}".repeat(60);
+        let footer = "SWE-1.6 Slow                                Press alt+m to switch between available models";
+        // The measured shape: text held, plus the empty row the Enter grew.
+        let grown = vec![
+            "Free plan, use /upgrade to access better models \u{b7} 100% remaining".to_string(),
+            rule.clone(),
+            "\u{276d} Reply with exactly: PONG".to_string(),
+            String::new(),
+            rule.clone(),
+            footer.to_string(),
+        ];
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Devin), &grown),
+            Some(true),
+            "the empty row below the input row must not end the scan in              cannot-say — that is the false-negative that desynced input-check              from the send guard"
+        );
+        // And the clean box keeps its answer with the walk in place.
+        let clean = vec![
+            "Free plan, use /upgrade to access better models \u{b7} 100% remaining".to_string(),
+            rule.clone(),
+            "\u{276d} Ask Devin to build features, fix bugs, or work on your code".to_string(),
+            String::new(),
+            rule,
+            footer.to_string(),
+        ];
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Devin), &clean),
+            Some(false),
+            "walking past empty rows must not turn the placeholder arm's              EMPTY answer into a draft"
         );
     }
 
