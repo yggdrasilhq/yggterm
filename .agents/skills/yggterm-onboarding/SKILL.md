@@ -362,6 +362,26 @@ what Claude learned on the laptop yesterday, without anyone hand-copying files.
 
 ---
 
+## Phase 4.6 — build optimization, derived from the ygg-ci spec ⭐
+
+When their fleet builds code (any cargo project, or any project at all), optimization
+is part of onboarding, not a favor you do later. The law lives in
+`docs/spec-ygg-ci.md` §2 (compile cache) of the yggterm repo — read it, then
+**derive their project's own plan from it**:
+
+- **Inventory the build surfaces** (hosts × targets × CI recipe × deploy path).
+- **Cargo:** confirm every build host carries the sccache wire from the spec
+  (`~/.cargo/config.toml` rustc-wrapper + `SCCACHE_BASEDIR` + sized cache dir);
+  a host missing it gets wired per the spec's §2.1 recipe — never a per-project cache.
+- **Measure one cold event before/after** with `sccache --zero-stats` and record
+  the hit rate; a cache that can't show its hit rate is a cache you can't trust.
+- **Non-cargo stacks** map to the same principle (gradle build cache, vite/pnpm
+  store, sbcl warm core) — name the layer, wire once per host, document it.
+- **Write the plan into THEIR repo** (docs/ or CLAUDE.md) with a pointer back to
+  `spec-ygg-ci.md` — the derivation is per-project, the recipe is not.
+
+---
+
 ## Phase 5 — the steers that belong in their global instructions
 
 Global agent instructions are read every session, so **every line is a tax on all
