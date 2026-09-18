@@ -83,6 +83,67 @@ fn ui_thread_wait() -> serde_json::Value {
     })
 }
 
+/// [11.109] Is this mid-stall wait reading an EVENT-LOOP PARK?
+///
+/// A healthy idle GUI's main thread parks in the glib event loop: measured
+/// live 2026-09-18 on the GUI host, the UI thread at rest sits in
+/// `wchan = poll_schedule_timeout.constprop.0` on `ppoll` (syscall 271) --
+/// parked, answerable the microsecond an event arrives, NOT stalled. The
+/// heartbeat's executor pump does not always keep pace with that park, so the
+/// watchdog measures 2 s "blocks" whose whole population is uniform at the
+/// pump cadence (p50 2052-2089 ms, ~4/min, PSI delta 0) -- an instrument
+/// artifact, filed SEVERE 4x a minute on a healthy desktop (the [11.109] wolf
+/// chorus). A REAL stall reads differently: computing = wchan `0`, lock =
+/// futex, disk/net = the syscall's own channel, and ANY unreadable wait is
+/// treated as real. Fail closed: only an unambiguous event-loop park every
+/// time the thread was observed may classify a stall as parked-idle.
+fn wait_is_event_loop_park(wait: &serde_json::Value) -> bool {
+    let wchan = wait
+        .get("wchan")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    wchan.contains("poll") || wchan.contains("epoll")
+}
+
+/// [11.109] Every wait sample taken during ONE stall, reduced.
+///
+/// Sampled on EVERY watchdog poll while the stall lasts (the old code
+/// captured the wait once into a loop-local and threw it away before the
+/// recovery iteration filed the incident -- which is why zero live block
+/// records ever carried `ui_thread_wait`). The verdict needs the WHOLE
+/// window: one futex/running sample inside a poll-park window is a real
+/// stall hiding in an idle-looking one.
+#[derive(Debug, Default)]
+struct StallWaitCensus {
+    samples: u32,
+    event_loop_parks: u32,
+    last: serde_json::Value,
+}
+
+impl StallWaitCensus {
+    fn observe(&mut self, wait: serde_json::Value) {
+        if wait.is_null() {
+            return;
+        }
+        self.samples += 1;
+        if wait_is_event_loop_park(&wait) {
+            self.event_loop_parks += 1;
+        }
+        self.last = wait;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Parked-idle artifact iff waits were seen at all and EVERY one was an
+    /// event-loop park. Zero samples (tid unreadable) files as a real stall
+    /// -- absence of evidence is evidence of a real stall here.
+    fn all_event_loop_parked(&self) -> bool {
+        self.samples > 0 && self.event_loop_parks == self.samples
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -403,40 +464,96 @@ fn watch_loop(home: PathBuf) {
     let mut tracker = BlockTracker::new();
     // Witness bookkeeping: captured on the FIRST poll inside a stall, so the
     // delta measures the stall window and not the recovery. The read runs on
-    // this thread — the UI thread cannot delay or block it, which is the whole
+    // this thread -- the UI thread cannot delay or block it, which is the whole
     // reason the watchdog exists.
     let mut pre_witness: Option<ProcWitness> = None;
+    // [11.109] The mid-stall wait is sampled on EVERY stalled poll and reduced
+    // into a census that survives until the filing iteration. The old code
+    // captured it once into a loop-local and discarded it before the recovery
+    // iteration could file it -- zero live ui_thread_wait witnesses ever
+    // shipped. The census is also the parked-idle verdict's evidence.
+    let mut wait_census = StallWaitCensus::default();
     loop {
         std::thread::sleep(Duration::from_millis(POLL_MS));
         let stamped = UI_STAMP_MS.load(Ordering::Relaxed);
         let now = now_ms();
         let ui_stalled = stamped != 0 && now.saturating_sub(stamped) >= threshold;
-        let mut ui_wait = serde_json::Value::Null;
-        if ui_stalled && pre_witness.is_none() {
-            pre_witness = ProcWitness::read();
+        if ui_stalled {
+            if pre_witness.is_none() {
+                pre_witness = ProcWitness::read();
+            }
             // MID-STALL, while the wait is live: the kernel names it.
-            ui_wait = ui_thread_wait();
+            wait_census.observe(ui_thread_wait());
         }
         let Some(measured) = tracker.observe(stamped, now, threshold) else {
             continue;
         };
         let post_witness = ProcWitness::read();
         let mut witness = witness_json(pre_witness.as_ref(), post_witness.as_ref());
-        if !ui_wait.is_null()
+        if !wait_census.last.is_null()
             && let Some(map) = witness.as_object_mut()
         {
-            map.insert("ui_thread_wait".to_string(), ui_wait);
+            map.insert("ui_thread_wait".to_string(), wait_census.last.clone());
         }
         pre_witness = None;
+        let parked_idle_artifact = wait_census.all_event_loop_parked();
+        wait_census.reset();
         let sample = ytrace::diagnosis::UiBlockSample {
             gap_ms: measured.gap_ms,
             last_activity: last_activity(),
             blocks_per_min: Some(measured.blocks_per_min),
         };
         if let Some(incident) = ytrace::diagnosis::diagnose_ui_block(&sample) {
-            file_incident(&home, &incident, measured.gap_ms, measured.blocks_per_min, witness);
+            if parked_idle_artifact {
+                // [11.109] The UI thread was parked in the event loop for the
+                // WHOLE measured window: it was never blocked-on-work, the
+                // heartbeat's pump just went quiet. File the observation, not
+                // the wolf: a queryable span keeps the instrument honest (the
+                // starvation is real, and a rising tail would still show),
+                // while the incident bus stays silent on a healthy desktop.
+                file_parked_idle_observation(
+                    &home,
+                    incident.id.as_str(),
+                    measured.gap_ms,
+                    measured.blocks_per_min,
+                    witness,
+                );
+            } else {
+                file_incident(&home, &incident, measured.gap_ms, measured.blocks_per_min, witness);
+            }
         }
     }
+}
+
+/// [11.109] The parked-idle record: span only, no incident, no complaint.
+///
+/// Same queryable span shape as `file_incident` (so `ytrace query --category
+/// ui` still ranks it by duration), under its OWN name -- `block` stays the
+/// real-stall feed, `block_parked_idle` is the heartbeat-starvation census.
+/// `complaint_for: llm` is deliberately absent: this classification is the
+/// instrument correcting itself, not a fault to escalate.
+fn file_parked_idle_observation(
+    home: &std::path::Path,
+    from_incident_id: &str,
+    gap_ms: u64,
+    density: f64,
+    witness: serde_json::Value,
+) {
+    crate::perf::ytrace_provider().emit_span(
+        "ui",
+        "ui".to_string(),
+        "block_parked_idle".to_string(),
+        ytrace::Clock::Wall,
+        gap_ms as f64,
+        serde_json::json!({
+            "gap_ms": gap_ms,
+            "blocks_per_min": density,
+            "classified_from": from_incident_id,
+            "classification": "parked_idle_heartbeat_starved",
+            "incident": false,
+            "witness": witness,
+        }),
+    );
 }
 
 fn file_incident(
@@ -544,6 +661,70 @@ mod tests {
             let t = 1000 + step * 60; // 60 ms apart, above the 50 ms stamp interval
             assert_eq!(tracker.observe(t, t + 10, T), None, "jitter must not file");
         }
+    }
+
+    #[test]
+    fn an_event_loop_park_is_the_only_wait_that_classifies_parked_idle() {
+        // MEASURED ground truth (GUI host, 2026-09-18): the idle UI thread
+        // sits in wchan `poll_schedule_timeout.constprop.0` on ppoll. That
+        // shape -- and only that shape -- is the artifact.
+        let park = serde_json::json!({
+            "tid": 1555068u64,
+            "wchan": "poll_schedule_timeout.constprop.0",
+            "syscall": "271 0x55e7c6dc2ea0 0x4 0x0 0x0 0x8 0x0",
+        });
+        assert!(wait_is_event_loop_park(&park));
+        let epoll = serde_json::json!({"wchan": "ep_poll", "syscall": "232"});
+        assert!(wait_is_event_loop_park(&epoll));
+        // A thread holding a lock, computing, sleeping in a service call, or
+        // UNREADABLE is a real stall -- fail closed.
+        for real in [
+            serde_json::json!({"wchan": "futex_do_wait", "syscall": "202"}),
+            serde_json::json!({"wchan": "0", "syscall": "running"}),
+            serde_json::json!({"wchan": "hrtimer_nanosleep", "syscall": "230"}),
+            serde_json::json!({"wchan": "unreadable", "syscall": "unreadable"}),
+        ] {
+            assert!(
+                !wait_is_event_loop_park(&real),
+                "non-park wait must classify as a real stall: {real}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parked_idle_verdict_needs_an_unbroken_park_window() {
+        let mut census = StallWaitCensus::default();
+        assert!(
+            !census.all_event_loop_parked(),
+            "zero samples must file as a REAL stall -- absence of evidence is not idle here"
+        );
+        census.observe(serde_json::json!({"wchan": "poll_schedule_timeout.constprop.0"}));
+        census.observe(serde_json::json!({"wchan": "do_sys_poll"}));
+        assert!(census.all_event_loop_parked());
+        census.observe(serde_json::json!({"wchan": "futex_do_wait"}));
+        assert!(
+            !census.all_event_loop_parked(),
+            "one working sample inside a park window is a real stall hiding"
+        );
+        census.reset();
+        assert_eq!(census.samples, 0, "reset must clear the whole census");
+    }
+
+    #[test]
+    fn the_census_keeps_the_last_wait_for_the_witness() {
+        let mut census = StallWaitCensus::default();
+        census.observe(serde_json::json!({"wchan": "poll_schedule_timeout.constprop.0"}));
+        census.observe(serde_json::json!({"wchan": "do_sys_poll"}));
+        assert_eq!(
+            census.last.get("wchan").and_then(|v| v.as_str()),
+            Some("do_sys_poll"),
+            "the witness carries the LAST mid-stall wait, not the first"
+        );
+        census.observe(serde_json::Value::Null);
+        assert_eq!(
+            census.samples, 2,
+            "a null wait (tid not yet known) must not count as a sample"
+        );
     }
 
     #[test]
