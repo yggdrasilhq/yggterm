@@ -3981,8 +3981,25 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // and is falsified: one codepoint off.
         composer_marker: '\u{276d}',
         composer_region_label: None,
-        composer_placeholder_needles: &[],
-        composer_footer_hints: &["ctrl+v to paste image in clipboard"],
+        // ⛔ [11.140] FIXED LIVE (2026-09-18, the 11.6.12 wrapper-proof pass):
+        // the IDLE placeholder sits ON the ❭ glyph row —
+        // `❭ Ask Devin to build features, fix bugs, or work on your code` —
+        // so the draft guard anchored it and read the vendor's suggestion as
+        // an unsent draft: EVERY wrapper send to a live devin row was refused
+        // `pending_draft` forever (measured: `accepted:false`,
+        // `refused:"pending_draft"` on a `ready` row). Declaring the
+        // placeholders (both measured verbatim: the idle ask and the
+        // mid-turn guide swap) makes the guard's box arm answer EMPTY for
+        // them — the [11.133] opencode precedent, second CLI.
+        composer_placeholder_needles: &[
+            "ask devin to build features",
+            "guide devin while it works",
+        ],
+        // ⛔ MEASURED DRIFT (v3000.10.31, 2026-09-18): the idle footer is
+        // `SWE-1.6 Slow … Press alt+m to switch between available models` —
+        // the 3000.10.27-era `ctrl+v to paste image in clipboard` no longer
+        // paints. Model-flavor left, model switcher right.
+        composer_footer_hints: &["swe-1.6 slow", "alt+m"],
         // The footer does NOT swap mid-turn (unlike grok's ctrl+c swap);
         // the interrupt contract rides the working line itself.
         working_footer_hints: &[],
