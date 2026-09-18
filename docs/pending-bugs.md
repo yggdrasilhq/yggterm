@@ -43,7 +43,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
 | 11.6.11 | zcode-tui | B | OPEN (native announce LANDED — emitter commit zcode-tui 0bd590f + daemon `announce` verb; arm matrix FILLED — all 10 tests green; §9 battery suite LANDED on `lane/integration/zcode-tui-battery` — 6/6 green against true main 0.5.9 through a real pty: paint, U+258F caret byte-exact, turn, sess_ store law, resume rederive, panic; the SCREEN-side live proof is delivered, the announce-WIRE proof rides the daemon listener; descriptor screen-phrase fill LANDED ([11.111] deleted per the verified-fix law — table matches 0.5.9 chrome, the §9 suite asserts declared==observed)) |
-| 11.6.12 | devin | C | MEASURED 2026-09-16 (lane/integration/devin-battery — the first measurement pass the registration owed; a zcode seat on the muse lab host, devin 3000.10.27 the only fleet install, auth LIVE via the owner's 2026-09-15 login): suites/devin.js 8/8 TWICE live — trust gate measured BOTH ways (`✓ Do you trust the authors of this directory?` / `Yes, trust` / `No, exit` on a fresh cwd; Enter grants; the grant is durable in `~/.local/share/devin/cli/trusted_workspaces.json`; a trusted cwd never sees the gate; print mode REFUSES an untrusted workspace by name: `Error: Refusing to run in an untrusted workspace: <path>`); composer glyph **U+276D `❭`** read off the RENDERED buffer — the registered U+276F was a placeholder, one codepoint off; working line `⣠⠀ Thinking · <N>s (esc twice to interrupt)` (braille = spinner frames, muse lesson) with the composer placeholder swapping to `❭ Guide Devin while it works` mid-turn; the interrupt is TWO DISTINCT esc presses (a single `\x1b\x1b` write reads as one event — measured, the turn kept running); footer `SWE-1.6 Slow` + `ctrl+v to paste image in clipboard`; STORE = ONE sqlite db `~/.local/share/devin/cli/sessions.db` (WAL; sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state) — session ids are word-word SLUGS (scythe-snowplow), `title` = the first prompt (eager self-titling — codex law, third instance), a row is written only on a COMPLETED turn (a turnless/interrupted session leaves session_locks/<slug>.lock = the pid; locks persist after exit, NOT a live registry); resume rederive PROVEN (`devin -r <slug>` repaints the history; ctrl+d exits rc 0 with the farewell naming `devin -r <slug>`); `devin list --format json` cwd-scoped machine surface; `--permission-mode` MEASURED `auto|accept-edits|smart|dangerous` (default auto, env DEVIN_PERMISSION_MODE) — the registration's docs-sourced `normal|dangerous|bypass` is DEAD on the binary; OSC title `devin: <cwd-basename>`. DESCRIPTOR FILLED WHERE MEASURED: screen tables, U+276D, permission modes + measured presets (smart rides as a preset — no enum slot), `content_rederives_on_resume: true`, store declared (durable_store_files sessions.db, scan_gap CLOSED, opencode posture: empty globs BY SHAPE + dedicated scanner `scan_devin_sessions`), title reader + membership probe + newest-for-directory arm + remote title probe wired. Core lib delta vs clean main = 0 new reds; arm matrix 10/10. WRAPPER-LEVEL LIVE-ROW PROOF RAN 2026-09-18 (the muse lab host, daemon 7e816ff3): the gate leg PROVEN (`startup_gate` classification + the NAMED `startup_gate_shown_refusal` — [11.107]'s naming half on a second CLI) and the turn leg FOUND [11.140] — every wrapper send refused `pending_draft` because the placeholder sits on the ❭ glyph row; FIXED IN CODE (composer_placeholder_needles declared, both measured forms; fixture-locked); the rotation then arrived (direct e66ee38f3104) and the guard half proved LIVE on clean composers, but `accepted:true` DELIVERY IS STILL OWED — turn leg blocked by [11.141] (wrapper input contract; zero store rows). Measured drift: devin self-updated to v3000.10.31, footer `ctrl+v…` → `alt+m to switch` (suite paired). Still open: cloud `/handoff` unprobed; model-surface (`/model`, `/fusion`) unprobed; `smart` mode has no AgentPermissionMode slot (preset only) |
+| 11.6.12 | devin | C | MEASURED 2026-09-16 (lane/integration/devin-battery — the first measurement pass the registration owed; a zcode seat on the muse lab host, devin 3000.10.27 the only fleet install, auth LIVE via the owner's 2026-09-15 login): suites/devin.js 8/8 TWICE live — trust gate measured BOTH ways (`✓ Do you trust the authors of this directory?` / `Yes, trust` / `No, exit` on a fresh cwd; Enter grants; the grant is durable in `~/.local/share/devin/cli/trusted_workspaces.json`; a trusted cwd never sees the gate; print mode REFUSES an untrusted workspace by name: `Error: Refusing to run in an untrusted workspace: <path>`); composer glyph **U+276D `❭`** read off the RENDERED buffer — the registered U+276F was a placeholder, one codepoint off; working line `⣠⠀ Thinking · <N>s (esc twice to interrupt)` (braille = spinner frames, muse lesson) with the composer placeholder swapping to `❭ Guide Devin while it works` mid-turn; the interrupt is TWO DISTINCT esc presses (a single `\x1b\x1b` write reads as one event — measured, the turn kept running); footer `SWE-1.6 Slow` + `ctrl+v to paste image in clipboard`; STORE = ONE sqlite db `~/.local/share/devin/cli/sessions.db` (WAL; sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state) — session ids are word-word SLUGS (scythe-snowplow), `title` = the first prompt (eager self-titling — codex law, third instance), a row is written only on a COMPLETED turn (a turnless/interrupted session leaves session_locks/<slug>.lock = the pid; locks persist after exit, NOT a live registry); resume rederive PROVEN (`devin -r <slug>` repaints the history; ctrl+d exits rc 0 with the farewell naming `devin -r <slug>`); `devin list --format json` cwd-scoped machine surface; `--permission-mode` MEASURED `auto|accept-edits|smart|dangerous` (default auto, env DEVIN_PERMISSION_MODE) — the registration's docs-sourced `normal|dangerous|bypass` is DEAD on the binary; OSC title `devin: <cwd-basename>`. DESCRIPTOR FILLED WHERE MEASURED: screen tables, U+276D, permission modes + measured presets (smart rides as a preset — no enum slot), `content_rederives_on_resume: true`, store declared (durable_store_files sessions.db, scan_gap CLOSED, opencode posture: empty globs BY SHAPE + dedicated scanner `scan_devin_sessions`), title reader + membership probe + newest-for-directory arm + remote title probe wired. Core lib delta vs clean main = 0 new reds; arm matrix 10/10. WRAPPER-LEVEL LIVE-ROW PROOF RAN 2026-09-18 (the muse lab host, daemon 7e816ff3): the gate leg PROVEN (`startup_gate` classification + the NAMED `startup_gate_shown_refusal` — [11.107]'s naming half on a second CLI) and the turn leg FOUND [11.140] — every wrapper send refused `pending_draft` because the placeholder sits on the ❭ glyph row; FIXED IN CODE (composer_placeholder_needles declared, both measured forms; fixture-locked); the rotation then arrived and the guard half proved LIVE on clean composers; the delivery leg RAN 2026-09-19 and a wrapper path DELIVERS A REAL TURN — prompt without the trailing newline, then a submit-only send: reply verbatim, composer back to idle, context meter moved, a sessions.db row written for the probe cwd ([11.140] and [11.141] deleted with that proof per the verified-fix law). RESIDUAL [11.142]: the one-shot text+submit contract send is still ONE coalesced pty read to devin (paste + newline, no turn) while the write report says submit:submitted + accepted:true, and the raw-mode probe posture false-wedges a healthy draft-holding row. Measured drift: devin self-updated to v3000.10.31, footer `ctrl+v…` → `alt+m to switch` (suite paired). Still open: cloud `/handoff` unprobed; model-surface (`/model`, `/fusion`) unprobed; `smart` mode has no AgentPermissionMode slot (preset only) |
 
 ### ⛔ 11.6.11 defect — ZCODE-TUI WAS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` RED (found by wave-1 seat B, 2026-09-10; FIXED IN CODE 2026-09-14)
 
@@ -31428,106 +31428,51 @@ needle is assembled from parts so the lock cannot trip itself).
 00:17/16:22/17:10 while the only daemon that needed them stayed four builds
 behind; the owner re-reported the same ghosts three times.
 
-## ⛔ [11.140] EVERY WRAPPER SEND TO A LIVE DEVIN ROW WAS REFUSED `pending_draft` FOREVER — THE COMPOSER PLACEHOLDER SITS ON THE ❭ GLYPH ROW AND THE DRAFT GUARD READ THE VENDOR'S SUGGESTION AS AN UNSENT DRAFT (found live 2026-09-18, the 11.6.12 wrapper-proof pass, the muse lab host, devin v3000.10.31, daemon direct build 7e816ff3)
+## ⛔ [11.142] THE ONE-SHOT CONTRACT SEND IS STILL ONE COALESCED READ TO DEVIN — THE WIRE-LEVEL CHUNK SPLIT FIRES, THE WRITE REPORT SAYS `submit:"submitted"` + `accepted:true`, AND THE TURN STILL DOES NOT START (PASTE + NEWLINE AGAIN); THE RAW-MODE PROBE POSTURE ALSO FALSE-WEDGES A HEALTHY DRAFT-HOLDING ROW (measured live 2026-09-19, the [11.141] delivery-proof leg, the muse lab host, devin v3000.10.31, daemon+GUI direct build b92c4abf14d4)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-(2026-09-18: the rotation arrived and the acceptance leg ran — guard half LIVE-PROVEN, delivery half blocked by [11.141]; see the acceptance-leg paragraph at the end of this entry.)
-
-**The proof that found it (the owed 11.6.12 live-row pass, run at last):**
-`server app terminal new --kind devin` on a fresh cwd → the trust gate painted and the daemon's own classifier called it `startup_gate` → a `
-` send was REFUSED BY NAME, `startup_gate_shown_refusal`, with the answer-it-interactively remedy (**[11.107]'s named-refusal half PROVEN on a second CLI** — the guard ordering fix generalizes); `probe-select` refused by name too (`terminal_rows_missing_for_pointer_selection` — the pointer plane needs GUI geometry, absent on the headless lab host). Respawned in a trusted cwd (durable `~/.local/share/devin/cli/trusted_workspaces.json`): no gate, classifier `ready`, composer `❭ Ask Devin to build features, fix bugs, or work on your code` verbatim → a one-line prompt send was **`accepted:false`, `refused:"pending_draft"`** while the row read `ready`. Root cause is the [11.133] class, second CLI: devin paints its placeholder ON the composer glyph row, the guard anchored the bottom-most ❭ row and read the vendor's suggestion as held text — the devin battery suite could never catch it because the suite drives the pty DIRECTLY, with no daemon guard in the path. Exactly what the wrapper-level proof exists to catch.
-
-**Fixed in the same sitting (lane/integration/devin-11140):** `composer_placeholder_needles` declared for devin — both measured verbatim forms, the idle ask and the mid-turn `Guide Devin while it works` swap — so the guard's box arm answers EMPTY for vendor suggestion; fixture `devin_placeholder_rows_are_never_a_draft` locks the measured screens. Measured drift rode along: the binary self-updated 3000.10.27 → **3000.10.31** and the idle footer is now `SWE-1.6 Slow … Press alt+m to switch between available models` — the declared `ctrl+v to paste image in clipboard` no longer paints (retired; suite paired). ACCEPTANCE LEG RAN 2026-09-18 (the rotation arrived: daemon exe + GUI client both on direct build e66ee38f3104): the guard half is LIVE-PROVEN — clean-composer sends answer `accepted:true` on three fresh rows, the forever refusal is dead. The delivery half is STILL OWED and now has a name: the turn never starts because of the wrapper input contract measured as [11.141] (coalesced text+Enter write, echo-gated submit verb, input-check draft desync); zero sessions.db rows exist for the probe cwds — screens and store agree.
-
-## ⛔ [11.141] NO WRAPPER PATH DELIVERS A TURN TO A LIVE DEVIN ROW — TEXT+ENTER SHIPS AS ONE COALESCED WRITE THE CLI READS AS PASTE, THE SUBMIT VERB'S ECHO GATE NEVER CONFIRMS ON A RAW-MODE TUI, AND INPUT-CHECK FALSE-NEGATIVES THE DRAFT IT CLAIMS TO CLEAR (measured live 2026-09-18, the [11.140] acceptance leg, the muse lab host, devin v3000.10.31, daemon+GUI direct build e66ee38f3104 — the [11.140] fix build)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-The [11.140] rotation arrived (daemon exe + GUI client both on direct build
-e66ee38f3104), the owed acceptance leg ran through the production wrapper, and
-the guard fix is LIVE-PROVEN: on a clean composer the placeholder needles answer
-EMPTY and `terminal send` is `accepted:true` — the forever-`pending_draft`
-refusal is dead (three fresh rows, three clean-composer accepts). But NO turn
-ever starts, and the store agrees with the screens: devin writes a sessions.db
-row only on a COMPLETED turn, and ZERO rows exist for the probe cwds. Every
-sanctioned path was measured:
-
-- `terminal send --data 'text\r'` (clean composer): `accepted:true`, bytes
-  land, the text renders in the composer — and stays there. The write is ONE
-  chunk (`chunk_count:1`) and devin's input parser coalesces a single write
-  (the battery's `\x1b\x1b`-reads-as-one-esc law, third instance): the
-  trailing `\r` inserts a newline IN the composer (the box grows an empty row
-  below the text) instead of submitting. The battery suite drives the pty
-  DIRECTLY with text and Enter as SEPARATE writes; the wrapper has no way to
-  do that. `--allow-multiline` does not help — a trailing-newline payload
-  still ships as one chunk (`line_chunk_count:0`), measured.
-- `terminal send` on a held draft: `refused:"pending_draft"` — now a TRUE
-  positive (real text is held), but there is no wrapper way out: a bare `\r`
-  send is refused by the same guard, so one half-delivered send bricks the
-  row for further sends until restart.
-- `terminal submit` (the designed brief path): `submitted:false` — its
-  echo-confirm gate waits for a pty echo that a raw-mode TUI never produces
-  and answers WEDGED ("alive, idle-looking, and not reading its PTY") after
-  31 s. The row demonstrably DOES read its PTY (it rendered the typed text);
-  the echo posture is the lie. An instrument that can only confirm by pty
-  echo refuses every raw-mode CLI forever.
-- `terminal input-check`: answers `composer_held_draft:false` while the
-  composer VISIBLY holds `❭ Reply with exactly: …` (screen-read in the same
-  minute), and does not clear the line — contradicting its own help ("the
-  probe clears the line"). Its draft reader is DESYNCED from the send guard's,
-  which correctly sees the same screen as a held draft. Two draft readers,
-  two answers, one screen.
-- `terminal new --prompt`: the launch path typed its own `yggterm_ready_probe`
-  into the composer and aborted before the real prompt (the probe text is the
-  draft the row now holds) — the same composer-consumption assumption, at
-  spawn time.
-- Recovery: `server terminal restart` on this daemon errors `local yggterm
-  daemon did not become reachable` — the known direct-store reachability
-  class (already covered in the [11.106]-family entries), so even the named
-  remedy is closed.
-
-Fix shape (for whoever takes it): the wrapper needs a per-CLI submit contract —
-the submit byte written as its OWN chunk (descriptor-declared; devin needs it,
-shell rows must not change), and the echo-confirm gate needs a raw-mode posture
-(confirm by composer DELTA on the decoded screen — the signal a raw-mode TUI
-can actually answer — not by pty echo). Until then [11.140]'s `accepted:true`
-delivery stays owed, and any automator that trusts the send verb's
-`accepted:true` silently half-delivers to devin rows.
-
-**Fixed in the same sitting it was named (lane/integration/11141-wrapper-input,
-2026-09-18):** the input contract is now descriptor data — two measured fields
-on the CLI descriptor, `submit_byte_own_chunk` and `pty_echo_confirms_input`,
-both true to the measured devin posture and defaulted to today's behavior for
-every other CLI (shell rows byte-for-byte unchanged; a lock test refuses a
-second CLI claiming the contract without its own live measurement). (1) THE
-SEND: for a contract CLI the trailing `\r` is split into its own chunk and
-delivered as the daemon's ATOMIC CONDITIONAL SUBMIT — press Enter iff the
-line the daemon forwarded still reads exactly the text just sent — which
-cannot be refused by the draft guard (it carries no data; the line-match IS
-the guard) and cannot splice a human's keystrokes (the comparison and the
-Enter run under one lock). The write report grew `submit` /
-`conditional_submit` and a `delivered()` gate, and the send verb now answers
-`accepted:false, reason:submit_line_mismatch_refusal` when the submit refuses
-— `accepted:true` means the TURN STARTED, not merely that bytes were counted.
-(2) THE PROBE: a raw-mode CLI confirms consumption by COMPOSER DELTA on the
-decoded screen — the marker typed once, polled for ~2.4 s to land in the
-rendered composer (the render, never the forwarded-byte flag: a wedged row
-must not confirm from its own queued bytes) — then cleared with Ctrl+U plus
-one backspace per marker char, residue named honestly in the reason when the
-line refuses to clear. One attempt, no retry barrage; every other CLI keeps
-the 180 ms echo-confirm loop unchanged. (3) THE DRAFT DESYNC: the composer
-box-arm now walks PAST an empty row below the input row instead of answering
-cannot-say — the grown box (devin's coalesced Enter; opencode paints one by
-design) was the screen on which input-check said "no draft" while the send
-guard refused the same pixels. Fixture-locked both ways. Tests: core +3
-(grown-box fixture, contract-uniqueness lock, chunker contract), shell +3
-(chunker, conditional-submit outcome classifier, probe-posture selector);
-full-suite red set byte-identical to a clean-main stash run. LIVE PROOF OWED:
-the `accepted:true` delivery leg on a real devin row rides the next jojo
-daemon rotation onto this build (the [11.106]/[11.140] law) — fresh trusted
-cwd, `terminal send` a one-line prompt, and a sessions.db row proving the turn
-completed.
+The [11.141] fix build rotated in (the muse lab host daemon at 01:22, direct
+b92c4abf14d4) and the owed delivery leg ran end to end. THE MACHINERY IS REAL
+AND LIVE-PROVEN: on a fresh trusted-cwd row with a clean composer (idle `❭ Ask
+Devin…`, no gate), the canonical one-shot send `--data '<prompt>\r'` reports
+the contract on the wire — `chunk_count:2`, `last_chunk_tail:"\r"`,
+`conditional_submit:true`, `submit:"submitted"`, `refused:null`,
+`accepted:true` — every field the fix promised. THE TURN STILL NEVER STARTS:
+90 s later the screen shows the prompt in the composer WITH the grown empty
+row below it (the exact [11.140]/[11.141] coalesced-Enter signature), the
+working line never paints, and the store stays silent. THE MECHANISM,
+MEASURED: the split is a WRITE-side split, and the pty delivers back-to-back
+writes to the CLI as ONE read — devin's raw-mode handler coalesces by READ,
+not by write, so text+\r microseconds apart is still one paste+newline event.
+The battery suite never hits this because it drives the pty directly with
+text and Enter separated in time. THE WORKING RECIPE (proven the same
+sitting, for every automator until the fix lands): send the prompt WITHOUT
+the trailing `\r` (it renders; the draft guard truly holds it), then a
+submit-only send (`--stdin` a bare `\r`) — the escape hatch fired, the held
+line submitted, devin replied verbatim, the composer returned to idle, the
+context meter moved (18k/200k), and sessions.db grew the row (word-word
+slug, cwd = the probe dir, title = the first prompt). [11.140]'s turn leg and
+[11.141]'s "no wrapper path delivers a turn" are therefore CLOSED by that
+proof, and both entries are deleted with it per the verified-fix law. TWO
+DEFECTS REMAIN HERE: (1) the one-shot contract send — the submit chunk must
+arrive in a LATER read than the text: a bounded inter-chunk delay measured in
+tens of ms, or a decode-confirmed submit (poll the contract's line-match
+against the RENDERED composer for a short window before pressing Enter; the
+match already exists, it is just evaluated at write time, before any render
+could land). And `submit:"submitted"` must mean the decode confirmed it, or
+be renamed — today it means only "the Enter byte was written", which is
+exactly the accepted:true lie [11.141] was filed to kill. (2) the probe
+posture — on a row holding a real draft (a text-only send), `terminal
+submit`'s marker probe refused "never rendered the probe marker … WEDGED"
+after its 2.4 s composer-delta window, and `input-check` answered the full
+WEDGED verdict with the `server terminal restart` remedy — on a demonstrably
+healthy row (its devin process alive and idle, and a sibling row in the
+identical posture consumed the bare `\r` and ran a turn). A held draft must
+not read as a wedged row. **Falsifier for the fix:** the one-shot `text\r`
+contract send on a fresh trusted devin row starts a turn — working line
+paints, store row appears, accepted:true honest — and `input-check` on a
+healthy draft-holding row does not answer wedged.
 
 ## ⛔ [11.138] THE WORKING-RECENCY METRONOME — BRIDGED KEEPALIVE FRAMES RESTAMP THE ACTIVITY CLOCKS AND AN IDLE CODEX ROW RIDES THE WORKING VERDICT EVERY ~305s FOR HOURS, HOLDING BOTH HOSTS' ROTATIONS (measured live 2026-09-17 09:49→11:31 on the GUI host + the dev headless, trace-fixing campaign)
 
