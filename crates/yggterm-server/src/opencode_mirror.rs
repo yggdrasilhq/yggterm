@@ -16,6 +16,13 @@
 //! mirror's UNIVERSE is the store list (turn recency orders it), the working
 //! set is a per-session status on it, and which session a window RENDERS is
 //! answered where the truth lives: the OSC window title (`OC | <title>`).
+//! ⭐ MEASURED 2026-09-17 (2.0.3): there is now ALSO a client-side surface —
+//! `.local/state/opencode/latest/tui/tabs.json`, cwd-keyed tabs with their
+//! `sessionID` ([`yggterm_core::opencode_service::tui_tabs`]) — which names a
+//! window's bound session directly and paints far more reliably than the OSC
+//! route title (three drives captured only the generic `OpenCode` there). A
+//! bind/divergence verdict for resumed rows should read THIS file; the OSC
+//! title stays the in-TUI-switch follow signal.
 //!
 //! Why real rows and not a side table: opencode2's service is BUILT for
 //! several windows on one session (measured 2026-08-29 — a second
