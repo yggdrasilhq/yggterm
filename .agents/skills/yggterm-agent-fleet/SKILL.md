@@ -1165,6 +1165,7 @@ ygg-ci.py subscribe --lane lane/foo/bar --project yggterm
 
 ygg-ci.py list --project yggterm          # who is enrolled
 ygg-ci.py status --json                   # watcher alive? held? last build?
+ygg-ci.py cache                           # per-host compile-cache health + recent build verdicts (spec-ygg-ci.md §4)
 ygg-ci.py events --since 30m              # the talking plane: refusals, builds, pushes
 ygg-ci.py why                             # plain-language state + the next action
 ygg-ci.py tick --project yggterm --dry-run  # what WOULD merge (no build)

@@ -287,6 +287,124 @@ def _run(cmd, cwd=None, timeout=120, shell=False, label=None, heartbeat_secs=0):
         r.overrun = {"pid": p.pid, "budget": timeout}
     return r
 
+
+# ─── compile-cache telemetry (docs/spec-ygg-ci.md §4) ────────────────────────
+# sccache fails SILENTLY into un-cached builds, and some drivers (dx's RUSTC
+# shim) bypass the wrapper by design. Every build therefore carries a delta
+# verdict; a cache that stopped serving is loud (cache_stale event), never a
+# guess. Deltas are read from `--show-stats` snapshots — never --zero-stats,
+# which would stomp parallel seats sharing the host cache.
+
+DEFAULT_FLEET_HOSTS = ["dev", "oc", "jojo", "practice"]
+_SCCACHE_TRIES = ["sccache", "/usr/local/bin/sccache", str(Path.home() / ".local" / "bin" / "sccache")]
+
+def _sccache_cmd(host=None):
+    script = " || ".join(f"{s} --show-stats 2>/dev/null" for s in _SCCACHE_TRIES)
+    if not host or host == this_host():
+        return ["bash", "-c", script]
+    return ["ssh", host, script]
+
+def _sccache_stats(host=None):
+    """Snapshot sccache counters; None when sccache is absent or unreachable.
+
+    Keys are anchored with \\s{2,} so sub-lines ("Cache misses (Rust)") and the
+    "Cache hits rate" line can never satisfy a plain-key grab."""
+    try:
+        r = subprocess.run(_sccache_cmd(host), capture_output=True, text=True, timeout=45)
+    except Exception:
+        return None
+    out = r.stdout or ""
+    if "Compile requests" not in out:
+        return None
+
+    def grab(*names):
+        for n in names:
+            m = re.search(rf"^\s*{re.escape(n)}\s{{2,}}(\S.*?)\s*$", out, re.M)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    def num(*names):
+        v = grab(*names)
+        try:
+            return int(str(v).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "requests_executed": num("Compile requests executed"),
+        "hits": num("Cache hits"),
+        "misses": num("Cache misses"),
+        "hit_rate": grab("Cache hits rate"),
+        "location": grab("Cache location"),
+        "max_size": grab("Max cache size"),
+    }
+
+def _cache_verdict(pre, post, build_out):
+    """Delta verdict across one build — spec-ygg-ci.md §4.
+
+    idle: nothing compiled (docs-only tick) · ok: the cache served the
+    compiles · STALE: rustc compiled but the cache saw zero requests
+    (bypassed or broken wire) · absent: no readable sccache on the host."""
+    if pre is None or post is None:
+        return {"verdict": "absent"}
+    d_req = (post.get("requests_executed") or 0) - (pre.get("requests_executed") or 0)
+    d_hit = (post.get("hits") or 0) - (pre.get("hits") or 0)
+    d_miss = (post.get("misses") or 0) - (pre.get("misses") or 0)
+    v = {"requests": d_req, "hits": d_hit, "misses": d_miss,
+         "hit_rate": round(100.0 * d_hit / d_req, 1) if d_req else None}
+    if d_req > 0:
+        v["verdict"] = "ok"
+    elif "Compiling " in (build_out or ""):
+        v["verdict"] = "STALE"
+    else:
+        v["verdict"] = "idle"
+    return v
+
+def _cache_wire_probe(host=None):
+    """Is the spec §2.1 wire present on host? {binary, wrapper} bools; None on probe failure."""
+    script = ('grep -sq rustc-wrapper ~/.cargo/config.toml && echo W=1 || echo W=0; '
+              '{ command -v sccache >/dev/null 2>&1 || [ -x /usr/local/bin/sccache ] '
+              '|| [ -x "$HOME/.local/bin/sccache" ]; } && echo B=1 || echo B=0')
+    cmd = ["bash", "-c", script] if not host or host == this_host() else ["ssh", host, script]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except Exception:
+        return {"binary": None, "wrapper": None}
+    o = r.stdout or ""
+    return {"wrapper": "W=1" in o, "binary": "B=1" in o}
+
+def cmd_cache(a):
+    """Per-host compile-cache health + the verdict digest of recent builds (§4)."""
+    hosts = [h.strip() for h in (a.host.split(",") if a.host else DEFAULT_FLEET_HOSTS)]
+    report = {"hosts": {}, "recent_builds": []}
+    for h in hosts:
+        st = _sccache_stats(h)
+        if st is None:
+            report["hosts"][h] = {"verdict": "absent"}
+            print(f"{h:10s} ⛔ sccache unreachable — wire it per docs/spec-ygg-ci.md §2.1")
+        else:
+            report["hosts"][h] = st
+            print(f"{h:10s} requests={st['requests_executed']} hits={st['hits']} "
+                  f"misses={st['misses']} rate={st['hit_rate']} size={st['max_size']} ({st['location']})")
+    recs = sorted(BUILDS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:max(0, a.tail)]
+    for p in recs:
+        try:
+            rec = json.loads(p.read_text())
+        except Exception:
+            continue
+        cc = rec.get("sccache")
+        if cc:
+            report["recent_builds"].append({"id": rec.get("id"), "sccache": cc})
+    if report["recent_builds"]:
+        print("recent builds (verdict / requests / hit rate):")
+        for b in report["recent_builds"]:
+            c = b["sccache"]
+            print(f"  {b['id']}: {c.get('verdict')} req={c.get('requests')} rate={c.get('hit_rate')}")
+    if a.json:
+        print(json.dumps(report, indent=2))
+    return 0
+
 def _repo_for(project, explicit=None):
     cfg = _project_cfg(project)
     p = Path(explicit or cfg["repo"]).expanduser()
@@ -560,6 +678,11 @@ def cmd_tune(a):
     if cfg2.get("projects", {}).get(project) != pcfg:
         log("⛔ tune did not read back")
         return 1
+    wire = _cache_wire_probe(pcfg.get("host") or "dev")
+    if wire.get("wrapper") is False or wire.get("binary") is False:
+        log(f"⚠ compile-cache wire incomplete on host '{pcfg.get('host') or 'dev'}' "
+            f"(wrapper={wire.get('wrapper')}, binary={wire.get('binary')}) — builds there run uncached, "
+            f"or fail hard under drivers that need the wrapper; wire per docs/spec-ygg-ci.md §2.1")
     return 0
 
 # ─── status ──────────────────────────────────────────────────────────────────
@@ -984,9 +1107,16 @@ def _do_tick_project(project, dry=False):
     hb_secs = int(pcfg.get("step_heartbeat_secs", DEFAULT_STEP_HEARTBEAT_SECS))
     build_to = int(pcfg.get("build_timeout_secs", DEFAULT_BUILD_TIMEOUT_SECS))
     gate_to = int(pcfg.get("gate_timeout_secs", DEFAULT_GATE_TIMEOUT_SECS))
+    cc = None
     if build_cmd:
         log(f"  building {project} IN {repo} ({main_branch}@{integ_sha[:12]}, budget {build_to}s): {build_cmd}")
+        cc_pre = _sccache_stats()
         r = _run(build_cmd, cwd=str(repo), timeout=build_to, shell=True, label=f"build {project}", heartbeat_secs=hb_secs)
+        cc = _cache_verdict(cc_pre, _sccache_stats(), (r.stdout or "") + (r.stderr or ""))
+        if cc.get("verdict") == "STALE":
+            _emit_event(project, "cache_stale", sha=integ_sha,
+                        requests=cc.get("requests"), hits=cc.get("hits"), misses=cc.get("misses"))
+            log("  ⚠ sccache STALE — rustc compiled but the cache saw zero requests (bypassed or broken wire; docs/spec-ygg-ci.md §4)")
         if getattr(r, "overrun", None):
             _emit_event(project, "build_step_overrun", sha=integ_sha, budget_secs=r.overrun["budget"], pid=r.overrun["pid"])
         build_log = (r.stdout or "")[-4000:] + (r.stderr or "")[-4000:]
@@ -1057,7 +1187,7 @@ def _do_tick_project(project, dry=False):
             "project": project, "at": int(time.time()), "host": this_host(),
             "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts,
             "build": build_cmd, "build_ok": build_ok, "status": "build-failed",
-            "reset_to": pre_tick, "quarantined": failed_lanes,
+            "reset_to": pre_tick, "quarantined": failed_lanes, "sccache": cc,
         }
         BUILDS.mkdir(parents=True, exist_ok=True)
         (BUILDS / f"{rec['id']}.json").write_text(json.dumps(rec, indent=2))
@@ -1119,7 +1249,7 @@ def _do_tick_project(project, dry=False):
         "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts,
         "subs": len(subs), "build": build_cmd, "build_ok": build_ok,
         "gates": gates, "deploy": deploy_cmd, "deploy_ok": deploy_ok,
-        "pushed": pushed, "upstream": upstream, "status": status,
+        "pushed": pushed, "upstream": upstream, "status": status, "sccache": cc,
     }
     BUILDS.mkdir(parents=True, exist_ok=True)
     (BUILDS / f"{rec['id']}.json").write_text(json.dumps(rec, indent=2))
@@ -1363,6 +1493,11 @@ def main():
     s.add_argument("--deploy-timeout", type=int, help="step watchdog budget for the deploy step, seconds (default 3600)")
     s.add_argument("--step-heartbeat", type=int, help="ci.log heartbeat interval while a named step runs, seconds (default 120, 0 disables)")
 
+    s = sub.add_parser("cache", help="per-host compile-cache health + recent build verdicts (spec-ygg-ci.md §4)")
+    s.add_argument("--host", help="comma-separated hosts (default dev,oc,jojo,practice)")
+    s.add_argument("--tail", type=int, default=10, help="last N build records to digest (default 10)")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("status", help="is watcher alive, subs, last build")
     s.add_argument("--json", action="store_true")
     s.add_argument("--project", help="filter project for subs/last build")
@@ -1412,6 +1547,8 @@ def main():
         sys.exit(cmd_config(a))
     elif a.cmd == "tune":
         sys.exit(cmd_tune(a))
+    elif a.cmd == "cache":
+        sys.exit(cmd_cache(a))
     elif a.cmd == "status":
         sys.exit(cmd_status(a))
     elif a.cmd == "tick":
