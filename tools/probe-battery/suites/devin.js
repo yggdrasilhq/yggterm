@@ -40,7 +40,9 @@ const { execSync } = require('child_process');
 const WORKING_NEEDLES = ['Thinking', 'esc twice to interrupt'];
 const COMPOSER_PLACEHOLDER = 'Ask Devin to build features, fix bugs, or work on your code';
 const MIDTURN_PLACEHOLDER = 'Guide Devin while it works';
-const FOOTER_HINT = 'ctrl+v to paste image in clipboard';
+// v3000.10.31 (2026-09-18): the footer is `SWE-1.6 Slow … Press alt+m to
+// switch between available models` — the 10.27-era ctrl+v hint no longer paints.
+const FOOTER_HINT = 'SWE-1.6 Slow'; // left-side, verbatim case, survives truncation; the RIGHT side rotates (alt+m variant / Shift+Tab permission-cycling variant both measured) // left-side, survives narrow-pty truncation (the right-side alt+m text truncates at 80 cols)
 const GATE_QUESTION = 'Do you trust the authors of this directory?';
 const GLYPH_CODEPOINT = 0x276d; // ❭ — measured; the registered ❯ U+276F is dead
 

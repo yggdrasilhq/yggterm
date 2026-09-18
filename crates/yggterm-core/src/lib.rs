@@ -3764,6 +3764,50 @@ mod tests {
         );
     }
 
+    /// ⛔ [11.140] DEVIN'S PLACEHOLDER IS NOT A DRAFT — the live wrapper proof
+    /// (2026-09-18, the muse lab host, v3000.10.31) caught every wrapper send
+    /// to a ready devin row refused `pending_draft`: the idle placeholder
+    /// sits ON the ❭ glyph row and the guard read it as held text. Fixtures
+    /// are the measured screen rows (the daemon's own `server screen`).
+    #[test]
+    fn devin_placeholder_rows_are_never_a_draft() {
+        let rows = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>()
+        };
+        let rule = "\u{2500}".repeat(60);
+        // Idle composer (measured verbatim).
+        let idle = rows(&[
+            "Free plan, use /upgrade to access better models \u{b7} 100% remaining (resets in 16h 41m)",
+            &rule,
+            "\u{276d} Ask Devin to build features, fix bugs, or work on your code",
+            &rule,
+            "SWE-1.6 Slow                                Press alt+m to switch between available models",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Devin), &idle),
+            Some(false),
+            "the vendor's placeholder on the glyph row must never read as an \
+             unsent draft — this exact shape refused every wrapper send live"
+        );
+
+        // Mid-turn: the placeholder swaps to the guide form (measured).
+        let midturn = rows(&[
+            "\u{2820}\u{2800} Thinking \u{b7} 12s (esc twice to interrupt)",
+            &rule,
+            "\u{276d} Guide Devin while it works",
+            &rule,
+            "SWE-1.6 Slow                                Press alt+m to switch between available models",
+        ]);
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::Devin), &midturn),
+            Some(false),
+            "the mid-turn guide placeholder is also vendor suggestion, not a draft"
+        );
+    }
+
     /// ⛔⛔ THE JAM THIS LOCKS OUT, measured 2026-08-21 across 19 rows and 434
     /// consecutive refusals: the agent CLI prefixes every DELIVERED message in
     /// its transcript with the SAME glyph the composer uses. Every reader that
