@@ -30126,73 +30126,6 @@ LARGELY THE SHELL RENDERER ITSELF: the heat and the swap-thrash are the
 same defect. Box carried 9.5G/15G swap through the morning. The growth
 feeder remains unprofiled; the falsifier stands unchanged.
 
-## ⚠ [11.109] ui/block FILES SEVERE 2s "STALLS" ON A HEALTHY IDLE GUI — INTER-EVENT GAPS CONFUSE PARKED-IDLE WITH STALLED (measured 2026-09-14, same sitting as [11.108])
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-After [11.108]'s remediation (PSI 0.00, renderers idle, pixels
-rendering), `ui/block` kept filing ~2,052ms SEVERE incidents ~4/min.
-Evidence this is the instrument, not the UI:
-
-- eu-stack × 4 on the main thread inside its R-state windows: every catch
-  is `ppoll` in `g_main_context_iteration` via `gtk_main_iteration_do` —
-  parked, not computing. Dense sampling (0.02-0.25s over ~2 min) found no
-  multi-second R stretch at all.
-- The post-recovery population is uniform (p50 2052-2089ms) at the ~13s
-  snapshot cadence, unlike the pre-fix population (p50 343ms, 40/min)
-  which was real churn under thrash.
-- The witness PSI delta inside those gaps is 0 — nothing waited on
-  memory, and the desktop had free RAM.
-
-Consequence: the incident feed (`complaint_for: llm`) cries wolf on a
-healthy GUI, drowning the real signal that caught [11.108]. Suspected
-shape: the detector measures inter-event gaps on the UI thread; a quiet
-park between periodic events (working_edge / snapshot cycle) exceeds
-severe_ms and files a fault with `thrashing` inferred from a stale or
-non-thread-local signal.
-
-**Falsifier:** an idle GUI (no output, no input) with zero ui/block
-incidents for 10 min while ytrace shows the normal snapshot cadence.
-
-**FIXED IN CODE (2026-09-18, trace-fixing seat, lane/trace/uiblock-parked-
-verdict):** two defects, both fixed in `crates/yggterm-core/src/ui_block.rs`.
-
-1. THE WITNESS PLUMBING NEVER SHIPPED. `watch_loop` captured the mid-stall
-`ui_thread_wait` (wchan + syscall) into a LOOP-LOCAL on the first stalled
-poll and discarded it before the recovery iteration filed the incident —
-verified live: zero of the 72 block records in the GUI host's live trace
-generation carried `ui_thread_wait`, while the pre/post proc witnesses
-(loop-externals) all rode. The wait census now lives beside `pre_witness`,
-samples EVERY stalled poll, and its last reading always reaches the span.
-
-2. THE VERDICT NOW READS THE THREAD. Measured ground truth (GUI host live):
-the idle UI thread sits in `wchan = poll_schedule_timeout.constprop.0` on
-ppoll (syscall 271) — parked in the glib event loop, answerable the
-microsecond an event arrives, NOT stalled. The heartbeat's executor pump
-does not keep pace with that park at idle, so the watchdog measured uniform
-~2s "blocks" (p50 2052-2089ms at the pump cadence, PSI delta 0). The stall
-is classified `parked_idle_heartbeat_starved` ONLY when EVERY mid-stall
-sample of the window reads an event-loop park (`poll`/`epoll` wchan); one
-futex/running/nanosleep/unreadable sample files a real stall — fail closed.
-A parked-idle verdict emits ONLY a queryable span under its own name
-`ui/block_parked_idle` with `incident: false` — the incident bus (and its
-`complaint_for: llm`) stays silent; `ytrace query --name block` remains the
-real-stall feed. UI_BLOCK_THRESHOLD_MS and the external ytrace diagnosis are
-untouched.
-
-Residual (dream-class, NOT fixed here): the heartbeat itself depends on the
-executor pumping every 50ms — a pump that idles for 2s is the real anomaly
-the artifact pointed at. The `block_parked_idle` spans now measure it;
-a rising tail there is the signal a future seat should chase.
-
-Tests: 3 new (classifier ground truth incl. fail-closed cases; unbroken-
-park-window verdict incl. zero-samples-files-real; census keeps last wait,
-null waits don't count). Suite delta vs stash-baseline same-worktree: +3
-green, same 1 pre-existing red ([11.54] environment-sensitive). LIVE PROOF
-OWED: after the deploy rotates, an idle 10-min window must show zero
-`ui/block` incidents while the artifact path shows `block_parked_idle` spans
-carrying `ui_thread_wait` for the first time.
-
 ## ⛔ [11.112] THE YGG-CI WATCHER DIES ON MULTIBYTE GATE OUTPUT — ONE UTF-8 CHAR SPLIT ACROSS A READ CHUNK KILLED THE WHOLE TICK LOOP AND EVERY SUBSCRIBED LANE WAITED IN SILENCE (wedged 2026-09-14 22:29:54 IST, found by the kimi-draft-guard seat waiting on its lane)
 
 **Status:** OPEN
@@ -31495,7 +31428,9 @@ behind; the owner re-reported the same ghosts three times.
 
 ## ⛔ [11.140] EVERY WRAPPER SEND TO A LIVE DEVIN ROW WAS REFUSED `pending_draft` FOREVER — THE COMPOSER PLACEHOLDER SITS ON THE ❭ GLYPH ROW AND THE DRAFT GUARD READ THE VENDOR'S SUGGESTION AS AN UNSENT DRAFT (found live 2026-09-18, the 11.6.12 wrapper-proof pass, the muse lab host, devin v3000.10.31, daemon direct build 7e816ff3)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (the `accepted:true` send rides the next daemon rotation)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+(The `accepted:true` send rides the next daemon rotation.)
 
 **The proof that found it (the owed 11.6.12 live-row pass, run at last):**
 `server app terminal new --kind devin` on a fresh cwd → the trust gate painted and the daemon's own classifier called it `startup_gate` → a `
