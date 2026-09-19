@@ -31874,3 +31874,60 @@ The measured birth, minute-precision: wrapper row `local://2bcd5a95…` launched
 The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local/state/opencode/*/tui/tabs.json` across instances) which session its window really binds. On production opencode 2.0.9 (ynpm re-point 11:59 local 2026-09-19; third version in four days after 2.0.3 → 2.0.8) that surface no longer exists: a fresh wrapper row driven through a REAL turn (reply verbatim, composer idle, store row auto-titled) wrote exactly two files under `~/.local/state/opencode` — `prompt-history.jsonl` and `service.json` — and a graceful `/exit` (TUI process verifiably gone) wrote NOTHING more. The only tabs.json on the host is the beta-era one (`beta/tui/`), and `latest/tui/` has sat empty since Sep 15 — which also means the 09-16/17-era "the tab map names the pinned id" measurements cannot have been reading a 2.0.x-written file. Consequence: the planner plans, the sibling reader reads, and the verdict is `Unknown` on every tick, silently, forever — a decorative gate, the [11.145] protocol-stamp class, and the reason the [11.134] live proof could not fire. NOT done on purpose: fabricating a tabs.json (or a scratch-HOME instance dir) to force a firing — the verdict plane is trace-only today, but normalizing fabricated client state as evidence defeats the positive-evidence law the check was designed around. Repair shape (owner's call): verify the bind from a surface 2.0.x actually maintains — the service plane's own session list already names `id` + `location.directory` (the daemon fetches it every tick; a row pinned to an id the service places under a DIFFERENT directory than the row's cwd is the divergence signal — weaker than the window-level truth the tab map gave, but real), or find 2.0.x's native successor to the client tab map before re-pointing the reader. The Verified/Diverged arms remain fixture-proven only.
 
 ⚠ CORRECTION (2026-09-19 later, the [11.148] seat's ride-along; claim ACK-9ad617aa6d lineage): "never persisted on 2.0.x" is FALSIFIED as a blanket claim. A directly-launched (node-pty, scratch HOME, scratch-local managed port) opencode 2.0.9 TUI persists `latest/tui/tabs.json` CONTINUOUSLY — writes observed every ~0.5 s poll from 2.6 s after launch, BEFORE any turn, the file naming the birth session under its cwd; the writes survive SIGKILL (no graceful exit involved; `killChild` is SIGKILL in the battery drive, so the 09-15/09-19 suite homes were written the same way). The mystery therefore SHARPENS instead of dying: the [11.134] proof's WRAPPER row (real home, same day, real turn at 12:43) wrote `prompt-history.jsonl` + `service.json` but NEVER the tab map — the suppressed variable is the daemon wrapper context, prime suspect being that the wrapper TUI joins the PRODUCTION service as a second client (real-home `locks/` mutated 12:40) while every positive measurement ran against an isolated scratch service. The repair decision stays the owner's call, but the surface is ALIVE in the plain flow: verify-bind from the tab map is viable wherever rows run outside the wrapper context, and the wrapper-context suppression is itself a measurable defect candidate.
+
+## ⛔ [11.153] A REMOTE ROW'S MOUNT RUNS A DOOMED RESPAWN LOOP AGAINST A PEER SESSION THE OWNER HAD ALREADY TERMINATED — ITS OWN PREFLIGHT SAYS "MISSING SESSION" AND LAUNCHES ANYWAY, THE ROW READS running·idle FOREVER, AND THE VIEWPORT SITS AT THE PLACEHOLDER BANNER (measured live 2026-09-19 19:10-19:40 on the GUI host + dev, owner screenshot + mid-turn report)
+
+**Status:** OPEN
+
+The owner created a "New dev Codex" row from the GUI (session 29434a5f). Codex
+0.155.1 ran and rendered its full TUI on the PEER (dev's composer_draft_union
+traces show `› Ask Codex to do anything` at grid row 12 of a 63-row screen),
+but the owner's viewport stayed at the client's empty-state placeholder (the
+row-summary line "Codex session rooted at /home/pi; the daemon owns the PTY…")
+— the stream never reached his xterm. Measured at 20:17 the same evening, a
+SHADOW client opening the same-shaped row paints it perfectly, so the
+daemon→client attach leg works when the peer session is alive; the blank is
+the remote-bridge mount leg ([11.139]/[11.32] family).
+
+The chain the traces pin, minute by minute:
+
+1. 19:17:19 — the GUI-host daemon rotates; the new daemon restores the row
+   (metadata only, launch_now:false) mid-ownership-handover.
+2. 19:17:40 — the owner closes the row: dev-side runs
+   `server remote terminate-codex 29434a5f`; dev marks the peer session
+   explicit-close + TOMBSTONED (dev removed-rows, count 13). The peer is dead.
+3. 19:17:43 + 19:18:31 — the GUI's ensure for the row answers
+   `hot_warm_ensure_error`/`daemon_declare_unavailable`
+   ("reading daemon response") — the rotation ate the mount.
+4. 19:18:40 — the mount machinery relaunches the row anyway:
+   `remote_saved_session_preflight_elided_runtime_launch {reason:
+   resume_command_owns_missing_session_failure}` — THE PREFLIGHT SAW THE
+   MISSING PEER SESSION AND THE LAUNCH PROCEEDED. What follows is a loop:
+   `resume-codex --require-existing` + 5 resize retries against
+   `local://29434a5f` ("terminal session not found") →
+   `remote_pty_resize_unownable` → `first_bytes` 165 (the stty preamble,
+   never codex's paint) → `replace_exited_runtime` — again at 19:19:33,
+   again at 19:21:33. The row reads running·idle throughout; the peer-side
+   error never becomes a row state.
+
+**Fix directions (the pipeline the owner asked to fix):** (a) the preflight's
+missing-session verdict must REFUSE the launch and surface a named row state
+("peer session gone — closed on dev?") instead of eliding into a doomed
+spawn; (b) the close of a remote row must be atomic across both planes — the
+peer terminate+tombstone must not leave the local row live through a rotation
+(the local plane holds NO tombstone for it; the 19:39:24 client-handshake
+birth brought it back a third time); (c) the resize forward's
+not-found-retries need a bounded terminal verdict that feeds (a), not an
+unownable shrug.
+
+**Falsifier:** a remote row whose peer session is terminated must reach a
+named closed/error row state within one resume ceiling — no
+`replace_exited_runtime` cycle, no third `resume-codex --require-existing`
+spawn, `terminal_attention` honest. The 19:18:40-19:21:33 window on the GUI
+host ytrace is the regression harness's script.
+
+Filed by the tombstone-rearm seat (zcode on the muse lab host); evidence
+windows preserved in both hosts' ytrace around the timestamps above. Sister
+defect of the same owner report: the tombstone TTL resurrection — FIXED in
+lane/trace/tombstone-rearm (main 23cd8dfc).
+
