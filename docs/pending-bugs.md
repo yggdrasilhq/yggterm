@@ -31698,6 +31698,46 @@ occurrence must trace `attach_supersede_watchdog` with action
 false within one resume ceiling; the instrumented unit above (search row)
 will re-verify if it ever recurs.
 
+## ⛔ [11.150] A REFUSED WRAPPER SUBMIT LATCHES A PHANTOM PENDING-DRAFT ON AN OPENCODE ROW — THE NEXT VERBS READ `composer_held_draft: true` ON A CLEAN COMPOSER, AND A REAL HELD DRAFT IS UNRECOVERABLE THROUGH WRAPPER VERBS (measured live 2026-09-19, the muse lab host, production 85df34b318d7 + opencode ynpm 2.0.9; the [11.148] seat's turn leg, claim ACK-9ad617aa6d lineage)
+
+**Status:** OPEN
+
+Three fresh warm wrapper rows, three different endings, one instrument set
+(read-buffer `daemon_screen` + `input-check` + `terminal submit`):
+
+1. **THE COLD RACE (honest half):** the first one-shot `text+\r` submit on a
+just-launched row wrote the text (46 bytes echoed in the composer) and then
+withheld the Enter — `refused: pending_draft` after the render-confirm window
+(253 ms) missed on a cold render. The held draft was REAL and rendered. From
+there every wrapper verb refuses forever: one-shot submit (input-check answers
+the draft by name, 1 ms — latched), bare-`\r` send (`pending_draft_refusal`,
+"would clobber a person's words"), raw Ctrl+U (opencode does not bind it — the
+byte is swallowed, text stays), the refusal's own named remedy "send an empty
+write first" (accepted, 0 bytes, changes nothing). Recovery = remove + respawn
+(measured, `verified:true`).
+2. **THE PHANTOM LATCH (the defect):** on a second fresh warm row the FIRST
+one-shot submit refused `pending_draft` PRE-WRITE (`chunk_count: 0`, verified
+virgin placeholder render beforehand); the probe sequence visibly ALTERED the
+render (placeholder line gone afterwards) — the probe's own typed marker is
+the prime suspect for the draft reading, self-read before its Ctrl+U cleared
+it. `input-check` afterwards answers `composer_held_draft: true` at 1 ms
+(cached) on the clean composer.
+3. **THE CONTROL:** a third fresh warm row, `input-check` as the VERY FIRST
+verb: `composer_held_draft: false, consuming_input: true` (echo-confirmed,
+248 ms) — the healthy [11.144]-close answer. The false positive is NOT
+unconditional; it is reached through the refused-submit path.
+
+Consequence: ANY wrapper send to an opencode row whose first submit loses the
+cold-render race bricks the row for wrapper input permanently (the [11.140]
+brick reborn as a latch), and the [11.148] live turn-leg cannot run until this
+is fixed. The [11.144] close's structural fix (TerminalSnapshotAnswer) is
+NOT implicated — the readers agree; the probe/guard SEQUENCE is. Repair shape
+(owner call): the probe must not leave evidence its own reader can read
+(type-read-clear with a settle between, or read BEFORE typing), and a refused
+submit's draft verdict must not latch past the clear; a real held draft needs
+a per-CLI clear binding (opencode has no Ctrl+U) or a wrapper-reachable
+recover path.
+
 ## ⛔ [11.148] A FRESH (NO `--session`) WRAPPER OPENCODE ROW GETS A DUPLICATE KEEP-ALIVE MIRROR TWIN — THE TAB-SYNC OWNS SESSIONS ONLY THROUGH THE "Tab Session Id" ROW METADATA, WHICH ONLY THE MIRROR'S OWN SPAWN PATH WRITES, SO THE WRAPPER ROW'S POST-HOC DISCOVERY (`session_id`, AUTHORITATIVE) IS INVISIBLE TO IT AND THE SESSION READS UN-OWNED (measured live 2026-09-19, the muse lab host, lane/integration/oc-bind-proof; claim ACK-ac4fedcd57)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -31730,6 +31770,15 @@ driven through a real turn on the muse lab host spawns NO `opencode-runtime://`
 twin row (rail shows exactly one row per session), and a twin that exists when
 the pin lands is gone by the next tick with `mirror_twin_retracted_pinned_elsewhere`
 on the trace plane.
+
+LIVE STATUS (same sitting, post-deploy 85df34b318d7 on the muse lab host): the
+fix is DEPLOYED and the new mirror tick is live — `tick_state` now carries
+`plan_retract` (daemon pid lineage of the new build, observed twice). The TURN
+leg of the live proof (a real wrapper turn pinning its session; the twin that
+must not spawn / must retract) is BLOCKED by [11.150] — every wrapper one-shot
+submit to an opencode row on this build/version refused `pending_draft` before
+writing. Rail verified clean post-cleanup: zero `opencode-runtime://` twin
+rows, probe rows removed with `verified:true`.
 
 The measured birth, minute-precision: wrapper row `local://2bcd5a95…` launched 12:39:33 local with NO session id (fresh launch — there is nothing to pin yet); the one-shot turn created service session `ses_f477cab07ffeBVe7OurGNbnhn5` at 12:43:29 (service plane `time.created`); the NEXT tab-sync tick at 12:43:33 (4 s later, `tab_sync` detail `spawned: 1`) spawned a mirror row `opencode-runtime://ses_f477cab0…` for it — the sync's ownership read is `owned_tabs_from`, which takes the ses id ONLY from a row's `"Tab Session Id"` metadata (`TAB_SESSION_ID_METADATA`), and that label is written only by the mirror's own spawn path (opencode_mirror.rs:526/580); the wrapper row's post-hoc discovery writes `session_id` (`session_kind_source: "authoritative"` in the rows plane) but NO metadata, so the service session read un-owned and the sync did what it is built to do. The bind settles later (a later 12th-tick `tab_sync` shows `focus: ses_f477cab0…`), but the twin is NEVER retracted: TWO keep-alive rail rows for ONE TUI, both whose detail label claims "the daemon owns the PTY". The [11.144]-era twins (`ses_f485d795…`, `ses_f48c6139…`, `ses_f48d29a7…`; births at the 06:30/06:43/08:38 tab_sync ticks) are the same class — proof seats removed their wrapper rows and the mirror kept the projections. Sharp edges: (a) the twin is what carries the bind-check pin, so [11.134]'s check plans from the twin, not the terminal row; (b) removing either row leaves the other; the tombstone veto only remembers closed rows. Repair shape: teach `owned_tabs_from` (or the wrapper bind path) the row plane's own `session_id` discovery — one book, not two — and retract a twin whose session a live wrapper row already pins. All four twins were removed + tombstoned in the proof sitting (veto set 6→10); rail verified clean.
 
