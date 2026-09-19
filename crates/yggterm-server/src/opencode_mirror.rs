@@ -64,11 +64,20 @@ pub struct TabSyncPlan {
     /// Listed sessions with no mirror row yet.
     pub spawn: Vec<OpencodeServiceSession>,
     /// Session ids no longer in the store list AND whose row was never
-    /// engaged.
+    /// engaged. Mirror projections only — a wrapper/anchor row is the user's
+    /// row and is never retired here ([11.148]).
     pub retire: Vec<String>,
+    /// [11.148] Mirror twins whose session a live non-mirror row already
+    /// pins — born in the seconds before the pin landed (or before the id
+    /// arm existed) and never retracted. Retraction removes the projection
+    /// row and drops NO tombstone: when the pinning row later dies, the
+    /// session legitimately re-projects (the keep-alive law).
+    pub retract: Vec<String>,
     /// The tab row key the human just focused — viewed recency moved to a
     /// session this mirror already mirrors. (Dormant on beta-19271: no TUI
     /// flow writes the viewed times; kept for builds with a writer.)
+    /// Mirror projections only: a pinned wrapper row IS the thing being
+    /// looked at — nothing to move.
     pub focus: Option<String>,
 }
 
@@ -77,6 +86,12 @@ pub(crate) struct OwnedTab {
     pub(crate) key: String,
     pub(crate) viewed_epoch_ms: u128,
     pub(crate) engaged: bool,
+    /// The row owning this tab is the mirror's OWN projection (key-shaped
+    /// `opencode-runtime://` or `Source`-stamped). A wrapper/anchor row that
+    /// pinned the session in its own `id` owns it WITHOUT being a projection:
+    /// the mirror never retires, retitles or focus-claims it, and its pin is
+    /// what retracts an unengaged twin ([11.148]).
+    pub(crate) mirror_owned: bool,
 }
 
 /// The mirror's own rows, read back OUT of the row plane (Source metadata) —
@@ -90,22 +105,64 @@ pub(crate) struct OwnedTab {
 /// on screen, so every tab looked new forever and nothing converged. The key
 /// shape is the identity: an OpenCode row keyed `opencode-runtime://ses_…`
 /// embeds the SERVICE's own id (uuid-keyed rows are anchors or phantoms and
-/// are never adopted).
-fn mirror_tab_session_id(kind: crate::SessionKind, key: &str, stamped: Option<&str>) -> Option<String> {
+/// are never adopted BY KEY — a rebound anchor still owns through its id,
+/// as a non-projection owner).
+///
+/// ⭐ [11.148] THE ROW PLANE'S OWN ID IS THE THIRD ARM: a WRAPPER row (keyed
+/// `local://…`) discovers its service session POST-HOC and the pin lands in
+/// `session.id` (authoritative, service-vouched) — it writes no Tab Session
+/// Id metadata, so the two-arm read called its session un-owned and the sync
+/// spawned a keep-alive twin for a session a live row already renders. One
+/// book, not two: the id IS the ownership record (and it survives a daemon
+/// restart, which the metadata historically does not).
+fn mirror_tab_session_id(
+    kind: crate::SessionKind,
+    key: &str,
+    stamped: Option<&str>,
+    id: &str,
+) -> Option<String> {
     if kind != crate::SessionKind::OpenCode {
         return None;
     }
     if let Some(ses) = stamped.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(ses.to_string());
     }
-    let rest = key.strip_prefix("opencode-runtime://")?;
-    rest.starts_with("ses_").then(|| rest.to_string())
+    if let Some(rest) = key.strip_prefix("opencode-runtime://") {
+        if rest.starts_with("ses_") {
+            return Some(rest.to_string());
+        }
+    }
+    let id = id.trim();
+    id.starts_with("ses_").then(|| id.to_string())
+}
+
+/// The liveness marks that make a row a WINDOW (a real PTY or a live launch
+/// phase). Shared by the owned read and the [11.148] retraction filter —
+/// one predicate, or the two readers can disagree about what "opened" means.
+fn row_is_engaged(session: &crate::ManagedSessionView) -> bool {
+    session.terminal_process_id.is_some()
+        || matches!(
+            session.launch_phase,
+            crate::TerminalLaunchPhase::Running
+                | crate::TerminalLaunchPhase::RemoteBootstrap
+                | crate::TerminalLaunchPhase::BridgePending
+        )
+}
+
+/// The row at a twin's spawn key is the mirror's projection — Source-stamped.
+/// The key shape alone is near-proof (only the mirror creates those rows),
+/// but retraction REMOVES a row, so removals confirm the stamp first.
+fn mirror_projection_row(session: &crate::ManagedSessionView) -> bool {
+    session
+        .metadata
+        .iter()
+        .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
 }
 
 fn owned_tabs_from(
     sessions: &std::collections::BTreeMap<String, crate::ManagedSessionView>,
 ) -> std::collections::HashMap<String, OwnedTab> {
-    let mut out = std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<String, OwnedTab> = std::collections::HashMap::new();
     for (key, session) in sessions {
         let Some(ses) = mirror_tab_session_id(
             session.kind,
@@ -115,43 +172,76 @@ fn owned_tabs_from(
                 .iter()
                 .find(|m| m.label == TAB_SESSION_ID_METADATA)
                 .map(|m| m.value.as_str()),
+            &session.id,
         ) else {
             continue;
         };
-        let is_mirror = session
-            .metadata
-            .iter()
-            .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA)
+        // [11.148] mirror_owned is the PROJECTION mark: the mirror's own key
+        // shape or its Source stamp. The id arm's owners (a wrapper row, a
+        // rebound anchor) are the user's real rows — never mirror bookkeeping
+        // targets. (The old computed-but-unused `is_mirror` counted a ses_
+        // id as a projection mark, which would have armed retire against a
+        // wrapper row the moment the id arm existed.)
+        let mirror_owned = key.starts_with("opencode-runtime://")
             || session
                 .metadata
                 .iter()
-                .any(|m| m.label == TAB_SESSION_ID_METADATA)
-            || ses.starts_with("ses_");
-        let engaged = session.terminal_process_id.is_some()
-            || matches!(
-                session.launch_phase,
-                crate::TerminalLaunchPhase::Running
-                    | crate::TerminalLaunchPhase::RemoteBootstrap
-                    | crate::TerminalLaunchPhase::BridgePending
-            );
+                .any(|m| m.label == "Source" && m.value == TAB_SOURCE_METADATA);
+        let engaged = row_is_engaged(session);
         let viewed = session
             .metadata
             .iter()
             .find(|m| m.label == VIEWED_METADATA)
             .and_then(|m| m.value.parse::<u128>().ok())
             .unwrap_or(0);
-        out.insert(ses, OwnedTab {
+        let tab = OwnedTab {
             key: key.clone(),
             viewed_epoch_ms: viewed,
             engaged,
-        });
+            mirror_owned,
+        };
+        // Two rows can claim one session mid-flight (the twin born in the
+        // seconds before the wrapper's pin landed). The AUTHORITATIVE row
+        // wins the slot: the plan must see the wrapper's ownership, not the
+        // projection's.
+        use std::collections::hash_map::Entry;
+        match out.entry(ses) {
+            Entry::Occupied(mut e) if e.get().mirror_owned && !mirror_owned => {
+                e.insert(tab);
+            }
+            Entry::Vacant(e) => {
+                e.insert(tab);
+            }
+            _ => {}
+        }
     }
     out
+}
+
+/// The ses ids pinned by STABLE live non-mirror rows — the set that may
+/// retract a twin ([11.148]). The ANCHOR's pin is excluded: its bound id
+/// follows the tab the human is viewing, so retracting on it would flap a
+/// projection (retract, re-project) on every tab switch.
+pub(crate) fn pinned_stable_from(
+    owned: &std::collections::HashMap<String, OwnedTab>,
+    anchor_key: Option<&str>,
+) -> std::collections::HashSet<String> {
+    owned
+        .iter()
+        .filter(|(_, tab)| {
+            !tab.mirror_owned
+                && tab.engaged
+                && anchor_key != Some(tab.key.as_str())
+        })
+        .map(|(ses, _)| ses.clone())
+        .collect()
 }
 
 pub fn plan_tab_sync(
     sessions: &[OpencodeServiceSession],
     owned: &std::collections::HashMap<String, OwnedTab>,
+    pinned_stable: &std::collections::HashSet<String>,
+    rows: &std::collections::BTreeMap<String, crate::ManagedSessionView>,
 ) -> TabSyncPlan {
     let mut spawn = Vec::new();
     for ses in sessions {
@@ -161,13 +251,33 @@ pub fn plan_tab_sync(
     }
     let mut retire = Vec::new();
     for (ses, tab) in owned {
+        if !tab.mirror_owned {
+            // [11.148] a wrapper/anchor row is the user's row — the mirror
+            // never retires it for losing its tab.
+            continue;
+        }
         if !sessions.iter().any(|s| &s.id == ses) && !tab.engaged {
             retire.push(ses.clone());
         }
     }
+    // [11.148] RETRACTION: a twin whose session a live non-mirror row pins.
+    // The owned slot for that ses belongs to the AUTHORITATIVE row (it wins
+    // the collision), so the twin is found at its deterministic spawn key,
+    // confirmed a Source-stamped projection, and skipped if the user OPENED
+    // it (an engaged twin is a real second window, not a duplicate rail row).
+    let mut retract: Vec<String> = pinned_stable
+        .iter()
+        .filter(|ses| {
+            rows.get(&format!("opencode-runtime://{ses}"))
+                .is_some_and(|twin| mirror_projection_row(twin) && !row_is_engaged(twin))
+        })
+        .cloned()
+        .collect();
+    retract.sort();
     // Focus-follow: the human's focused tab is the most recently VIEWED one,
     // and following is due only when that view moved PAST what this mirror
-    // has already recorded for the row — a no-op on quiet ticks.
+    // has already recorded for the row — a no-op on quiet ticks. Projections
+    // only ([11.148]): a pinned wrapper row IS the thing being looked at.
     let mut focus = None;
     if let Some(newest) = sessions
         .iter()
@@ -175,7 +285,7 @@ pub fn plan_tab_sync(
         .max_by_key(|s| s.viewed_epoch_ms)
     {
         if let Some(tab) = owned.get(&newest.id) {
-            if newest.viewed_epoch_ms > tab.viewed_epoch_ms {
+            if tab.mirror_owned && newest.viewed_epoch_ms > tab.viewed_epoch_ms {
                 focus = Some(newest.id.clone());
             }
         }
@@ -183,6 +293,7 @@ pub fn plan_tab_sync(
     TabSyncPlan {
         spawn,
         retire,
+        retract,
         focus,
     }
 }
@@ -436,7 +547,12 @@ impl YggtermServer {
         terminal_titles: &std::collections::HashMap<String, String>,
     ) {
         let owned = owned_tabs_from(&self.sessions);
-        let mut plan = plan_tab_sync(sessions, &owned);
+        // [11.148] the pin set that may retract a twin — computed before the
+        // plan, from the same read (the anchor key is reused by the
+        // anchor-as-header section below; one scan, one answer).
+        let anchor_key = self.opencode_anchor_key(screen_live);
+        let pinned_stable = pinned_stable_from(&owned, anchor_key.as_deref());
+        let mut plan = plan_tab_sync(sessions, &owned, &pinned_stable, &self.sessions);
         // THE CLOSE OUTRANKS THE TAB. A service tab whose row the user closed
         // must not re-project — see `tombstoned_opencode_mirror_spawns`.
         if let Ok(home_dir) = crate::resolve_yggterm_home() {
@@ -478,6 +594,7 @@ impl YggtermServer {
                         "owned": owned.len(),
                         "plan_spawn": plan.spawn.len(),
                         "plan_retire": plan.retire.len(),
+                        "plan_retract": plan.retract.len(),
                         "plan_focus": plan.focus.is_some(),
                     }),
                 );
@@ -631,6 +748,32 @@ impl YggtermServer {
                 retired += 1;
             }
         }
+        // [11.148] RETRACTION: a twin whose session a live non-mirror row
+        // already pins is a DUPLICATE rail row for one TUI — remove it at its
+        // deterministic spawn key. No tombstone: a session whose pinning row
+        // later dies legitimately re-projects (the keep-alive law); only user
+        // closes veto.
+        let mut retracted: Vec<(String, String)> = Vec::new();
+        for ses in &plan.retract {
+            let key = format!("opencode-runtime://{ses}");
+            if self.remove_live_session(&key).unwrap_or(false) {
+                retracted.push((ses.clone(), key));
+            }
+        }
+        if !retracted.is_empty() {
+            #[cfg(not(test))]
+            if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                yggterm_core::append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "opencode_mirror",
+                    "mirror_twin_retracted_pinned_elsewhere",
+                    serde_json::json!({
+                        "retracted": retracted,
+                    }),
+                );
+            }
+        }
         // Title sync: the row name IS the tab name. The service title is
         // authoritative for mirror rows (the human renames tabs in the TUI,
         // not in the sidebar), so drift is corrected every tick — placeholders
@@ -643,6 +786,11 @@ impl YggtermServer {
             let Some(tab) = owned.get(&ses.id) else {
                 continue;
             };
+            if !tab.mirror_owned {
+                // [11.148] the service title is authoritative for the mirror's
+                // PROJECTIONS; a pinned wrapper/anchor row keeps its own name.
+                continue;
+            }
             if let Some(session) = self.sessions.get_mut(&tab.key) {
                 if !session.title_is_explicit && session.title != title {
                     session.title = title;
@@ -653,7 +801,7 @@ impl YggtermServer {
         // header, titled by the tab the human is looking at (most recently
         // viewed) — the owner's contract, 2026-08-30. A hand-titled anchor is
         // respected and left alone.
-        if let Some(anchor_key) = self.opencode_anchor_key(screen_live) {
+        if let Some(anchor_key) = anchor_key.clone() {
             let explicit = self
                 .sessions
                 .get(&anchor_key)
@@ -977,7 +1125,7 @@ impl YggtermServer {
                 }
             }
         }
-        if spawned > 0 || retired > 0 || plan.focus.is_some() {
+        if spawned > 0 || retired > 0 || !retracted.is_empty() || plan.focus.is_some() {
             if let Ok(home_dir) = crate::resolve_yggterm_home() {
                 yggterm_core::append_trace_event(
                     &home_dir,
@@ -987,6 +1135,7 @@ impl YggtermServer {
                     serde_json::json!({
                         "spawned": spawned,
                         "retired": retired,
+                        "retracted": retracted.len(),
                         "focus": plan.focus,
                         "active_tabs": sessions.len(),
                     }),
@@ -1126,6 +1275,7 @@ mod tests {
                 key: format!("opencode-runtime://{ses}"),
                 viewed_epoch_ms: viewed,
                 engaged,
+                mirror_owned: true,
             },
         )
     }
@@ -1254,6 +1404,7 @@ mod tests {
                     key: live_key.clone(),
                     viewed_epoch_ms: 100,
                     engaged: true,
+                    mirror_owned: true,
                 },
             ),
             (
@@ -1262,6 +1413,7 @@ mod tests {
                     key: dead_key.clone(),
                     viewed_epoch_ms: 100,
                     engaged: true,
+                    mirror_owned: true,
                 },
             ),
             (
@@ -1270,6 +1422,7 @@ mod tests {
                     key: remote_key.clone(),
                     viewed_epoch_ms: 100,
                     engaged: true,
+                    mirror_owned: true,
                 },
             ),
             (
@@ -1278,6 +1431,7 @@ mod tests {
                     key: live_key.clone(),
                     viewed_epoch_ms: 100,
                     engaged: true,
+                    mirror_owned: true,
                 },
             ),
         ]);
@@ -1307,6 +1461,7 @@ mod tests {
                 key: row_key.clone(),
                 viewed_epoch_ms: 100,
                 engaged: true,
+                mirror_owned: true,
             },
         )]);
         let service = vec![ses(ses_id, 100)];
@@ -1457,7 +1612,7 @@ mod tests {
             50,
             false,
         )]);
-        let plan = plan_tab_sync(&sessions, &owned_map);
+        let plan = plan_tab_sync(&sessions, &owned_map, &std::collections::HashSet::new(), &std::collections::BTreeMap::new());
         assert_eq!(plan.spawn.len(), 1);
         assert_eq!(plan.spawn[0].id, "ses_new000000000000000000001");
         assert_eq!(plan.retire, vec!["ses_gone00000000000000000001"]);
@@ -1475,7 +1630,7 @@ mod tests {
             50,
             true, // the user opened it: it is a window now
         )]);
-        let plan = plan_tab_sync(&sessions, &owned_map);
+        let plan = plan_tab_sync(&sessions, &owned_map, &std::collections::HashSet::new(), &std::collections::BTreeMap::new());
         assert!(plan.retire.is_empty(), "windows close when the user closes them");
         assert!(plan.spawn.is_empty());
     }
@@ -1489,7 +1644,7 @@ mod tests {
             1_000,
             false,
         )]);
-        let plan = plan_tab_sync(&sessions, &owned_map);
+        let plan = plan_tab_sync(&sessions, &owned_map, &std::collections::HashSet::new(), &std::collections::BTreeMap::new());
         assert_eq!(
             plan.focus.as_deref(),
             Some("ses_mirrored0000000000000000001"),
@@ -1502,7 +1657,7 @@ mod tests {
             9_000,
             false,
         )]);
-        let plan = plan_tab_sync(&sessions, &settled);
+        let plan = plan_tab_sync(&sessions, &settled, &std::collections::HashSet::new(), &std::collections::BTreeMap::new());
         assert_eq!(plan.focus, None, "quiet tick — nothing to follow");
     }
 
@@ -1516,7 +1671,7 @@ mod tests {
         idle.running = false;
         idle.viewed_epoch_ms = 0;
         // A listed session with no row yet still spawns, idle or not.
-        let plan = plan_tab_sync(&[idle.clone()], &std::collections::HashMap::new());
+        let plan = plan_tab_sync(&[idle.clone()], &std::collections::HashMap::new(), &std::collections::HashSet::new(), &std::collections::BTreeMap::new());
         assert_eq!(
             plan.spawn.len(),
             1,
@@ -1529,7 +1684,7 @@ mod tests {
             0,
             false,
         )]);
-        let plan = plan_tab_sync(&[idle], &owned_map);
+        let plan = plan_tab_sync(&[idle], &owned_map, &std::collections::HashSet::new(), &std::collections::BTreeMap::new());
         assert!(
             plan.retire.is_empty(),
             "listed-but-idle never retires an unengaged row"
@@ -1550,6 +1705,7 @@ mod adoption_tests {
                 crate::SessionKind::OpenCode,
                 "opencode-runtime://ses_abc000000000000000000001",
                 Some("ses_abc000000000000000000001"),
+                "ses_abc000000000000000000001",
             ),
             Some("ses_abc000000000000000000001".to_string())
         );
@@ -1560,15 +1716,17 @@ mod adoption_tests {
                 crate::SessionKind::OpenCode,
                 "opencode-runtime://ses_abc000000000000000000001",
                 None,
+                "ses_abc000000000000000000001",
             ),
             Some("ses_abc000000000000000000001".to_string())
         );
-        // uuid-keyed rows are anchors or phantoms — never mirror rows.
+        // uuid-keyed rows are anchors or phantoms — never mirror rows BY KEY.
         assert_eq!(
             mirror_tab_session_id(
                 crate::SessionKind::OpenCode,
                 "opencode-runtime://0d841111-1111-4111-8111-111111111111",
                 None,
+                "0d841111-1111-4111-8111-111111111111",
             ),
             None
         );
@@ -1578,8 +1736,246 @@ mod adoption_tests {
                 crate::SessionKind::ClaudeCode,
                 "opencode-runtime://ses_abc000000000000000000001",
                 None,
+                "ses_abc000000000000000000001",
             ),
             None
+        );
+    }
+
+    /// [11.148] THE ID ARM: a wrapper row's key carries no ses id and its
+    /// spawn path writes no Tab Session Id metadata — the pin lives in the
+    /// row plane's own `session.id`, and that alone must own the tab.
+    #[test]
+    fn a_wrapper_rows_own_discovered_id_owns_its_tab() {
+        assert_eq!(
+            mirror_tab_session_id(
+                crate::SessionKind::OpenCode,
+                "local://2bcd5a95-1111-4111-8111-111111111111",
+                None,
+                "ses_f477cab000000000000000000001",
+            ),
+            Some("ses_f477cab000000000000000000001".to_string())
+        );
+        // A uuid id (a fresh wrapper row before the pin, a phantom) owns
+        // nothing.
+        assert_eq!(
+            mirror_tab_session_id(
+                crate::SessionKind::OpenCode,
+                "local://2bcd5a95-1111-4111-8111-111111111111",
+                None,
+                "0d841111-1111-4111-8111-111111111111",
+            ),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod twin_retract_tests {
+    use super::*;
+
+    const SES: &str = "ses_twinretract00000000000001";
+
+    fn listed(id: &str, viewed: u128) -> OpencodeServiceSession {
+        OpencodeServiceSession {
+            id: id.to_string(),
+            title: Some(id.to_string()),
+            directory: Some("/home/user/proj".to_string()),
+            updated_epoch_ms: viewed,
+            viewed_epoch_ms: viewed,
+            running: true,
+        }
+    }
+
+    /// A wrapper-shaped live row: `local://…` key (NOT the mirror's key
+    /// shape), optional discovered pin in the row plane's own id.
+    fn server_with_wrapper_row(
+        pinned: Option<&str>,
+        engaged: bool,
+    ) -> (crate::YggtermServer, String) {
+        let mut server = crate::YggtermServer::new(
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            crate::SessionKind::OpenCode,
+            Some("/home/user/proj"),
+            Some("opencode wrapper row"),
+        );
+        let row = server.sessions.get_mut(&key).expect("the row exists");
+        if engaged {
+            row.launch_phase = crate::TerminalLaunchPhase::Running;
+            row.terminal_process_id = Some(4242);
+        } else {
+            // start_local_session leaves a fresh row in an ENGAGED phase —
+            // the disengaged arm must say so explicitly.
+            row.launch_phase = crate::TerminalLaunchPhase::Queued;
+            row.terminal_process_id = None;
+        }
+        if let Some(ses) = pinned {
+            row.id = ses.to_string();
+        }
+        (server, key)
+    }
+
+    /// A mirror PROJECTION row at the deterministic twin key, Source-stamped
+    /// the way the spawn path stamps it.
+    fn server_with_twin_row(engaged: bool) -> (crate::YggtermServer, String) {
+        let twin_key = format!("opencode-runtime://{SES}");
+        let (mut server, _) = server_with_wrapper_row(None, false);
+        let mut row = server
+            .sessions
+            .values()
+            .next()
+            .expect("a row exists")
+            .clone();
+        if engaged {
+            row.launch_phase = crate::TerminalLaunchPhase::Running;
+            row.terminal_process_id = Some(4242);
+        } else {
+            row.launch_phase = crate::TerminalLaunchPhase::Queued;
+            row.terminal_process_id = None;
+        }
+        crate::upsert_session_metadata(
+            &mut row.metadata,
+            "Source",
+            TAB_SOURCE_METADATA.to_string(),
+        );
+        row.session_path = twin_key.clone();
+        server.sessions.clear();
+        server.sessions.insert(twin_key.clone(), row);
+        (server, twin_key)
+    }
+
+    /// [11.148] THE DEFECT: a live wrapper row pinned its session — the tab
+    /// is owned through the row plane's own id, the sync spawns NO twin, and
+    /// the user's row is never a retire candidate.
+    #[test]
+    fn a_pinned_wrapper_row_suppresses_the_twin_and_is_never_retired() {
+        let (server, key) = server_with_wrapper_row(Some(SES), true);
+        let owned = owned_tabs_from(&server.sessions);
+        let tab = owned
+            .get(SES)
+            .expect("the wrapper row owns its pin through the id arm");
+        assert_eq!(tab.key, key, "the authoritative row holds the slot");
+        assert!(!tab.mirror_owned, "a wrapper row is not a projection");
+        assert!(tab.engaged);
+        let pinned = pinned_stable_from(&owned, None);
+        assert!(pinned.contains(SES), "a live wrapper pin is stable");
+        let plan = plan_tab_sync(&[listed(SES, 100)], &owned, &pinned, &server.sessions);
+        assert!(
+            plan.spawn.is_empty(),
+            "no twin for a session a live row already renders"
+        );
+        assert!(plan.retire.is_empty(), "the wrapper row is never retired");
+        assert!(plan.retract.is_empty(), "the wrapper row is not a twin");
+    }
+
+    /// A twin born in the seconds before the pin landed retracts once the
+    /// wrapper pins — the duplicate rail row goes away.
+    #[test]
+    fn an_unengaged_twin_whose_session_a_live_wrapper_row_pins_is_retracted() {
+        let (mut server, _twin_key) = server_with_twin_row(false);
+        let (mut wrapper_host, wrapper_key) = server_with_wrapper_row(Some(SES), true);
+        let wrapper_row = wrapper_host
+            .sessions
+            .values()
+            .next()
+            .expect("the wrapper row exists")
+            .clone();
+        server.sessions.insert(wrapper_key.clone(), wrapper_row);
+        let owned = owned_tabs_from(&server.sessions);
+        assert_eq!(
+            owned.get(SES).expect("owned").key,
+            wrapper_key,
+            "the authoritative row wins the slot over the projection"
+        );
+        let pinned = pinned_stable_from(&owned, None);
+        let plan = plan_tab_sync(&[listed(SES, 100)], &owned, &pinned, &server.sessions);
+        assert_eq!(
+            plan.retract,
+            vec![SES.to_string()],
+            "the duplicate twin is named for retraction"
+        );
+    }
+
+    /// An ENGAGED twin is a window the user opened — a real second client on
+    /// a multi-native CLI — never a duplicate to delete.
+    #[test]
+    fn an_opened_twin_is_a_window_and_is_never_retracted() {
+        let (mut server, _twin_key) = server_with_twin_row(true);
+        let (mut wrapper_host, wrapper_key) = server_with_wrapper_row(Some(SES), true);
+        let wrapper_row = wrapper_host
+            .sessions
+            .values()
+            .next()
+            .expect("the wrapper row exists")
+            .clone();
+        server.sessions.insert(wrapper_key.clone(), wrapper_row);
+        let owned = owned_tabs_from(&server.sessions);
+        let pinned = pinned_stable_from(&owned, None);
+        let plan = plan_tab_sync(&[listed(SES, 100)], &owned, &pinned, &server.sessions);
+        assert!(
+            plan.retract.is_empty(),
+            "an opened twin is the user's window, not a rail duplicate"
+        );
+    }
+
+    /// The anchor's bound id follows the tab the human is viewing — its pin
+    /// is UNSTABLE and must never arm retraction (a projection would flap
+    /// per tab switch).
+    #[test]
+    fn the_anchor_pin_is_not_stable() {
+        let ses_a = "ses_stablepin0000000000000001";
+        let ses_b = "ses_anchorpin0000000000000001";
+        let (mut server, wrapper_key) = server_with_wrapper_row(Some(ses_a), true);
+        let anchor_key = format!("local://anchor-{wrapper_key}");
+        let mut anchor = server
+            .sessions
+            .values()
+            .next()
+            .expect("a row exists")
+            .clone();
+        anchor.id = ses_b.to_string();
+        anchor.terminal_process_id = Some(4243);
+        anchor.launch_phase = crate::TerminalLaunchPhase::Running;
+        server.sessions.insert(anchor_key.clone(), anchor);
+        let owned = owned_tabs_from(&server.sessions);
+        let pinned = pinned_stable_from(&owned, Some(&anchor_key));
+        assert!(
+            pinned.contains(ses_a),
+            "a non-anchor wrapper pin is stable"
+        );
+        assert!(
+            !pinned.contains(ses_b),
+            "the anchor's pin never arms retraction"
+        );
+    }
+
+    /// A dead pinning row owns nothing stable — no retraction, and the twin
+    /// (or a fresh one) stays as the session's keep-alive.
+    #[test]
+    fn a_dead_wrapper_pin_keeps_the_twin() {
+        let (server, _key) = server_with_wrapper_row(Some(SES), false);
+        let (mut both, _twin_key) = server_with_twin_row(false);
+        let wrapper_row = server
+            .sessions
+            .values()
+            .next()
+            .expect("the wrapper row exists")
+            .clone();
+        both.sessions.insert("local://dead-wrapper".to_string(), wrapper_row);
+        let owned = owned_tabs_from(&both.sessions);
+        let pinned = pinned_stable_from(&owned, None);
+        assert!(
+            !pinned.contains(SES),
+            "a disengaged wrapper row is not a live pin"
+        );
+        let plan = plan_tab_sync(&[listed(SES, 100)], &owned, &pinned, &both.sessions);
+        assert!(
+            plan.retract.is_empty(),
+            "the twin stays while no live row renders the session"
         );
     }
 }
