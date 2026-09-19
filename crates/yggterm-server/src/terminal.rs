@@ -3141,6 +3141,10 @@ impl PtySessionRuntime {
                 // per-reader epoch law as the witness it sits beside.
                 let mut osc_title_tracker = crate::app_declare::OscTitleTracker::new();
                 let mut saw_any_output = false;
+                // [11.138] throttle for the content-free-frame witness below:
+                // enough to name the next metronome's frame without tracing
+                // every cursor twitch.
+                let mut last_content_free_frame_trace_ms = 0u64;
                 loop {
                     // Stand down here rather than inside the read: a parked
                     // reader must own no bytes at all, so that everything the
@@ -3226,8 +3230,10 @@ impl PtySessionRuntime {
                             let raw_data =
                                 decode_terminal_utf8_chunk(&mut pending_utf8, &buffer[..bytes]);
                             if raw_data.is_empty() {
-                                reader_activity.store(now_millis(), Ordering::SeqCst);
-                                reader_output.store(now_millis(), Ordering::SeqCst);
+                                // [11.138] Bytes held pending an incomplete
+                                // UTF-8 sequence carry no text yet, so they
+                                // move no activity clock; the chunk that
+                                // completes the sequence stamps for both.
                                 continue;
                             }
                             let (data, stripped_attach_ready_marker) =
@@ -3310,16 +3316,44 @@ impl PtySessionRuntime {
                                 );
                             }
                             reader_runtime_output_seen.store(true, Ordering::SeqCst);
-                            // ⛔ Our OWN control heartbeat is not session
-                            // activity. Everything else about this chunk is
-                            // unchanged — it still reaches the screen, the ring
-                            // and the declare log; only the idle clock, which
-                            // the hot-restart gate reads as "a human or an agent
-                            // is doing something here", declines to move.
-                            // See [`crate::app_declare::chunk_is_only_app_declares`].
-                            if !crate::app_declare::chunk_is_only_app_declares(&data) {
+                            // ⛔ Session activity is the only thing that
+                            // moves the activity clocks. Our OWN control
+                            // heartbeat is not session activity, and neither
+                            // is a content-free paint frame: [11.138]'s ~305s
+                            // metronome rode a 77-byte frame
+                            // (synchronized-output bracket + cursor
+                            // positioning + cursor shape, zero printable) and
+                            // restamped `last_activity_ms`/`last_output_ms` on
+                            // every tick. The law lives in
+                            // [`reader_chunk_moves_activity_clocks`], applied
+                            // HERE at the reader so every recency consumer
+                            // (the chore verdict, the gate's recently_active
+                            // blocker, `input_unanswered_ms`) reads the truth
+                            // without re-patching one by one. Everything else
+                            // about the chunk is unchanged — it still reaches
+                            // the screen, the ring and the declare log; the
+                            // idle clock, which the hot-restart gate reads as
+                            // "a human or an agent is doing something here",
+                            // is what declines to move.
+                            if reader_chunk_moves_activity_clocks(&data) {
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
                                 reader_output.store(now_millis(), Ordering::SeqCst);
+                            } else if !crate::app_declare::chunk_is_only_app_declares(&data) {
+                                // A content-free paint frame: throttled
+                                // witness, so the next metronome names its
+                                // frame without a seat having to strace.
+                                let now = now_millis();
+                                if now.saturating_sub(last_content_free_frame_trace_ms) >= 60_000 {
+                                    last_content_free_frame_trace_ms = now;
+                                    trace_terminal_event(
+                                        "content_free_frame_no_stamp",
+                                        serde_json::json!({
+                                            "path": key_label,
+                                            "bytes": data.len(),
+                                            "sample": truncate_terminal_trace_sample(&data),
+                                        }),
+                                    );
+                                }
                             }
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
@@ -3611,6 +3645,14 @@ impl PtySessionRuntime {
     /// mid-turn or just finished. See [[finding-hot-update-interrupts-remote-sessions]].
     fn idle_for_ms(&self) -> u64 {
         now_millis().saturating_sub(self.last_activity_ms.load(Ordering::SeqCst))
+    }
+
+    /// Milliseconds since this session last produced PTY output — [11.138]:
+    /// content-free paint frames no longer restamp this clock, so it answers
+    /// "how recently did the child SAY something", not "how recently did it
+    /// twitch a cursor".
+    fn output_idle_for_ms(&self) -> u64 {
+        now_millis().saturating_sub(self.last_output_ms.load(Ordering::SeqCst))
     }
 
     /// `true` when the user has typed text on the current input line but not yet
@@ -5395,6 +5437,19 @@ fn terminal_chunk_has_visible_text(data: &str) -> bool {
     let (data, _) = terminal_data_without_attach_ready_markers(data);
     let stripped = strip_terminal_control_sequences(&data);
     stripped.chars().any(|ch| !ch.is_whitespace())
+}
+
+/// [11.138] The reader's activity-clock law, in one named place: a pty chunk
+/// moves `last_activity_ms`/`last_output_ms` only when it is session
+/// activity — not our own app-declare heartbeat (see
+/// [`crate::app_declare::chunk_is_only_app_declares`]) and not a content-free
+/// paint frame (synchronized-output brackets, cursor positioning, cursor
+/// shape — the ~305s metronome measured in docs/pending-bugs.md [11.138]).
+/// Printable bytes — working phrases, progress glyphs, box-drawing redraws —
+/// are text and stamp.
+fn reader_chunk_moves_activity_clocks(data: &str) -> bool {
+    !crate::app_declare::chunk_is_only_app_declares(data)
+        && terminal_chunk_has_visible_text(data)
 }
 
 pub fn terminal_data_has_scrollback_text(data: &str) -> bool {
@@ -10413,6 +10468,131 @@ line-two on the real screen\r\n\
             "kimi's region label must not anchor a marker-scoped guard"
         );
         let _ = manager.shutdown_all(|_key| None::<String>);
+    }
+
+
+    // ------------------------------------------------------------------
+    // [11.138] content-free paint frames must not restamp the clocks
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn content_free_paint_frames_do_not_restamp_the_activity_clocks() {
+        // The measured metronome frame: synchronized-output bracket + cursor
+        // positioning + cursor shape, zero printable bytes.
+        let metronome = "\x1b[?2026h\x1b[7;1H\x1b[2 q";
+        assert!(
+            !reader_chunk_moves_activity_clocks(metronome),
+            "a sync-bracket + cursor-twitch frame moves no clock"
+        );
+        for frame in ["\x1b[?2026h", "\x1b[2J\x1b[H", "\x1b[?25l\x1b[?12l"] {
+            assert!(
+                !reader_chunk_moves_activity_clocks(frame),
+                "content-free frame {frame:?} moves no clock"
+            );
+        }
+        // Printable progress glyphs and box-drawing redraws ARE text.
+        assert!(reader_chunk_moves_activity_clocks("working · working…"));
+        assert!(reader_chunk_moves_activity_clocks(
+            "\x1b[7;1H┃  Build auto · Muse Spark 1.3 Free"
+        ));
+        // Our own heartbeat stays carved out of both clocks.
+        let declare = "\x1b]7717;sidebar;declare;eyJhIjoxfQ==\x07";
+        assert!(!reader_chunk_moves_activity_clocks(declare));
+    }
+
+    #[test]
+    fn content_free_paint_frames_do_not_move_the_activity_clocks_on_a_real_pty() {
+        let gate1 = std::env::temp_dir().join(format!(
+            "yggterm-1138-gate1-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let gate2 = std::env::temp_dir().join(format!(
+            "yggterm-1138-gate2-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = std::fs::remove_file(&gate1);
+        let _ = std::fs::remove_file(&gate2);
+        let runtime = PtySessionRuntime::spawn(
+            "local://content-free-clock",
+            &format!(
+                "printf BASELINE; \
+                 while [ ! -f '{g1}' ]; do sleep 0.05; done; \
+                 printf '\\033[?2026h\\033[7;1H\\033[2 q'; \
+                 while [ ! -f '{g2}' ]; do sleep 0.05; done; \
+                 printf MORETEXT; sleep 600",
+                g1 = gate1.display(),
+                g2 = gate2.display()
+            ),
+            None,
+            Some((80, 24)),
+        )
+        .expect("spawn content-free clock test runtime");
+
+        let _ = wait_for_screen_snapshot(&runtime, "the baseline paint", |screen| {
+            screen.contains("BASELINE")
+        });
+        settle_pty_output(&runtime);
+        // Let the output age well past any slop before the frame arrives.
+        std::thread::sleep(Duration::from_millis(400));
+        let seq_before = runtime.screen_snapshot_key().output_seq;
+
+        std::fs::write(&gate1, b"go").expect("release the content-free frame");
+        for _ in 0..200 {
+            if runtime.screen_snapshot_key().output_seq > seq_before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            runtime.screen_snapshot_key().output_seq > seq_before,
+            "precondition: the frame reached the ring"
+        );
+        let output_age = runtime.output_idle_for_ms();
+        let idle_age = runtime.idle_for_ms();
+        assert!(
+            output_age >= 300,
+            "the content-free frame restamped last_output_ms (age {output_age}ms) — [11.138]'s metronome is back"
+        );
+        assert!(
+            idle_age >= 300,
+            "the content-free frame restamped last_activity_ms (age {idle_age}ms)"
+        );
+
+        std::fs::write(&gate2, b"go").expect("release the text paint");
+        let _ = wait_for_screen_snapshot(&runtime, "the text paint", |screen| {
+            screen.contains("MORETEXT")
+        });
+        let output_after = runtime.output_idle_for_ms();
+        assert!(
+            output_after <= 250,
+            "a text chunk must still stamp the output clock (age {output_after}ms)"
+        );
+
+        runtime.shutdown(None).expect("shutdown test runtime");
+        let _ = std::fs::remove_file(&gate1);
+        let _ = std::fs::remove_file(&gate2);
+    }
+
+    /// [11.138] probe (b): the observed keepalive carried `ESC[?2026h` with no
+    /// matching `2026l` in the same frame. If the daemon's vt100 honored
+    /// synchronized output by holding updates, a long-lived bracket would
+    /// freeze the served screen — the deaf-row family. vt100 0.16.2 has no
+    /// DECSET 2026 support at all, so the answer today is "the screen keeps
+    /// painting"; this lock makes any parser upgrade that GAINS synchronized
+    /// output re-answer the question here, loudly, before the deaf-row family
+    /// inherits a new stall mechanism unnoticed.
+    #[test]
+    fn the_daemon_vt100_does_not_hold_the_screen_behind_a_sync_bracket() {
+        let mut state = TerminalScreenState::new(24, 80);
+        state.process(b"\x1b[?2026h");
+        state.process(b"\x1b[7;1HDEAFPROBE");
+        let rendered = state.parser.screen().contents();
+        assert!(
+            rendered.contains("DEAFPROBE"),
+            "text behind an unmatched sync bracket must still paint — vt100 holds updates, the deaf-row stall has a new candidate mechanism"
+        );
     }
 
 }
