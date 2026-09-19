@@ -33089,6 +33089,62 @@ console.log('ok');
     }
 
     #[test]
+    fn the_close_retries_its_transport_but_never_a_named_refusal() {
+        // [11.154]: a close whose transport died mid-rotation is re-delivered
+        // onto the successor daemon on a bounded budget (1s/2s/4s); a daemon
+        // that ANSWERED has spoken and is never overridden.
+        assert_eq!(
+            remove_session_retry_delay_ms(&anyhow::anyhow!("reading daemon response"), 1),
+            Some(1_000)
+        );
+        assert_eq!(
+            remove_session_retry_delay_ms(&anyhow::anyhow!("reading daemon response"), 2),
+            Some(2_000)
+        );
+        assert_eq!(
+            remove_session_retry_delay_ms(&anyhow::anyhow!("reading daemon response"), 3),
+            Some(4_000)
+        );
+        assert_eq!(
+            remove_session_retry_delay_ms(&anyhow::anyhow!("reading daemon response"), 4),
+            None,
+            "the budget is bounded — a dead endpoint must not burn forever"
+        );
+        assert_eq!(
+            remove_session_retry_delay_ms(
+                &anyhow::anyhow!("session remove for local://x was not verified: pending_draft"),
+                1
+            ),
+            None,
+            "an answered verdict is not a delivery failure"
+        );
+        assert_eq!(
+            remove_session_retry_delay_ms(&anyhow::anyhow!("refused to despawn local://x"), 1),
+            None,
+            "a named refusal is the daemon speaking, not a lost letter"
+        );
+    }
+
+    #[test]
+    fn the_remove_session_arm_re_delivers_through_the_retry_loop() {
+        // The budget must be WIRED into the app-control close closure, not
+        // merely defined — the 2026-09-19 close was lost with exactly one
+        // transport error and nothing retried it.
+        let source = include_str!("state.rs");
+        let arm = source
+            .find("AppControlCommand::RemoveSession { session_path } => {")
+            .expect("the app-control close arm must exist");
+        let closure = &source[arm..];
+        let budget = closure
+            .find("remove_session_retry_delay_ms(&error, attempt)")
+            .expect("the close closure must consult the re-delivery budget");
+        assert!(
+            closure[..budget].contains("loop {"),
+            "the budget must sit inside a re-delivery loop over remove_session"
+        );
+    }
+
+    #[test]
     fn app_control_remove_session_uses_live_close_fallback_contract() {
         let previous_path = "local://previous-shell";
         let active_path = "local://closing-shell";

@@ -84071,6 +84071,29 @@ async fn dom_eval_for_app_control(script: &str) -> Value {
         Err(_) => json!({ "error": "dom_eval_timeout" }),
     }
 }
+/// The bounded re-delivery budget for a user close whose transport died —
+/// the [11.154] mid-rotation close-loss class. `None` means give up: either
+/// the budget is spent or the failure is not a delivery failure. Delays are
+/// 1s/2s/4s — inside the same-version swap gap the boot-readiness gate
+/// (DAEMON_READY_TO_SEAT) closes in, never a burn against a live daemon.
+fn remove_session_retry_delay_ms(error: &anyhow::Error, attempt: u32) -> Option<u64> {
+    if attempt > 3 {
+        return None;
+    }
+    let rendered = format!("{error:#}");
+    // A daemon that ANSWERED spoke: its verdict (a named refusal, an
+    // unverified teardown) is not a delivery failure and a retry would be
+    // overriding it.
+    if rendered.contains("was not verified") || rendered.contains("refused") {
+        return None;
+    }
+    Some(match attempt {
+        1 => 1_000,
+        2 => 2_000,
+        _ => 4_000,
+    })
+}
+
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -88328,8 +88351,34 @@ async fn process_pending_app_control_requests(
                     "app_control_remove_session",
                     &home,
                     move || {
-                        let (mut snapshot, message) =
-                            remove_session(&endpoint, &session_path_for_task, false)?;
+                        // ⛔ THE [11.154] CLOSE RE-DELIVERY. A close issued while
+                        // the daemon is mid-rotation dies with ONE transport
+                        // error ("reading daemon response", measured
+                        // 2026-09-19 19:17:43) and the close is LOST — no local
+                        // tombstone, no removal, and every later restore or
+                        // client-handshake birth lawfully re-births the row.
+                        // A close is a deliberate user act, so transport-class
+                        // failures are re-delivered onto the successor daemon
+                        // with a bounded budget; the tombstone the successor
+                        // writes first is the shared file that outlives it. An
+                        // ANSWERED request is never retried — the daemon spoke.
+                        let mut attempt: u32 = 0;
+                        let (mut snapshot, message) = loop {
+                            match remove_session(&endpoint, &session_path_for_task, false) {
+                                Ok(answered) => break answered,
+                                Err(error) => {
+                                    attempt += 1;
+                                    let Some(delay_ms) =
+                                        remove_session_retry_delay_ms(&error, attempt)
+                                    else {
+                                        return Err(error);
+                                    };
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        delay_ms,
+                                    ));
+                                }
+                            }
+                        };
                         let mut redirect_error = None::<String>;
                         if let Some(target) = close_redirect_target_for_task.as_ref()
                             && let Some(sync_result) =

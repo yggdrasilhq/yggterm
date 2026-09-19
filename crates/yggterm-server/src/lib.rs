@@ -6389,10 +6389,13 @@ impl YggtermServer {
                     "detail": "the user closed this row; the held runtime does not resurrect it",
                 }),
             );
-            return None;
             // The refusal re-arms the grave — the sweep runs forever, so an
             // un-re-armed veto would age out and the next tick would be the
-            // lawful-looking resurrection (2026-09-19 class).
+            // lawful-looking resurrection (2026-09-19 class). ⛔ [11.154]
+            // ride-along: the re-arm was landed AFTER the return — dead on
+            // arrival — so this door refused without re-arming and an
+            // eternal offerer could wait the veto out. It precedes the
+            // return now.
             crate::rearm_live_row_closes_among(home, [runtime_key]);
             return None;
         }
@@ -14111,6 +14114,33 @@ impl YggtermServer {
         activate: bool,
         launch: &AgentLaunchOptions,
     ) {
+        // ⛔ THE [11.154] BIRTH VETO. A PASSIVE birth (`launch_now == false` —
+        // a rotation restore, a client-handshake re-birth, a scanned-session
+        // re-open) must not resurrect a row the user CLOSED. The tombstone
+        // plane is the machine-wide record of that close, and every OTHER
+        // door asks it — the persisted restore, the recovery sweep, the
+        // import admission — but this chokepoint never did, so the
+        // 2026-09-19 19:39:24 client-handshake birth walked the row straight
+        // back in against a dead peer. A user-driven start
+        // (`launch_now == true`) is a DELIBERATE re-entry: it inserts, and
+        // the persist reconcile lifts the stale veto on the row now living.
+        if !launch_now
+            && let Ok(home) = resolve_yggterm_home()
+            && !crate::live_row_closes_remembered_among(home.as_path(), [key]).is_empty()
+        {
+            append_trace_event(
+                &home,
+                "server",
+                "session",
+                "live_session_birth_vetoed_closed_row",
+                serde_json::json!({
+                    "key": key,
+                    "kind": format!("{kind:?}"),
+                    "detail": "the user closed this row; a passive birth does not resurrect it",
+                }),
+            );
+            return;
+        }
         let mut session = build_live_session_with_launch_options(
             session_id,
             kind,
@@ -36780,6 +36810,67 @@ mod tests {
     /// verdict is the confident no; the ensure funnel must spend it, and the
     /// spend must sit before the elide so a refused launch never reaches the
     /// resume command.
+    /// [11.154]: the ONE birth chokepoint is the door every passive birth
+    /// walks through — rotation restores, client-handshake re-births,
+    /// scanned-session re-opens. The persisted restore, the recovery sweep
+    /// and the import admission all ask the tombstone plane; this door never
+    /// did, and the 2026-09-19 19:39:24 client-handshake birth walked the
+    /// user's closed row straight back in against a dead peer. The consult
+    /// must sit BEFORE the session build (a vetoed birth never builds), must
+    /// gate PASSIVE births only (a user-driven start is a deliberate
+    /// re-entry whose persist reconcile lifts the veto), and must refuse by
+    /// name.
+    #[test]
+    fn the_passive_birth_chokepoint_asks_the_tombstone_plane() {
+        let source = include_str!("lib.rs");
+        let chokepoint = source
+            .find("fn insert_live_session_with_launch_options")
+            .expect("the one birth chokepoint must exist");
+        let build = source[chokepoint..]
+            .find("build_live_session_with_launch_options(")
+            .expect("the chokepoint must build the session");
+        let head = &source[chokepoint..chokepoint + build];
+        assert!(
+            head.contains("!launch_now"),
+            "the veto gates PASSIVE births only — a user-driven start is a \
+             deliberate re-entry and the persist reconcile lifts its veto"
+        );
+        assert!(
+            head.contains("live_row_closes_remembered_among"),
+            "the birth door must consult the tombstone plane — a close must \
+             hold through restores and client-handshake births"
+        );
+        assert!(
+            head.contains("live_session_birth_vetoed_closed_row"),
+            "a refused birth must be a named trace, not a silence"
+        );
+    }
+
+    /// [11.154] ride-along: the tombstone-rearm lane landed the recovery
+    /// sweep's re-arm AFTER its `return None` — dead on arrival — so the
+    /// door refused without re-arming and an eternal offerer could wait the
+    /// veto out (the scheduled-resurrection class the re-arm exists for).
+    /// The re-arm must precede the return it belongs to.
+    #[test]
+    fn the_recovery_sweep_rearm_precedes_its_return() {
+        let source = include_str!("lib.rs");
+        let door = source
+            .find("\"recovery_vetoed_closed_row\"")
+            .expect("the recovery veto trace must exist");
+        let tail = &source[door..];
+        let rearm = tail
+            .find("crate::rearm_live_row_closes_among")
+            .expect("the recovery door must re-arm the close");
+        let give_up = tail
+            .find("return None;")
+            .expect("the vetoed recovery must not restore");
+        assert!(
+            rearm < give_up,
+            "the re-arm must run BEFORE the door gives up — dead code after a \
+             return is a comment lying about what the door does"
+        );
+    }
+
     #[test]
     fn a_confident_peer_missing_verdict_refuses_the_saved_session_relaunch() {
         let source = include_str!("daemon.rs");
