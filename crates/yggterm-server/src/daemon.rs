@@ -13365,7 +13365,14 @@ impl DaemonRuntime {
                 // the owner answer. `Some(false)` and `None` both proceed:
                 // refusing on "unknown" would make every proxied row
                 // unbootable, which on the GUI host is all of them.
+                // ⛔ [11.144] The refusal's own remedy must stay executable.
+                // The detail text says "Clear the row's input (or send an empty
+                // write first) and resend" — and the guard refused both, so no
+                // app-control path could recover a draft-holding row. The
+                // remedy payloads (empty, or a pure Ctrl+U clear) proceed; the
+                // helper's doc carries the line the carve-out will not cross.
                 if refuse_if_draft
+                    && !terminal_write_is_draft_remedy(&data)
                     && self.terminals.session_composer_holds_draft(
                         &runtime_path,
                         self.server.live_session_kind(&runtime_path),
@@ -22232,6 +22239,20 @@ pub fn terminal_write_was_refused_for_draft(message: Option<&str>) -> bool {
 /// Was this write refused because the row is parked on its CLI's startup gate?
 pub fn terminal_write_was_refused_for_startup_gate(message: Option<&str>) -> bool {
     message.is_some_and(|message| message.starts_with(STARTUP_GATE_REFUSAL_MESSAGE))
+}
+
+/// Is this payload the draft refusal's OWN remedy — a write that can only
+/// clear the row's input, never type over it? [11.144]: the refusal's detail
+/// text prescribes "Clear the row's input (or send an empty write first) and
+/// resend", and the guard refused every payload on a draft-holding row,
+/// including the empty write and the Ctrl+U its own text names. An empty write
+/// delivers no bytes; a payload composed solely of Ctrl+U can only clear the
+/// line. Both proceed. ⛔ Backspaces and other erasers stay refused: a \u{7f}
+/// run can silently eat the tail of a person's sentence — exactly the clobber
+/// the guard exists to prevent — and Ctrl+U is the canonical full clear the
+/// refusal text itself names.
+pub fn terminal_write_is_draft_remedy(data: &str) -> bool {
+    data.is_empty() || data.chars().all(|ch| ch == '\u{15}')
 }
 
 pub fn terminal_resize(
@@ -31769,6 +31790,30 @@ mod tests {
         assert!(
             !rendered.contains("abc123def456"),
             "the column must not be showing a constant: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_draft_refusals_own_remedy_is_not_refused_by_it() {
+        use super::terminal_write_is_draft_remedy as remedy;
+        // [11.144] the deadlock: the refusal text prescribed "clear the row's
+        // input (or send an empty write first)" while the guard refused both —
+        // no app-control path could recover the row.
+        assert!(remedy(""), "an empty write delivers nothing and must proceed");
+        assert!(remedy("\u{15}"), "Ctrl+U is the prescribed clear");
+        assert!(
+            remedy("\u{15}\u{15}\u{15}"),
+            "a repeated Ctrl+U is still only a clear"
+        );
+        assert!(!remedy("Z"), "typing over the sentence stays refused");
+        assert!(!remedy(" \u{15}"), "a space TYPES before it clears — not a remedy");
+        assert!(
+            !remedy("\u{7f}"),
+            "backspace runs can silently eat a sentence's tail; Ctrl+U is the remedy"
+        );
+        assert!(
+            !remedy("\u{15}\u{7f}"),
+            "mixed clear+backspace stays guarded — only the pure clear proceeds"
         );
     }
 
