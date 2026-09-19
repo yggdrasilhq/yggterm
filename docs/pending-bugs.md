@@ -31494,31 +31494,6 @@ frame reaches the ring while both clocks stand still; the next text chunk
 stamps) + the probe, 3 green. LIVE PROOF of both this residual and the
 screen-qualified verdict rides the next rotation.
 
-## ⛔ [11.146] A DAEMON RUNNING THE CURRENT BUILD FROM AN UNLISTED INSTALL ROOT IS FLAGGED STALE BY EVERY CLIENT FOREVER — THE STALE VERDICT COMPARED INSTALL PATHS WHILE IGNORING THE BUILD ID IT WAS ALREADY LOGGING (filed 2026-09-19, owner screenshot)
-
-**Status:** OPEN
-
-Measured 2026-09-19 on the build host: the 09:33 deploy hot-restarted the
-daemon; at 10:50:29 it idle-shutdown (see [11.147]); the 11:02:58 recovery
-spawn won the bind from the direct-store builds root — same version, same
-build id, an exe path the allowlist roster (current exe + headless
-companion + the two managed bin roots) does not carry. Every client
-boot-wait then logged `stale_daemon_binary_detected` and IGNORED the live
-daemon: 994 flags in 5 minutes, each invocation burning the spawn lock on
-a competitor that lost the bind (`bind_lock_busy` churn 11:03→11:13+),
-and row starts racing the contention answered `Error: local yggterm
-daemon did not become reachable` — the owner's dev·remote codex and
-zcode-tui rows. Third instance of the root-roster class (two roots
-patched before; a roster can never be the SSOT of same-bits). FIX
-(lane/integration/stale-buildid): `local_daemon_binary_current_problem`
-accepts build-identity first — reported `server_build_id` equal to the
-client's own `current_build_id()` plus an exe-size witness, hence
-current whatever the root; the path roster stays for genuinely different
-builds. Locked by `same_build_identity_daemon_is_current_from_any_install_root`
-(own pid = foreign root, same build id accepted; a /bin/sleep child at an
-unknown root with a foreign build id refused). Delete this entry per the
-verified-fix law once the rotated build has lived through a recovery.
-
 ## ⛔ [11.147] THE 90s IDLE-SHUTDOWN DEFAULT RETIRES A ROW-FLEET HOST'S DAEMON WHILE KEEP-ALIVE ROWS ARE REGISTERED — MISSING_RUNTIME ROWS BLOCK NOTHING, AND THE HOST SITS DARK UNTIL SOMETHING NEEDS IT (filed 2026-09-19, owner screenshot)
 
 **Status:** OPEN
