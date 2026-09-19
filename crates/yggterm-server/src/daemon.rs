@@ -5631,6 +5631,11 @@ pub(crate) struct DaemonRuntime {
     pending_remote_pty_resizes:
         Arc<Mutex<HashMap<String, (RemoteMachineRef, String, SessionKind, u16, u16)>>>,
     remote_pty_resize_in_flight: Arc<Mutex<HashSet<String>>>,
+    /// The [11.153] doomed respawn loop's memory: the remote PTY resize
+    /// forward's CONFIDENT "terminal session not found" verdict records here,
+    /// and the saved-session ensure funnel refuses to elide the next resume
+    /// into the same dead end while the verdict is fresh.
+    peer_runtime_missing: Arc<Mutex<HashMap<String, PeerRuntimeMissingVerdict>>>,
     /// Content gate for the routine persist paths — see
     /// [`write_persisted_state_if_changed`]. `None` until this daemon has
     /// written the file once, so the first persist of a process always writes.
@@ -5813,6 +5818,7 @@ impl DaemonRuntime {
             superseded_routine_persist_muted: false,
             pending_remote_pty_resizes: Arc::new(Mutex::new(HashMap::new())),
             remote_pty_resize_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            peer_runtime_missing: Arc::new(Mutex::new(HashMap::new())),
             last_persisted_state: None,
         };
         // Baseline, not an observation: rows restored at boot have not "come
@@ -9146,6 +9152,7 @@ impl DaemonRuntime {
         }
         let pending = Arc::clone(&self.pending_remote_pty_resizes);
         let in_flight = Arc::clone(&self.remote_pty_resize_in_flight);
+        let peer_runtime_missing = Arc::clone(&self.peer_runtime_missing);
         let home = self.store.home_dir().to_path_buf();
         let worker_path = path.to_string();
         let spawn_result = std::thread::Builder::new()
@@ -9277,6 +9284,25 @@ impl DaemonRuntime {
                                     "not_found_retries": not_found_retries,
                                 }),
                             );
+                            // THE VERDICT FEEDS THE MOUNT (the [11.153]
+                            // doomed respawn loop): the peer said, past every
+                            // retry, that this runtime key is gone. Record
+                            // the confident no so the saved-session ensure
+                            // funnel refuses the next resume instead of
+                            // spawning into the same dead end.
+                            let now = std::time::Instant::now();
+                            let mut memo = peer_runtime_missing
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let verdict = memo.entry(path.clone()).or_insert_with(
+                                || PeerRuntimeMissingVerdict {
+                                    first_verdict_at: now,
+                                    last_verdict_at: now,
+                                    error: error_text.clone(),
+                                },
+                            );
+                            verdict.last_verdict_at = now;
+                            verdict.error = error_text.clone();
                         }
                     }
                 }
@@ -10114,6 +10140,60 @@ impl DaemonRuntime {
                 );
             }
             let _ = self.persist_state_only();
+        }
+        // ⛔ THE [11.153] GATE. A saved remote session whose owning host has
+        // CONFIRMED the runtime key gone (the resize forward's exhausted
+        // "terminal session not found") must not be resumed again on the next
+        // ensure: the resume command owns the missing-session failure, so
+        // every ensure spawned `resume-… --require-existing` into the same
+        // dead end, the row read running·idle, and the viewport sat at the
+        // placeholder banner. Spend the memo instead: refuse, name the state
+        // in the row itself, and let the window expire so a peer-side
+        // restore can heal the row.
+        if path.starts_with("remote-session://") {
+            let peer_missing_error = {
+                let mut memo = self
+                    .peer_runtime_missing
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match memo.get(path) {
+                    Some(verdict) if verdict.last_verdict_at.elapsed()
+                        <= REMOTE_PEER_MISSING_REFUSE_WINDOW =>
+                    {
+                        Some(verdict.error.clone())
+                    }
+                    Some(_) => {
+                        memo.remove(path);
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(error) = peer_missing_error {
+                let refusal = format!(
+                    "peer session gone — the owning host reports this runtime \
+                     missing ({error}); closed there? Re-open the row to start \
+                     a fresh session."
+                );
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "remote_saved_session_launch_refused_peer_missing",
+                        serde_json::json!({
+                            "path": path,
+                            "peer_error": error,
+                            "refuse_window_secs":
+                                REMOTE_PEER_MISSING_REFUSE_WINDOW.as_secs(),
+                        }),
+                    );
+                }
+                self.server
+                    .record_launch_refusal_for_path(path, &refusal, "peer session gone");
+                let _ = self.persist_state_only();
+                bail!("{refusal}");
+            }
         }
         if path.starts_with("remote-session://")
             && let Ok(home) = crate::resolve_yggterm_home()
@@ -29685,6 +29765,25 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
 /// flight, so "not found" is retried a few times rather than dropped.
 const REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES: u32 = 5;
 const REMOTE_PTY_RESIZE_NOT_FOUND_RETRY_DELAY_MS: u64 = 2_000;
+
+/// A remote owning-host daemon answered, past every bounded retry, that this
+/// row's runtime key does not exist there ("terminal session not found") —
+/// the confident no the [11.153] ensure gate spends.
+#[derive(Debug, Clone)]
+struct PeerRuntimeMissingVerdict {
+    first_verdict_at: std::time::Instant,
+    last_verdict_at: std::time::Instant,
+    error: String,
+}
+
+/// How long a confident peer-missing verdict gates the saved-session
+/// relaunch. The steady state under a permanently missing peer is ONE doomed
+/// spawn per window: the window expires, the next ensure tries the resume
+/// again (a peer-side restore CAN re-create the runtime key under the same
+/// id), and a still-missing peer re-arms the memo within seconds through the
+/// resize forward's own retries.
+const REMOTE_PEER_MISSING_REFUSE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalWriteStrategy {
