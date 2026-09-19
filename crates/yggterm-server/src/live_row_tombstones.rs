@@ -27,6 +27,19 @@
 //! [`MAX_TOMBSTONES`] (oldest evicted first), and any row that legitimately
 //! re-enters the live order clears its own tombstone through the
 //! reconcile chokepoint in `daemon::persist`.
+
+//!
+//! Expiry is the end for a QUIET close — but not for one an offerer keeps
+//! contesting. An eternal offerer (a daemonized opencode serve re-projecting
+//! every session its store holds, every mirror tick) would turn the TTL into
+//! a scheduled resurrection: measured 2026-09-19 19:34 IST on the muse lab
+//! host, the 09-16 ghost despawns' tombstones expired at the same
+//! wall-clock minute and six rows walked back in through the lawful
+//! restore/import doors, rearranging the owner's Live pane. So a door that
+//! just REFUSED a row on this plane re-arms the close at the half-life
+//! ([`LiveRowTombstones::touch_close`], wired at every veto door through
+//! [`crate::rearm_live_row_closes_among`]). A close nobody contests still
+//! expires from its original timestamp; a user re-entry still clears it.
 //!
 //! # The file has N writers, so nothing here may write a private snapshot
 //!
@@ -68,6 +81,19 @@ const LOCK_RETRY_SLEEP_MS: u64 = 5;
 /// caused the resurrection (peers linger for hours, not days), short enough
 /// that a row the user closed last week is not un-addable today.
 pub const TOMBSTONE_TTL_SECS: u64 = 3 * 24 * 60 * 60;
+
+/// A vetoed automatic offer re-arms the close once it is this old (half the
+/// TTL). Renewal exists because some offerers are ETERNAL: a daemonized
+/// opencode `serve --service` re-projects every session its store holds on
+/// every mirror tick, forever, so a bare 3-day tombstone against it is a
+/// scheduled resurrection — jojo 2026-09-19 19:34 IST, the 09-16 ghost
+/// despawns' tombstones expired at the same wall-clock minute and six rows
+/// walked back in through the lawful restore/import doors. Renewing at
+/// half-life keeps writes rare (one per half-age per refused row, not one per
+/// mirror tick) while a continuously-offered row can never reach
+/// [`TOMBSTONE_TTL_SECS`]. A quiet close still expires from the ORIGINAL
+/// timestamp; a user re-entry still clears through the reconcile chokepoint.
+pub(crate) const TOMBSTONE_RENEWAL_AGE_SECS: u64 = TOMBSTONE_TTL_SECS / 2;
 
 /// Hard cap on remembered closes. Oldest recorded entries are evicted first.
 pub const MAX_TOMBSTONES: usize = 512;
@@ -292,6 +318,33 @@ impl LiveRowTombstones {
     pub fn record_close(&mut self, home_dir: &Path, identity: &str, now: u64) -> Result<bool> {
         self.mutate_shared(home_dir, |shared| {
             shared.record(identity, now);
+        })
+    }
+
+    /// Re-arm a close that just REFUSED an automatic offer — the write-side
+    /// twin of the read door [`crate::live_row_closes_remembered_among`].
+    /// [`Self::record_close`] deliberately never refreshes (the original
+    /// timestamp is what makes the TTL a real expiry), and that stays right
+    /// for the row itself; this moves the timestamp forward only once the
+    /// entry is past [`TOMBSTONE_RENEWAL_AGE_SECS`], so an offerer that keeps
+    /// pushing the row back cannot wait out the grave. An EXPIRED entry cannot
+    /// be re-armed by a late offer — expiry is the designed end, and a load
+    /// has already gc'd it, so this is a no-op there, never a resurrection of
+    /// the record.
+    pub fn touch_close(&mut self, home_dir: &Path, identity: &str, now: u64) -> Result<bool> {
+        self.mutate_shared(home_dir, |shared| {
+            if let Some(recorded) = shared.entries.get_mut(identity) {
+                if Self::expired(*recorded, now) {
+                    // An expired close cannot be re-armed by a late offer:
+                    // expiry is the designed end. The shared file can still
+                    // hold what a fresh load would have gc'd — drop it here,
+                    // so the file converges to the gc'd view instead of the
+                    // touch reviving a dead record.
+                    shared.entries.remove(identity);
+                } else if now.saturating_sub(*recorded) >= TOMBSTONE_RENEWAL_AGE_SECS {
+                    *recorded = now;
+                }
+            }
         })
     }
 
@@ -622,6 +675,114 @@ mod tests {
         assert!(tombstones.clear("id::row"));
         assert!(!tombstones.blocks("id::row", 10));
         assert!(!tombstones.clear("id::row"));
+    }
+
+    /// THE 2026-09-19 LAW: a close an offerer keeps contesting must not be
+    /// wait-out-able. The original-timestamp rule in `record` makes the TTL a
+    /// real expiry for a QUIET close; `touch_close` re-arms one that just
+    /// refused an offer, at the half-life, so an eternal offerer (an opencode
+    /// serve's store, re-projected every mirror tick) cannot hold a countdown
+    /// against the user's close. Measured live: the 09-16 ghost despawns'
+    /// tombstones expired at 19:34 and the six rows walked back in within
+    /// seconds, offers still standing every ~26 s.
+    #[test]
+    fn a_contested_close_rearms_at_the_half_life_and_a_quiet_one_expires() {
+        let dir =
+            std::env::temp_dir().join(format!("yggterm-tombstone-rearm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let half = TOMBSTONE_TTL_SECS / 2;
+
+        // The contested close: refused at the half-life, re-armed, and still
+        // blocking well past where the ORIGINAL timestamp would have expired.
+        let mut contested = LiveRowTombstones::default();
+        contested.record("id::row", 0);
+        contested.save(&dir).expect("save");
+        let mut rearmed = LiveRowTombstones::load(&dir, half);
+        assert!(rearmed.blocks("id::row", half), "the refusal fires first");
+        assert!(
+            rearmed.touch_close(&dir, "id::row", half).expect("rearm writes"),
+            "a touch past the renewal age is a real change"
+        );
+        assert!(
+            rearmed.blocks("id::row", TOMBSTONE_TTL_SECS + half - 1),
+            "the renewal restarted the countdown: alive past the original horizon"
+        );
+        // The quiet control: same original close, no offers, long dead.
+        let mut quiet = LiveRowTombstones::default();
+        quiet.record("id::row", 0);
+        assert!(
+            !quiet.blocks("id::row", TOMBSTONE_TTL_SECS + half - 1),
+            "without renewal the close expires from its original timestamp"
+        );
+
+        // Below the renewal age a touch changes nothing and writes nothing:
+        // mirror ticks must not churn the shared file.
+        let mut young = LiveRowTombstones::default();
+        young.record("id::row", 10);
+        young.save(&dir).expect("save");
+        let mut fresh = LiveRowTombstones::load(&dir, 10);
+        assert!(
+            !fresh
+                .touch_close(&dir, "id::row", 10 + 60)
+                .expect("young touch is a no-op"),
+            "below the renewal age there is nothing to re-arm"
+        );
+        assert_eq!(
+            fresh.entries.get("id::row"),
+            Some(&10),
+            "the original close timestamp is untouched below the renewal age"
+        );
+
+        // An EXPIRED close cannot be re-armed by a late offer — expiry is the
+        // designed end, and a fresh load has already gc'd the entry.
+        let mut expired = LiveRowTombstones::default();
+        expired.record("id::row", 0);
+        expired.save(&dir).expect("save");
+        let mut gone = LiveRowTombstones::load(&dir, TOMBSTONE_TTL_SECS + 1);
+        assert!(!gone.blocks("id::row", TOMBSTONE_TTL_SECS + 1));
+        assert!(
+            gone.touch_close(&dir, "id::row", TOMBSTONE_TTL_SECS + 1)
+                .expect("expired touch converges the file"),
+            "dropping the dead record IS the change — not a renewal"
+        );
+        assert!(
+            gone.entries.get("id::row").is_none(),
+            "a late offer must not resurrect the record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every door that refuses a birth on this plane must re-arm the close it
+    /// just refused — the re-arm is what makes the TTL compatible with eternal
+    /// offerers. Source-scan lock: the wiring is one call at each veto site,
+    /// and a site that loses it silently reintroduces the 2026-09-19
+    /// scheduled resurrection.
+    #[test]
+    fn every_tombstone_veto_door_rearms_the_close_it_refused() {
+        let mirror = include_str!("opencode_mirror.rs");
+        let lib = include_str!("lib.rs");
+        let daemon = include_str!("daemon.rs");
+        let needle = "rearm_live_row_closes_among(";
+        assert!(
+            mirror.matches(needle).count() >= 1,
+            "the opencode mirror veto must re-arm the graves it refuses — it is              the eternal offerer behind the 2026-09-19 resurrection"
+        );
+        assert!(
+            lib.contains("fn rearm_live_row_closes_among"),
+            "the shared re-arm door must exist in lib.rs beside the read door"
+        );
+        assert!(
+            lib.matches(needle).count() >= 2,
+            "lib.rs carries the batch-restore and the recovery-sweep veto call sites"
+        );
+        assert!(
+            daemon.matches(needle).count() >= 2,
+            "both cross-daemon import callers (B4 adoption + superseded              takeover) must re-arm what they refuse"
+        );
+        assert!(
+            lib.contains("touch_close("),
+            "the re-arm must go through the shared RMW door, never a private              snapshot write"
+        );
     }
 
     #[test]

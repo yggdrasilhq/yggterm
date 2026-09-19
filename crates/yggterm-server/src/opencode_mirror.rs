@@ -564,6 +564,11 @@ impl YggtermServer {
                 plan.spawn.retain(|ses| {
                     !vetoed.contains(&format!("opencode-runtime://{}", ses.id))
                 });
+                // The refusal re-arms the grave (see
+                // LiveRowTombstones::touch_close): this mirror is an eternal
+                // offerer on behalf of daemonized serves, so the veto must not
+                // age out while the offers keep standing.
+                crate::rearm_live_row_closes_among(&home_dir, vetoed.iter().map(String::as_str));
                 yggterm_core::append_trace_event(
                     &home_dir,
                     "daemon",

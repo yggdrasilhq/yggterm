@@ -8488,6 +8488,17 @@ impl DaemonRuntime {
             // plain shell's row dies the moment the rescuer retires.
             let advertised =
                 peer_live_rows_marked_as_rescued(&owner_status.live_terminal_sessions, &owned);
+            // Offers this walk refuses on the tombstone plane re-arm their
+            // closes: the peer advertises forever, so the veto must not age
+            // out while the offers keep standing (2026-09-19 class).
+            // touch_close no-ops for anything not already remembered, so
+            // handing it the whole offered set is safe.
+            if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                crate::rearm_live_row_closes_among(
+                    &home_dir,
+                    advertised.iter().map(|live| live.key.as_str()),
+                );
+            }
             let adopted = self
                 .server
                 .import_peer_live_rows_in_order(&advertised, |live| {
@@ -8958,6 +8969,14 @@ impl DaemonRuntime {
                 .map(|key| crate::normalized_live_row_identity(key))
                 .collect();
             let tombstones = &self.live_row_tombstones;
+            // Same re-arm as the B4 adoption walk below/above: a refused
+            // offer re-arms the close it tripped (2026-09-19 class).
+            if let Ok(home_dir) = crate::resolve_yggterm_home() {
+                crate::rearm_live_row_closes_among(
+                    &home_dir,
+                    saved.live_sessions.iter().map(|live| live.key.as_str()),
+                );
+            }
             imported_keys.extend(self.server.import_peer_live_rows_in_order(
                 &saved.live_sessions,
                 |live| {
