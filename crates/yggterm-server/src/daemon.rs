@@ -6013,6 +6013,7 @@ impl DaemonRuntime {
         // the budget bounds that.
         let mut boot_retry_deadline = None::<std::time::Instant>;
         for key in keys {
+            let mut self_dial_attempts = 0usize;
             let Some(takeout) = self.terminals.handoff_takeout(&key) else {
                 first_failure =
                     first_failure.or(Some(format!("{key}: no live runtime to take")));
@@ -6042,6 +6043,30 @@ impl DaemonRuntime {
                 ) {
                     sent @ Ok(_) => break sent,
                     Err(error) => {
+                        // ⛔ [11.152] A SELF-DIAL answered by name: the connect
+                        // looped back to our own listener (the same-version
+                        // rebind race). The fd never moved — retry the CONNECT
+                        // toward the real successor, briefly: by the second
+                        // attempt the successor's rebind has long landed.
+                        if !error.committed
+                            && crate::pty_handoff::verdict_is_self_dial(&error.message)
+                            && self_dial_attempts < SELF_DIAL_RETRY_ATTEMPTS
+                        {
+                            self_dial_attempts += 1;
+                            append_trace_event(
+                                &self.store.home_dir(),
+                                "daemon",
+                                "lifecycle",
+                                "pty_fd_handoff_self_dial_retry",
+                                serde_json::json!({
+                                    "runtime_key": key,
+                                    "successor_version": successor_version,
+                                    "attempt": self_dial_attempts,
+                                }),
+                            );
+                            std::thread::sleep(SELF_DIAL_RETRY_PAUSE);
+                            continue;
+                        }
                         let boot_refusal = !error.committed
                             && crate::pty_handoff::verdict_is_boot_refusal(&error.message);
                         if !boot_refusal {
@@ -19297,6 +19322,16 @@ const BOOT_REFUSAL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from
 #[cfg(any(target_os = "linux", test))]
 const BOOT_REFUSAL_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How many times ONE key's send may retry after a self-dial refusal
+/// ([11.152]): the same-version rebind race resolves within one successor
+/// boot, so three short tries are generous.
+#[cfg(any(target_os = "linux", test))]
+const SELF_DIAL_RETRY_ATTEMPTS: usize = 3;
+
+/// The pause between self-dial retries.
+#[cfg(any(target_os = "linux", test))]
+const SELF_DIAL_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// The version the fd-handoff sweep should knock on.
 ///
 /// A successor that was ALREADY live at prepare time wins (the probe's
@@ -19934,6 +19969,35 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
+                // ⛔ [11.152] THE SELF-DIAL REFUSAL, BEFORE ANYTHING SERVES.
+                // On a same-version spawn arm the successor rebinds the shared
+                // pty-handoff path ~200 ms into ITS boot, and the
+                // predecessor's sweep can dial the path while it still points
+                // at OUR OWN listener. Serving ourselves deadlocks — the seat
+                // closure needs the runtime lock the sweep's request thread
+                // holds — and the measured shape was a silent 13 s stall with
+                // the fd parked in the socket buffer. Peer credentials, not
+                // the path, decide; a self-pid peer gets a NAMED pre-commit
+                // refusal so the predecessor can retry toward the real
+                // successor instead of burning its ack timeout.
+                if crate::pty_handoff::handoff_peer_is_self(&stream) {
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "pty_handoff_self_dial_refused",
+                        serde_json::json!({
+                            "pid": std::process::id(),
+                        }),
+                    );
+                    let _ = crate::pty_handoff::send_verdict(
+                        &stream,
+                        &crate::pty_handoff::HandoffVerdict::refused(
+                            crate::pty_handoff::SELF_DIAL_MARKER.to_string(),
+                        ),
+                    );
+                    continue;
+                }
                 // ⭐⭐ THE SEAT DECISION MOVES AHEAD OF THE DESCRIPTOR.
                 //
                 // The metadata line carries the entire input to the decision —
@@ -30683,6 +30747,32 @@ mod tests {
         assert!(
             reconcile < ready,
             "readiness must be declared AFTER the deep reconcile, not before"
+        );
+    }
+
+    /// ⛔ [11.152] THE ACCEPT LOOP MUST REFUSE A SELF-DIAL BEFORE SERVING IT.
+    /// A daemon that serves its own sweep connection deadlocks on its own
+    /// runtime lock — the measured 13 s silent stall. The peer check must sit
+    /// ahead of `serve_handoff` in the accept loop, and the refusal must be
+    /// traced by name.
+    #[test]
+    fn the_handoff_accept_loop_refuses_a_self_dial_before_serving_it() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(&source, "fn spawn_pty_handoff_listener(");
+        let self_check = body
+            .find("handoff_peer_is_self(&stream)")
+            .expect("the accept loop must ask whether the peer is this very process");
+        let serve = body
+            .find("serve_handoff(")
+            .expect("the handoff serve call is gone");
+        assert!(
+            self_check < serve,
+            "the self-dial check must answer BEFORE serve_handoff — behind it the \
+             serve thread deadlocks on the lock the sweep holds"
+        );
+        assert!(
+            body.contains("pty_handoff_self_dial_refused"),
+            "the self-dial refusal must be traced by name (§9 observability contract)"
         );
     }
 

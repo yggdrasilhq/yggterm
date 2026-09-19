@@ -508,6 +508,55 @@ pub(crate) fn verdict_is_boot_refusal(message: &str) -> bool {
     message.contains(BOOT_READINESS_MARKER)
 }
 
+/// The one wording of the SELF-DIAL refusal (measured live 2026-09-19 on a
+/// fresh scratch home): on a SAME-VERSION spawn arm the successor rebinds the
+/// shared `pty-handoff-<ver>.sock` ~200 ms into ITS boot, and the
+/// predecessor's sweep — freed by its 100 ms listener-wait poll — can dial
+/// the PATH while it still points at the PREDECESSOR'S OWN listener inode.
+/// A daemon that serves its own sweep connection deadlocks: the serve
+/// thread's seat closure needs the runtime lock while the request thread
+/// holds it across `hand_off_all_runtimes(&mut self)` — silent verdict (the
+/// predecessor reads one silence and sends blind), the fd parked in the
+/// socket buffer ("accepted the fd"), 10 s ack timeout, NoneMoved. Refusing
+/// BY NAME at accept turns the race into a retry.
+pub(crate) const SELF_DIAL_MARKER: &str =
+    "predecessor dialed its own pty-handoff listener (self-dial)";
+
+/// True when a pre-commit refusal says the connection looped back to the
+/// dialing daemon itself. The descriptor never moved; the caller retries the
+/// connect toward the real successor.
+pub(crate) fn verdict_is_self_dial(message: &str) -> bool {
+    message.contains(SELF_DIAL_MARKER)
+}
+
+/// True when the connection's PEER is this very process — the predecessor
+/// dialing its own handoff listener (see [`SELF_DIAL_MARKER`]). Peer
+/// credentials, not names: the socket path is shared per version, so the
+/// PATH cannot tell who answered — the kernel's pid can. Unreadable
+/// credentials answer "not self", which is the safe direction: the worst case
+/// is yesterday's behaviour, never a refused real successor.
+#[cfg(target_os = "linux")]
+pub(crate) fn handoff_peer_is_self(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    // `UnixStream::peer_cred` is std-unstable; SO_PEERCRED is the same answer
+    // from the kernel, and this crate already speaks libc for flock.
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    cred.pid == std::process::id() as i32
+}
+
 /// Write the verdict the predecessor is waiting on.
 ///
 /// ⛔ Call this ONLY when [`HandoffMetadata::precommit_verdict`] says the
@@ -863,6 +912,24 @@ mod tests {
              one is retried within the budget, the other drops the duplicate"
         );
         assert!(!verdict_is_boot_refusal("some other wire noise"));
+    }
+
+    #[test]
+    fn a_self_connection_reads_as_self_dial_and_the_markers_stay_distinct() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let _ = &b;
+        assert!(
+            handoff_peer_is_self(&a),
+            "both ends of a socketpair live in this process, so the peer IS self"
+        );
+        assert!(verdict_is_self_dial(SELF_DIAL_MARKER));
+        assert!(
+            !verdict_is_self_dial(BOOT_READINESS_MARKER)
+                && !verdict_is_boot_refusal(SELF_DIAL_MARKER),
+            "the two retryable refusals must not read as each other — \
+             one retries the connect, the other retries the send"
+        );
+        assert!(!verdict_is_self_dial("some other wire noise"));
     }
 
     fn metadata() -> HandoffMetadata {
