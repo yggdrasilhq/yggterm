@@ -31829,3 +31829,19 @@ window. **Fix shape:** a compound verdict for the excluded class — the
 [11.153] memo fresh (retry-exhausted) AND the peer's
 `agent-runtime-alive` answer (already strict-parse) false on two spaced asks
 — closing the row through the same PeerSessionGone close.
+
+**FIX IN CODE (2026-09-20, lane/integration/11158-startborn-ghost):** the
+excluded class now closes on the compound verdict — the [11.153] memo fresh
+AND `agent-runtime-alive` false on two SPACED ensure ticks (a per-path
+first-no map; the spacing is real ticks, the request loop never parks) —
+through THE one PeerSessionGone close, named
+`remote_saved_session_startborn_peer_close_learned`. The store ask stays
+excluded (bind-may-land stands); a transport error, an alive peer, or a
+stale memo disarms and preserves; the alive verb only goes out under a
+fresh memo, so a healthy start-born row pays no ask. Locks: the [11.155]
+gate-order lock extended (the inconclusive-fallthrough law now scopes to
+transport inconclusives; the start-born re-exam still closes through the
+same named-trace-then-one-close order) + the compound-verdict table test.
+Suite delta vs clean main: +1 green, failure set byte-identical (the
+owner-gated stamp red). Live proof = the filed falsifier, owed on the
+rotated build.
