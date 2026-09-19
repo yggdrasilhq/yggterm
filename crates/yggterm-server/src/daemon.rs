@@ -6003,6 +6003,15 @@ impl DaemonRuntime {
         // `first_failure` keeps its name: the FIRST failure is retained, later
         // ones do not overwrite it, so the reason a sweep is Partial stays the
         // reason it first went wrong.
+        // ⛔ [11.152] THE BOOT-RETRY BUDGET — set lazily on the FIRST
+        // boot-readiness refusal, shared by every key in this sweep. A young
+        // successor refuses PRE-commit while its startup deep reconcile holds
+        // the runtime lock; refusals there are free, so the right answer is
+        // to knock again until it is ready, not to book a failure that leaves
+        // this daemon serving forever ([11.151]). Parked readers consume
+        // nothing, so retrying costs no bytes — only retirement delay, and
+        // the budget bounds that.
+        let mut boot_retry_deadline = None::<std::time::Instant>;
         for key in keys {
             let Some(takeout) = self.terminals.handoff_takeout(&key) else {
                 first_failure =
@@ -6024,12 +6033,43 @@ impl DaemonRuntime {
                 // predecessor that never asks is one this daemon is not.
                 precommit_verdict: true,
             };
-            match crate::pty_handoff::send_session(
-                &socket,
-                &metadata,
-                takeout.master_fd,
-                &mut precommit,
-            ) {
+            let sent = loop {
+                match crate::pty_handoff::send_session(
+                    &socket,
+                    &metadata,
+                    takeout.master_fd,
+                    &mut precommit,
+                ) {
+                    sent @ Ok(_) => break sent,
+                    Err(error) => {
+                        let boot_refusal = !error.committed
+                            && crate::pty_handoff::verdict_is_boot_refusal(&error.message);
+                        if !boot_refusal {
+                            break Err(error);
+                        }
+                        let deadline = boot_retry_deadline
+                            .get_or_insert_with(|| {
+                                std::time::Instant::now() + BOOT_REFUSAL_RETRY_BUDGET
+                            });
+                        if std::time::Instant::now() >= *deadline {
+                            break Err(error);
+                        }
+                        append_trace_event(
+                            &self.store.home_dir(),
+                            "daemon",
+                            "lifecycle",
+                            "pty_fd_handoff_boot_retry",
+                            serde_json::json!({
+                                "runtime_key": key,
+                                "successor_version": successor_version,
+                                "reason": error.message,
+                            }),
+                        );
+                        std::thread::sleep(BOOT_REFUSAL_RETRY_PAUSE);
+                    }
+                }
+            };
+            match sent {
                 Ok(ack) => {
                     moved += 1;
                     moved_keys.push(key.clone());
@@ -6039,6 +6079,27 @@ impl DaemonRuntime {
                     }
                 }
                 Err(error) => {
+                    if !error.committed
+                        && crate::pty_handoff::verdict_is_boot_refusal(&error.message)
+                    {
+                        // ⛔ [11.152] The retry budget ran out on a successor
+                        // that is still not seating: say so by name and keep
+                        // the rows — the predecessor serving forever is the
+                        // proven safe arm, a corpse is not.
+                        append_trace_event(
+                            &self.store.home_dir(),
+                            "daemon",
+                            "lifecycle",
+                            "pty_fd_handoff_boot_retry_exhausted",
+                            serde_json::json!({
+                                "runtime_key": key,
+                                "successor_version": successor_version,
+                                "budget_ms": BOOT_REFUSAL_RETRY_BUDGET.as_millis() as u64,
+                                "reason": error.message,
+                                "pid": std::process::id(),
+                            }),
+                        );
+                    }
                     // ⛔ `refused` is asked, not `!committed`. A connect that
                     // failed is uncommitted too, and counting it as a refusal
                     // would report the successor's sessions when the fault was
@@ -11685,6 +11746,7 @@ impl DaemonRuntime {
                     if spawn_result.is_err() && bequeathed.is_some() {
                         bequeath_rollback(self.store.home_dir(), std::process::id());
                     }
+                    let spawn_ok = spawn_result.is_ok();
                     spawn_result?;
                     // ★ LEVEL (b): try the LOSSLESS route before lingering.
                     //
@@ -11692,60 +11754,102 @@ impl DaemonRuntime {
                     // failure past the commit point destroys a live shell. When
                     // it is off, or when nothing moves, behaviour is exactly the
                     // lingering-preserved-owner path this replaces.
-                    // ⛔ THE SPAWN ARM MUST NOT SWEEP (yet). Sweeping toward a
-                    // successor this request just SPAWNED looked like the fix
-                    // for the fresh-home never-drain ([11.151]): the probe
-                    // below is None by construction before the child exists,
-                    // so the sweep never ran there. MEASURED LIVE 2026-09-19
-                    // and REVERTED the same day: the listener binds EARLY in
-                    // the successor's boot ("accept PTY handoffs before
-                    // anything else could look for us"), but its adopt path
-                    // can stall after the commit point — the fd was taken,
-                    // no adoption ran, no ack ever came, the queued
-                    // descriptor was dropped with the stream, the master
-                    // closed and the row's shell died SIGHUP. A corpse is
-                    // strictly worse than a predecessor that serves forever.
-                    // The drain needs the successor-side fix ([11.152]): a
-                    // boot-readiness answer BEFORE the commit point, and a
-                    // predecessor that retries pre-commit refusals while the
-                    // child boots. The listener-existing gate below is NOT
-                    // that proof.
+                    // ★ THE SPAWN ARM SWEEPS TOO — now safe, because the
+                    // successor refuses PRE-commit until it can seat
+                    // ([11.152]). The sweep used to run only when a successor
+                    // was ALREADY live at prepare time — but on the spawn arm
+                    // (the only arm a fresh home can take)
+                    // `live_successor_version` is None by construction: the
+                    // peer probe ran before the child existed, so the sweep
+                    // never ran, the ownership ledger was never written, and
+                    // no later mechanism drains a same-version predecessor
+                    // ([11.151]). The first re-land (2026-09-19) was REVERTED
+                    // the same day: the listener binds ~200 ms into the
+                    // successor's boot but its adopt path stalled PAST the
+                    // commit point — the fd crossed, nothing adopted it, no
+                    // ack ever came, the shell died SIGHUP. What makes the
+                    // sweep safe now is the successor-side boot-readiness
+                    // gate: `DAEMON_READY_TO_SEAT` refuses BEFORE the commit
+                    // point until the boot's lock-holding phases (the startup
+                    // deep reconcile) are done, `BOOT_READINESS_MARKER` names
+                    // that refusal on the wire, and the sweep retries it
+                    // within its budget (see `hand_off_all_runtimes`). A
+                    // refusal is free; a corpse is not.
                     #[cfg(target_os = "linux")]
-                    if pty_fd_handoff_enabled()
-                        && let Some(successor) = live_successor_version.as_deref()
-                    {
-                        let outcome = self.hand_off_all_runtimes(successor);
-                        append_trace_event(
-                            self.store.home_dir(),
-                            "daemon",
-                            "lifecycle",
-                            "pty_fd_handoff_sweep",
-                            serde_json::json!({
-                                "successor_version": successor,
-                                "outcome": format!("{:?}", outcome.sweep),
-                                "readers_stood_down": outcome.stood_down,
-                                "readers_resumed": outcome.resumed,
-                                "pid": std::process::id(),
-                            }),
+                    if pty_fd_handoff_enabled() {
+                        let sweep_successor = handoff_sweep_target(
+                            live_successor_version.as_deref(),
+                            spawn_ok,
+                            expected_version.as_deref(),
                         );
-                        if !outcome.parked.is_empty() {
-                            // ⛔ Accepting is not surviving. The watch holds our
-                            // descriptors — parked, serving nothing — until the
-                            // successor has lived out its settle window, and
-                            // wakes every reader again if it has not. Its own
-                            // thread, so this request's response still reaches
-                            // the caller.
-                            //
-                            // The watch must name the endpoint THIS daemon
-                            // actually answers at — after a same-version
-                            // bequest that is the RETIRED path (`owner_endpoint`
-                            // above), not the canonical name we just yielded.
-                            spawn_handoff_settle_watch(
-                                self.store.home_dir().to_path_buf(),
-                                owner_endpoint.clone(),
-                                successor.to_string(),
-                                outcome,
-                            );
+                        if let Some(successor) = sweep_successor.as_deref() {
+                            let listener_ready = if live_successor_version.is_none() {
+                                // The successor we just spawned must bind its
+                                // pty-handoff listener before anything can
+                                // knock. The bound listener is NOT an
+                                // adoption-capability proof — it only says
+                                // when knocking becomes possible; the
+                                // boot-readiness gate decides each knock.
+                                let listener = crate::pty_handoff::handoff_socket_path(
+                                    self.store.home_dir(),
+                                    successor,
+                                );
+                                wait_for_handoff_listener(
+                                    &listener,
+                                    HANDOFF_SPAWN_LISTEN_WAIT_MS,
+                                )
+                            } else {
+                                true
+                            };
+                            if !listener_ready {
+                                append_trace_event(
+                                    self.store.home_dir(),
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_fd_handoff_sweep_skipped_listener_timeout",
+                                    serde_json::json!({
+                                        "successor_version": successor,
+                                        "waited_ms": HANDOFF_SPAWN_LISTEN_WAIT_MS,
+                                        "pid": std::process::id(),
+                                    }),
+                                );
+                            } else {
+                                let outcome = self.hand_off_all_runtimes(successor);
+                                append_trace_event(
+                                    self.store.home_dir(),
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_fd_handoff_sweep",
+                                    serde_json::json!({
+                                        "successor_version": successor,
+                                        "outcome": format!("{:?}", outcome.sweep),
+                                        "readers_stood_down": outcome.stood_down,
+                                        "readers_resumed": outcome.resumed,
+                                        "pid": std::process::id(),
+                                    }),
+                                );
+                                if !outcome.parked.is_empty() {
+                                    // ⛔ Accepting is not surviving. The watch
+                                    // holds our descriptors — parked, serving
+                                    // nothing — until the successor has lived
+                                    // out its settle window, and wakes every
+                                    // reader again if it has not. Its own
+                                    // thread, so this request's response still
+                                    // reaches the caller.
+                                    //
+                                    // The watch must name the endpoint THIS
+                                    // daemon actually answers at — after a
+                                    // same-version bequest that is the RETIRED
+                                    // path (`owner_endpoint` above), not the
+                                    // canonical name we just yielded.
+                                    spawn_handoff_settle_watch(
+                                        self.store.home_dir().to_path_buf(),
+                                        owner_endpoint.clone(),
+                                        successor.to_string(),
+                                        outcome,
+                                    );
+                                }
+                            }
                         }
                     }
                     return Ok(ServerResponse::HotUpdateHandoff {
@@ -18717,6 +18821,22 @@ fn run_working_flag_owner_discovery_if_due(runtime: &Arc<Mutex<DaemonRuntime>>) 
 #[cfg(target_os = "linux")]
 static SAME_VERSION_HANDOFF_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
+/// ⛔ [11.152] THE BOOT-READINESS GATE for PTY handoffs. False from process
+/// start; set true only when this daemon can actually SEAT a handed-off
+/// runtime — after the startup preserved-owner deep reconcile (which holds
+/// the runtime lock through its cross-daemon probes) and just before the
+/// request accept loop. The pty-handoff listener binds long before that (the
+/// bind-order law puts it first), so a predecessor could knock and COMMIT a
+/// descriptor into a daemon that cannot adopt it yet — the exact
+/// commit-then-stall that killed a live row on 2026-09-19 (verdict answered
+/// in a lock-free window, then the reconcile took the lock, the adopt closure
+/// blocked 13 s, no ack, fd lost with the stream, shell SIGHUP). The handoff
+/// seat closure reads this BEFORE taking the lock and refuses pre-commit by
+/// name while it is false; the predecessor retries within its boot-retry
+/// budget. See [`BOOT_READINESS_MARKER`].
+static DAEMON_READY_TO_SEAT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// One `cooldown deferred` trace per hysteresis window, not one per 20 s poll.
 #[cfg(target_os = "linux")]
 static SAME_VERSION_HANDOFF_DEFER_ANNOUNCED_MS: AtomicU64 = AtomicU64::new(0);
@@ -19155,6 +19275,74 @@ fn pty_fd_handoff_enabled() -> bool {
             .map(str::trim),
         Some("0") | Some("false") | Some("no") | Some("off")
     )
+}
+
+/// How long a handoff that SPAWNED its successor waits for that child to bind
+/// its pty-handoff listener before giving up on the fd sweep. Fresh children
+/// bind in well under a second; the bound exists for a loaded host's boot.
+#[cfg(any(target_os = "linux", test))]
+const HANDOFF_SPAWN_LISTEN_WAIT_MS: u64 = 5_000;
+
+/// How long ONE sweep keeps retrying a young successor's PRE-commit
+/// boot-readiness refusals before giving up and keeping the rows ([11.152]).
+/// Parked readers consume nothing, so retrying costs no bytes — only
+/// retirement delay, and this bounds it. The successor's boot-lock phases
+/// (the startup deep reconcile's cross-daemon probes) are bounded by their
+/// own probe timeouts, so a multiple of those converges; on exhaustion the
+/// predecessor keeps serving — the proven safe arm ([11.151]).
+#[cfg(any(target_os = "linux", test))]
+const BOOT_REFUSAL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The pause between boot-readiness retries within one sweep.
+#[cfg(any(target_os = "linux", test))]
+const BOOT_REFUSAL_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The version the fd-handoff sweep should knock on.
+///
+/// A successor that was ALREADY live at prepare time wins (the probe's
+/// answer). Otherwise the successor this request just SPAWNED is the target:
+/// its version is the expected target version when the caller named one, and
+/// our OWN version on the same-version bequest arm (the headless restart verb
+/// sends no expected version at all). A failed spawn leaves nothing to knock
+/// on. Split out pure so the spawn-arm law keeps a test that no environment
+/// where the sweep is disabled can skip.
+#[cfg(any(target_os = "linux", test))]
+fn handoff_sweep_target(
+    live_successor_version: Option<&str>,
+    spawn_ok: bool,
+    expected_version: Option<&str>,
+) -> Option<String> {
+    live_successor_version
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            spawn_ok.then(|| {
+                expected_version
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| SERVER_PROTOCOL_VERSION.to_string())
+            })
+        })
+}
+
+/// Block until `listener` exists or the budget runs out. Existence is the
+/// readiness proxy: the handoff listener unlinks and rebinds the path at
+/// startup, so the path pointing at anything means a listener either is live
+/// or is about to accept. A stale graveyard file costs one refused connect,
+/// which the sweep's own all-or-nothing failure handling absorbs (readers
+/// unparked, predecessor keeps serving). ⛔ Existence is NOT an
+/// adoption-capability proof — the boot-readiness gate ([11.152]) decides
+/// each knock; this only says when knocking becomes possible.
+#[cfg(any(target_os = "linux", test))]
+fn wait_for_handoff_listener(listener: &Path, budget_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    loop {
+        if listener.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 
@@ -19761,6 +19949,33 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                 let served = crate::pty_handoff::serve_handoff(
                     &stream,
                     &mut |metadata| {
+                        // ⛔ [11.152] THE BOOT-READINESS ANSWER, BEFORE THE
+                        // LOCK. The listener binds ~200 ms into boot, but the
+                        // startup deep reconcile holds the runtime lock through
+                        // its cross-daemon probes long after; answering the
+                        // verdict from behind that lock stalls the predecessor's
+                        // whole sweep, and committing past it is what killed a
+                        // live row (fd committed, never adopted, never acked,
+                        // shell SIGHUP). While `DAEMON_READY_TO_SEAT` is false
+                        // this daemon refuses by name — pre-commit, free,
+                        // retryable.
+                        if !DAEMON_READY_TO_SEAT.load(std::sync::atomic::Ordering::Acquire) {
+                            append_trace_event(
+                                &home_dir,
+                                "daemon",
+                                "lifecycle",
+                                "pty_handoff_boot_readiness_refused",
+                                serde_json::json!({
+                                    "runtime_key": metadata.runtime_key,
+                                    "shell_pid": metadata.shell_pid,
+                                }),
+                            );
+                            return Some(format!(
+                                "refusing to adopt {}: {}",
+                                metadata.runtime_key,
+                                crate::pty_handoff::BOOT_READINESS_MARKER
+                            ));
+                        }
                         let verdict = {
                             let rt = lock_daemon_runtime(&runtime, "pty_handoff_seat_verdict");
                             rt.terminals.seat_verdict(
@@ -19799,7 +20014,36 @@ fn spawn_pty_handoff_listener(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntim
                         }
                     },
                     &mut |metadata, fd| {
+                        // ⛔ [11.152] THE POST-COMMIT WINDOW MUST NAME ITSELF.
+                        // Past `receive_descriptor` the fd is this daemon's; if
+                        // anything below stalls, the predecessor burns its ack
+                        // timeout with no error line anywhere — the 2026-09-19
+                        // stall was diagnosed to exactly "silent".
+                        // `pty_handoff_adopt_started` (pre-lock) and
+                        // `pty_handoff_adopt_lock_acquired` bracket the lock
+                        // wait — the startup deep reconcile held it for the
+                        // whole 13 s on the measured kill — and the existing
+                        // `pty_handoff_adopted` names the completed seat.
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "pty_handoff_adopt_started",
+                            serde_json::json!({
+                                "runtime_key": metadata.runtime_key,
+                                "shell_pid": metadata.shell_pid,
+                            }),
+                        );
                         let mut rt = lock_daemon_runtime(&runtime, "pty_handoff_adopt");
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "pty_handoff_adopt_lock_acquired",
+                            serde_json::json!({
+                                "runtime_key": metadata.runtime_key,
+                            }),
+                        );
                         rt.terminals
                             .adopt_session(
                                 &metadata.runtime_key,
@@ -26436,6 +26680,19 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             let mut rt = lock_daemon_runtime(&runtime, "startup_preserved_owner_deep_reconcile");
             rt.run_deferred_preserved_owner_deep_reconcile("startup_post_bind");
         }
+        // ⛔ [11.152] Every boot phase that can hold the runtime lock through
+        // startup has finished: from here the daemon can SEAT a handed-off
+        // runtime. This store is the readiness the handoff seat closure
+        // answers with — see `DAEMON_READY_TO_SEAT`. Traced by name so the
+        // boot timeline is readable next to the handoff traces.
+        DAEMON_READY_TO_SEAT.store(true, std::sync::atomic::Ordering::Release);
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "lifecycle",
+            "daemon_ready_to_seat_handoffs",
+            serde_json::json!({ "pid": std::process::id() }),
+        );
         listener
             .set_nonblocking(true)
             .context("setting daemon unix listener nonblocking")?;
@@ -29407,6 +29664,61 @@ pub(crate) fn terminal_write_strategy_for_path(
 /// the retiree's listener and flock survive on the SAME inodes at the retired
 /// names. These tests run the REAL filesystem + REAL flock in a temp home —
 /// mocking rename would prove nothing the kernel could not contradict.
+#[cfg(test)]
+mod handoff_spawn_arm_sweep {
+    use super::{handoff_sweep_target, wait_for_handoff_listener, SERVER_PROTOCOL_VERSION};
+
+    #[test]
+    fn the_sweep_target_prefers_the_probe_answer_and_falls_to_the_spawned_target() {
+        assert_eq!(
+            handoff_sweep_target(Some("3.3.0"), false, Some("3.2.113")),
+            Some("3.3.0".to_string()),
+            "a successor the probe found live is always the target"
+        );
+        assert_eq!(
+            handoff_sweep_target(None, true, Some("3.3.0")),
+            Some("3.3.0".to_string()),
+            "the child a version-bump handoff spawned is the target"
+        );
+        assert_eq!(
+            handoff_sweep_target(None, true, None),
+            Some(SERVER_PROTOCOL_VERSION.to_string()),
+            "the same-version bequest arm sweeps to our own version — the \
+             headless restart verb sends no expected version"
+        );
+    }
+
+    #[test]
+    fn a_failed_spawn_leaves_no_sweep_target() {
+        assert_eq!(handoff_sweep_target(None, false, Some("3.3.0")), None);
+        assert_eq!(handoff_sweep_target(None, false, None), None);
+    }
+
+    #[test]
+    fn the_listener_wait_returns_as_soon_as_the_socket_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-handoff-wait-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let listener = dir.join("pty-handoff-3-2-113.sock");
+        assert!(
+            !wait_for_handoff_listener(&listener, 150),
+            "a missing listener must exhaust the budget"
+        );
+        std::fs::write(&listener, b"socket").expect("listener file");
+        assert!(
+            wait_for_handoff_listener(&listener, 1_000),
+            "an existing listener must return immediately"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(unix)]
 #[cfg(test)]
 mod same_version_bequest_locks {
@@ -30326,6 +30638,51 @@ mod tests {
         assert!(
             body.contains("progressive_migration_adopter_seen"),
             "the adopter's identity must be traced when first seen"
+        );
+    }
+
+    /// ⛔ [11.152] THE SEAT CLOSURE MUST ANSWER BOOT READINESS BEFORE TAKING
+    /// THE LOCK. The startup deep reconcile holds the runtime lock through
+    /// cross-daemon probes; a seat closure that locks first stalls the whole
+    /// sweep behind it, and a commit that slips past is the one that killed a
+    /// live row on 2026-09-19.
+    #[test]
+    fn the_handoff_seat_closure_answers_boot_readiness_before_taking_the_lock() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(&source, "fn spawn_pty_handoff_listener(");
+        let ready = body
+            .find("DAEMON_READY_TO_SEAT.load")
+            .expect("the seat closure must consult the boot-readiness gate");
+        let lock = body
+            .find("pty_handoff_seat_verdict")
+            .expect("the seat verdict lock label is gone");
+        assert!(
+            ready < lock,
+            "the boot-readiness refusal must be answered BEFORE the seat closure \
+             takes the runtime lock — behind it the startup deep reconcile stalls"
+        );
+        assert!(
+            body.contains("pty_handoff_boot_readiness_refused"),
+            "the refusal must be traced by name (§9 observability contract)"
+        );
+    }
+
+    /// ⛔ [11.152] READINESS ARRIVES ONLY AFTER THE LOCK-HOLDING BOOT PHASES.
+    /// The flag must flip after the startup preserved-owner deep reconcile —
+    /// flipping it earlier would reintroduce the commit-into-a-booting-daemon
+    /// window this whole defect exists to close.
+    #[test]
+    fn the_boot_readiness_flag_flips_only_after_the_startup_deep_reconcile() {
+        let source = daemon_product_source();
+        let reconcile = source
+            .find("run_deferred_preserved_owner_deep_reconcile(\"startup_post_bind\")")
+            .expect("the startup deep reconcile is gone");
+        let ready = source
+            .find("DAEMON_READY_TO_SEAT.store(true")
+            .expect("the readiness flag must be set somewhere in boot");
+        assert!(
+            reconcile < ready,
+            "readiness must be declared AFTER the deep reconcile, not before"
         );
     }
 

@@ -31774,7 +31774,7 @@ menu heading).
 
 ## ⛔ [11.152] A YOUNG SUCCESSOR'S HANDOFF PATH COMMITS THE DESCRIPTOR AND THEN NEVER ADOPTS AND NEVER ACKS — THE QUEUED FD IS DROPPED WITH THE STREAM, THE PTY MASTER CLOSES, AND THE ROW'S SHELL DIES SIGHUP; THE SPAWN-ARM SWEEP THAT TRUSTED A BOUND LISTENER KILLED A LIVE ROW AND WAS REVERTED (measured live 2026-09-19, fresh scratch home on a fleet host, production 2a4acc64; the [11.151] repair leg, claim ACK-83597c3317 lineage)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 MEASURED: fresh home, forced same-version restart with a working shell row.
 The first attempt at [11.151]'s drain swept the spawn arm toward the
@@ -31808,6 +31808,40 @@ pre-commit refusals while the child boots, within a bounded budget; (3) the
 ack-less post-commit window needs a named trace on the successor side (what
 ran, what it waited for) so the next occurrence is diagnosable — this
 sitting's evidence ends at "silent".
+
+FIXED IN CODE 2026-09-19 (lane/integration/bequeath-1152, zcode seat on the
+muse lab host, work FROM dev; claim ACK-ac362fd102): **ROOT CAUSE FOUND — the
+successor's STARTUP, not its handoff code, held the lock.** The boot sequence
+runs the preserved-owner deep reconcile
+(`run_deferred_preserved_owner_deep_reconcile("startup_post_bind")`) inline
+before the accept loop WHILE HOLDING the runtime mutex, and its cross-daemon
+probes are lock-held socket round-trips. The handoff listener binds ~200 ms
+into boot (bind-order law), the seat verdict answered in the lock-free window
+before the reconcile began, the descriptor committed, and the adopt closure
+then blocked on `lock_daemon_runtime("pty_handoff_adopt")` for the
+reconcile's duration — 13 s to the predecessor's ack timeout, no panic, no
+error line, fd lost with the stream. THE FIX, three legs: (1) SUCCESSOR
+BOOT-READINESS GATE — `DAEMON_READY_TO_SEAT` flips true only AFTER the
+startup deep reconcile (traced `daemon_ready_to_seat_handoffs`); the handoff
+seat closure consults it BEFORE taking the lock and refuses pre-commit by the
+wire marker `BOOT_READINESS_MARKER` ("successor still starting up: seating
+not ready yet"), traced `pty_handoff_boot_readiness_refused` — a bound
+listener is no longer an adoption-capability proof. (2) THE SPAWN-ARM DRAIN
+RE-LANDED (the [11.151] owed half): `handoff_sweep_target` + the bounded
+listener wait resurrected from the reverted lane 404f70e4, and the sweep now
+RETRIES boot-refusal pre-commit refusals within a 30 s per-sweep budget
+(`pty_fd_handoff_boot_retry` / `pty_fd_handoff_boot_retry_exhausted`;
+exhaustion is named and the predecessor keeps serving — the proven safe arm).
+(3) THE POST-COMMIT WINDOW NAMES ITSELF: `pty_handoff_adopt_started`
+(pre-lock) + `pty_handoff_adopt_lock_acquired` + the existing
+`pty_handoff_adopted` bracket the window that was silent. Guards: the
+seat-closure ordering lock and the readiness-after-reconcile lock via
+`daemon_product_source` (the non-self-referential class), sweep-target law +
+listener-wait tests resurrected from the reverted lane, and a
+boot-refusal-vs-seat-conflict marker distinctness test (one is retried, the
+other drops the duplicate). [11.151]'s never-drain half lands behind this
+gate; version skew (OLD successor that never answers verdicts) is unchanged —
+a silent old build still commits, by the two-strike silence law.
 
 ## ⛔ [11.151] A FRESH HOME'S FORCED RESTART PREPARES THE HANDOFF BUT NEVER SWEEPS — THE FD-HANDOFF SWEEP RAN ONLY WHEN A SUCCESSOR WAS ALREADY LIVE, THE SPAWN ARM'S PEER PROBE IS NONE BY CONSTRUCTION, AND NOTHING LATER DRAINS A SAME-VERSION PREDECESSOR, SO THE PREDECESSOR SERVES ITS ROWS FOREVER WHILE THE SUCCESSOR SITS AT OWNED:0 AND THE OWNERSHIP LEDGER IS NEVER WRITTEN (measured live 2026-09-19, fresh scratch home on a fleet host, claim ACK-83597c3317 lineage; filed by the adopted-disposition outcome as its item 4)
 
@@ -31873,6 +31907,14 @@ never-drain half of THIS defect stays OPEN until [11.152] gives the
 successor a pre-commit boot-readiness answer; the predecessor serving its
 rows forever is the SAFE arm and is what the deployed build now does again,
 live-verified.
+
+DRAIN RE-LANDED 2026-09-19 behind that answer (lane/integration/bequeath-1152,
+claim ACK-ac362fd102; see [11.152] for the boot-readiness root cause): the
+spawn-arm sweep is back with `handoff_sweep_target` + the bounded listener
+wait from the reverted lane, and boot-readiness pre-commit refusals are
+RETRIED within a 30 s per-sweep budget instead of booked as failures. The
+never-drain half closes when the live proof shows the fresh-home drain
+running AND the row surviving.
 
 ## ⛔ [11.148] A FRESH (NO `--session`) WRAPPER OPENCODE ROW GETS A DUPLICATE KEEP-ALIVE MIRROR TWIN — THE TAB-SYNC OWNS SESSIONS ONLY THROUGH THE "Tab Session Id" ROW METADATA, WHICH ONLY THE MIRROR'S OWN SPAWN PATH WRITES, SO THE WRAPPER ROW'S POST-HOC DISCOVERY (`session_id`, AUTHORITATIVE) IS INVISIBLE TO IT AND THE SESSION READS UN-OWNED (measured live 2026-09-19, the muse lab host, lane/integration/oc-bind-proof; claim ACK-ac4fedcd57)
 
