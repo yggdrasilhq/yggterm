@@ -3126,20 +3126,28 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         store_membership_index: None,
         live_session_argv_flag: None,
         live_session_marker: None,
-        // ⛔ `read_live_store_title` is None again: the reader it pointed at
-        // opens state.json, and 1.50.0 ships no state.json — there is nothing
-        // to read (see the title_authority block). Restored only together
-        // with a reader for a store that exists. The remote probe died with
-        // it: a probe with no local reader is the exact drift its own gate
-        // test exists to refuse.
-        read_live_store_title: None,
+        // [11.6.6-a] left this None ("restored only together with a reader
+        // for a store that exists") — the reader EXISTS now (2026-09-19, the
+        // [11.145] red sweep): `read_kimi_live_store_title` below. 1.50.0's
+        // wire carries NO title key, so the honest read is None-by-shape and
+        // the title stays Generated — but the store IS measured, and `None`
+        // is documented to mean UNMEASURED, the exact hole the qwen reader's
+        // comment names (and the reason both full-coverage title locks ran
+        // red on main: kimi claimed a store with no reader). The reader
+        // scans the wire for a `title` string, so the day kimi writes titles
+        // it serves them with no further edit. The remote twin rides the
+        // same shape (a local reader with a remote arm owes the probe).
+        read_live_store_title: Some(read_kimi_live_store_title),
         // Input contract: line-discipline defaults — a trailing \r rides with
         // the text and the pty echoes it back. The shell-row behavior and the
         // echo-confirmed probe both depend on these; flip only on a live
         // measurement ([11.141] holds the bar).
         submit_byte_own_chunk: false,
         pty_echo_confirms_input: true,
-        remote_live_store_title: None,
+        // The ssh twin of `read_kimi_live_store_title`: same title shape
+        // (a `title` string on a wire line), run THERE. Globs ride argv via
+        // RemoteStoreLocators::StoreGlobs, exactly like grok's.
+        remote_live_store_title: Some(KIMI_REMOTE_TITLE_PROBE),
     },
     AgentCliDescriptor {
         kind: SessionKind::Muse,
@@ -5738,6 +5746,121 @@ fn read_kimi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
         detail: None,
     })
 }
+
+/// One title shape, two transports (the local reader below and the remote
+/// script both mean it): a non-empty string at `title` — top-level on a wire
+/// line or inside its `metadata` object. 1.50.0 ships no such key anywhere
+/// (measured [11.6.6-a]); the first line that ever does wins. An id-shaped
+/// value is not a title.
+fn kimi_title_from_wire_line(line: &str, session_id: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return None;
+    };
+    let metadata = value.get("metadata");
+    for holder in [Some(&value), metadata] {
+        let Some(holder) = holder else { continue };
+        let Some(title) = holder.get("title").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let title = title.trim();
+        if !title.is_empty() && title != session_id {
+            return Some(title.to_string());
+        }
+    }
+    None
+}
+
+/// [`AgentCliDescriptor::read_live_store_title`] for Kimi. The session dir
+/// is `~/.kimi/sessions/<md5hex-of-cwd>/<session-uuid>/wire.jsonl` — the
+/// bucket encodes the cwd, so it cannot be derived from the id and every
+/// bucket is walked (the qwen shape). Every real 1.50.0 store answers None
+/// today (no title key), leaving the title Generated; the day kimi writes
+/// titles this serves them with no further edit — the flip-back the
+/// [11.6.6-a] door promised.
+fn read_kimi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let descriptor = agent_cli_descriptor(SessionKind::Kimi)?;
+    // `store_roots` is the glob's literal prefix: `<home>/.kimi/sessions`
+    // itself — the md5 buckets sit directly under it.
+    for root in descriptor.store_roots_absolute(home) {
+        let Ok(buckets) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for bucket in buckets.flatten() {
+            let wire = bucket.path().join(session_id).join("wire.jsonl");
+            let Ok(text) = std::fs::read_to_string(&wire) else {
+                continue;
+            };
+            for line in text.lines() {
+                if let Some(title) = kimi_title_from_wire_line(line, session_id) {
+                    return Some(title);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Kimi's remote twin: the same wire-title shape, run on the session's host.
+/// Store globs ride argv (locators first, then `--`, then the ids) exactly
+/// like grok's script; a session dir whose name is the id is this id's.
+const KIMI_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+split = argv.index('--')
+globs = [v for v in argv[:split] if v.strip()]
+ids = [v for v in argv[split + 1:] if v.strip()]
+if not ids or not globs:
+    sys.exit(0)
+home = Path(os.path.expanduser('~'))
+wanted = set(ids)
+
+def title_of(path, sid):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except Exception:
+                    continue
+                holders = [value]
+                meta = value.get('metadata')
+                if isinstance(meta, dict):
+                    holders.append(meta)
+                for holder in holders:
+                    t = holder.get('title') if isinstance(holder, dict) else None
+                    if isinstance(t, str):
+                        t = t.strip()
+                        if t and t != sid:
+                            return t
+    except Exception:
+        return None
+    return None
+
+for g in globs:
+    try:
+        matches = home.glob(g)
+    except Exception:
+        continue
+    for p in matches:
+        sid = p.parent.name
+        if sid not in wanted:
+            continue
+        t = title_of(p, sid)
+        if t:
+            print(json.dumps({'session_id': sid, 'candidates': [t]}, ensure_ascii=False))
+"#;
+
+const KIMI_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: KIMI_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::StoreGlobs,
+    choose: first_non_empty_candidate,
+};
 
 fn read_muse_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     let db_path = home.join(".local/share/muse/session-index.db");
@@ -11299,6 +11422,64 @@ mod tests {
             read_codex_live_store_title(&home, "test-codex-idx-1").as_deref(),
             Some("Count to twelve"),
             "the index name the CLI displays beats the rollout's first prompt",
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Kimi's 1.50.0 wire carries NO title key ([11.6.6-a], measured on the
+    /// muse lab host) — the reader answers None and the title stays
+    /// Generated. The flip-back arm is pinned too: the day kimi writes a
+    /// `title` (top-level or inside the metadata line), the reader serves it
+    /// with no further edit; an id-shaped value is never a title.
+    #[test]
+    fn kimi_reader_answers_none_on_the_titleless_store_and_flips_back_when_titles_arrive() {
+        let home = std::env::temp_dir().join(format!("ygg-kimi-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // The measured bucket: md5("/tmp") is a bucket name verbatim
+        // ([11.6.6-a] verified the scheme on the muse lab host).
+        let dir = home
+            .join(".kimi/sessions/d42b9c5708f43d58ad2f22597e5cf586")
+            .join("kimi-title-session-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let session_id = "kimi-title-session-1";
+        std::fs::write(
+            dir.join("wire.jsonl"),
+            concat!(
+                "{\"type\":\"metadata\",\"protocol_version\":\"1.10\"}\n",
+                "{\"type\":\"TurnBegin\",\"user_input\":\"hello\",\"ts\":1}\n",
+                "{\"type\":\"TurnEnd\",\"ts\":2}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_kimi_live_store_title(&home, session_id),
+            None,
+            "the measured 1.50.0 store has no title key: say so, do not pretend",
+        );
+        // The flip-back: a title on the metadata line is served.
+        std::fs::write(
+            dir.join("wire.jsonl"),
+            "{\"type\":\"metadata\",\"protocol_version\":\"1.10\",\"title\":\"Count to twelve\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kimi_live_store_title(&home, session_id).as_deref(),
+            Some("Count to twelve"),
+            "the day kimi writes titles the reader serves them, no edit needed",
+        );
+        // A top-level title wins; an id-shaped value is not a title.
+        std::fs::write(
+            dir.join("wire.jsonl"),
+            concat!(
+                "{\"type\":\"event\",\"title\":\"kimi-title-session-1\"}\n",
+                "{\"type\":\"event\",\"title\":\"Top level\"}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_kimi_live_store_title(&home, session_id).as_deref(),
+            Some("Top level"),
+            "an id-shaped value is not a title",
         );
         let _ = std::fs::remove_dir_all(&home);
     }
