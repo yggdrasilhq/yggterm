@@ -31700,7 +31700,36 @@ will re-verify if it ever recurs.
 
 ## ⛔ [11.148] A FRESH (NO `--session`) WRAPPER OPENCODE ROW GETS A DUPLICATE KEEP-ALIVE MIRROR TWIN — THE TAB-SYNC OWNS SESSIONS ONLY THROUGH THE "Tab Session Id" ROW METADATA, WHICH ONLY THE MIRROR'S OWN SPAWN PATH WRITES, SO THE WRAPPER ROW'S POST-HOC DISCOVERY (`session_id`, AUTHORITATIVE) IS INVISIBLE TO IT AND THE SESSION READS UN-OWNED (measured live 2026-09-19, the muse lab host, lane/integration/oc-bind-proof; claim ACK-ac4fedcd57)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+FIXED IN CODE 2026-09-19 (lane/integration/oc-1148-twin-retract, a zcode seat on
+the muse lab host, work FROM dev; claim ACK-9ad617aa6d): the reader-side fix,
+ONE BOOK — `mirror_tab_session_id` gained the row plane's own `session.id` as
+the THIRD ownership arm (`ses_`-prefixed, kind OpenCode): a wrapper pin, a
+rebound anchor and a mirror row all carry the ses id there, and the id
+survives a daemon restart where metadata historically does not. `OwnedTab`
+gained `mirror_owned` (key shape `opencode-runtime://` or the Source stamp —
+the computed-but-unused `is_mirror` became load-bearing, MINUS its ses_-prefix
+arm, which would have read a wrapper pin as a projection). Guards this forces:
+`retire` and the title-sync apply to mirror projections ONLY (a wrapper row is
+never auto-closed or retitled by the mirror); focus-follow follows projections
+only; the authoritative row wins the owned slot when twin and wrapper coexist.
+NEW RETRACT ARM: a twin whose session is in `pinned_stable` (live non-mirror
+rows' pins, EXCLUDING the anchor — the anchor's bound id follows the human's
+viewed tab, and retracting on it would flap a projection per tab switch) is
+found at its deterministic spawn key, confirmed a Source-stamped projection,
+skipped if ENGAGED (an opened twin is a real second window on a multi-native
+CLI), and removed via `remove_live_session` — which drops NO tombstone, so the
+keep-alive projection legitimately returns if the pinning row later dies; only
+user closes veto. Named trace `mirror_twin_retracted_pinned_elsewhere`;
+`tick_state` carries `plan_retract`. Tests: 5 new `twin_retract_tests` + the id
+arm in `adoption_tests`; full server-lib delta vs clean main 01cde218 = +6
+green, failure set byte-identical (the 11 pre-existing reds). THE OBSERVATION
+THAT FALSIFIES THE FIX: a fresh (no `--session`) wrapper opencode 2.0.9 row
+driven through a real turn on the muse lab host spawns NO `opencode-runtime://`
+twin row (rail shows exactly one row per session), and a twin that exists when
+the pin lands is gone by the next tick with `mirror_twin_retracted_pinned_elsewhere`
+on the trace plane.
 
 The measured birth, minute-precision: wrapper row `local://2bcd5a95…` launched 12:39:33 local with NO session id (fresh launch — there is nothing to pin yet); the one-shot turn created service session `ses_f477cab07ffeBVe7OurGNbnhn5` at 12:43:29 (service plane `time.created`); the NEXT tab-sync tick at 12:43:33 (4 s later, `tab_sync` detail `spawned: 1`) spawned a mirror row `opencode-runtime://ses_f477cab0…` for it — the sync's ownership read is `owned_tabs_from`, which takes the ses id ONLY from a row's `"Tab Session Id"` metadata (`TAB_SESSION_ID_METADATA`), and that label is written only by the mirror's own spawn path (opencode_mirror.rs:526/580); the wrapper row's post-hoc discovery writes `session_id` (`session_kind_source: "authoritative"` in the rows plane) but NO metadata, so the service session read un-owned and the sync did what it is built to do. The bind settles later (a later 12th-tick `tab_sync` shows `focus: ses_f477cab0…`), but the twin is NEVER retracted: TWO keep-alive rail rows for ONE TUI, both whose detail label claims "the daemon owns the PTY". The [11.144]-era twins (`ses_f485d795…`, `ses_f48c6139…`, `ses_f48d29a7…`; births at the 06:30/06:43/08:38 tab_sync ticks) are the same class — proof seats removed their wrapper rows and the mirror kept the projections. Sharp edges: (a) the twin is what carries the bind-check pin, so [11.134]'s check plans from the twin, not the terminal row; (b) removing either row leaves the other; the tombstone veto only remembers closed rows. Repair shape: teach `owned_tabs_from` (or the wrapper bind path) the row plane's own `session_id` discovery — one book, not two — and retract a twin whose session a live wrapper row already pins. All four twins were removed + tombstoned in the proof sitting (veto set 6→10); rail verified clean.
 
