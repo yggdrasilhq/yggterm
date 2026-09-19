@@ -36723,10 +36723,12 @@ mod tests {
              so the follower and the audit key their store reads by the SAME id"
         );
         assert!(
-            !body.contains("live_session_views()"),
+            !body.contains(".live_session_views()"),
             "the chore must not read candidates from live_session_views(): \
              a view id can diverge from the persisted record id on a rebound \
-             row (the measured [11.86] two-wires fault)"
+             row (the measured [11.86] two-wires fault). The needle is the \
+             CALL shape — the body's own history comment names the verb in \
+             prose, and prose is not a regression."
         );
         assert!(
             body.contains("live_session_title_resolved"),
@@ -38736,13 +38738,20 @@ mod tests {
             Some(AgentResumeHolderKind::StrandedYggtermOwned),
         );
 
-        // ⛔ A marker naming a DIFFERENT row stays external. A user who typed
-        // `claude --resume <this session>` inside some other yggterm shell row
-        // really would race us, and "it is inside yggterm somewhere" is not the
-        // question being asked.
+        // ⛔ A marker naming a DIFFERENT row is STILL ours-stranded, not
+        // external (the [11.145] test-law update): the marker proves BIRTH,
+        // never the session name — newer integrations stamp the marker with
+        // the ROW's runtime uuid (`opencode-runtime://<row-uuid>`) while the
+        // process holds `ses_…`, so demanding the marker name the session
+        // classified every orphan of that family external and the stranded-
+        // orphan reap never armed (measured live 2026-09-05, the all-CLI
+        // orphan-refusal plague). Which session the process holds is the
+        // ARGV gate's question — it ran first, and this argv names THIS
+        // session — so a yggterm-born process holding our session is ours to
+        // reap no matter which row's marker it carries.
         assert_eq!(
             holder(Some("local://0e96c07d-cc0e-45ec-b04a-5da4186752a5")),
-            Some(AgentResumeHolderKind::External),
+            Some(AgentResumeHolderKind::StrandedYggtermOwned),
         );
 
         // A process that is not this session's resume at all is not a holder.
@@ -40431,6 +40440,18 @@ mod tests {
         unsafe {
             std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
         }
+        // ⛔ THE STORE TIER READS THE USER HOME (2026-09-04, measured: the
+        // vouch must see the db opencode2 actually writes —
+        // $HOME/.local/share/opencode — not resolve_yggterm_home(), which
+        // answered none on every live restore). The fixture db this test
+        // plants is therefore only reachable when HOME itself points at the
+        // scratch home for the ensure — the sanctioned HOME injection, held
+        // under both env locks so the other HOME-setting test cannot race it.
+        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
+        let previous_user_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
         let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
             .expect("fixture store");
         conn.execute_batch(
@@ -40476,6 +40497,16 @@ mod tests {
             )
             .expect("ensure the stampless anchor");
 
+        if let Some(previous_user_home) = previous_user_home {
+            unsafe {
+                std::env::set_var("HOME", previous_user_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        drop(_codex_home_guard);
         if let Some(previous_home) = previous_home {
             unsafe {
                 std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
@@ -40643,14 +40674,47 @@ mod tests {
 
         assert_eq!(ensured, anchor_key);
         let session = server.sessions.get(&anchor_key).expect("anchor row");
+        // ⛔ THE PICKER ARM IS THE DEGRADE (the [11.145] test-law update): a
+        // self-minting kind's absent store answer composes the CLI's OWN
+        // resume picker — opencode's tokens are the bare `--session` flag
+        // (`resume_picker_tokens`, pinned id-free in core) — not a fresh
+        // `--auto` launch. The compose may also NAME the phantom in the
+        // picker notice ("saved session <id> was not found") — naming is
+        // not resuming. The law this lock guards is about the ID: `--session`
+        // must never CARRY one (the store never held it; a bare flag is the
+        // CLI's own picker surface — [11.134] measured what a value does).
+        for shape in [
+            format!("--session {anchor_id}"),
+            format!("--session '{anchor_id}'"),
+            format!("--session=\"{anchor_id}\""),
+            format!("--session={anchor_id}"),
+        ] {
+            assert!(
+                !session.launch_command.contains(&shape),
+                "a phantom id must never be composed as an opencode resume: {}",
+                session.launch_command
+            );
+        }
+        let exec_tail = session
+            .launch_command
+            .rsplit("&&")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let tokens: Vec<&str> = exec_tail.split_whitespace().collect();
+        let flag_at = tokens
+            .iter()
+            .position(|token| token.trim_matches('\'') == "--session");
         assert!(
-            !session.launch_command.contains("--session"),
-            "a phantom id must never be composed as an opencode resume: {}",
+            flag_at.is_some(),
+            "the picker arm lost its resume surface: {}",
             session.launch_command
         );
-        assert!(
-            !session.launch_command.contains(anchor_id),
-            "the degraded fresh launch must not carry the phantom: {}",
+        assert_eq!(
+            flag_at.unwrap() + 1,
+            tokens.len(),
+            "--session must stay id-less in the picker degrade: {}",
             session.launch_command
         );
     }
@@ -43081,6 +43145,25 @@ mod tests {
             .spawn()
             .expect("spawn the stand-in TUI process");
         let pid = child.id();
+        // ⛔ THE FORK/EXEC RACE: between fork and exec, /proc/<pid>/cmdline
+        // still shows the FORKING PARENT's image (this test binary's own
+        // argv, which names no session). The walk is only meaningful once
+        // the child IS the stand-in TUI, so wait for the exec to land
+        // (bounded) before walking — a fast walk on a slow exec read the
+        // wrong image and the test flapped red on loaded hosts ([11.145]).
+        let exec_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                .unwrap_or_default();
+            if cmdline.starts_with("python3") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < exec_deadline,
+                "the stand-in process never exec'd python3"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let walked = agent_runtime_session_id_from_root_pid(SessionKind::OpenCode, pid);
         let _ = child.kill();
         let _ = child.wait();

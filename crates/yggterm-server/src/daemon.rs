@@ -29525,16 +29525,30 @@ mod same_version_bequest_locks {
     /// this.
     #[test]
     fn a_forced_same_version_handoff_is_never_deferred() {
-        let source = include_str!("daemon.rs");
-        let block_at = source
-            .find("if same_version_target && !force {")
-            .expect("the !force refusal branch exists");
-        let block = &source[block_at..block_at + 12_000];
+        // ⛔ Scan the PRODUCT source (test modules stripped): this lock's own
+        // text carries every needle it looks for, so the old raw
+        // include_str! window self-matched the moment its anchor drifted out
+        // of the handler — it spent weeks red on main reading its own
+        // assertion strings ([11.145]). `fn handle_request(` is unique in
+        // the product source, so the body window is the real dispatcher.
+        let product = super::tests::daemon_product_source();
+        let block = super::tests::daemon_fn_body(&product, "fn handle_request(");
         assert!(
             block.contains("same_version_bequest_preserving_handoff"),
             "the forced same-version branch lost its fall-through to the \
              preserving arm — same-version builds will pin behind the idle \
              gate again (the GUI-host hang of 2026-09-03)"
+        );
+        // The [11.137] law, pinned where it can bite: the UNFORCED refusal
+        // is gone too — the deploy fires this door unforced by design, so a
+        // `!force` gate on the same-version branch refuses every
+        // same-version lane merge while runtimes live (and on this fleet,
+        // runtimes always live).
+        assert!(
+            !block.contains("same_version_target && !force"),
+            "an unforced-only refusal gate is back on the same-version branch \
+             — [11.137] falsified it live on the GUI host (the deploy fires \
+             this door unforced by design)"
         );
         assert!(
             !block.contains("same-version swap deferred at the idle gate"),
@@ -30255,8 +30269,13 @@ mod tests {
     /// This file with its `#[cfg(test)]` module stripped, through the
     /// workspace's ONE test-module skip rule. Every structural lock below scans
     /// THIS, so the lock's own text can never satisfy the needles it looks for
-    /// (field guide §7.1, the `unwrap_or(len)` trap).
-    fn daemon_product_source() -> String {
+    /// (field guide §7.1, the `unwrap_or(len)` trap). `pub(crate)`: the
+    /// sibling lock modules (same_version_bequest_locks et al) scan the same
+    /// surface — a raw `include_str!` window in a lock module self-matches
+    /// the moment its anchor drifts out of the handler (the [11.145] red
+    /// `a_forced_same_version_handoff_is_never_deferred` shipped for weeks
+    /// reading its own assertion text).
+    pub(crate) fn daemon_product_source() -> String {
         yggterm_core::agent_cli::product_lines(include_str!("daemon.rs"))
             .into_iter()
             .map(|(_index, line)| line)
@@ -30268,7 +30287,7 @@ mod tests {
     /// `fn` at the same indentation. The residual seam for wiring a test
     /// cannot call (field guide §7.1) — used only where the alternative is a
     /// live `DaemonRuntime`.
-    fn daemon_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    pub(crate) fn daemon_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
         source
             .split(signature)
             .nth(1)
@@ -30740,11 +30759,19 @@ mod tests {
         // the working-flags owner resolution must check the resolved owner
         // against self and PURGE a self-alias, because the census's
         // discovery-time drop cannot see an alias created at adoption time.
-        let source = include_str!("daemon.rs");
-        let resolve_at = source
-            .find("// The registry first: it is authoritative and free.")
-            .expect("the owner-resolution loop must still exist");
-        let resolve_scope = &source[resolve_at..resolve_at + 3_000];
+        // ⛔ Scanned on the PRODUCT source through the enclosing function's
+        // real body (`daemon_fn_body`, test modules stripped): the old raw
+        // include_str! + fixed 3,000-byte window drifted past the purge arm
+        // when the arm grew its own trace event, and the lock ran red for
+        // days while the code was CORRECT ([11.145]; the 2026-09-11
+        // "environment-sensitive" filing was this byte window, not the
+        // machine). The purge is asserted inside
+        // `working_flags_including_proxied` — the one fn that owns the loop.
+        let product = daemon_product_source();
+        let resolve_scope = daemon_fn_body(
+            &product,
+            "fn working_flags_including_proxied(",
+        );
         assert!(
             resolve_scope.contains("server_endpoints_same_target(&owner, &own_endpoint)"),
             "the owner-resolution loop lost its use-time self-alias check — \
