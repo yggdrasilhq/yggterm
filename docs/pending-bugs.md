@@ -31520,7 +31520,7 @@ override via `YGGTERM_DAEMON_IDLE_SHUTDOWN_MS` on row-heavy hosts
 (config, no code); (d) shorter default with the dying-rows ledger write
 as the only persistence (today's behavior). Owner GO pending.
 
-## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
+## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL) — BOTH SWEEPS LANDED 2026-09-19 (server leg lane/integration/11145-reds, shell leg lane/integration/11145-shell-reds): 19 of the 21 die with named causes, shell is 2147/0; the remainder is the stamp (owner GO) + the [11.54] install-promote
 
 **Status:** OPEN
 
@@ -31766,11 +31766,60 @@ registration landed daemon arms without its SHELL arms (the spec §6 A6
 class, third instance of the registration-gap family). Local +
 remote-devin:// rows filled with the standard remote axes; the fixture id
 is slug-shaped per the measured sessions.db law (`brass-lantern`, not a
-uuid). The other 9 shell reds are pre-existing with failure sets
-byte-identical to clean main and are NOT diagnosed by this leg — cause
-sweep owed, other owners (counted shellstate writes ×2, generated-session
-copy, markdown adapter, web-surface immersion ×2, reclaim ×2, webtabs
-menu heading).
+uuid). The other 9 shell reds were left undiagnosed by this leg — the SHELL
+SWEEP leg (below) took them the same night.
+
+**SHELL SWEEP (2026-09-19 night, lane/integration/11145-shell-reds, a
+zcode seat on the muse lab host, work FROM dev; claim ACK-f54d2ac46c): the
+remaining 9 shell reds FIXED, each with a named cause. Baseline re-measured
+on the lane (= origin/main 4ba97b34): shell 9 / server 1 (the stamp) / core
+1 ([11.54]) — failure sets byte-identical to the red sweep's record.**
+
+1.+2. `every_shellstate_write_goes_through_a_counted_wrapper` +
+   `no_uncounted_raw_write_to_shell_state_survives_in_this_file` —
+   PRODUCT DRIFT, not test rot: two raw `state.with_mut(` writes (the
+   sidebar policy-fetch rearm, the appearance-failure path) bypassed the
+   counted wrapper, invisible to the storm autopsy. Both routed through
+   `with_mut_counted`; the raw-site count is back to the sanctioned 3.
+3. `supports_generated_session_copy_accepts_local_stored_session_paths` —
+   TEST LAW SUPERSEDED TWICE: the check collapsed to its one owner
+   (`yggterm_server::session_accepts_generated_copy`, f90c3a47) and the
+   Honor Law (owner, 2026-09-10) took agent rows off the interface-titling
+   table for good — a Shell-kind fixture is now CORRECTLY rejected. The
+   lock is rewritten as the gate's one surviving accept case: a Document
+   row (`supports_generated_session_copy_accepts_a_document_row`).
+4. `the_markdown_adapter_owns_no_typography_of_its_own` — ANCHOR DRIFT:
+   the adapter grew the link-click contract and its name with it
+   (`md_inline_nodes_linked`, f5a54ddc); the lock follows the rename; the
+   adapter body itself is still typography-free (the delegation to
+   `yggui::prose` held).
+5. `the_chrome_gate_is_fed_by_the_engine_and_worn_by_every_surface` —
+   BYTE-WINDOW NEEDLE: the shown-predicate wrapped onto one line in the
+   product; the needle bound the historical two-line form.
+6. `the_placement_rule_is_wired_to_the_reconciler_and_the_render` — same
+   class: the `web_surface_place_page_rect` call collapsed to one line.
+7. `the_reconcile_loop_still_sweeps_surfaces_whose_row_was_closed_
+   elsewhere` — same class: the refusal guard wrapped across lines and
+   grew a trailing comma.
+   5+6+7 FIX: a shared `seam_contains` matcher (whitespace-stripped
+   substring — argument tokens exact, line wrapping free) now carries the
+   seam needles in both lock modules. The exactness law is unchanged: any
+   token change still reds; only the wrapping stops mattering.
+8. `the_reclaim_pass_call_site_is_wired_to_the_live_machine` — EXACT
+   VECTOR SUPERSEDED by 34f4a23a (reap unfocused hidden pages sooner):
+   the caller now owns the FOCUS split (`if window_focused { configured }
+   else { web_surface_unfocused_background_hold_ms(configured) }` for
+   BOTH holds) while the pass still owns pressure — the seam's substance
+   (live readings in, no re-derivation) is intact. The vector is updated
+   to the new shape with the focus law named.
+9. `a_menu_heading_says_only_what_the_row_underneath_it_cannot` —
+   BYTE-WINDOW NEEDLE: the title else-arm was re-indented one level deeper
+   by the surrounding edit; matched via `seam_contains` now.
+
+Proof: shell 2147 passed / 0 failed (was 2138/9); server and core failure
+sets byte-identical to clean main (protocol stamp = owner GO pending,
+install-promote = [11.54]). The shell remainder of [11.145] is CLOSED with
+this leg; the stamp re-stamp stays the entry's one open half.
 
 ## ⛔ [11.152] A YOUNG SUCCESSOR'S HANDOFF PATH COMMITS THE DESCRIPTOR AND THEN NEVER ADOPTS AND NEVER ACKS — THE QUEUED FD IS DROPPED WITH THE STREAM, THE PTY MASTER CLOSES, AND THE ROW'S SHELL DIES SIGHUP; THE SPAWN-ARM SWEEP THAT TRUSTED A BOUND LISTENER KILLED A LIVE ROW AND WAS REVERTED (measured live 2026-09-19, fresh scratch home on a fleet host, production 2a4acc64; the [11.151] repair leg, claim ACK-83597c3317 lineage)
 

@@ -9459,12 +9459,24 @@ mod web_surface_reclaim_locks {
                 // nothing, which is the reading that lets a comfortable machine
                 // keep the page. It takes no pressure argument: the PASS owns
                 // that, and a caller that could pre-apply pressure here is a
-                // second encoding of the rule.
-                "web_surface_background_hold_ms(),",
-                // ...and the TAB hold, its own knob. Passing the session hold
-                // twice would silently give background tabs the session
-                // schedule, which is exactly the knob this lane added.
-                "web_surface_tab_background_hold_ms(),",
+                // second encoding of the rule. The caller owns the FOCUS split
+                // (34f4a23a, reap unfocused hidden pages sooner): a focused
+                // window hands over the configured reading untouched, an
+                // UNFOCUSED window the shortened unfocused hold.
+                "if window_focused {",
+                "configured_hold_ms",
+                "} else {",
+                "web_surface_unfocused_background_hold_ms(configured_hold_ms)",
+                "},",
+                // ...and the TAB hold, its own knob, through the same focus
+                // split. Passing the session hold twice would silently give
+                // background tabs the session schedule, which is exactly the
+                // knob this lane added.
+                "if window_focused {",
+                "configured_tab_hold_ms",
+                "} else {",
+                "web_surface_unfocused_background_hold_ms(configured_tab_hold_ms)",
+                "},",
                 // The reclaim DOMAIN: (session, tab) candidates with the reason
                 // that produced each one.
                 "&backgrounded,",
@@ -10915,13 +10927,13 @@ mod web_surface_reclaim_locks {
             // ...and the SAME conjunction `web ensure` revives on. An owner that
             // cannot be reached is Unknown and keeps its surfaces.
             "web_ensure_closed_session_check(endpoint, &trace_home, &session_path).await",
-            "if !web_ensure_refuses_closed_session(&check.runtime, check.row_close_remembered)",
+            "if !web_ensure_refuses_closed_session(&check.runtime, check.row_close_remembered,)",
             // ONE teardown owner, the same one the local close path uses.
             "shell.tear_down_web_surfaces_for_closed_session(",
             "WEB_SURFACE_ROW_CLOSED_ELSEWHERE,",
         ] {
             assert!(
-                sweep.contains(needle),
+                seam_contains(&sweep, needle),
                 "the stranded sweep no longer does `{needle}`:\n{sweep}",
             );
         }
@@ -17021,7 +17033,7 @@ async fn web_ensure_await_policy_gate(
             WebEnsurePolicyGateStep::RearmFetch => {
                 rearmed_already = true;
                 if let Some(version) =
-                    state.with_mut(|shell| shell.rearm_abandoned_sidebar_policy_fetch(session_path))
+                    state.with_mut_counted(|shell| shell.rearm_abandoned_sidebar_policy_fetch(session_path))
                 {
                     app_policy_fetch(state, session_path.to_string(), version, trace_home.clone())
                         .await;
@@ -72056,7 +72068,7 @@ async fn app_appearance_fetch(
             });
         }
         Err(error) => {
-            let exhausted = state.with_mut(|shell| {
+            let exhausted = state.with_mut_counted(|shell| {
                 shell.fail_sidebar_appearance(&session_path, &appearance_version)
             });
             append_trace_event(
