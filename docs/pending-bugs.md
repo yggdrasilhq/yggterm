@@ -31829,6 +31829,33 @@ remote-scan has advertised this session to), or the home plane asking the
 peer one existence question before the first mount of a restored remote row.
 
 
+FIX IN CODE (2026-09-20, lane/integration/11155-peer-close-notice): the home
+plane now ASKS before it mounts. The ensure funnel's remote-agent arm puts one
+structured existence question to the peer's OWN CLI store
+(`fetch_remote_saved_agent_session_exists`, the per-kind verb the resume
+wrapper itself answers to) for every remote agent row whose runtime is not
+running locally, BEFORE the mount is spent. A confident NO closes the row
+through THE one close path with a new honest departure reason
+`PeerSessionGone` ("peer-session-gone"; tombstone veto + departure, so no
+passive birth re-births it — the [11.154] plane), names the learning on the
+trace (`remote_saved_session_peer_close_learned`), skips the pointless
+remote-shutdown dispatch (`peer_gone_close_skips_remote_shutdown`), and
+refuses the mount by name. Everything else is NOT evidence and keeps
+today's flow: a transport error (`remote_saved_session_peer_close_probe_inconclusive`),
+a kind whose existence verb the peer cannot answer, and
+start-born rows (id minted at birth — the store never heard of it; the
+launch-path probe law applies). The [11.153] memo stays as the in-flight
+backstop and the heal law is untouched: a peer store that answers PRESENT
+keeps the row and the mount proceeds. Locks: the gate order pinned
+(`the_peer_close_gate_asks_before_it_mounts_and_only_a_confident_no_closes`);
+the close-path / despawn / reap / remote-close-site locks moved to the
+parameterized signature, invariants unchanged. Suite delta vs clean main
+54895083: server-lib 1537/1 -> 1539/1 (+2 green: the gate lock +
+`a_kind_without_an_existence_verb_is_never_absent`), failure set
+byte-identical (the owner-gated stamp red only). LIVE PROOF OWED: the
+falsifier drive — a peer-only close must leave the home with neither a
+spawn against the dead peer nor the row itself, with the named trace.
+
 ## ⛔ [11.157] AN SSH ROW'S STORED-OPEN KEEPS THE SHELL ARM'S FOSSIL — THE COMPOSER THAT USED TO SYNTHESIZE `codex resume` FOR SHELL ROWS STILL HANDS IT TO SSH ROWS (filed 2026-09-20, the [11.156] close; UNMEASURED)
 
 **Status:** OPEN
