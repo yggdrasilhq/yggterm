@@ -1067,6 +1067,21 @@ pub fn live_row_closes_remembered_among<'a>(
         .collect()
 }
 
+/// The identity fields a deliberate close remembered for `path`'s row — the
+/// stored-open re-open door's data source ([11.156]): a closed local row is
+/// re-derived from its close record, never synthesized from the key's shape.
+/// A fresh load, not the daemon's cache: the close may have landed on a peer
+/// daemon after we booted, and [`live_row_closes_remembered_among`] already
+/// established that an answer off this plane is only as good as its freshness.
+pub(crate) fn live_row_closed_identity(
+    home_dir: &std::path::Path,
+    path: &str,
+) -> Option<crate::live_row_tombstones::ClosedRowIdentity> {
+    let now = crate::live_row_tombstones::now_secs();
+    let tombstones = crate::live_row_tombstones::LiveRowTombstones::load(home_dir, now);
+    tombstones.closed_row_identity(&normalized_live_row_identity(path))
+}
+
 /// The write-side twin of [`live_row_closes_remembered_among`]: a door that
 /// just REFUSED a row on the tombstone plane re-arms the close, so an offerer
 /// that never stops offering cannot wait out the TTL (the 2026-09-19
@@ -5603,8 +5618,13 @@ impl YggtermServer {
                 .map(ToOwned::to_owned)
                 .or_else(|| agent_store_session_id_for_path(path))
                 .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
+            let entry_cwd = session_metadata_value(entry, "Cwd");
             let resolved_cwd = cwd
                 .map(ToOwned::to_owned)
+                // The row's own Cwd stamp outranks the path guess: a held
+                // entry knows where it lived even when the path is a scheme
+                // key with no directory ([11.156] class).
+                .or(entry_cwd)
                 .unwrap_or_else(|| session_preview_cwd(path));
             entry.launch_command = stored_session_launch_command_for_locality(
                 kind,
@@ -9175,6 +9195,11 @@ impl YggtermServer {
                         // somebody asking why their row is gone, and without this
                         // the ledger sends them back to a rotating trace.
                         detail: Some(reason.to_string()),
+                        // A persist drop is not a user close; it carries no
+                        // re-open identity, and the re-open door never asks one
+                        // for it ([11.156] consults ExplicitClose records only).
+                        kind: None,
+                        cwd: None,
                     },
                 );
             }
@@ -36001,7 +36026,20 @@ fn stored_session_launch_command_from_vouch(
             None => claude_code_fresh_launch_command_with_options(Some(cwd), session_id, launch),
         },
         SessionKind::Document => "document web view".to_string(),
-        SessionKind::Shell | SessionKind::SshShell => format!(
+        SessionKind::Shell => {
+            // ⛔ The `cd <cwd> && codex resume <id>` this arm emitted was the
+            // pre-descriptor era speaking (every stored row was codex-flavored
+            // 2.0.9 code): a re-opened SHELL row's ensured launch was bash
+            // refusing a bogus cd — the [11.156] measured defect. The honest
+            // stored-open of a shell row is the born form; the cwd rides the
+            // spawn (the pty is given the session's cwd), never the string.
+            local_interactive_shell_launch_command(&local_interactive_shell_program())
+        }
+        // ⚠ SshShell keeps the fossil line UNMEASURED: an ssh re-open degrades
+        // the same way and the honest attach needs the ssh target, which this
+        // composer is not given. Named residual in [11.156], deliberately not
+        // half-fixed.
+        SessionKind::SshShell => format!(
             "cd {} && codex resume {}",
             shell_single_quote(cwd),
             session_id
@@ -36589,6 +36627,13 @@ fn session_preview_tone(role: TranscriptRole) -> PreviewTone {
 }
 
 fn session_preview_cwd(path: &str) -> String {
+    // A SCHEME key names no filesystem parent: the "parent" of `local://<uuid>`
+    // is the string `local:/`, and a row whose cwd said `local:/` painted
+    // bash's refusal as its first frame ([11.156]). A key with no directory
+    // falls back to the same home default a born row takes.
+    if path.contains("://") {
+        return local_default_cwd();
+    }
     let trimmed = path.trim_end_matches('/');
     let parent = trimmed
         .rsplit_once('/')
@@ -36622,6 +36667,38 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scheme_key_never_previews_as_a_scheme_root_cwd() {
+        // [11.156]: the "parent" of local://<uuid> used to come back as the
+        // string `local:/`, and a re-opened row cd'd into it and died.
+        let previewed = session_preview_cwd("local://0e96c07d-cc0e-45ec-b04a-5da4186752a5");
+        assert!(
+            !previewed.contains("local:"),
+            "a scheme key must never preview as a scheme root, got {previewed}"
+        );
+        assert_eq!(previewed, local_default_cwd());
+    }
+
+    #[test]
+    fn a_shell_stored_open_launches_a_shell_never_a_codex_resume() {
+        // [11.156]: the Shell arm of the stored-open launch composer was a
+        // 2.0.9-era fossil that handed `codex resume` to shell rows.
+        let command = stored_session_launch_command_from_vouch(
+            SessionKind::Shell,
+            "/tmp/ygg-1156-proof",
+            "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
+            true,
+            &AgentLaunchOptions::default(),
+            None,
+        );
+        assert!(
+            !command.contains("codex resume"),
+            "a shell row's stored-open must never name a codex resume, got {command}"
+        );
+        let expected = local_interactive_shell_launch_command(&local_interactive_shell_program());
+        assert_eq!(command, expected);
+    }
 
     #[test]
     #[cfg(unix)]

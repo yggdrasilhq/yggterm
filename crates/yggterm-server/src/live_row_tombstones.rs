@@ -200,6 +200,18 @@ pub struct LiveRowDeparture {
     /// an invented one would be worse than none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The row's kind and cwd AT the close, when the departing session was
+    /// still resolvable. This is the identity half of a close: the stored-open
+    /// of a closed local row re-derives the row from this record instead of
+    /// guessing from the key's shape — the [11.156] measured defect (a shell
+    /// row re-opened as `cd 'local:/' && codex resume <id>`). `Option` +
+    /// serde default so records written before these fields read unchanged,
+    /// and an older daemon writing the file only loses re-open fidelity,
+    /// never a veto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -224,6 +236,17 @@ pub struct LiveRowTombstones {
     /// costs history and never costs a veto.
     #[serde(default)]
     departures: Vec<LiveRowDeparture>,
+}
+
+/// The identity a deliberate close remembered about a row: enough to
+/// re-derive what the user closed — its kind, its cwd, the title it carried
+/// ([11.156]). `kind` travels as the string `SessionKind` serializes to and
+/// is parsed at this edge, so a caller never sees a kind-shaped string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedRowIdentity {
+    pub kind: Option<yggterm_core::SessionKind>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
 }
 
 impl LiveRowTombstones {
@@ -365,6 +388,26 @@ impl LiveRowTombstones {
         let mut ordered = self.departures.clone();
         ordered.sort_by(|left, right| right.at.cmp(&left.at));
         ordered
+    }
+
+    /// The newest deliberate close (`RowDeparture::ExplicitClose`) recorded
+    /// for `identity`, as identity fields. A stored-open of a closed local row
+    /// consults this instead of synthesizing a row from the key alone;
+    /// `None` means the close carried no usable identity — an older record, a
+    /// departure that was not a user close — and the caller must refuse by
+    /// name rather than guess ([11.156]).
+    pub fn closed_row_identity(&self, identity: &str) -> Option<ClosedRowIdentity> {
+        let departure = self.departures.iter().rev().find(|departure| {
+            departure.identity == identity && departure.reason == RowDeparture::ExplicitClose
+        })?;
+        Some(ClosedRowIdentity {
+            kind: departure
+                .kind
+                .as_deref()
+                .and_then(|kind| serde_json::from_str(kind).ok()),
+            cwd: departure.cwd.clone(),
+            title: (!departure.title.trim().is_empty()).then(|| departure.title.clone()),
+        })
     }
 
     fn push_departure(&mut self, departure: LiveRowDeparture) {
@@ -604,6 +647,8 @@ mod tests {
                     reason: RowDeparture::GuiCloseDisposable,
                     at: 1_000,
                     detail: None,
+                    kind: None,
+                    cwd: None,
                 },
             )
             .expect("record the departure");
@@ -641,6 +686,8 @@ mod tests {
             reason: RowDeparture::ExplicitClose,
             at: 10,
             detail: None,
+            kind: None,
+            cwd: None,
         });
         ledger.push_departure(LiveRowDeparture {
             identity: "id::row".to_string(),
@@ -649,6 +696,8 @@ mod tests {
             reason: RowDeparture::GuiCloseDisposable,
             at: 20,
             detail: None,
+            kind: None,
+            cwd: None,
         });
 
         assert!(ledger.clear("id::row"));
@@ -870,5 +919,61 @@ mod tests {
         assert!(!tombstones.blocks("id::row-0000", 0));
         assert!(!tombstones.blocks("id::row-0004", 0));
         assert!(tombstones.blocks("id::row-0005", 0));
+    }
+
+    /// [11.156]: the identity half of a close. A deliberate close remembers
+    /// the row's kind/cwd/title so the stored-open re-open door can re-derive
+    /// the row instead of guessing from the key's shape; the newest
+    /// ExplicitClose wins; a departure that is not a user close never answers.
+    #[test]
+    fn a_deliberate_close_remembers_the_rows_identity_for_the_reopen_door() {
+        let mut ledger = LiveRowTombstones::default();
+        ledger.push_departure(LiveRowDeparture {
+            identity: "id::shell".to_string(),
+            path: "local://shell".to_string(),
+            title: String::new(),
+            reason: RowDeparture::GuiCloseDisposable,
+            at: 10,
+            detail: None,
+            kind: None,
+            cwd: None,
+        });
+        ledger.push_departure(LiveRowDeparture {
+            identity: "id::shell".to_string(),
+            path: "local://shell".to_string(),
+            title: "proof shell".to_string(),
+            reason: RowDeparture::ExplicitClose,
+            at: 20,
+            detail: None,
+            kind: Some(serde_json::to_string(&yggterm_core::SessionKind::Shell).unwrap()),
+            cwd: Some("/tmp/ygg-1156-proof".to_string()),
+        });
+
+        let remembered = ledger
+            .closed_row_identity("id::shell")
+            .expect("the deliberate close remembers the row's identity");
+        assert_eq!(remembered.kind, Some(yggterm_core::SessionKind::Shell));
+        assert_eq!(remembered.cwd.as_deref(), Some("/tmp/ygg-1156-proof"));
+        assert_eq!(remembered.title.as_deref(), Some("proof shell"));
+
+        // A row that was never deliberately closed answers None — the re-open
+        // must refuse by name, not borrow a GuiCloseDisposable record.
+        assert!(ledger.closed_row_identity("id::absent").is_none());
+
+        // An older-format record (no identity fields on disk) still loads and
+        // answers with what it has; the caller's guard treats that as
+        // underdetermined rather than guessing.
+        let legacy = serde_json::from_str::<LiveRowTombstones>(
+            "{\"entries\":{},\"departures\":[{\"identity\":\"id::old\",\
+             \"path\":\"local://old\",\"title\":\"old row\",\"reason\":\
+             \"explicit-close\",\"at\":5}]}",
+        )
+        .expect("an older record without the identity fields still loads");
+        let old = legacy
+            .closed_row_identity("id::old")
+            .expect("the close is still a deliberate close");
+        assert_eq!(old.kind, None);
+        assert_eq!(old.cwd, None);
+        assert_eq!(old.title.as_deref(), Some("old row"));
     }
 }

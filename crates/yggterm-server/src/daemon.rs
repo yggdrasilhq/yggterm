@@ -11033,11 +11033,21 @@ impl DaemonRuntime {
             return;
         };
         let identity = crate::normalized_live_row_identity(&key);
-        let title = self
+        // The identity half ([11.156]): kind + cwd ride the departure record
+        // so a re-open can re-derive the row instead of guessing from its key.
+        // `None`s are honest — a departure whose session is already gone (the
+        // persist-drop reasons) remembers less, never wrong.
+        let (title, kind, cwd) = self
             .server
             .resolve_live_session_entry(&key)
-            .map(|(_resolved, session)| session.title)
-            .unwrap_or_default();
+            .map(|(_resolved, session)| {
+                (
+                    session.title.clone(),
+                    serde_json::to_string(&session.kind).ok(),
+                    crate::session_metadata_value(&session, "Cwd"),
+                )
+            })
+            .unwrap_or_else(|| (String::new(), None, None));
         let departure = crate::live_row_tombstones::LiveRowDeparture {
             identity: identity.clone(),
             path: key.clone(),
@@ -11047,6 +11057,8 @@ impl DaemonRuntime {
             // A close has no sub-cause: it was closed. Inventing one would make
             // the field lie for the two reasons that do not have one.
             detail: None,
+            kind: kind.clone(),
+            cwd: cwd.clone(),
         };
         let home = self.store.home_dir().to_path_buf();
         match self.live_row_tombstones.record_departure(&home, departure) {
@@ -11059,6 +11071,8 @@ impl DaemonRuntime {
                     "path": key,
                     "identity": identity,
                     "title": title,
+                    "kind": kind,
+                    "cwd": cwd,
                     "reason": reason.label(),
                 }),
             ),
@@ -12070,6 +12084,56 @@ impl DaemonRuntime {
                 title_hint,
                 view_mode,
             } => {
+                // ⛔ [11.156] A stored-open of a LOCAL runtime key that is
+                // neither live nor held is a RE-OPEN of a closed row. The
+                // caller's kind is a guess from the key's shape and carries no
+                // cwd or title; synthesizing a row from the key alone re-opened
+                // a shell row as `cd 'local:/' && codex resume <id>` (measured
+                // 2026-09-20, the muse lab host). The close remembered the
+                // row's kind/cwd/title on the tombstone plane — consult it,
+                // and refuse by name when it holds nothing.
+                let mut session_kind = session_kind;
+                let mut cwd = cwd;
+                let mut title_hint = title_hint;
+                if session_kind != SessionKind::Document
+                    && crate::local_runtime_id_from_key(&path).is_some()
+                    && self.server.resolve_live_session_entry(&path).is_none()
+                    && self.server.session_for_path(&path).is_none()
+                {
+                    let home = self.store.home_dir().to_path_buf();
+                    match crate::live_row_closed_identity(&home, &path) {
+                        Some(recorded) => {
+                            if let Some(recorded_kind) = recorded.kind {
+                                session_kind = recorded_kind;
+                            }
+                            cwd = recorded.cwd.or(cwd);
+                            title_hint = recorded.title.or(title_hint);
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "session",
+                                "live_session_row_reopened_from_close_record",
+                                serde_json::json!({
+                                    "path": path.clone(),
+                                    "kind": format!("{:?}", session_kind),
+                                    "cwd": cwd.clone(),
+                                }),
+                            );
+                        }
+                        None => {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "session",
+                                "live_session_row_open_refused_identity_underdetermined",
+                                serde_json::json!({ "path": path.clone() }),
+                            );
+                            bail!(
+                                "closed_row_identity_underdetermined: {path} is not live, not                                  stored, and its close left no kind/cwd to re-derive the row                                  from — open the row that owns it or create a new row"
+                            );
+                        }
+                    }
+                }
                 let document = if session_kind == SessionKind::Document {
                     self.store.load_document(&path)?
                 } else {
@@ -30611,6 +30675,36 @@ mod tests {
         assert!(
             arm.contains("row_despawned"),
             "the despawn must name itself on the trace"
+        );
+    }
+
+    #[test]
+    fn a_missing_local_row_stored_open_consults_the_close_record_before_birth() {
+        // [11.156]: a stored-open of a closed local row must re-derive the row
+        // from its close record — kind/cwd/title — or refuse by name. It must
+        // never synthesize an identity from the key's shape alone.
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let arm = source
+            .split("ServerRequest::OpenStoredSession {\n                session_kind,")
+            .nth(1)
+            .expect("the OpenStoredSession request arm");
+        let arm = arm
+            .split("ServerRequest::ConnectSsh { target_ix }")
+            .next()
+            .expect("the end of the OpenStoredSession arm");
+        let consult = arm
+            .find("crate::live_row_closed_identity(&home, &path)")
+            .expect("the stored-open must consult the close record for a closed local row");
+        let refuse = arm.find("closed_row_identity_underdetermined").expect(
+            "a close record with no identity must refuse by name, not synthesize a row",
+        );
+        let birth = arm
+            .find("self.server.open_or_focus_session(")
+            .expect("the open must still flow through the one birth funnel");
+        assert!(
+            consult < refuse && refuse < birth,
+            "consult the close record, then refuse the underdetermined, THEN birth — the ordering is the law"
         );
     }
 
