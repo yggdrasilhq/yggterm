@@ -484,6 +484,30 @@ impl HandoffVerdict {
     }
 }
 
+/// The one wording of the boot-readiness refusal: the successor words it, the
+/// predecessor reads it, and the two cannot drift — the same law as
+/// [`crate::terminal::SEAT_CONFLICT_MARKER`].
+///
+/// ⛔ [11.152] A BOUND LISTENER IS NOT AN ADOPTION-CAPABILITY PROOF. The
+/// pty-handoff listener binds ~200 ms into the successor's boot, while the
+/// startup preserved-owner deep reconcile still holds the runtime lock
+/// through its cross-daemon probes; a descriptor committed in that window was
+/// adopted by nobody, dropped with the stream, and the row's shell died
+/// SIGHUP (measured live 2026-09-19). A successor that is not ready says so
+/// HERE — before the commit point, where a refusal is free and the
+/// predecessor may knock again within its boot-retry budget.
+pub(crate) const BOOT_READINESS_MARKER: &str =
+    "successor still starting up: seating not ready yet";
+
+/// True when a pre-commit refusal is the successor's boot-readiness gate: the
+/// descriptor never moved, and the caller may retry the SAME session while
+/// the successor finishes booting. Deliberately NOT
+/// [`crate::terminal::message_is_seat_conflict`] — one refusal is retried,
+/// the other drops the duplicate.
+pub(crate) fn verdict_is_boot_refusal(message: &str) -> bool {
+    message.contains(BOOT_READINESS_MARKER)
+}
+
 /// Write the verdict the predecessor is waiting on.
 ///
 /// ⛔ Call this ONLY when [`HandoffMetadata::precommit_verdict`] says the
@@ -829,6 +853,17 @@ pub(crate) fn send_ack(stream: &UnixStream, ack: &HandoffAck) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_boot_refusal_marker_is_distinct_from_the_seat_conflict_marker() {
+        assert!(verdict_is_boot_refusal(BOOT_READINESS_MARKER));
+        assert!(
+            !verdict_is_boot_refusal(&crate::terminal::seat_conflict_reason("local://demo")),
+            "a boot refusal must never read as the permanent seat conflict — \
+             one is retried within the budget, the other drops the duplicate"
+        );
+        assert!(!verdict_is_boot_refusal("some other wire noise"));
+    }
 
     fn metadata() -> HandoffMetadata {
         HandoffMetadata {
