@@ -5631,6 +5631,7 @@ impl YggtermServer {
                 &resolved_cwd,
                 &resolved_session_id,
                 !session_path_is_remote(path),
+                ssh_target_from_session_path(path),
             );
         }
         entry.kind = kind;
@@ -8508,6 +8509,7 @@ impl YggtermServer {
                         &cwd,
                         session_id,
                         true,
+                        None,
                     )
                 } else {
                     stored_session_launch_command_service_vouched(
@@ -9681,6 +9683,7 @@ impl YggtermServer {
                                 &cwd,
                                 &session.id,
                                 !session_path_is_remote(&storage_path),
+                                ssh_target_from_session_path(&storage_path),
                             );
                             if session.session_path.starts_with("codex-runtime://") {
                                 session.session_path = format!("local://{}", session.id);
@@ -13213,6 +13216,7 @@ impl YggtermServer {
                         &cwd,
                         &id,
                         true,
+                        None,
                         &agent_launch_options,
                     );
                     upsert_session_metadata(
@@ -13371,6 +13375,7 @@ impl YggtermServer {
             &cwd,
             &session_id,
             true,
+            None,
         );
         live.preview = stored.preview.clone();
         live.rendered_sections = stored.rendered_sections.clone();
@@ -34354,6 +34359,7 @@ fn build_session(
         &cwd,
         &session_id,
         !session_path_is_remote(path),
+        ssh_target_from_session_path(path),
     );
     let should_hydrate_stored_preview = kind == SessionKind::Document
         || matches!(hydration_mode, StoredPreviewHydrationMode::Eager);
@@ -35945,6 +35951,17 @@ fn local_cc_current_session_id_in(projects_dir: &Path, candidates: &[&str]) -> S
         .to_string()
 }
 
+/// The ssh target carried by an `ssh://<target>/<id>` row-identity path —
+/// the target the honest re-open attach must name ([11.157]). `None` for
+/// every other scheme.
+fn ssh_target_from_session_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("ssh://")?;
+    Some(match rest.split_once('/') {
+        Some((target, _)) => target,
+        None => rest,
+    })
+}
+
 /// Launch command for a stored session. `is_local` says whether the row lives on THIS
 /// machine; it is passed explicitly rather than inferred, because the Claude Code arm
 /// consults the local transcript store and must not do so for a remote row.
@@ -35953,12 +35970,14 @@ fn stored_session_launch_command_for_locality(
     cwd: &str,
     session_id: &str,
     is_local: bool,
+    ssh_target: Option<&str>,
 ) -> String {
     stored_session_launch_command_for_locality_with_options(
         kind,
         cwd,
         session_id,
         is_local,
+        ssh_target,
         &AgentLaunchOptions::default(),
     )
 }
@@ -35970,12 +35989,21 @@ fn stored_session_launch_command_for_locality_with_options(
     cwd: &str,
     session_id: &str,
     is_local: bool,
+    ssh_target: Option<&str>,
     launch: &AgentLaunchOptions,
 ) -> String {
     let vouch = is_local
         .then(|| local_agent_store_vouches_for_session(kind, session_id))
         .flatten();
-    stored_session_launch_command_from_vouch(kind, cwd, session_id, is_local, launch, vouch)
+    stored_session_launch_command_from_vouch(
+        kind,
+        cwd,
+        session_id,
+        is_local,
+        ssh_target,
+        launch,
+        vouch,
+    )
 }
 
 /// A resume for an id the CLI's OWN SERVICE has vouched for — the live TUI is
@@ -35994,6 +36022,7 @@ fn stored_session_launch_command_service_vouched(
         cwd,
         session_id,
         true,
+        None,
         &AgentLaunchOptions::default(),
         None,
     )
@@ -36007,6 +36036,7 @@ fn stored_session_launch_command_from_vouch(
     cwd: &str,
     session_id: &str,
     is_local: bool,
+    ssh_target: Option<&str>,
     launch: &AgentLaunchOptions,
     vouch: Option<bool>,
 ) -> String {
@@ -36035,15 +36065,38 @@ fn stored_session_launch_command_from_vouch(
             // spawn (the pty is given the session's cwd), never the string.
             local_interactive_shell_launch_command(&local_interactive_shell_program())
         }
-        // ⚠ SshShell keeps the fossil line UNMEASURED: an ssh re-open degrades
-        // the same way and the honest attach needs the ssh target, which this
-        // composer is not given. Named residual in [11.156], deliberately not
-        // half-fixed.
-        SessionKind::SshShell => format!(
-            "cd {} && codex resume {}",
-            shell_single_quote(cwd),
-            session_id
-        ),
+        // [11.157]: the honest stored-open of an ssh row is the attach for
+        // ITS target — the same command the remote-runtime ensure funnel
+        // recomposes before any spawn (the peer's yggterm attach with the
+        // plain-shell fallback), so the field is honest from birth and the
+        // ensure's recompose stays a refinement, not a repair. The old arm
+        // was the same pre-descriptor fossil the Shell arm carried (`cd
+        // <cwd> && codex resume <id>`): measured 2026-09-20, a re-opened ssh
+        // row BIRTHED with that line in its launch command — the ensure
+        // recompose overwrote it before spawn on the main path, so the lie
+        // was field-only, but every between-birth-and-ensure consumer
+        // (trace events, spec compares) read it.
+        SessionKind::SshShell => match ssh_target {
+            Some(target) if !target.trim().is_empty() => {
+                let remote_binary = preferred_remote_binary_fallback();
+                remote_ssh_launch_command(
+                    target,
+                    None,
+                    &remote_binary,
+                    &[
+                        "server",
+                        "attach",
+                        session_id,
+                        cwd,
+                        crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
+                    ],
+                )
+            }
+            // No `ssh://` path in reach — not a shape the stored-open
+            // produces today. Degrade to the honest local shell rather than
+            // a foreign CLI's resume line.
+            _ => local_interactive_shell_launch_command(&local_interactive_shell_program()),
+        },
         // Every agent CLI resumes through the ONE builder, which reads the
         // resume shape off the descriptor. Only Claude Code needs an arm of its
         // own, above, and only for a LOCAL row: CC keys its project directory
@@ -36167,12 +36220,14 @@ fn stored_session_launch_command_with_options(
     session_id: &str,
     launch: &AgentLaunchOptions,
 ) -> String {
-    stored_session_launch_command_for_locality_with_options(kind, cwd, session_id, true, launch)
+    stored_session_launch_command_for_locality_with_options(
+        kind, cwd, session_id, true, None, launch,
+    )
 }
 
 /// Launch command for a stored session whose row lives on THIS machine.
 fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str) -> String {
-    stored_session_launch_command_for_locality(kind, cwd, session_id, true)
+    stored_session_launch_command_for_locality(kind, cwd, session_id, true, None)
 }
 
 fn local_default_cwd() -> String {
@@ -36689,6 +36744,7 @@ mod tests {
             "/tmp/ygg-1156-proof",
             "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
             true,
+            None,
             &AgentLaunchOptions::default(),
             None,
         );
@@ -36698,6 +36754,69 @@ mod tests {
         );
         let expected = local_interactive_shell_launch_command(&local_interactive_shell_program());
         assert_eq!(command, expected);
+    }
+
+    #[test]
+    fn an_ssh_stored_open_launches_the_attach_for_its_target_never_a_codex_resume() {
+        // [11.157]: the SshShell arm carried the same 2.0.9-era fossil the
+        // Shell arm did — a re-opened ssh row BIRTHED with
+        // `cd <cwd> && codex resume <id>`. The honest field is the attach
+        // for the path's own target, byte-identical to what the
+        // remote-runtime ensure recomposes before any spawn.
+        let command = stored_session_launch_command_from_vouch(
+            SessionKind::SshShell,
+            "/home/pi",
+            "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
+            false,
+            Some("dev"),
+            &AgentLaunchOptions::default(),
+            None,
+        );
+        assert!(
+            !command.contains("codex resume"),
+            "an ssh row's stored-open must never name a codex resume, got {command}"
+        );
+        let expected = remote_ssh_launch_command(
+            "dev",
+            None,
+            &preferred_remote_binary_fallback(),
+            &[
+                "server",
+                "attach",
+                "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
+                "/home/pi",
+                crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
+            ],
+        );
+        assert_eq!(command, expected);
+        assert!(
+            command.contains("ssh -tt"),
+            "the honest field is an ssh attach for the target, got {command}"
+        );
+    }
+
+    #[test]
+    fn an_ssh_stored_open_without_a_target_degrades_to_the_honest_local_shell() {
+        // The no-target shape does not occur through the stored-open paths
+        // today (an `ssh://` path always carries its target); the arm must
+        // still never resurrect the fossil.
+        let command = stored_session_launch_command_from_vouch(
+            SessionKind::SshShell,
+            "/home/pi",
+            "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
+            false,
+            None,
+            &AgentLaunchOptions::default(),
+            None,
+        );
+        assert!(
+            !command.contains("codex resume"),
+            "the no-target arm must never resurrect the fossil, got {command}"
+        );
+        assert_eq!(
+            command,
+            local_interactive_shell_launch_command(&local_interactive_shell_program())
+        );
     }
 
     #[test]
@@ -43069,6 +43188,7 @@ mod tests {
             "/tmp/workspace",
             orphan_id,
             true,
+            None,
         );
         assert!(
             command.contains(&format!("--session-id '{orphan_id}'")),
@@ -43086,6 +43206,7 @@ mod tests {
             "/tmp/workspace",
             orphan_id,
             false,
+            None,
         );
         assert!(
             remote.contains("--resume"),
@@ -43551,6 +43672,7 @@ mod tests {
             "/tmp/workspace",
             phantom,
             false,
+            None,
         );
         assert!(
             remote.contains(phantom),
@@ -52437,6 +52559,7 @@ terminal_window_id: None,
             "/tmp/workspace",
             minted,
             false,
+            None,
         );
         assert!(resume.contains(minted), "{resume}");
         assert!(
