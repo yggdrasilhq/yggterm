@@ -12101,7 +12101,15 @@ impl DaemonRuntime {
                     && self.server.session_for_path(&path).is_none()
                 {
                     let home = self.store.home_dir().to_path_buf();
-                    match crate::live_row_closed_identity(&home, &path) {
+                    // A record that names NEITHER kind nor cwd (a pre-fix close)
+                    // carries no identity at all — re-opening from it would be
+                    // the same synthesis the refusal exists to stop, wearing a
+                    // record's clothes ([11.156] legacy-record leg, measured
+                    // live: the owner's pre-fix departure fired this arm within
+                    // the hour).
+                    let usable_identity = crate::live_row_closed_identity(&home, &path)
+                        .filter(|recorded| recorded.kind.is_some() || recorded.cwd.is_some());
+                    match usable_identity {
                         Some(recorded) => {
                             if let Some(recorded_kind) = recorded.kind {
                                 session_kind = recorded_kind;
@@ -30696,6 +30704,11 @@ mod tests {
         let consult = arm
             .find("crate::live_row_closed_identity(&home, &path)")
             .expect("the stored-open must consult the close record for a closed local row");
+        assert!(
+            arm.contains("recorded.kind.is_some() || recorded.cwd.is_some()"),
+            "a record naming neither kind nor cwd is NOT an identity — the re-open \
+             must refuse it, not wear the record as a license to synthesize"
+        );
         let refuse = arm.find("closed_row_identity_underdetermined").expect(
             "a close record with no identity must refuse by name, not synthesize a row",
         );
