@@ -31809,52 +31809,26 @@ The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local
 
 ⚠ CORRECTION (2026-09-19 later, the [11.148] seat's ride-along; claim ACK-9ad617aa6d lineage): "never persisted on 2.0.x" is FALSIFIED as a blanket claim. A directly-launched (node-pty, scratch HOME, scratch-local managed port) opencode 2.0.9 TUI persists `latest/tui/tabs.json` CONTINUOUSLY — writes observed every ~0.5 s poll from 2.6 s after launch, BEFORE any turn, the file naming the birth session under its cwd; the writes survive SIGKILL (no graceful exit involved; `killChild` is SIGKILL in the battery drive, so the 09-15/09-19 suite homes were written the same way). The mystery therefore SHARPENS instead of dying: the [11.134] proof's WRAPPER row (real home, same day, real turn at 12:43) wrote `prompt-history.jsonl` + `service.json` but NEVER the tab map — the suppressed variable is the daemon wrapper context, prime suspect being that the wrapper TUI joins the PRODUCTION service as a second client (real-home `locks/` mutated 12:40) while every positive measurement ran against an isolated scratch service. The repair decision stays the owner's call, but the surface is ALIVE in the plain flow: verify-bind from the tab map is viable wherever rows run outside the wrapper context, and the wrapper-context suppression is itself a measurable defect candidate.
 
-## ⛔ [11.155] A CLOSE THAT RUNS ONLY ON THE PEER MACHINE NEVER REACHES THE ROW'S HOME MACHINE — THE HOME PLANE LEARNS PEER-GONE ONLY AFTER ONE DOOMED MOUNT (filed 2026-09-20, the [11.154] close)
+## ⛔ [11.158] A START-BORN REMOTE ROW EXCLUDED FROM THE PEER-CLOSE GATE KEEPS ITS [11.153] PRESERVE STATE FOREVER — THE GUARD IS DELIBERATE, BUT THE CLASS IT EXCLUDES STILL ENDS IN A PERMANENT GHOST (filed 2026-09-20, the [11.155] close)
 
 **Status:** OPEN
 
-The [11.154] fix holds the home plane once a close lands on ANY daemon of the
-home machine (the birth veto + the shared tombstone). The measured 19:17:40
-event was the other geometry: the peer session was terminated and tombstoned
-on dev while the home machine never learned — dev holds no roster of which
-homes carry its rows, so there is no honest channel for a peer-to-home close
-notice, and the home plane re-births the row, mounts the dead peer once, and
-only then learns peer-gone through the [11.153] memo (that lane's accepted
-steady state: one doomed spawn per window). **Falsifier:** close a remote
-row's session on its owning machine only; the home machine must neither spawn
-against the dead peer nor keep the row, with a named trace for the
-peer-death it learned. **Fix shape:** a peer-to-home close notice on the
-existing remote command channel (the owner machine tells the machines its
-remote-scan has advertised this session to), or the home plane asking the
-peer one existence question before the first mount of a restored remote row.
-
-
-FIX IN CODE (2026-09-20, lane/integration/11155-peer-close-notice): the home
-plane now ASKS before it mounts. The ensure funnel's remote-agent arm puts one
-structured existence question to the peer's OWN CLI store
-(`fetch_remote_saved_agent_session_exists`, the per-kind verb the resume
-wrapper itself answers to) for every remote agent row whose runtime is not
-running locally, BEFORE the mount is spent. A confident NO closes the row
-through THE one close path with a new honest departure reason
-`PeerSessionGone` ("peer-session-gone"; tombstone veto + departure, so no
-passive birth re-births it — the [11.154] plane), names the learning on the
-trace (`remote_saved_session_peer_close_learned`), skips the pointless
-remote-shutdown dispatch (`peer_gone_close_skips_remote_shutdown`), and
-refuses the mount by name. Everything else is NOT evidence and keeps
-today's flow: a transport error (`remote_saved_session_peer_close_probe_inconclusive`),
-a kind whose existence verb the peer cannot answer, and
-start-born rows (id minted at birth — the store never heard of it; the
-launch-path probe law applies). The [11.153] memo stays as the in-flight
-backstop and the heal law is untouched: a peer store that answers PRESENT
-keeps the row and the mount proceeds. Locks: the gate order pinned
-(`the_peer_close_gate_asks_before_it_mounts_and_only_a_confident_no_closes`);
-the close-path / despawn / reap / remote-close-site locks moved to the
-parameterized signature, invariants unchanged. Suite delta vs clean main
-54895083: server-lib 1537/1 -> 1539/1 (+2 green: the gate lock +
-`a_kind_without_an_existence_verb_is_never_absent`), failure set
-byte-identical (the owner-gated stamp red only). LIVE PROOF OWED: the
-falsifier drive — a peer-only close must leave the home with neither a
-spawn against the dead peer nor the row itself, with the named trace.
+The [11.155] gate asks the peer's own CLI store before spending a mount and
+closes the row on a confident NO. A start-born row (Remote Launch Action
+`start-…`) is EXCLUDED on purpose: its id was minted at birth and the CLI's
+store never heard of it, so store-absence is not evidence — the bind-may-land
+law from the launch-path probe. For such a row whose peer runtime died
+permanently, the funnel still ends in the [11.153] preserve state (memo
+refusal window, Saved Session stamp, row kept). MEASURED CAVEAT from the same
+sitting: the original [11.155] defect row 29434a5f was NOT excluded — its
+stored metadata no longer named it start-born (restores may drop the label),
+so the gate closed it; honest there, but the guard's evidence is a mutable
+metadata label. **Falsifier:** a start-born remote row whose peer runtime is
+permanently gone keeps its row forever with launches refused only by the memo
+window. **Fix shape:** a compound verdict for the excluded class — the
+[11.153] memo fresh (retry-exhausted) AND the peer's
+`agent-runtime-alive` answer (already strict-parse) false on two spaced asks
+— closing the row through the same PeerSessionGone close.
 
 ## ⛔ [11.157] AN SSH ROW'S STORED-OPEN KEEPS THE SHELL ARM'S FOSSIL — THE COMPOSER THAT USED TO SYNTHESIZE `codex resume` FOR SHELL ROWS STILL HANDS IT TO SSH ROWS (filed 2026-09-20, the [11.156] close; UNMEASURED)
 
