@@ -31832,10 +31832,10 @@ window. **Fix shape:** a compound verdict for the excluded class — the
 
 **FIX IN CODE (2026-09-20, lane/integration/11158-startborn-ghost):** the
 excluded class now closes on the compound verdict — the [11.153] memo fresh
-AND  false on two SPACED ensure ticks (a per-path
+AND `agent-runtime-alive` false on two SPACED ensure ticks (a per-path
 first-no map; the spacing is real ticks, the request loop never parks) —
 through THE one PeerSessionGone close, named
-. The store ask stays
+`remote_saved_session_startborn_peer_close_learned`. The store ask stays
 excluded (bind-may-land stands); a transport error, an alive peer, or a
 stale memo disarms and preserves; the alive verb only goes out under a
 fresh memo, so a healthy start-born row pays no ask. Locks: the [11.155]
