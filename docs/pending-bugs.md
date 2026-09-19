@@ -31843,6 +31843,42 @@ other drops the duplicate). [11.151]'s never-drain half lands behind this
 gate; version skew (OLD successor that never answers verdicts) is unchanged —
 a silent old build still commits, by the two-strike silence law.
 
+LIVE PROOF + CORRECTION 2026-09-19 (same seat, fresh scratch home on dev,
+deployed 7ce9151d3eaa; interim on infra/meta ACK-69a27d4a6f): the drain RAN
+on the spawn arm ([11.151]'s mechanic landed), the readiness gate flipped
+(`daemon_ready_to_seat_handoffs` 3 ms after the listener binds on a fresh
+home), and THE ROW SURVIVED — `sleep 300` same pid before and after, the
+predecessor resumed serving (`readers_resumed:1`), no corpse. ⚠ CORRECTION to
+the root cause above: the 13 s stall REPRODUCED anyway, and the new traces
+falsified the boot-window theory for THIS path — `pty_handoff_adopt_started`
+never fired on EITHER daemon, and 4 ms after the ack timeout the
+PREDECESSOR'S OWN serve loop traced
+`pty_handoff_refused {error: "writing handoff verdict: Broken pipe"}`. THE
+REAL MECHANISM IS THE SELF-DIAL: on a same-version spawn arm the successor
+rebinds the shared `pty-handoff-<ver>.sock` ~200 ms into ITS boot, and the
+predecessor's sweep — freed by its 100 ms listener-wait poll — can dial the
+path while it still points at the PREDECESSOR'S OWN listener inode. Serving
+itself then deadlocks: the serve thread's seat closure needs the runtime lock
+the sweep's request thread holds across `hand_off_all_runtimes(&mut self)` —
+one silent verdict (PrecommitSupport saw a single silence and sent blind),
+the fd parked in the socket buffer ("accepted the fd"), 10 s ack timeout,
+NoneMoved, and the unblocked serve thread's deferred verdict write EPIPEs.
+Every measured number fits. The boot gate and the post-commit traces STAY:
+defense in depth, and they are what made this diagnosable.
+
+SECOND FIX, same day (lane/integration/bequeath-1152-selfdial): the accept
+loop reads PEER CREDENTIALS (`peer_cred`, not the path — the path is shared
+per version and cannot say who answered) and a self-pid peer gets a NAMED
+pre-commit refusal (`SELF_DIAL_MARKER` =
+"predecessor dialed its own pty-handoff listener (self-dial)", traced
+`pty_handoff_self_dial_refused`) instead of a silent lock-block; the sweep
+retries the CONNECT toward the real successor (3 attempts, 300 ms apart,
+`pty_fd_handoff_self_dial_retry`) — the same-version rebind resolves within
+one successor boot. Unreadable credentials answer "not self" — the safe
+direction. Guards: a socketpair self-dial test + marker-distinctness, and a
+product-source ordering lock (the peer check must sit ahead of
+`serve_handoff` in the accept loop).
+
 ## ⛔ [11.151] A FRESH HOME'S FORCED RESTART PREPARES THE HANDOFF BUT NEVER SWEEPS — THE FD-HANDOFF SWEEP RAN ONLY WHEN A SUCCESSOR WAS ALREADY LIVE, THE SPAWN ARM'S PEER PROBE IS NONE BY CONSTRUCTION, AND NOTHING LATER DRAINS A SAME-VERSION PREDECESSOR, SO THE PREDECESSOR SERVES ITS ROWS FOREVER WHILE THE SUCCESSOR SITS AT OWNED:0 AND THE OWNERSHIP LEDGER IS NEVER WRITTEN (measured live 2026-09-19, fresh scratch home on a fleet host, claim ACK-83597c3317 lineage; filed by the adopted-disposition outcome as its item 4)
 
 **Status:** OPEN
