@@ -5639,6 +5639,12 @@ pub(crate) struct DaemonRuntime {
     /// and the saved-session ensure funnel refuses to elide the next resume
     /// into the same dead end while the verdict is fresh.
     peer_runtime_missing: Arc<Mutex<HashMap<String, PeerRuntimeMissingVerdict>>>,
+    /// THE [11.158] compound verdict's memory: the ensure tick a start-born
+    /// remote row's `agent-runtime-alive` ask first answered false, per path.
+    /// The store ask must never close this class (its id was minted at birth,
+    /// store-absence is not evidence), so peer death confirms across SPACED
+    /// asks — real ensure ticks apart, the loop never parks on them.
+    startborn_alive_no_at: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Content gate for the routine persist paths — see
     /// [`write_persisted_state_if_changed`]. `None` until this daemon has
     /// written the file once, so the first persist of a process always writes.
@@ -5822,6 +5828,7 @@ impl DaemonRuntime {
             pending_remote_pty_resizes: Arc::new(Mutex::new(HashMap::new())),
             remote_pty_resize_in_flight: Arc::new(Mutex::new(HashSet::new())),
             peer_runtime_missing: Arc::new(Mutex::new(HashMap::new())),
+            startborn_alive_no_at: Arc::new(Mutex::new(HashMap::new())),
             last_persisted_state: None,
         };
         // Baseline, not an observation: rows restored at boot have not "come
@@ -10198,6 +10205,60 @@ impl DaemonRuntime {
                                 }),
                             );
                         }
+                        // ⛔ THE [11.158] COMPOUND VERDICT. A start-born
+                        // refusal is not the end of the evidence — it is the
+                        // store instrument excusing itself (the id was minted
+                        // at birth, the store never heard of it). The
+                        // [11.153] memo IS evidence (the peer's own
+                        // retry-exhausted "runtime key not found") and the
+                        // strict-parse `agent-runtime-alive` verb is the
+                        // independent second instrument. A TRANSPORT error
+                        // arms nothing; the start-born class re-examines and
+                        // closes only on a fresh memo AND alive=false on two
+                        // SPACED asks — real ticks apart, the funnel never parks on them.
+                        if self.remote_saved_session_row_is_start_born(path) {
+                            match self.startborn_peer_gone_ask(path) {
+                                StartbornPeerAsk::ConfirmClose => {
+                                    if let Ok(home) = crate::resolve_yggterm_home() {
+                                        append_trace_event(
+                                            &home,
+                                            "daemon",
+                                            "terminal_ensure",
+                                            "remote_saved_session_startborn_peer_close_learned",
+                                            serde_json::json!({
+                                                "path": path,
+                                                "verdict": "start-born row: the peer-missing memo is fresh and the runtime is gone on two spaced alive asks",
+                                                "confirm_spacing_secs": REMOTE_STARTBORN_ALIVE_CONFIRM_SPACING.as_secs(),
+                                            }),
+                                        );
+                                    }
+                                    self.close_live_session_row(path, crate::live_row_tombstones::RowDeparture::PeerSessionGone)?;
+                                    bail!(
+                                        "peer session gone — a start-born row whose \
+                                         runtime the owning machine no longer holds \
+                                         (fresh missing verdict + two spaced alive \
+                                         asks answered gone), so the row was closed \
+                                         here to match. Re-open the row to start a \
+                                         fresh session."
+                                    );
+                                }
+                                StartbornPeerAsk::ArmFirstAsk => {
+                                    if let Ok(home) = crate::resolve_yggterm_home() {
+                                        append_trace_event(
+                                            &home,
+                                            "daemon",
+                                            "terminal_ensure",
+                                            "remote_saved_session_startborn_peer_dead_first_ask",
+                                            serde_json::json!({
+                                                "path": path,
+                                                "verdict": "alive ask answered gone; the confirm ask follows on a later ensure tick",
+                                            }),
+                                        );
+                                    }
+                                }
+                                StartbornPeerAsk::KeepArmed | StartbornPeerAsk::Disarm => {}
+                            }
+                        }
                     }
                 }
             }
@@ -11099,15 +11160,7 @@ impl DaemonRuntime {
         else {
             bail!("path parses to no remote agent target");
         };
-        let start_born = self
-            .server
-            .live_session_row_key(path)
-            .and_then(|key| self.server.resolve_live_session_entry(&key))
-            .map(|(_resolved, session)| {
-                crate::remote_live_session_starts_new_codex(&session)
-            })
-            .unwrap_or(false);
-        if start_born {
+        if self.remote_saved_session_row_is_start_born(path) {
             bail!(
                 "{path} is start-born — its id is not a store id, absence is \
                  not evidence"
@@ -11123,6 +11176,83 @@ impl DaemonRuntime {
         .map_err(|error| {
             anyhow::anyhow!("peer existence ask failed: {error:#}")
         })
+    }
+
+    /// Whether the row behind `path` is start-born — the same predicate the
+    /// store ask refuses on, hoisted so the funnel can route that refusal to
+    /// the [11.158] compound verdict instead of dead-ending in it.
+    fn remote_saved_session_row_is_start_born(&self, path: &str) -> bool {
+        self.server
+            .live_session_row_key(path)
+            .and_then(|key| self.server.resolve_live_session_entry(&key))
+            .map(|(_resolved, session)| {
+                crate::remote_live_session_starts_new_codex(&session)
+            })
+            .unwrap_or(false)
+    }
+
+    /// THE [11.158] second look for the class the store ask must exclude. A
+    /// start-born row's id was minted at birth, so store-absence says
+    /// nothing — but the [11.153] memo (the peer's own retry-exhausted
+    /// "runtime key not found") and the strict-parse `agent-runtime-alive`
+    /// verb are both evidence about the RUNTIME KEY, and they agree only
+    /// when the peer is truly gone. The ask ARMS on the first false answer,
+    /// CONFIRMS on a later tick's false answer once the spacing has
+    /// elapsed, and every other shape — no fresh memo, a transport error,
+    /// an alive peer — disarms and keeps today's flow. The alive verb only
+    /// ever goes out under a fresh memo: a healthy start-born row pays no
+    /// ssh ask on this path at all.
+    fn startborn_peer_gone_ask(&self, path: &str) -> StartbornPeerAsk {
+        let memo_fresh = {
+            let memo = self
+                .peer_runtime_missing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            memo.get(path).is_some_and(|verdict| {
+                verdict.last_verdict_at.elapsed() <= REMOTE_PEER_MISSING_REFUSE_WINDOW
+            })
+        };
+        if !memo_fresh {
+            self.startborn_alive_no_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(path);
+            return StartbornPeerAsk::Disarm;
+        }
+        let (machine, session_id, kind) =
+            match self.server.remote_agent_pty_target_for_path(path) {
+                Some(target) => target,
+                None => {
+                    self.startborn_alive_no_at
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(path);
+                    return StartbornPeerAsk::Disarm;
+                }
+            };
+        let ask = crate::remote_agent_session_runtime_alive(&machine, &session_id, kind);
+        let prior_no_ago = {
+            let armed = self
+                .startborn_alive_no_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            armed.get(path).map(|at| at.elapsed())
+        };
+        let action = startborn_peer_action(true, prior_no_ago, &ask);
+        let mut armed = self
+            .startborn_alive_no_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match action {
+            StartbornPeerAsk::ArmFirstAsk => {
+                armed.entry(path.to_string()).or_insert_with(std::time::Instant::now);
+            }
+            StartbornPeerAsk::Disarm => {
+                armed.remove(path);
+            }
+            StartbornPeerAsk::KeepArmed | StartbornPeerAsk::ConfirmClose => {}
+        }
+        action
     }
 
     /// Remember that the user closed the row currently listed for `path`, so no
@@ -29999,6 +30129,52 @@ struct PeerRuntimeMissingVerdict {
 const REMOTE_PEER_MISSING_REFUSE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(600);
 
+/// THE [11.158] spacing: the two `agent-runtime-alive` asks that may close a
+/// start-born ghost must be REAL ensure ticks apart. A birth in progress on
+/// the peer answers false until its daemon owns the runtime key, and the
+/// spacing is what keeps one unlucky tick from closing a row being born.
+const REMOTE_STARTBORN_ALIVE_CONFIRM_SPACING: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// The [11.158] compound verdict's ask outcome, one ensure tick at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartbornPeerAsk {
+    /// First `alive=false` on a fresh memo: arm the countdown, keep today's flow.
+    ArmFirstAsk,
+    /// Fresh memo AND `alive=false` again past the spacing: the peer is gone.
+    ConfirmClose,
+    /// A false answer inside the spacing: leave the countdown alone.
+    KeepArmed,
+    /// No fresh memo, a transport error, or an alive peer: disarm and preserve.
+    Disarm,
+}
+
+/// THE [11.158] decision core, pure so the table is testable: a start-born
+/// row closes only when the [11.153] memo is fresh AND the alive verb
+/// answered false again after the confirm spacing. A transport error, an
+/// alive peer, a stale memo — each disarms and preserves the row. The row
+/// is a ghost, and ghosts are preserved until the evidence is this strong.
+fn startborn_peer_action(
+    memo_fresh: bool,
+    first_no_ago: Option<std::time::Duration>,
+    ask: &anyhow::Result<bool>,
+) -> StartbornPeerAsk {
+    if !memo_fresh {
+        return StartbornPeerAsk::Disarm;
+    }
+    match ask {
+        Err(_) => StartbornPeerAsk::Disarm,
+        Ok(true) => StartbornPeerAsk::Disarm,
+        Ok(false) => match first_no_ago {
+            None => StartbornPeerAsk::ArmFirstAsk,
+            Some(ago) if ago >= REMOTE_STARTBORN_ALIVE_CONFIRM_SPACING => {
+                StartbornPeerAsk::ConfirmClose
+            }
+            Some(_) => StartbornPeerAsk::KeepArmed,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalWriteStrategy {
     LocalRuntime,
@@ -30321,7 +30497,8 @@ mod tests {
         hot_restart_gate_working_signal, ServerRequest, ShadowAccess, gate_screen_tail,
         hot_restart_blockers_actionable_first, hot_restart_deadline_verdict,
         hot_update_handoff_would_refuse_binary, role_gate, DAEMON_REQUEST_IO_TIMEOUT_MS,
-        PEER_TRIAGE_PROBE_BUDGET_MS,
+        PEER_TRIAGE_PROBE_BUDGET_MS, startborn_peer_action, StartbornPeerAsk,
+        REMOTE_STARTBORN_ALIVE_CONFIRM_SPACING,
     };
     use crate::live_row_tombstones::LiveRowTombstones;
     #[cfg(unix)]
@@ -30903,14 +31080,91 @@ mod tests {
         );
         let helper = daemon_fn_body(source, "    fn remote_saved_session_peer_gone(");
         assert!(
-            helper.contains("remote_live_session_starts_new_codex"),
+            helper.contains("self.remote_saved_session_row_is_start_born(path)"),
             "a start-born row's id is not a store id — its absence is not \
-             evidence and must never close a row"
+             evidence and must never close a row; the refusal routes through \
+             the named predicate"
+        );
+        let predicate =
+            daemon_fn_body(source, "    fn remote_saved_session_row_is_start_born(");
+        assert!(
+            predicate.contains("remote_live_session_starts_new_codex"),
+            "start-born is the measured Remote Launch Action label — the \
+             predicate reads the metadata, never a guess"
         );
         assert!(
             helper.contains("fetch_remote_saved_agent_session_exists"),
             "the ask must be the per-kind structured store question, not a \
              heuristic"
+        );
+        let startborn_route = funnel
+            .find("self.remote_saved_session_row_is_start_born(path)")
+            .expect("the start-born refusal must be routed to the [11.158] \
+                     compound verdict, never dead-end in the inconclusive arm");
+        let startborn_close = funnel
+            .find("remote_saved_session_startborn_peer_close_learned")
+            .expect("a confirmed start-born ghost close must be named");
+        assert!(
+            inconclusive < startborn_route && startborn_route < startborn_close,
+            "the start-born re-exam lives INSIDE the inconclusive arm: only \
+             transport errors keep a row unexamined, and the compound verdict \
+             still closes through the same named-trace-then-one-close order"
+        );
+        assert!(
+            funnel.contains("self.startborn_peer_gone_ask(path)"),
+            "the second look must run through the helper that asks the alive \
+             verb under a fresh memo — never a heuristic"
+        );
+    }
+
+    #[test]
+    fn the_startborn_compound_verdict_closes_on_two_spaced_nos_only() {
+        // [11.158]: the store ask must keep refusing start-born rows (their
+        // ids are not store ids), so the ghost class closes only when BOTH
+        // instruments agree — the [11.153] memo fresh AND the alive verb
+        // false again after the confirm spacing. Every thinner shape
+        // disarms and preserves the row: a ghost is preserved until the
+        // evidence is this strong.
+        let spacing = REMOTE_STARTBORN_ALIVE_CONFIRM_SPACING;
+        let ok = |alive: bool| Ok::<bool, anyhow::Error>(alive);
+        assert_eq!(
+            startborn_peer_action(false, None, &ok(false)),
+            StartbornPeerAsk::Disarm,
+            "no fresh memo — no close, ever: the memo is the peer's own \
+             retry-exhausted verdict and its absence leaves the ask alone"
+        );
+        assert_eq!(
+            startborn_peer_action(
+                true,
+                None,
+                &Err(anyhow::anyhow!("ssh transport failed"))
+            ),
+            StartbornPeerAsk::Disarm,
+            "a transport error is unverifiable, never evidence of death"
+        );
+        assert_eq!(
+            startborn_peer_action(true, None, &ok(true)),
+            StartbornPeerAsk::Disarm,
+            "an alive peer disarms — the row may be restoring into its key"
+        );
+        assert_eq!(
+            startborn_peer_action(true, None, &ok(false)),
+            StartbornPeerAsk::ArmFirstAsk,
+            "the first false answer arms the countdown and keeps today's flow"
+        );
+        assert_eq!(
+            startborn_peer_action(
+                true,
+                Some(spacing - std::time::Duration::from_secs(1)),
+                &ok(false)
+            ),
+            StartbornPeerAsk::KeepArmed,
+            "a false answer inside the spacing keeps the countdown, not a close"
+        );
+        assert_eq!(
+            startborn_peer_action(true, Some(spacing), &ok(false)),
+            StartbornPeerAsk::ConfirmClose,
+            "two spaced nos on a fresh memo is the compound verdict"
         );
     }
 
