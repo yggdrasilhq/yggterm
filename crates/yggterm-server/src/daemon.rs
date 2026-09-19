@@ -9833,16 +9833,11 @@ impl DaemonRuntime {
         reason: &'static str,
     ) -> bool {
         match terminal_snapshot(owner_endpoint, runtime_path) {
-            Ok((
-                snapshot,
-                _running,
+            Ok(TerminalSnapshotAnswer {
+                text: snapshot,
                 runtime_output_seen,
-                _post_resize_output_seen,
-                _last_resize_seq,
-                _runtime_spawn_id,
-                _composer_holds_draft,
-                _pty_in_alternate_screen,
-            )) => {
+                ..
+            }) => {
                 if !runtime_output_seen || snapshot.trim().is_empty() {
                     return false;
                 }
@@ -13015,28 +13010,19 @@ impl DaemonRuntime {
                         let _ = self.ensure_terminal_for_path(&path)?;
                     } else {
                         match terminal_snapshot(&owner_endpoint, &runtime_path) {
-                            Ok((
-                                text,
-                                running,
-                                runtime_output_seen,
-                                post_resize_output_seen,
-                                last_resize_seq,
-                                runtime_spawn_id,
-                                composer_holds_draft,
-                                pty_in_alternate_screen,
-                            )) => {
+                            Ok(answer) => {
                                 return Ok(ServerResponse::TerminalSnapshot {
-                                    text,
-                                    running,
-                                    runtime_output_seen,
-                                    post_resize_output_seen,
-                                    last_resize_seq,
-                                    runtime_spawn_id,
+                                    text: answer.text,
+                                    running: answer.running,
+                                    runtime_output_seen: answer.runtime_output_seen,
+                                    post_resize_output_seen: answer.post_resize_output_seen,
+                                    last_resize_seq: answer.last_resize_seq,
+                                    runtime_spawn_id: answer.runtime_spawn_id,
                                     // The owner's answer, forwarded. This
                                     // daemon does not hold the line and must
                                     // not invent one.
-                                    composer_holds_draft,
-                                    pty_in_alternate_screen,
+                                    composer_holds_draft: answer.composer_holds_draft,
+                                    pty_in_alternate_screen: answer.pty_in_alternate_screen,
                                 });
                             }
                             Err(error) => {
@@ -21923,16 +21909,33 @@ pub fn terminal_read(
     }
 }
 
-pub fn terminal_snapshot(
-    endpoint: &ServerEndpoint,
-    path: &str,
-) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>, Option<bool>)> {
-    match send_request(
-        endpoint,
-        &ServerRequest::TerminalSnapshot {
-            path: path.to_string(),
-        },
-    )? {
+/// The full answer to `ServerRequest::TerminalSnapshot` — a STRUCT, where an
+/// 8-wide positional tuple used to be. The tuple's two trailing
+/// `Option<bool>`s (`composer_holds_draft`, `pty_in_alternate_screen`) were
+/// tail-bound by `.., x)` patterns, and when `pty_in_alternate_screen` was
+/// appended (2026-09-03) every such binding silently shifted onto it: the
+/// input-probe readers then reported the alternate-screen flag as "composer
+/// holds a draft" — a virgin opencode row (an alt-screen TUI) answered
+/// `composer_held_draft: true` with `cached_input_bytes: 0`, the exact
+/// [11.144] false positive. Named fields end the class: a future field
+/// append updates this struct and the mapping below, and every consumer
+/// pattern is compiler-checked by name.
+#[derive(Debug, Clone)]
+pub struct TerminalSnapshotAnswer {
+    pub text: String,
+    pub running: bool,
+    pub runtime_output_seen: bool,
+    pub post_resize_output_seen: bool,
+    pub last_resize_seq: u64,
+    pub runtime_spawn_id: u64,
+    pub composer_holds_draft: Option<bool>,
+    pub pty_in_alternate_screen: Option<bool>,
+}
+
+/// The one place the wire answer becomes the struct — factored out so the
+/// draft/alternate-screen pair has a test that pins them DISTINCT.
+fn terminal_snapshot_answer_from_response(response: ServerResponse) -> Result<TerminalSnapshotAnswer> {
+    match response {
         ServerResponse::TerminalSnapshot {
             text,
             running,
@@ -21942,7 +21945,7 @@ pub fn terminal_snapshot(
             runtime_spawn_id,
             composer_holds_draft,
             pty_in_alternate_screen,
-        } => Ok((
+        } => Ok(TerminalSnapshotAnswer {
             text,
             running,
             runtime_output_seen,
@@ -21951,10 +21954,22 @@ pub fn terminal_snapshot(
             runtime_spawn_id,
             composer_holds_draft,
             pty_in_alternate_screen,
-        )),
+        }),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
     }
+}
+
+pub fn terminal_snapshot(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<TerminalSnapshotAnswer> {
+    terminal_snapshot_answer_from_response(send_request(
+        endpoint,
+        &ServerRequest::TerminalSnapshot {
+            path: path.to_string(),
+        },
+    )?)
 }
 
 pub fn terminal_retained_snapshot(
@@ -42827,5 +42842,35 @@ mod comm_truncation_locks {
                 cli.binary_name,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_snapshot_answer_tests {
+    use super::*;
+
+    #[test]
+    fn the_snapshot_answer_keeps_the_draft_and_alternate_screen_distinct() {
+        // The [11.144] class: the terminal snapshot answer rode an 8-wide
+        // positional tuple whose two trailing Options (`composer_holds_draft`,
+        // `pty_in_alternate_screen`) were tail-bound by `.., x)` patterns, so
+        // every input-probe reader read the alternate-screen flag as the
+        // composer draft (a virgin alt-screen opencode row answered
+        // composer_held_draft: true with cached_input_bytes: 0). The struct
+        // mapping must keep the two fields DISTINCT.
+        let answer =
+            terminal_snapshot_answer_from_response(ServerResponse::TerminalSnapshot {
+                text: "screen".to_string(),
+                running: true,
+                runtime_output_seen: true,
+                post_resize_output_seen: false,
+                last_resize_seq: 7,
+                runtime_spawn_id: 9,
+                composer_holds_draft: Some(false),
+                pty_in_alternate_screen: Some(true),
+            })
+            .expect("the snapshot answer maps");
+        assert_eq!(answer.composer_holds_draft, Some(false));
+        assert_eq!(answer.pty_in_alternate_screen, Some(true));
     }
 }

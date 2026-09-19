@@ -174,7 +174,8 @@ pub use daemon::{
     hot_update_handoff_would_refuse_binary,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,
     ServerResponse, ServerRuntimeStatus, SessionDraftState, hot_restart_block_reason_summary,
-    TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
+    TerminalSnapshotAnswer, TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh,
+    connect_ssh_custom, default_endpoint,
     resolve_client_daemon_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
     focus_live_with_view, hot_restart, hot_restart_detailed, open_remote_session,
@@ -25098,16 +25099,11 @@ fn bridge_remote_runtime_session_stdio(
             initial_snapshot_probe_count = initial_snapshot_probe_count.saturating_add(1);
             next_initial_snapshot_probe_at = Instant::now() + Duration::from_millis(120);
             match terminal_snapshot(endpoint, path) {
-                Ok((
-                    snapshot,
-                    _running,
-                    snapshot_runtime_output_seen,
-                    _snapshot_post_resize_output_seen,
-                    _snapshot_last_resize_seq,
-                    _runtime_spawn_id,
-                    _composer_holds_draft,
-                    _pty_in_alternate_screen,
-                )) => {
+                Ok(daemon::TerminalSnapshotAnswer {
+                    text: snapshot,
+                    runtime_output_seen: snapshot_runtime_output_seen,
+                    ..
+                }) => {
                     let snapshot_text =
                         bridge_initial_snapshot_text_for_path(path, Some(snapshot.as_str()))
                             .map(str::to_string);
@@ -31998,18 +31994,27 @@ pub fn run_app_control_read_terminal_buffer(
         let screen = if retained {
             crate::daemon::terminal_retained_snapshot(&endpoint, session_path)
                 .map(|(text, running, seen, post, seq, spawn)| {
-                    (text, running, seen, post, seq, spawn, None, None)
+                    daemon::TerminalSnapshotAnswer {
+                        text,
+                        running,
+                        runtime_output_seen: seen,
+                        post_resize_output_seen: post,
+                        last_resize_seq: seq,
+                        runtime_spawn_id: spawn,
+                        composer_holds_draft: None,
+                        pty_in_alternate_screen: None,
+                    }
                 })
         } else {
             crate::daemon::terminal_snapshot(&endpoint, session_path)
         };
-        if let Ok((text, running, runtime_output_seen, _, _, _, _, _)) = screen {
+        if let Ok(answer) = screen {
             let fallback = daemon_screen_read_terminal_buffer_payload(
                 session_path,
                 mode,
-                &text,
-                running,
-                runtime_output_seen,
+                &answer.text,
+                answer.running,
+                answer.runtime_output_seen,
             );
             write_stdout_payload(&serde_json::to_string_pretty(&fallback)?)?;
             return Ok(());
