@@ -8,6 +8,20 @@
 // in this section to find regression coverage that maps back to the bug
 // registry.
 // ============================================================================
+// A seam needle names a call and its argument TOKENS, and the product
+// re-wraps those freely — three locks went red on indentation alone while
+// the wiring they guard was intact. `seam_contains` matches a needle
+// whitespace-insensitively: all whitespace is stripped from both sides,
+// then the usual substring. The exactness law is unchanged — any token
+// change still reds; only the line wrapping stops mattering.
+#[cfg(test)]
+pub(crate) fn seam_contains(haystack: &str, needle: &str) -> bool {
+    fn stripped(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+    stripped(haystack).contains(&stripped(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14445,7 +14459,7 @@ console.log('ok');
         let source = SHELL_SOURCE;
         let implementation = source.split("\nmod tests {").next().unwrap_or(source);
         let start = implementation
-            .find("fn md_inline_nodes(")
+            .find("fn md_inline_nodes_linked(")
             .expect("the adapter must still be here");
         let end = implementation[start..]
             .find("/// The pure-Markdown reader")
@@ -29295,14 +29309,20 @@ console.log('ok');
         );
         assert!(!active_session_title_needs_generation(&shell, &session));
     }
+    /// The gate's one surviving ACCEPT case. The old shape — a Shell row on a
+    /// local stored session path — was killed twice over: the check collapsed
+    /// to its ONE owner (`yggterm_server::session_accepts_generated_copy`,
+    /// f90c3a47), and the Honor Law (owner, 2026-09-10) took agent rows off
+    /// the interface-titling table for good. What still accepts generated
+    /// copy is exactly a Document row — a body yggterm may name from its own
+    /// content.
     #[test]
-    fn supports_generated_session_copy_accepts_local_stored_session_paths() {
+    fn supports_generated_session_copy_accepts_a_document_row() {
         let session = ManagedSessionView {
             id: "019d0000-1111-2222-3333-444444444444".to_string(),
-            session_path: "/home/user/.codex/sessions/2026/04/01/rollout-2026-04-01T06-18-55.jsonl"
-                .to_string(),
+            session_path: "document://019d0000-1111-2222-3333-444444444444".to_string(),
             title: "019d0000".to_string(),
-            kind: SessionKind::Shell,
+            kind: SessionKind::Document,
             host_label: "dev".to_string(),
             source: yggterm_server::SessionSource::Stored,
             backend: TerminalBackend::Xterm,
@@ -61224,9 +61244,8 @@ mod webtabs_menu_switcher_locks {
         // something ("3 selected items"), one row's own label does not.
         let snapshot = function_body(&product, "fn snapshot(");
         assert!(
-            snapshot.contains("format!(\"{selected_count} selected items\")")
-                && snapshot
-                    .contains("} else {\n                    String::new()\n                };"),
+            seam_contains(&snapshot, "format!(\"{selected_count} selected items\")")
+                && seam_contains(&snapshot, "} else { String::new() };"),
             "the tree's single-row menu must carry no heading",
         );
         // A contributed pane's rows are rows too.
@@ -68890,7 +68909,7 @@ mod web_surface_immersion_locks {
             // `web_surface_place_page_rect(` is satisfied by the function's
             // DEFINITION line, so with that needle the call could be deleted
             // and this lock would stay green.
-            ".map(|raw| {\n                    web_surface_place_page_rect(\n                        raw,\n                        viewport_size,\n                        chrome_claims,\n                        tab_fullscreen,\n                    )\n                });",
+            ".map(|raw| { web_surface_place_page_rect(raw, viewport_size, chrome_claims, tab_fullscreen) });",
             // ...with the engine's own fullscreen answer, not a shell guess.
             "let fullscreen_native_id = desktop.web_surface_fullscreen();",
             // ...and the claims the eval sampled, not a re-derivation.
@@ -68924,7 +68943,7 @@ mod web_surface_immersion_locks {
             "pinned: autohide_pinned && !visible,",
         ] {
             assert!(
-                scanned.contains(needle),
+                seam_contains(&scanned, needle),
                 "the immersion wiring lost its call site: {needle}"
             );
         }
@@ -69161,7 +69180,7 @@ mod web_surface_immersion_locks {
             // ...gated on the surface actually being SHOWN, the same predicate
             // the paint/input holes use — a fullscreen page in the soft stash
             // must not blank the chrome of the session the user switched to.
-            "&& entry.visible\n                        && entry.stashed_at_ms.is_none()",
+            "&& entry.visible && entry.stashed_at_ms.is_none()",
             // ...carried to the render through the snapshot chain.
             "page_fullscreen: self.page_fullscreen,",
             "page_fullscreen: snapshot.page_fullscreen,",
@@ -69184,7 +69203,7 @@ mod web_surface_immersion_locks {
             "web_overlay.find.clone().filter(|_| !web_chrome_hidden)",
         ] {
             assert!(
-                scanned.contains(needle),
+                seam_contains(&scanned, needle),
                 "the fullscreen chrome gate lost a seam: {needle}"
             );
         }
@@ -69197,7 +69216,7 @@ mod web_surface_immersion_locks {
             "if fullscreen {\n                    div {",
         ] {
             assert!(
-                !scanned.contains(forbidden),
+                !seam_contains(&scanned, forbidden),
                 "a chrome surface went back to the distraction-free-only gate \
                  ({forbidden}) — under glass that paints it over a fullscreen page"
             );
