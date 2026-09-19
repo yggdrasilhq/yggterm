@@ -1067,6 +1067,25 @@ pub fn live_row_closes_remembered_among<'a>(
         .collect()
 }
 
+/// The write-side twin of [`live_row_closes_remembered_among`]: a door that
+/// just REFUSED a row on the tombstone plane re-arms the close, so an offerer
+/// that never stops offering cannot wait out the TTL (the 2026-09-19
+/// scheduled-resurrection class — the mirror's eternal re-offer met a grave
+/// that had just expired). A no-op for identities that are not tombstoned or
+/// are already past expiry: renewal never resurrects a record, and below the
+/// renewal age it never rewrites the shared file.
+pub(crate) fn rearm_live_row_closes_among<'a>(
+    home_dir: &std::path::Path,
+    session_paths: impl IntoIterator<Item = &'a str>,
+) {
+    let now = crate::live_row_tombstones::now_secs();
+    let mut tombstones = crate::live_row_tombstones::LiveRowTombstones::load(home_dir, now);
+    for path in session_paths {
+        let identity = normalized_live_row_identity(path);
+        let _ = tombstones.touch_close(home_dir, &identity, now);
+    }
+}
+
 /// *"Where did my row go?"* — the ledger, newest first.
 ///
 /// A record nobody can read is not a record, and that is not a figure of speech
@@ -6371,6 +6390,11 @@ impl YggtermServer {
                 }),
             );
             return None;
+            // The refusal re-arms the grave — the sweep runs forever, so an
+            // un-re-armed veto would age out and the next tick would be the
+            // lawful-looking resurrection (2026-09-19 class).
+            crate::rearm_live_row_closes_among(home, [runtime_key]);
+            return None;
         }
         self.restore_live_session(PersistedLiveSession {
             app_launch: None,
@@ -9451,6 +9475,19 @@ impl YggtermServer {
                 continue;
             }
             self.restore_live_session(live);
+        }
+
+        // Every veto this restore just fired re-arms the close: the persisted
+        // state that carries the row back is itself written by an eternal
+        // offerer (a peer's persist), so the veto must not age out while the
+        // offers keep standing (the 2026-09-19 scheduled-resurrection class).
+        if !tombstone_vetoed_rows.is_empty()
+            && let Some(home) = perf_home.as_deref()
+        {
+            crate::rearm_live_row_closes_among(
+                home,
+                tombstone_vetoed_rows.iter().map(String::as_str),
+            );
         }
         let state_active_view_mode = state.active_view_mode;
         self.active_view_mode = state.active_view_mode;
