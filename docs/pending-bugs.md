@@ -31829,26 +31829,3 @@ window. **Fix shape:** a compound verdict for the excluded class — the
 [11.153] memo fresh (retry-exhausted) AND the peer's
 `agent-runtime-alive` answer (already strict-parse) false on two spaced asks
 — closing the row through the same PeerSessionGone close.
-
-## ⛔ [11.157] AN SSH ROW'S STORED-OPEN KEEPS THE SHELL ARM'S FOSSIL — THE COMPOSER THAT USED TO SYNTHESIZE `codex resume` FOR SHELL ROWS STILL HANDS IT TO SSH ROWS (filed 2026-09-20, the [11.156] close; UNMEASURED)
-
-**Status:** OPEN
-
-The [11.156] fix rebuilt the `SessionKind::Shell` arm of
-`stored_session_launch_command_from_vouch` (a 2.0.9-era fossil that
-synthesized `cd <cwd> && codex resume <id>` for a stored-open shell row) into
-the honest interactive-shell launch, and gave the stored-open of a closed
-LOCAL row its close-record identity plus the named
-`closed_row_identity_underdetermined` refusal. The `SessionKind::SshShell`
-half of that same arm kept the fossil line verbatim, deliberately: an `ssh://`
-stored-open degrades the same way (the composer is not given the ssh target,
-so the honest attach cannot be composed there), and half-fixing an unmeasured
-path manufactures a newer lie. Measured exposure: `open_or_focus_session`'s
-was-missing birth for an `ssh://` path — a closed ssh row re-opened through
-`server connect` or a GUI click. **Falsifier:** close a live ssh row, re-open
-it by its path; the re-born row must carry an ssh attach launch command for
-ITS target — never a `codex resume` line. **Fix shape:** compose the born-form
-`remote_ssh_launch_command` from the path's own target (the entry's
-`ssh_target` is already parsed from `ssh://<target>/<id>` one call frame
-away), or refuse with a named underdetermined verdict the way the local row
-now does.
