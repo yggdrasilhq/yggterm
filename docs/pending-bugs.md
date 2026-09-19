@@ -31503,6 +31503,33 @@ claim ACK-e3f6255b64, deployed 22ef5d4a43e3): three of the four teeth are
 FIXED AND LIVE-PROVEN; the reconcile's live heal is the remaining leg, and
 the reader disagreement moved one seam up.
 
+ROOT CAUSE FOUND + FIXED IN CODE (2026-09-19 later,
+lane/integration/oc208-1144-inputcheck, deployed with this lane): the
+"GUI-side cached snapshot" theory is FALSIFIED — there is no cache. The
+input-probe family never read the composer draft at all: terminal_snapshot
+answered an 8-wide positional tuple whose two trailing Options
+(`composer_holds_draft`, `pty_in_alternate_screen`) were tail-bound by
+`.., x)` patterns, and when the alt-screen field was appended (3.2.51-era)
+every such binding silently shifted onto it. Four probe-path readers (the
+readiness probe's first-poll verdict, the raw-mode confirm window, the
+post-echo cleanup reading, the marker cleanup) spent 16 days reporting the
+alternate-screen flag as the draft answer — a virgin alt-screen opencode
+2.0.8 row answered `composer_held_draft:true` at waited_ms 1-4 (instant
+because the IPC is fast, not because anything was cached), while the
+send-path guard read the REAL union and accepted a write seconds later:
+"two readers one screen" was literally two different fields. THE FIX is
+structural: terminal_snapshot returns the named TerminalSnapshotAnswer
+struct (wire ServerResponse unchanged; the mapping is factored behind a
+distinctness test pinning draft=false / alt-screen=true as DIFFERENT
+fields), every consumer binds by name, and a source-scan lock
+(no_input_probe_positionally_tail_binds_the_snapshot_answer) keeps the
+tail-binding shape out of the shell. Suite delta vs clean main eb77c32a:
+failure sets IDENTICAL (11 server + 11 shell, pre-existing — see
+[11.145]). OWED before this entry deletes: the live phantom battery on the
+deployed build — Z on a fresh dormant --no-activate row → input-check
+draft:true inside the 2s grace → trace composer_draft_reconciled_stale_bytes
+→ consuming past it → guarded one-shot send starts a REAL turn.
+
 FIXED + LIVE-PROVEN (two full battery runs on fresh 2.0.8 rows through the
 wrapper):
 1. THE DEADLOCK IS BROKEN at the enforcement point:
@@ -31613,6 +31640,49 @@ independent and mechanical: the guard must permit a write whose payload is
 empty or is exactly the erase sequence (Ctrl+U / backspaces), or the refusal
 must route the remedy itself; (3) re-run the [11.133] live proof + [11.134]
 bind proof on 2.0.8.
+
+## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 22 PRE-EXISTING REDS AND TWO OF THEM ARE SELF-GATES — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) AND THE RECONCILE-FETCH STARVATION LOCK (its source-scan needle no longer matches the source it guards) — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
+
+**Status:** OPEN
+
+The [11.144] input-check lane ran the full yggterm-server and yggterm-shell
+suites on CLEAN MAIN (eb77c32a) and on the lane before claiming anything:
+the two failure sets are identical — 11 server + 11 shell, none of them the
+lane's. Two of the 22 are gates, not tests:
+
+- `daemon::tests::protocol_shape_stamp_forces_version_bump` computes
+  0x2363fb2b0c9e7582 against STAMPED_AT_VERSION 3.2.78 / hash
+  0x74843ba79da0f1fa — the wire enums drifted post-3.2.78 and no seat
+  re-stamped; serde(default) kept old peers alive, which is why nothing
+  broke loudly. The wire-shape gate is currently decorative. The honest
+  repair needs the drift inventory (which commits touched the enums; each
+  field serde(default)-guarded?) and a re-stamp at the shipped version —
+  the wire contract owner's call, deliberately not taken as a drive-by.
+- `shell::terminal_loop_input_starvation_locks::
+  the_reconcile_fetch_is_dispatched_off_the_select_loop` pins a literal
+  that no longer matches the source it guards (the fetch shape was rewritten
+  without updating the lock).
+
+The other 20, verbatim for their owners: server —
+a_forced_same_version_handoff_is_never_deferred, a_symlink_to_our_own_
+socket_is_self_not_a_peer (known environment-sensitive since 2026-09-11),
+a_local_row_of_a_cli_with_no_measured_reader_says_so,
+no_live_agent_row_is_refused_by_both_title_chores_without_saying_so,
+remote_store_title_poll_selects_working_and_unconfirmed_rows, an_anchor_
+without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom,
+a_reparented_agent_is_still_ours_by_its_own_environment, a_stampless_
+anchor_resumes_the_newest_store_session_for_its_cwd, the_argv_identity_
+walk_reads_a_live_tuis_own_cmdline, title_follow_reads_the_persisted_
+records_the_audit_reads. shell — every_registered_cli_has_both_shell_arms,
+every_shellstate_write_goes_through_a_counted_wrapper,
+no_uncounted_raw_write_to_shell_state_survives_in_this_file,
+supports_generated_session_copy_accepts_local_stored_session_paths,
+the_markdown_adapter_owns_no_typography_of_its_own,
+the_chrome_gate_is_fed_by_the_engine_and_worn_by_every_surface,
+the_placement_rule_is_wired_to_the_reconciler_and_the_render,
+the_reclaim_pass_call_site_is_wired_to_the_live_machine,
+the_reconcile_loop_still_sweeps_surfaces_whose_row_was_closed_elsewhere,
+a_menu_heading_says_only_what_the_row_underneath_it_cannot.
 
 ## ⚠ [11.139] THE OWNER-VISIBLE CODEX AMBER IS A STUCK REMOTE ATTACH — `ghost_frame` + `transport_degraded` + `remote_attach_pending` OUTLIVES THE MOUNT RACE THAT CAUSED IT, WITH NO TIMEOUT AND NO RETRY THAT COMPLETES (measured live 2026-09-17 on the GUI host, same sitting as [11.138])
 
