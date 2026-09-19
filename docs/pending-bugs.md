@@ -31877,7 +31877,7 @@ The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local
 
 ## ⛔ [11.154] A REMOTE ROW'S CLOSE IS NOT ATOMIC ACROSS THE TWO PLANES — A ROTATION MID-CLOSE LEFT THE LOCAL ROW LIVE WHILE THE PEER SESSION WAS TERMINATED AND TOMBSTONED, AND A CLIENT-HANDSHAKE BIRTH RE-BIRTHED THE ROW A THIRD TIME (measured live 2026-09-19 19:10-19:40 + 19:39:24 on the GUI host + dev; the [11.153] sitting's fix direction (b))
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The respawn-loop half of the owner's report is FIXED AND VERIFIED (2026-09-19,
 lane/trace/11153-remote-mount, deleted above per the verified-fix law): the
@@ -31906,3 +31906,44 @@ daemon rotation, and a client-handshake birth for a peer-tombstoned session
 must surface the peer's death instead of re-birthing the row unasked. The
 mount-side gate landed above does not close this hole; it only stops the row
 from respawning into it forever.
+
+FORENSICS DEEPENED 2026-09-19 (the fix seat, the muse lab host's ytrace plus
+the shared tombstone file): the close's local half never reached ANY daemon on
+the GUI host — `removed-rows.json` holds NEITHER an entry NOR a departure for
+29434a5f, and `record_row_departure` runs unconditionally as the first line of
+`tombstone_live_row`, so a close that reached even the dying predecessor would
+have left one. The measured chain: 19:17:19-20 TWO `server/cli birth` events
+with `launch_now:false` (the rotation restored the row metadata-only —
+predecessor and successor both); 19:17:43 the close window errored
+(`hot_warm_ensure_error "reading daemon response"`); 19:18:40 onward the
+doomed ensure-spawn loop every ~2 minutes; 19:39:24 another `server/cli birth`
+— the client-handshake re-birth through the ONE birth door that never asked
+the tombstone plane.
+
+FIXED IN CODE (lane/trace/11154-close-atomic): (1) THE BIRTH VETO —
+`insert_live_session_with_launch_options` (the one birth chokepoint) consults
+`live_row_closes_remembered_among` for PASSIVE births (`launch_now == false`)
+and refuses by name (`live_session_birth_vetoed_closed_row`); a user-driven
+start (`launch_now == true`) is a deliberate re-entry whose persist reconcile
+lifts the veto. A close that lands on ANY daemon of the home machine now
+holds through every restore and re-birth door. (2) THE CLOSE RE-DELIVERY —
+the app-control close (the GUI's RemoveSession) retries transport-class
+failures at 1s/2s/4s onto the successor daemon
+(`remove_session_retry_delay_ms`); an answered verdict is never retried.
+That closes the measured ORIGIN: a close issued inside the swap gap died with
+one transport error and was lost — no tombstone, no removal. (3) RIDE-ALONG —
+the recovery sweep's tombstone re-arm had landed AFTER its `return None`
+(dead on arrival, aa8c72fa): the door refused without re-arming, exactly the
+wait-out-the-veto hole the re-arm exists to close; it precedes the return
+now, and a lock pins the order. Locks: `the_passive_birth_chokepoint_asks_
+the_tombstone_plane`, `the_recovery_sweep_rearm_precedes_its_return`, shell
+`the_close_retries_its_transport_but_never_a_named_refusal` +
+`the_remove_session_arm_re_delivers_through_the_retry_loop`.
+
+STILL OPEN (the remaining half, honestly): a close that runs ONLY on the peer
+machine (the dev terminate+tombstone at 19:17:40) still tells nobody on the
+home machine — the peer holds no roster of which homes carry its rows, so the
+home plane learns peer-gone only through the [11.153] memo after ONE doomed
+mount attempt (that lane's accepted steady state). The full fix is a
+peer-to-home close notice on the existing command channel; it wants its own
+seat and its own measured transport.
