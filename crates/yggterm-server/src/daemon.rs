@@ -18062,7 +18062,7 @@ fn spawn_stale_owner_retirement(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRunt
     });
 }
 
-fn current_build_id() -> u64 {
+pub(crate) fn current_build_id() -> u64 {
     daemon_binary_path()
         .and_then(|path| fs::metadata(path).ok())
         .and_then(|meta| meta.modified().ok())

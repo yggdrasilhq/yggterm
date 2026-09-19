@@ -24164,6 +24164,17 @@ fn local_daemon_binary_current_problem(runtime_status: &ServerRuntimeStatus) -> 
     if pid == 0 {
         return None;
     }
+    // Same build identity means current, whatever root the exe lives at. The
+    // daemon also runs from the direct-store builds root, which no path
+    // roster enumerates exhaustively; sameness of bits is decided by the
+    // build id (the running binary's mtime-second) plus a size witness, not by
+    // install-path membership. Measured 2026-09-19: dev's recovery daemon
+    // (direct-store exe, identical build id) was flagged stale by every
+    // client for its whole lifetime — 994 flags in 5 minutes, each spawning
+    // a bind-lock competitor. ([11.146])
+    if same_build_identity_as_current_exe(pid, runtime_status.server_build_id) {
+        return None;
+    }
     let proc_exe = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     let current = std::env::current_exe().ok()?;
     if local_daemon_proc_exe_target_is_allowed(&current, &proc_exe) {
@@ -24193,6 +24204,20 @@ fn proc_exe_target_without_deleted_suffix(proc_exe_target: &Path) -> PathBuf {
         .strip_suffix(" (deleted)")
         .map(PathBuf::from)
         .unwrap_or_else(|| proc_exe_target.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn same_build_identity_as_current_exe(pid: u32, build_id: u64) -> bool {
+    if build_id != daemon::current_build_id() {
+        return false;
+    }
+    let Ok(mine) = std::env::current_exe().and_then(|path| fs::metadata(&path)) else {
+        return false;
+    };
+    let Ok(theirs) = fs::metadata(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    mine.len() == theirs.len()
 }
 
 #[cfg(target_os = "linux")]
@@ -55903,6 +55928,103 @@ terminal_window_id: None,
             &current,
             Path::new("/tmp/old-yggterm (deleted)")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_build_identity_daemon_is_current_from_any_install_root() {
+        // [11.146] — the pid points at THIS test process, so /proc/<pid>/exe
+        // is the test binary: a real running exe no allowlist roster carries.
+        // Reporting our own current_build_id() must read as current (the
+        // 2026-09-19 dev incident: the direct-store recovery daemon, same
+        // build id, flagged stale by every client for its whole lifetime);
+        // any other build id at that unknown root must stay stale.
+        let base = server_runtime_status_for_stale_probe();
+        let mut same_build = base.clone();
+        same_build.server_pid = std::process::id();
+        same_build.server_build_id = daemon::current_build_id();
+        assert_eq!(
+            super::local_daemon_binary_current_problem(&same_build),
+            None,
+            "same build id and size must be current regardless of exe root"
+        );
+
+        // The refusal arm needs a genuinely foreign exe: this process' own
+        // /proc/<pid>/exe is always allowlist member zero. A sleeping child
+        // runs /usr/bin/sleep — an unknown root — and must stay stale on a
+        // different build id.
+        let mut other_build = base;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn foreign-binary child for the refusal arm");
+        other_build.server_pid = child.id();
+        other_build.server_build_id = daemon::current_build_id().wrapping_add(1);
+        let refused = super::local_daemon_binary_current_problem(&other_build);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            refused.is_some(),
+            "a different build id at an unknown root stays stale"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn server_runtime_status_for_stale_probe() -> ServerRuntimeStatus {
+        ServerRuntimeStatus {
+            pending_input_drafts: None,
+            server_build_commit: String::new(),
+            daemon_started_at_ms: 0,
+            daemon_uptime_ms: 0,
+            running_build_id: 0,
+            on_disk_build_id: 0,
+            hot_restart_pending: false,
+            hot_restart_block_reason: None,
+            hot_restart_blockers: Vec::new(),
+            role_enforcement: true,
+            same_version_handoff_cooldown_remaining_ms: None,
+            live_terminal_sessions: Vec::new(),
+            advertises_live_session_rows: true,
+            persisted_state_recovery: None,
+            remote_yggterm_retry_total: 0,
+            server_version: "test".to_string(),
+            server_build_id: 0,
+            server_pid: 0,
+            host_kind: "xterm".to_string(),
+            host_detail: String::new(),
+            embedded_surface_supported: true,
+            bridge_enabled: false,
+            restored_from_persisted_state: false,
+            restored_stored_sessions: 0,
+            restored_live_sessions: 0,
+            restored_remote_machines: 0,
+            owned_terminal_session_count: 0,
+            owned_terminal_session_keys: Vec::new(),
+            terminal_session_count: 0,
+            terminal_session_keys: Vec::new(),
+            preserved_terminal_owner_count: 0,
+            preserved_terminal_owner_keys: Vec::new(),
+            stored_terminal_session_count: 0,
+            stored_terminal_session_keys: Vec::new(),
+            stored_terminal_sessions: Vec::new(),
+            advertises_stored_session_keys: true,
+            terminal_retained_chunks: 0,
+            terminal_retained_bytes: 0,
+            terminal_session_buffer_limit_bytes: 0,
+            terminal_idle_buffer_limit_bytes: 0,
+            managed_session_count: 0,
+            session_metadata_entries: 0,
+            session_metadata_bytes: 0,
+            session_preview_block_count: 0,
+            session_preview_line_count: 0,
+            session_preview_bytes: 0,
+            session_rendered_section_count: 0,
+            session_rendered_line_count: 0,
+            session_rendered_bytes: 0,
+            session_terminal_line_count: 0,
+            session_terminal_bytes: 0,
+            session_payload_total_bytes: 0,
+        }
     }
 
     #[cfg(unix)]

@@ -31494,6 +31494,55 @@ frame reaches the ring while both clocks stand still; the next text chunk
 stamps) + the probe, 3 green. LIVE PROOF of both this residual and the
 screen-qualified verdict rides the next rotation.
 
+## ⛔ [11.146] A DAEMON RUNNING THE CURRENT BUILD FROM AN UNLISTED INSTALL ROOT IS FLAGGED STALE BY EVERY CLIENT FOREVER — THE STALE VERDICT COMPARED INSTALL PATHS WHILE IGNORING THE BUILD ID IT WAS ALREADY LOGGING (filed 2026-09-19, owner screenshot)
+
+**Status:** OPEN
+
+Measured 2026-09-19 on the build host: the 09:33 deploy hot-restarted the
+daemon; at 10:50:29 it idle-shutdown (see [11.147]); the 11:02:58 recovery
+spawn won the bind from the direct-store builds root — same version, same
+build id, an exe path the allowlist roster (current exe + headless
+companion + the two managed bin roots) does not carry. Every client
+boot-wait then logged `stale_daemon_binary_detected` and IGNORED the live
+daemon: 994 flags in 5 minutes, each invocation burning the spawn lock on
+a competitor that lost the bind (`bind_lock_busy` churn 11:03→11:13+),
+and row starts racing the contention answered `Error: local yggterm
+daemon did not become reachable` — the owner's dev·remote codex and
+zcode-tui rows. Third instance of the root-roster class (two roots
+patched before; a roster can never be the SSOT of same-bits). FIX
+(lane/integration/stale-buildid): `local_daemon_binary_current_problem`
+accepts build-identity first — reported `server_build_id` equal to the
+client's own `current_build_id()` plus an exe-size witness, hence
+current whatever the root; the path roster stays for genuinely different
+builds. Locked by `same_build_identity_daemon_is_current_from_any_install_root`
+(own pid = foreign root, same build id accepted; a /bin/sleep child at an
+unknown root with a foreign build id refused). Delete this entry per the
+verified-fix law once the rotated build has lived through a recovery.
+
+## ⛔ [11.147] THE 90s IDLE-SHUTDOWN DEFAULT RETIRES A ROW-FLEET HOST'S DAEMON WHILE KEEP-ALIVE ROWS ARE REGISTERED — MISSING_RUNTIME ROWS BLOCK NOTHING, AND THE HOST SITS DARK UNTIL SOMETHING NEEDS IT (filed 2026-09-19, owner screenshot)
+
+**Status:** OPEN
+
+Measured 2026-09-19 on the build host: `idle_shutdown` fired at 10:50:29
+(`idle_shutdown_ms: 90000`, the default) because
+`daemon_should_idle_shutdown` counts ONLY `is_running()` sessions in the
+daemon's own registry — preserved and missing_runtime rows (the
+attachment sweep that morning: 77 detached, 10 antigravity
+missing_runtime) block nothing, and no client record was live at that
+minute. The host then had NO daemon for 12 minutes (10:50:29 to
+11:02:58); every row PTY was already gone and no resume could even
+start — the owner's "dev codex sessions are disconnecting". The gate
+carries an owner-recorded economics call (the preserved-count
+deliberately-not-fixed note: daemon population costs
+`N_reachable × ~0.2-core`), so this is a DESIGN question, not a seat
+fix. Options for the owner: (a) keep the 90s default and accept
+unattended flap ([11.146] makes recovery clean, resume is
+ledger-served); (b) block idle-shutdown while ANY registered row exists
+(the preserved-count economics concern applies); (c) host-class
+override via `YGGTERM_DAEMON_IDLE_SHUTDOWN_MS` on row-heavy hosts
+(config, no code); (d) shorter default with the dying-rows ledger write
+as the only persistence (today's behavior). Owner GO pending.
+
 ## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
 
 **Status:** OPEN
