@@ -1883,6 +1883,19 @@ fn composer_row_is_chrome(row: &str) -> bool {
     if text.is_empty() {
         return true;
     }
+    // ⛔ [11.144] A RIGHT-ALIGNED bare `>` is opencode 2.0.8's bottom-right
+    // corner glyph on daemon rows (measured live, the muse lab host, two
+    // rows). Left unclassified it stopped the below-composer chrome trim on
+    // every settled production row, the grid arm answered cannot-say where
+    // the sim read Some(false), and the phantom-draft reconcile could never
+    // see the confident-empty render it needs. RIGHT-ALIGNED is the
+    // discriminator: agy's `>` composer sits at the left margin and its EMPTY
+    // state must stay readable (trimming it here would blind agy's own
+    // classifier), and a `>` with anything after it is transcript (codex
+    // error lines start `> text` — [11.66]).
+    if text == ">" && row.starts_with(|ch: char| ch == ' ' || ch == '\t') {
+        return true;
+    }
     // A bare version stamp is vendor chrome, not composer content (opencode
     // paints `2.0.3` bottom-right on a fresh screen — [11.133] measured).
     if !text.is_empty() && text.chars().all(|ch: char| ch.is_ascii_digit() || ch == '.') {
@@ -3759,6 +3772,46 @@ mod tests {
     /// visible screen showed none, and without the row itself no deploy could
     /// answer which frame lied. The evidence is the contract the daemon's
     /// `composer_draft_union` trace event rides on.
+    /// ⛔ [11.144] THE CORNER GLYPH. opencode 2.0.8 daemon rows paint a bare
+    /// `>` bottom-right; unclassified it blinded the grid arm on every settled
+    /// production row (cannot-say instead of the sim's Some(false)). The
+    /// end-to-end half is the measured settled shape WITH the corner row.
+    #[test]
+    fn the_bare_right_aligned_corner_greater_than_is_chrome() {
+        let corner = format!("{}>", " ".repeat(169));
+        assert!(
+            super::composer_row_is_chrome(&corner),
+            "the right-aligned corner glyph is vendor chrome"
+        );
+        assert!(
+            !super::composer_row_is_chrome(">"),
+            "agy's left-margin bare `>` is its empty composer, never chrome"
+        );
+        assert!(
+            !super::composer_row_is_chrome("> boot failed: no store"),
+            "a `>` with content after it is transcript, never chrome"
+        );
+
+        // The measured settled row shape, corner glyph included: the walk
+        // must still reach the box and answer confidently empty.
+        let rows: Vec<String> = [
+            "\u{2503}  Ask anything\u{2026} \"Fix a TODO in the codebase\"",
+            "\u{2503}",
+            "\u{2503}  Build auto \u{b7} Muse Spark 1.3 Free OpenCode Zen \u{b7} xhigh",
+            &format!("\u{2579}{}", "\u{2580}".repeat(80)),
+            "/tmp/oc144-proof-cwd                    shift+tab agents  ctrl+p commands",
+            &corner,
+        ]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+        assert_eq!(
+            super::composer_row_holds_text(Some(SessionKind::OpenCode), &rows),
+            Some(false),
+            "the corner glyph must not stop the walk from reaching the box"
+        );
+    }
+
     #[test]
     fn a_positive_draft_reading_names_the_row_that_produced_it() {
         let rows: Vec<String> = [
