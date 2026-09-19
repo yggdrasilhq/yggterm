@@ -140,12 +140,43 @@ exit, 2026-09-10, dev) — and all three resume wrappers consult the ledger
 BEFORE the saved-session probe and the /proc wait: a self-minting CLI is
 asked about yggterm's row id, which its store has never heard of, so the
 store probe reads false for exactly the rows the ledger can vouch for.
-`died_with_me` is typed, served and consumed but **no current exit path
-writes one**: a daemon exits only after an AllMoved sweep (nothing left
-held), and a partial sweep's held rows stay unrecorded because their writer
-keeps serving them — the first writers of death sentences will be the
-force-retire / cold-exit paths and the class-C resume arms. NoAnswer falls
-back to today's scan-and-banner.
+`died_with_me` is typed, served and consumed; the hot-restart same-version
+cold swap writes one per row it cannot save (first measured live on a real
+rotation 2026-09-14: `reattach_ledger_died_with_me_written` ->
+`reattach_ledger_served {disposition: died_with_me}` ~150 ms in,
+`clear_satisfied` consumed both; re-proven three further times 2026-09-19).
+NoAnswer falls back to today's scan-and-banner.
+
+MEASURED LIVE, 2026-09-19 (scratch-home rotations, production binaries) —
+the two arms and the arm ranking, end to end:
+
+- **Which arm runs is decided by the hot-update gate's blockers, not by
+  idleness alone.** The sweep's own per-row gate wants >= 45 s idle
+  (`MIGRATE_IDLE_MS`) while the hot-update gate's recency blocker fires
+  inside a 300 s window — the two CANNOT both pass on idleness, so an idle
+  fleet always cold-swaps (reproduced 4x: `died_with_me` x2 each time). A
+  blocker that is not idleness — a shell row running a foreground command
+  reads as `working` — selects the PRESERVING arm: bequeath ->
+  `pty_fd_handoff_sweep {outcome: AllMoved {moved: 3}}` ->
+  `reattach_ledger_written {adopted_records: 3}`.
+- **`adopted` records were then read in the ledger file**: one per moved
+  agent row, `by_pid` = the successor's pid. The moved SHELL row correctly
+  earned no record (shells carry no store identity — the writer's
+  exclusion verified live). The [11.97]-class linger socket formed in the
+  same rotation.
+- **The live-runtime arm outranks the ledger** (measured, not just read
+  from the code): every resume before the swap and every resume after it
+  BRIDGED — post-handoff the successor advertises the adopted rows under
+  their session ids. The ledger's consumption window is therefore the
+  daemon-less gap mid-swap, where `reattach_ledger_served` fires (~155 ms
+  measured) and the served record is consumed. `served {adopted}` shares
+  that window; catching it live needs a resume landing inside an actual
+  handoff. An unconsumed `died_with_me` record is also honest: when the
+  successor restores rows itself, the records simply expire.
+- ⚠ a probe loop ticking faster than ~1.5 s file-descriptor-bombed a
+  successor mid-handoff (`Too many open files` on client accept) and
+  stalled the sweep — instruments are participants; keep rotation probes
+  serial and slow.
 
 ## 5. Observability — tiered, mostly file-shaped
 
