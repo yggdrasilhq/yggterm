@@ -31828,22 +31828,26 @@ existing remote command channel (the owner machine tells the machines its
 remote-scan has advertised this session to), or the home plane asking the
 peer one existence question before the first mount of a restored remote row.
 
-## ⛔ [11.156] OPENING A ROW THE TOMBSTONE REMEMBERS RE-BIRTHS IT DEGRADED — CWD LOST TO `local:/`, EMPTY TITLE, AND A SHELL ROW HANDED A `codex resume` LAUNCH COMMAND (measured live 2026-09-20 00:24 on the muse lab host, the [11.154] proof's deliberate re-open control)
+
+## ⛔ [11.157] AN SSH ROW'S STORED-OPEN KEEPS THE SHELL ARM'S FOSSIL — THE COMPOSER THAT USED TO SYNTHESIZE `codex resume` FOR SHELL ROWS STILL HANDS IT TO SSH ROWS (filed 2026-09-20, the [11.156] close; UNMEASURED)
 
 **Status:** OPEN
 
-The [11.154] live proof closed a local shell row and re-opened it through the
-deliberate door (`server connect`). The re-entry is LAWFUL (the tombstone
-reconcile lifts the veto — that half of the law measured working), but the
-re-birth came back DEGRADED: `cwd` read `local:/` (the original
-`/tmp/ygg-1154-proof` was gone from the reconstruction), the title was empty,
-and the ensured launch command was `cd 'local:/' && codex resume <id>` for a
-SHELL row — bash answered `No such file or directory` as the row's first
-paint. The stored-open re-derivation rebuilds a closed row's identity from
-the runtime key alone and guesses the kind from the id's shape. **Falsifier:**
-close a live local shell row, re-open it by its path; the re-born row must
-carry its cwd, its kind and a shell launch command — never a `codex resume`
-line, never `local:/`. **Fix shape:** the stored-open path must read the
-kind and cwd from the persisted stored-session record (or refuse with a
-named `closed_row_identity_underdetermined` instead of synthesizing a wrong
-row).
+The [11.156] fix rebuilt the `SessionKind::Shell` arm of
+`stored_session_launch_command_from_vouch` (a 2.0.9-era fossil that
+synthesized `cd <cwd> && codex resume <id>` for a stored-open shell row) into
+the honest interactive-shell launch, and gave the stored-open of a closed
+LOCAL row its close-record identity plus the named
+`closed_row_identity_underdetermined` refusal. The `SessionKind::SshShell`
+half of that same arm kept the fossil line verbatim, deliberately: an `ssh://`
+stored-open degrades the same way (the composer is not given the ssh target,
+so the honest attach cannot be composed there), and half-fixing an unmeasured
+path manufactures a newer lie. Measured exposure: `open_or_focus_session`'s
+was-missing birth for an `ssh://` path — a closed ssh row re-opened through
+`server connect` or a GUI click. **Falsifier:** close a live ssh row, re-open
+it by its path; the re-born row must carry an ssh attach launch command for
+ITS target — never a `codex resume` line. **Fix shape:** compose the born-form
+`remote_ssh_launch_command` from the path's own target (the entry's
+`ssh_target` is already parsed from `ssh://<target>/<id>` one call frame
+away), or refuse with a named underdetermined verdict the way the local row
+now does.
