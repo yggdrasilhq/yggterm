@@ -43,7 +43,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
 | 11.6.11 | zcode-tui | B | OPEN (native announce LANDED — emitter commit zcode-tui 0bd590f + daemon `announce` verb; arm matrix FILLED — all 10 tests green; §9 battery suite LANDED on `lane/integration/zcode-tui-battery` — 6/6 green against true main 0.5.9 through a real pty: paint, U+258F caret byte-exact, turn, sess_ store law, resume rederive, panic; the SCREEN-side live proof is delivered, the announce-WIRE proof rides the daemon listener; descriptor screen-phrase fill LANDED ([11.111] deleted per the verified-fix law — table matches 0.5.9 chrome, the §9 suite asserts declared==observed)) |
-| 11.6.12 | devin | C | MEASURED 2026-09-16 (lane/integration/devin-battery — the first measurement pass the registration owed; a zcode seat on the muse lab host, devin 3000.10.27 the only fleet install, auth LIVE via the owner's 2026-09-15 login): suites/devin.js 8/8 TWICE live — trust gate measured BOTH ways (`✓ Do you trust the authors of this directory?` / `Yes, trust` / `No, exit` on a fresh cwd; Enter grants; the grant is durable in `~/.local/share/devin/cli/trusted_workspaces.json`; a trusted cwd never sees the gate; print mode REFUSES an untrusted workspace by name: `Error: Refusing to run in an untrusted workspace: <path>`); composer glyph **U+276D `❭`** read off the RENDERED buffer — the registered U+276F was a placeholder, one codepoint off; working line `⣠⠀ Thinking · <N>s (esc twice to interrupt)` (braille = spinner frames, muse lesson) with the composer placeholder swapping to `❭ Guide Devin while it works` mid-turn; the interrupt is TWO DISTINCT esc presses (a single `\x1b\x1b` write reads as one event — measured, the turn kept running); footer `SWE-1.6 Slow` + `ctrl+v to paste image in clipboard`; STORE = ONE sqlite db `~/.local/share/devin/cli/sessions.db` (WAL; sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state) — session ids are word-word SLUGS (scythe-snowplow), `title` = the first prompt (eager self-titling — codex law, third instance), a row is written only on a COMPLETED turn (a turnless/interrupted session leaves session_locks/<slug>.lock = the pid; locks persist after exit, NOT a live registry); resume rederive PROVEN (`devin -r <slug>` repaints the history; ctrl+d exits rc 0 with the farewell naming `devin -r <slug>`); `devin list --format json` cwd-scoped machine surface; `--permission-mode` MEASURED `auto|accept-edits|smart|dangerous` (default auto, env DEVIN_PERMISSION_MODE) — the registration's docs-sourced `normal|dangerous|bypass` is DEAD on the binary; OSC title `devin: <cwd-basename>`. DESCRIPTOR FILLED WHERE MEASURED: screen tables, U+276D, permission modes + measured presets (smart rides as a preset — no enum slot), `content_rederives_on_resume: true`, store declared (durable_store_files sessions.db, scan_gap CLOSED, opencode posture: empty globs BY SHAPE + dedicated scanner `scan_devin_sessions`), title reader + membership probe + newest-for-directory arm + remote title probe wired. Core lib delta vs clean main = 0 new reds; arm matrix 10/10. WRAPPER-LEVEL LIVE-ROW PROOF RAN 2026-09-18 (the muse lab host, daemon 7e816ff3): the gate leg PROVEN (`startup_gate` classification + the NAMED `startup_gate_shown_refusal` — [11.107]'s naming half on a second CLI) and the turn leg FOUND [11.140] — every wrapper send refused `pending_draft` because the placeholder sits on the ❭ glyph row; FIXED IN CODE (composer_placeholder_needles declared, both measured forms; fixture-locked); the rotation then arrived and the guard half proved LIVE on clean composers; the delivery leg RAN 2026-09-19 and a wrapper path DELIVERS A REAL TURN — prompt without the trailing newline, then a submit-only send: reply verbatim, composer back to idle, context meter moved, a sessions.db row written for the probe cwd ([11.140] and [11.141] deleted with that proof per the verified-fix law). RESIDUAL [11.142] CLOSED 2026-09-19 — decode-confirmed submit + probe posture LIVE-PROVEN on the rotated build (b530cd958516, the muse lab host): the one-shot text+CR contract send started a REAL turn (working line painted, composer back to idle, context meter 18k/200k, sessions.db row steep-saver titled with the one-shot prompt, accepted:true honest), and input-check AND terminal submit on a healthy draft-holding row answer the DRAFT refusal by name (wedged:false, composer_held_draft:true, remedy:null, no probe typed) — entry deleted per the verified-fix law, git remembers. Measured drift: devin self-updated to v3000.10.31, footer `ctrl+v…` → `alt+m to switch` (suite paired). CORRECTION (2026-09-19, the devin-repair seat, b98cc431): the ctrl+v hint is NOT dead — the footer right side is CONTEXTUAL: `ctrl+v to paste image in clipboard` paints whenever the composer HOLDS TEXT, the `alt+m` variant paints on the EMPTY idle composer; and esc closes overlays but does NOT clear composer text (typed text concatenates — probe hazard, measured). The [11.142] close’s owed suite placeholder re-pair is MEASURED NOT NEEDED — 8/8 twice live on b98cc431; the [11.140] pairing (242d87d2) already carries the grown idle-ask form in both the suite constant and the descriptor needles. Still open: cloud `/handoff` unprobed; model-surface MEASURED 2026-09-19 (`/model` = inline autocomplete, `Interactively choose a model, or specify one directly`, hint names `claude-opus-5|claude-sonnet-5|…`; `/fusion` = `Choose a Fusion model (same as /model fusion)`; alt+m = the searchable model picker overlay — pricing panel, `✑ New ✑ Promotion ✑ Beta` tags, footer `↑↓ select · ↵ confirm · esc cancel`; banner carries plan + quota `Free plan · use /upgrade · 98% remaining (resets in …)`); `smart` mode has no AgentPermissionMode slot (preset only); independently corroborated the same night by a second seat on a second fresh trusted-cwd row (one-shot text+CR delivered BANANA-1142 verbatim, context meter 18k/200k, sessions.db row colossal-bait; a cold-host one-shot answered the NAMED refused_render with Enter withheld and left a clean composer; the draft-holding probe answered evidence, never WEDGED); follow-up residual filed [11.143] |
+| 11.6.12 | devin | C | MEASURED 2026-09-16 (lane/integration/devin-battery — the first measurement pass the registration owed; a zcode seat on the muse lab host, devin 3000.10.27 the only fleet install, auth LIVE via the owner's 2026-09-15 login): suites/devin.js 8/8 TWICE live — trust gate measured BOTH ways (`✓ Do you trust the authors of this directory?` / `Yes, trust` / `No, exit` on a fresh cwd; Enter grants; the grant is durable in `~/.local/share/devin/cli/trusted_workspaces.json`; a trusted cwd never sees the gate; print mode REFUSES an untrusted workspace by name: `Error: Refusing to run in an untrusted workspace: <path>`); composer glyph **U+276D `❭`** read off the RENDERED buffer — the registered U+276F was a placeholder, one codepoint off; working line `⣠⠀ Thinking · <N>s (esc twice to interrupt)` (braille = spinner frames, muse lesson) with the composer placeholder swapping to `❭ Guide Devin while it works` mid-turn; the interrupt is TWO DISTINCT esc presses (a single `\x1b\x1b` write reads as one event — measured, the turn kept running); footer `SWE-1.6 Slow` + `ctrl+v to paste image in clipboard`; STORE = ONE sqlite db `~/.local/share/devin/cli/sessions.db` (WAL; sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state) — session ids are word-word SLUGS (scythe-snowplow), `title` = the first prompt (eager self-titling — codex law, third instance), a row is written only on a COMPLETED turn (a turnless/interrupted session leaves session_locks/<slug>.lock = the pid; locks persist after exit, NOT a live registry); resume rederive PROVEN (`devin -r <slug>` repaints the history; ctrl+d exits rc 0 with the farewell naming `devin -r <slug>`); `devin list --format json` cwd-scoped machine surface; `--permission-mode` MEASURED `auto|accept-edits|smart|dangerous` (default auto, env DEVIN_PERMISSION_MODE) — the registration's docs-sourced `normal|dangerous|bypass` is DEAD on the binary; OSC title `devin: <cwd-basename>`. DESCRIPTOR FILLED WHERE MEASURED: screen tables, U+276D, permission modes + measured presets (smart rides as a preset — no enum slot), `content_rederives_on_resume: true`, store declared (durable_store_files sessions.db, scan_gap CLOSED, opencode posture: empty globs BY SHAPE + dedicated scanner `scan_devin_sessions`), title reader + membership probe + newest-for-directory arm + remote title probe wired. Core lib delta vs clean main = 0 new reds; arm matrix 10/10. WRAPPER-LEVEL LIVE-ROW PROOF RAN 2026-09-18 (the muse lab host, daemon 7e816ff3): the gate leg PROVEN (`startup_gate` classification + the NAMED `startup_gate_shown_refusal` — [11.107]'s naming half on a second CLI) and the turn leg FOUND [11.140] — every wrapper send refused `pending_draft` because the placeholder sits on the ❭ glyph row; FIXED IN CODE (composer_placeholder_needles declared, both measured forms; fixture-locked); the rotation then arrived and the guard half proved LIVE on clean composers; the delivery leg RAN 2026-09-19 and a wrapper path DELIVERS A REAL TURN — prompt without the trailing newline, then a submit-only send: reply verbatim, composer back to idle, context meter moved, a sessions.db row written for the probe cwd ([11.140] and [11.141] deleted with that proof per the verified-fix law). RESIDUAL [11.142] CLOSED 2026-09-19 — decode-confirmed submit + probe posture LIVE-PROVEN on the rotated build (b530cd958516, the muse lab host): the one-shot text+CR contract send started a REAL turn (working line painted, composer back to idle, context meter 18k/200k, sessions.db row steep-saver titled with the one-shot prompt, accepted:true honest), and input-check AND terminal submit on a healthy draft-holding row answer the DRAFT refusal by name (wedged:false, composer_held_draft:true, remedy:null, no probe typed) — entry deleted per the verified-fix law, git remembers. Measured drift: devin self-updated to v3000.10.31, footer `ctrl+v…` → `alt+m to switch` (suite paired). CORRECTION (2026-09-19, the devin-repair seat, b98cc431): the ctrl+v hint is NOT dead — the footer right side is CONTEXTUAL: `ctrl+v to paste image in clipboard` paints whenever the composer HOLDS TEXT, the `alt+m` variant paints on the EMPTY idle composer; and esc closes overlays but does NOT clear composer text (typed text concatenates — probe hazard, measured). The [11.142] close’s owed suite placeholder re-pair is MEASURED NOT NEEDED — 8/8 twice live on b98cc431; the [11.140] pairing (242d87d2) already carries the grown idle-ask form in both the suite constant and the descriptor needles. Still open: cloud `/handoff` unprobed; model-surface MEASURED 2026-09-19 (`/model` = inline autocomplete, `Interactively choose a model, or specify one directly`, hint names `claude-opus-5|claude-sonnet-5|…`; `/fusion` = `Choose a Fusion model (same as /model fusion)`; alt+m = the searchable model picker overlay — pricing panel, `✑ New ✑ Promotion ✑ Beta` tags, footer `↑↓ select · ↵ confirm · esc cancel`; banner carries plan + quota `Free plan · use /upgrade · 98% remaining (resets in …)`); `smart` mode has no AgentPermissionMode slot (preset only); independently corroborated the same night by a second seat on a second fresh trusted-cwd row (one-shot text+CR delivered BANANA-1142 verbatim, context meter 18k/200k, sessions.db row colossal-bait; a cold-host one-shot answered the NAMED refused_render with Enter withheld and left a clean composer; the draft-holding probe answered evidence, never WEDGED); follow-up residual filed [11.143]; the registration's shell-arm gap (daemon arms without shell arms — `every_registered_cli_has_both_shell_arms` red on main) was FILLED 2026-09-19 in the [11.145] red sweep: Local + remote-devin:// shell rows with the standard axes, fixture id slug-shaped per the sessions.db law |
 
 ### ⛔ 11.6.11 defect — ZCODE-TUI WAS REGISTERED WITHOUT ITS LAUNCH ARMS; `agent_arm_matrix::every_registered_cli_has_both_arms` RED (found by wave-1 seat B, 2026-09-10; FIXED IN CODE 2026-09-14)
 
@@ -31697,6 +31697,80 @@ occurrence must trace `attach_supersede_watchdog` with action
 `rearmed_via_recovery_door` or `released_background`, and `terminal_attention`
 false within one resume ceiling; the instrumented unit above (search row)
 will re-verify if it ever recurs.
+
+**RED SWEEP (2026-09-19 late, lane/integration/11145-reds, a zcode seat on
+the muse lab host, work FROM dev; claim ACK-685a65bde1; landed c8035603):
+10 of the 11 pre-existing server reds FIXED, each with a named cause.
+Measured-today baseline on clean main 2a4acc64 (failure sets byte-identical
+clean vs lane before the fixes): server 11, shell 10, core 1 (the [11.54]
+install-promote).**
+
+1. `a_forced_same_version_handoff_is_never_deferred` — SELF-REFERENTIAL
+   (the [11.151] seat's diagnosis CONFIRMED): its `source.find("if
+   same_version_target && !force {")` matches only the test's own `.find()`
+   argument, so the 12k window swept in the test's own assertion strings
+   and the second assert failed on its own message. Rewritten on
+   `daemon_product_source()` (test modules stripped) +
+   `daemon_fn_body("fn handle_request(")`; also now pins the [11.137] law
+   (no `!force` gate may return to the same-version branch).
+2.+3. The two kimi full-coverage title locks — kimi claimed a store with
+   no reader since the [11.6.6-a] flip. The door's own promise is now
+   KEPT: `read_kimi_live_store_title` + `KIMI_REMOTE_TITLE_PROBE` wired
+   (None-by-shape on every real 1.50.0 store — the title stays Generated —
+   and it serves the day kimi writes a `title` key; a fixture test pins
+   both arms, including the id-is-not-a-title guard).
+4. `remote_store_title_poll_selects_working_and_unconfirmed_rows` — the
+   same kimi cause (its `remote-session://` row expected the reader+probe
+   the flip removed); green again with no edit of its own.
+5. `a_reparented_agent_is_still_ours_by_its_own_environment` — TEST-LAW
+   UPDATE, the classifier is correct: the different-row-marker ⇒ External
+   expectation predates the 2026-09-05 marker-proves-birth law (the
+   all-CLI orphan-refusal plague, measured live); the argv gate already
+   answers the which-session question before the marker is consulted.
+6. `an_anchor_without_a_viewing_stamp_still_degrades...` — TEST-LAW
+   UPDATE: the degrade is the PICKER ARM now (opencode
+   `resume_picker_tokens` = the bare `--session`, pinned id-free in core).
+   The lock keeps its anti-phantom force where it lives — `--session` must
+   never CARRY the anchor uuid (any quoting) and must stay id-less in the
+   composed exec; the compose may still NAME the phantom in the picker
+   notice ("saved session <id> was not found" is a sentence to a human,
+   not a resume).
+7. `a_stampless_anchor_resumes_the_newest_store_session_for_its_cwd` —
+   FIXTURE STALE: the store tier reads the USER home (the 2026-09-04 live
+   falsification) while the test planted the fixture db under
+   YGGTERM_HOME. HOME now points at the scratch home for the ensure, under
+   both env locks so the other HOME-setting test cannot race it.
+8. `the_argv_identity_walk_reads_a_live_tuis_own_cmdline` — FORK/EXEC
+   RACE, not identity drift: between fork and exec,
+   `/proc/<pid>/cmdline` still shows the FORKING PARENT's image (the test
+   binary's own argv); a fast walk read the wrong image and answered None.
+   An eprintln was enough to flip it green — the classic heisenbug. The
+   test now waits out the exec (bounded: argv0 becomes python3) before
+   walking.
+9. `title_follow_reads_the_persisted_records_the_audit_reads` — the needle
+   tripped on the chore body's own history COMMENT naming
+   `live_session_views()` in prose; the code is correct (it calls
+   `persisted_live_sessions()`). The needle is the CALL shape
+   `.live_session_views()` now.
+10. `a_symlink_to_our_own_socket_is_self_not_a_peer` — the purge arm GREW
+    a trace event and drifted past the fixed 3,000-byte window; the
+    2026-09-11 "environment-sensitive, needs an owner" filing was this
+    byte window, not the machine. The lock now scans the real body of
+    `working_flags_including_proxied` via `daemon_fn_body` on the product
+    source.
+11. `protocol_shape_stamp_forces_version_bump` — NOT TOUCHED: owner GO
+    pending on the staged re-stamp (the inventory leg above).
+
+SHELL: `every_registered_cli_has_both_shell_arms` FIXED — devin's 11.6.12
+registration landed daemon arms without its SHELL arms (the spec §6 A6
+class, third instance of the registration-gap family). Local +
+remote-devin:// rows filled with the standard remote axes; the fixture id
+is slug-shaped per the measured sessions.db law (`brass-lantern`, not a
+uuid). The other 9 shell reds are pre-existing with failure sets
+byte-identical to clean main and are NOT diagnosed by this leg — cause
+sweep owed, other owners (counted shellstate writes ×2, generated-session
+copy, markdown adapter, web-surface immersion ×2, reclaim ×2, webtabs
+menu heading).
 
 ## ⛔ [11.152] A YOUNG SUCCESSOR'S HANDOFF PATH COMMITS THE DESCRIPTOR AND THEN NEVER ADOPTS AND NEVER ACKS — THE QUEUED FD IS DROPPED WITH THE STREAM, THE PTY MASTER CLOSES, AND THE ROW'S SHELL DIES SIGHUP; THE SPAWN-ARM SWEEP THAT TRUSTED A BOUND LISTENER KILLED A LIVE ROW AND WAS REVERTED (measured live 2026-09-19, fresh scratch home on a fleet host, production 2a4acc64; the [11.151] repair leg, claim ACK-83597c3317 lineage)
 
