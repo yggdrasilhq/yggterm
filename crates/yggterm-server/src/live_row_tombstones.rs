@@ -171,6 +171,15 @@ pub enum RowDeparture {
     /// path runs, so before this variant existed the departure left no record
     /// anywhere except a trace event in a file that rotates per GUI launch.
     PersistDropped,
+    /// [11.155] The row's PEER session was closed on its owning machine, and
+    /// this machine learned it honestly: the mount path asked the peer's own
+    /// CLI store before spending the mount, and the store answered the
+    /// session gone. The row followed its session — closed here too, so the
+    /// two planes agree again instead of the home keeping a ghost ([11.153]'s
+    /// steady state). A deliberate re-open stays lawful: it lifts the veto
+    /// and starts a fresh session, which is what the [11.153] refusal always
+    /// promised the user.
+    PeerSessionGone,
 }
 
 impl RowDeparture {
@@ -179,6 +188,7 @@ impl RowDeparture {
             Self::ExplicitClose => "explicit-close",
             Self::GuiCloseDisposable => "gui-close-disposable",
             Self::PersistDropped => "persist-dropped",
+            Self::PeerSessionGone => "peer-session-gone",
         }
     }
 }

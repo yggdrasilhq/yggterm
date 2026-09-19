@@ -4145,7 +4145,9 @@ fn live_session_uses_remote_runtime(session: &ManagedSessionView) -> bool {
             || session.session_path.starts_with("ssh://"))
 }
 
-fn remote_live_session_starts_new_codex(session: &ManagedSessionView) -> bool {
+pub(crate) fn remote_live_session_starts_new_codex(
+    session: &ManagedSessionView,
+) -> bool {
     session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL)
         .map(|action| action.starts_with("start-"))
         .unwrap_or(false)
@@ -18887,7 +18889,7 @@ fn remote_session_exists_verb(kind: SessionKind) -> Option<String> {
 /// The per-CLI remote verb already existed and was simply never called:
 /// [`AgentCliDescriptor::session_exists_subcommand`] names it, and the remote
 /// arm resolves it through the same registry that generates it.
-fn fetch_remote_saved_agent_session_exists(
+pub(crate) fn fetch_remote_saved_agent_session_exists(
     kind: SessionKind,
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -54857,7 +54859,7 @@ terminal_window_id: None,
         for (label, open, close) in [
             (
                 "close_live_session_row",
-                "fn close_live_session_row(&mut self, path: &str)",
+                "fn close_live_session_row(\n        &mut self,\n        path: &str,\n        reason: crate::live_row_tombstones::RowDeparture,\n    )",
                 "\n    fn ",
             ),
             (
@@ -55500,6 +55502,22 @@ terminal_window_id: None,
             remote_cache_key("guihost", Some("   ")),
             remote_cache_key("guihost", None)
         );
+    }
+
+    #[test]
+    fn a_kind_without_an_existence_verb_is_never_absent() {
+        // [11.155]'s peer-gone close leans on this ask, so the no-verb law it
+        // inherits from the launch-path probe must hold: a kind whose family
+        // has no remote existence verb answers "present" — keep the row —
+        // without any transport, never "gone".
+        let exists = super::fetch_remote_saved_agent_session_exists(
+            SessionKind::Shell,
+            "unreachable@example",
+            None,
+            "019ad8",
+        )
+        .expect("a verbless kind answers without any transport");
+        assert!(exists);
     }
 
     #[test]

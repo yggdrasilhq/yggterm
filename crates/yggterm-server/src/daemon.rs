@@ -5099,7 +5099,10 @@ impl crate::session_tenancy::EphemeralReapHost for LiveEphemeralReapHost<'_> {
         // The graceful, explicit close — the same tombstone-then-remove the
         // user's own close takes, and for the same reason: a peer daemon that
         // never saw the close would hand the row straight back.
-        if let Err(error) = self.runtime.close_live_session_row(session_path) {
+        if let Err(error) = self.runtime.close_live_session_row(
+            session_path,
+            crate::live_row_tombstones::RowDeparture::ExplicitClose,
+        ) {
             warn!(
                 path = session_path,
                 reason = reason.trace_name(),
@@ -10141,6 +10144,64 @@ impl DaemonRuntime {
             }
             let _ = self.persist_state_only();
         }
+        // ⛔ THE [11.155] GATE. The [11.153] memo learns peer-gone only
+        // AFTER one doomed mount's resize forward exhausts its retries, and
+        // it must expire so a peer-side restore can heal the row. A peer-only
+        // CLOSE is the other geometry — the owning machine ended the session
+        // and nothing told this machine ([11.155]). So before this funnel
+        // spends a mount on a remote agent row whose runtime is not running
+        // here, ask the peer's OWN CLI store — the same structured question
+        // the resume wrapper is about to answer the hard way. A confident NO
+        // is the peer-death notice: close the row through THE one close path
+        // (the tombstone veto + departure keep passive births from
+        // re-birthing it), name what was learned, and refuse the mount. Every
+        // other answer spends nothing: a transport error, a kind whose
+        // existence verb the peer cannot answer, and a start-born row (its id
+        // was minted at birth; the store never heard of it) all fall through
+        // to today's flow, where the resume command owns its own failure.
+        if crate::session_path_is_remote_agent(path) {
+            let runtime_path = self.terminal_runtime_key_for_path(path);
+            if !self.terminals.session_is_running(&runtime_path) {
+                match self.remote_saved_session_peer_gone(path) {
+                    Ok(true) => {
+                        if let Ok(home) = crate::resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_ensure",
+                                "remote_saved_session_peer_close_learned",
+                                serde_json::json!({
+                                    "path": path,
+                                    "verdict":
+                                        "peer store answers the session gone",
+                                }),
+                            );
+                        }
+                        self.close_live_session_row(path, crate::live_row_tombstones::RowDeparture::PeerSessionGone)?;
+                        bail!(
+                            "peer session gone — the owning machine no longer \
+                             holds this session, so the row was closed here to \
+                             match. Re-open the row to start a fresh session."
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(probe_error) => {
+                        if let Ok(home) = crate::resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_ensure",
+                                "remote_saved_session_peer_close_probe_inconclusive",
+                                serde_json::json!({
+                                    "path": path,
+                                    "probe_error": probe_error.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // ⛔ THE [11.153] GATE. A saved remote session whose owning host has
         // CONFIRMED the runtime key gone (the resize forward's exhausted
         // "terminal session not found") must not be resumed again on the next
@@ -10928,8 +10989,12 @@ impl DaemonRuntime {
     /// reaper's close is the same close, so a declared-ephemeral row is taken
     /// whether or not it is marked keep-alive — not because ephemerality
     /// overrides anything, but because there is nothing here to override.
-    fn close_live_session_row(&mut self, path: &str) -> Result<ClosedLiveRow> {
-        self.tombstone_live_row(path);
+    fn close_live_session_row(
+        &mut self,
+        path: &str,
+        reason: crate::live_row_tombstones::RowDeparture,
+    ) -> Result<ClosedLiveRow> {
+        self.tombstone_live_row_as(path, reason);
         let stop_command = self.server.terminal_stop_command(path);
         // THE CORRECTED resolver, not the session map's raw fold: a close that
         // addresses the folded `local://<id>` removes nothing and leaves the
@@ -10945,6 +11010,27 @@ impl DaemonRuntime {
         // running on the other machine. Same hole `forward_remote_pty_resize`
         // had, same resolver that closes it.
         let remote_target = self.server.remote_agent_pty_target_for_path(path);
+        // [11.155] A PEER-GONE close never dispatches a remote shutdown: the
+        // peer's own store just answered the session gone, so a terminate ask
+        // would chase a ghost across the wire. Retire the target and name the
+        // suppression instead.
+        let remote_target = if matches!(
+            reason,
+            crate::live_row_tombstones::RowDeparture::PeerSessionGone
+        ) {
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "session",
+                "peer_gone_close_skips_remote_shutdown",
+                serde_json::json!({
+                    "path": path,
+                }),
+            );
+            None
+        } else {
+            remote_target
+        };
         let removed_terminal = self
             .terminals
             .remove_session(&runtime_path, stop_command.as_deref())?;
@@ -10997,6 +11083,45 @@ impl DaemonRuntime {
         Ok(ClosedLiveRow {
             removed_terminal,
             removed_session,
+        })
+    }
+
+    /// THE [11.155] ask: does the owning machine still hold this session, in
+    /// the store of the CLI that wrote it? `Ok(true)` is a CONFIDENT no — the
+    /// peer store answered absent for a row whose id came from that store.
+    /// Every inconclusive shape is `Err`, never a close: a transport error, a
+    /// kind whose existence verb the peer cannot answer (the ask answers
+    /// "present" when it has no verb at all), and a start-born row whose id
+    /// the store never knew all refuse to be evidence.
+    fn remote_saved_session_peer_gone(&self, path: &str) -> anyhow::Result<bool> {
+        let Some((machine, session_id, kind)) =
+            self.server.remote_agent_pty_target_for_path(path)
+        else {
+            bail!("path parses to no remote agent target");
+        };
+        let start_born = self
+            .server
+            .live_session_row_key(path)
+            .and_then(|key| self.server.resolve_live_session_entry(&key))
+            .map(|(_resolved, session)| {
+                crate::remote_live_session_starts_new_codex(&session)
+            })
+            .unwrap_or(false);
+        if start_born {
+            bail!(
+                "{path} is start-born — its id is not a store id, absence is \
+                 not evidence"
+            );
+        }
+        crate::fetch_remote_saved_agent_session_exists(
+            kind,
+            &machine.ssh_target,
+            machine.prefix.as_deref(),
+            &session_id,
+        )
+        .map(|exists| !exists)
+        .map_err(|error| {
+            anyhow::anyhow!("peer existence ask failed: {error:#}")
         })
     }
 
@@ -11091,7 +11216,21 @@ impl DaemonRuntime {
     }
 
     fn tombstone_live_row(&mut self, path: &str) {
-        self.record_row_departure(path, crate::live_row_tombstones::RowDeparture::ExplicitClose);
+        self.tombstone_live_row_as(
+            path,
+            crate::live_row_tombstones::RowDeparture::ExplicitClose,
+        );
+    }
+
+    /// The tombstone with its reason named. The departure record is the
+    /// answer to "where did my row go?", so a close that is not the user's
+    /// own must not borrow the explicit-close label ([11.155]).
+    fn tombstone_live_row_as(
+        &mut self,
+        path: &str,
+        reason: crate::live_row_tombstones::RowDeparture,
+    ) {
+        self.record_row_departure(path, reason);
         let Some(identity) = self
             .server
             .live_session_row_key(path)
@@ -12581,7 +12720,10 @@ impl DaemonRuntime {
                 }
                 // (The keep-alive DETACH arm above returns early on purpose —
                 // detaching a viewport is not closing a row.)
-                let closed = self.close_live_session_row(&path)?;
+                let closed = self.close_live_session_row(
+                    &path,
+                    crate::live_row_tombstones::RowDeparture::ExplicitClose,
+                )?;
                 let removed_terminal = closed.removed_terminal;
                 let removed_session = closed.removed_session;
                 self.snapshot_response(Some(if removed_terminal {
@@ -30722,6 +30864,57 @@ mod tests {
     }
 
     #[test]
+    fn the_peer_close_gate_asks_before_it_mounts_and_only_a_confident_no_closes() {
+        // [11.155]: a peer-only close is invisible to the home plane unless
+        // the mount path ASKS. The gate must sit on the ensure funnel before
+        // any mount is spent, close through THE one close path with the
+        // honest departure reason, and every inconclusive answer must fall
+        // through to the mount — never to a close.
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let funnel = daemon_fn_body(
+            source,
+            "    fn ensure_terminal_for_path_with_initial_size_and_seed(",
+        );
+        let ask = funnel
+            .find("self.remote_saved_session_peer_gone(path)")
+            .expect("the funnel must ask the peer before spending a mount");
+        let learned = funnel
+            .find("remote_saved_session_peer_close_learned")
+            .expect("a confident NO must be named on the trace");
+        let close_call = funnel
+            .find(
+                "close_live_session_row(path, crate::live_row_tombstones::RowDeparture::PeerSessionGone)?;",
+            )
+            .expect("a learned peer close must go through THE one close path");
+        let inconclusive = funnel
+            .find("remote_saved_session_peer_close_probe_inconclusive")
+            .expect("an inconclusive ask must be named, never a close");
+        assert!(
+            ask < learned && learned < close_call && close_call < inconclusive,
+            "ask, then learn, then close — the inconclusive arm that follows \
+             the close in source order falls through to the mount, never to a \
+             close of its own"
+        );
+        assert!(
+            funnel.contains("session_is_running"),
+            "the ask belongs to the mount decision — a running runtime is \
+             never asked about"
+        );
+        let helper = daemon_fn_body(source, "    fn remote_saved_session_peer_gone(");
+        assert!(
+            helper.contains("remote_live_session_starts_new_codex"),
+            "a start-born row's id is not a store id — its absence is not \
+             evidence and must never close a row"
+        );
+        assert!(
+            helper.contains("fetch_remote_saved_agent_session_exists"),
+            "the ask must be the per-kind structured store question, not a \
+             heuristic"
+        );
+    }
+
+    #[test]
     fn the_close_path_writes_a_tombstone_and_persist_reconciles_them() {
         let source = daemon_product_source();
         let source = source.as_str();
@@ -30734,12 +30927,17 @@ mod tests {
             .next()
             .expect("the end of the RemoveSession arm");
         assert!(
-            arm.contains("self.close_live_session_row(&path)?"),
+            arm.contains(
+                "self.close_live_session_row(\n                    &path,\n                    crate::live_row_tombstones::RowDeparture::ExplicitClose,\n                )?"
+            ),
             "the user's close must go through the ONE close path, not a copy of it"
         );
 
-        let close = daemon_fn_body(source, "    fn close_live_session_row(&mut self, path: &str)");
-        let recorded = close.find("self.tombstone_live_row(path);").expect(
+        let close = daemon_fn_body(
+            source,
+            "    fn close_live_session_row(\n        &mut self,\n        path: &str,\n        reason: crate::live_row_tombstones::RowDeparture,\n    )",
+        );
+        let recorded = close.find("self.tombstone_live_row_as(path, reason);").expect(
             "closing a live row must record a tombstone, or a peer daemon undoes the close",
         );
         let removed = close
@@ -30840,7 +31038,10 @@ mod tests {
              correction: {bypasses:?}"
         );
 
-        let close = daemon_fn_body(source, "    fn close_live_session_row(&mut self, path: &str)");
+        let close = daemon_fn_body(
+            source,
+            "    fn close_live_session_row(\n        &mut self,\n        path: &str,\n        reason: crate::live_row_tombstones::RowDeparture,\n    )",
+        );
         assert!(
             close.contains("let runtime_path = self.terminal_runtime_key_for_path(path);"),
             "the close must address the key the terminal map answers to, or it removes \
@@ -31459,7 +31660,9 @@ mod tests {
             "    fn close_row(&mut self, session_path: &str, reason: crate::session_tenancy::EphemeralReapReason) {",
         );
         assert!(
-            close_row.contains("self.runtime.close_live_session_row(session_path)"),
+            close_row.contains(
+                "self.runtime.close_live_session_row(\n            session_path,\n            crate::live_row_tombstones::RowDeparture::ExplicitClose,\n        )",
+            ),
             "a reap that does not use the shared close path leaves no tombstone, and \
              a peer daemon hands the row straight back"
         );
@@ -35817,7 +36020,7 @@ mod tests {
         // now covers the ephemeral reaper's close as well.
         let source = daemon_product_source();
         let remove_session_block = source
-            .split("fn close_live_session_row(&mut self, path: &str)")
+            .split("fn close_live_session_row(\n        &mut self,\n        path: &str,\n        reason: crate::live_row_tombstones::RowDeparture,\n    )")
             .nth(1)
             .and_then(|suffix| suffix.split("\n    fn ").next())
             .expect("the shared close path should be present");
@@ -37582,7 +37785,7 @@ mod tests {
         assert!(
             code_of(
                 source,
-                "fn close_live_session_row(&mut self, path: &str)",
+                "fn close_live_session_row(\n        &mut self,\n        path: &str,\n        reason: crate::live_row_tombstones::RowDeparture,\n    )",
                 "the shared close path",
             )
             .contains("tombstone_live_row"),
