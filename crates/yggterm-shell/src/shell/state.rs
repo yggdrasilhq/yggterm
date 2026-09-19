@@ -86659,6 +86659,7 @@ async fn process_pending_app_control_requests(
                                 "session_path": session_path,
                                 "reason": format!("{}_refusal", reason),
                                 "detail": detail,
+                                "held_len": write_report.draft_held_len,
                                 "bytes": data.len(),
                                 "write": write_report.to_json(),
                             })),

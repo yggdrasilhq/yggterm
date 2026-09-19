@@ -13359,14 +13359,24 @@ impl DaemonRuntime {
                 // helper's doc carries the line the carve-out will not cross.
                 if refuse_if_draft
                     && !terminal_write_is_draft_remedy(&data)
+                    && !self.terminals.session_walk_line_erase_is_sized(&runtime_path, &data)
                     && self.terminals.session_composer_holds_draft(
                         &runtime_path,
                         self.server.live_session_kind(&runtime_path),
                     ) == Some(true)
                 {
+                    // [11.150] The remedy message carries the held line's
+                    // character count so a caller on a CLI that binds no
+                    // Ctrl+U (opencode, measured 2026-09-19) can size the
+                    // per-CLI clear: one write of Ctrl+U plus held_len
+                    // backspaces — the ONE backspace run the guard accepts,
+                    // because it is sized to the line this daemon itself
+                    // accounts for. A blind run stays refused.
+                    let held_len = self.terminals.session_walk_line_len(&runtime_path);
                     return Ok(ServerResponse::Ack {
                         message: Some(format!(
-                            "{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input"
+                            "{DRAFT_REFUSAL_MESSAGE}: {runtime_path} has typed-but-unsent input (held_len={})",
+                            held_len.unwrap_or(0)
                         )),
                     });
                 }
