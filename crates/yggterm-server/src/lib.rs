@@ -24208,16 +24208,53 @@ fn proc_exe_target_without_deleted_suffix(proc_exe_target: &Path) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn same_build_identity_as_current_exe(pid: u32, build_id: u64) -> bool {
-    if build_id != daemon::current_build_id() {
-        return false;
-    }
-    let Ok(mine) = std::env::current_exe().and_then(|path| fs::metadata(&path)) else {
-        return false;
-    };
     let Ok(theirs) = fs::metadata(format!("/proc/{pid}/exe")) else {
         return false;
     };
-    mine.len() == theirs.len()
+    let Ok(mine) = std::env::current_exe().and_then(|path| fs::metadata(&path)) else {
+        return false;
+    };
+    if theirs.len() != mine.len() {
+        return false;
+    }
+    if build_id == daemon::current_build_id() {
+        return true;
+    }
+    // Deploy copies land in different seconds, so the mtime-second build id
+    // skews between roots of the SAME bits (measured within one deploy:
+    // direct-store staging 1789798357 vs the managed bins 1789798355 — id
+    // equality alone would have false-staled the fixed build too). Same
+    // size plus equal content means same build; the hash only runs in the
+    // id-mismatch window, so the common boot-wait never pays for it.
+    let Ok(theirs_path) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(mine_path) = std::env::current_exe() else {
+        return false;
+    };
+    content_hash64(&theirs_path) == content_hash64(&mine_path)
+}
+
+#[cfg(target_os = "linux")]
+fn content_hash64(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Ok(file) = fs::File::open(path) else {
+        return 0;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut reader, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.write_usize(n);
+                chunk[..n].hash(&mut hasher);
+            }
+            Err(_) => return 0,
+        }
+    }
+    hasher.finish()
 }
 
 #[cfg(target_os = "linux")]
@@ -55966,6 +56003,21 @@ terminal_window_id: None,
         assert!(
             refused.is_some(),
             "a different build id at an unknown root stays stale"
+        );
+
+        // The 2026-09-19 deploy-skew arm: the SAME bits report a skewed
+        // mtime-second build id (measured 1789798357 vs 1789798355 within
+        // one deploy). This process' own exe at a skewed reported id must
+        // read current via size + content hash — the identity decision is
+        // root-blind, and a live foreign-root child of the same bits is a
+        // race this test does not need.
+        let mut skew_status = server_runtime_status_for_stale_probe();
+        skew_status.server_pid = std::process::id();
+        skew_status.server_build_id = daemon::current_build_id().wrapping_add(1);
+        assert_eq!(
+            super::local_daemon_binary_current_problem(&skew_status),
+            None,
+            "same bits at a skewed reported build id must read as current"
         );
     }
 
