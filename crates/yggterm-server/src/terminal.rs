@@ -658,6 +658,12 @@ pub struct TerminalTrimSummary {
 
 pub struct TerminalManager {
     sessions: HashMap<String, PtySessionRuntime>,
+    /// [11.144] per-row throttle for the `composer_draft_union` trace event —
+    /// (last emit ms, last emitted screen hash).
+    draft_trace_state: Mutex<HashMap<String, (u64, Option<u64>)>>,
+    /// [11.144] per-row first-seen timestamp of a `keystrokes:true ∧
+    /// grid:confidently-empty` disagreement — the phantom-draft grace window.
+    draft_reconcile_state: Mutex<HashMap<String, u64>>,
 }
 
 /// One live session's handoff inputs, gathered while this daemon still owns it.
@@ -964,6 +970,8 @@ impl TerminalManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            draft_trace_state: Mutex::new(HashMap::new()),
+            draft_reconcile_state: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1346,6 +1354,15 @@ impl TerminalManager {
             .map(|session| session.has_pending_input_draft())
     }
 
+    /// [11.144] See [`PtySessionRuntime::clear_stale_pending_input`]. Only the
+    /// union's phantom-draft reconcile may call this — the grace window that
+    /// proves the bytes stale lives there.
+    pub fn session_clear_stale_pending_input(&self, key: &str) {
+        if let Some(session) = self.sessions.get(key) {
+            session.clear_stale_pending_input();
+        }
+    }
+
     /// Atomic conditional submit — see
     /// [`PtySessionRuntime::submit_if_line_equals`]. `NotOwned` when this
     /// daemon does not hold the runtime, which a caller must not confuse with a
@@ -1495,20 +1512,160 @@ impl TerminalManager {
     /// `None` means neither could answer — which is not permission. The costs
     /// are not symmetric: a needless refusal delays a wake, and a wrong "it is
     /// empty" spends somebody's unsent sentence.
+    ///
+    /// ⛔ [11.144] AND ONE RECONCILE: a keystrokes-true answer standing over a
+    /// grid that confidently reads drawn-and-empty is echo lag or bytes the
+    /// CLI dropped — never a sentence. Inside a grace window the union stays
+    /// drafted (the safe direction, unchanged); past it the stale
+    /// reconstruction is healed and the union answers empty
+    /// ([`TerminalManager::reconcile_phantom_draft`]).
     pub fn session_composer_holds_draft(
         &self,
         key: &str,
         kind: Option<yggterm_core::SessionKind>,
     ) -> Option<bool> {
         let keystrokes = self.session_has_pending_input_draft(key);
-        let grid = self
-            .session_screen_plain_rows(key)
-            .and_then(|rows| yggterm_core::composer_row_holds_text(kind, &rows));
-        match (keystrokes, grid) {
+        let plain_rows = self.session_screen_plain_rows(key);
+        let (grid, evidence) = plain_rows
+            .as_deref()
+            .map(|rows| yggterm_core::composer_row_holds_text_detailed(kind, rows))
+            .unwrap_or((None, None));
+        let union = match (keystrokes, grid) {
             (None, None) => None,
             (left, right) => Some(left.unwrap_or(false) || right.unwrap_or(false)),
+        };
+        let union = self.reconcile_phantom_draft(key, keystrokes, grid, union);
+        if union == Some(true) {
+            self.trace_draft_union(key, kind, keystrokes, grid, evidence, plain_rows.as_deref());
         }
+        union
     }
+
+    /// [11.144] The reconcile the union owes its two arms. `keystrokes` is
+    /// byte-truth: bytes were forwarded to the pty. `grid` is the rendered
+    /// composer. A real draft is rendered synchronously by every CLI this
+    /// guard serves, so `Some(true) ∧ Some(false)` is either echo lag (tens of
+    /// ms) or bytes the CLI dropped before its input loop was live
+    /// (permanent — the deadlock class). Past
+    /// [`COMPOSER_DRAFT_ECHO_GRACE_MS`] of persistent disagreement the bytes
+    /// are declared stale: the reconstruction is healed and the union answers
+    /// empty. Inside the grace the union stays drafted — clearing a real
+    /// sentence is the one mistake this guard must never make.
+    ///
+    /// ⛔ This CARVES the sticky-arm doctrine, it does not repeal it: the kimi
+    /// region test's "sticky-dominates-grid is the safe direction" holds for
+    /// every reading inside the grace, and that test completes inside it.
+    fn reconcile_phantom_draft(
+        &self,
+        key: &str,
+        keystrokes: Option<bool>,
+        grid: Option<bool>,
+        union: Option<bool>,
+    ) -> Option<bool> {
+        if !(keystrokes == Some(true) && grid == Some(false)) {
+            self.draft_reconcile_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(key);
+            return union;
+        }
+        let (first, elapsed) = {
+            let mut state = self
+                .draft_reconcile_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = now_millis();
+            let first = *state.entry(key.to_string()).or_insert(now);
+            (first, now.saturating_sub(first))
+        };
+        if elapsed < Self::COMPOSER_DRAFT_ECHO_GRACE_MS {
+            return Some(true);
+        }
+        self.session_clear_stale_pending_input(key);
+        trace_terminal_event(
+            "composer_draft_reconciled_stale_bytes",
+            serde_json::json!({
+                "path": key,
+                "disagreed_ms": elapsed,
+                "grace_ms": Self::COMPOSER_DRAFT_ECHO_GRACE_MS,
+            }),
+        );
+        Some(false)
+    }
+
+    /// [11.144] The one named answer to "which input said draft": both arms,
+    /// the kind, the anchor row, and the screen tail it was read from. The
+    /// virgin opencode 2.0.8 false-positive was provably one of these two arms
+    /// lying while the visible screen was clean — without the frame itself a
+    /// deploy could only guess. Throttled per row to once per second or on any
+    /// screen change: the GUI's status polls ask this question many times a
+    /// minute, and a 10 Hz screen dump is not what the trace is for.
+    fn trace_draft_union(
+        &self,
+        key: &str,
+        kind: Option<yggterm_core::SessionKind>,
+        keystrokes: Option<bool>,
+        grid: Option<bool>,
+        evidence: Option<yggterm_core::ComposerDraftEvidence>,
+        rows: Option<&[String]>,
+    ) {
+        let hash = rows.map(|rows| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            rows.hash(&mut hasher);
+            hasher.finish()
+        });
+        let should_emit = {
+            let mut state = self
+                .draft_trace_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = now_millis();
+            let entry = state.entry(key.to_string()).or_insert((0, hash));
+            let emit = entry.1 != hash || now.saturating_sub(entry.0) >= 1_000;
+            if emit {
+                *entry = (now, hash);
+            }
+            emit
+        };
+        if !should_emit {
+            return;
+        }
+        let screen_tail: Vec<String> = rows
+            .map(|rows| {
+                let start = rows.len().saturating_sub(24);
+                rows[start..]
+                    .iter()
+                    .map(|row| truncate_terminal_trace_sample(row))
+                    .collect()
+            })
+            .unwrap_or_default();
+        trace_terminal_event(
+            "composer_draft_union",
+            serde_json::json!({
+                "path": key,
+                "kind": kind.map(|kind| format!("{kind:?}")),
+                "keystrokes": keystrokes,
+                "grid": grid,
+                "grid_row": evidence.as_ref().map(|evidence| evidence.row_index),
+                "grid_row_text": evidence
+                    .as_ref()
+                    .map(|evidence| truncate_terminal_trace_sample(&evidence.row_text)),
+                "row_count": rows.map(|rows| rows.len()),
+                "screen_tail": screen_tail,
+            }),
+        );
+    }
+
+    /// [11.144] How long a `keystrokes:true ∧ grid:confidently-empty`
+    /// disagreement may stand before the bytes are declared stale. A raw-mode
+    /// CLI renders a real draft within tens of milliseconds of consuming it,
+    /// so two full seconds of confident-empty render means the CLI never
+    /// consumed the bytes (opencode 2.0.8 drops pre-paint writes
+    /// deterministically; measured live on the muse lab host). Generous on
+    /// purpose: the reconcile clears the guard's byte-truth, and a wedged CLI
+    /// that later wakes would rather see the person's bytes than not.
+    const COMPOSER_DRAFT_ECHO_GRACE_MS: u64 = 2_000;
 
     /// The libyggterm declares the daemon has retained for this session (the
     /// app's latest `web-surface` / `sidebar` payloads). Empty for a plain
@@ -3461,6 +3618,22 @@ impl PtySessionRuntime {
     /// treats this as PROTECTED — releasing such a session would lose the draft.
     fn has_pending_input_draft(&self) -> bool {
         self.pending_input_draft.load(Ordering::SeqCst)
+    }
+
+    /// [11.144] Heal the phantom draft: the bytes were FORWARDED but the CLI
+    /// provably never consumed them — the rendered composer sat confidently
+    /// empty past the echo grace while this flag stood. A real draft is always
+    /// rendered; these bytes are the pre-paint writes a raw-mode TUI dropped
+    /// (measured live: opencode 2.0.8 ate a `Z` sent before its input loop was
+    /// live, and the reconstruction held it as an unsent draft forever).
+    /// ⛔ Named `stale` because this must never run on a disagreement that
+    /// could still be echo lag — the caller owns the persistence window.
+    fn clear_stale_pending_input(&self) {
+        self.pending_input_draft.store(false, Ordering::SeqCst);
+        self.pending_input_line
+            .lock()
+            .expect("pty input line lock poisoned")
+            .clear();
     }
 
     /// Press Enter IFF the composer's current line is exactly `expected`.
@@ -10006,6 +10179,108 @@ line-two on the real screen\r\n\
         assert_eq!(
             manager.session_submit_if_line_equals("local://not-here", "boot the row"),
             SubmitIffLineVerdict::NotOwned
+        );
+    }
+
+    /// ⛔ [11.144] THE PHANTOM-DRAFT RECONCILE, END-TO-END ON A LIVE PTY.
+    /// Bytes the CLI never consumed leave the keystrokes arm sticky-true while
+    /// the rendered composer sits confidently empty — the union refused every
+    /// write forever (the [11.144] deadlock's fuel). Inside the echo grace the
+    /// union still says drafted; past it the stale bytes are healed and the
+    /// union — and the reconstruction itself — answer empty.
+    #[test]
+    fn a_dropped_draft_reconciles_to_empty_past_the_echo_grace() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("bash start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send_master_fd");
+        let master = crate::pty_handoff_wire::recv_master_fd(&recv)
+            .expect("recv_master_fd")
+            .0;
+        drop(pair);
+
+        let mut manager = TerminalManager::new();
+        let key = "local://phantom-draft-test";
+        manager
+            .adopt_session(key, "bash", None, 100, 24, master, pid, start, None)
+            .expect("adopt_session");
+
+        // Paint the settled opencode 2.0.8 composer shape (empty box). The
+        // mode row is chrome by its footer hint; the placeholder is never a
+        // draft; the walk then answers Some(false) past the top of the box.
+        manager
+            .write(
+                key,
+                "stty -echo; printf '%s\\n' '\u{2503}  Ask anything' '\u{2503}' '\u{2503}  Build auto \u{b7} OpenCode Zen' '\u{2579}\u{2580}\u{2580}'\r",
+            )
+            .expect("paint the box (and silence the echo)");
+        let mut painted = false;
+        for _ in 0..50 {
+            if manager
+                .session_screen_plain_rows(key)
+                .is_some_and(|rows| rows.iter().any(|row| row.contains("Build auto")))
+            {
+                painted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(painted, "the composer box never painted");
+        // Confirm the grid arm is a confident empty BEFORE the dropped bytes.
+        assert_eq!(
+            yggterm_core::composer_row_holds_text(
+                Some(yggterm_core::SessionKind::OpenCode),
+                &manager.session_screen_plain_rows(key).expect("rows"),
+            ),
+            Some(false),
+            "the fixture box must read drawn-and-empty, or the test proves nothing"
+        );
+
+        // Bytes the CLI will never render as a draft: the echo went off with
+        // the paint command, so bash takes the Z into its buffer without
+        // painting it anywhere.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        manager.write(key, "Z").expect("drop the phantom byte");
+        assert_eq!(
+            manager.session_has_pending_input_draft(key),
+            Some(true),
+            "the forwarded Z must stand in the reconstruction, or nothing is tested"
+        );
+
+        // INSIDE the grace: the union stays drafted — the safe direction.
+        assert_eq!(
+            manager.session_composer_holds_draft(key, Some(yggterm_core::SessionKind::OpenCode)),
+            Some(true),
+            "inside the echo grace a disagreement may still be a real sentence"
+        );
+
+        // Past the grace: the bytes are stale, the union heals, and the
+        // reconstruction itself is cleared — not merely outvoted.
+        std::thread::sleep(std::time::Duration::from_millis(
+            2_300,
+        ));
+        assert_eq!(
+            manager.session_composer_holds_draft(key, Some(yggterm_core::SessionKind::OpenCode)),
+            Some(false),
+            "a full grace of confident-empty render proves the bytes dropped"
+        );
+        assert_eq!(
+            manager.session_has_pending_input_draft(key),
+            Some(false),
+            "the reconcile heals the reconstruction; an outvoted flag would lie again"
         );
     }
 

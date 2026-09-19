@@ -1712,7 +1712,10 @@ pub fn screen_text_shows_agent_background_hint(sample: &str) -> bool {
 /// anchor is glyph-FIRST per row and bottom-up, so a CLI that draws both keeps
 /// its glyph semantics; and the same below-chrome-only window guards this arm
 /// as guards the marker arm.
-pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Option<bool> {
+fn composer_row_holds_text_impl(
+    kind: Option<SessionKind>,
+    rows: &[String],
+) -> (Option<bool>, Option<ComposerDraftEvidence>) {
     // How far above the CLI's own chrome the marker may sit. A long line wraps
     // over a few rows; anything deeper is transcript, not composer.
     const COMPOSER_WRAP_ROWS: usize = 14;
@@ -1721,7 +1724,7 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
         end -= 1;
     }
     if end == 0 {
-        return None;
+        return (None, None);
     }
     let floor = end.saturating_sub(COMPOSER_WRAP_ROWS);
     // ⛔ [11.66] THE MARKER IS THE SESSION'S OWN — the match was KIND-AGNOSTIC
@@ -1730,7 +1733,9 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
     // its ERROR TEXT as typed composer text and held the row in
     // pending_draft forever. A session without a known descriptor answers
     // `None` — cannot say, which keeps the row protected.
-    let descriptor = kind.and_then(|kind| agent_cli::agent_cli_descriptor(kind))?;
+    let Some(descriptor) = kind.and_then(|kind| agent_cli::agent_cli_descriptor(kind)) else {
+        return (None, None);
+    };
     let marker = descriptor.composer_marker;
     // ⛔ [11.133] THE GUTTER-BOX ARM — opencode 2.0.3's composer is a ┃-ruled
     // BOX, not a glyph row: the placeholder/input row, an EMPTY gutter row
@@ -1756,13 +1761,19 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
                     .iter()
                     .any(|needle| lowered.contains(needle));
                 if !head.is_empty() && !is_placeholder {
-                    return Some(true);
+                    return (
+                        Some(true),
+                        Some(ComposerDraftEvidence {
+                            row_index: index,
+                            row_text: rows[index].trim_end().to_string(),
+                        }),
+                    );
                 }
                 continue;
             }
             if anchored {
                 // Past the top of the box: everything up there is transcript.
-                return Some(false);
+                return (Some(false), None);
             }
             // ⛔ [11.141] AN EMPTY ROW BELOW THE COMPOSER IS NOT "CANNOT SAY".
             // The box GROWS: devin (measured live 2026-09-18) holds its
@@ -1780,9 +1791,9 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
             }
             // The box is not on this screen (no gutter row above the chrome):
             // cannot say, which keeps the row protected.
-            return None;
+            return (None, None);
         }
-        return anchored.then_some(false);
+        return (anchored.then_some(false), None);
     }
     let mut content = String::new();
     for index in (floor..end).rev() {
@@ -1791,7 +1802,14 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
             .trim_start_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
         if text.starts_with(marker) {
             let head = text[marker.len_utf8()..].trim();
-            return Some(!head.is_empty() || !content.trim().is_empty());
+            let verdict = !head.is_empty() || !content.trim().is_empty();
+            return (
+                Some(verdict),
+                verdict.then(|| ComposerDraftEvidence {
+                    row_index: index,
+                    row_text: rows[index].trim_end().to_string(),
+                }),
+            );
         }
         // The region arm: the labeled rule the box-drawing trimmer reduces to
         // the bare label word anchors a glyph-less composer. Exposed only to
@@ -1818,14 +1836,44 @@ pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Op
                 })
                 .eq_ignore_ascii_case(label)
             {
-                return Some(!content.trim().is_empty());
+                let verdict = !content.trim().is_empty();
+                return (
+                    Some(verdict),
+                    verdict.then(|| ComposerDraftEvidence {
+                        row_index: index,
+                        row_text: rows[index].trim_end().to_string(),
+                    }),
+                );
             }
         }
         content.push_str(text);
     }
     // An anchor further up than a composer can reach: what is at the bottom of
     // this screen is transcript, and nothing here may be typed into.
-    None
+    (None, None)
+}
+
+/// WHERE a positive draft reading came from — the row the classifier anchored
+/// on. [11.144]: the union's grid arm answered Some(true) on a virgin opencode
+/// 2.0.8 composer while the visible screen showed none, and without the row
+/// itself no deploy could answer which frame lied. The evidence rides in the
+/// daemon's `composer_draft_union` trace event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerDraftEvidence {
+    pub row_index: usize,
+    pub row_text: String,
+}
+
+/// The verdict plus, on a positive reading, the anchor row that produced it.
+pub fn composer_row_holds_text_detailed(
+    kind: Option<SessionKind>,
+    rows: &[String],
+) -> (Option<bool>, Option<ComposerDraftEvidence>) {
+    composer_row_holds_text_impl(kind, rows)
+}
+
+pub fn composer_row_holds_text(kind: Option<SessionKind>, rows: &[String]) -> Option<bool> {
+    composer_row_holds_text_impl(kind, rows).0
 }
 
 /// Rows that may sit BELOW the composer without making it a transcript entry:
@@ -3706,6 +3754,41 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// [11.144] A positive reading must carry its anchor row: the union's grid
+    /// arm answered Some(true) on a virgin opencode 2.0.8 composer while the
+    /// visible screen showed none, and without the row itself no deploy could
+    /// answer which frame lied. The evidence is the contract the daemon's
+    /// `composer_draft_union` trace event rides on.
+    #[test]
+    fn a_positive_draft_reading_names_the_row_that_produced_it() {
+        let rows: Vec<String> = [
+            "\u{2503}",
+            "\u{2503}  unsent draft f0k7d",
+            "\u{2503}  Build auto \u{b7} Union Alpha Free OpenCode Zen",
+            &format!("\u{2579}{}", "\u{2580}".repeat(47)),
+            "/tmp/probe-ws            shift+tab agents  ctrl+p commands",
+        ]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+        let (verdict, evidence) =
+            super::composer_row_holds_text_detailed(Some(SessionKind::OpenCode), &rows);
+        assert_eq!(verdict, Some(true));
+        let evidence = evidence.expect("a positive reading names its anchor row");
+        assert_eq!(evidence.row_index, 1);
+        assert!(
+            evidence.row_text.contains("unsent draft"),
+            "the evidence is the offending row itself: {evidence:?}"
+        );
+
+        // A cannot-say reading carries no evidence — there is nothing to name.
+        let empty: Vec<String> = Vec::new();
+        let (verdict, evidence) =
+            super::composer_row_holds_text_detailed(Some(SessionKind::OpenCode), &empty);
+        assert_eq!(verdict, None);
+        assert_eq!(evidence, None);
+    }
+
     /// ⛔ [11.133] THE GUTTER-BOX ANSWERS FOR THE MEASURED SCREENS — captured
     /// live 2026-09-16 (the muse lab host, opencode 2.0.3, node-pty + vendored
     /// xterm, suites/opencode.js probe session): idle (placeholder + empty
