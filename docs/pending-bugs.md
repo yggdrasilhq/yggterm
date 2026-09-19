@@ -31494,14 +31494,14 @@ frame reaches the ring while both clocks stand still; the next text chunk
 stamps) + the probe, 3 green. LIVE PROOF of both this residual and the
 screen-qualified verdict rides the next rotation.
 
-## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 22 PRE-EXISTING REDS AND TWO OF THEM ARE SELF-GATES — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) AND THE RECONCILE-FETCH STARVATION LOCK (its source-scan needle no longer matches the source it guards) — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
+## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
 
 **Status:** OPEN
 
 The [11.144] input-check lane ran the full yggterm-server and yggterm-shell
 suites on CLEAN MAIN (eb77c32a) and on the lane before claiming anything:
 the two failure sets are identical — 11 server + 11 shell, none of them the
-lane's. Two of the 22 are gates, not tests:
+lane's. Two of the original 22 were gates, not tests (one since fixed):
 
 - `daemon::tests::protocol_shape_stamp_forces_version_bump` computes
   0x2363fb2b0c9e7582 against STAMPED_AT_VERSION 3.2.78 / hash
@@ -31511,10 +31511,17 @@ lane's. Two of the 22 are gates, not tests:
   repair needs the drift inventory (which commits touched the enums; each
   field serde(default)-guarded?) and a re-stamp at the shipped version —
   the wire contract owner's call, deliberately not taken as a drive-by.
-- `shell::terminal_loop_input_starvation_locks::
-  the_reconcile_fetch_is_dispatched_off_the_select_loop` pins a literal
-  that no longer matches the source it guards (the fetch shape was rewritten
-  without updating the lock).
+- FIXED 2026-09-19 (lane/integration/11145-starvation-lock, a zcode seat on
+  the muse lab host, work FROM dev): `the_reconcile_fetch_is_dispatched_
+  off_the_select_loop` pinned `screen_reconcile_decision(` inside
+  include_str!("viewport.rs"), but 3d1ef1b0 (fix(terminal): honor screen
+  reconcile deadline, Sep 10) moved the decision fn to state.rs and renamed
+  the apply-branch call site to `screen_reconcile_apply_decision(` — the
+  needle was dead in viewport.rs and the lock red-on-main since. The needle
+  now pins the current literal; the invariant is unchanged (the apply branch
+  routes the never-repaint-a-working-surface decision, traces failed
+  fetches, releases the in-flight latch). Lock green on the lane; the
+  remaining red set unchanged.
 
 The other 20, verbatim for their owners: server —
 a_forced_same_version_handoff_is_never_deferred, a_symlink_to_our_own_
