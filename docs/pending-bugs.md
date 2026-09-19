@@ -31494,7 +31494,7 @@ frame reaches the ring while both clocks stand still; the next text chunk
 stamps) + the probe, 3 green. LIVE PROOF of both this residual and the
 screen-qualified verdict rides the next rotation.
 
-## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
+## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL)
 
 **Status:** OPEN
 
@@ -31511,6 +31511,23 @@ lane's. Two of the original 22 were gates, not tests (one since fixed):
   repair needs the drift inventory (which commits touched the enums; each
   field serde(default)-guarded?) and a re-stamp at the shipped version —
   the wire contract owner's call, deliberately not taken as a drive-by.
+  **INVENTORY LANDED 2026-09-19**
+  ([docs/protocol-shape-stamp-drift-2026-09-19.md](protocol-shape-stamp-drift-2026-09-19.md),
+  lane/integration/11145-stamp-inventory): the ENTIRE drift is ONE commit —
+  85a5ac5a (2026-09-10, forward Codex flags through remote wrapper) added
+  `#[serde(default)] configured_extra_args: Option<String>` to the
+  `EnsureRemoteRuntimeCodexSession` + `StartRemoteRuntimeCodexSession`
+  request twins (the AgentSession twins already had the field AT the stamp;
+  `ServerResponse` byte-identical; shape stable at 0x2363fb2b0c9e7582 across
+  the seven release bumps since). serde audit: unknown-field-ignore both
+  directions (no `deny_unknown_fields` on the enum), old peers safe, the
+  latch-storm class does NOT apply — damage was a decorative gate + lying
+  baseline for nine days, not a compat break. Re-stamp recipe staged:
+  `STAMPED_AT_VERSION="3.2.113"`, `STAMPED_SHAPE_HASH=0x2363fb2b0c9e7582`,
+  no Cargo bump needed (shape stable since 85a5ac5a; invariant
+  stamped <= current holds at equality) — ONE owner GO away from green.
+  Scope note: the gate hashes ONLY the two enum blocks in daemon.rs; wire
+  shapes living elsewhere are invisible to it.
 - FIXED 2026-09-19 (lane/integration/11145-starvation-lock, a zcode seat on
   the muse lab host, work FROM dev): `the_reconcile_fetch_is_dispatched_
   off_the_select_loop` pinned `screen_reconcile_decision(` inside
