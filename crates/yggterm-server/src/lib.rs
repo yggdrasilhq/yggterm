@@ -36772,6 +36772,43 @@ mod tests {
     /// orphaned wrap fragments while every instrument called the session
     /// healthy. The exhausted-not-found verdict must be its own named
     /// event, so the state is greppable and alertable.
+    /// [11.153]: the mount relaunches a saved remote session by eliding into
+    /// `resume-… --require-existing`, which owns the missing-session failure —
+    /// so after the owner closed the peer session, every ensure spawned into
+    /// the same dead end, the row read running·idle, and the viewport sat at
+    /// the placeholder banner. The resize forward's exhausted not-found
+    /// verdict is the confident no; the ensure funnel must spend it, and the
+    /// spend must sit before the elide so a refused launch never reaches the
+    /// resume command.
+    #[test]
+    fn a_confident_peer_missing_verdict_refuses_the_saved_session_relaunch() {
+        let source = include_str!("daemon.rs");
+        let verdict_emit = source
+            .find("\"remote_pty_resize_unownable\"")
+            .expect("the unownable verdict emit must exist");
+        source[verdict_emit..]
+            .find("peer_runtime_missing")
+            .expect(
+                "the unownable verdict must record the peer-missing memo — \
+                 without it the ensure funnel has no confident no to spend",
+            );
+        let gate = source
+            .find("remote_saved_session_launch_refused_peer_missing")
+            .expect("the ensure funnel must refuse the relaunch by name");
+        let elide = source
+            .find("remote_saved_session_preflight_elided_runtime_launch")
+            .expect("the elide trace must exist for launches that proceed");
+        assert!(
+            gate < elide,
+            "the refusal gate must sit before the elide trace — a refused \
+             launch never elides into the resume command"
+        );
+        assert!(
+            source.contains("REMOTE_PEER_MISSING_REFUSE_WINDOW"),
+            "the memo must expire so a peer-side restore can heal the row"
+        );
+    }
+
     #[test]
     fn the_unownable_remote_resize_verdict_is_named_once() {
         let source = include_str!("daemon.rs");
