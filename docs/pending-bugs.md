@@ -31471,13 +31471,28 @@ keep the politeness; a row whose CLI's working phrase never matches (phrase
 drift) falls back to the forced-swap deadline as backstop.
 Lock: `keepalive_output_recency_rides_the_verdict_only_while_the_working_screen_window_is_open`.
 
-**Residual (OPEN, next seat):** (a) the clock-stamping itself — content-free
-paint frames still restamp `last_activity_ms`/`last_output_ms`; filtering
-them at the reader (screen_state.process but no stamp when the frame carries
-no text) would heal every future consumer, not just these two; (b) the
-observed `ESC[?2026h` bracket with no matching `2026l` in the same frame —
-worth one probe whether long-lived synchronized-output brackets stall
-repaints (the deaf-row family).
+**Residual RESOLVED IN CODE (2026-09-19, cli-integration seat,
+lane/integration/1138-keepalive-clocks):** (a) the clock-stamping itself —
+FIXED at the reader: the streaming stamp runs
+`reader_chunk_moves_activity_clocks` — a chunk moves
+`last_activity_ms`/`last_output_ms` only when it is neither our app-declare
+heartbeat NOR a frame carrying zero printable bytes (the measured 77-byte
+metronome frame — sync bracket + cursor positioning + cursor shape — strips
+to nothing; printable progress glyphs and box-drawing redraws still stamp);
+the chunk still reaches the screen, the ring, the declare log and
+`runtime_output_seen`, and the empty-decode early-continue lost its
+unconditional both-clock stamp by the same law; a throttled
+`content_free_frame_no_stamp` trace (60s/row) names the next metronome's
+frame without a seat having to strace. (b) the observed `ESC[?2026h` bracket
+with no matching `2026l` — PROBED AND FALSIFIED at the daemon's screen:
+vt100 0.16.2 implements no DECSET 2026 at all, so text behind an unmatched
+bracket paints normally and the parser cannot be the deaf-row stall
+mechanism; `the_daemon_vt100_does_not_hold_the_screen_behind_a_sync_bracket`
+locks the question so a parser upgrade that GAINS synchronized output
+re-answers it loudly. Tests: the predicate lock + the real-pty law (the
+frame reaches the ring while both clocks stand still; the next text chunk
+stamps) + the probe, 3 green. LIVE PROOF of both this residual and the
+screen-qualified verdict rides the next rotation.
 
 ## ⛔ [11.144] THE OPENCODE 2.0.8 WRAPPER PLANE ANSWERS "DRAFT HELD" ON A VIRGIN CLEAN COMPOSER, ITS SEND GUARD DISAGREES WITH ITS OWN PROBE, AND ONCE ANY WRITE LANDS THE PLANE DEADLOCKS — `pending_draft_refusal` REFUSES THE EMPTY WRITE THE REFUSAL TEXT ITSELF PRESCRIBES AND THE ERASE KEY THAT WOULD CLEAR THE DRAFT (measured live 2026-09-19, the muse lab host, daemon+GUI b530cd958516, opencode 2.0.8 via ynpm, two fresh rows)
 
