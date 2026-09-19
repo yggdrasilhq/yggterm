@@ -31698,9 +31698,51 @@ occurrence must trace `attach_supersede_watchdog` with action
 false within one resume ceiling; the instrumented unit above (search row)
 will re-verify if it ever recurs.
 
+## ⛔ [11.152] A YOUNG SUCCESSOR'S HANDOFF PATH COMMITS THE DESCRIPTOR AND THEN NEVER ADOPTS AND NEVER ACKS — THE QUEUED FD IS DROPPED WITH THE STREAM, THE PTY MASTER CLOSES, AND THE ROW'S SHELL DIES SIGHUP; THE SPAWN-ARM SWEEP THAT TRUSTED A BOUND LISTENER KILLED A LIVE ROW AND WAS REVERTED (measured live 2026-09-19, fresh scratch home on a fleet host, production 2a4acc64; the [11.151] repair leg, claim ACK-83597c3317 lineage)
+
+**Status:** OPEN
+
+MEASURED: fresh home, forced same-version restart with a working shell row.
+The first attempt at [11.151]'s drain swept the spawn arm toward the
+just-spawned successor as soon as its `pty-handoff-<ver>.sock` listener path
+existed (the listener binds EARLY in boot, ~200 ms, while the daemon is still
+restoring/starting). The trace: `hot_update_handoff_prepared {spawn_ok: true,
+successor_already_live: false}` -> successor `pty_handoff_listener_bound` ->
+13 s later `pty_fd_handoff_sweep {outcome: NoneMoved {reason: "successor
+accepted the fd but never acknowledged it (AFTER the commit point — the fd is
+gone)"}}` + `reattach_ledger_written {adopted_records: 0}`. Aftermath: the
+shell row DEAD — no `sleep 300` process, ZERO pty fds on BOTH daemons, screen
+unreadable on every endpoint, no adopt event and no refusal trace anywhere.
+The successor's handoff thread answered the seat-verdict ask (the commit
+proceeded), then never completed the adopt closure and never wrote any ack
+line — no panic in daemon.log; the stall is SILENT. When the predecessor gave
+up and dropped the stream, the kernel discarded the queued descriptor, the
+master closed, and the shell took SIGHUP. A corpse is strictly worse than the
+[11.151] never-drain it was trying to fix; the spawn-arm sweep was REVERTED
+same-day (lane/integration/fresh-bequeath-sweep-repair).
+
+THE DEFECT FOR THE NEXT SEAT (successor-side): between the seat-verdict answer
+and the adopt closure, `serve_handoff`'s adopt arm can stall or die with NO
+ack and NO error line, and the descriptor is then lost past the commit point —
+the exact hazard the wire comment names ("a failure past the commit point
+destroys a live shell"). Fix shape: (1) the successor must answer a
+boot-readiness refusal BEFORE the commit point while its runtime lock is
+still held by startup (the listener currently binds before the daemon can
+seat anything, so a bound listener is NOT an adoption-capability proof); (2)
+the predecessor's spawn-arm drain (still owed for [11.151]) retries
+pre-commit refusals while the child boots, within a bounded budget; (3) the
+ack-less post-commit window needs a named trace on the successor side (what
+ran, what it waited for) so the next occurrence is diagnosable — this
+sitting's evidence ends at "silent".
+
 ## ⛔ [11.151] A FRESH HOME'S FORCED RESTART PREPARES THE HANDOFF BUT NEVER SWEEPS — THE FD-HANDOFF SWEEP RAN ONLY WHEN A SUCCESSOR WAS ALREADY LIVE, THE SPAWN ARM'S PEER PROBE IS NONE BY CONSTRUCTION, AND NOTHING LATER DRAINS A SAME-VERSION PREDECESSOR, SO THE PREDECESSOR SERVES ITS ROWS FOREVER WHILE THE SUCCESSOR SITS AT OWNED:0 AND THE OWNERSHIP LEDGER IS NEVER WRITTEN (measured live 2026-09-19, fresh scratch home on a fleet host, claim ACK-83597c3317 lineage; filed by the adopted-disposition outcome as its item 4)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN — the destructive second-bequest half is FIXED IN CODE AND
+LANDED (bequest guard); the never-drain half stays OPEN and its first fix
+attempt was REVERTED FOR SAFETY the same day (see [11.152]: a spawn-arm sweep
+that trusted a bound listener killed a live row). The predecessor serving
+forever is the SAFE arm until [11.152] makes the young successor refuse BEFORE
+the commit point.
 
 MEASURED (production binaries, fresh home never rotated before): forced
 restart with a working blocker takes the preserving arm and traces
@@ -31744,6 +31786,18 @@ refuses by name instead of renaming the successor's socket and lock aside and
 spawning a bind-lock competitor. Tests: bequest guard pair on the real
 filesystem + real flock, sweep-target law, listener wait; server-lib delta +5
 green, failure set byte-identical to clean main.
+
+CORRECTED 2026-09-19 (lane/integration/fresh-bequeath-sweep-repair): half (1)
+of the landed fix — the spawn-arm sweep with the listener-wait gate — is
+REVERTED. Live proof on the deployed build caught it killing a live row: the
+sweep fired on the spawn arm and the just-spawned successor committed the
+descriptor and then never adopted and never acked (the fd was dropped with
+the stream, the master closed, the shell died SIGHUP — full measurements in
+[11.152]). The bequest guard (half 2) is unchanged and stays landed. The
+never-drain half of THIS defect stays OPEN until [11.152] gives the
+successor a pre-commit boot-readiness answer; the predecessor serving its
+rows forever is the SAFE arm and is what the deployed build now does again,
+live-verified.
 
 ## ⛔ [11.148] A FRESH (NO `--session`) WRAPPER OPENCODE ROW GETS A DUPLICATE KEEP-ALIVE MIRROR TWIN — THE TAB-SYNC OWNS SESSIONS ONLY THROUGH THE "Tab Session Id" ROW METADATA, WHICH ONLY THE MIRROR'S OWN SPAWN PATH WRITES, SO THE WRAPPER ROW'S POST-HOC DISCOVERY (`session_id`, AUTHORITATIVE) IS INVISIBLE TO IT AND THE SESSION READS UN-OWNED (measured live 2026-09-19, the muse lab host, lane/integration/oc-bind-proof; claim ACK-ac4fedcd57)
 
