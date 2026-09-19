@@ -67872,7 +67872,7 @@ mod terminal_loop_input_starvation_locks {
             .expect("the reconcile apply must come back on its own select branch");
         let apply_branch = &source[apply_at..apply_at + 12_000];
         assert!(
-            apply_branch.contains("screen_reconcile_decision("),
+            apply_branch.contains("screen_reconcile_apply_decision("),
             "the apply branch lost the never-repaint-a-working-surface decision"
         );
         assert!(
