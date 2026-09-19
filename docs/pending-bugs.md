@@ -31496,11 +31496,12 @@ screen-qualified verdict rides the next rotation.
 
 ## ⛔ [11.144] THE OPENCODE 2.0.8 WRAPPER PLANE ANSWERS "DRAFT HELD" ON A VIRGIN CLEAN COMPOSER, ITS SEND GUARD DISAGREES WITH ITS OWN PROBE, AND ONCE ANY WRITE LANDS THE PLANE DEADLOCKS — `pending_draft_refusal` REFUSES THE EMPTY WRITE THE REFUSAL TEXT ITSELF PRESCRIBES AND THE ERASE KEY THAT WOULD CLEAR THE DRAFT (measured live 2026-09-19, the muse lab host, daemon+GUI b530cd958516, opencode 2.0.8 via ynpm, two fresh rows)
 
-**Status:** OPEN — NARROWED 2026-09-19 late (fix lane
-lane/integration/oc208-1144-fix, board claim ACK-e3f6255b64, deployed
-22ef5d4a43e3): three of the four teeth are FIXED AND LIVE-PROVEN; the
-reconcile's live heal is the remaining leg, and the reader disagreement
-moved one seam up.
+**Status:** OPEN
+
+NARROWED 2026-09-19 late (fix lane lane/integration/oc208-1144-fix, board
+claim ACK-e3f6255b64, deployed 22ef5d4a43e3): three of the four teeth are
+FIXED AND LIVE-PROVEN; the reconcile's live heal is the remaining leg, and
+the reader disagreement moved one seam up.
 
 FIXED + LIVE-PROVEN (two full battery runs on fresh 2.0.8 rows through the
 wrapper):
