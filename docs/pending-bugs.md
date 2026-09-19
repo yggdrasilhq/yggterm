@@ -31737,12 +31737,13 @@ sitting's evidence ends at "silent".
 
 ## ⛔ [11.151] A FRESH HOME'S FORCED RESTART PREPARES THE HANDOFF BUT NEVER SWEEPS — THE FD-HANDOFF SWEEP RAN ONLY WHEN A SUCCESSOR WAS ALREADY LIVE, THE SPAWN ARM'S PEER PROBE IS NONE BY CONSTRUCTION, AND NOTHING LATER DRAINS A SAME-VERSION PREDECESSOR, SO THE PREDECESSOR SERVES ITS ROWS FOREVER WHILE THE SUCCESSOR SITS AT OWNED:0 AND THE OWNERSHIP LEDGER IS NEVER WRITTEN (measured live 2026-09-19, fresh scratch home on a fleet host, claim ACK-83597c3317 lineage; filed by the adopted-disposition outcome as its item 4)
 
-**Status:** OPEN — the destructive second-bequest half is FIXED IN CODE AND
-LANDED (bequest guard); the never-drain half stays OPEN and its first fix
-attempt was REVERTED FOR SAFETY the same day (see [11.152]: a spawn-arm sweep
-that trusted a bound listener killed a live row). The predecessor serving
-forever is the SAFE arm until [11.152] makes the young successor refuse BEFORE
-the commit point.
+**Status:** OPEN
+
+The destructive second-bequest half is FIXED IN CODE AND LANDED (bequest
+guard); the never-drain half stays OPEN and its first fix attempt was REVERTED
+FOR SAFETY the same day (see [11.152]: a spawn-arm sweep that trusted a bound
+listener killed a live row). The predecessor serving forever is the SAFE arm
+until [11.152] makes the young successor refuse BEFORE the commit point.
 
 MEASURED (production binaries, fresh home never rotated before): forced
 restart with a working blocker takes the preserving arm and traces
