@@ -31698,6 +31698,53 @@ occurrence must trace `attach_supersede_watchdog` with action
 false within one resume ceiling; the instrumented unit above (search row)
 will re-verify if it ever recurs.
 
+## ⛔ [11.151] A FRESH HOME'S FORCED RESTART PREPARES THE HANDOFF BUT NEVER SWEEPS — THE FD-HANDOFF SWEEP RAN ONLY WHEN A SUCCESSOR WAS ALREADY LIVE, THE SPAWN ARM'S PEER PROBE IS NONE BY CONSTRUCTION, AND NOTHING LATER DRAINS A SAME-VERSION PREDECESSOR, SO THE PREDECESSOR SERVES ITS ROWS FOREVER WHILE THE SUCCESSOR SITS AT OWNED:0 AND THE OWNERSHIP LEDGER IS NEVER WRITTEN (measured live 2026-09-19, fresh scratch home on a fleet host, claim ACK-83597c3317 lineage; filed by the adopted-disposition outcome as its item 4)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+MEASURED (production binaries, fresh home never rotated before): forced
+restart with a working blocker takes the preserving arm and traces
+`same_version_socket_bequeathed` -> `hot_update_handoff_prepared {reason:
+headless-cli-restart, expected_version: null, successor_already_live: false,
+same_version_bequest: true, spawn_ok: true}` -> the successor binds its
+pty-handoff listener — and NO `pty_fd_handoff_sweep`, NO
+`reattach_ledger_written`. The daemon roster afterward: predecessor OWNS the
+rows (`deferring: ... is working`), successor OWNED 0 PRESV 1. Two defects
+stack: (1) the sweep is gated on `live_successor_version`, computed by a
+PRE-SPAWN peer probe that is None BY CONSTRUCTION when `expected_version` is
+null (the headless restart verb sends null) or when no successor is live yet
+(always true on a fresh home), so the spawn arm never sweeps and never writes
+the ledger; (2) no later mechanism drains a same-version predecessor — the
+superseded-self-retire sweep requires a strictly NEWER daemon and
+idle-shutdown refuses while rows remain — so the predecessor holds the rows
+forever. The filing seat's two-prepare shape is the same hole reached from the
+second trigger (`disk_binary_replaced_self_retire` with a readable target
+version) landing mid-boot or on probe deafness. RIDE-ALONG DIAGNOSIS: the
+pre-existing red
+`a_forced_same_version_handoff_is_never_deferred` (in the [11.145] pre-existing
+red family, red on clean main too) is SELF-REFERENTIAL — its
+`source.find("if same_version_target && !force {")` no longer matches any
+handler code, so the scan window falls back to the test module's own text and
+the window contains the very literal the test forbids; the test needs a
+handler-unique anchor, not a history lesson in its own assertions.
+
+FIXED IN CODE 2026-09-19 (lane/integration/fresh-bequeath-sweep): (1) the
+spawn arm now sweeps — `handoff_sweep_target` (pure, tested) prefers the
+probe's live answer and otherwise targets the child this request just spawned
+(the expected target version when named, our own version on the same-version
+bequest arm), waiting bounded (`HANDOFF_SPAWN_LISTEN_WAIT_MS`, 5 s) for the
+spawned child's pty-handoff listener to bind; a listener timeout skips the
+sweep with a named `pty_fd_handoff_sweep_skipped_listener_timeout` trace and
+yesterday's failure mode (predecessor keeps serving). A failed spawn leaves no
+sweep target. (2) THE BEQUEST NEVER RENAMES A LOCK THE SUCCESSOR OWNS —
+`canonical_socket_lock_is_held` (flock probe in the shape of the bind lock)
+plus our own retired-name litter distinguish "our lock" from "the successor's
+fresh inode"; a second bequest whose peer probe missed the successor now
+refuses by name instead of renaming the successor's socket and lock aside and
+spawning a bind-lock competitor. Tests: bequest guard pair on the real
+filesystem + real flock, sweep-target law, listener wait; server-lib delta +5
+green, failure set byte-identical to clean main.
+
 ## ⛔ [11.148] A FRESH (NO `--session`) WRAPPER OPENCODE ROW GETS A DUPLICATE KEEP-ALIVE MIRROR TWIN — THE TAB-SYNC OWNS SESSIONS ONLY THROUGH THE "Tab Session Id" ROW METADATA, WHICH ONLY THE MIRROR'S OWN SPAWN PATH WRITES, SO THE WRAPPER ROW'S POST-HOC DISCOVERY (`session_id`, AUTHORITATIVE) IS INVISIBLE TO IT AND THE SESSION READS UN-OWNED (measured live 2026-09-19, the muse lab host, lane/integration/oc-bind-proof; claim ACK-ac4fedcd57)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

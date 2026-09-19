@@ -11666,6 +11666,7 @@ impl DaemonRuntime {
                     if spawn_result.is_err() && bequeathed.is_some() {
                         bequeath_rollback(self.store.home_dir(), std::process::id());
                     }
+                    let spawn_ok = spawn_result.is_ok();
                     spawn_result?;
                     // ★ LEVEL (b): try the LOSSLESS route before lingering.
                     //
@@ -11674,41 +11675,90 @@ impl DaemonRuntime {
                     // it is off, or when nothing moves, behaviour is exactly the
                     // lingering-preserved-owner path this replaces.
                     #[cfg(target_os = "linux")]
-                    if pty_fd_handoff_enabled()
-                        && let Some(successor) = live_successor_version.as_deref()
-                    {
-                        let outcome = self.hand_off_all_runtimes(successor);
-                        append_trace_event(
-                            self.store.home_dir(),
-                            "daemon",
-                            "lifecycle",
-                            "pty_fd_handoff_sweep",
-                            serde_json::json!({
-                                "successor_version": successor,
-                                "outcome": format!("{:?}", outcome.sweep),
-                                "readers_stood_down": outcome.stood_down,
-                                "readers_resumed": outcome.resumed,
-                                "pid": std::process::id(),
-                            }),
+                    if pty_fd_handoff_enabled() {
+                        // ★ THE SPAWN ARM MUST SWEEP TOO. The sweep used to run
+                        // only when a successor was ALREADY live at prepare
+                        // time — but on the spawn arm (the only arm a fresh
+                        // home can take) `live_successor_version` is None by
+                        // construction: the peer probe ran before the child
+                        // existed. The sweep then never ran, the ownership
+                        // ledger was never written, and no later mechanism
+                        // drains a same-version predecessor (the
+                        // superseded-self-retire sweep requires a strictly
+                        // NEWER daemon and idle-shutdown refuses while rows
+                        // remain), so the predecessor served its rows forever
+                        // while the successor sat at owned:0. Measured live
+                        // 2026-09-19 on a fresh scratch home:
+                        // `hot_update_handoff_prepared {reason:
+                        // headless-cli-restart, expected_version: null,
+                        // spawn_ok: true}` and NO pty_fd_handoff_sweep.
+                        let sweep_successor = handoff_sweep_target(
+                            live_successor_version.as_deref(),
+                            spawn_ok,
+                            expected_version.as_deref(),
                         );
-                        if !outcome.parked.is_empty() {
-                            // ⛔ Accepting is not surviving. The watch holds our
-                            // descriptors — parked, serving nothing — until the
-                            // successor has lived out its settle window, and
-                            // wakes every reader again if it has not. Its own
-                            // thread, so this request's response still reaches
-                            // the caller.
-                            //
-                            // The watch must name the endpoint THIS daemon
-                            // actually answers at — after a same-version
-                            // bequest that is the RETIRED path (`owner_endpoint`
-                            // above), not the canonical name we just yielded.
-                            spawn_handoff_settle_watch(
-                                self.store.home_dir().to_path_buf(),
-                                owner_endpoint.clone(),
-                                successor.to_string(),
-                                outcome,
-                            );
+                        if let Some(successor) = sweep_successor.as_deref() {
+                            let listener_ready = if live_successor_version.is_none() {
+                                // The successor we just spawned must bind its
+                                // pty-handoff listener before anything can knock.
+                                let listener = crate::pty_handoff::handoff_socket_path(
+                                    self.store.home_dir(),
+                                    successor,
+                                );
+                                wait_for_handoff_listener(
+                                    &listener,
+                                    HANDOFF_SPAWN_LISTEN_WAIT_MS,
+                                )
+                            } else {
+                                true
+                            };
+                            if !listener_ready {
+                                append_trace_event(
+                                    self.store.home_dir(),
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_fd_handoff_sweep_skipped_listener_timeout",
+                                    serde_json::json!({
+                                        "successor_version": successor,
+                                        "waited_ms": HANDOFF_SPAWN_LISTEN_WAIT_MS,
+                                        "pid": std::process::id(),
+                                    }),
+                                );
+                            } else {
+                                let outcome = self.hand_off_all_runtimes(successor);
+                                append_trace_event(
+                                    self.store.home_dir(),
+                                    "daemon",
+                                    "lifecycle",
+                                    "pty_fd_handoff_sweep",
+                                    serde_json::json!({
+                                        "successor_version": successor,
+                                        "outcome": format!("{:?}", outcome.sweep),
+                                        "readers_stood_down": outcome.stood_down,
+                                        "readers_resumed": outcome.resumed,
+                                        "pid": std::process::id(),
+                                    }),
+                                );
+                                if !outcome.parked.is_empty() {
+                                    // ⛔ Accepting is not surviving. The watch holds our
+                                    // descriptors — parked, serving nothing — until the
+                                    // successor has lived out its settle window, and
+                                    // wakes every reader again if it has not. Its own
+                                    // thread, so this request's response still reaches
+                                    // the caller.
+                                    //
+                                    // The watch must name the endpoint THIS daemon
+                                    // actually answers at — after a same-version
+                                    // bequest that is the RETIRED path (`owner_endpoint`
+                                    // above), not the canonical name we just yielded.
+                                    spawn_handoff_settle_watch(
+                                        self.store.home_dir().to_path_buf(),
+                                        owner_endpoint.clone(),
+                                        successor.to_string(),
+                                        outcome,
+                                    );
+                                }
+                            }
                         }
                     }
                     return Ok(ServerResponse::HotUpdateHandoff {
@@ -18192,6 +18242,28 @@ fn try_acquire_daemon_socket_lock(
     Err(error).with_context(|| format!("locking daemon socket {}", lock_path.display()))
 }
 
+/// Is the daemon socket bind lock at `lock_path` held by any live open file
+/// description? Non-blocking probe in the shape of
+/// [`try_acquire_daemon_socket_lock`] without keeping the claim: a free lock
+/// is unlocked again and the descriptor dropped.
+#[cfg(unix)]
+fn canonical_socket_lock_is_held(lock_path: &Path) -> bool {
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    else {
+        return false;
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
+}
+
 pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
     #[cfg(unix)]
     {
@@ -19096,6 +19168,58 @@ fn pty_fd_handoff_enabled() -> bool {
             .map(str::trim),
         Some("0") | Some("false") | Some("no") | Some("off")
     )
+}
+
+/// How long a handoff that SPAWNED its successor waits for that child to bind
+/// its pty-handoff listener before giving up on the fd sweep. Fresh children
+/// bind in well under a second; the bound exists for a loaded host's boot.
+#[cfg(any(target_os = "linux", test))]
+const HANDOFF_SPAWN_LISTEN_WAIT_MS: u64 = 5_000;
+
+/// The version the fd-handoff sweep should knock on.
+///
+/// A successor that was ALREADY live at prepare time wins (the probe's
+/// answer). Otherwise the successor this request just SPAWNED is the target:
+/// its version is the expected target version when the caller named one, and
+/// our OWN version on the same-version bequest arm (the headless restart verb
+/// sends no expected version at all). A failed spawn leaves nothing to knock
+/// on. Split out pure so the spawn-arm law keeps a test that no environment
+/// where the sweep is disabled can skip.
+#[cfg(any(target_os = "linux", test))]
+fn handoff_sweep_target(
+    live_successor_version: Option<&str>,
+    spawn_ok: bool,
+    expected_version: Option<&str>,
+) -> Option<String> {
+    live_successor_version
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            spawn_ok.then(|| {
+                expected_version
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| SERVER_PROTOCOL_VERSION.to_string())
+            })
+        })
+}
+
+/// Block until `listener` exists or the budget runs out. Existence is the
+/// readiness proxy: the handoff listener unlinks and rebinds the path at
+/// startup, so the path pointing at anything means a listener either is live
+/// or is about to accept. A stale graveyard file costs one refused connect,
+/// which the sweep's own all-or-nothing failure handling absorbs (readers
+/// unparked, predecessor keeps serving).
+#[cfg(any(target_os = "linux", test))]
+fn wait_for_handoff_listener(listener: &Path, budget_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    loop {
+        if listener.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// How often a superseded daemon asks whether it can hand its PTYs over and go.
@@ -24521,6 +24645,26 @@ fn bequeath_version_socket_to_same_version_successor(
     let lock_path = daemon_socket_lock_path(&canonical);
     let retired_lock =
         retire_name(&lock_path).ok_or_else(|| "lock path has no file name".to_string())?;
+    // ⛔ THE BEQUEST NEVER RENAMES A LOCK THE SUCCESSOR OWNS. Our own bequest
+    // renames our lock inode to the retired name, so after it the canonical
+    // lock is the SUCCESSOR's fresh inode — and a second handoff request whose
+    // peer probe missed the successor (the budgeted triage probe is deaf for
+    // seconds) would otherwise rename the successor's socket and lock aside
+    // and spawn a bind-lock competitor against it. Within one home the
+    // bind-lock law allows at most one same-version daemon, so a held
+    // canonical lock is OURS while our retired names do not exist and the
+    // successor's once they do. A free lock is always safe: renaming it
+    // disturbs no live daemon, which is also the retry path when a successor
+    // died between our bequest and its settle.
+    #[cfg(unix)]
+    if canonical_socket_lock_is_held(&lock_path)
+        && retired_daemon_socket_names(&canonical, pid).1.exists()
+    {
+        return Err(
+            "canonical socket lock is held by the successor this daemon already bequeathed to"
+                .to_string(),
+        );
+    }
     // The lock first: a successor that started between the two renames would
     // find the socket path free but the lock still held at the canonical name.
     // Renaming the lock inode moves our flock with it, so the successor's
@@ -29467,6 +29611,119 @@ mod same_version_bequest_locks {
             "the same-version handoff no longer bequeaths the version socket — \
              the successor will die bind_lock_busy again"
         );
+    }
+
+    #[test]
+    fn a_second_bequest_refuses_to_rename_the_lock_the_successor_owns() {
+        let home = temp_home();
+        let (canonical, _held_lock) = hold_daemon_address(&home);
+        // First bequest: ours, legal — our own lock holds canonical and our
+        // retired names do not exist yet.
+        bequeath_version_socket_to_same_version_successor(&home).expect("first bequest ok");
+        // A successor binds the yielded canonical name: fresh socket file,
+        // fresh lock inode, held. Exactly the shape after any same-version
+        // swap.
+        fs::write(&canonical, b"successor socket").expect("successor socket file");
+        let _successor_lock = try_acquire_daemon_socket_lock(&canonical, &home)
+            .expect("lock probe ok")
+            .expect("the successor must be able to bind the yielded name");
+        // A SECOND handoff request on the same predecessor — its peer probe
+        // missed the live successor — must not rename the successor's address
+        // aside and spawn a bind-lock competitor.
+        let error = bequeath_version_socket_to_same_version_successor(&home)
+            .expect_err("a second bequest must refuse");
+        assert!(
+            error.contains("successor"),
+            "the refusal must name the successor: {error}"
+        );
+        assert!(canonical.exists(), "the successor's socket must survive");
+        assert!(
+            daemon_socket_lock_path(&canonical).exists(),
+            "the successor's lock must survive"
+        );
+        drop(_successor_lock);
+        drop(_held_lock);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_retry_bequest_after_the_successor_died_is_allowed() {
+        let home = temp_home();
+        let (canonical, _held_lock) = hold_daemon_address(&home);
+        // First bequest, a successor binds, then dies: the lock is released
+        // (file left behind — the normal leftover shape) and nobody serves
+        // the canonical name.
+        bequeath_version_socket_to_same_version_successor(&home).expect("first bequest ok");
+        fs::write(&canonical, b"successor socket").expect("successor socket file");
+        let successor_lock = try_acquire_daemon_socket_lock(&canonical, &home)
+            .expect("lock probe ok")
+            .expect("the successor must be able to bind the yielded name");
+        drop(successor_lock);
+        // The retry bequest is the recovery path: a free canonical lock
+        // disturbs no live daemon.
+        bequeath_version_socket_to_same_version_successor(&home)
+            .expect("a free canonical lock must allow the retry bequest");
+        assert!(
+            !canonical.exists(),
+            "the retry bequest yields the canonical name again"
+        );
+        drop(_held_lock);
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod handoff_spawn_arm_sweep {
+    use super::{handoff_sweep_target, wait_for_handoff_listener, SERVER_PROTOCOL_VERSION};
+
+    #[test]
+    fn the_sweep_target_prefers_the_probe_answer_and_falls_to_the_spawned_target() {
+        assert_eq!(
+            handoff_sweep_target(Some("3.3.0"), false, Some("3.2.113")),
+            Some("3.3.0".to_string()),
+            "a successor the probe found live is always the target"
+        );
+        assert_eq!(
+            handoff_sweep_target(None, true, Some("3.3.0")),
+            Some("3.3.0".to_string()),
+            "the child a version-bump handoff spawned is the target"
+        );
+        assert_eq!(
+            handoff_sweep_target(None, true, None),
+            Some(SERVER_PROTOCOL_VERSION.to_string()),
+            "the same-version bequest arm sweeps to our own version — the \
+             headless restart verb sends no expected version"
+        );
+    }
+
+    #[test]
+    fn a_failed_spawn_leaves_no_sweep_target() {
+        assert_eq!(handoff_sweep_target(None, false, Some("3.3.0")), None);
+        assert_eq!(handoff_sweep_target(None, false, None), None);
+    }
+
+    #[test]
+    fn the_listener_wait_returns_as_soon_as_the_socket_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-handoff-wait-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let listener = dir.join("pty-handoff-3-2-113.sock");
+        assert!(
+            !wait_for_handoff_listener(&listener, 150),
+            "a missing listener must exhaust the budget"
+        );
+        std::fs::write(&listener, b"socket").expect("listener file");
+        assert!(
+            wait_for_handoff_listener(&listener, 1_000),
+            "an existing listener must return immediately"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
