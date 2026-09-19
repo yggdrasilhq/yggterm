@@ -1378,6 +1378,24 @@ impl TerminalManager {
         }
     }
 
+    /// [11.150] Does this payload size its backspace run EXACTLY to the line
+    /// this session's walk reconstruction holds? See
+    /// `walk_line_erase_is_sized_to`. `false` when unowned — a daemon that
+    /// does not hold the line cannot size an erase to it.
+    pub fn session_walk_line_erase_is_sized(&self, key: &str, data: &str) -> bool {
+        match self.sessions.get(key) {
+            Some(session) => session.walk_line_erase_is_sized(data),
+            None => false,
+        }
+    }
+
+    /// [11.150] The walk line's character count — the number the draft
+    /// refusal's remedy message carries so a caller can size its erase.
+    /// `None` when this daemon does not hold the session.
+    pub fn session_walk_line_len(&self, key: &str) -> Option<usize> {
+        self.sessions.get(key).map(|session| session.walk_line_len())
+    }
+
     pub fn session_process_id(&self, key: &str) -> Option<u32> {
         self.sessions
             .get(key)
@@ -2244,6 +2262,27 @@ impl TerminalManager {
 ///
 /// ⛔ No variant carries the line's TEXT. The whole point of the guard is that
 /// the line may be the human's own half-typed sentence.
+/// [11.150] Does this payload size its backspace run EXACTLY to `line` — the
+/// daemon's own reconstruction of the composer's current line? `Ctrl+U` plus
+/// one backspace per held character is the draft remedy for a CLI that binds
+/// no Ctrl+U (measured live 2026-09-19, opencode 2.0.9 on the muse lab host:
+/// a pure Ctrl+U is swallowed, and a real draft was unrecoverable through
+/// every wrapper verb). The sizing is the safety: the run can only erase the
+/// bytes the walk accounts for, and a wrong-sized run refuses. A BLIND
+/// backspace run stays refused — see `terminal_write_is_draft_remedy` in
+/// `crate::daemon` for the clobber doctrine this carves a measured exception
+/// out of.
+pub fn walk_line_erase_is_sized_to(data: &str, line: &[u8]) -> bool {
+    let Some(rest) = data.strip_prefix('\u{15}') else {
+        return false;
+    };
+    let backspaces = rest.chars().count();
+    if !rest.chars().all(|ch| ch == '\u{7f}') {
+        return false;
+    }
+    backspaces == String::from_utf8_lossy(line).chars().count()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitIffLineVerdict {
     /// The line matched and the Enter was enqueued.
@@ -3676,6 +3715,25 @@ impl PtySessionRuntime {
             .lock()
             .expect("pty input line lock poisoned")
             .clear();
+    }
+
+    /// [11.150] Does `data` size its backspace run exactly to the line the
+    /// walk holds? See `walk_line_erase_is_sized_to`.
+    fn walk_line_erase_is_sized(&self, data: &str) -> bool {
+        let line = self
+            .pending_input_line
+            .lock()
+            .expect("pty input line lock poisoned");
+        walk_line_erase_is_sized_to(data, &line)
+    }
+
+    /// [11.150] The walk line's character count.
+    fn walk_line_len(&self) -> usize {
+        let line = self
+            .pending_input_line
+            .lock()
+            .expect("pty input line lock poisoned");
+        String::from_utf8_lossy(&line).chars().count()
     }
 
     /// Press Enter IFF the composer's current line is exactly `expected`.
@@ -5885,6 +5943,44 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    /// [11.150] Ctrl+U plus one backspace per held character is the per-CLI
+    /// draft remedy; the SIZING is the safety. The pure predicate's arms:
+    #[test]
+    fn a_sized_backspace_erase_is_exact_to_the_walk_line() {
+        // Exact: Ctrl+U + one backspace per char of the held line.
+        assert!(walk_line_erase_is_sized_to(
+            "\u{15}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}",
+            "REPRO1150".as_bytes(),
+        ));
+        // A short run leaves residue behind — refused.
+        assert!(!walk_line_erase_is_sized_to(
+            "\u{15}\u{7f}\u{7f}",
+            "REPRO".as_bytes(),
+        ));
+        // A long run could eat a human's tail beyond our bytes — refused.
+        assert!(!walk_line_erase_is_sized_to(
+            "\u{15}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}\u{7f}",
+            "REPRO".as_bytes(),
+        ));
+        // No Ctrl+U prefix: a BLIND backspace run stays refused (the clobber
+        // doctrine the carve-out is measured against).
+        assert!(!walk_line_erase_is_sized_to("\u{7f}\u{7f}", "RE".as_bytes()));
+        // Anything typed inside the payload: refused.
+        assert!(!walk_line_erase_is_sized_to(
+            "\u{15}\u{7f}x",
+            "RE".as_bytes(),
+        ));
+        // Multi-byte walk line: characters, not bytes, are the unit — the
+        // walk reconstruction pops whole UTF-8 scalars.
+        assert!(walk_line_erase_is_sized_to(
+            "\u{15}\u{7f}\u{7f}\u{7f}",
+            "ééé".as_bytes(),
+        ));
+        // An empty line sizes only the pure clear (which the plain remedy
+        // already admits) — a run over nothing refuses.
+        assert!(!walk_line_erase_is_sized_to("\u{15}\u{7f}", "".as_bytes()));
+    }
 
     #[test]
     fn a_forged_web_surface_declare_from_a_plain_shell_is_refused() {

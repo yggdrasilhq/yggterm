@@ -47301,6 +47301,74 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     /// scan can lock that the loop still ASKS it. A probe that stopped calling
     /// `probe_write_is_permitted` would pass both of them while typing over the
     /// owner exactly as before, which is the whole failure being fixed here.
+    /// ⛔ [11.150] THE PROBE'S MARKER MUST NOT OUTLIVE THE PROBE — and the
+    /// erase's backspaces may never eat past the probe's own bytes.
+    /// Behavioral locks on the line-final guard:
+    #[test]
+    fn the_probe_marker_erase_never_eats_past_the_probe_bytes() {
+        let marker = TERMINAL_INPUT_ECHO_PROBE;
+        // The composer row with only decoration after the marker: safe to
+        // backspace it away.
+        let clean = "▄▄▄\r\n\u{2503}  yggterm_ready_probe   \r\n\u{2503}\r\nfooter";
+        assert!(probe_marker_is_line_final(clean, marker));
+        // A human keystroke appended inside the confirm window: NOT safe —
+        // the guard flips and the erase degrades to the Ctrl+U alone.
+        let appended = "▄▄▄\r\n\u{2503}  yggterm_ready_probex   \r\nfooter";
+        assert!(!probe_marker_is_line_final(appended, marker));
+        // Marker absent entirely (bytes the CLI dropped): not line-final.
+        assert!(!probe_marker_is_line_final("▄▄▄\r\n\u{2503}  \r\nfooter", marker));
+        // A marker that is a PREFIX of longer content is not line-final.
+        assert!(!probe_marker_is_line_final(
+            "\u{2503}  yggterm_ready_probe_was_here",
+            marker,
+        ));
+    }
+
+    /// ⛔ [11.150] The echo posture must confirm by the RENDER'S clock and
+    /// verify its erase — a structural lock, because the defect was the
+    /// single 180 ms echo shot plus an UNVERIFIED cleanup: a cold render
+    /// missed the shot, the probe read its own marker as a human draft, and
+    /// returned without clearing it. A source scan, because a MISSING call
+    /// passes every behavioral test.
+    #[test]
+    fn the_echo_posture_confirms_by_render_clock_and_verifies_its_erase() {
+        let source = SHELL_SOURCE;
+        let start = source
+            .find("async fn probe_terminal_input_consumption(")
+            .expect("the probe function must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|at| at + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS"),
+            "the confirm window must be the render's clock (the raw-mode \
+             posture's measured window), not a single echo shot"
+        );
+        assert!(
+            !body.contains("sleep(Duration::from_millis(180))"),
+            "the single 180 ms echo shot is the defect's clock — the cold-\
+             render race left the marker standing as a phantom draft"
+        );
+        assert!(
+            body.contains("erase_probe_marker"),
+            "a rendered marker must be erased before any verdict returns"
+        );
+        assert!(
+            body.contains("TERMINAL_INPUT_CONSUMING_RENDER_RESIDUE_REASON"),
+            "an erase that did not finish must be NAMED (the residue \
+             verdict), never silently assumed gone"
+        );
+        assert!(
+            body.contains("probe_marker_is_line_final"),
+            "the backspace erase must be guarded by the line-final check — \
+             a human keystroke appended in the window is never eaten"
+        );
+    }
+
     #[test]
     fn every_probe_write_site_is_still_guarded_and_the_retry_still_backs_off() {
         let source = SHELL_SOURCE;
@@ -67555,6 +67623,7 @@ mod terminal_loop_input_starvation_locks {
             interline_read_nudge_count: 0,
             last_chunk_tail: "\\r".to_string(),
             refused: None,
+            draft_held_len: None,
             submit: Some("refused_render"),
             conditional_submit: true,
         };

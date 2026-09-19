@@ -18156,6 +18156,12 @@ const TERMINAL_INPUT_CONSUMING_REASON_RAW_MODE: &str =
     "the session rendered the probe marker into its composer and it was erased again (composer-delta confirm — raw-mode TUI, no pty echo)";
 const TERMINAL_INPUT_CONSUMING_RAW_MODE_RESIDUE_REASON: &str =
     "the session rendered the probe marker into its composer (composer-delta confirm — it IS reading input) but Ctrl+U and backspaces did not clear the line; the probe text may remain in the composer";
+/// [11.150] The render-confirm posture's residue verdict: the marker confirmed
+/// by render (an "echo" that was really the composer painting it) and the
+/// erase could not finish it. The row IS consuming — but the probe's bytes
+/// may remain, and the caller must not send over them.
+const TERMINAL_INPUT_CONSUMING_RENDER_RESIDUE_REASON: &str =
+    "the session rendered the probe marker (render-confirm) and it was NOT fully erased — the row IS reading input, but the probe text may remain in the composer; clear it before sending";
 const TERMINAL_INPUT_WEDGED_RAW_MODE_REASON: &str =
     "session never rendered the probe marker into its composer within the timeout (raw-mode posture: confirmed by composer delta, not pty echo) — the row is WEDGED: alive, idle-looking, and not reading its PTY";
 /// [11.142] The probe's marker write itself was refused — no marker was ever
@@ -18177,6 +18183,10 @@ const TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_TAIL_CHARS: usize = 120;
 /// or never; a raw-mode TUI repaints on its own schedule, so the delta is
 /// polled instead of sampled once.
 const TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS: u64 = 2_400;
+
+/// How long a rendered marker gets to leave after its erase before the
+/// cleanup reading decides ([11.150]).
+const TERMINAL_INPUT_MARKER_ERASE_SETTLE_MS: u64 = 150;
 
 /// How long to wait before the probe tries again, and the ceiling it climbs to.
 ///
@@ -18306,6 +18316,7 @@ async fn probe_input_consumption_by_composer_delta(
     ));
     let mut rendered = false;
     let mut fresh_draft = composer_held_draft;
+    let mut rendered_screen: Option<String> = None;
     while Instant::now() < confirm_deadline {
         sleep(Duration::from_millis(150)).await;
         if let Ok(answer) =
@@ -18321,6 +18332,7 @@ async fn probe_input_consumption_by_composer_delta(
             // the CLI actually consumed and painted it.
             if screen.contains(TERMINAL_INPUT_ECHO_PROBE) {
                 rendered = true;
+                rendered_screen = Some(screen);
                 break;
             }
         }
@@ -18347,21 +18359,21 @@ async fn probe_input_consumption_by_composer_delta(
             reason,
         };
     }
-    // Cleanup: Ctrl+U clears the daemon's reconstructed line even where the
-    // CLI ignores it; the backspaces then erase the marker from a composer
-    // that never bound Ctrl+U. One write, one chunk — the walk processes both.
-    let mut clear = String::from(TERMINAL_INPUT_CLEAR_LINE);
-    for _ in 0..TERMINAL_INPUT_ECHO_PROBE.chars().count() {
-        clear.push('\u{7f}');
-    }
-    let _ = terminal_write_app_control_input_async(
+    // Cleanup — [`erase_probe_marker`]: Ctrl+U clears the daemon's
+    // reconstructed line even where the CLI ignores it; the backspaces then
+    // erase the marker from a composer that never bound Ctrl+U, guarded by
+    // the line-final check so a keystroke a human slipped in during the
+    // confirm window is never eaten. One write, one chunk — the walk
+    // processes both.
+    let marker_is_line_final = rendered_screen
+        .as_deref()
+        .is_some_and(|screen| probe_marker_is_line_final(screen, TERMINAL_INPUT_ECHO_PROBE));
+    erase_probe_marker(
         endpoint.clone(),
         runtime_session_path.clone(),
         session_path.clone(),
-        clear,
-        "submit_probe",
-        false,
         trace_home,
+        marker_is_line_final,
     )
     .await;
     sleep(Duration::from_millis(120)).await;
@@ -18394,6 +18406,71 @@ async fn probe_input_consumption_by_composer_delta(
             TERMINAL_INPUT_CONSUMING_RAW_MODE_RESIDUE_REASON
         },
     }
+}
+
+/// [11.150] The probe marker's exit — ONE statement of the contract, shared
+/// by the echo and raw-mode postures. Ctrl+U first (clears the daemon's own
+/// reconstructed line on every CLI); then, only when the screen proves the
+/// marker is its row's whole tail, one backspace per marker character — the
+/// eraser every composer binds, Ctrl+U or not (measured live 2026-09-19,
+/// opencode 2.0.9 on the muse lab host: Ctrl+U is not bound, and a probe
+/// marker that outlived its probe became the phantom draft [11.150] exists
+/// for).
+async fn erase_probe_marker(
+    endpoint: ServerEndpoint,
+    runtime_session_path: String,
+    session_path: String,
+    trace_home: &Path,
+    marker_is_line_final: bool,
+) {
+    let mut clear = String::from(TERMINAL_INPUT_CLEAR_LINE);
+    if marker_is_line_final {
+        for _ in 0..TERMINAL_INPUT_ECHO_PROBE.chars().count() {
+            clear.push('\u{7f}');
+        }
+    }
+    let _ = terminal_write_app_control_input_async(
+        endpoint,
+        runtime_session_path,
+        session_path,
+        clear,
+        "submit_probe",
+        false,
+        trace_home,
+    )
+    .await;
+}
+
+/// [11.150] Does the rendered screen show the probe marker as its row's whole
+/// tail — nothing content-bearing typed after it? The guard that lets the
+/// erase use backspaces: a human's keystroke appended inside the confirm
+/// window flips this to false and the erase degrades to the Ctrl+U alone, so
+/// the backspaces can never eat past the probe's own bytes.
+fn probe_marker_is_line_final(screen: &str, marker: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(screen);
+    stripped
+        .lines()
+        .rev()
+        .find_map(|row| {
+            let trimmed = row.trim_end_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '\u{2500}'..='\u{257F}')
+            });
+            trimmed.ends_with(marker).then_some(true)
+        })
+        .unwrap_or(false)
+}
+
+/// [11.150] The draft refusal's Ack message carries the held line's character
+/// count (`held_len=<n>`) — the number a caller sizes the per-CLI erase with.
+/// `None` on any other refusal.
+fn terminal_write_refusal_held_len(message: &Option<String>) -> Option<usize> {
+    let message = message.as_deref()?;
+    let at = message.find("held_len=")?;
+    let digits: String = message[at + "held_len=".len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// One verdict on one question: **is this row consuming input right now?**
@@ -18550,47 +18627,91 @@ async fn probe_terminal_input_consumption(
             trace_home,
         )
         .await;
-        sleep(Duration::from_millis(180)).await;
-        let reading =
-            terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
-                .await
-                .ok();
-        let fresh_draft = reading
-            .as_ref()
-            .and_then(|answer| answer.composer_holds_draft);
-        let screen = reading.map(|answer| answer.text);
-        let echoed = screen
-            .as_deref()
-            .is_some_and(|screen| screen.contains(TERMINAL_INPUT_ECHO_PROBE));
-        if echoed {
-            // Our marker is on the screen and has to come off it again.
-            let _ = terminal_write_app_control_input_async(
+        // ⛔ [11.150] THE CONFIRM WINDOW IS THE RENDER'S CLOCK, NOT THE ECHO'S.
+        // A single 180 ms shot answers "does the pty echo" — but the CLIs this
+        // posture serves confirm by RENDER (the composer paints typed text),
+        // and a cold first paint can land past the shot: the probe then read
+        // its OWN marker on the walk arm as a human draft and returned WITHOUT
+        // clearing it, leaving `yggterm_ready_probe` standing in the composer
+        // as the phantom draft every later read refused on (measured live
+        // 2026-09-19, the muse lab host). Poll for the render the way the
+        // raw-mode posture does (same measured window); the walk's draft
+        // reading is OUR OWN BYTES until the window closes and is never
+        // consulted inside it.
+        let confirm_deadline = Instant::now()
+            + Duration::from_millis(TERMINAL_INPUT_RAW_MODE_CONFIRM_WINDOW_MS);
+        let mut marker_screen: Option<String> = None;
+        while Instant::now() < confirm_deadline {
+            sleep(Duration::from_millis(150)).await;
+            if let Ok(reading) =
+                terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
+                    .await
+                && reading.text.contains(TERMINAL_INPUT_ECHO_PROBE)
+            {
+                marker_screen = Some(reading.text);
+                break;
+            }
+        }
+        if let Some(screen) = marker_screen {
+            // The render IS the consumption proof, and the marker has to come
+            // off the screen again — erased, verified, and NAMED when it will
+            // not leave (the residue verdict), never silently assumed gone.
+            // The verdict's draft reading is the POST-erase one: what the
+            // caller will actually find.
+            let marker_is_line_final =
+                probe_marker_is_line_final(&screen, TERMINAL_INPUT_ECHO_PROBE);
+            erase_probe_marker(
                 endpoint.clone(),
                 runtime_session_path.clone(),
                 session_path.clone(),
-                TERMINAL_INPUT_CLEAR_LINE.to_string(),
-                "submit_probe",
-                false,
                 trace_home,
+                marker_is_line_final,
             )
             .await;
-            sleep(Duration::from_millis(60)).await;
+            sleep(Duration::from_millis(TERMINAL_INPUT_MARKER_ERASE_SETTLE_MS)).await;
+            let (post_draft, residue) = terminal_snapshot_async(
+                endpoint.clone(),
+                session_path.clone(),
+                trace_home,
+            )
+            .await
+            .ok()
+            .map_or((None, true), |answer| {
+                (
+                    answer.composer_holds_draft,
+                    answer.text.contains(TERMINAL_INPUT_ECHO_PROBE),
+                )
+            });
             return TerminalInputProbeVerdict {
                 consuming_input: true,
                 composer_shown: true,
-                composer_held_draft,
+                composer_held_draft: post_draft,
                 activity,
                 waited_ms: started.elapsed().as_millis() as u64,
-                reason: TERMINAL_INPUT_CONSUMING_REASON,
+                reason: if residue {
+                    TERMINAL_INPUT_CONSUMING_RENDER_RESIDUE_REASON
+                } else {
+                    TERMINAL_INPUT_CONSUMING_REASON
+                },
             };
         }
-        // ⭐ Re-read before the Ctrl+U, because the echo wait is 180 ms and a
-        // person can easily start typing inside it — and the fresh reading is
-        // the daemon's, taken on the snapshot we just fetched. ⛔ `None` (it
-        // could not say) stays `None` and refuses; it is not a clean composer.
-        composer_draft_now = fresh_draft;
+        // The window closed with no render. NOW the draft reading decides,
+        // taken on a fresh snapshot — never the stale pre-typing one. ⛔ `None`
+        // (it could not say) stays `None` and refuses; it is not a clean
+        // composer. ⛔ And the refusal writes NOTHING: the bytes were
+        // forwarded but never rendered — a CLI that dropped them before its
+        // input loop was live (the class the daemon's stale-bytes reconcile
+        // heals) or a human mid-word. Either way nothing of ours is on the
+        // screen to erase, and the clear is the destructive half.
+        composer_draft_now = terminal_snapshot_async(
+            endpoint.clone(),
+            session_path.clone(),
+            trace_home,
+        )
+        .await
+        .ok()
+        .and_then(|answer| answer.composer_holds_draft);
         if !probe_write_is_permitted(composer_draft_now) {
-            // ⛔ Return WITHOUT the Ctrl+U. The clear is the destructive half.
             return TerminalInputProbeVerdict {
                 consuming_input: false,
                 composer_shown: true,
@@ -19086,6 +19207,10 @@ struct AppControlTerminalWriteReport {
     /// trailing Enter would have ANSWERED the gate; measured agy 1.2.0,
     /// pending-bugs [11.94]). Carries the refusal reason slug.
     refused: Option<&'static str>,
+    /// [11.150] `held_len` off a draft refusal's message: the held line's
+    /// character count, the number the sized clear is built from. `None` on
+    /// every other outcome.
+    draft_held_len: Option<usize>,
     /// ⛔ [11.141] The outcome of the contract's conditional-submit chunk, when
     /// one was issued: "submitted" · "refused_line" · "startup_gate_shown" ·
     /// "refused_render" ([11.142]: the render never named the line, so no
@@ -19112,6 +19237,7 @@ impl AppControlTerminalWriteReport {
             "interrupt_chunk_count": self.interrupt_chunk_count,
             "interline_read_nudge_count": self.interline_read_nudge_count,
             "last_chunk_tail": self.last_chunk_tail,
+            "draft_held_len": self.draft_held_len,
         })
     }
 
@@ -19304,6 +19430,7 @@ async fn terminal_write_app_control_input_async(
                     interline_read_nudge_count,
                     last_chunk_tail,
                     refused: None,
+                    draft_held_len: None,
                     submit: Some("refused_render"),
                     conditional_submit: true,
                 });
@@ -19322,6 +19449,7 @@ async fn terminal_write_app_control_input_async(
                 interline_read_nudge_count,
                 last_chunk_tail,
                 refused: None,
+                draft_held_len: None,
                 submit: Some(conditional_submit_outcome(&message)),
                 conditional_submit: true,
             });
@@ -19346,6 +19474,7 @@ async fn terminal_write_app_control_input_async(
                 interline_read_nudge_count,
                 last_chunk_tail,
                 refused: Some(reason),
+                draft_held_len: terminal_write_refusal_held_len(&ack_message),
                 submit: None,
                 conditional_submit: false,
             });
@@ -19386,6 +19515,7 @@ async fn terminal_write_app_control_input_async(
         interline_read_nudge_count,
         last_chunk_tail,
         refused: None,
+        draft_held_len: None,
         submit: None,
         conditional_submit: false,
     })
