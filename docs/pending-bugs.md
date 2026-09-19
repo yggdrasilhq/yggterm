@@ -31875,59 +31875,34 @@ The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local
 
 ⚠ CORRECTION (2026-09-19 later, the [11.148] seat's ride-along; claim ACK-9ad617aa6d lineage): "never persisted on 2.0.x" is FALSIFIED as a blanket claim. A directly-launched (node-pty, scratch HOME, scratch-local managed port) opencode 2.0.9 TUI persists `latest/tui/tabs.json` CONTINUOUSLY — writes observed every ~0.5 s poll from 2.6 s after launch, BEFORE any turn, the file naming the birth session under its cwd; the writes survive SIGKILL (no graceful exit involved; `killChild` is SIGKILL in the battery drive, so the 09-15/09-19 suite homes were written the same way). The mystery therefore SHARPENS instead of dying: the [11.134] proof's WRAPPER row (real home, same day, real turn at 12:43) wrote `prompt-history.jsonl` + `service.json` but NEVER the tab map — the suppressed variable is the daemon wrapper context, prime suspect being that the wrapper TUI joins the PRODUCTION service as a second client (real-home `locks/` mutated 12:40) while every positive measurement ran against an isolated scratch service. The repair decision stays the owner's call, but the surface is ALIVE in the plain flow: verify-bind from the tab map is viable wherever rows run outside the wrapper context, and the wrapper-context suppression is itself a measurable defect candidate.
 
-## ⛔ [11.153] A REMOTE ROW'S MOUNT RUNS A DOOMED RESPAWN LOOP AGAINST A PEER SESSION THE OWNER HAD ALREADY TERMINATED — ITS OWN PREFLIGHT SAYS "MISSING SESSION" AND LAUNCHES ANYWAY, THE ROW READS running·idle FOREVER, AND THE VIEWPORT SITS AT THE PLACEHOLDER BANNER (measured live 2026-09-19 19:10-19:40 on the GUI host + dev, owner screenshot + mid-turn report)
+## ⛔ [11.154] A REMOTE ROW'S CLOSE IS NOT ATOMIC ACROSS THE TWO PLANES — A ROTATION MID-CLOSE LEFT THE LOCAL ROW LIVE WHILE THE PEER SESSION WAS TERMINATED AND TOMBSTONED, AND A CLIENT-HANDSHAKE BIRTH RE-BIRTHED THE ROW A THIRD TIME (measured live 2026-09-19 19:10-19:40 + 19:39:24 on the GUI host + dev; the [11.153] sitting's fix direction (b))
 
 **Status:** OPEN
 
-The owner created a "New dev Codex" row from the GUI (session 29434a5f). Codex
-0.155.1 ran and rendered its full TUI on the PEER (dev's composer_draft_union
-traces show `› Ask Codex to do anything` at grid row 12 of a 63-row screen),
-but the owner's viewport stayed at the client's empty-state placeholder (the
-row-summary line "Codex session rooted at /home/pi; the daemon owns the PTY…")
-— the stream never reached his xterm. Measured at 20:17 the same evening, a
-SHADOW client opening the same-shaped row paints it perfectly, so the
-daemon→client attach leg works when the peer session is alive; the blank is
-the remote-bridge mount leg ([11.139]/[11.32] family).
+The respawn-loop half of the owner's report is FIXED AND VERIFIED (2026-09-19,
+lane/trace/11153-remote-mount, deleted above per the verified-fix law): the
+remote PTY resize forward's confident peer-missing verdict
+(`remote_pty_resize_unownable` — "terminal session not found" past all five
+bounded retries) now feeds a peer-runtime-missing memo, and the saved-session
+ensure funnel spends it — `remote_saved_session_launch_refused_peer_missing`
+refuses the relaunch, stamps the row `Status: peer session gone` with the
+peer's own evidence in Launch Error, and the memo expires after ten minutes so
+a peer-side restore can heal the row. LIVE-PROVEN twice on the muse lab host
+after the fix deployed (main 037a8339): the owner's own defect row
+(29434a5f) met the gate in production at 22:34 local — its doomed
+`replace_exited_runtime` cycle (last seen 21:48 on the old build) never
+returned; and a driven probe row (create → the owner's close →
+client-handshake re-birth) ran the full measured chain — ONE doomed spawn, the
+resize retries, the unownable verdict, the named refusal 10.7 s later, then
+two more ensure ticks refused with zero further spawns.
 
-The chain the traces pin, minute by minute:
-
-1. 19:17:19 — the GUI-host daemon rotates; the new daemon restores the row
-   (metadata only, launch_now:false) mid-ownership-handover.
-2. 19:17:40 — the owner closes the row: dev-side runs
-   `server remote terminate-codex 29434a5f`; dev marks the peer session
-   explicit-close + TOMBSTONED (dev removed-rows, count 13). The peer is dead.
-3. 19:17:43 + 19:18:31 — the GUI's ensure for the row answers
-   `hot_warm_ensure_error`/`daemon_declare_unavailable`
-   ("reading daemon response") — the rotation ate the mount.
-4. 19:18:40 — the mount machinery relaunches the row anyway:
-   `remote_saved_session_preflight_elided_runtime_launch {reason:
-   resume_command_owns_missing_session_failure}` — THE PREFLIGHT SAW THE
-   MISSING PEER SESSION AND THE LAUNCH PROCEEDED. What follows is a loop:
-   `resume-codex --require-existing` + 5 resize retries against
-   `local://29434a5f` ("terminal session not found") →
-   `remote_pty_resize_unownable` → `first_bytes` 165 (the stty preamble,
-   never codex's paint) → `replace_exited_runtime` — again at 19:19:33,
-   again at 19:21:33. The row reads running·idle throughout; the peer-side
-   error never becomes a row state.
-
-**Fix directions (the pipeline the owner asked to fix):** (a) the preflight's
-missing-session verdict must REFUSE the launch and surface a named row state
-("peer session gone — closed on dev?") instead of eliding into a doomed
-spawn; (b) the close of a remote row must be atomic across both planes — the
-peer terminate+tombstone must not leave the local row live through a rotation
-(the local plane holds NO tombstone for it; the 19:39:24 client-handshake
-birth brought it back a third time); (c) the resize forward's
-not-found-retries need a bounded terminal verdict that feeds (a), not an
-unownable shrug.
-
-**Falsifier:** a remote row whose peer session is terminated must reach a
-named closed/error row state within one resume ceiling — no
-`replace_exited_runtime` cycle, no third `resume-codex --require-existing`
-spawn, `terminal_attention` honest. The 19:18:40-19:21:33 window on the GUI
-host ytrace is the regression harness's script.
-
-Filed by the tombstone-rearm seat (zcode on the muse lab host); evidence
-windows preserved in both hosts' ytrace around the timestamps above. Sister
-defect of the same owner report: the tombstone TTL resurrection — FIXED in
-lane/trace/tombstone-rearm (main 23cd8dfc).
-
+What remains is the CLOSE itself (the [11.153] entry's direction (b)): the
+owner's close at 19:17:40 terminated and tombstoned the peer session on dev
+while the 19:17:19 rotation restored the local row metadata-only — the local
+plane held NO tombstone for the row, so the close could not stop it, and the
+19:39:24 client-handshake birth brought the row back a third time against the
+dead peer. A remote-row close must hold both planes through a concurrent
+daemon rotation, and a client-handshake birth for a peer-tombstoned session
+must surface the peer's death instead of re-birthing the row unasked. The
+mount-side gate landed above does not close this hole; it only stops the row
+from respawning into it forever.
