@@ -31894,7 +31894,7 @@ existing remote command channel (the owner machine tells the machines its
 remote-scan has advertised this session to), or the home plane asking the
 peer one existence question before the first mount of a restored remote row.
 
-## ⛔ [11.156] OPENING A CLOSED ROW'S IDENTITY RE-BIRTHS A DEGRADED ROW — CWD LOST TO `local:/`, EMPTY TITLE, AND A SHELL ROW HANDED A `codex resume` LAUNCH COMMAND (measured live 2026-09-20 00:24 on the muse lab host, the [11.154] proof's deliberate re-open control)
+## ⛔ [11.156] OPENING A ROW THE TOMBSTONE REMEMBERS RE-BIRTHS IT DEGRADED — CWD LOST TO `local:/`, EMPTY TITLE, AND A SHELL ROW HANDED A `codex resume` LAUNCH COMMAND (measured live 2026-09-20 00:24 on the muse lab host, the [11.154] proof's deliberate re-open control)
 
 **Status:** OPEN
 
