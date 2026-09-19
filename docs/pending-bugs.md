@@ -31875,75 +31875,41 @@ The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local
 
 ⚠ CORRECTION (2026-09-19 later, the [11.148] seat's ride-along; claim ACK-9ad617aa6d lineage): "never persisted on 2.0.x" is FALSIFIED as a blanket claim. A directly-launched (node-pty, scratch HOME, scratch-local managed port) opencode 2.0.9 TUI persists `latest/tui/tabs.json` CONTINUOUSLY — writes observed every ~0.5 s poll from 2.6 s after launch, BEFORE any turn, the file naming the birth session under its cwd; the writes survive SIGKILL (no graceful exit involved; `killChild` is SIGKILL in the battery drive, so the 09-15/09-19 suite homes were written the same way). The mystery therefore SHARPENS instead of dying: the [11.134] proof's WRAPPER row (real home, same day, real turn at 12:43) wrote `prompt-history.jsonl` + `service.json` but NEVER the tab map — the suppressed variable is the daemon wrapper context, prime suspect being that the wrapper TUI joins the PRODUCTION service as a second client (real-home `locks/` mutated 12:40) while every positive measurement ran against an isolated scratch service. The repair decision stays the owner's call, but the surface is ALIVE in the plain flow: verify-bind from the tab map is viable wherever rows run outside the wrapper context, and the wrapper-context suppression is itself a measurable defect candidate.
 
-## ⛔ [11.154] A REMOTE ROW'S CLOSE IS NOT ATOMIC ACROSS THE TWO PLANES — A ROTATION MID-CLOSE LEFT THE LOCAL ROW LIVE WHILE THE PEER SESSION WAS TERMINATED AND TOMBSTONED, AND A CLIENT-HANDSHAKE BIRTH RE-BIRTHED THE ROW A THIRD TIME (measured live 2026-09-19 19:10-19:40 + 19:39:24 on the GUI host + dev; the [11.153] sitting's fix direction (b))
+## ⛔ [11.155] A CLOSE THAT RUNS ONLY ON THE PEER MACHINE NEVER REACHES THE ROW'S HOME MACHINE — THE HOME PLANE LEARNS PEER-GONE ONLY AFTER ONE DOOMED MOUNT (filed 2026-09-20, the [11.154] close)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-The respawn-loop half of the owner's report is FIXED AND VERIFIED (2026-09-19,
-lane/trace/11153-remote-mount, deleted above per the verified-fix law): the
-remote PTY resize forward's confident peer-missing verdict
-(`remote_pty_resize_unownable` — "terminal session not found" past all five
-bounded retries) now feeds a peer-runtime-missing memo, and the saved-session
-ensure funnel spends it — `remote_saved_session_launch_refused_peer_missing`
-refuses the relaunch, stamps the row `Status: peer session gone` with the
-peer's own evidence in Launch Error, and the memo expires after ten minutes so
-a peer-side restore can heal the row. LIVE-PROVEN twice on the muse lab host
-after the fix deployed (main 037a8339): the owner's own defect row
-(29434a5f) met the gate in production at 22:34 local — its doomed
-`replace_exited_runtime` cycle (last seen 21:48 on the old build) never
-returned; and a driven probe row (create → the owner's close →
-client-handshake re-birth) ran the full measured chain — ONE doomed spawn, the
-resize retries, the unownable verdict, the named refusal 10.7 s later, then
-two more ensure ticks refused with zero further spawns.
+The [11.154] fix holds the home plane once a close lands on ANY daemon of the
+home machine (the birth veto + the shared tombstone). The measured 19:17:40
+event was the other geometry: the peer session was terminated and tombstoned
+on dev while the home machine never learned — dev holds no roster of which
+homes carry its rows, so there is no honest channel for a peer-to-home close
+notice, and the home plane re-births the row, mounts the dead peer once, and
+only then learns peer-gone through the [11.153] memo (that lane's accepted
+steady state: one doomed spawn per window). **Falsifier:** close a remote
+row's session on its owning machine only; the home machine must neither spawn
+against the dead peer nor keep the row, with a named trace for the
+peer-death it learned. **Fix shape:** a peer-to-home close notice on the
+existing remote command channel (the owner machine tells the machines its
+remote-scan has advertised this session to), or the home plane asking the
+peer one existence question before the first mount of a restored remote row.
 
-What remains is the CLOSE itself (the [11.153] entry's direction (b)): the
-owner's close at 19:17:40 terminated and tombstoned the peer session on dev
-while the 19:17:19 rotation restored the local row metadata-only — the local
-plane held NO tombstone for the row, so the close could not stop it, and the
-19:39:24 client-handshake birth brought the row back a third time against the
-dead peer. A remote-row close must hold both planes through a concurrent
-daemon rotation, and a client-handshake birth for a peer-tombstoned session
-must surface the peer's death instead of re-birthing the row unasked. The
-mount-side gate landed above does not close this hole; it only stops the row
-from respawning into it forever.
+## ⛔ [11.156] OPENING A CLOSED ROW'S IDENTITY RE-BIRTHS A DEGRADED ROW — CWD LOST TO `local:/`, EMPTY TITLE, AND A SHELL ROW HANDED A `codex resume` LAUNCH COMMAND (measured live 2026-09-20 00:24 on the muse lab host, the [11.154] proof's deliberate re-open control)
 
-FORENSICS DEEPENED 2026-09-19 (the fix seat, the muse lab host's ytrace plus
-the shared tombstone file): the close's local half never reached ANY daemon on
-the GUI host — `removed-rows.json` holds NEITHER an entry NOR a departure for
-29434a5f, and `record_row_departure` runs unconditionally as the first line of
-`tombstone_live_row`, so a close that reached even the dying predecessor would
-have left one. The measured chain: 19:17:19-20 TWO `server/cli birth` events
-with `launch_now:false` (the rotation restored the row metadata-only —
-predecessor and successor both); 19:17:43 the close window errored
-(`hot_warm_ensure_error "reading daemon response"`); 19:18:40 onward the
-doomed ensure-spawn loop every ~2 minutes; 19:39:24 another `server/cli birth`
-— the client-handshake re-birth through the ONE birth door that never asked
-the tombstone plane.
+**Status:** OPEN
 
-FIXED IN CODE (lane/trace/11154-close-atomic): (1) THE BIRTH VETO —
-`insert_live_session_with_launch_options` (the one birth chokepoint) consults
-`live_row_closes_remembered_among` for PASSIVE births (`launch_now == false`)
-and refuses by name (`live_session_birth_vetoed_closed_row`); a user-driven
-start (`launch_now == true`) is a deliberate re-entry whose persist reconcile
-lifts the veto. A close that lands on ANY daemon of the home machine now
-holds through every restore and re-birth door. (2) THE CLOSE RE-DELIVERY —
-the app-control close (the GUI's RemoveSession) retries transport-class
-failures at 1s/2s/4s onto the successor daemon
-(`remove_session_retry_delay_ms`); an answered verdict is never retried.
-That closes the measured ORIGIN: a close issued inside the swap gap died with
-one transport error and was lost — no tombstone, no removal. (3) RIDE-ALONG —
-the recovery sweep's tombstone re-arm had landed AFTER its `return None`
-(dead on arrival, aa8c72fa): the door refused without re-arming, exactly the
-wait-out-the-veto hole the re-arm exists to close; it precedes the return
-now, and a lock pins the order. Locks: `the_passive_birth_chokepoint_asks_
-the_tombstone_plane`, `the_recovery_sweep_rearm_precedes_its_return`, shell
-`the_close_retries_its_transport_but_never_a_named_refusal` +
-`the_remove_session_arm_re_delivers_through_the_retry_loop`.
-
-STILL OPEN (the remaining half, honestly): a close that runs ONLY on the peer
-machine (the dev terminate+tombstone at 19:17:40) still tells nobody on the
-home machine — the peer holds no roster of which homes carry its rows, so the
-home plane learns peer-gone only through the [11.153] memo after ONE doomed
-mount attempt (that lane's accepted steady state). The full fix is a
-peer-to-home close notice on the existing command channel; it wants its own
-seat and its own measured transport.
+The [11.154] live proof closed a local shell row and re-opened it through the
+deliberate door (`server connect`). The re-entry is LAWFUL (the tombstone
+reconcile lifts the veto — that half of the law measured working), but the
+re-birth came back DEGRADED: `cwd` read `local:/` (the original
+`/tmp/ygg-1154-proof` was gone from the reconstruction), the title was empty,
+and the ensured launch command was `cd 'local:/' && codex resume <id>` for a
+SHELL row — bash answered `No such file or directory` as the row's first
+paint. The stored-open re-derivation rebuilds a closed row's identity from
+the runtime key alone and guesses the kind from the id's shape. **Falsifier:**
+close a live local shell row, re-open it by its path; the re-born row must
+carry its cwd, its kind and a shell launch command — never a `codex resume`
+line, never `local:/`. **Fix shape:** the stored-open path must read the
+kind and cwd from the persisted stored-session record (or refuse with a
+named `closed_row_identity_underdetermined` instead of synthesizing a wrong
+row).
