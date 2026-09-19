@@ -69677,4 +69677,27 @@ mod web_surface_immersion_locks {
         );
     }
 
+    #[test]
+    fn no_input_probe_positionally_tail_binds_the_snapshot_answer() {
+        // [11.144] root cause: the terminal snapshot answer used to be an
+        // 8-wide positional tuple whose two trailing Options
+        // (`composer_holds_draft`, `pty_in_alternate_screen`) were tail-bound
+        // by `.., x)` patterns. When the alternate-screen field was appended
+        // (2026-09-03), every such binding silently shifted onto it and the
+        // input-probe family reported the alternate-screen flag as a held
+        // draft. The answer is a named struct now; this keeps the
+        // tail-binding shape from coming back.
+        for pattern in [
+            ".., draft)",
+            ".., daemon_draft)",
+            "|(.., draft)|",
+        ] {
+            assert!(
+                !SHELL_SOURCE.contains(pattern),
+                "positional tail-binding {pattern:?} of the terminal snapshot answer is \
+                 the [11.144] class — bind composer_holds_draft by name"
+            );
+        }
+    }
+
 }

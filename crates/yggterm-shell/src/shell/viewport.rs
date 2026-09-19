@@ -4444,15 +4444,15 @@ fn TerminalCanvas(
                 )
                 .await
                 {
-                    Ok((
-                        snapshot_text,
+                    Ok(yggterm_server::TerminalSnapshotAnswer {
+                        text: snapshot_text,
                         running,
                         runtime_output_seen,
                         post_resize_output_seen,
                         last_resize_seq,
-                        _runtime_spawn_id,
-                        ..,
-                    )) if running
+                        runtime_spawn_id: _runtime_spawn_id,
+                        ..
+                    }) if running
                         && runtime_output_seen
                         && remote_resume_screen_snapshot_is_replayable_for_blank_host(
                             &snapshot_text,
@@ -4886,15 +4886,15 @@ fn TerminalCanvas(
                         )
                         .await
                         {
-                            Ok((
-                                screen_text,
-                                screen_running,
-                                screen_runtime_output_seen,
-                                screen_post_resize_output_seen,
-                                screen_last_resize_seq,
-                                screen_runtime_spawn_id,
-                                ..,
-                            )) => {
+                            Ok(yggterm_server::TerminalSnapshotAnswer {
+                                text: screen_text,
+                                running: screen_running,
+                                runtime_output_seen: screen_runtime_output_seen,
+                                post_resize_output_seen: screen_post_resize_output_seen,
+                                last_resize_seq: screen_last_resize_seq,
+                                runtime_spawn_id: screen_runtime_spawn_id,
+                                ..
+                            }) => {
                                 if screen_runtime_spawn_id != 0 {
                                     runtime_spawn_id = screen_runtime_spawn_id;
                                 }
@@ -5243,15 +5243,15 @@ fn TerminalCanvas(
                         )
                         .await
                         {
-                            Ok((
-                                screen_text,
-                                screen_running,
-                                screen_runtime_output_seen,
-                                screen_post_resize_output_seen,
-                                screen_last_resize_seq,
-                                screen_runtime_spawn_id,
-                                ..,
-                            )) => {
+                            Ok(yggterm_server::TerminalSnapshotAnswer {
+                                text: screen_text,
+                                running: screen_running,
+                                runtime_output_seen: screen_runtime_output_seen,
+                                post_resize_output_seen: screen_post_resize_output_seen,
+                                last_resize_seq: screen_last_resize_seq,
+                                runtime_spawn_id: screen_runtime_spawn_id,
+                                ..
+                            }) => {
                                 if screen_runtime_spawn_id != 0 {
                                     runtime_spawn_id = screen_runtime_spawn_id;
                                 }
@@ -10769,15 +10769,14 @@ fn TerminalCanvas(
                                 match kind {
                                     SnapshotReplayKind::NonPrompt => {
                                             match result {
-                                        Ok((
-                                            snapshot_text,
+                                        Ok(yggterm_server::TerminalSnapshotAnswer {
+                                            text: snapshot_text,
                                             running,
                                             runtime_output_seen,
                                             post_resize_output_seen,
                                             last_resize_seq,
-                                            _runtime_spawn_id,
-                                            ..,
-                                        ))
+                                            ..
+                                        })
                                             if remote_resume_non_prompt_snapshot_is_replayable(
                                                 &snapshot_text,
                                                 &cursor_line_text,
@@ -10872,15 +10871,14 @@ fn TerminalCanvas(
                                                 + Duration::from_millis(read_poll_ms);
                                             continue;
                                         }
-                                        Ok((
-                                            snapshot_text,
+                                        Ok(yggterm_server::TerminalSnapshotAnswer {
+                                            text: snapshot_text,
                                             running,
                                             runtime_output_seen,
                                             post_resize_output_seen,
                                             last_resize_seq,
-                                            _runtime_spawn_id,
-                                            ..,
-                                        )) => {
+                                            ..
+                                        }) => {
                                             append_trace_event(
                                                 &trace_home,
                                                 "ui",
@@ -11009,15 +11007,14 @@ fn TerminalCanvas(
                                     }
                                     SnapshotReplayKind::BlankHost => {
                                         match result {
-                                    Ok((
-                                        snapshot_text,
+                                    Ok(yggterm_server::TerminalSnapshotAnswer {
+                                        text: snapshot_text,
                                         running,
                                         runtime_output_seen,
                                         post_resize_output_seen,
                                         last_resize_seq,
-                                        _runtime_spawn_id,
-                                        ..,
-                                    ))
+                                        ..
+                                    })
                                         if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                             &snapshot_text,
                                             remote_starting_agent_session,
@@ -11113,15 +11110,14 @@ fn TerminalCanvas(
                                             + Duration::from_millis(read_poll_ms);
                                         continue;
                                     }
-                                    Ok((
-                                        snapshot_text,
+                                    Ok(yggterm_server::TerminalSnapshotAnswer {
+                                        text: snapshot_text,
                                         running,
                                         runtime_output_seen,
                                         post_resize_output_seen,
                                         last_resize_seq,
-                                        _runtime_spawn_id,
-                                        ..,
-                                    )) => {
+                                        ..
+                                    }) => {
                                         append_trace_event(
                                             &trace_home,
                                             "ui",
@@ -17362,16 +17358,7 @@ const TERMINAL_LOOP_BRANCH_BLOCK_WARN_MS: u64 = 120;
 /// exactly what the old inline apply half read, so the branch bodies below are
 /// the old code minus the `.await`.
 /// A full daemon terminal snapshot, ready to replay into the client.
-type SnapshotReplayPayload = (
-    String,
-    bool,
-    bool,
-    bool,
-    u64,
-    u64,
-    Option<bool>,
-    Option<bool>,
-);
+type SnapshotReplayPayload = yggterm_server::TerminalSnapshotAnswer;
 
 /// Which reveal path requested a snapshot replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18321,10 +18308,11 @@ async fn probe_input_consumption_by_composer_delta(
     let mut fresh_draft = composer_held_draft;
     while Instant::now() < confirm_deadline {
         sleep(Duration::from_millis(150)).await;
-        if let Ok((screen, .., draft)) =
+        if let Ok(answer) =
             terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await
         {
-            fresh_draft = draft;
+            fresh_draft = answer.composer_holds_draft;
+            let screen = answer.text;
             // ⛔ THE DELTA IS THE RENDER, NOT THE QUEUED BYTES. The walk arm of
             // the daemon's draft union flips true the moment the marker is
             // FORWARDED — a wedged row would confirm instantly if that were
@@ -18383,10 +18371,11 @@ async fn probe_input_consumption_by_composer_delta(
             .ok();
     let (clean, cleaned_draft) = cleanup_reading
         .as_ref()
-        .map_or((false, None), |(screen, .., draft)| {
+        .map_or((false, None), |answer| {
             (
-                *draft != Some(true) && !screen.contains(TERMINAL_INPUT_ECHO_PROBE),
-                *draft,
+                answer.composer_holds_draft != Some(true)
+                    && !answer.text.contains(TERMINAL_INPUT_ECHO_PROBE),
+                answer.composer_holds_draft,
             )
         });
     TerminalInputProbeVerdict {
@@ -18477,13 +18466,13 @@ async fn probe_terminal_input_consumption(
     let mut composer_held_draft: Option<bool> = None;
     let mut activity = AgentRowActivity::Unknown;
     while started.elapsed() < timeout {
-        if let Ok((screen, .., daemon_draft)) = terminal_snapshot_async(
+        if let Ok(answer) = terminal_snapshot_async(
             endpoint.clone(),
             session_path.clone(),
             trace_home,
         )
         .await
-            && terminal_chunk_has_agent_composer_row(&screen)
+            && terminal_chunk_has_agent_composer_row(&answer.text)
         {
             composer_shown = true;
             // ⛔⛔ ASK THE DAEMON, NEVER THE SCREEN BYTES. This used to walk the
@@ -18495,7 +18484,8 @@ async fn probe_terminal_input_consumption(
             // messages, and the CLI now draws a person's own typing faint too.
             // The daemon holds the input line the keystrokes actually built and
             // the rendered grid a person actually sees; this is its answer.
-            composer_held_draft = daemon_draft;
+            composer_held_draft = answer.composer_holds_draft;
+            let screen = answer.text;
             // The session's own kind — never inferred from the composer glyph,
             // which several CLIs share.
             activity = terminal_chunk_agent_activity(session_kind, &screen);
@@ -18565,8 +18555,10 @@ async fn probe_terminal_input_consumption(
             terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home)
                 .await
                 .ok();
-        let fresh_draft = reading.as_ref().and_then(|(.., draft)| *draft);
-        let screen = reading.map(|(screen, ..)| screen);
+        let fresh_draft = reading
+            .as_ref()
+            .and_then(|answer| answer.composer_holds_draft);
+        let screen = reading.map(|answer| answer.text);
         let echoed = screen
             .as_deref()
             .is_some_and(|screen| screen.contains(TERMINAL_INPUT_ECHO_PROBE));
@@ -18658,7 +18650,7 @@ fn spawn_screen_reconcile_fetch(
         let fetched = terminal_snapshot_async(endpoint, session_path, &trace_home)
             .await
             .ok()
-            .map(|(screen_text, _running, _out, _post, _seq, _spawn, ..)| screen_text);
+            .map(|answer| answer.text);
         // The loop dropping its receiver means the session unmounted: nothing
         // left to reconcile.
         let _ = result_tx.send((
@@ -18674,7 +18666,7 @@ async fn terminal_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,
     trace_home: &Path,
-) -> Result<(String, bool, bool, bool, u64, u64, Option<bool>, Option<bool>)> {
+) -> Result<yggterm_server::TerminalSnapshotAnswer> {
     run_dedicated_terminal_io("terminal_snapshot", trace_home, move || {
         terminal_snapshot(&endpoint, &session_path)
     })
@@ -19218,9 +19210,9 @@ async fn wait_for_composer_to_name_the_line(
     let deadline = Instant::now()
         + Duration::from_millis(TERMINAL_INPUT_SUBMIT_RENDER_CONFIRM_WINDOW_MS);
     loop {
-        if let Ok((screen, ..)) =
+        if let Ok(answer) =
             terminal_snapshot_async(endpoint.clone(), session_path.clone(), trace_home).await
-            && composer_render_names_line(&screen, expected_line)
+            && composer_render_names_line(&answer.text, expected_line)
         {
             return true;
         }

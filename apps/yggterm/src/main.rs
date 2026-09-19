@@ -1602,8 +1602,15 @@ fn main() -> Result<()> {
             // ⚠ Only the LIVE screen can vouch for what is in a composer now, so
             // only it carries the verdict; the retained frame is a stored one and
             // is not given a value it cannot stand behind.
-            let (text, running, seen, post, seq, spawn, _composer, _pty_alt) =
-                terminal_snapshot(&endpoint, &args[3])?;
+            let answer = terminal_snapshot(&endpoint, &args[3])?;
+            let (text, running, seen, post, seq, spawn) = (
+                answer.text,
+                answer.running,
+                answer.runtime_output_seen,
+                answer.post_resize_output_seen,
+                answer.last_resize_seq,
+                answer.runtime_spawn_id,
+            );
             (text, running, seen, post, seq, spawn)
         };
         if raw {
