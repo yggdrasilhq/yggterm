@@ -4094,9 +4094,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             "guide devin while it works",
         ],
         // ⛔ MEASURED DRIFT (v3000.10.31, 2026-09-18): the idle footer is
-        // `SWE-1.6 Slow … Press alt+m to switch between available models` —
-        // the 3000.10.27-era `ctrl+v to paste image in clipboard` no longer
-        // paints. Model-flavor left, model switcher right.
+        // `SWE-1.6 Slow … Press alt+m to switch between available models`.
+        // Model-flavor left; the right side is CONTEXTUAL (corrected
+        // 2026-09-19 on b98cc431): the `alt+m` variant paints on the EMPTY
+        // idle composer, the 3000.10.27-era `ctrl+v to paste image in
+        // clipboard` paints whenever the composer HOLDS TEXT — both live.
         composer_footer_hints: &["swe-1.6 slow", "alt+m"],
         // The footer does NOT swap mid-turn (unlike grok's ctrl+c swap);
         // the interrupt contract rides the working line itself.
