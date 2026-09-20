@@ -30779,3 +30779,60 @@ restored within one minute — the screenshot row healed and reads healthy.
 FIXED IN CODE 2026-09-20 (the muse lab host seat, work FROM dev): (1) THE REMOTE LAUNCH GATE — the ensure funnel's remote door beside the local binary-missing check: a fresh negative remote-ensure cache answer refuses BY NAME before any spawn, and the refusal stamps the [11.153] pattern (Status `CLI binary not installed on <host>` + Launch Error, launch_phase Failed, dead wrapper PID cleared, the Restore entry removed so Connect stops advertising `--require-existing` for a never-started session); (2) THE LEARN ARM — the reuse-check stream classifies the peer's own refusal frame (yggterm's contract words, machine-agnostic), which is the ground truth a stale positive cache cannot see past (the probe-seat / ynpm-re-point / self-update class vanished inside the 2h TTL), removes the dead wrapper so the pane falls back to the recorded words, and refuses; (3) THE HEAL — a stamped row distrusts every cached answer but a fresh negative (the background hop re-answers, inflight-deduped, the fresh-negative TTL bounds the cadence), a fresh positive retires the stamp (no scar: the clear restores the resume-form Restore and the pending states re-derive the phase), and the snapshot reconcile guard keeps Failed off the bootstrapping relabel while a stamp is current. Locks: funnel order (local < remote gate < peer-gone ask < learn arm < reuse check), the gate table, the reconcile guard, the heal-probe shape. Suite 1549/1 vs clean main f17a1fa4, failure set byte-identical (the owner-gated stamp red).
 
 LIVE-MEASURED 2026-09-20 on the deployed build (the muse lab host, probe rows against dev): (a) THE START-BORN WINDOW IS NOW OWNED AND HONEST — a row opened while the peer binary is held aside gets the [11.153] peer-missing memo stamp within ~12s and the [11.158] start-born compound CLOSE by ~24s (departure reason `peer-session-gone`, twice measured) — the persistent raw-paint loop and the lying running-idle plane of the owner report no longer persist anywhere; the raw frame, if painted at all, lives seconds. (b) THE GATE/LEARN/HEAL PLANES ARE DEPLOYED for the surviving-row surfaces (fresh peer-answered negative before any spawn; the learn arm for bound-row frames; the heal clear) but their END-TO-END DRIVE IS STILL OWED — the instrument gap: binding a session needs a submitted turn, and the probe composer submit was blocked by the byte-tracker-vs-screen divergence (the [11.144] family: the atomic submit refused with `holds 0 bytes` while the screen held the line). The next seat: bind via a real turn (any submit instrument that clears the tracker divergence), then hold the generation binary aside (the provisioner self-heals the hold within one hop — time-box ~90s), kill the peer TUI vendor binary (NOT terminal restart — its teardown makes the peer answer `terminal session not found` and the [11.153] memo shadows the learn arm), and connect-tick until the stamp lands. ⚠ the [11.153] stamp TEXT (`peer session gone`) mis-names the binary-missing cause for the memo arm — the evidence half carries the truth; filing the re-naming as a residual.
+
+## ⛔ [11.161] THE PEER'S RESIZE HANDLER ANSWERED A RUNTIME-KEY ASK ABOUT THE WRONG KEY, AND THE ASKER READ THAT AS PEER TRUTH — A SELF-PERPETUATING `peer session gone` STAMP ON A LIVE SESSION (owner-reported 2026-09-20 21:03 IST "codex session wedged, restart didn't help"; diagnosis ACK-e845da5926, fix claim ACK-38518fc7f9)
+
+**Status:** OPEN
+
+The dev·remote codex row `remote-session://dev/47a239b0-c7cf-4091-af4e-76bc7b0dc148`
+(codex session `01a0bf3b-a7e7-7673-a74c-3347f7c4971c`) froze for the owner;
+the metadata plane read launch-failed · idle; his restart made it permanent.
+The diagnosis sitting root-caused two layers: (1) the CLI — codex's turn died
+21:04:15 IST on the account usage limit (not a yggterm bug; the frozen frame
+was a fossil); (2) the yggterm defect this entry owns — the bootstrap-mount
+ensure funnel's resize-forward ask armed the [11.153] peer-session-gone memo
+from an HONEST not-found, and every later bootstrap re-armed it
+(4302 trace events in the family; refusals 21:03:29→21:09:18 IST, then
+self-perpetuating through each new bootstrap exactly as the diagnosis
+predicted).
+
+THE MEASURED CHAIN (corrects one line of the board diagnosis — the ask did
+not literally carry `local://`; the PEER's fold manufactured it):
+
+1. The muse lab host resize worker asked dev in the CORRECT key space —
+   `resize_remote_agent_session_pty` builds `codex-runtime://<session-id>`
+   from the descriptor's `runtime_key_scheme` (asked key
+   `codex-runtime://01a0bf3b…`; the sibling spelling
+   `codex-runtime://47a239b0…` — the path uuid — is what dev actually held
+   at wedge time per the diagnosis seat's live evidence; dev's own trace
+   later shows `codex-runtime://01a0bf3b…` serving a live composer).
+2. Dev's `TerminalResize` handler folds the incoming key through
+   `terminal_runtime_key_for_path` BEFORE answering. When nothing is
+   servable (the runtime under a sibling spelling the fold's alias
+   candidates miss), the fold's final fallback returns the SESSIONS-MAP
+   guess — dev's local row spelling `local://01a0bf3b…` — and the resize
+   fails with `Error: terminal session not found: local://01a0bf3b…`: an
+   honest daemon answering about a key nobody asked for.
+3. The muse lab host worker classified any `terminal session not found` as peer truth
+   about ITS key: five re-queues → `remote_pty_resize_unownable` → the
+   [11.153] memo armed → the [11.153] gate spent it → the row stamped
+   launch-failed (`remote_saved_session_launch_refused_peer_missing`) → the
+   next bootstrap re-asked and re-armed. The runtime was alive throughout
+   (dev wrapper + codex pids from the owner's restart #1; gap-free rollout).
+
+THE DEFECT, two layers, both structural: (1) THE PEER — a runtime-lane-keyed
+ask is answered about the fold's local spelling when nothing is servable; an
+ask phrased in a runtime lane's own key space must be answered in that key
+space (the [11.160] `peer_answered` bit separates transport failures from
+real negatives; a WRONG-KEY negative is peer-answered and slips past it).
+(2) THE ASKER — a not-found whose refused key differs from the asked key is
+a key-space fault, not verdict evidence about the asked key; retrying it and
+arming the peer-gone memo converted a fold into a death sentence.
+
+Falsifier: on any two-host (or scratch-home) rig where the peer holds a row
+whose sessions-map spelling is `local://<id>` while the ask carries
+`codex-runtime://<id>` and nothing servable matches — the refusal must name
+the ASKED key, the asker must trace
+`remote_pty_resize_key_space_mismatch`, and neither the [11.153] memo nor
+the launch-failed stamp may arm; the row's next mount attempt must proceed
+to the resume attempt instead of refusing.

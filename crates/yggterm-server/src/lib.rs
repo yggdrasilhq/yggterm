@@ -15459,7 +15459,10 @@ fn remote_direct_write_target_for_path(path: &str) -> Option<(&str, String)> {
 /// `_ => None` this replaced answered `None` for every CLI registered after
 /// Claude Code too, and `None` here means the caller cannot even build a key to
 /// ask the daemon about: no resume, no resize, no terminate.
-fn remote_runtime_agent_session_key(kind: SessionKind, session_id: &str) -> Option<String> {
+pub(crate) fn remote_runtime_agent_session_key(
+    kind: SessionKind,
+    session_id: &str,
+) -> Option<String> {
     agent_cli_descriptor(kind)
         .and_then(|descriptor| descriptor.runtime_key_scheme)
         .map(|scheme| format!("{scheme}{session_id}"))
@@ -25914,6 +25917,28 @@ fn strip_leading_partial_escape_sequence(text: &str) -> (String, bool) {
 /// RUNTIME KEY. The behaviour is a property of "a daemon owns this PTY on
 /// another machine", which is what a runtime key means — it was never a
 /// property of codex.
+/// Does this key phrase a runtime lane in its own right — a pure
+/// `*-runtime://` spelling, not a row path that merely folds to one?
+///
+/// ⛔ THE [11.161] KEY-SPACE LAW's predicate: an ask phrased in a runtime
+/// lane's own key space must be ANSWERED in that key space. The fold's
+/// final fallback may otherwise rewrite `codex-runtime://<id>` into the
+/// local row spelling `local://<id>` when nothing is servable, and a
+/// remote peer reading that answer mistakes the fold for a verdict about
+/// the runtime it asked for. `local://` itself is RowAndRuntimeKey —
+/// deliberately OUT of scope: a local row ask keeps today's
+/// fold-to-the-live-spelling behavior.
+pub(crate) fn key_phrases_a_runtime_lane(key: &str) -> bool {
+    yggterm_core::agent_scheme::SESSION_PATH_SCHEMES
+        .iter()
+        .any(|scheme| {
+            matches!(
+                scheme.role,
+                yggterm_core::agent_scheme::SchemeRole::RuntimeKey
+            ) && key.starts_with(scheme.prefix)
+        })
+}
+
 fn bridge_initial_snapshot_should_use_raw_stream(path: &str) -> bool {
     // ⚠ REMOTE runtime keys only. `agent_runtime_key_schemes()` also yields
     // `local://`, which is BOTH a row identity and a runtime key — and a local
@@ -37482,12 +37507,17 @@ mod tests {
             "the exhausted-not-found resize verdict must emit the named \
              remote_pty_resize_unownable event"
         );
+        // The [11.161] classifier owns the not-found needle now: the gate is
+        // spelled on its verdict, and the needle lives in the classifier.
         let verdict_start = source
-            .find("let unownable = !will_retry")
-            .expect("the verdict gate must be spelled on will_retry");
-        let gate = &source[verdict_start..verdict_start + 400];
+            .find("let unownable = matches!(verdict, RemoteResizeVerdict::Unownable)")
+            .expect("the verdict gate must be spelled on the [11.161] classifier verdict");
+        let classifier = source
+            .find("fn classify_remote_resize_not_found(")
+            .expect("the [11.161] classifier must exist");
+        let classifier_body = &source[classifier..classifier + 1600];
         assert!(
-            gate.contains("contains(\"terminal session not found\")"),
+            classifier_body.contains("terminal session not found"),
             "the verdict must fire only for the not-found class — every \
              other terminal error keeps its own text"
         );
