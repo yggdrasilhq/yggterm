@@ -6132,6 +6132,25 @@ fn missing_binary_refusal_message(descriptor: &AgentCliDescriptor) -> String {
     )
 }
 
+/// The same words for a launch that will exec on ANOTHER machine ([11.160]).
+/// The peer prints the "this machine" template at the row's own PTY, and to an
+/// owner staring at a `dev` row that sentence reads as a lie about THEIR
+/// machine. The peer host is the truth-maker, so the remote gate and its stamp
+/// name it; the contract sentence is otherwise word-for-word the local one.
+pub(crate) fn missing_binary_refusal_message_on_machine(
+    tool: ManagedCliTool,
+    machine: &str,
+) -> String {
+    let descriptor = tool.descriptor();
+    format!(
+        "{} is not installed on {} — `{}` is not on the launch PATH there, so yggterm cannot start this session. {}",
+        descriptor.display_name,
+        machine,
+        descriptor.binary_name,
+        descriptor.install_instruction(),
+    )
+}
+
 /// Per-tool in-flight guard so at most one background provision/refresh runs per tool
 /// at a time (no thread pile-up under rapid switching). The 60s focus cache rate-limits
 /// the spawn cadence to <=1/min while actively switching.
