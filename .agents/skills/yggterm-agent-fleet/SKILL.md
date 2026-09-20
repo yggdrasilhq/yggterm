@@ -1390,6 +1390,26 @@ piecemeal edit of harness state. Everything else in that law stands.
   token. A stale copy on another host is harmless until switched; if its
   refresh then fails, re-fetch from the writer host.
 
+- **Provenance makes single-writer enforceable** (dream ACK-68ce18afa6, built
+  2026-09-20): every mutating verb stamps `~/.yggterm/auth/<harness>/.provenance.json`
+  with the lineage's writer + stamps. `refresh` now REFUSES a foreign-owned
+  lineage without --force; `doctor` compares each replica against its writer
+  and says STALE where a re-fetch is owed; `fleet` prints the accounts × hosts
+  matrix over ssh (no remote install — the script runs remotely via stdin).
+  First call takes `--hosts a,b,c --save`; after that `fleet` knows the fleet.
+- **rotate measures before it moves** (dream ACK-37c41cbde1): candidates rank
+  by real headroom from the usage endpoint — an account at 2% beats one at
+  100% regardless of slug order. `--fast` (or a down API) falls back to the
+  clock heuristic.
+- **litellm is a first-class lineage source** (dream ACK-447fefa6b4):
+  `ygg-auth.py adopt` pulls the account litellm currently holds (its live
+  auth.json is the only fresh copy — rotation kills its snapshots);
+  `litellm-switch <slug>` pushes a profile in, restarts the container, and
+  health-checks. After litellm-switch, litellm owns the lineage.
+- **login surfaces its code where the owner looks** (dream ACK-52ebf788f0):
+  the device code also posts as a pinned `infra/auth` card that auto-closes
+  when the poll completes. `--no-notify` silences it.
+
 Origin: the owner's switch-chatgpt.py prototype on the litellm LXC
 (device-code login + per-account snapshots), productized 2026-09-20 after a
 gemini-3.8-flash-high consult (cooldown state, refresh-race guard, umask 077

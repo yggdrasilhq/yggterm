@@ -186,7 +186,7 @@ def s_redaction():
     assert S.run("capture").returncode == 0
     assert S.run("switch", "a@x.io").returncode == 0
     for args in (("status",), ("status", "--json"), ("list", "--json"),
-                 ("switch", "b@x.io", "--json"), ("rotate", "--json"),
+                 ("switch", "b@x.io", "--json"), ("rotate", "--fast", "--json"),
                  ("capture",), ("harnesses", "--json")):
         r = S.run(*args)
         blob = r.stdout + r.stderr
@@ -202,7 +202,7 @@ def s_rotate_cooldown():
         S.write_live(make_record(email, acct))
         assert S.run("capture").returncode == 0
     assert S.run("switch", "a@x.io").returncode == 0
-    r1 = S.run("rotate", "--json")
+    r1 = S.run("rotate", "--fast", "--json")
     assert r1.returncode == 0, f"rotate1 exit {r1.returncode}: {r1.stderr}"
     first = json.loads(r1.stdout)["switched_to"]
     assert first == "b_x.io", f"rotate1 picked {first}, want b_x.io (a just vacated, cooling)"
@@ -295,6 +295,100 @@ def s_new_verbs_guards():
     assert S.read_live()["tokens"].get("access_token") == "y"
 
 
+@screen("provenance: capture stamps writer; refresh refuses a foreign writer")
+def s_provenance():
+    S.reset()
+    S.write_live(make_record("a@x.io", "acct-a"))
+    assert S.run("capture").returncode == 0
+    prov = json.load(open(os.path.join(S.store, "codex", ".provenance.json")))
+    ent = prov["a_x.io"]
+    assert ent["writer"] == os.uname().nodename, f"writer {ent['writer']!r} != this host"
+    assert ent["source"] == "capture" and ent["writer_updated_at"] > 0
+    # forge a foreign writer and try to refresh the stored copy (no refresh_token,
+    # so --force must get PAST the single-writer gate and fail later with 6)
+    S.reset()
+    rec = make_record("a@x.io", "acct-a")
+    del rec["tokens"]["refresh_token"]
+    S.write_live(rec)
+    S.run("capture", "--name", "foreign")
+    prov = json.load(open(os.path.join(S.store, "codex", ".provenance.json")))
+    prov["foreign"]["writer"] = "some-other-host"
+    with open(os.path.join(S.store, "codex", ".provenance.json"), "w") as f:
+        json.dump(prov, f)
+    r = S.run("refresh", "foreign")
+    assert r.returncode == 5 and "some-other-host" in (r.stdout + r.stderr), \
+        f"foreign-writer refresh exit {r.returncode}, want the single-writer refusal (5)"
+    r = S.run("refresh", "foreign", "--force")
+    assert r.returncode == 6, f"--force exit {r.returncode}, want 6 (past the gate, no refresh_token)"
+
+
+@screen("unit: convert_flat + rotate scoring rank measured headroom first")
+def s_unit_rank_and_convert():
+    # sandbox the module import: STORE_ROOT is read from env at import time
+    os.environ["YGG_AUTH_HOME"] = os.path.join(S.store, "unit")
+    os.environ["HOME"] = S.home
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ygg_auth_unit", os.path.abspath(S.script))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # convert_flat: flat → nested, grants preserved verbatim
+    flat = {"access_token": "at", "refresh_token": "rt", "id_token": jwt({"email": "c@x.io"}),
+            "expires_at": 123, "account_id": "acct-c"}
+    nested = mod.convert_flat(flat, "codex")
+    assert nested["tokens"] == {"id_token": flat["id_token"], "access_token": "at",
+                                "refresh_token": "rt", "account_id": "acct-c"}, \
+        "conversion mangled the grants"
+    assert nested["auth_mode"] == "chatgpt"
+    # scoring: measured-ok beats measured-limited beats unmeasurable
+    def fake_snapshot(record):
+        aid = record["tokens"]["account_id"]
+        if aid == "acct-good":
+            return {"ok": True, "limit_reached": False, "primary": {"used_percent": 10}}
+        if aid == "acct-full":
+            return {"ok": True, "limit_reached": True, "primary": {"used_percent": 100}}
+        return {"ok": False, "error": "dead"}
+    mod.usage_snapshot = fake_snapshot
+    unit_store = os.path.join(S.store, "unit", "codex")
+    os.makedirs(unit_store, exist_ok=True)
+    ranked = []
+    for aid, used in (("acct-dead", None), ("acct-full", 100), ("acct-good", 10)):
+        path = os.path.join(unit_store, f"{aid}.json")
+        with open(path, "w") as f:
+            json.dump({"tokens": {"account_id": aid}}, f)
+        ranked.append({"slug": aid, "path": path, "expired": False})
+    ranked = sorted(ranked, key=lambda p: mod.rotate_score(p, measure=True))
+    assert [p["slug"] for p in ranked] == ["acct-good", "acct-full", "acct-dead"], \
+        f"ranked {[p['slug'] for p in ranked]} — headroom did not lead"
+    # provenance + dest memory helpers round-trip inside the sandbox
+    mod.stamp_provenance("codex", "unit-test", writer="somewhere", source="fetch")
+    assert mod.get_writer("codex", "unit-test") == "somewhere"
+    mod.remember_ssh_dest("pi@dev")
+    assert mod.ssh_dest_candidates("dev")[0] == "pi@dev", "dest memory did not self-learn"
+
+
+@screen("fleet/doctor offline: self row works; no-provenance and litellm writers report")
+def s_fleet_doctor_offline():
+    S.reset()
+    S.write_live(make_record("a@x.io", "acct-a"))
+    S.run("capture")
+    r = S.run("fleet", "--hosts", os.uname().nodename, "--json")
+    assert r.returncode == 0, f"fleet self exit {r.returncode}: {r.stderr}"
+    row = json.loads(r.stdout)["rows"][os.uname().nodename]
+    assert row["live"]["slug"] == "a_x.io", "fleet self row lost the live identity"
+    r = S.run("doctor", "--json")
+    assert r.returncode == 0, f"doctor exit {r.returncode}: {r.stderr}"
+    findings = {f["slug"]: f["state"] for f in json.loads(r.stdout)["findings"]}
+    assert findings.get("a_x.io") == "writer-here", findings
+    # litellm writer → special guidance, no ssh attempted
+    prov = json.load(open(os.path.join(S.store, "codex", ".provenance.json")))
+    prov["a_x.io"]["writer"] = "litellm"
+    with open(os.path.join(S.store, "codex", ".provenance.json"), "w") as f:
+        json.dump(prov, f)
+    r = S.run("doctor", "--json")
+    findings = {f["slug"]: f["state"] for f in json.loads(r.stdout)["findings"]}
+    assert findings.get("a_x.io") == "writer-litellm", findings
+
+
 @screen("usage errors: unknown slug exit 6; capture without live file exit 3")
 def s_usage_errors():
     r = S.run("switch", "nosuch@x.io")
@@ -323,6 +417,9 @@ def main():
     s_import()
     s_claude_swap()
     s_new_verbs_guards()
+    s_provenance()
+    s_unit_rank_and_convert()
+    s_fleet_doctor_offline()
     s_usage_errors()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
