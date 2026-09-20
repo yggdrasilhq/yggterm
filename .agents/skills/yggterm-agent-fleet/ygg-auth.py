@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""ygg-auth — the fleet auth-rotation plane (base tier, like booter/monitor/ygg-ci).
+
+DEFECT THIS EXISTS FOR (owner, 2026-09-20):
+  One subscription per harness strands the fleet: when codex hits its usage
+  limit, every codex row on the host parks until it resets, and the only
+  remedy was a human hand-editing ~/.codex/auth.json. The owner keeps
+  multiple paid subscriptions per harness precisely so the fleet can rotate;
+  the switch just did not exist. Proven prototype: switch-chatgpt.py on the
+  litellm LXC (device-code login + per-account snapshots), productized here
+  for the fleet's own harnesses.
+
+SHAPE:
+  Per harness, ONE live auth file (~/.codex/auth.json for codex) and a local
+  profile store ~/.yggterm/auth/<harness>/<email-slug>.json holding VERBATIM
+  harness auth records. Verbatim, not normalized: restore = byte-faithful
+  swap, so format evolution (codex added auth_mode + last_refresh) cannot
+  corrupt a stored profile.
+
+  capture-on-leave is the rotation invariant: before a switch overwrites the
+  live file it re-snapshots the CURRENT live record into its own profile,
+  because the harness refreshes tokens in place while running. Switching is
+  therefore lossless in both directions.
+
+  Agents rotate themselves: on a usage-limit wall, `ygg-auth.py rotate`
+  moves the harness to the next fresh profile — no human in the loop. login
+  (device-code flow) is the one verb that touches the network and needs the
+  owner's browser.
+
+LAWS THIS TOOL LIVES UNDER:
+  - Harness Isolation Law (SKILL.md §5): private harness stores are private.
+    ygg-auth is the ONE sanctioned writer, whole-file atomic swap only —
+    never edit a harness auth file piecemeal.
+  - Memory-sync law: credentials never travel between machines. The store is
+    per-host, never in ~/.yggterm/memory, never posted, never logged.
+  - Redaction: no verb prints a token value. Only email, plan, account id,
+    expiry. Errors never echo file contents.
+
+VERBS:
+  status  [--harness H] [--json]   live identity + every stored profile
+  list    [--harness H] [--json]   stored profiles only
+  capture [--harness H] [--name S] snapshot the live record into the store
+  switch  <slug> [--harness H] [--json]  capture-on-leave, then atomic swap
+  rotate  [--harness H] [--cooldown-minutes N] [--json]
+                                   switch to the next fresh profile (rate-limit
+                                   verb); the vacated account is put on cooldown
+                                   (default 30 min) so rotation cannot cycle
+                                   straight back into a quota-locked profile
+  login   [--harness H] [--name S] device-code OAuth (codex only; owner completes it)
+  import  <file> [--harness H] [--name S]
+                                   convert a foreign auth record (the litellm
+                                   prototype's flat {access_token, refresh_token,
+                                   id_token, expires_at, account_id}) into this
+                                   harness's shape and store it — seeds profiles
+                                   without a browser login
+  harnesses                        the registry: what each harness supports
+
+Applies to NEW harness invocations: a running codex/claude session keeps the
+tokens it loaded at start and refreshes within its account.
+
+CODEX_HOME / CLAUDE_CONFIG_DIR are honored, so `codex-litellm`
+(~/.codex-litellm) can carry its own rotation set: CODEX_HOME=~/.codex-litellm
+ygg-auth.py rotate.
+
+Exit codes: 0 ok · 2 nothing to rotate to · 3 live auth file missing ·
+4 login not supported for the harness · 5 auth/network protocol failure ·
+6 bad usage (unknown harness/slug).
+"""
+import argparse
+import base64
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+STORE_ROOT = os.environ.get("YGG_AUTH_HOME") or os.path.expanduser("~/.yggterm/auth")
+LOCK_FILE = os.path.join(STORE_ROOT, ".lock")
+DEFAULT_COOLDOWN_MINUTES = 30
+
+CHATGPT_AUTH_BASE = "https://auth.openai.com"
+CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_USER_AGENT = "codex_cli_rs/0.0.0"
+DEVICE_CODE_TIMEOUT_SECONDS = 900
+POLL_INTERVAL_SECONDS = 5
+
+
+def harness_auth_file(harness):
+    """The harness's live auth file, honoring the CLIs' own relocation env vars."""
+    home = os.environ.get("CODEX_HOME") if harness == "codex" else None
+    if harness == "codex":
+        return os.path.join(home or os.path.expanduser("~/.codex"), "auth.json")
+    if harness == "claude":
+        home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+        return os.path.join(home, ".credentials.json")
+    raise KeyError(harness)
+
+
+HARNESSES = {
+    "codex": {
+        "auth_file": harness_auth_file,
+        "login": "device-code (auth.openai.com; the owner completes the browser step)",
+        "live_note": "running codex sessions keep the tokens they loaded at start",
+    },
+    "claude": {
+        "auth_file": harness_auth_file,
+        "login": None,
+        "live_note": "swap supported; login flow not implemented (add when the need lands)",
+    },
+}
+
+
+class AuthError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def require_harness(harness):
+    if harness not in HARNESSES:
+        raise AuthError(6, f"unknown harness {harness!r}; known: {', '.join(sorted(HARNESSES))}")
+    return harness
+
+
+def store_dir(harness):
+    return os.path.join(STORE_ROOT, harness)
+
+
+def decode_jwt_claims(token):
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def identity_of(record):
+    """Claims only — this dict is what every verb is allowed to print."""
+    tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
+    id_token = tokens.get("id_token") or ""
+    access_token = tokens.get("access_token") or ""
+    id_claims = decode_jwt_claims(id_token) if id_token else {}
+    access_claims = decode_jwt_claims(access_token) if access_token else {}
+    auth_claim = (id_claims.get("https://api.openai.com/auth")
+                  or access_claims.get("https://api.openai.com/auth") or {})
+    profile_claim = access_claims.get("https://api.openai.com/profile") or {}
+    email = id_claims.get("email") or profile_claim.get("email")
+    account_id = tokens.get("account_id") or auth_claim.get("chatgpt_account_id")
+    expires_at = record.get("expires_at") or access_claims.get("exp") or 0
+    try:
+        expired = bool(expires_at) and time.time() > float(expires_at)
+    except (TypeError, ValueError):
+        expired = False
+    plan = auth_claim.get("chatgpt_plan_type")
+    if not plan and not access_token and record.get("OPENAI_API_KEY"):
+        plan = "api-key"
+    return {
+        "slug": slug_for(email) if email else None,
+        "email": email or "unknown",
+        "plan": plan or "unknown",
+        "account_id": account_id or "none",
+        "expires_at": expires_at,
+        "expired": expired,
+    }
+
+
+def slug_for(email):
+    return re.sub(r"[^a-zA-Z0-9_\-.]", "_", email).lower()
+
+
+# Cooldown state is OPERATIONAL, not identity — the one thing that cannot be
+# derived from the stored record (consult 2026-09-20: blind round-robin cycles
+# straight back into a quota-locked account). Sidecar file, never credentials.
+def cooldown_path(harness):
+    return os.path.join(store_dir(harness), ".cooldown.json")
+
+
+def load_cooldowns(harness):
+    try:
+        return read_json(cooldown_path(harness))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cooldowns(harness, data):
+    atomic_write_json(cooldown_path(harness), data)
+
+
+def mark_cooldown(harness, slug, minutes):
+    if minutes <= 0:
+        return None
+    until = time.time() + minutes * 60
+    data = load_cooldowns(harness)
+    data[slug] = until
+    save_cooldowns(harness, data)
+    return until
+
+
+def cooling_until(harness, slug):
+    until = load_cooldowns(harness).get(slug)
+    return float(until) if until and float(until) > time.time() else None
+
+
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def atomic_write_json(path, record, mode=0o600):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-auth-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.chmod(directory, 0o700)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+class fleet_lock:
+    """Exclusive fleet-wide lock over every mutating verb; readers need none."""
+
+    def __init__(self):
+        self.fd = None
+
+    def __enter__(self):
+        os.makedirs(STORE_ROOT, exist_ok=True)
+        self.fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+        return False
+
+
+def live_record(harness, required=False):
+    path = HARNESSES[harness]["auth_file"](harness)
+    if not os.path.exists(path):
+        if required:
+            raise AuthError(3, f"no live auth file at {path} — run `login` first")
+        return None
+    try:
+        return read_json(path)
+    except (OSError, ValueError) as exc:
+        raise AuthError(3, f"live auth file at {path} is unreadable ({type(exc).__name__}); refusing to touch it")
+
+
+def capture(harness, name=None, lock_held=False):
+    """Snapshot the live record verbatim into the store. Returns (slug, path)."""
+    record = live_record(harness, required=True)
+    ident = identity_of(record)
+    if not ident["slug"] and not name:
+        raise AuthError(3, "live record carries no usable identity; pass --name to store it anyway")
+    slug = name or ident["slug"]
+    path = os.path.join(store_dir(harness), f"{slug}.json")
+    if not lock_held:
+        with fleet_lock():
+            return _capture_locked(harness, record, slug, path, ident)
+    return _capture_locked(harness, record, slug, path, ident)
+
+
+def _capture_locked(harness, record, slug, path, ident):
+    atomic_write_json(path, record)
+    return {**ident, "slug": slug, "path": path}
+
+
+def stored_profiles(harness):
+    directory = store_dir(harness)
+    if not os.path.isdir(directory):
+        return []
+    profiles = []
+    for fname in sorted(os.listdir(directory)):
+        if not (fname.startswith("auth_") or fname.endswith(".json")) or fname.startswith("."):
+            continue
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(directory, fname)
+        try:
+            record = read_json(path)
+        except (OSError, ValueError):
+            continue
+        ident = identity_of(record)
+        ident.update({"path": path, "filename": fname})
+        profiles.append(ident)
+    return profiles
+
+
+def _live_fingerprint(path):
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_size)
+
+
+def switch(harness, slug, lock_held=False):
+    """capture-on-leave, then byte-faithful atomic swap to the named profile.
+
+    The live file is re-read if the harness rewrote it mid-swap: OAuth refresh
+    rotates refresh tokens, so capturing a stale record would store (and later
+    restore) a revoked token — consult 2026-09-20. The replace happens only
+    when the file is fingerprint-unchanged from the read; three attempts, then
+    fail loudly rather than swap silently stale.
+    """
+    slug = slug_for(slug)  # accept the raw email; store/lookup use one normalization
+    target = os.path.join(store_dir(harness), f"{slug}.json")
+    if not os.path.exists(target):
+        known = ", ".join(p["slug"] or "?" for p in stored_profiles(harness)) or "(none stored)"
+        raise AuthError(6, f"no stored profile {slug!r} for {harness}; stored: {known}")
+    live_path = HARNESSES[harness]["auth_file"](harness)
+    target_record = read_json(target)
+
+    captured = None
+    if os.path.exists(live_path):
+        swapped = False
+        for _ in range(3):
+            before = _live_fingerprint(live_path)
+            current = live_record(harness, required=True)
+            current_ident = identity_of(current)
+            if current_ident["slug"] and current_ident["slug"] != slug:
+                captured = _capture_locked(harness, current, current_ident["slug"],
+                                           os.path.join(store_dir(harness), f"{current_ident['slug']}.json"),
+                                           current_ident)
+            if _live_fingerprint(live_path) != before:
+                continue  # the harness rewrote mid-read; its tokens would be lost — redo
+            atomic_write_json(live_path, target_record)
+            swapped = True
+            break
+        if not swapped:
+            raise AuthError(5, f"the live auth file kept changing during capture ({live_path}); not switching")
+    else:
+        atomic_write_json(live_path, target_record)
+
+    swapped = identity_of(live_record(harness, required=True))
+    if swapped["slug"] and swapped["slug"] != slug:
+        raise AuthError(5, f"post-switch verification failed: live file reports {swapped['slug']!r}")
+    return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured}
+
+
+def pick_rotate_target(harness):
+    """Next profile that is neither live, expired, nor cooling (consult 2026-09-20)."""
+    profiles = stored_profiles(harness)
+    if not profiles:
+        raise AuthError(2, f"no stored profiles for {harness} — nothing to rotate to; run `capture` or `login`")
+    current = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
+    current_slug = current["slug"] if current else None
+    others = [p for p in profiles if p["slug"] and p["slug"] != current_slug]
+    if not others:
+        raise AuthError(2, f"the only profile is the live one ({current_slug}); capture or login another account first")
+
+    def cooldown_left(p):
+        until = cooling_until(harness, p["slug"])
+        return (until - time.time()) if until else 0.0
+
+    def warn(message):
+        print(f"⚠️  {message}", file=sys.stderr)
+
+    fresh = [p for p in others if not p["expired"] and cooldown_left(p) <= 0]
+    if fresh:
+        return min(fresh, key=lambda p: p["slug"]), True
+    if all(cooldown_left(p) > 0 for p in others) and all(not p["expired"] for p in others):
+        warn("every other profile is rate-limit cooling; rotating to the one closest to its cooldown end")
+    elif not any(not p["expired"] for p in others):
+        warn("every other profile is expired; rotating to the least-stale one anyway")
+    else:
+        warn("no fully fresh profile; rotating to the best available")
+    pool = [p for p in others if not p["expired"]] or others
+    return min(pool, key=lambda p: (cooldown_left(p), p["slug"])), False
+
+
+def cmd_status(args):
+    harness = require_harness(args.harness)
+    ident = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
+    profiles = stored_profiles(harness)
+    for p in profiles:
+        p["live"] = bool(ident and p["slug"] and p["slug"] == ident["slug"])
+        cooling = cooling_until(harness, p["slug"]) if p["slug"] else None
+        p["cooling_until"] = cooling
+        p["cooldown_minutes_left"] = round((cooling - time.time()) / 60) if cooling else 0
+    out = {
+        "harness": harness,
+        "auth_file": HARNESSES[harness]["auth_file"](harness),
+        "live": ident,
+        "profiles": [{k: v for k, v in p.items() if k != "path"} for p in profiles],
+    }
+    return out
+
+
+def cmd_list(args):
+    out = cmd_status(args)
+    return {"harness": out["harness"], "profiles": out["profiles"]}
+
+
+def cmd_capture(args):
+    harness = require_harness(args.harness)
+    with fleet_lock():
+        got = capture(harness, name=args.name, lock_held=True)
+    return {"captured": got["slug"], "path": got["path"], "email": got["email"], "plan": got["plan"]}
+
+
+def cmd_switch(args):
+    harness = require_harness(args.harness)
+    if not args.slug:
+        raise AuthError(6, "switch needs a profile slug (see `list`)")
+    with fleet_lock():
+        result = switch(harness, args.slug, lock_held=True)
+    return result
+
+
+def cmd_rotate(args):
+    harness = require_harness(args.harness)
+    with fleet_lock():
+        target, _ = pick_rotate_target(harness)
+        vacated = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
+        result = switch(harness, target["slug"], lock_held=True)
+        cooldown = None
+        if (vacated and vacated["slug"] and vacated["slug"] != target["slug"]
+                and args.cooldown_minutes > 0):
+            cooldown = {"slug": vacated["slug"],
+                        "until": mark_cooldown(harness, vacated["slug"], args.cooldown_minutes)}
+    result["vacated_to_cooldown"] = cooldown
+    return result
+
+
+def cmd_harnesses(args):
+    out = {}
+    for name, spec in sorted(HARNESSES.items()):
+        out[name] = {
+            "auth_file": spec["auth_file"](name),
+            "login": spec["login"],
+            "live_note": spec["live_note"],
+        }
+    return {"harnesses": out, "store": STORE_ROOT}
+
+
+def now_rfc3339_nanos():
+    dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".%09dZ" % (dt.microsecond * 1000)
+
+
+def device_login(harness, name=None):
+    """Ported from the proven litellm prototype: codex device-code OAuth."""
+    if HARNESSES[harness]["login"] is None:
+        raise AuthError(4, f"login is not implemented for {harness}: {HARNESSES[harness]['live_note']}")
+
+    def post_json(url, payload, as_form=False):
+        if as_form:
+            data = urllib.parse.urlencode(payload).encode()
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        else:
+            data = json.dumps(payload).encode()
+            headers = {"Content-Type": "application/json"}
+        headers["User-Agent"] = CODEX_USER_AGENT
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        code = post_json(f"{CHATGPT_AUTH_BASE}/api/accounts/deviceauth/usercode",
+                         {"client_id": CHATGPT_CLIENT_ID})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise AuthError(5, f"device-code request failed: {exc}")
+    device_auth_id = code.get("device_auth_id")
+    user_code = code.get("user_code") or code.get("usercode")
+    interval = int(code.get("interval", POLL_INTERVAL_SECONDS))
+    if not device_auth_id or not user_code:
+        raise AuthError(5, "device-code response missing device_auth_id/user_code")
+
+    print(f"  1) open  {CHATGPT_AUTH_BASE}/codex/device  in a browser")
+    print(f"  2) enter the code:  {user_code}")
+    print(f"  polling every {interval}s (timeout {DEVICE_CODE_TIMEOUT_SECONDS // 60} min)…", file=sys.stderr)
+
+    deadline = time.time() + DEVICE_CODE_TIMEOUT_SECONDS
+    auth_code_data = None
+    while time.time() < deadline:
+        try:
+            got = post_json(f"{CHATGPT_AUTH_BASE}/api/accounts/deviceauth/token",
+                            {"device_auth_id": device_auth_id, "user_code": user_code})
+            if all(k in got for k in ("authorization_code", "code_challenge", "code_verifier")):
+                auth_code_data = got
+                break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (403, 404):
+                raise AuthError(5, f"device poll failed: HTTP {exc.code}")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise AuthError(5, f"device poll failed: {exc}")
+        sys.stderr.write(".")
+        sys.stderr.flush()
+        time.sleep(interval)
+    if auth_code_data is None:
+        raise AuthError(5, "timed out waiting for browser authorization")
+
+    try:
+        tokens = post_json(
+            f"{CHATGPT_AUTH_BASE}/oauth/token",
+            {"grant_type": "authorization_code", "code": auth_code_data["authorization_code"],
+             "redirect_uri": f"{CHATGPT_AUTH_BASE}/deviceauth/callback",
+             "client_id": CHATGPT_CLIENT_ID, "code_verifier": auth_code_data["code_verifier"]},
+            as_form=True)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise AuthError(5, f"token exchange failed: {exc}")
+    if not all(k in tokens for k in ("access_token", "refresh_token", "id_token")):
+        raise AuthError(5, "token exchange response missing required fields")
+
+    record = {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": tokens["id_token"],
+            "access_token": tokens["access_token"],
+            "refresh_token": tokens["refresh_token"],
+            "account_id": tokens.get("account_id") or identity_of(tokens).get("account_id") or "none",
+        },
+        "last_refresh": now_rfc3339_nanos(),
+    }
+    ident = identity_of(record)
+    slug = name or ident["slug"] or "unnamed-account"
+
+    with fleet_lock():
+        live_path = HARNESSES[harness]["auth_file"](harness)
+        captured = None
+        if os.path.exists(live_path):
+            current = live_record(harness, required=True)
+            current_ident = identity_of(current)
+            if current_ident["slug"] and current_ident["slug"] != slug:
+                captured = _capture_locked(harness, current, current_ident["slug"],
+                                           os.path.join(store_dir(harness), f"{current_ident['slug']}.json"),
+                                           current_ident)
+        atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
+        atomic_write_json(live_path, record)
+    return {"logged_in": slug, "identity": ident, "captured_before_leaving": captured}
+
+
+def cmd_login(args):
+    return device_login(require_harness(args.harness), name=args.name)
+
+
+def import_foreign(path, harness, name=None):
+    """Convert a flat litellm-prototype record into the harness's own shape.
+
+    The prototype on the litellm LXC stores {access_token, refresh_token,
+    id_token, expires_at, account_id}; codex wants auth_mode + tokens.{...} +
+    last_refresh. The OAuth grants are the same — conversion re-wraps them,
+    it does not mint anything.
+    """
+    require_harness(harness)
+    try:
+        flat = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise AuthError(6, f"cannot read {path}: {type(exc).__name__}")
+    if not isinstance(flat, dict) or not all(k in flat for k in ("access_token", "refresh_token", "id_token")):
+        raise AuthError(6, "not a flat litellm auth record (need access_token, refresh_token, id_token)")
+    if "tokens" in flat:
+        raise AuthError(6, "record already carries a tokens block — import the flat prototype format, or use `capture`")
+    record = {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": flat["id_token"],
+            "access_token": flat["access_token"],
+            "refresh_token": flat["refresh_token"],
+            "account_id": flat.get("account_id") or identity_of(flat).get("account_id") or "none",
+        },
+        "last_refresh": now_rfc3339_nanos(),
+    }
+    ident = identity_of(record)
+    slug = slug_for(name) if name else ident["slug"]
+    if not slug:
+        raise AuthError(6, "record carries no usable identity; pass --name to store it anyway")
+    with fleet_lock():
+        atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
+    return {"imported": slug, "identity": {k: v for k, v in ident.items() if k != "slug"}}
+
+
+def cmd_import(args):
+    if not args.file:
+        raise AuthError(6, "import needs the path to the foreign auth record")
+    return import_foreign(args.file, require_harness(args.harness), name=args.name)
+
+
+def render_table(status):
+    lines = []
+    live = status["live"]
+    if live:
+        state = "EXPIRED" if live["expired"] else "active"
+        lines.append(f"live: {live['email']} ({live['plan']}) account {live['account_id']} — {state}")
+    else:
+        lines.append("live: (no auth file — run `login` or `switch`)")
+    if status["profiles"]:
+        lines.append("profiles:")
+        for p in status["profiles"]:
+            marks = []
+            if p["live"]:
+                marks.append("←live")
+            elif p.get("cooldown_minutes_left"):
+                marks.append(f"cooling {p['cooldown_minutes_left']}m")
+            if p["expired"]:
+                marks.append("EXPIRED")
+            suffix = ("  " + " ".join(marks)) if marks else ""
+            lines.append(f"  {p['slug']:<40} {p['plan']:<10}{suffix}")
+    else:
+        lines.append("profiles: (none stored — `capture` the current account or `login` a new one)")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ygg-auth.py",
+        description="Fleet auth-rotation plane: fast multi-account switching for harness CLIs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Credentials never leave the host. Output never prints tokens.")
+    parser.add_argument("--harness", default="codex", help="target harness (default codex)")
+    # Subparsers re-declare --harness with a SUPPRESS default so it may sit on
+    # either side of the verb (`--harness claude capture` AND `capture --harness
+    # claude`) without the sub-default clobbering the top-level value.
+    sub_parent = argparse.ArgumentParser(add_help=False)
+    sub_parent.add_argument("--harness", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    p = sub.add_parser("status", parents=[sub_parent], help="live identity + stored profiles")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list", parents=[sub_parent], help="stored profiles")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("capture", parents=[sub_parent], help="snapshot the live record into the store")
+    p.add_argument("--name", help="override the profile slug")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("switch", parents=[sub_parent], help="switch to a stored profile (capture-on-leave)")
+    p.add_argument("slug", nargs="?", help="profile slug or account email from `list`")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_switch)
+
+    p = sub.add_parser("rotate", parents=[sub_parent], help="switch to the next fresh profile — the rate-limit verb")
+    p.add_argument("--cooldown-minutes", type=int, default=DEFAULT_COOLDOWN_MINUTES,
+                   help=f"put the vacated account on cooldown (default {DEFAULT_COOLDOWN_MINUTES}; 0 disables)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_rotate)
+
+    p = sub.add_parser("login", parents=[sub_parent], help="device-code OAuth into a NEW account (codex)")
+    p.add_argument("--name", help="override the profile slug")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("import", parents=[sub_parent], help="convert a flat litellm-prototype record and store it")
+    p.add_argument("file", nargs="?", help="path to the foreign auth record")
+    p.add_argument("--name", help="override the profile slug")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("harnesses", parents=[sub_parent], help="registry: what each harness supports")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_harnesses)
+
+    args = parser.parse_args(argv)
+    os.umask(0o077)  # consult 2026-09-20: nothing this tool writes is ever group/other-readable
+    args.json = getattr(args, "json", False)
+    try:
+        out = args.func(args)
+    except AuthError as exc:
+        print(f"⛔ {exc}", file=sys.stderr)
+        return exc.code
+    if args.json:
+        print(json.dumps(out, indent=2))
+    else:
+        if args.verb == "status":
+            print(render_table(out))
+        elif args.verb == "switch":
+            idt = out["identity"]
+            print(f"✅ switched to {idt['email']} ({idt['plan']})")
+            if out.get("captured_before_leaving"):
+                print(f"   previous account captured: {out['captured_before_leaving']['slug']}")
+        elif args.verb == "rotate":
+            idt = out["identity"]
+            print(f"🔄 rotated to {idt['email']} ({idt['plan']})")
+            if out.get("captured_before_leaving"):
+                print(f"   previous account captured: {out['captured_before_leaving']['slug']}")
+            vac = out.get("vacated_to_cooldown")
+            if vac:
+                mins = max(1, round((vac["until"] - time.time()) / 60))
+                print(f"   {vac['slug']} cooling for ~{mins}m (skip on next rotates)")
+        elif args.verb == "capture":
+            print(f"💾 captured {out['captured']} → {out['path']}")
+        elif args.verb == "login":
+            idt = out["identity"]
+            print(f"🎉 logged in as {idt['email']} ({idt['plan']}); profile {out['logged_in']} stored + live")
+        elif args.verb == "import":
+            idt = out["identity"]
+            print(f"📥 imported {idt['email']} ({idt['plan']}) as {out['imported']} — stored, not live (use `switch`)")
+        else:
+            print(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
