@@ -930,7 +930,8 @@ def main(argv=None):
                 u = acct["usage"]
                 name = acct["slug"] + (" ←live" if acct["live"] else "")
                 if not u.get("ok"):
-                    print(f"  {name:<44} ⛔ {u.get('error', 'unknown error')[:70]}")
+                    oneline = " ".join(u.get("error", "unknown error").split())
+                    print(f"  {name:<44} ⛔ {oneline[:90]}")
                     continue
                 pri, sec = u["primary"], u["secondary"]
                 def w(x):

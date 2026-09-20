@@ -1381,6 +1381,9 @@ piecemeal edit of harness state. Everything else in that law stands.
   `ygg-auth.py fetch <ssh-alias> <email> --activate` copies the record from
   the source host's store and switches to it (hosts without a yggterm checkout
   run the script standalone — stdlib only). Records are pulled, never pushed.
+  ⛔ `<ssh-dest>` must land on the ACCOUNT that owns the store, user included —
+  measured 2026-09-20: plain `dev` from oc resolves to root@dev (/root) and
+  finds nothing; write `pi@dev`.
 - ⛔ **Single-writer law for replicated profiles.** OAuth refresh ROTATES the
   refresh token: refresh on the host where the profile is LIVE only, never on
   two hosts against the same stored copy — the second refresh uses a revoked
