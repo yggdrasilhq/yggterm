@@ -31809,6 +31809,42 @@ The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local
 
 ⚠ CORRECTION (2026-09-19 later, the [11.148] seat's ride-along; claim ACK-9ad617aa6d lineage): "never persisted on 2.0.x" is FALSIFIED as a blanket claim. A directly-launched (node-pty, scratch HOME, scratch-local managed port) opencode 2.0.9 TUI persists `latest/tui/tabs.json` CONTINUOUSLY — writes observed every ~0.5 s poll from 2.6 s after launch, BEFORE any turn, the file naming the birth session under its cwd; the writes survive SIGKILL (no graceful exit involved; `killChild` is SIGKILL in the battery drive, so the 09-15/09-19 suite homes were written the same way). The mystery therefore SHARPENS instead of dying: the [11.134] proof's WRAPPER row (real home, same day, real turn at 12:43) wrote `prompt-history.jsonl` + `service.json` but NEVER the tab map — the suppressed variable is the daemon wrapper context, prime suspect being that the wrapper TUI joins the PRODUCTION service as a second client (real-home `locks/` mutated 12:40) while every positive measurement ran against an isolated scratch service. The repair decision stays the owner's call, but the surface is ALIVE in the plain flow: verify-bind from the tab map is viable wherever rows run outside the wrapper context, and the wrapper-context suppression is itself a measurable defect candidate.
 
+## ⛔ [11.159] ENSURE-CARRYING CLIENT VERBS DECLARE A SERVING SAME-VERSION DAEMON UNREACHABLE WHILE THE CANONICAL BINARY LAGS OR LEADS THE RUNNING DAEMON'S BUILD (filed 2026-09-20, the [11.158] seat's drive; deploy-skew class, [11.146] family)
+
+**Status:** OPEN
+
+Measured on the muse lab host, one sitting, fully traced. The serving
+daemon (pid 3341220, build d63e578e90e1) answers rows live/show, status,
+working_flags, app-control, and the census — but every verb that runs
+`ensure_daemon_running` first (`server connect`, `server terminal
+restart`, `server ping`) answers `local yggterm daemon did not become
+reachable`. The daemon_recovery trace shows why: `current_exe` resolves
+to the CANONICAL install (`~/.yggterm/bin/`, build 9e15bf89ddfe — a later
+ygg-ci aggregate) whose build differs from the serving daemon's; the
+reachability verdict fails anyway (version is EQUAL on both sides, so the
+serve predicate's version compare cannot be what fails — the predicate or
+its inputs need the owner's eye); the ensure then demand-starts the
+canonical binary, whose `server daemon` exits 0 in ~150-250 ms because
+the bind lock is held by the serving daemon, and after 4 retries the verb
+errors. Four spawn/exit pairs per verb attempt, traced
+(`spawned_daemon_child`/`spawned_daemon_exit code=0`, 1789863897589
+onward). SIDE EFFECT measured: one demand-start storm stood up a SECOND
+full daemon (pid 3396192, build 9e15bf89ddfe) that bound no socket,
+restored all rows into its memory with the preserved-owner reconcile
+deferred, and ticked beside the serving daemon until retired by hand
+(zero owned rows, measured). Working recipe meanwhile: invoke the binary
+that matches the serving daemon's build directly
+(`~/.local/share/yggterm/direct/builds/<build>/yggterm-headless ...`) —
+and note even that path demand-starts the CANONICAL binary when its own
+reachability check fails, so `current_spawn_executable` resolving the
+canonical install instead of the invoked binary is part of this defect.
+Fix shape (owner's call): the ensure must accept a serving daemon whose
+build differs from the canonical install when the version is equal (the
+[11.146] build-identity comparator applied client-side), and/or
+`current_spawn_executable` must resolve the invoked binary; the deploy
+skew itself (the daemon did not rotate onto the 05:37 aggregate) is the
+[11.146]-class trigger.
+
 ## ⛔ [11.158] A START-BORN REMOTE ROW EXCLUDED FROM THE PEER-CLOSE GATE KEEPS ITS [11.153] PRESERVE STATE FOREVER — THE GUARD IS DELIBERATE, BUT THE CLASS IT EXCLUDES STILL ENDS IN A PERMANENT GHOST (filed 2026-09-20, the [11.155] close)
 
 **Status:** OPEN
@@ -31843,5 +31879,18 @@ gate-order lock extended (the inconclusive-fallthrough law now scopes to
 transport inconclusives; the start-born re-exam still closes through the
 same named-trace-then-one-close order) + the compound-verdict table test.
 Suite delta vs clean main: +1 green, failure set byte-identical (the
-owner-gated stamp red). Live proof = the filed falsifier, owed on the
-rotated build.
+owner-gated stamp red). Live proof state (2026-09-20, the filing seat's drive, the muse lab
+host): the fix is DEPLOYED (main d63e578e90e1, both daemons of the fleet
+rotated) and the funnel routing is LIVE-MEASURED — every ensure of a
+start-born row now traces `remote_saved_session_peer_close_probe_inconclusive`
+naming the start-born refusal and routes into the compound arm; the Disarm
+cost model held (a healthy start-born row pays no alive ask). MEASURED
+CAVEAT AMENDED: the start-born metadata label does NOT survive a
+persist/restore round-trip (a crafted server-state row and the competitor
+daemon's boot restore both lost it — restored rows re-enter the store ask,
+which closes them honestly; measured). The ghost class therefore exists
+only within the birth daemon's lifetime. END-TO-END CLOSE CHAIN (fresh
+memo + two spaced alive nos -> PeerSessionGone) OWED: the memo-arming
+resize rides the spawn-carrying funnel, and on the muse lab host every
+spawn-carrying verb is blocked by [11.159] (filed this sitting). Proof
+resumes when [11.159] lands.
