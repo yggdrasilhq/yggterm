@@ -30782,7 +30782,7 @@ LIVE-MEASURED 2026-09-20 on the deployed build (the muse lab host, probe rows ag
 
 ## ⛔ [11.161] THE PEER'S RESIZE HANDLER ANSWERED A RUNTIME-KEY ASK ABOUT THE WRONG KEY, AND THE ASKER READ THAT AS PEER TRUTH — A SELF-PERPETUATING `peer session gone` STAMP ON A LIVE SESSION (owner-reported 2026-09-20 21:03 IST "codex session wedged, restart didn't help"; diagnosis ACK-e845da5926, fix claim ACK-38518fc7f9)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The dev·remote codex row `remote-session://dev/47a239b0-c7cf-4091-af4e-76bc7b0dc148`
 (codex session `01a0bf3b-a7e7-7673-a74c-3347f7c4971c`) froze for the owner;
@@ -30836,3 +30836,8 @@ the ASKED key, the asker must trace
 `remote_pty_resize_key_space_mismatch`, and neither the [11.153] memo nor
 the launch-failed stamp may arm; the row's next mount attempt must proceed
 to the resume attempt instead of refusing.
+
+FIXED IN CODE 2026-09-21 (the muse lab host seat, work FROM dev; lane lane/integration/11161-peerkey f3f68a03 -> main a519bab9bf78, ygg-ci DEPLOYED fleet-wide 01:45): (1) THE PEER — the fold answers a runtime-lane ask in the ASKED key space when nothing is servable: new registry-derived predicate `key_phrases_a_runtime_lane` (pure RuntimeKey schemes; `local://` is RowAndRuntimeKey and deliberately out — row-path asks keep the fold-to-the-live-spelling behavior), source-scan lock `a_runtime_lane_ask_is_answered_in_the_asked_key_space_when_nothing_is_servable`; (2) THE ASKER — the resize worker routes every error through `classify_remote_resize_not_found`: a refusal naming a DIFFERENT key than the ask carried is `KeySpaceMismatch` — named trace `remote_pty_resize_key_space_mismatch`, NO retry, NO [11.153] memo, NO launch-failed stamp, and the loop drains (continue, never break — the in-flight marker releases); honest not-founds keep today's retry/unownable semantics; verbatim production error strings (both measured spellings) are pinned as unit law in `a_refused_key_that_differs_from_the_asked_key_is_never_peer_gone_evidence`; (3) the [11.153]-era verdict lock re-spelled onto the classifier without losing its intent. Suite 1554/1 vs clean main, failure set byte-identical (the owner-gated stamp red; two unrelated parallel-load flakes passed in isolation and on the re-run).
+
+MEASURED 2026-09-21 on the deployed build (scratch homes on the dev host): the fold fallback answers runtime-lane asks in the asked key space when nothing is servable; births and restart-restores keep today's codex rows under their runtime-lane key (measured: birth AND restore both `codex-runtime://<uuid>`), so the fold-rewrite precondition — a codex row stored under a `local://` spelling, which the production wedge row HAD — is a legacy-map shape current code no longer births. HONEST LEDGER: the before-side stands on production telemetry (stronger than any synthetic rig); the delta-exercising geometry could not be re-birthed headlessly; the mismatch arm against an OLD peer is structurally extinct once both peers run the fix — both are unit-pinned instead. REMAINING FALSIFIER for the next remote seat: (a) any natural production observation of `remote_pty_resize_key_space_mismatch` (the class is now NAMED and greppable — its absence over time is also evidence); (b) a probe row born through the resume-codex arm against a host carrying a legacy `local://`-spelled codex map entry must mount with zero `remote_saved_session_launch_refused_peer_missing` events.
+
