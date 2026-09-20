@@ -59,9 +59,9 @@ VERBS:
                                    pulled, never pushed) and optionally activate it
   usage   [--harness H] [--slug S] [--json]
                                    measured rate-limit state per profile from
-                                   chatgpt.com/backend-api/codex/usage — primary
-                                   (5h) and secondary (7d) used_percent + resets;
-                                   read-only, never refreshes
+                                   chatgpt.com/backend-api/codex/usage — per-plan
+                                   windows (5h/7d on plus, longer on free) with
+                                   used_percent and resets; read-only, never refreshes
   refresh [<slug>] [--harness H]   renew tokens via the OAuth refresh grant and
                                    persist atomically (default: the live profile).
                                    ⛔ single-writer: a profile replicated across
@@ -937,9 +937,10 @@ def main(argv=None):
                 def w(x):
                     if not x:
                         return "—"
-                    return f"{x['used_percent']}% used, resets in ~{x['reset_in_minutes']}m"
+                    length = f"{x['window_minutes']}m-window"
+                    return f"{length}: {x['used_percent']}% used, resets ~{x['reset_in_minutes']}m"
                 flag = "⛔ LIMIT" if u["limit_reached"] else "ok"
-                print(f"  {name:<44} {u['plan_type']:<6} {flag:<8} 5h: {w(pri)} | 7d: {w(sec)}")
+                print(f"  {name:<44} {u['plan_type']:<6} {flag:<8} {w(pri)} | {w(sec)}")
         elif args.verb == "refresh":
             print(f"🔄 refreshed {out['refreshed']}; persisted to {out['persisted']}")
         else:
