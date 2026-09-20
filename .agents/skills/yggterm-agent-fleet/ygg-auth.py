@@ -53,6 +53,21 @@ VERBS:
                                    id_token, expires_at, account_id}) into this
                                    harness's shape and store it — seeds profiles
                                    without a browser login
+  fetch   <host> <slug> [--harness H] [--activate]
+                                   copy a profile from another fleet host's store
+                                   over ssh (owner-authorized use; the record is
+                                   pulled, never pushed) and optionally activate it
+  usage   [--harness H] [--slug S] [--json]
+                                   measured rate-limit state per profile from
+                                   chatgpt.com/backend-api/codex/usage — primary
+                                   (5h) and secondary (7d) used_percent + resets;
+                                   read-only, never refreshes
+  refresh [<slug>] [--harness H]   renew tokens via the OAuth refresh grant and
+                                   persist atomically (default: the live profile).
+                                   ⛔ single-writer: a profile replicated across
+                                   hosts must be refreshed only on the host where
+                                   it is LIVE — refresh rotates the refresh token
+                                   and orphans every other host's copy (re-fetch)
   harnesses                        the registry: what each harness supports
 
 Applies to NEW harness invocations: a running codex/claude session keeps the
@@ -73,6 +88,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -88,6 +104,10 @@ DEFAULT_COOLDOWN_MINUTES = 30
 CHATGPT_AUTH_BASE = "https://auth.openai.com"
 CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USER_AGENT = "codex_cli_rs/0.0.0"
+# Measured live 2026-09-20 (dev, real token): bearer + ChatGPT-Account-Id →
+# {email, plan_type, rate_limit:{allowed, limit_reached, primary_window{used_percent,
+# limit_window_seconds, reset_after_seconds, reset_at}, secondary_window{...}}}.
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
 DEVICE_CODE_TIMEOUT_SECONDS = 900
 POLL_INTERVAL_SECONDS = 5
 
@@ -602,6 +622,173 @@ def cmd_import(args):
     return import_foreign(args.file, require_harness(args.harness), name=args.name)
 
 
+def fetch_remote(host, harness, slug, activate=False):
+    """Pull one profile from another host's store over ssh and store it here.
+
+    Pull, never push: the remote host is the authority for its own records
+    (owner-authorized cross-host provisioning, 2026-09-20). ssh must work
+    keyless (BatchMode) — the fleet standard.
+    """
+    require_harness(harness)
+    slug = slug_for(slug)
+    remote_path = f"~/.yggterm/auth/{harness}/{slug}.json"
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "cat", remote_path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise AuthError(5, f"ssh {host} timed out reading {remote_path}")
+    if proc.returncode != 0:
+        raise AuthError(5, f"ssh {host} could not read {remote_path}: {proc.stderr.strip()[:200]}")
+    try:
+        record = json.loads(proc.stdout)
+    except ValueError:
+        raise AuthError(5, f"{host}:{remote_path} is not valid JSON — refusing to store it")
+    ident = identity_of(record)
+    if ident["slug"] and ident["slug"] != slug:
+        raise AuthError(6, f"record at {host}:{remote_path} identifies as {ident['slug']!r}, not {slug!r}")
+    with fleet_lock():
+        atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
+        if activate:
+            return {**switch(harness, slug, lock_held=True), "fetched_from": host}
+    return {"fetched_from": host, "slug": slug, "identity": {k: v for k, v in ident.items() if k != "slug"},
+            "activated": False}
+
+
+def cmd_fetch(args):
+    if not args.host or not args.slug:
+        raise AuthError(6, "fetch needs <host> <slug>")
+    return fetch_remote(args.host, require_harness(args.harness), args.slug,
+                        activate=bool(args.activate))
+
+
+def usage_snapshot(record):
+    """One measured rate-limit snapshot for a record. Network per call."""
+    tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
+    access = tokens.get("access_token") or ""
+    if not access:
+        return {"ok": False, "error": "no access token in record"}
+    req = urllib.request.Request(CODEX_USAGE_URL, headers={
+        "Authorization": f"Bearer {access}",
+        "ChatGPT-Account-Id": tokens.get("account_id") or "",
+        "User-Agent": CODEX_USER_AGENT,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:150]
+        return {"ok": False, "error": f"HTTP {exc.code}: {detail}"}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    rl = payload.get("rate_limit") or {}
+
+    def window(w):
+        if not isinstance(w, dict):
+            return None
+        return {"used_percent": w.get("used_percent"),
+                "window_minutes": round(w.get("limit_window_seconds", 0) / 60),
+                "reset_at": w.get("reset_at"),
+                "reset_in_minutes": round(w.get("reset_after_seconds", 0) / 60)}
+
+    return {"ok": True,
+            "email": payload.get("email"),
+            "plan_type": payload.get("plan_type"),
+            "limit_reached": bool(rl.get("limit_reached")),
+            "allowed": bool(rl.get("allowed")),
+            "primary": window(rl.get("primary_window")),
+            "secondary": window(rl.get("secondary_window"))}
+
+
+def cmd_usage(args):
+    harness = require_harness(args.harness)
+    profiles = stored_profiles(harness)
+    targets = []
+    if args.slug:
+        slug = slug_for(args.slug)
+        targets = [p for p in profiles if p["slug"] == slug]
+        if not targets:
+            raise AuthError(6, f"no stored profile {slug!r} for {harness}")
+    else:
+        targets = profiles
+    out = []
+    live_path = HARNESSES[harness]["auth_file"](harness)
+    live_ident = identity_of(live_record(harness)) if os.path.exists(live_path) else None
+    for p in targets:
+        record = read_json(p["path"])
+        snap = usage_snapshot(record)
+        out.append({"slug": p["slug"], "live": bool(live_ident and p["slug"] == live_ident["slug"]),
+                    "access_expired": p["expired"], "usage": snap})
+    return {"harness": harness, "accounts": out}
+
+
+def refresh_grant(record):
+    """OAuth refresh grant — the same client_id codex itself uses. ROTATES the
+    refresh token: the caller MUST persist the returned record immediately."""
+    tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise AuthError(6, "record carries no refresh_token — cannot refresh")
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token", "refresh_token": refresh_token,
+        "client_id": CHATGPT_CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(f"{CHATGPT_AUTH_BASE}/oauth/token", data=body, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": CODEX_USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            got = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:150]
+        raise AuthError(5, f"refresh grant rejected: HTTP {exc.code} {detail}")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise AuthError(5, f"refresh grant failed: {exc}")
+    if not got.get("access_token"):
+        raise AuthError(5, "refresh response missing access_token")
+    new = json.loads(json.dumps(record))  # deep copy, verbatim shape preserved
+    container = new["tokens"] if "tokens" in new else new
+    container["access_token"] = got["access_token"]
+    if got.get("refresh_token"):  # rotation: the old one is dead the moment this returns
+        container["refresh_token"] = got["refresh_token"]
+    if got.get("id_token"):
+        container["id_token"] = got["id_token"]
+    if "last_refresh" in new:
+        new["last_refresh"] = now_rfc3339_nanos()
+    return new
+
+
+def cmd_refresh(args):
+    harness = require_harness(args.harness)
+    live_path = HARNESSES[harness]["auth_file"](harness)
+    with fleet_lock():
+        if args.slug:
+            slug = slug_for(args.slug)
+            store_file = os.path.join(store_dir(harness), f"{slug}.json")
+            if not os.path.exists(store_file):
+                raise AuthError(6, f"no stored profile {slug!r} for {harness}")
+            record = read_json(store_file)
+            fresh = refresh_grant(record)
+            atomic_write_json(store_file, fresh)
+            out = {"refreshed": slug, "persisted": "store"}
+            live_ident = identity_of(live_record(harness)) if os.path.exists(live_path) else None
+            if live_ident and live_ident["slug"] == slug:
+                atomic_write_json(live_path, fresh)
+                out["persisted"] = "store+live"
+            return out
+        record = live_record(harness, required=True)
+        fresh = refresh_grant(record)
+        ident = identity_of(fresh)
+        out = {"refreshed": ident["slug"] or "live", "persisted": "live"}
+        atomic_write_json(live_path, fresh)
+        if ident["slug"]:
+            atomic_write_json(os.path.join(store_dir(harness), f"{ident['slug']}.json"), fresh)
+            out["persisted"] = "live+store"
+        return out
+
+
 def render_table(status):
     lines = []
     live = status["live"]
@@ -676,6 +863,23 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_import)
 
+    p = sub.add_parser("fetch", parents=[sub_parent], help="pull a profile from another fleet host's store")
+    p.add_argument("host", nargs="?", help="ssh alias of the remote host")
+    p.add_argument("slug", nargs="?", help="profile slug or account email")
+    p.add_argument("--activate", action="store_true", help="also switch the live account to it")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("usage", parents=[sub_parent], help="measured rate-limit state per profile")
+    p.add_argument("--slug", help="one profile instead of all")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_usage)
+
+    p = sub.add_parser("refresh", parents=[sub_parent], help="renew tokens via the OAuth refresh grant")
+    p.add_argument("slug", nargs="?", help="stored profile (default: the live account)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_refresh)
+
     p = sub.add_parser("harnesses", parents=[sub_parent], help="registry: what each harness supports")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_harnesses)
@@ -715,6 +919,28 @@ def main(argv=None):
         elif args.verb == "import":
             idt = out["identity"]
             print(f"📥 imported {idt['email']} ({idt['plan']}) as {out['imported']} — stored, not live (use `switch`)")
+        elif args.verb == "fetch":
+            if out.get("activated"):
+                idt = out["identity"]
+                print(f"📡 fetched {out['switched_to']} from {out['fetched_from']} and activated: {idt['email']} ({idt['plan']})")
+            else:
+                print(f"📡 fetched {out['slug']} from {out['fetched_from']} — stored, not live (use `switch` or `--activate`)")
+        elif args.verb == "usage":
+            for acct in out["accounts"]:
+                u = acct["usage"]
+                name = acct["slug"] + (" ←live" if acct["live"] else "")
+                if not u.get("ok"):
+                    print(f"  {name:<44} ⛔ {u.get('error', 'unknown error')[:70]}")
+                    continue
+                pri, sec = u["primary"], u["secondary"]
+                def w(x):
+                    if not x:
+                        return "—"
+                    return f"{x['used_percent']}% used, resets in ~{x['reset_in_minutes']}m"
+                flag = "⛔ LIMIT" if u["limit_reached"] else "ok"
+                print(f"  {name:<44} {u['plan_type']:<6} {flag:<8} 5h: {w(pri)} | 7d: {w(sec)}")
+        elif args.verb == "refresh":
+            print(f"🔄 refreshed {out['refreshed']}; persisted to {out['persisted']}")
         else:
             print(json.dumps(out, indent=2))
     return 0
