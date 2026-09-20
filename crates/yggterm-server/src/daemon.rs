@@ -18736,7 +18736,7 @@ impl Drop for DaemonSocketLock {
 }
 
 #[cfg(unix)]
-fn daemon_socket_lock_path(socket_path: &Path) -> PathBuf {
+pub(crate) fn daemon_socket_lock_path(socket_path: &Path) -> PathBuf {
     let file_name = socket_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -18787,7 +18787,7 @@ fn try_acquire_daemon_socket_lock(
 /// [`try_acquire_daemon_socket_lock`] without keeping the claim: a free lock
 /// is unlocked again and the descriptor dropped.
 #[cfg(unix)]
-fn canonical_socket_lock_is_held(lock_path: &Path) -> bool {
+pub(crate) fn canonical_socket_lock_is_held(lock_path: &Path) -> bool {
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
         .write(true)
