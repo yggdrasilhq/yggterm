@@ -2125,6 +2125,56 @@ fn remove_session_should_detach_keep_alive_runtime(keep_alive_runtime: bool) -> 
     false
 }
 
+/// What a remote resize error actually is (the [11.161] classifier).
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteResizeVerdict {
+    /// Not a `terminal session not found` answer at all — the plain failed
+    /// path: no retry, no memo, the failed trace carries the text.
+    Other,
+    /// Still inside the retry budget — the mid-switch law re-queues the grid.
+    Retriable,
+    /// The peer answers, past the retry budget, that the key we ASKED is not
+    /// there — the [11.153] unownable verdict and the only memo evidence.
+    Unownable,
+    /// THE [11.161] class: the refusal names a DIFFERENT key than the ask
+    /// carried. A peer-side fold or a stale alias answered about its own
+    /// local spelling — peer-answered truth about a key we never asked for.
+    /// That is a key-space fault, never verdict evidence about ours.
+    KeySpaceMismatch { refused_key: String },
+}
+
+/// Classify one remote resize error for the worker's drain. Pure so the
+/// measured production strings stay pinned as unit law.
+fn classify_remote_resize_not_found(
+    error_text: &str,
+    asked_runtime_key: Option<&str>,
+    retries_exhausted: bool,
+) -> RemoteResizeVerdict {
+    const NEEDLE: &str = "terminal session not found";
+    if !error_text.contains(NEEDLE) {
+        return RemoteResizeVerdict::Other;
+    }
+    let refused_key = error_text
+        .split_once(NEEDLE)
+        .and_then(|(_, rest)| {
+            rest.trim_start_matches(':')
+                .trim()
+                .split_whitespace()
+                .next()
+        })
+        .map(|key| key.trim_end_matches([',', ';', '.']).to_string());
+    if let (Some(asked), Some(refused)) = (asked_runtime_key, refused_key)
+        && refused != asked
+    {
+        return RemoteResizeVerdict::KeySpaceMismatch { refused_key: refused };
+    }
+    if retries_exhausted {
+        RemoteResizeVerdict::Unownable
+    } else {
+        RemoteResizeVerdict::Retriable
+    }
+}
+
 /// Pure half of [`DaemonRuntime::terminal_runtime_key_for_path`]: the session
 /// map proposed `resolved` for `path` — does the terminal map's own contents
 /// overrule it?
@@ -7904,6 +7954,20 @@ impl DaemonRuntime {
                 return candidate.to_string();
             }
         }
+        // ⛔ THE [11.161] KEY-SPACE LAW. Nothing is servable — the fold's
+        // `resolved` guess may still rewrite a RUNTIME-LANE ask into the
+        // local row spelling (`codex-runtime://<id>` → `local://<id>`). An
+        // ask phrased in a runtime lane's own key space is answered in that
+        // key space: the asker can only act on the key it actually asked
+        // for, and a fold-named refusal was read as the peer's verdict
+        // about a live runtime — the 2026-09-20 wedge manufactured the
+        // [11.153] memo from exactly this shape (production error text
+        // `terminal session not found: local://<id>` under an ask for
+        // `codex-runtime://<id>`). Row-path asks (local://,
+        // remote-session://, …) keep the fold.
+        if crate::key_phrases_a_runtime_lane(path) {
+            return path.to_string();
+        }
         resolved
     }
 
@@ -9123,6 +9187,9 @@ impl DaemonRuntime {
     /// live-caught with the remote codex PTY stuck at DEFAULT 120×36 under a
     /// 159×63 client. Latest-wins per session, one in-flight SSH per session,
     /// always off the request loop. No-op for non-remote paths.
+    /// THE [11.161] KEY-SPACE MISMATCH ARM lives in the error drain of the
+    /// worker below: a refusal naming a different key than the ask carried
+    /// is never peer-gone evidence.
     fn forward_remote_pty_resize(&mut self, path: &str, cols: u16, rows: u16) {
         // Kill switch (size-war lesson: every resize writer needs one).
         if std::env::var("YGGTERM_DISABLE_REMOTE_PTY_RESIZE_FORWARD")
@@ -9195,6 +9262,8 @@ impl DaemonRuntime {
                         }
                         break;
                     };
+                    let asked_runtime_key =
+                        crate::remote_runtime_agent_session_key(kind, &session_id);
                     let result = crate::resize_remote_agent_session_pty(
                         &machine,
                         &session_id,
@@ -9230,13 +9299,18 @@ impl DaemonRuntime {
                         // instead of dropping it — a newer client grid that
                         // arrives meanwhile wins via or_insert.
                         let error_text = error.to_string();
-                        let will_retry = error_text.contains("terminal session not found")
-                            && not_found_retries < REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES;
+                        let verdict = classify_remote_resize_not_found(
+                            &error_text,
+                            asked_runtime_key.as_deref(),
+                            not_found_retries >= REMOTE_PTY_RESIZE_NOT_FOUND_RETRIES,
+                        );
+                        let will_retry = matches!(verdict, RemoteResizeVerdict::Retriable);
                         // The unownable verdict gate: not-found AND the re-queue
-                        // exhausted. Everything else that refuses a retry is a
-                        // different terminal state and keeps its own text.
-                        let unownable = !will_retry
-                            && error_text.contains("terminal session not found");
+                        // exhausted, AND the refused key is the key we ASKED (the
+                        // [11.161] mismatch arm below spends nothing). Everything
+                        // else that refuses a retry is a different terminal state
+                        // and keeps its own text.
+                        let unownable = matches!(verdict, RemoteResizeVerdict::Unownable);
                         if will_retry {
                             not_found_retries += 1;
                             let mut pending = pending
@@ -9265,6 +9339,36 @@ impl DaemonRuntime {
                             std::thread::sleep(std::time::Duration::from_millis(
                                 REMOTE_PTY_RESIZE_NOT_FOUND_RETRY_DELAY_MS,
                             ));
+                        }
+                        // ⛔ THE [11.161] KEY-SPACE MISMATCH ARM. The peer
+                        // refused a DIFFERENT key than the ask carried — a
+                        // peer-side fold or a stale alias answering about a
+                        // local spelling we never asked for. That is a
+                        // key-space fault (ours or the peer's), never verdict
+                        // evidence about the key we asked: retrying it and
+                        // arming the [11.153] memo stamped live rows
+                        // launch-failed while the runtime lived on the peer
+                        // (the 2026-09-20 wedge, 4302 trace events). Name it,
+                        // spend nothing, and let the loop drain — a NEW grid
+                        // re-asks and earns a fresh verdict.
+                        if let RemoteResizeVerdict::KeySpaceMismatch { refused_key } =
+                            verdict
+                        {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_resize",
+                                "remote_pty_resize_key_space_mismatch",
+                                serde_json::json!({
+                                    "path": path,
+                                    "kind": kind,
+                                    "asked_key": asked_runtime_key,
+                                    "refused_key": refused_key,
+                                    "error": error_text,
+                                    "verdict": "the peer refused a different                                         key than the ask carried — no retry,                                         no memo",
+                                }),
+                            );
+                            continue;
                         }
                         // THE UNOWNABLE VERDICT (width-divorce class, measured
                         // 2026-09-05 on remote-agy 16e85426): when the retries
@@ -44392,4 +44496,141 @@ mod terminal_snapshot_answer_tests {
         assert_eq!(answer.composer_holds_draft, Some(false));
         assert_eq!(answer.pty_in_alternate_screen, Some(true));
     }
+    #[test]
+    fn a_refused_key_that_differs_from_the_asked_key_is_never_peer_gone_evidence() {
+        // [11.161], verbatim production strings (event-trace, 2026-09-20):
+        // the ask carried `codex-runtime://01a0bf3b…` and the peer's fold
+        // answered about `local://01a0bf3b…`. The worker must read that as a
+        // KEY-SPACE fault — no retry, no [11.153] memo — not as peer truth
+        // about the asked key.
+        let production = "remote yggterm command failed for dev: Error: \
+terminal session not found: local://01a0bf3b-a7e7-7673-a74c-3347f7c4971c";
+        let asked = "codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c";
+        assert_eq!(
+            classify_remote_resize_not_found(production, Some(asked), true),
+            RemoteResizeVerdict::KeySpaceMismatch {
+                refused_key: "local://01a0bf3b-a7e7-7673-a74c-3347f7c4971c".to_string(),
+            },
+            "a wrong-key refusal is a key-space fault at ANY retry depth"
+        );
+        // The same text with the path-uuid key (the other measured spelling).
+        let production_path_id = "remote yggterm command failed for dev: Error: \
+terminal session not found: local://47a239b0-c7cf-4091-af4e-76bc7b0dc148";
+        assert_eq!(
+            classify_remote_resize_not_found(
+                production_path_id,
+                Some("codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c"),
+                false
+            ),
+            RemoteResizeVerdict::KeySpaceMismatch {
+                refused_key: "local://47a239b0-c7cf-4091-af4e-76bc7b0dc148".to_string(),
+            },
+        );
+        // An HONEST not-found — the refused key IS the asked key — keeps
+        // today's semantics: retry inside the budget, unownable past it.
+        let honest = "remote yggterm command failed for dev: Error: \
+terminal session not found: codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c";
+        assert_eq!(
+            classify_remote_resize_not_found(honest, Some(asked), false),
+            RemoteResizeVerdict::Retriable,
+        );
+        assert_eq!(
+            classify_remote_resize_not_found(honest, Some(asked), true),
+            RemoteResizeVerdict::Unownable,
+            "the memo arms only past the retry budget AND only on the asked key"
+        );
+        // Unrelated errors stay on the plain failed path.
+        assert_eq!(
+            classify_remote_resize_not_found(
+                "remote yggterm command failed for dev: Error: failed to upload yggterm binary",
+                Some(asked),
+                true
+            ),
+            RemoteResizeVerdict::Other,
+        );
+    }
+
+    #[test]
+    fn the_resize_worker_never_arms_the_peer_gone_memo_on_a_key_space_mismatch() {
+        // [11.161] source law: the worker classifies BEFORE the memo arm, and
+        // the mismatch arm is named, spends nothing, and drains the loop.
+        let source = crate::daemon::tests::daemon_product_source();
+        let source = source.as_str();
+        let worker = crate::daemon::tests::daemon_fn_body(source, "    fn forward_remote_pty_resize(");
+        let classify = worker
+            .find("classify_remote_resize_not_found(")
+            .expect("the worker must route every error through the [11.161] classifier");
+        let mismatch = worker
+            .find("remote_pty_resize_key_space_mismatch")
+            .expect("the mismatch arm must be named on the trace");
+        let memo = worker
+            .find("verdict.last_verdict_at = now;")
+            .expect("the memo WRITE arm must still exist for honest unownable verdicts");
+        assert!(
+            classify < memo,
+            "classify first — the verdict decides whether the memo may arm at all"
+        );
+        assert!(
+            mismatch < memo,
+            "the mismatch arm (continue, no memo) must sit before the memo arm              so a wrong-key refusal never reaches it"
+        );
+        assert!(
+            worker.contains("continue;"),
+            "the mismatch arm drains the loop (continue), it must not break              with the in-flight marker still held"
+        );
+    }
+
+    #[test]
+    fn a_runtime_lane_ask_is_answered_in_the_asked_key_space_when_nothing_is_servable() {
+        // [11.161] source law on the peer fold: the servable-candidate loop
+        // keeps priority, but the final fallback must answer a runtime-lane
+        // ask in the asked key space — never the local row spelling.
+        let source = crate::daemon::tests::daemon_product_source();
+        let source = source.as_str();
+        let fold = crate::daemon::tests::daemon_fn_body(source, "    fn terminal_runtime_key_for_path(");
+        let loop_end = fold
+            .find("if self.can_serve_runtime_key(candidate) {")
+            .expect("the servable-candidate loop keeps priority");
+        let fallback = fold
+            .find("crate::key_phrases_a_runtime_lane(path)")
+            .expect("the fold must carry the [11.161] runtime-lane fallback");
+        assert!(
+            loop_end < fallback,
+            "servable candidates win first; the key-space fallback answers only              when nothing is servable"
+        );
+        assert!(
+            fold.contains("return path.to_string();"),
+            "the fallback answers with the ASKED key"
+        );
+    }
+
+    #[test]
+    fn scheme_registry_lock_key_phrases_a_runtime_lane() {
+        // The [11.161] predicate is registry-derived and scoped to PURE
+        // runtime lanes: RowAndRuntimeKey spellings (local://) stay out — a
+        // local row ask keeps the fold-to-the-live-spelling behavior.
+        use yggterm_core::agent_scheme::{self, SchemeRole};
+        let name = "key_phrases_a_runtime_lane";
+        let in_scope = |s: &agent_scheme::SchemeDescriptor| {
+            matches!(s.role, SchemeRole::RuntimeKey)
+        };
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| in_scope(s)) {
+            assert!(
+                crate::key_phrases_a_runtime_lane(scheme.example),
+                "{name} does not phrase {} — fix it or record a hole",
+                scheme.prefix
+            );
+        }
+        for scheme in agent_scheme::SESSION_PATH_SCHEMES.iter().filter(|s| !in_scope(s)) {
+            let covered = crate::key_phrases_a_runtime_lane(scheme.example);
+            let hole = agent_scheme::predicate_hole_allowed(name, scheme.prefix);
+            assert!(
+                !covered || hole,
+                "STALE SCOPE: {name} covers {} (role {:?}) — widen the law or                  record the hole deliberately",
+                scheme.prefix,
+                scheme.role
+            );
+        }
+    }
+
 }
