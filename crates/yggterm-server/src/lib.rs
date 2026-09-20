@@ -660,6 +660,25 @@ pub struct SessionMetadataEntry {
     pub value: String,
 }
 
+/// The Status stamp a REMOTE binary-missing refusal writes ([11.160]). The
+/// prefix is the heal predicate's key — `clear_remote_cli_binary_missing_
+/// refusal_for_path` removes exactly this family and nothing else, because a
+/// verdict that can only be written in one direction is a scar.
+pub(crate) const REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX: &str = "CLI binary not installed on ";
+
+/// What [`YggtermServer::remote_agent_cli_launch_gate_for_path`] decided about
+/// one remote row's launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteAgentLaunchGateAnswer {
+    /// No remote-lane opinion — the launch follows the ordinary flow.
+    Proceed,
+    /// The launch may proceed, and a stale refusal stamp must be retired on
+    /// the way: the condition it named no longer holds.
+    ProceedAndClearRefusal,
+    /// Refuse the launch by name — no PTY, no raw paint, the stamp speaks.
+    Refuse(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRenderedSection {
     pub title: &'static str,
@@ -10666,6 +10685,202 @@ impl YggtermServer {
         ];
     }
 
+    /// The host a remote agent row's CLI execs on, as the user names it — the
+    /// row's ssh target ("dev"), not the normalized machine key.
+    pub(crate) fn remote_agent_cli_host_display_for_path(&self, path: &str) -> Option<String> {
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
+        session
+            .ssh_target
+            .as_deref()
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether a remote row carries a CURRENT binary-missing refusal stamp —
+    /// the Failed phase plus the Status marker the recorder below writes. The
+    /// pair matters: a stale Status from an unrelated arm must never keep a
+    /// healthy row refused.
+    pub(crate) fn session_has_current_remote_cli_binary_missing_refusal(
+        &self,
+        path: &str,
+    ) -> bool {
+        let Some(key) = self.resolve_session_storage_key(path) else {
+            return false;
+        };
+        let Some(session) = self.sessions.get(key) else {
+            return false;
+        };
+        session.launch_phase == TerminalLaunchPhase::Failed
+            && session.metadata.iter().any(|entry| {
+                entry.label == "Status"
+                    && entry
+                        .value
+                        .starts_with(REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX)
+            })
+    }
+
+    /// The REMOTE door of the missing-binary launch gate ([11.160]) — the exact
+    /// complement of [`Self::local_agent_cli_launch_refusal_for_path`], which
+    /// answers only rows whose CLI execs HERE.
+    ///
+    /// Three answers, because the remote probe is an SSH ROUND TRIP while the
+    /// local one is a stat: a fresh negative cache refuses BY NAME before any
+    /// spawn; a fresh positive passes and retires a stamp the probe has
+    /// outlived; and a CURRENT stamp refuses even against a stale-or-absent
+    /// cache, because the stamp was LEARNED from the peer's own refusal frame —
+    /// the one truth a cache TTL cannot retract. The learn arm is the reuse
+    /// check's refusal-frame classifier in the daemon funnel.
+    pub(crate) fn remote_agent_cli_launch_gate_for_path(
+        &self,
+        path: &str,
+    ) -> RemoteAgentLaunchGateAnswer {
+        let Some((machine_key, tool, ssh_target)) =
+            self.remote_agent_cli_launch_target_for_path(path)
+        else {
+            return RemoteAgentLaunchGateAnswer::Proceed;
+        };
+        let now = current_time_ms();
+        let cached = remote_managed_cli_ensure_cache().lock().ok().and_then(|cache| {
+            cache
+                .get(&(machine_key, tool.binary_name()))
+                .copied()
+        });
+        if let Some((available, cached_at_ms)) = cached
+            && remote_managed_cli_ensure_entry_is_fresh(available, cached_at_ms, now)
+        {
+            if available {
+                return RemoteAgentLaunchGateAnswer::ProceedAndClearRefusal;
+            }
+            return RemoteAgentLaunchGateAnswer::Refuse(
+                managed_cli::missing_binary_refusal_message_on_machine(tool, &ssh_target),
+            );
+        }
+        if self.session_has_current_remote_cli_binary_missing_refusal(path) {
+            return RemoteAgentLaunchGateAnswer::Refuse(
+                managed_cli::missing_binary_refusal_message_on_machine(tool, &ssh_target),
+            );
+        }
+        RemoteAgentLaunchGateAnswer::Proceed
+    }
+
+    /// The `(machine_key, tool, ssh_target)` a remote row's launch will exec
+    /// with, or `None` when the remote lane is not this row's business — the
+    /// same complementarity rule `remote_managed_cli_target_for_session_path`
+    /// owns, plus the target string the refusal text and the stamp name.
+    fn remote_agent_cli_launch_target_for_path(
+        &self,
+        path: &str,
+    ) -> Option<(String, ManagedCliTool, String)> {
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
+        let tool = remote_managed_cli_tool_for(path, session.source, session.kind)?;
+        let ssh_target = session.ssh_target.as_deref()?.trim();
+        if ssh_target.is_empty() {
+            return None;
+        }
+        Some((
+            machine_key_from_ssh_target(ssh_target),
+            tool,
+            ssh_target.to_string(),
+        ))
+    }
+
+    /// Stamp a REMOTE launch refusal ON THE ROW ([11.160]) — the [11.153]
+    /// pattern: Status + Launch Error carry the named refusal, the launch phase
+    /// answers `Failed`, the dead wrapper's PID leaves the plane, and the
+    /// Restore entry (which advertises `resume-… --require-existing` for a
+    /// session that was never started) is removed so the Connect panel falls
+    /// through to the honest `ssh <host>`.
+    pub(crate) fn record_remote_cli_binary_missing_refusal_for_path(
+        &mut self,
+        path: &str,
+        message: &str,
+        host: &str,
+    ) {
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        session.last_launch_error = Some(message.to_string());
+        session.launch_phase = TerminalLaunchPhase::Failed;
+        session.terminal_process_id = None;
+        upsert_session_metadata(&mut session.metadata, "Launch Error", message.to_string());
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Status",
+            format!("{REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX}{host}"),
+        );
+        session.metadata.retain(|entry| entry.label != "Restore");
+        session.status_line = format!("launch refused · {message}");
+        session.terminal_lines = vec![
+            message.to_string(),
+            String::new(),
+            "yggterm refused this launch instead of painting the raw failure:              the CLI binary was missing on the machine that owns this session.              An install may be in flight — the row retries and heals on its own."
+                .to_string(),
+        ];
+    }
+
+    /// Retire a refusal stamp whose condition no longer holds — the scar law:
+    /// a verdict that can only be written in one direction is not a verdict.
+    /// The following launch re-derives the phase through the pending states,
+    /// and the Restore entry returns so the Connect panel advertises the resume
+    /// form again for the session that NOW exists.
+    pub(crate) fn clear_remote_cli_binary_missing_refusal_for_path(&mut self, path: &str) {
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return;
+        };
+        let stamped = session.metadata.iter().any(|entry| {
+            entry.label == "Status"
+                && entry
+                    .value
+                    .starts_with(REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX)
+        });
+        if !stamped {
+            return;
+        }
+        session.last_launch_error = None;
+        session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+        session.metadata.retain(|entry| {
+            entry.label != "Launch Error"
+                && !(entry.label == "Status"
+                    && entry
+                        .value
+                        .starts_with(REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX))
+        });
+        if let Some(resume_verb) = remote_agent_resume_subcommand(session.kind)
+            && let Some(ssh_target) = session
+                .ssh_target
+                .as_deref()
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+        {
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Restore",
+                format!(
+                    "ssh {ssh_target} 'yggterm server remote {resume_verb} {} \
+                     --require-existing'",
+                    session.id
+                ),
+            );
+        }
+        session.status_line = describe_status_line(
+            session.backend,
+            self.theme,
+            session.source,
+            session.launch_phase,
+            session.remote_deploy_state,
+            session.bridge_available,
+        );
+    }
+
     /// Record that a row's launch process EXITED before its CLI ever took
     /// input — the husk: a PTY that spawned, printed an error frame, and died.
     ///
@@ -10788,6 +11003,42 @@ impl YggtermServer {
             return;
         };
         let now_ms = current_time_ms();
+        // ⛔ THE [11.160] HEAL PROBE. A row carrying a current binary-missing
+        // stamp distrusts every cache answer except a FRESH negative: the stamp
+        // was LEARNED from the peer's own refusal frame, which a stale positive
+        // (the probe-seat / ynpm-re-point / self-update class — "installed"
+        // vanished inside the 2h TTL) cannot outvote. Skipping the freshness
+        // short-circuit lets the background hop re-answer; the inflight dedupe
+        // keeps it one ssh at a time, and a fresh negative still bounds the
+        // re-probe cadence to its own 60s TTL.
+        if self.session_has_current_remote_cli_binary_missing_refusal(path) {
+            let fresh_negative = remote_managed_cli_ensure_cache()
+                .lock()
+                .ok()
+                .and_then(|cache| {
+                    cache
+                        .get(&(machine_key.clone(), tool.binary_name()))
+                        .copied()
+                })
+                .is_some_and(|(available, cached_at_ms)| {
+                    !available && remote_managed_cli_ensure_entry_is_fresh(
+                        available,
+                        cached_at_ms,
+                        now_ms,
+                    )
+                });
+            if !fresh_negative
+                && let Ok(target) = self.remote_target_for_machine_key(&machine_key)
+            {
+                spawn_remote_managed_cli_ensure(
+                    machine_key,
+                    target.ssh_target,
+                    target.prefix,
+                    tool,
+                );
+                return;
+            }
+        }
         if let Ok(cache) = remote_managed_cli_ensure_cache().lock()
             && let Some((available, cached_at_ms)) =
                 cache.get(&(machine_key.clone(), tool.binary_name()))
@@ -16395,6 +16646,35 @@ fn remote_snapshot_has_codex_resume_instruction(bytes: &[u8]) -> bool {
         .join(" ");
     normalized.contains("to continue this session, run codex resume")
         || normalized.contains("run codex resume ")
+}
+
+/// The one line of a REMOTE runtime's output that is the peer's CLI-binary
+/// launch refusal ([11.160]) — or `None` when the stream carries none.
+///
+/// The refusal reaches the viewport as PTY bytes: the peer's ensure bails with
+/// the very `missing_binary_refusal_message` the local gate prints, the
+/// wrapper's stderr IS the row PTY, and the frame painted raw into the owner's
+/// viewport while the metadata claimed a healthy row. The classifier keys the
+/// shared CONTRACT WORDS ("not installed on this machine" + "not on the launch
+/// PATH") — the template is yggterm's own, so every agent CLI's refusal
+/// matches it and no CLI's ordinary output does. The learned line becomes the
+/// row's Launch Error stamp: the peer's own evidence, not a paraphrase.
+pub(crate) fn remote_stream_cli_binary_missing_refusal_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("not installed on this machine")
+            && lower.contains("not on the launch path"))
+        {
+            return None;
+        }
+        let trimmed = line.trim();
+        let stripped = trimmed
+            .strip_prefix("Error: ")
+            .map(str::to_string)
+            .unwrap_or_else(|| trimmed.to_string());
+        (!stripped.is_empty()).then_some(stripped)
+    })
 }
 
 pub(crate) fn remote_resume_runtime_output_requires_restart(bytes: &[u8]) -> bool {
@@ -44716,6 +44996,34 @@ mod tests {
         ));
     }
 
+    /// THE [11.160] LEARN ARM'S EYES. The classifier keys yggterm's own
+    /// contract words, so the incident's exact frame classifies and the peer's
+    /// words — not a paraphrase — become the row's Launch Error.
+    #[test]
+    fn the_remote_stream_classifier_names_the_peer_refusal_line() {
+        let incident = "Error: Codex is not installed on this machine — `codex` is not on the \
+launch PATH, so yggterm cannot start this session. yggterm provisions codex \
+from npm (@openai/codex) — an install may be in flight, so retry in a moment.\r\n";
+        let line = remote_stream_cli_binary_missing_refusal_line(incident.as_bytes())
+            .expect("the incident frame must classify");
+        assert!(
+            !line.starts_with("Error: "),
+            "the stamp carries the words, not the CLI's error prefix: {line}"
+        );
+        assert_eq!(
+            remote_stream_cli_binary_missing_refusal_line(
+                "OpenAI Codex\n\u{203a} give me a refactor\ngpt-5.2 \u{b7} 84% left\n".as_bytes()
+            ),
+            None,
+            "a healthy codex screen is not a refusal"
+        );
+        assert_eq!(
+            remote_stream_cli_binary_missing_refusal_line(b"Error: connection refused\n"),
+            None,
+            "an unrelated error line is not the binary-missing refusal"
+        );
+    }
+
     #[test]
     fn remote_resume_runtime_output_requires_restart_for_shell_prompt() {
         let prompt = b"user@examplehost:~$\n";
@@ -53872,6 +54180,162 @@ terminal_window_id: None,
     ///   is a plain shell);
     /// - the rail's session-id row and the Restore line, which are what a human
     ///   uses to reconnect by hand.
+    /// THE [11.160] GATE TABLE. No opinion before the first remote answer —
+    /// the background provision owns that case; a fresh negative refuses BY
+    /// NAME before any spawn; a fresh positive retires a stamp the probe has
+    /// outlived; and a current stamp refuses even against a STALE positive,
+    /// because the stamp was learned from the peer's own refusal frame.
+    #[test]
+    fn the_remote_launch_gate_refuses_by_name_and_the_heal_retires_the_stamp() {
+        let mut server = server_with_one_remote_machine();
+        let key = server
+            .start_remote_agent_session_with_launch_options(
+                SessionKind::Codex,
+                "dev",
+                None,
+                None,
+                None,
+                &AgentLaunchOptions::default(),
+            )
+            .expect("the remote row");
+        let cache_key = (machine_key_from_ssh_target("dev"), "codex");
+        {
+            let mut cache = remote_managed_cli_ensure_cache().lock().unwrap();
+            cache.remove(&cache_key);
+        }
+        assert!(matches!(
+            server.remote_agent_cli_launch_gate_for_path(&key),
+            RemoteAgentLaunchGateAnswer::Proceed
+        ));
+        // Fresh negative: refuse by name, naming the machine the user named.
+        remote_managed_cli_ensure_cache()
+            .lock()
+            .unwrap()
+            .insert(cache_key.clone(), (false, current_time_ms()));
+        let RemoteAgentLaunchGateAnswer::Refuse(message) =
+            server.remote_agent_cli_launch_gate_for_path(&key)
+        else {
+            panic!("a fresh negative remote ensure must refuse the launch");
+        };
+        assert!(
+            message.contains("not installed on dev"),
+            "the refusal must name the peer host, got: {message}"
+        );
+
+        // The refusal stamps the [11.153] pattern onto the row: honest phase,
+        // no PID, Status + Launch Error, and the never-started session's
+        // Restore advertisement GONE.
+        server.record_remote_cli_binary_missing_refusal_for_path(
+            &key,
+            &message,
+            "dev",
+        );
+        {
+            let session = server.sessions.get(&key).expect("the row");
+            assert_eq!(session.launch_phase, TerminalLaunchPhase::Failed);
+            assert_eq!(
+                session.terminal_process_id, None,
+                "a refused row has no process to name"
+            );
+            let status = session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Status")
+                .map(|entry| entry.value.as_str());
+            assert_eq!(
+                status,
+                Some("CLI binary not installed on dev"),
+                "the Status stamp is the state plane's honest answer"
+            );
+            assert!(
+                !session.metadata.iter().any(|entry| entry.label == "Restore"),
+                "the Connect panel must not advertise --require-existing for a                  session that was never started"
+            );
+            assert!(session.status_line.contains("launch refused"));
+        }
+        assert!(server.session_has_current_remote_cli_binary_missing_refusal(&key));
+
+        // A STALE positive cache cannot outvote the stamp: the stamp was
+        // learned from the peer's own refusal frame after some cache said the
+        // binary was there.
+        remote_managed_cli_ensure_cache()
+            .lock()
+            .unwrap()
+            .insert(
+                cache_key.clone(),
+                (
+                    true,
+                    current_time_ms().saturating_sub(REMOTE_MANAGED_CLI_ENSURE_TTL_MS + 1_000),
+                ),
+            );
+        assert!(matches!(
+            server.remote_agent_cli_launch_gate_for_path(&key),
+            RemoteAgentLaunchGateAnswer::Refuse(_)
+        ));
+
+        // The heal: a fresh positive retires the stamp; the scar is gone and
+        // the resume-form Restore returns with the session that now exists.
+        remote_managed_cli_ensure_cache()
+            .lock()
+            .unwrap()
+            .insert(cache_key, (true, current_time_ms()));
+        assert!(matches!(
+            server.remote_agent_cli_launch_gate_for_path(&key),
+            RemoteAgentLaunchGateAnswer::ProceedAndClearRefusal
+        ));
+        server.clear_remote_cli_binary_missing_refusal_for_path(&key);
+        assert!(
+            !server.session_has_current_remote_cli_binary_missing_refusal(&key),
+            "a healed row carries no refusal scar"
+        );
+        let session = server.sessions.get(&key).expect("the row");
+        let restore = session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Restore")
+            .map(|entry| entry.value.clone())
+            .expect("the resume form returns with the healed session");
+        assert!(
+            restore.contains("--require-existing") && restore.contains("resume-codex"),
+            "the healed row's Connect panel advertises the real resume form: {restore}"
+        );
+    }
+
+    /// ⛔ THE HEAL PROBE'S SHAPE LOCK. A stamped row must be able to skip the
+    /// freshness short-circuit (the stale-positive case is exactly how the
+    /// binary vanished under a 2h TTL), while a fresh negative still bounds the
+    /// re-probe cadence. Scans the production body with the test module
+    /// stripped, so the lock cannot self-match.
+    #[test]
+    fn the_remote_heal_probe_distrusts_every_cached_answer_but_a_fresh_negative() {
+        let source = yggterm_core::agent_cli::product_lines(include_str!("lib.rs"))
+            .into_iter()
+            .map(|(_index, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = source
+            .split("pub fn ensure_remote_managed_cli_for_session_path(")
+            .nth(1)
+            .expect("the remote ensure is gone; the heal-probe lock is stale")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of the function");
+        let stamped = body
+            .find("session_has_current_remote_cli_binary_missing_refusal(path)")
+            .expect("the heal probe must consult the current-stamp predicate");
+        let freshness = body
+            .find("remote_managed_cli_ensure_entry_is_fresh(*available, *cached_at_ms, now_ms)")
+            .expect("the freshness short-circuit must remain for unstamped rows");
+        assert!(
+            stamped < freshness,
+            "the stamped row must be able to skip the freshness short-circuit"
+        );
+        assert!(
+            body.contains("fresh_negative"),
+            "a fresh negative must still bound the re-probe cadence"
+        );
+    }
+
     #[test]
     fn every_cli_with_a_remote_arm_starts_a_remote_row_on_its_own_scheme_and_verb() {
         let mut started = 0;

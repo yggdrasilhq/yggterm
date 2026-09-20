@@ -9844,6 +9844,27 @@ impl DaemonRuntime {
         }
     }
 
+    /// A refused remote row must not keep serving the dead wrapper's raw
+    /// frame ([11.160]): remove the runtime when it has exited, so the pane
+    /// falls back to the row's recorded terminal_lines — the stamp's words. A
+    /// LIVE runtime is left alone: this arm only ever fires beside a refusal,
+    /// and a live runtime beside a fresh refusal is a race the next tick
+    /// re-reads.
+    fn remove_dead_refused_remote_runtime(&mut self, path: &str) {
+        let runtime_path = self.terminal_runtime_key_for_path(path);
+        if self.terminals.has_session(&runtime_path)
+            && !self.terminals.session_is_running(&runtime_path)
+            && let Err(error) = self.terminals.remove_session(&runtime_path, None)
+        {
+            warn!(
+                path = %path,
+                runtime = %runtime_path,
+                error = %error,
+                "refused remote runtime removal failed"
+            );
+        }
+    }
+
     /// The last visible line the dead runtime left on screen — the frozen error
     /// frame, which for a failed launch wrapper IS the diagnosis and is about to
     /// become the only surviving copy of it.
@@ -10126,6 +10147,58 @@ impl DaemonRuntime {
             }
             let _ = self.persist_state_only();
             bail!("{refusal}");
+        }
+        // ⛔ THE [11.160] REMOTE DOOR of the same launch gate. The local check
+        // above answers rows whose CLI execs HERE; this one answers rows whose
+        // CLI execs on the peer — where the refusal used to arrive as the
+        // wrapper's raw stderr ON the row PTY, painting `Error: Codex is not
+        // installed…` verbatim into the viewport while the metadata claimed
+        // running·idle. The gate refuses BEFORE any spawn; the stamp is the
+        // [11.153] pattern (Status + Launch Error on the row, no raw bytes, an
+        // honest Connect panel), and the heal is the cache re-answer.
+        match self.server.remote_agent_cli_launch_gate_for_path(path) {
+            crate::RemoteAgentLaunchGateAnswer::Refuse(message) => {
+                let host = self
+                    .server
+                    .remote_agent_cli_host_display_for_path(path)
+                    .unwrap_or_else(|| "the remote machine".to_string());
+                self.server.record_remote_cli_binary_missing_refusal_for_path(
+                    path,
+                    &message,
+                    &host,
+                );
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "launch_refused_cli_binary_missing",
+                        serde_json::json!({
+                            "path": path,
+                            "scope": "remote",
+                            "machine": host,
+                            "refusal": message,
+                        }),
+                    );
+                }
+                self.remove_dead_refused_remote_runtime(path);
+                let _ = self.persist_state_only();
+                bail!("{message}");
+            }
+            crate::RemoteAgentLaunchGateAnswer::ProceedAndClearRefusal => {
+                // The probe outlived the stamp — but a dead refused runtime may
+                // still hold the frame the stamp was learned from. Clear only
+                // when that evidence is gone (runtime removed or replaced by a
+                // live one); otherwise the learn arm below owns the truth.
+                let runtime_path = self.terminal_runtime_key_for_path(path);
+                if !self.terminals.has_session(&runtime_path)
+                    || self.terminals.session_is_running(&runtime_path)
+                {
+                    self.server.clear_remote_cli_binary_missing_refusal_for_path(path);
+                    let _ = self.persist_state_only();
+                }
+            }
+            crate::RemoteAgentLaunchGateAnswer::Proceed => {}
         }
         // ⛔ NOT a refusal, on the same funnel. A local launch into a directory
         // that does not exist here still STARTS — `best_effort_cwd_shell_prefix`
@@ -10519,21 +10592,63 @@ impl DaemonRuntime {
                     })
                 })
                 .unwrap_or(false);
-            let remote_runtime_output_requires_restart = has_runtime_output
-                && self
-                    .terminals
+            let remote_stream_text = if has_runtime_output {
+                self.terminals
                     .read(&runtime_path, 0)
                     .map(|stream| {
-                        let snapshot = stream
+                        stream
                             .chunks
                             .into_iter()
                             .map(|chunk| chunk.data)
-                            .collect::<String>();
-                        remote_resume_runtime_output_requires_restart(snapshot.as_bytes())
+                            .collect::<String>()
                     })
-                    .unwrap_or(false);
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let remote_runtime_output_requires_restart = has_runtime_output
+                && remote_resume_runtime_output_requires_restart(remote_stream_text.as_bytes());
             let remote_resume_path =
                 path.starts_with("remote-session://") || runtime_saved_session_mismatch;
+            // ⛔ THE [11.160] LEARN ARM. The gate above can only refuse from
+            // cache knowledge, and a cache that said "installed" cannot see a
+            // binary vanish under it (probe seat, ynpm re-point, self-update).
+            // The peer's own refusal frame in this row's stream IS the ground
+            // truth: learn it into the [11.153]-pattern stamp, remove the dead
+            // wrapper so the raw frame stops being served, and refuse the
+            // mount. Every tick after this is refused by the gate at the top.
+            if remote_resume_path
+                && !remote_stream_text.is_empty()
+                && let Some(refusal_line) = crate::remote_stream_cli_binary_missing_refusal_line(
+                    remote_stream_text.as_bytes(),
+                )
+            {
+                let host = self
+                    .server
+                    .remote_agent_cli_host_display_for_path(path)
+                    .unwrap_or_else(|| "the remote machine".to_string());
+                self.server.record_remote_cli_binary_missing_refusal_for_path(
+                    path,
+                    &refusal_line,
+                    &host,
+                );
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "remote_launch_refusal_frame_learned",
+                        serde_json::json!({
+                            "path": path,
+                            "machine": host,
+                            "refusal": refusal_line,
+                        }),
+                    );
+                }
+                self.remove_dead_refused_remote_runtime(path);
+                let _ = self.persist_state_only();
+                bail!("{refusal_line}");
+            }
             let stale_remote_attach = remote_resume_path
                 && remote_resume_stale_attach(
                     has_runtime_output,
@@ -14506,6 +14621,23 @@ fn snapshot_session_is_keep_alive_recovery_target(session: &SnapshotSessionView)
             .any(|entry| entry.label == "Runtime Persistence" && entry.value == "keep-alive")
 }
 
+/// Whether a row carries a CURRENT binary-missing refusal stamp ([11.160]) —
+/// the Failed phase plus the recorder's Status marker. The snapshot reconcile's
+/// runtime-loss arm relabels surviving rows `RemoteBootstrap` to unlie a stale
+/// `Running` over a dead runtime; a refusal-stamped row is NOT that lie — its
+/// Failed is the freshest truth the funnel learned, and "bootstrapping" would
+/// promise a launch the gate is refusing. The stamp self-expires: the heal
+/// clears it, and the ordinary pending flip takes over from there.
+fn snapshot_session_launch_refusal_is_current(session: &SnapshotSessionView) -> bool {
+    session.launch_phase == crate::TerminalLaunchPhase::Failed
+        && session.metadata.iter().any(|entry| {
+            entry.label == "Status"
+                && entry
+                    .value
+                    .starts_with(crate::REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX)
+        })
+}
+
 /// Per the first-class agent-session spec: an agent CLI session's row
 /// re-derives from the agent CLI's own store (codex / Claude Code JSONL), so a
 /// runtime exit must never erase the row from the snapshot — the row stays and
@@ -14593,7 +14725,10 @@ fn apply_terminal_runtime_truth_to_snapshot(
             runtime_keys,
             &active_session.session_path,
         ));
-        if !runtime_owned && snapshot_session_row_survives_runtime_loss(active_session) {
+        if !runtime_owned
+            && snapshot_session_row_survives_runtime_loss(active_session)
+            && !snapshot_session_launch_refusal_is_current(active_session)
+        {
             active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         } else if runtime_owned && snapshot_session_is_pending_runtime_launch(active_session) {
             // Runtime truth outranks a stale stored phase in BOTH directions: a
@@ -14611,7 +14746,10 @@ fn apply_terminal_runtime_truth_to_snapshot(
             runtime_keys,
             &session.session_path,
         ));
-        if !runtime_owned && snapshot_session_row_survives_runtime_loss(session) {
+        if !runtime_owned
+            && snapshot_session_row_survives_runtime_loss(session)
+            && !snapshot_session_launch_refusal_is_current(session)
+        {
             session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         } else if runtime_owned && snapshot_session_is_pending_runtime_launch(session) {
             session.launch_phase = crate::TerminalLaunchPhase::Running;
@@ -38045,6 +38183,102 @@ mod tests {
             .contains("tombstone_live_row"),
             "the close path must still tombstone — if this scan cannot find the one \
              real writer, it cannot find an illegitimate one either"
+        );
+    }
+
+    /// THE [11.160] RECONCILE GUARD. The runtime-loss arm relabels surviving
+    /// rows `RemoteBootstrap` to unlie a stale `Running` over a dead runtime —
+    /// but a refusal-stamped row's `Failed` is the FRESHEST truth the funnel
+    /// learned, and "bootstrapping" would promise a launch the gate is
+    /// refusing. The stamp self-expires: the heal clears it and the ordinary
+    /// flip takes over.
+    #[test]
+    fn a_current_refusal_stamp_keeps_failed_off_the_bootstrapping_relabel() {
+        let server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let refused_path = "remote-session://dev/refused-row".to_string();
+        let mut refused = daemon_test_snapshot_session(&refused_path, SessionSource::LiveSsh);
+        refused.launch_phase = TerminalLaunchPhase::Failed;
+        refused.metadata.push(SnapshotMetadataEntry {
+            label: "Status".to_string(),
+            value: format!("{}dev", crate::REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX),
+        });
+        refused.metadata.push(SnapshotMetadataEntry {
+            label: "Runtime Persistence".to_string(),
+            value: "keep-alive".to_string(),
+        });
+        let control_path = "remote-session://dev/control-row".to_string();
+        let mut control = daemon_test_snapshot_session(&control_path, SessionSource::LiveSsh);
+        control.launch_phase = TerminalLaunchPhase::Failed;
+        control.metadata.push(SnapshotMetadataEntry {
+            label: "Runtime Persistence".to_string(),
+            value: "keep-alive".to_string(),
+        });
+        let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: Some(refused_path.clone()),
+            active_session: Some(refused),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![control],
+        };
+        apply_terminal_runtime_truth_to_snapshot(&server, &HashSet::new(), &mut snapshot);
+        assert_eq!(
+            snapshot
+                .active_session
+                .as_ref()
+                .expect("the refused row stays active")
+                .launch_phase,
+            TerminalLaunchPhase::Failed,
+            "a refusal stamp is the freshest truth — the reconcile must not \
+             promise a launch the gate is refusing"
+        );
+        assert_eq!(
+            snapshot.live_sessions[0].launch_phase,
+            TerminalLaunchPhase::RemoteBootstrap,
+            "without the stamp the relabel is the ordinary runtime-loss truth"
+        );
+    }
+
+    /// ⛔ FUNNEL ORDER LOCK. The remote launch gate must sit AFTER the local
+    /// refusal check (same funnel, complementary lanes) and BEFORE the
+    /// peer-gone ask (cheaper, and the ask cannot help a row whose binary is
+    /// missing) and BEFORE the reuse check, whose learn arm is the gate's
+    /// teacher. A reorder that breaks any of these arms silently resurrects
+    /// the raw-paint storm this gate exists to kill.
+    #[test]
+    fn the_remote_launch_gate_precedes_the_peer_gone_ask_and_the_reuse_check() {
+        let source = daemon_product_source();
+        let body = daemon_fn_body(
+            &source,
+            "fn ensure_terminal_for_path_with_initial_size_and_seed(",
+        );
+        let local = body
+            .find("local_agent_cli_launch_refusal_for_path(path)")
+            .expect("the local binary-missing refusal arm is gone");
+        let remote_gate = body
+            .find("remote_agent_cli_launch_gate_for_path(path)")
+            .expect("the [11.160] remote launch gate is gone");
+        let peer_gone = body
+            .find("remote_saved_session_peer_gone(path)")
+            .expect("the [11.155] peer-gone ask is gone");
+        let learn_arm = body
+            .find("remote_launch_refusal_frame_learned")
+            .expect("the [11.160] learn arm is gone");
+        let reuse_check = body
+            .find("\"reuse_check\"")
+            .expect("the reuse-check trace is gone");
+        assert!(
+            local < remote_gate && remote_gate < peer_gone,
+            "the remote gate belongs beside the local check, before the peer-gone ask"
+        );
+        assert!(
+            remote_gate < learn_arm && learn_arm < reuse_check,
+            "the learn arm belongs in the reuse-check region, after the gate"
         );
     }
 
