@@ -30735,7 +30735,7 @@ resumes when [11.159] lands.
 
 ## ⛔ [11.160] A REMOTE ROW'S LAUNCH REFUSAL PAINTS RAW INTO THE VIEWPORT WHILE THE STATE PLANE KEEPS CLAIMING RUNNING·IDLE — THE USER SEES AN ERROR DUMP YGGTERM SHOULD HAVE STAMPED, AND THE METADATA LIES ABOUT IT (owner-reported 2026-09-20 ~08:10 with a screenshot)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE (lane/integration/11160-rawpaint a714cd87, want=next; live proof + close pending — the entry closes per the verified-fix law only after the refusal window is driven on production)
 
 The owner opened a new dev Codex row from the GUI (`remote-session://dev/
 3f3fcfee-d5a2-40f6-8f8c-604ead426b27`) while the peer's codex launch binary
@@ -30775,3 +30775,5 @@ running·idle); the Connect panel does not advertise `--require-existing` for
 a session that was never started. Filed from the seat that was driving the
 peer (sess_63b2cfdc); the driving experiment ended and the peer binary was
 restored within one minute — the screenshot row healed and reads healthy.
+
+FIXED IN CODE 2026-09-20 (the muse lab host seat, work FROM dev): (1) THE REMOTE LAUNCH GATE — the ensure funnel's remote door beside the local binary-missing check: a fresh negative remote-ensure cache answer refuses BY NAME before any spawn, and the refusal stamps the [11.153] pattern (Status `CLI binary not installed on <host>` + Launch Error, launch_phase Failed, dead wrapper PID cleared, the Restore entry removed so Connect stops advertising `--require-existing` for a never-started session); (2) THE LEARN ARM — the reuse-check stream classifies the peer's own refusal frame (yggterm's contract words, machine-agnostic), which is the ground truth a stale positive cache cannot see past (the probe-seat / ynpm-re-point / self-update class vanished inside the 2h TTL), removes the dead wrapper so the pane falls back to the recorded words, and refuses; (3) THE HEAL — a stamped row distrusts every cached answer but a fresh negative (the background hop re-answers, inflight-deduped, the fresh-negative TTL bounds the cadence), a fresh positive retires the stamp (no scar: the clear restores the resume-form Restore and the pending states re-derive the phase), and the snapshot reconcile guard keeps Failed off the bootstrapping relabel while a stamp is current. Locks: funnel order (local < remote gate < peer-gone ask < learn arm < reuse check), the gate table, the reconcile guard, the heal-probe shape. Suite 1549/1 vs clean main f17a1fa4, failure set byte-identical (the owner-gated stamp red).
