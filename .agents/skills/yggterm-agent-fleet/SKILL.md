@@ -1334,8 +1334,11 @@ python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py status                  #
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py capture                 # snapshot the live account
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py switch <email>          # move to a stored account
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py rotate                  # next fresh account (the rate-limit verb)
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py usage                   # MEASURED limits per profile (5h + 7d windows)
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py login                   # device-code OAuth for a NEW account (owner's browser)
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py import <flat.json>     # seed from a litellm-prototype record
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py fetch <host> <email> --activate   # pull a profile from another host
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py refresh                 # renew tokens (live by default) — see single-writer law
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py harnesses --json        # what each harness supports
 ```
 
@@ -1365,6 +1368,24 @@ Mechanics an agent must know before relying on it:
 `ygg-auth.py` may swap a harness's WHOLE auth file (`~/.codex/auth.json`,
 `~/.claude/.credentials.json`) atomically — capture-then-replace, never a
 piecemeal edit of harness state. Everything else in that law stands.
+
+- **`usage` is the measured chooser.** It calls
+  `chatgpt.com/backend-api/codex/usage` (measured live 2026-09-20) with each
+  stored profile's own access token and reports plan, primary (5h) and
+  secondary (7d) used_percent and resets, and the limit-reached flag — run it
+  before rotating so an agent picks an account that actually has headroom. An
+  expired-access profile reports `access_expired`; activate it with `switch`
+  (codex refreshes on its next run) or `refresh` it explicitly.
+- **Cross-host provisioning is `fetch`, pull-only.** The owner assigns
+  accounts to machines: on the target host,
+  `ygg-auth.py fetch <ssh-alias> <email> --activate` copies the record from
+  the source host's store and switches to it (hosts without a yggterm checkout
+  run the script standalone — stdlib only). Records are pulled, never pushed.
+- ⛔ **Single-writer law for replicated profiles.** OAuth refresh ROTATES the
+  refresh token: refresh on the host where the profile is LIVE only, never on
+  two hosts against the same stored copy — the second refresh uses a revoked
+  token. A stale copy on another host is harmless until switched; if its
+  refresh then fails, re-fetch from the writer host.
 
 Origin: the owner's switch-chatgpt.py prototype on the litellm LXC
 (device-code login + per-account snapshots), productized 2026-09-20 after a

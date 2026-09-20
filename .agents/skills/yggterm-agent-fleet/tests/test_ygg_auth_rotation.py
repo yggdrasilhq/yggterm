@@ -273,6 +273,28 @@ def s_import():
     assert S.read_live()["tokens"]["account_id"] == "acct-flat"
 
 
+@screen("fetch/usage/refresh offline guards: bad host, unknown slug, no refresh_token")
+def s_new_verbs_guards():
+    S.reset()
+    S.write_live(make_record("a@x.io", "acct-a"))
+    assert S.run("capture").returncode == 0
+    r = S.run("fetch", "no-such-host.invalid", "a@x.io")
+    assert r.returncode == 5, f"fetch from dead host exit {r.returncode}, want 5"
+    r = S.run("fetch", "no-such-host.invalid", "a@x.io", "--activate")
+    assert r.returncode == 5, "activate fetch must fail before any live mutation"
+    assert S.read_live()["tokens"]["account_id"] == "acct-a", "failed fetch mutated the live file"
+    r = S.run("usage", "--slug", "ghost@x.io")
+    assert r.returncode == 6, f"usage unknown slug exit {r.returncode}, want 6"
+    norefresh = {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+                 "tokens": {"id_token": "x", "access_token": "y", "account_id": "acct-a"},
+                 "last_refresh": "t"}
+    S.write_live(norefresh)
+    r = S.run("refresh")
+    assert r.returncode == 6, f"refresh without refresh_token exit {r.returncode}, want 6"
+    # the failed refresh must not have touched the live file
+    assert S.read_live()["tokens"].get("access_token") == "y"
+
+
 @screen("usage errors: unknown slug exit 6; capture without live file exit 3")
 def s_usage_errors():
     r = S.run("switch", "nosuch@x.io")
@@ -300,6 +322,7 @@ def main():
     s_rotate_cooldown()
     s_import()
     s_claude_swap()
+    s_new_verbs_guards()
     s_usage_errors()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
