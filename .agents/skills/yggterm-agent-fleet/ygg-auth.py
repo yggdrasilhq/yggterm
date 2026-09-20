@@ -105,6 +105,7 @@ Exit codes: 0 ok · 2 nothing to rotate to · 3 live auth file missing ·
 import argparse
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -282,10 +283,16 @@ def save_provenance(harness, prov):
     atomic_write_json(provenance_path(harness), prov)
 
 
-def stamp_provenance(harness, slug, **kw):
+def record_hash(record):
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def stamp_provenance(harness, slug, record=None, **kw):
     prov = load_provenance(harness)
     entry = prov.get(slug) or {}
     entry.update(kw)
+    if record is not None:
+        entry["content_hash"] = record_hash(record)
     entry["updated_at"] = time.time()
     prov[slug] = entry
     save_provenance(harness, prov)
@@ -425,7 +432,7 @@ def capture(harness, name=None, lock_held=False):
 
 def _capture_locked(harness, record, slug, path, ident):
     atomic_write_json(path, record)
-    stamp_provenance(harness, slug, writer=HOSTNAME, source="capture",
+    stamp_provenance(harness, slug, record=record, writer=HOSTNAME, source="capture",
                      writer_updated_at=time.time())
     return {**ident, "slug": slug, "path": path}
 
@@ -811,7 +818,7 @@ def import_foreign(path, harness, name=None, writer=None):
         raise AuthError(6, "record carries no usable identity; pass --name to store it anyway")
     with fleet_lock():
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
-    stamp_provenance(harness, slug, writer=writer or HOSTNAME, source="import",
+    stamp_provenance(harness, slug, record=record, writer=writer or HOSTNAME, source="import",
                      writer_updated_at=time.time())
     return {"imported": slug, "identity": {k: v for k, v in ident.items() if k != "slug"}}
 
@@ -882,7 +889,8 @@ def fetch_remote(host, harness, slug, activate=False):
 
     with fleet_lock():
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
-        stamp_provenance(harness, slug, writer=writer, writer_updated_at=writer_updated_at,
+        stamp_provenance(harness, slug, record=record, writer=writer,
+                         writer_updated_at=writer_updated_at,
                          source="fetch", fetched_from=used_dest)
         if activate:
             return {**switch(harness, slug, lock_held=True), "fetched_from": used_dest}
@@ -1089,7 +1097,16 @@ def cmd_doctor(args):
                 findings.append({"slug": slug, "state": "writer-unreachable", "writer": writer,
                                  "note": f"could not reach {writer}: {remote['error']}"})
             else:
-                theirs = (remote.get(slug) or {}).get("writer_updated_at") or 0
+                their_entry = remote.get(slug) or {}
+                their_hash = their_entry.get("content_hash")
+                my_hash = entry.get("content_hash")
+                if their_hash and my_hash:
+                    state = "fresh" if their_hash == my_hash else "STALE"
+                    note = ("records identical — stamp drift only" if state == "fresh"
+                            else f"writer's copy differs — re-fetch from {writer}")
+                    findings.append({"slug": slug, "state": state, "writer": writer, "note": note})
+                    continue
+                theirs = their_entry.get("writer_updated_at") or 0
                 mine = entry.get("writer_updated_at") or 0
                 if theirs > mine + 1:
                     mins = round((theirs - mine) / 60)
@@ -1134,7 +1151,7 @@ def cmd_adopt(args):
     ident = identity_of(record)
     with fleet_lock():
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
-    stamp_provenance(harness, slug, writer="litellm", source="adopt",
+    stamp_provenance(harness, slug, record=record, writer="litellm", source="adopt",
                      writer_updated_at=time.time())
     return {"adopted": slug, "identity": {k: v for k, v in ident.items() if k != "slug"},
             "from": f"{LITELLM_VIA_HOST}:{LITELLM_CONTAINER}"}
@@ -1226,7 +1243,7 @@ def cmd_refresh(args):
             record = read_json(store_file)
             fresh = refresh_grant(record)
             atomic_write_json(store_file, fresh)
-            stamp_provenance(harness, slug, source="refresh",
+            stamp_provenance(harness, slug, record=fresh, source="refresh",
                              writer_updated_at=time.time())
             out = {"refreshed": slug, "persisted": "store"}
             live_ident = identity_of(live_record(harness)) if os.path.exists(live_path) else None
@@ -1241,7 +1258,7 @@ def cmd_refresh(args):
         atomic_write_json(live_path, fresh)
         if ident["slug"]:
             atomic_write_json(os.path.join(store_dir(harness), f"{ident['slug']}.json"), fresh)
-            stamp_provenance(harness, ident["slug"], source="refresh",
+            stamp_provenance(harness, ident["slug"], record=fresh, source="refresh",
                              writer_updated_at=time.time())
             out["persisted"] = "live+store"
         return out
