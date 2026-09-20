@@ -10747,15 +10747,20 @@ impl YggtermServer {
                 .get(&(machine_key, tool.binary_name()))
                 .copied()
         });
-        if let Some((available, cached_at_ms)) = cached
+        if let Some((available, cached_at_ms, peer_answered)) = cached
             && remote_managed_cli_ensure_entry_is_fresh(available, cached_at_ms, now)
         {
             if available {
                 return RemoteAgentLaunchGateAnswer::ProceedAndClearRefusal;
             }
-            return RemoteAgentLaunchGateAnswer::Refuse(
-                managed_cli::missing_binary_refusal_message_on_machine(tool, &ssh_target),
-            );
+            // ⛔ Refuse only on a MEASURED absence — the peer's own answer. A
+            // transport-failure negative (ssh flake, 60s TTL) must not put
+            // words in the peer's mouth.
+            if peer_answered {
+                return RemoteAgentLaunchGateAnswer::Refuse(
+                    managed_cli::missing_binary_refusal_message_on_machine(tool, &ssh_target),
+                );
+            }
         }
         if self.session_has_current_remote_cli_binary_missing_refusal(path) {
             return RemoteAgentLaunchGateAnswer::Refuse(
@@ -11020,7 +11025,7 @@ impl YggtermServer {
                         .get(&(machine_key.clone(), tool.binary_name()))
                         .copied()
                 })
-                .is_some_and(|(available, cached_at_ms)| {
+                .is_some_and(|(available, cached_at_ms, _peer_answered)| {
                     !available && remote_managed_cli_ensure_entry_is_fresh(
                         available,
                         cached_at_ms,
@@ -11040,7 +11045,7 @@ impl YggtermServer {
             }
         }
         if let Ok(cache) = remote_managed_cli_ensure_cache().lock()
-            && let Some((available, cached_at_ms)) =
+            && let Some((available, cached_at_ms, _)) =
                 cache.get(&(machine_key.clone(), tool.binary_name()))
             && remote_managed_cli_ensure_entry_is_fresh(*available, *cached_at_ms, now_ms)
         {
@@ -26322,9 +26327,15 @@ fn remote_managed_cli_ensure_entry_is_fresh(
     now_ms.saturating_sub(cached_at_ms) < ttl
 }
 
-type RemoteManagedCliEnsureCache = Mutex<HashMap<(String, &'static str), (bool, u64)>>;
+type RemoteManagedCliEnsureCache = Mutex<HashMap<(String, &'static str), (bool, u64, bool)>>;
 
-/// `(machine_key, tool)` -> (available, cached_at_ms).
+/// `(machine_key, tool)` -> (available, cached_at_ms, peer_answered). The third
+/// slot is the [11.160] honesty bit: `true` means the PEER itself answered
+/// `available: false` — a measured absence the launch gate may refuse on.
+/// A transport failure also lands `available: false` (the provisioner's own
+/// short-lived negative), but refusing a launch because ssh flaked would name
+/// the wrong cause, so a `peer_answered: false` negative rate-limits
+/// provisioning only and the gate lets the launch proceed.
 ///
 /// ⭐ The key is what makes create-vs-focus separable WITHOUT plumbing an "is
 /// this a create" flag down the attach funnel: the first launch of a tool on a
@@ -26371,8 +26382,10 @@ fn spawn_remote_managed_cli_ensure(
     }
     std::thread::spawn(move || {
         let result = ensure_remote_managed_cli(&ssh_target, exec_prefix.as_deref(), tool);
-        let available = match &result {
-            Ok(status) => status.available,
+        let (available, peer_answered) = match &result {
+            // The peer ANSWERED: its `false` is a measured absence, not a
+            // transport guess.
+            Ok(status) => (status.available, !status.available),
             Err(error) => {
                 warn!(
                     machine_key = %machine_key,
@@ -26381,11 +26394,11 @@ fn spawn_remote_managed_cli_ensure(
                     error = %error,
                     "remote managed cli ensure failed"
                 );
-                false
+                (false, false)
             }
         };
         if let Ok(mut cache) = remote_managed_cli_ensure_cache().lock() {
-            cache.insert(cache_key.clone(), (available, current_time_ms()));
+            cache.insert(cache_key.clone(), (available, current_time_ms(), peer_answered));
         }
         if let Ok(mut inflight) = remote_managed_cli_ensure_inflight().lock() {
             inflight.remove(&cache_key);
@@ -54208,10 +54221,11 @@ terminal_window_id: None,
             RemoteAgentLaunchGateAnswer::Proceed
         ));
         // Fresh negative: refuse by name, naming the machine the user named.
+        // `peer_answered: true` — the peer itself measured the absence.
         remote_managed_cli_ensure_cache()
             .lock()
             .unwrap()
-            .insert(cache_key.clone(), (false, current_time_ms()));
+            .insert(cache_key.clone(), (false, current_time_ms(), true));
         let RemoteAgentLaunchGateAnswer::Refuse(message) =
             server.remote_agent_cli_launch_gate_for_path(&key)
         else {
@@ -54266,6 +54280,7 @@ terminal_window_id: None,
                 (
                     true,
                     current_time_ms().saturating_sub(REMOTE_MANAGED_CLI_ENSURE_TTL_MS + 1_000),
+                    false,
                 ),
             );
         assert!(matches!(
@@ -54278,7 +54293,7 @@ terminal_window_id: None,
         remote_managed_cli_ensure_cache()
             .lock()
             .unwrap()
-            .insert(cache_key, (true, current_time_ms()));
+            .insert(cache_key, (true, current_time_ms(), false));
         assert!(matches!(
             server.remote_agent_cli_launch_gate_for_path(&key),
             RemoteAgentLaunchGateAnswer::ProceedAndClearRefusal
@@ -54333,6 +54348,37 @@ terminal_window_id: None,
         assert!(
             body.contains("fresh_negative"),
             "a fresh negative must still bound the re-probe cadence"
+        );
+    }
+
+    /// ⛔ THE TRANSPORT NEGATIVE MUST NOT SPEAK FOR THE PEER. A failed hop
+    /// lands `available: false` for the provisioner's rate-limit, but refusing
+    /// a launch on it names the wrong cause ("not installed" during an ssh
+    /// flake). Only a peer-answered negative refuses.
+    #[test]
+    fn a_transport_failure_negative_never_refuses_the_remote_launch() {
+        let mut server = server_with_one_remote_machine();
+        let key = server
+            .start_remote_agent_session_with_launch_options(
+                SessionKind::Codex,
+                "dev",
+                None,
+                None,
+                None,
+                &AgentLaunchOptions::default(),
+            )
+            .expect("the remote row");
+        let cache_key = (machine_key_from_ssh_target("dev"), "codex");
+        remote_managed_cli_ensure_cache()
+            .lock()
+            .unwrap()
+            .insert(cache_key, (false, current_time_ms(), false));
+        assert!(
+            matches!(
+                server.remote_agent_cli_launch_gate_for_path(&key),
+                RemoteAgentLaunchGateAnswer::Proceed
+            ),
+            "an ssh-flake negative must not become a not-installed refusal"
         );
     }
 
