@@ -31611,6 +31611,51 @@ build differs from the canonical install when the version is equal (the
 skew itself (the daemon did not rotate onto the 05:37 aggregate) is the
 [11.146]-class trigger.
 
+FIX IN CODE (2026-09-20, lane/integration/11159-demandstart, zcode seat
+sess_63b2cfdc on the muse lab host, work FROM dev; claim ACK-3772d0934c):
+the ensure's accept arm is the COMPOUND verdict — version-compatible
+status answer AND the version's bind lock actually HELD
+(`bind_lock_owner_accept_verdict`; served by
+`served_by_live_bind_lock_owner`, unix) — because each half alone is the
+defect one way or the other: version alone would accept a daemon a spawn
+could legally replace (free lock), lock alone would accept a daemon the
+client cannot talk to. A held lock proves the demand-start CANNOT win
+(the child exits `bind_lock_busy`); a version-compatible answer proves
+the holder CAN serve this client. Call sites: `ensure_local_daemon_running`
+right after its initial build-identity refusal (BEFORE the first 3 s boot
+wait — the order is source-scan-locked), and both poll loops
+(`wait_for_existing_local_daemon_boot`, `wait_for_local_daemon`) so an
+owner that appears mid-wait is accepted instead of polled to death. The
+accept traces once per process: `ensure_accepted_live_bind_lock_owner`
+with server_pid + server_build_id + client_build_id (the skew witness —
+consult Q1 correction). The deliberate upgrade stays where the doctrine
+already put it (startup reconcile + hot-restart paths). PROOF (scratch
+home, two same-version different-bits binaries placed OUTSIDE the direct
+root so install-state's boot re-exec cannot converge them): pre-fix, the
+spawn-carrying verb (`server remote start-codex`) burned 28.7 s — 169
+`stale_daemon_binary_detected` across the five stages, one
+`bind_lock_busy` child — and failed "local yggterm daemon did not become
+reachable" while the serving daemon answered pong throughout; post-fix
+the same shape accepts ~1 ms after the stale flag and the verb then
+STARTED A REAL CODEX RUNTIME on the old-bits daemon (composer painted
+16 s later). Server-lib suite 1544 pass / 1 fail = clean main's failure
+set byte-identical (the owner-gated [11.145] stamp red) + 2 new greens.
+CONSULT (gemini-3.8-flash HIGH via agy, YOLO; chain node
+lores/chain-of-thought/2026-09-20-11159-ensure-demandstart.md): Q1
+accept (predicate right; skew witness adopted); Q2 REBUT — no transport
+hazard, do NOT gate transport on build identity, gate features at the
+RPC callsite if one ever needs it; Q3 REBUT — the bequest-window race
+(lock renamed free while the predecessor still serves) deserves an
+explicit in-flight-bequest guard on the FREE-lock spawn path, filed as
+observation, NOT adopted this lane (that path is untouched by this fix
+and a litter-presence wait could stall the [11.151] dead-successor retry
+bequest); Q4 accept — the deploy-side force-rotation signal
+(`SAME_VERSION_HANDOFF_COOLDOWN_MS` stall is why the skew window is
+30-40 min long) is lifecycle-layer future work. STILL OWED: the
+`current_spawn_executable` half (canonical divert on the invoked-binary
+path, owner's call above) and the production-rotation proof (rides the
+[11.158] falsifier after this deploy).
+
 ## ⛔ [11.158] A START-BORN REMOTE ROW EXCLUDED FROM THE PEER-CLOSE GATE KEEPS ITS [11.153] PRESERVE STATE FOREVER — THE GUARD IS DELIBERATE, BUT THE CLASS IT EXCLUDES STILL ENDS IN A PERMANENT GHOST (filed 2026-09-20, the [11.155] close)
 
 **Status:** OPEN
