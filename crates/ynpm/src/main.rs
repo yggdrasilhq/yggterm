@@ -7375,6 +7375,14 @@ fn upsert_skill_record(
     }
 }
 
+fn skills_clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max - 1).collect();
+    format!("{cut}…")
+}
+
 fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     let Some(sub) = args.first() else {
         bail!("skills needs a subcommand: scan | list [--json] | info <name> | register <name> --home PATH [--summary S] [--notes N] [--tag T] | install <name> | note <name> <text> | enable <name> | disable <name> | check");
@@ -7431,22 +7439,22 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
                 return Ok(());
             }
             for record in &registry.skills {
-                let state = if record.disabled {
-                    "disabled"
+                let marker = if record.disabled {
+                    "!"
                 } else if record.installed.is_empty() {
-                    "registered"
+                    "*"
                 } else {
-                    "installed"
+                    ""
+                };
+                let body = if record.summary.is_empty() {
+                    record.home.as_str()
+                } else {
+                    record.summary.as_str()
                 };
                 println!(
-                    "{:24} {:10} {}",
-                    record.name,
-                    state,
-                    if record.summary.is_empty() {
-                        &record.home
-                    } else {
-                        &record.summary
-                    }
+                    "{:24} {}",
+                    format!("{}{marker}", record.name),
+                    skills_clip(body, 110)
                 );
                 if !record.notes.is_empty() {
                     for line in record.notes.lines() {
