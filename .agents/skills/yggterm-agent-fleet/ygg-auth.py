@@ -1455,7 +1455,7 @@ def main(argv=None):
                 mark = "⛔" if f["state"] in ("STALE",) else "·"
                 if f["state"] in ("STALE", "writer-unreachable"):
                     bad += 1
-                print(f"  {mark} {f['slug']:<38} {f['state']:<20} {f['note'][:70]}")
+                print(f"  {mark} {f['slug']:<38} {f['state']:<20} {f.get('note', '')[:70]}")
             if not out["findings"]:
                 print("  no provenance recorded at all — capture or fetch to stamp lineages")
         elif args.verb == "adopt":
