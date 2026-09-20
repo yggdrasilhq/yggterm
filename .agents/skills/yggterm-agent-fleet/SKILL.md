@@ -1322,6 +1322,55 @@ python3 .agents/skills/yggterm-agent-fleet/repo-doctor.py <repo> --grep PATTERN 
 yggdrasil, ...). Exit 0 = even/landed/found; 1 = behind/diverged/not-found;
 2 = error. Tests: `tests/test_repo_doctor.py`.
 
+## 3f. ygg-auth — the fleet auth-rotation plane (base)
+
+The owner keeps multiple paid subscriptions per harness so the fleet can
+rotate; `ygg-auth.py` makes rotation a verb instead of a human hand-editing
+`~/.codex/auth.json`. THE rate-limit remedy: when a harness walls you on
+usage, rotate to another account and keep working.
+
+```
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py status                  # live identity + every profile
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py capture                 # snapshot the live account
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py switch <email>          # move to a stored account
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py rotate                  # next fresh account (the rate-limit verb)
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py login                   # device-code OAuth for a NEW account (owner's browser)
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py import <flat.json>     # seed from a litellm-prototype record
+python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py harnesses --json        # what each harness supports
+```
+
+Every verb takes `--json`; `--harness claude` targets another harness (claude:
+swap supported, login not yet). `CODEX_HOME`/`CLAUDE_CONFIG_DIR` are honored,
+so `CODEX_HOME=~/.codex-litellm ygg-auth.py rotate` rotates a parallel codex
+root independently.
+
+Mechanics an agent must know before relying on it:
+
+- **capture-on-leave is the invariant.** Before any switch overwrites the live
+  file it re-snapshots the CURRENT record, because the harness refreshes tokens
+  in place while running — and OAuth refresh ROTATES refresh tokens, so a stale
+  capture would come back bricked. The swap itself fingerprints the live file
+  and re-reads if the harness rewrote it mid-capture.
+- **rotate puts the vacated account on cooldown** (30 min, `--cooldown-minutes`
+  to change, 0 to disable) so rotation cannot cycle straight back into the
+  quota-locked account it just fled. `status` shows the cooldown.
+- **Applies to NEW invocations.** A running codex/claude session keeps the
+  tokens it loaded at start; rotate, then start fresh rows.
+- **Credentials never leave the host.** The store is
+  `~/.yggterm/auth/<harness>/` — never in `~/.yggterm/memory`, never posted to
+  a board, never synced. No verb prints a token. Violating this is the one way
+  this tool can hurt the fleet.
+
+⛔ **The one sanctioned exception to the Harness Isolation Law (§5):**
+`ygg-auth.py` may swap a harness's WHOLE auth file (`~/.codex/auth.json`,
+`~/.claude/.credentials.json`) atomically — capture-then-replace, never a
+piecemeal edit of harness state. Everything else in that law stands.
+
+Origin: the owner's switch-chatgpt.py prototype on the litellm LXC
+(device-code login + per-account snapshots), productized 2026-09-20 after a
+gemini-3.8-flash-high consult (cooldown state, refresh-race guard, umask 077
+landed from its verdicts). Tests: `tests/test_ygg_auth_rotation.py`.
+
 ## 4. Correspondence — any session can reach any other
 
 A row is an address. That is the whole mechanism, and it needs no new protocol:
@@ -1444,6 +1493,7 @@ python3 .agents/skills/yggterm-agent-fleet/ygg-memory.py publish --file <finding
 
 - ⛔ **Private harness stores are strictly PRIVATE:** No agent (Gemini/Antigravity, Grok, Codex, Kimi, Muse, etc.) is permitted to write directly into another harness's private directory (`~/.claude/`, `~/.gemini/`, `~/.grok/`, `~/.codex/`).
 - ✅ **Reading is allowed; writing is forbidden:** An agent may read another harness's files if needed for context, but must NEVER mutate them.
+- ⭐ **The ONE sanctioned exception — `ygg-auth.py` (owner, 2026-09-20):** the fleet auth-rotation plane may swap a harness's WHOLE auth file (`~/.codex/auth.json`, `~/.claude/.credentials.json`) atomically, capture-then-replace — never a piecemeal edit of harness state. See §3f. Everything else in this law stands unchanged.
 - ⭐ **The Unified Store is the Only Conduit:** Cross-harness knowledge sharing must travel through `~/.yggterm/memory/` (via `ygg-memory publish`) or canonical project repository documents (e.g. `docs/discussions/`).
 
 ---
