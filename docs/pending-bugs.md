@@ -30735,7 +30735,7 @@ resumes when [11.159] lands.
 
 ## ⛔ [11.160] A REMOTE ROW'S LAUNCH REFUSAL PAINTS RAW INTO THE VIEWPORT WHILE THE STATE PLANE KEEPS CLAIMING RUNNING·IDLE — THE USER SEES AN ERROR DUMP YGGTERM SHOULD HAVE STAMPED, AND THE METADATA LIES ABOUT IT (owner-reported 2026-09-20 ~08:10 with a screenshot)
 
-**Status:** FIXED IN CODE (lane/integration/11160-rawpaint a714cd87, want=next; live proof + close pending — the entry closes per the verified-fix law only after the refusal window is driven on production)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The owner opened a new dev Codex row from the GUI (`remote-session://dev/
 3f3fcfee-d5a2-40f6-8f8c-604ead426b27`) while the peer's codex launch binary
