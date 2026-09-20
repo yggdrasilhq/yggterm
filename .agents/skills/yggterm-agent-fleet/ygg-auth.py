@@ -41,12 +41,16 @@ VERBS:
   list    [--harness H] [--json]   stored profiles only
   capture [--harness H] [--name S] snapshot the live record into the store
   switch  <slug> [--harness H] [--json]  capture-on-leave, then atomic swap
-  rotate  [--harness H] [--cooldown-minutes N] [--json]
-                                   switch to the next fresh profile (rate-limit
-                                   verb); the vacated account is put on cooldown
-                                   (default 30 min) so rotation cannot cycle
-                                   straight back into a quota-locked profile
-  login   [--harness H] [--name S] device-code OAuth (codex only; owner completes it)
+  rotate  [--harness H] [--fast] [--cooldown-minutes N] [--json]
+                                   rotate off the current profile (rate-limit
+                                   verb); ranks candidates by MEASURED headroom
+                                   from the usage endpoint, clock heuristic when
+                                   --fast or the API is down; the vacated account
+                                   goes on cooldown (default 30 min)
+  login   [--harness H] [--name S] [--no-notify]
+                                   device-code OAuth (codex only; owner completes
+                                   it); the code also lands on a pinned infra/auth
+                                   card that auto-closes when the poll ends
   import  <file> [--harness H] [--name S]
                                    convert a foreign auth record (the litellm
                                    prototype's flat {access_token, refresh_token,
@@ -56,18 +60,35 @@ VERBS:
   fetch   <host> <slug> [--harness H] [--activate]
                                    copy a profile from another fleet host's store
                                    over ssh (owner-authorized use; the record is
-                                   pulled, never pushed) and optionally activate it
+                                   pulled, never pushed) and optionally activate it.
+                                   Destinations self-learn: a working user@host is
+                                   remembered under its bare alias
   usage   [--harness H] [--slug S] [--json]
                                    measured rate-limit state per profile from
                                    chatgpt.com/backend-api/codex/usage — per-plan
                                    windows (5h/7d on plus, longer on free) with
                                    used_percent and resets; read-only, never refreshes
-  refresh [<slug>] [--harness H]   renew tokens via the OAuth refresh grant and
+  refresh [<slug>] [--harness H] [--force]
+                                   renew tokens via the OAuth refresh grant and
                                    persist atomically (default: the live profile).
-                                   ⛔ single-writer: a profile replicated across
-                                   hosts must be refreshed only on the host where
-                                   it is LIVE — refresh rotates the refresh token
-                                   and orphans every other host's copy (re-fetch)
+                                   ⛔ single-writer, now ENFORCED from provenance:
+                                   refreshing a lineage owned by another host
+                                   refuses without --force
+  fleet   [--hosts a,b,c] [--save]
+                                   accounts × hosts matrix over ssh — who is live
+                                   on what, per host (dream ACK-68ce18afa6)
+  doctor  [--harness H] [--json]   flag stale replicas against each lineage's
+                                   recorded writer; re-fetch where it says STALE
+  provenance [--harness H] [--json]
+                                   the raw lineage sidecar (writer, stamps)
+  adopt   [--harness H] [--name S] [--json]
+                                   adopt the account the litellm proxy currently
+                                   holds — its live auth.json is the only fresh
+                                   copy of its lineages (dream ACK-447fefa6b4)
+  litellm-switch <slug> [--harness H]
+                                   push a stored profile INTO litellm, restart the
+                                   stack, verify health; litellm owns the lineage
+                                   afterward — re-adopt to re-sync the fleet
   harnesses                        the registry: what each harness supports
 
 Applies to NEW harness invocations: a running codex/claude session keeps the
@@ -87,6 +108,7 @@ import fcntl
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -100,6 +122,14 @@ from datetime import datetime, timezone
 STORE_ROOT = os.environ.get("YGG_AUTH_HOME") or os.path.expanduser("~/.yggterm/auth")
 LOCK_FILE = os.path.join(STORE_ROOT, ".lock")
 DEFAULT_COOLDOWN_MINUTES = 30
+HOSTNAME = socket.gethostname()
+FLEET_HOSTS_FILE = os.path.join(STORE_ROOT, ".fleet-hosts")
+SSH_DESTS_FILE = os.path.join(STORE_ROOT, ".ssh-dests.json")
+PROVENANCE_FILE = os.path.join(STORE_ROOT, ".provenance")
+LITELLM_VIA_HOST = "manin"
+LITELLM_CONTAINER = "litellm"
+LITELLM_TOKEN_DIR = "/root/chatgpt_tokens"
+LITELLM_CONTAINER_NAME = "root-litellm-1"
 
 CHATGPT_AUTH_BASE = "https://auth.openai.com"
 CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -231,6 +261,93 @@ def cooling_until(harness, slug):
     return float(until) if until and float(until) > time.time() else None
 
 
+# Provenance — dream ACK-68ce18afa6. The auth record itself stays VERBATIM
+# (restore = byte-faithful swap), so lineage facts live in a sidecar:
+#   slug -> {writer, writer_updated_at, source, fetched_from, updated_at}
+# writer = the host that owns the lineage (the only one that may refresh it);
+# writer_updated_at = the writer's own mutation stamp, copied at fetch time,
+# which is what `doctor` compares to flag stale replicas.
+def provenance_path(harness):
+    return os.path.join(store_dir(harness), ".provenance.json")
+
+
+def load_provenance(harness):
+    try:
+        return read_json(provenance_path(harness))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_provenance(harness, prov):
+    atomic_write_json(provenance_path(harness), prov)
+
+
+def stamp_provenance(harness, slug, **kw):
+    prov = load_provenance(harness)
+    entry = prov.get(slug) or {}
+    entry.update(kw)
+    entry["updated_at"] = time.time()
+    prov[slug] = entry
+    save_provenance(harness, prov)
+    return entry
+
+
+def get_writer(harness, slug):
+    return (load_provenance(harness).get(slug) or {}).get("writer")
+
+
+# Self-learning ssh destinations — dream ACK-62a8b4abe4. Hosts disagree about
+# who an alias is (oc: dev=root, jojo: dev=pi); remember per host which
+# destination actually reached a store, and try memories before the raw alias.
+def load_ssh_dests():
+    try:
+        return read_json(SSH_DESTS_FILE)
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_ssh_dest(dest):
+    if "@" not in dest:
+        return
+    bare = dest.split("@", 1)[1]
+    mem = load_ssh_dests()
+    variants = mem.get(bare, [])
+    if dest not in variants:
+        mem[bare] = [dest] + variants
+        atomic_write_json(SSH_DESTS_FILE, mem)
+
+
+def ssh_dest_candidates(dest):
+    if "@" in dest:
+        return [dest]
+    mem = load_ssh_dests().get(dest, [])
+    return (mem + [dest]) if dest not in mem else mem
+
+
+def load_fleet_hosts():
+    try:
+        with open(FLEET_HOSTS_FILE) as f:
+            return [h.strip() for h in f.read().split(",") if h.strip()]
+    except OSError:
+        return []
+
+
+def save_fleet_hosts(hosts):
+    os.makedirs(STORE_ROOT, exist_ok=True)
+    with open(FLEET_HOSTS_FILE, "w") as f:
+        f.write(",".join(hosts))
+
+
+def ssh_script(host_dest, argv, script_bytes, timeout=40):
+    """Run this script on a remote host via stdin (no remote install needed)."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host_dest,
+           "python3", "-", *argv]
+    try:
+        return subprocess.run(cmd, input=script_bytes, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def read_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -308,6 +425,8 @@ def capture(harness, name=None, lock_held=False):
 
 def _capture_locked(harness, record, slug, path, ident):
     atomic_write_json(path, record)
+    stamp_provenance(harness, slug, writer=HOSTNAME, source="capture",
+                     writer_updated_at=time.time())
     return {**ident, "slug": slug, "path": path}
 
 
@@ -381,8 +500,33 @@ def switch(harness, slug, lock_held=False):
     return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured}
 
 
-def pick_rotate_target(harness):
-    """Next profile that is neither live, expired, nor cooling (consult 2026-09-20)."""
+def rotate_score(p, measure=True):
+    """(tier, headroom, slug): tier 0 measured-ok, 1 measured-limited,
+    2 unmeasurable (expired access), 3 measurement failed. Headroom is the
+    primary window's free percent — higher is better. Module-level so tests
+    can drive it with a stubbed usage_snapshot."""
+    if not measure:
+        return (0, 0, p["slug"])
+    try:
+        snap = usage_snapshot(read_json(p["path"]))
+    except (OSError, ValueError):
+        snap = {"ok": False, "error": "unreadable"}
+    if snap.get("ok"):
+        pri = snap.get("primary") or {}
+        used = pri.get("used_percent")
+        tier = 1 if snap.get("limit_reached") else 0
+        return (tier, 100 - (used if isinstance(used, (int, float)) else 100), p["slug"])
+    if p["expired"]:
+        return (2, 0, p["slug"])  # dead access: measurable only after activation
+    return (3, 0, p["slug"])
+
+
+def pick_rotate_target(harness, measure=True):
+    """Next profile to rotate to (dream ACK-37c41cbde1): when measurement is
+    on, candidates rank by MEASURED headroom from the usage endpoint — an
+    account at 2% beats one at 100% regardless of slug order. Falls back to
+    the clock heuristic (slug order + cooldowns) when the API is unreachable
+    or --fast was passed."""
     profiles = stored_profiles(harness)
     if not profiles:
         raise AuthError(2, f"no stored profiles for {harness} — nothing to rotate to; run `capture` or `login`")
@@ -399,9 +543,21 @@ def pick_rotate_target(harness):
     def warn(message):
         print(f"⚠️  {message}", file=sys.stderr)
 
+    measured = {}
+    if measure:
+        for p in others:
+            measured[p["slug"]] = rotate_score(p, measure=True)
+        if all(t == 3 for t, _, _ in measured.values()):
+            warn("usage endpoint unreachable for every candidate — falling back to slug order")
+            measure = False
+
     fresh = [p for p in others if not p["expired"] and cooldown_left(p) <= 0]
     if fresh:
-        return min(fresh, key=lambda p: p["slug"]), True
+        if measure:
+            pick = min(fresh, key=lambda p: measured.get(p["slug"], (0, 0, p["slug"])))
+        else:
+            pick = min(fresh, key=lambda p: p["slug"])
+        return pick, True
     if all(cooldown_left(p) > 0 for p in others) and all(not p["expired"] for p in others):
         warn("every other profile is rate-limit cooling; rotating to the one closest to its cooldown end")
     elif not any(not p["expired"] for p in others):
@@ -409,6 +565,8 @@ def pick_rotate_target(harness):
     else:
         warn("no fully fresh profile; rotating to the best available")
     pool = [p for p in others if not p["expired"]] or others
+    if measure:
+        return min(pool, key=lambda p: (cooldown_left(p), measured.get(p["slug"], (0, 0, p["slug"])))), False
     return min(pool, key=lambda p: (cooldown_left(p), p["slug"])), False
 
 
@@ -416,13 +574,16 @@ def cmd_status(args):
     harness = require_harness(args.harness)
     ident = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
     profiles = stored_profiles(harness)
+    prov = load_provenance(harness)
     for p in profiles:
         p["live"] = bool(ident and p["slug"] and p["slug"] == ident["slug"])
         cooling = cooling_until(harness, p["slug"]) if p["slug"] else None
         p["cooling_until"] = cooling
         p["cooldown_minutes_left"] = round((cooling - time.time()) / 60) if cooling else 0
+        p["provenance"] = prov.get(p["slug"] or "")
     out = {
         "harness": harness,
+        "host": HOSTNAME,
         "auth_file": HARNESSES[harness]["auth_file"](harness),
         "live": ident,
         "profiles": [{k: v for k, v in p.items() if k != "path"} for p in profiles],
@@ -454,7 +615,7 @@ def cmd_switch(args):
 def cmd_rotate(args):
     harness = require_harness(args.harness)
     with fleet_lock():
-        target, _ = pick_rotate_target(harness)
+        target, _ = pick_rotate_target(harness, measure=not args.fast)
         vacated = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
         result = switch(harness, target["slug"], lock_held=True)
         cooldown = None
@@ -482,8 +643,24 @@ def now_rfc3339_nanos():
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".%09dZ" % (dt.microsecond * 1000)
 
 
-def device_login(harness, name=None):
-    """Ported from the proven litellm prototype: codex device-code OAuth."""
+def _msgboard_post(args_list):
+    """Best-effort msgGraph post; the plane exists on fleet hosts, not everywhere."""
+    msgboard = os.path.expanduser("~/data/msggraph/bin/msgboard")
+    if not os.path.exists(msgboard):
+        return None
+    try:
+        proc = subprocess.run([msgboard, *args_list], capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    m = re.search(r"ACK-[0-9a-f]+", proc.stdout)
+    return m.group(0) if m else None
+
+
+def device_login(harness, name=None, notify=True):
+    """Ported from the proven litellm prototype: codex device-code OAuth.
+    Dream ACK-52ebf788f0: the code is the one thing a human must touch, so it
+    also goes where the owner actually looks — a pinned msgGraph card that
+    auto-closes when the poll completes."""
     if HARNESSES[harness]["login"] is None:
         raise AuthError(4, f"login is not implemented for {harness}: {HARNESSES[harness]['live_note']}")
 
@@ -513,6 +690,19 @@ def device_login(harness, name=None):
     print(f"  1) open  {CHATGPT_AUTH_BASE}/codex/device  in a browser")
     print(f"  2) enter the code:  {user_code}")
     print(f"  polling every {interval}s (timeout {DEVICE_CODE_TIMEOUT_SECONDS // 60} min)…", file=sys.stderr)
+    notify_ack = None
+    if notify:
+        notify_ack = _msgboard_post([
+            "post", "infra/auth", "--kind", "question", "--ttl-days", "0",
+            "--tags", "ygg-auth,device-login",
+            "--body",
+            f"⏳ device login needed on {HOSTNAME} ({harness}): open "
+            f"{CHATGPT_AUTH_BASE}/codex/device and enter code {user_code} "
+            f"(expires in {DEVICE_CODE_TIMEOUT_SECONDS // 60} min). This card "
+            f"auto-closes when the poll completes.",
+        ])
+        if notify_ack:
+            print(f"  card posted: {notify_ack} (infra/auth)", file=sys.stderr)
 
     deadline = time.time() + DEVICE_CODE_TIMEOUT_SECONDS
     auth_code_data = None
@@ -532,6 +722,9 @@ def device_login(harness, name=None):
         sys.stderr.flush()
         time.sleep(interval)
     if auth_code_data is None:
+        if notify_ack:
+            _msgboard_post(["answer", "infra/auth", notify_ack, "--body",
+                            f"⛔ poll timed out on {HOSTNAME} — run login again for a fresh code"])
         raise AuthError(5, "timed out waiting for browser authorization")
 
     try:
@@ -559,6 +752,10 @@ def device_login(harness, name=None):
     }
     ident = identity_of(record)
     slug = name or ident["slug"] or "unnamed-account"
+    if notify_ack:
+        _msgboard_post(["answer", "infra/auth", notify_ack, "--body",
+                        f"✅ login completed on {HOSTNAME} as {ident['email']} ({ident['plan']}); "
+                        f"profile {slug} stored + live"])
 
     with fleet_lock():
         live_path = HARNESSES[harness]["auth_file"](harness)
@@ -576,10 +773,11 @@ def device_login(harness, name=None):
 
 
 def cmd_login(args):
-    return device_login(require_harness(args.harness), name=args.name)
+    return device_login(require_harness(args.harness), name=args.name,
+                        notify=not args.no_notify)
 
 
-def import_foreign(path, harness, name=None):
+def import_foreign(path, harness, name=None, writer=None):
     """Convert a flat litellm-prototype record into the harness's own shape.
 
     The prototype on the litellm LXC stores {access_token, refresh_token,
@@ -613,6 +811,8 @@ def import_foreign(path, harness, name=None):
         raise AuthError(6, "record carries no usable identity; pass --name to store it anyway")
     with fleet_lock():
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
+    stamp_provenance(harness, slug, writer=writer or HOSTNAME, source="import",
+                     writer_updated_at=time.time())
     return {"imported": slug, "identity": {k: v for k, v in ident.items() if k != "slug"}}
 
 
@@ -627,31 +827,67 @@ def fetch_remote(host, harness, slug, activate=False):
 
     Pull, never push: the remote host is the authority for its own records
     (owner-authorized cross-host provisioning, 2026-09-20). ssh must work
-    keyless (BatchMode) — the fleet standard.
+    keyless (BatchMode) — the fleet standard. Destinations are self-learned
+    (dream ACK-62a8b4abe4): a working user@host is remembered under its bare
+    alias and tried first next time. Provenance (dream ACK-68ce18afa6): the
+    remote's writer + writer stamp ride along, so doctor can compare.
     """
     require_harness(harness)
     slug = slug_for(slug)
     remote_path = f"~/.yggterm/auth/{harness}/{slug}.json"
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "cat", remote_path]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        raise AuthError(5, f"ssh {host} timed out reading {remote_path}")
-    if proc.returncode != 0:
-        raise AuthError(5, f"ssh {host} could not read {remote_path}: {proc.stderr.strip()[:200]}")
-    try:
-        record = json.loads(proc.stdout)
-    except ValueError:
-        raise AuthError(5, f"{host}:{remote_path} is not valid JSON — refusing to store it")
+    record = None
+    used_dest = None
+    last_err = "no destination tried"
+    for dest in ssh_dest_candidates(host):
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", dest,
+               "cat", remote_path]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            last_err = f"ssh {dest} timed out"
+            continue
+        if proc.returncode == 0:
+            try:
+                record = json.loads(proc.stdout)
+            except ValueError:
+                last_err = f"{dest}:{remote_path} is not valid JSON"
+                continue
+            used_dest = dest
+            break
+        last_err = f"ssh {dest}: {proc.stderr.strip()[:160]}"
+    if record is None:
+        raise AuthError(5, f"could not read {slug} from {host}: {last_err}")
+    remember_ssh_dest(used_dest)
+
     ident = identity_of(record)
     if ident["slug"] and ident["slug"] != slug:
-        raise AuthError(6, f"record at {host}:{remote_path} identifies as {ident['slug']!r}, not {slug!r}")
+        raise AuthError(6, f"record at {used_dest}:{remote_path} identifies as {ident['slug']!r}, not {slug!r}")
+
+    # carry the remote's lineage stamp when the remote keeps provenance
+    writer, writer_updated_at = None, None
+    prov_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", used_dest,
+                "cat", f"~/.yggterm/auth/{harness}/.provenance.json"]
+    try:
+        prov_proc = subprocess.run(prov_cmd, capture_output=True, text=True, timeout=20)
+        if prov_proc.returncode == 0:
+            remote_prov = (json.loads(prov_proc.stdout) or {}).get(slug) or {}
+            writer = remote_prov.get("writer")
+            writer_updated_at = remote_prov.get("writer_updated_at")
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
+    if writer is None:
+        writer = used_dest.split("@")[-1]
+    if writer_updated_at is None:
+        writer_updated_at = time.time()
+
     with fleet_lock():
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
+        stamp_provenance(harness, slug, writer=writer, writer_updated_at=writer_updated_at,
+                         source="fetch", fetched_from=used_dest)
         if activate:
-            return {**switch(harness, slug, lock_held=True), "fetched_from": host}
-    return {"fetched_from": host, "slug": slug, "identity": {k: v for k, v in ident.items() if k != "slug"},
-            "activated": False}
+            return {**switch(harness, slug, lock_held=True), "fetched_from": used_dest}
+    return {"fetched_from": used_dest, "slug": slug,
+            "writer": writer, "activated": False}
 
 
 def cmd_fetch(args):
@@ -760,6 +996,217 @@ def refresh_grant(record):
     return new
 
 
+def _fleet_host_status(host, script_bytes):
+    """One host's status --json, via stdin-executed script (no remote install).
+    Returns the parsed payload or an {"error": ...} dict. Self is handled by
+    the caller — this always goes over ssh."""
+    last = {"error": f"no destination for {host}"}
+    for dest in ssh_dest_candidates(host):
+        proc = ssh_script(dest, ["--json", "status"], script_bytes)
+        if proc is None:
+            last = {"error": f"ssh {dest} timed out"}
+            continue
+        if proc.returncode == 0:
+            try:
+                parsed = json.loads(proc.stdout.decode("utf-8"))
+                remember_ssh_dest(dest)
+                return parsed
+            except ValueError:
+                last = {"error": f"{dest}: unparseable output"}
+                continue
+        err = proc.stderr.decode("utf-8", "replace").strip()[:120]
+        last = {"error": f"ssh {dest}: {err or proc.returncode}"}
+    return last
+
+
+def cmd_fleet(args):
+    harness = require_harness(args.harness)
+    if args.hosts:
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+        if args.save:
+            save_fleet_hosts(hosts)
+    else:
+        hosts = load_fleet_hosts() or [HOSTNAME]
+    script_bytes = open(os.path.abspath(__file__), "rb").read()
+    rows = {}
+    for host in hosts:
+        if host == HOSTNAME:
+            rows[host] = cmd_status(type("NS", (), {"harness": harness})())
+        else:
+            rows[host] = _fleet_host_status(host, script_bytes)
+    slugs = []
+    for row in rows.values():
+        for p in row.get("profiles", []) or []:
+            s = p.get("slug")
+            if s and s not in slugs:
+                slugs.append(s)
+    return {"harness": harness, "hosts": hosts, "accounts": slugs, "rows": rows}
+
+
+def cmd_doctor(args):
+    harness = require_harness(args.harness)
+    prov = load_provenance(harness)
+    findings = []
+    hosts_needed = set()
+    for slug, entry in prov.items():
+        writer = entry.get("writer")
+        if not writer or writer in (HOSTNAME, "unknown", "litellm"):
+            continue
+        hosts_needed.add(writer)
+    script_bytes = open(os.path.abspath(__file__), "rb").read()
+    remote_prov = {}
+    for host in hosts_needed:
+        for dest in ssh_dest_candidates(host):
+            proc = ssh_script(dest, ["--json", "provenance", "--harness", harness], script_bytes, timeout=30)
+            if proc is not None and proc.returncode == 0:
+                try:
+                    remote_prov[host] = json.loads(proc.stdout.decode("utf-8"))
+                    remember_ssh_dest(dest)
+                except ValueError:
+                    remote_prov[host] = {"error": "unparseable"}
+                break
+        else:
+            remote_prov[host] = {"error": "unreachable"}
+
+    for slug in sorted(prov):
+        entry = prov[slug]
+        writer = entry.get("writer")
+        if not writer:
+            findings.append({"slug": slug, "state": "no-lineage",
+                             "note": "no provenance recorded; capture or fetch to stamp it"})
+        elif writer == HOSTNAME:
+            findings.append({"slug": slug, "state": "writer-here",
+                             "note": "this host owns the lineage"})
+        elif writer == "litellm":
+            findings.append({"slug": slug, "state": "writer-litellm",
+                             "note": "lineage rotates inside litellm; re-adopt from its live auth.json, never refresh here"})
+        elif writer == "unknown":
+            findings.append({"slug": slug, "state": "writer-unknown",
+                             "note": "imported without a known writer; treat as dormant"})
+        else:
+            remote = remote_prov.get(writer) or {}
+            if "error" in remote:
+                findings.append({"slug": slug, "state": "writer-unreachable", "writer": writer,
+                                 "note": f"could not reach {writer}: {remote['error']}"})
+            else:
+                theirs = (remote.get(slug) or {}).get("writer_updated_at") or 0
+                mine = entry.get("writer_updated_at") or 0
+                if theirs > mine + 1:
+                    mins = round((theirs - mine) / 60)
+                    findings.append({"slug": slug, "state": "STALE", "writer": writer,
+                                     "note": f"writer moved ahead ~{mins}m ago — re-fetch from {writer}"})
+                else:
+                    findings.append({"slug": slug, "state": "fresh", "writer": writer})
+    return {"harness": harness, "host": HOSTNAME, "findings": findings}
+
+
+def cmd_provenance(args):
+    return load_provenance(require_harness(args.harness))
+
+
+def _litellm_ssh(cmd_argv, stdin_bytes=None, timeout=30):
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", LITELLM_VIA_HOST,
+           f"lxc-attach -n {LITELLM_CONTAINER} -- {cmd_argv}"]
+    try:
+        return subprocess.run(cmd, input=stdin_bytes, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def cmd_adopt(args):
+    """Dream ACK-447fefa6b4: adopt what the litellm proxy currently holds.
+    Its live auth.json is the only place its lineages stay fresh (rotation)."""
+    harness = require_harness(args.harness)
+    proc = _litellm_ssh(f"cat {LITELLM_TOKEN_DIR}/auth.json")
+    if proc is None:
+        raise AuthError(5, f"ssh {LITELLM_VIA_HOST} → {LITELLM_CONTAINER} timed out")
+    if proc.returncode != 0:
+        raise AuthError(5, f"litellm read failed: {proc.stderr.decode('utf-8', 'replace').strip()[:160]}")
+    try:
+        flat = json.loads(proc.stdout.decode("utf-8"))
+    except ValueError:
+        raise AuthError(5, "litellm auth.json is not valid JSON")
+    ident_preview = identity_of(flat)
+    slug = slug_for(args.name) if args.name else ident_preview["slug"]
+    if not slug:
+        raise AuthError(6, "could not identify the litellm account; pass --name")
+    record = convert_flat(flat, harness)
+    ident = identity_of(record)
+    with fleet_lock():
+        atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
+    stamp_provenance(harness, slug, writer="litellm", source="adopt",
+                     writer_updated_at=time.time())
+    return {"adopted": slug, "identity": {k: v for k, v in ident.items() if k != "slug"},
+            "from": f"{LITELLM_VIA_HOST}:{LITELLM_CONTAINER}"}
+
+
+def convert_flat(flat, harness):
+    """Flat litellm record → the harness's own nested shape (verbatim codecs)."""
+    if not isinstance(flat, dict) or not all(k in flat for k in ("access_token", "refresh_token", "id_token")):
+        raise AuthError(6, "not a flat litellm auth record (need access_token, refresh_token, id_token)")
+    if "tokens" in flat:
+        raise AuthError(6, "record already carries a tokens block — import the flat prototype format, or use `capture`")
+    return {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": flat["id_token"],
+            "access_token": flat["access_token"],
+            "refresh_token": flat["refresh_token"],
+            "account_id": flat.get("account_id") or identity_of(flat).get("account_id") or "none",
+        },
+        "last_refresh": now_rfc3339_nanos(),
+    }
+
+
+def cmd_litellm_switch(args):
+    """Push a stored profile INTO litellm (reverse of adopt), then restart its
+    stack and verify health — the prototype's restart_litellm_stack, productized.
+    ⚠ after this, litellm owns the lineage: refreshes there will orphan the
+    fleet's copies (re-adopt to re-sync)."""
+    harness = require_harness(args.harness)
+    if not args.slug:
+        raise AuthError(6, "litellm-switch needs a profile slug")
+    slug = slug_for(args.slug)
+    store_file = os.path.join(store_dir(harness), f"{slug}.json")
+    if not os.path.exists(store_file):
+        raise AuthError(6, f"no stored profile {slug!r} for {harness}")
+    nested = read_json(store_file)
+    tokens = nested.get("tokens") or nested
+    flat = {
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token"),
+        "id_token": tokens.get("id_token"),
+        "account_id": tokens.get("account_id"),
+        "expires_at": (identity_of(nested).get("expires_at") or 0),
+    }
+    payload = (json.dumps(flat, indent=2) + "\n").encode()
+    writer = _litellm_ssh(f"sh -c 'cat > {LITELLM_TOKEN_DIR}/auth.json.tmp && "
+                          f"mv {LITELLM_TOKEN_DIR}/auth.json.tmp {LITELLM_TOKEN_DIR}/auth.json && "
+                          f"chmod 600 {LITELLM_TOKEN_DIR}/auth.json'",
+                          stdin_bytes=payload, timeout=30)
+    if writer is None or writer.returncode != 0:
+        err = writer.stderr.decode("utf-8", "replace").strip()[:160] if writer else "timed out"
+        raise AuthError(5, f"writing litellm auth.json failed: {err}")
+    snap = _litellm_ssh(f"sh -c 'cp {LITELLM_TOKEN_DIR}/auth.json {LITELLM_TOKEN_DIR}/auth_{slug}.json'")
+    restart = _litellm_ssh(f"docker restart {LITELLM_CONTAINER_NAME}", timeout=60)
+    if restart is None or restart.returncode != 0:
+        raise AuthError(5, "litellm auth written but the container restart failed — check docker on "
+                           f"{LITELLM_VIA_HOST}")
+    healthy = False
+    for _ in range(6):
+        time.sleep(2)
+        probe = _litellm_ssh("python3 -c \"import urllib.request;print(urllib.request.urlopen("
+                             "'http://127.0.0.1:4000/health/liveliness',timeout=5).status)\"",
+                             timeout=20)
+        if probe is not None and probe.returncode == 0 and b"200" in probe.stdout:
+            healthy = True
+            break
+    stamp_provenance(harness, slug, writer="litellm", source="litellm-switch",
+                     writer_updated_at=time.time())
+    return {"litellm_switched": slug, "healthy": healthy, "note": "litellm owns this lineage now; re-adopt after its refreshes"}
+
+
 def cmd_refresh(args):
     harness = require_harness(args.harness)
     live_path = HARNESSES[harness]["auth_file"](harness)
@@ -769,9 +1216,18 @@ def cmd_refresh(args):
             store_file = os.path.join(store_dir(harness), f"{slug}.json")
             if not os.path.exists(store_file):
                 raise AuthError(6, f"no stored profile {slug!r} for {harness}")
+            writer = get_writer(harness, slug)
+            if (writer and writer != HOSTNAME and writer != "unknown"
+                    and not args.force):
+                raise AuthError(
+                    5, f"{slug}'s lineage is owned by {writer} (single-writer law, "
+                       f"SKILL.md §3f) — refresh there, or re-fetch from {writer}; "
+                       f"--force overrides")
             record = read_json(store_file)
             fresh = refresh_grant(record)
             atomic_write_json(store_file, fresh)
+            stamp_provenance(harness, slug, source="refresh",
+                             writer_updated_at=time.time())
             out = {"refreshed": slug, "persisted": "store"}
             live_ident = identity_of(live_record(harness)) if os.path.exists(live_path) else None
             if live_ident and live_ident["slug"] == slug:
@@ -785,6 +1241,8 @@ def cmd_refresh(args):
         atomic_write_json(live_path, fresh)
         if ident["slug"]:
             atomic_write_json(os.path.join(store_dir(harness), f"{ident['slug']}.json"), fresh)
+            stamp_provenance(harness, ident["slug"], source="refresh",
+                             writer_updated_at=time.time())
             out["persisted"] = "live+store"
         return out
 
@@ -846,7 +1304,9 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_switch)
 
-    p = sub.add_parser("rotate", parents=[sub_parent], help="switch to the next fresh profile — the rate-limit verb")
+    p = sub.add_parser("rotate", parents=[sub_parent], help="switch to the freshest profile — the rate-limit verb")
+    p.add_argument("--fast", action="store_true",
+                   help="skip usage measurement; rank by slug order + cooldowns only")
     p.add_argument("--cooldown-minutes", type=int, default=DEFAULT_COOLDOWN_MINUTES,
                    help=f"put the vacated account on cooldown (default {DEFAULT_COOLDOWN_MINUTES}; 0 disables)")
     p.add_argument("--json", action="store_true")
@@ -854,8 +1314,39 @@ def main(argv=None):
 
     p = sub.add_parser("login", parents=[sub_parent], help="device-code OAuth into a NEW account (codex)")
     p.add_argument("--name", help="override the profile slug")
+    p.add_argument("--no-notify", action="store_true",
+                   help="do not post the device-code card to infra/auth")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("fleet", parents=[sub_parent],
+                       help="accounts × hosts matrix over ssh (provenance-aware)")
+    p.add_argument("--hosts", help="comma-separated host list (persisted with --save)")
+    p.add_argument("--save", action="store_true", help="remember this host list as the default")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_fleet)
+
+    p = sub.add_parser("doctor", parents=[sub_parent],
+                       help="flag stale replicas against each lineage's writer")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("provenance", parents=[sub_parent],
+                       help="the raw lineage sidecar (writer, stamps)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_provenance)
+
+    p = sub.add_parser("adopt", parents=[sub_parent],
+                       help="adopt the account the litellm proxy currently holds")
+    p.add_argument("--name", help="override the profile slug")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_adopt)
+
+    p = sub.add_parser("litellm-switch", parents=[sub_parent],
+                       help="push a stored profile into litellm, restart, verify health")
+    p.add_argument("slug", nargs="?", help="profile slug or account email")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_litellm_switch)
 
     p = sub.add_parser("import", parents=[sub_parent], help="convert a flat litellm-prototype record and store it")
     p.add_argument("file", nargs="?", help="path to the foreign auth record")
@@ -877,6 +1368,8 @@ def main(argv=None):
 
     p = sub.add_parser("refresh", parents=[sub_parent], help="renew tokens via the OAuth refresh grant")
     p.add_argument("slug", nargs="?", help="stored profile (default: the live account)")
+    p.add_argument("--force", action="store_true",
+                   help="override the single-writer refusal (rotates the token out from the recorded writer)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_refresh)
 
@@ -943,6 +1436,34 @@ def main(argv=None):
                 print(f"  {name:<44} {u['plan_type']:<6} {flag:<8} {w(pri)} | {w(sec)}")
         elif args.verb == "refresh":
             print(f"🔄 refreshed {out['refreshed']}; persisted to {out['persisted']}")
+        elif args.verb == "fleet":
+            for host, row in out["rows"].items():
+                if row.get("error"):
+                    print(f"  {host:<12} ⛔ {row['error'][:80]}")
+                    continue
+                live = (row.get("live") or {}).get("slug") or "(none)"
+                marks = []
+                for p in row.get("profiles", []) or []:
+                    s = p.get("slug") or "?"
+                    tag = "L" if p.get("live") else "·"
+                    marks.append(f"{s}:{tag}")
+                print(f"  {host:<12} live={live:<34} stored: {', '.join(marks) or '—'}")
+            print(f"  (L = live on that host; accounts known: {len(out['accounts'])})")
+        elif args.verb == "doctor":
+            bad = 0
+            for f in out["findings"]:
+                mark = "⛔" if f["state"] in ("STALE",) else "·"
+                if f["state"] in ("STALE", "writer-unreachable"):
+                    bad += 1
+                print(f"  {mark} {f['slug']:<38} {f['state']:<20} {f['note'][:70]}")
+            if not out["findings"]:
+                print("  no provenance recorded at all — capture or fetch to stamp lineages")
+        elif args.verb == "adopt":
+            idt = out["identity"]
+            print(f"🛰  adopted {idt['email']} ({idt['plan']}) as {out['adopted']} from {out['from']} — writer is litellm; re-adopt to re-sync")
+        elif args.verb == "litellm-switch":
+            health = "healthy" if out["healthy"] else "⚠ health check did not clear — check the container"
+            print(f"🛰  litellm now runs {out['litellm_switched']} ({health}); lineage lives in litellm — re-adopt after its refreshes")
         else:
             print(json.dumps(out, indent=2))
     return 0
