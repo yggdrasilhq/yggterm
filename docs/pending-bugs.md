@@ -30683,87 +30683,6 @@ The [11.134] closer asks every live pinned opencode row's TUI tab map (`~/.local
 
 ⚠ CORRECTION (2026-09-19 later, the [11.148] seat's ride-along; claim ACK-9ad617aa6d lineage): "never persisted on 2.0.x" is FALSIFIED as a blanket claim. A directly-launched (node-pty, scratch HOME, scratch-local managed port) opencode 2.0.9 TUI persists `latest/tui/tabs.json` CONTINUOUSLY — writes observed every ~0.5 s poll from 2.6 s after launch, BEFORE any turn, the file naming the birth session under its cwd; the writes survive SIGKILL (no graceful exit involved; `killChild` is SIGKILL in the battery drive, so the 09-15/09-19 suite homes were written the same way). The mystery therefore SHARPENS instead of dying: the [11.134] proof's WRAPPER row (real home, same day, real turn at 12:43) wrote `prompt-history.jsonl` + `service.json` but NEVER the tab map — the suppressed variable is the daemon wrapper context, prime suspect being that the wrapper TUI joins the PRODUCTION service as a second client (real-home `locks/` mutated 12:40) while every positive measurement ran against an isolated scratch service. The repair decision stays the owner's call, but the surface is ALIVE in the plain flow: verify-bind from the tab map is viable wherever rows run outside the wrapper context, and the wrapper-context suppression is itself a measurable defect candidate.
 
-## ⛔ [11.159] ENSURE-CARRYING CLIENT VERBS DECLARE A SERVING SAME-VERSION DAEMON UNREACHABLE WHILE THE CANONICAL BINARY LAGS OR LEADS THE RUNNING DAEMON'S BUILD (filed 2026-09-20, the [11.158] seat's drive; deploy-skew class, [11.146] family)
-
-**Status:** OPEN
-
-Measured on the muse lab host, one sitting, fully traced. The serving
-daemon (pid 3341220, build d63e578e90e1) answers rows live/show, status,
-working_flags, app-control, and the census — but every verb that runs
-`ensure_daemon_running` first (`server connect`, `server terminal
-restart`, `server ping`) answers `local yggterm daemon did not become
-reachable`. The daemon_recovery trace shows why: `current_exe` resolves
-to the CANONICAL install (`~/.yggterm/bin/`, build 9e15bf89ddfe — a later
-ygg-ci aggregate) whose build differs from the serving daemon's; the
-reachability verdict fails anyway (version is EQUAL on both sides, so the
-serve predicate's version compare cannot be what fails — the predicate or
-its inputs need the owner's eye); the ensure then demand-starts the
-canonical binary, whose `server daemon` exits 0 in ~150-250 ms because
-the bind lock is held by the serving daemon, and after 4 retries the verb
-errors. Four spawn/exit pairs per verb attempt, traced
-(`spawned_daemon_child`/`spawned_daemon_exit code=0`, 1789863897589
-onward). SIDE EFFECT measured: one demand-start storm stood up a SECOND
-full daemon (pid 3396192, build 9e15bf89ddfe) that bound no socket,
-restored all rows into its memory with the preserved-owner reconcile
-deferred, and ticked beside the serving daemon until retired by hand
-(zero owned rows, measured). Working recipe meanwhile: invoke the binary
-that matches the serving daemon's build directly
-(`~/.local/share/yggterm/direct/builds/<build>/yggterm-headless ...`) —
-and note even that path demand-starts the CANONICAL binary when its own
-reachability check fails, so `current_spawn_executable` resolving the
-canonical install instead of the invoked binary is part of this defect.
-Fix shape (owner's call): the ensure must accept a serving daemon whose
-build differs from the canonical install when the version is equal (the
-[11.146] build-identity comparator applied client-side), and/or
-`current_spawn_executable` must resolve the invoked binary; the deploy
-skew itself (the daemon did not rotate onto the 05:37 aggregate) is the
-[11.146]-class trigger.
-
-FIX IN CODE (2026-09-20, lane/integration/11159-demandstart, zcode seat
-sess_63b2cfdc on the muse lab host, work FROM dev; claim ACK-3772d0934c):
-the ensure's accept arm is the COMPOUND verdict — version-compatible
-status answer AND the version's bind lock actually HELD
-(`bind_lock_owner_accept_verdict`; served by
-`served_by_live_bind_lock_owner`, unix) — because each half alone is the
-defect one way or the other: version alone would accept a daemon a spawn
-could legally replace (free lock), lock alone would accept a daemon the
-client cannot talk to. A held lock proves the demand-start CANNOT win
-(the child exits `bind_lock_busy`); a version-compatible answer proves
-the holder CAN serve this client. Call sites: `ensure_local_daemon_running`
-right after its initial build-identity refusal (BEFORE the first 3 s boot
-wait — the order is source-scan-locked), and both poll loops
-(`wait_for_existing_local_daemon_boot`, `wait_for_local_daemon`) so an
-owner that appears mid-wait is accepted instead of polled to death. The
-accept traces once per process: `ensure_accepted_live_bind_lock_owner`
-with server_pid + server_build_id + client_build_id (the skew witness —
-consult Q1 correction). The deliberate upgrade stays where the doctrine
-already put it (startup reconcile + hot-restart paths). PROOF (scratch
-home, two same-version different-bits binaries placed OUTSIDE the direct
-root so install-state's boot re-exec cannot converge them): pre-fix, the
-spawn-carrying verb (`server remote start-codex`) burned 28.7 s — 169
-`stale_daemon_binary_detected` across the five stages, one
-`bind_lock_busy` child — and failed "local yggterm daemon did not become
-reachable" while the serving daemon answered pong throughout; post-fix
-the same shape accepts ~1 ms after the stale flag and the verb then
-STARTED A REAL CODEX RUNTIME on the old-bits daemon (composer painted
-16 s later). Server-lib suite 1544 pass / 1 fail = clean main's failure
-set byte-identical (the owner-gated [11.145] stamp red) + 2 new greens.
-CONSULT (gemini-3.8-flash HIGH via agy, YOLO; chain node
-lores/chain-of-thought/2026-09-20-11159-ensure-demandstart.md): Q1
-accept (predicate right; skew witness adopted); Q2 REBUT — no transport
-hazard, do NOT gate transport on build identity, gate features at the
-RPC callsite if one ever needs it; Q3 REBUT — the bequest-window race
-(lock renamed free while the predecessor still serves) deserves an
-explicit in-flight-bequest guard on the FREE-lock spawn path, filed as
-observation, NOT adopted this lane (that path is untouched by this fix
-and a litter-presence wait could stall the [11.151] dead-successor retry
-bequest); Q4 accept — the deploy-side force-rotation signal
-(`SAME_VERSION_HANDOFF_COOLDOWN_MS` stall is why the skew window is
-30-40 min long) is lifecycle-layer future work. STILL OWED: the
-`current_spawn_executable` half (canonical divert on the invoked-binary
-path, owner's call above) and the production-rotation proof (rides the
-[11.158] falsifier after this deploy).
-
 ## ⛔ [11.158] A START-BORN REMOTE ROW EXCLUDED FROM THE PEER-CLOSE GATE KEEPS ITS [11.153] PRESERVE STATE FOREVER — THE GUARD IS DELIBERATE, BUT THE CLASS IT EXCLUDES STILL ENDS IN A PERMANENT GHOST (filed 2026-09-20, the [11.155] close)
 
 **Status:** OPEN
@@ -30813,3 +30732,46 @@ memo + two spaced alive nos -> PeerSessionGone) OWED: the memo-arming
 resize rides the spawn-carrying funnel, and on the muse lab host every
 spawn-carrying verb is blocked by [11.159] (filed this sitting). Proof
 resumes when [11.159] lands.
+
+## ⛔ [11.160] A REMOTE ROW'S LAUNCH REFUSAL PAINTS RAW INTO THE VIEWPORT WHILE THE STATE PLANE KEEPS CLAIMING RUNNING·IDLE — THE USER SEES AN ERROR DUMP YGGTERM SHOULD HAVE STAMPED, AND THE METADATA LIES ABOUT IT (owner-reported 2026-09-20 ~08:10 with a screenshot)
+
+**Status:** OPEN
+
+The owner opened a new dev Codex row from the GUI (`remote-session://dev/
+3f3fcfee-d5a2-40f6-8f8c-604ead426b27`) while the peer's codex launch binary
+was briefly unavailable, and the row's VIEWPORT painted the refusal verbatim:
+`Error: Codex is not installed on this machine — 'codex' is not on the launch
+PATH, so yggterm cannot start this session. yggterm provisions codex from npm
+(@openai/codex) — an install may be in flight, so retry in a moment.` — while
+the Session Metadata plane SIMULTANEOUSLY claimed Runtime Status `running ·
+idle`, History `keep-alive`, a live PID (3476873), and the Connect panel
+advertised `ssh dev 'yggterm server remote resume-codex 3f3fcfee… --require-
+existing'` for a session that had never started. Owner's words: users should
+never see this screen, yggterm should take care of it — and it is not even
+clear the screen is telling the truth (it is not: the metadata half lies).
+
+The refusal itself was CORRECT and NAMED on the peer: dev trace
+`launch_refused_cli_binary_missing` (ts 1789871989018,
+`codex-runtime://3f3fcfee…`, the full refusal text). The trigger this time was
+a probe seat holding the peer's launch binary aside for the [11.158]
+falsifier drive; any equivalent infra condition produces the same screen for
+a user — a codex self-update swapping the ynpm generation, a ynpm re-point,
+a wedged install (the [11.145]-class port hazards), the [11.159]-class skew.
+
+THE DEFECT, two layers: (1) the refusal text rides the row's channel as PTY
+bytes and paints as terminal output — the designed plane for exactly this is
+the row stamp ([11.153]'s precedent: `Status: peer session gone` with the
+peer's evidence in Launch Error) — the binary-missing arm never stamps, so
+the raw paint is all the user gets; (2) the state plane keeps answering
+`running · idle` + keep-alive + a PID through the refusal — the metadata
+contradicts the viewport, which is the worse half of the report. The row
+SELF-HEALED when the binary returned (keep-alive retried, runtime spawned,
+healthy) — the heal path is fine; the failure-WINDOW UX is the defect.
+
+Fix shape: the launch refusal stamps the row (the [11.153] pattern — a Status
+line + Launch Error carrying the named refusal) and the raw bytes never reach
+the viewport; the state plane answers the refused state honestly (not
+running·idle); the Connect panel does not advertise `--require-existing` for
+a session that was never started. Filed from the seat that was driving the
+peer (sess_63b2cfdc); the driving experiment ended and the peer binary was
+restored within one minute — the screenshot row healed and reads healthy.
