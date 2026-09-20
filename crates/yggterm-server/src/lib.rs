@@ -24146,6 +24146,14 @@ pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<
     if reachable_local_daemon_is_current(endpoint, "initial_status") {
         return Ok(());
     }
+    // [11.159]: a version-compatible daemon answered and the bind lock is
+    // held — the demand-start below cannot win (the child exits
+    // `bind_lock_busy`), so serve from the live owner instead of burning the
+    // boot waits, the spawn lock, and a 15 s poll of an unsatisfiable
+    // condition.
+    if served_by_live_bind_lock_owner(endpoint) {
+        return Ok(());
+    }
     if wait_for_existing_local_daemon_boot(endpoint, Duration::from_millis(3_000)) {
         return Ok(());
     }
@@ -24255,6 +24263,77 @@ fn reachable_local_daemon_is_current(endpoint: &ServerEndpoint, stage: &'static 
     }
     handle_mismatched_local_daemon(endpoint, &runtime_status, stage);
     false
+}
+
+/// Whether the endpoint is answered by a live daemon that holds the
+/// version's bind lock, whatever bits it runs from — the ensure's accept arm
+/// for that case.
+///
+/// ⛔ [11.159], measured 2026-09-20 (the muse lab host): after a deploy lands a
+/// new same-version aggregate, the serving daemon keeps the previous
+/// aggregate's bits and every spawn-carrying verb's ensure refused it on build
+/// identity — then demand-started a child the bind lock was guaranteed to
+/// refuse (`bind_lock_busy`, exit 0) and polled the still-serving daemon
+/// 100 × 150 ms before failing "local yggterm daemon did not become
+/// reachable". Seven verbs burned ~24.5 s each (187 stale-binary polls
+/// apiece, 1309 events in the storm window) and one storm won a
+/// bequest-window race into a rowless second daemon. A held bind lock proves
+/// the demand-start CANNOT win; a version-compatible status answer proves the
+/// daemon that holds it CAN serve this client. Accept it — the deliberate
+/// upgrade stays with the startup reconcile + hot-restart paths, exactly as
+/// the shell-side ensure's preserved-owner doctrine already says. The build
+/// identity is still traced once per process when this arm fires.
+#[cfg(unix)]
+fn served_by_live_bind_lock_owner(endpoint: &ServerEndpoint) -> bool {
+    let ServerEndpoint::UnixSocket(path) = endpoint else {
+        return false;
+    };
+    let Ok(runtime_status) = status(endpoint) else {
+        return false;
+    };
+    let lock_held = daemon::canonical_socket_lock_is_held(&daemon::daemon_socket_lock_path(path));
+    if !bind_lock_owner_accept_verdict(&runtime_status.server_version, lock_held) {
+        return false;
+    }
+    static ACCEPTED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ACCEPTED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Some(home) = daemon_trace_home_for_endpoint(endpoint) {
+            append_trace_event(
+                &home,
+                "server",
+                "daemon_lifecycle",
+                "ensure_accepted_live_bind_lock_owner",
+                json!({
+                    "endpoint": path.display().to_string(),
+                    "server_pid": runtime_status.server_pid,
+                    "server_build_id": runtime_status.server_build_id,
+                    "server_version": runtime_status.server_version,
+                    // The skew witness (consult Q1 correction): the accept is
+                    // licensed by version compatibility, so the trace names
+                    // what the client WOULD have spawned — the delta between
+                    // these two ids is the deploy-skew shape this arm exists
+                    // for.
+                    "client_build_id": daemon::current_build_id(),
+                }),
+            );
+        }
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn served_by_live_bind_lock_owner(_endpoint: &ServerEndpoint) -> bool {
+    false
+}
+
+/// The pure half of [`served_by_live_bind_lock_owner`]: the compound verdict a
+/// live bind-lock owner must pass before an ensure accepts it instead of
+/// demand-starting a child that cannot win. Version-compatible (the wire gate
+/// the rest of the ensure already speaks) AND the lock actually held (the
+/// spawn-futility witness — a free lock means the demand-start can still win
+/// and must be allowed to run).
+fn bind_lock_owner_accept_verdict(server_version: &str, lock_held: bool) -> bool {
+    server_version == daemon::SERVER_PROTOCOL_VERSION && lock_held
 }
 
 #[cfg(target_os = "linux")]
@@ -24706,7 +24785,9 @@ fn wait_for_existing_local_daemon_boot(endpoint: &ServerEndpoint, timeout: Durat
     let deadline = Instant::now() + timeout;
     let mut saw_candidate = false;
     loop {
-        if reachable_local_daemon_is_current(endpoint, "existing_daemon_boot_wait") {
+        if reachable_local_daemon_is_current(endpoint, "existing_daemon_boot_wait")
+            || served_by_live_bind_lock_owner(endpoint)
+        {
             return true;
         }
         let pids = local_daemon_pids_for_home(&home);
@@ -24952,7 +25033,9 @@ fn spawn_local_daemon_process(current_exe: &Path, endpoint: &ServerEndpoint) -> 
 fn wait_for_local_daemon(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(150));
-        if reachable_local_daemon_is_current(endpoint, "spawned_daemon_wait") {
+        if reachable_local_daemon_is_current(endpoint, "spawned_daemon_wait")
+            || served_by_live_bind_lock_owner(endpoint)
+        {
             return Ok(());
         }
     }
@@ -54871,6 +54954,82 @@ terminal_window_id: None,
             !super::attach_should_ensure_local_daemon(Some(&fell_back)),
             "the resolver only returns a different endpoint after PINGING it — that \
              daemon is already up, and ensuring it would block ~24s and then fail"
+        );
+    }
+
+    /// The accept verdict is a compound: version-compatible (the client can
+    /// ride the wire) AND the bind lock held (the demand-start cannot win).
+    /// Each half alone is the defect one way or the other — version alone
+    /// accepts a daemon a spawn could legally replace; lock alone accepts a
+    /// daemon the client cannot talk to. ⛔ [11.159]: the measured storm was
+    /// the opposite error — NEITHER half accepted a live same-version owner,
+    /// so seven verbs burned ~24.5 s each demanding spawns the lock refused.
+    #[test]
+    fn a_live_bind_lock_owner_is_accepted_only_version_compatible_and_held() {
+        let current = daemon::SERVER_PROTOCOL_VERSION;
+        assert!(super::bind_lock_owner_accept_verdict(current, true));
+        assert!(
+            !super::bind_lock_owner_accept_verdict("0.0.1", true),
+            "an incompatible version is not servable, lock or no lock"
+        );
+        assert!(
+            !super::bind_lock_owner_accept_verdict(current, false),
+            "a free lock means the demand-start can still win — the ensure must spawn"
+        );
+    }
+
+    /// ⛔ [11.159] THE ORDER LOCK. The ensure must ask the live bind-lock
+    /// owner BEFORE its first boot wait: the refusal that starts the boot
+    /// wait is the build-identity check, and under deploy skew that refusal
+    /// can never clear while the lock is held — every skipped ask is the
+    /// measured ~24 s-per-verb churn (three 3 s boot waits + a
+    /// `bind_lock_busy` child + a 15 s spawned wait) that ended in "local
+    /// yggterm daemon did not become reachable" against a healthy serving
+    /// daemon.
+    #[test]
+    fn the_ensure_asks_the_bind_lock_owner_before_its_boot_waits() {
+        let source = include_str!("lib.rs");
+        let function = source
+            .split("pub fn ensure_local_daemon_running(")
+            .nth(1)
+            .expect("the ensure is present");
+        let body = function
+            .split("fn normalize_path_lexically")
+            .next()
+            .expect("the ensure body ends at the next item");
+        let ask = body
+            .find("served_by_live_bind_lock_owner")
+            .expect("the ensure consults the live bind-lock owner");
+        let first_wait = body
+            .find("wait_for_existing_local_daemon_boot")
+            .expect("the ensure still waits for a booting daemon");
+        assert!(
+            ask < first_wait,
+            "the bind-lock owner ask must precede the first boot wait — after it, \
+             every deploy-skewed verb burns the boot waits + a bind_lock_busy child \
+             + the 15 s spawned wait before failing"
+        );
+        // The two poll loops the arm can also rescue mid-wait (an owner that
+        // appears after the initial probe, and the lock-lost child case).
+        let boot_loop = source
+            .split("fn wait_for_existing_local_daemon_boot(")
+            .nth(1)
+            .expect("the boot wait is present")
+            .split("#[cfg(not(target_os = \"linux\"))]")
+            .next()
+            .expect("the boot wait body ends at its non-unix stub");
+        assert!(
+            boot_loop.contains("served_by_live_bind_lock_owner"),
+            "the boot wait must accept a live bind-lock owner mid-poll"
+        );
+        let spawned_loop = source
+            .split("fn wait_for_local_daemon(")
+            .nth(1)
+            .expect("the spawned wait is present");
+        assert!(
+            spawned_loop.contains("served_by_live_bind_lock_owner"),
+            "the spawned wait must accept a live bind-lock owner mid-poll — the \
+             child that lost the lock exits busy while the owner keeps answering"
         );
     }
 
