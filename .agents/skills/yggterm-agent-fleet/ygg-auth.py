@@ -1002,7 +1002,7 @@ def _fleet_host_status(host, script_bytes):
     the caller — this always goes over ssh."""
     last = {"error": f"no destination for {host}"}
     for dest in ssh_dest_candidates(host):
-        proc = ssh_script(dest, ["--json", "status"], script_bytes)
+        proc = ssh_script(dest, ["status", "--json"], script_bytes)
         if proc is None:
             last = {"error": f"ssh {dest} timed out"}
             continue
@@ -1057,7 +1057,7 @@ def cmd_doctor(args):
     remote_prov = {}
     for host in hosts_needed:
         for dest in ssh_dest_candidates(host):
-            proc = ssh_script(dest, ["--json", "provenance", "--harness", harness], script_bytes, timeout=30)
+            proc = ssh_script(dest, ["provenance", "--harness", harness, "--json"], script_bytes, timeout=30)
             if proc is not None and proc.returncode == 0:
                 try:
                     remote_prov[host] = json.loads(proc.stdout.decode("utf-8"))
