@@ -10724,6 +10724,7 @@ impl DaemonRuntime {
             // RECORD-GONE stamp (the peer re-derived its record and the row
             // truly attached again).
             if still_running
+                && crate::session_path_is_remote_agent(path)
                 && !remote_stream_text.is_empty()
                 && crate::remote_stream_launch_refusal(remote_stream_text.as_bytes()).is_none()
                 && self
@@ -10755,7 +10756,7 @@ impl DaemonRuntime {
             // survives). Learn it into the family stamp, remove the dead
             // wrapper so the raw frame stops being served, and refuse the
             // mount. Every tick after this is refused by the gate at the top.
-            if remote_resume_path
+            if crate::session_path_is_remote_agent(path)
                 && !remote_stream_text.is_empty()
                 && let Some((refusal_family, refusal_line)) =
                     crate::remote_stream_launch_refusal(remote_stream_text.as_bytes())
