@@ -10266,7 +10266,7 @@ impl DaemonRuntime {
                     .server
                     .remote_agent_cli_host_display_for_path(path)
                     .unwrap_or_else(|| "the remote machine".to_string());
-                self.server.record_remote_cli_binary_missing_refusal_for_path(
+                self.server.restamp_remote_launch_refusal_for_path(
                     path,
                     &message,
                     &host,
@@ -10289,11 +10289,14 @@ impl DaemonRuntime {
                 let _ = self.persist_state_only();
                 bail!("{message}");
             }
-            crate::RemoteAgentLaunchGateAnswer::ProceedAndClearRefusal => {
+            crate::RemoteAgentLaunchGateAnswer::ProceedAndClearBinaryMissing => {
                 // The probe outlived the stamp — but a dead refused runtime may
                 // still hold the frame the stamp was learned from. Clear only
                 // when that evidence is gone (runtime removed or replaced by a
-                // live one); otherwise the learn arm below owns the truth.
+                // live one); otherwise the learn arm below owns the truth. The
+                // cache positive speaks for the BINARY-MISSING family only
+                // ([11.162]); a record-gone stamp is retired by evidence or a
+                // recomposed launch, never by a cache answer.
                 let runtime_path = self.terminal_runtime_key_for_path(path);
                 if !self.terminals.has_session(&runtime_path)
                     || self.terminals.session_is_running(&runtime_path)
@@ -10714,27 +10717,60 @@ impl DaemonRuntime {
                 && remote_resume_runtime_output_requires_restart(remote_stream_text.as_bytes());
             let remote_resume_path =
                 path.starts_with("remote-session://") || runtime_saved_session_mismatch;
-            // ⛔ THE [11.160] LEARN ARM. The gate above can only refuse from
-            // cache knowledge, and a cache that said "installed" cannot see a
-            // binary vanish under it (probe seat, ynpm re-point, self-update).
-            // The peer's own refusal frame in this row's stream IS the ground
-            // truth: learn it into the [11.153]-pattern stamp, remove the dead
+            // ⛔ THE EVIDENCE CLEAR ([11.162]). A runtime that is RUNNING
+            // with output and carries NO refusal frame falsifies every refusal
+            // stamp the machinery owns — the launch recovered, whatever the
+            // old frame said. This is the only thing that can retire a
+            // RECORD-GONE stamp (the peer re-derived its record and the row
+            // truly attached again).
+            if still_running
+                && !remote_stream_text.is_empty()
+                && crate::remote_stream_launch_refusal(remote_stream_text.as_bytes()).is_none()
+                && self
+                    .server
+                    .row_carries_any_remote_launch_refusal(path)
+                {
+                    self.server.clear_remote_launch_refusal_for_path(
+                        path,
+                        crate::REMOTE_LAUNCH_REFUSAL_STATUS_PREFIXES,
+                    );
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_launch_refusal_cleared_by_evidence",
+                            serde_json::json!({ "path": path }),
+                        );
+                    }
+                    let _ = self.persist_state_only();
+                }
+            // ⛔ THE [11.160] LEARN ARM, generalized to the refusal families
+            // ([11.162]). The gate above can only refuse from cache knowledge
+            // and from a CURRENT stamp; the peer's own refusal frame in this
+            // row's stream is the ground truth for everything else — binary
+            // missing, or the peer losing the runtime's record across ITS
+            // rotation (`no terminal spec` / `terminal session not found`,
+            // where the [11.153] memo stands down because the transcript
+            // survives). Learn it into the family stamp, remove the dead
             // wrapper so the raw frame stops being served, and refuse the
             // mount. Every tick after this is refused by the gate at the top.
             if remote_resume_path
                 && !remote_stream_text.is_empty()
-                && let Some(refusal_line) = crate::remote_stream_cli_binary_missing_refusal_line(
-                    remote_stream_text.as_bytes(),
-                )
+                && let Some((refusal_family, refusal_line)) =
+                    crate::remote_stream_launch_refusal(remote_stream_text.as_bytes())
             {
                 let host = self
                     .server
                     .remote_agent_cli_host_display_for_path(path)
                     .unwrap_or_else(|| "the remote machine".to_string());
-                self.server.record_remote_cli_binary_missing_refusal_for_path(
+                let remedy = crate::refusal_remedy_for_family(refusal_family);
+                self.server.record_remote_launch_refusal_for_path(
                     path,
                     &refusal_line,
                     &host,
+                    refusal_family,
+                    remedy,
                 );
                 if let Ok(home) = crate::resolve_yggterm_home() {
                     append_trace_event(
@@ -10745,6 +10781,7 @@ impl DaemonRuntime {
                         serde_json::json!({
                             "path": path,
                             "machine": host,
+                            "family": refusal_family,
                             "refusal": refusal_line,
                         }),
                     );
@@ -14736,9 +14773,9 @@ fn snapshot_session_launch_refusal_is_current(session: &SnapshotSessionView) -> 
     session.launch_phase == crate::TerminalLaunchPhase::Failed
         && session.metadata.iter().any(|entry| {
             entry.label == "Status"
-                && entry
-                    .value
-                    .starts_with(crate::REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX)
+                && crate::REMOTE_LAUNCH_REFUSAL_STATUS_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.value.starts_with(prefix))
         })
 }
 
