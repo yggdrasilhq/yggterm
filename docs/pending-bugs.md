@@ -30733,6 +30733,16 @@ resize rides the spawn-carrying funnel, and on the muse lab host every
 spawn-carrying verb is blocked by [11.159] (filed this sitting). Proof
 resumes when [11.159] lands.
 
+## ⛔ [11.162] THE [11.160] REFUSAL PLANES WERE BINARY-MISSING-SHAPED — THE PEER LOSING THE RUNTIME RECORD ACROSS ITS OWN ROTATION PAINTS RAW ON EVERY KEEP-ALIVE RESPAWN FOREVER, BECAUSE THE TRANSCRIPT SURVIVING STANDS DOWN EVERY MEMO (owner screenshot 2026-09-21 08:40, the agy row "100.0 medgraph: trace and log run from traccar")
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The row `remote-agy://dev/b8f0c09d…` painted `Error: no terminal spec for session: agy-runtime://b8f0c09d…` verbatim into the viewport while the plane claimed running·idle + keep-alive and Connect advertised `resume-agy … --require-existing`. Measured live: dev holds ZERO records for the agy-runtime key — the peer daemon lost the runtime's spec across ITS rotation — while agy's transcript survives, so the [11.155]/[11.153] store ask answers EXISTS (inconclusive → fall through), the [11.158] start-born close does not apply (the row is bound), and the [11.160] learn arm's binary-missing needles do not match the wording: a permanent doomed-respawn loop with a lying plane.
+
+FIXED IN CODE (lane/integration/11162-refusal-stamp-family cd5fe984, the [11.160] planes generalized to a stamp family): the learn arm classifies yggterm's OWN refusal wordings — binary-missing, `no terminal spec for session:`, `terminal session not found:` — and nothing else (a CLI's own error output must never trip the stamp); the record-gone family stamps `peer runtime record gone on <host>` with the peer's words and the remedy (the conversation is safe in the CLI's own store — re-open the row to start fresh); every stamp pins a `Launch Refused For` fingerprint of the refused launch command, so a recomposed launch (user restart, re-open) invalidates it by construction; the gate refuses a CURRENT stamp in the peer's own words, and the fresh-positive cache arm retires the BINARY-MISSING family only (installed says nothing about a runtime record); the EVIDENCE clear retires the whole family the moment a live healthy runtime carries no refusal frame. Suite 1556/1, failure set byte-identical (the owner-gated stamp red). The falsifier is the OWNER'S OWN medgraph row: after the deploy it stamps honestly and the doomed respawns stop.
+
+RESIDUALS: (1) the peer half — resume-agy demands the old daemon's runtime record instead of re-deriving the spec from the saved transcript (the local [11.96] discharge proved resume rederives locally; the REMOTE resume-after-peer-rotation path needs the same); (2) the [11.153] stamp text (`peer session gone`) mis-names the binary-missing cause for the memo arm.
+
 ## ⛔ [11.160] A REMOTE ROW'S LAUNCH REFUSAL PAINTS RAW INTO THE VIEWPORT WHILE THE STATE PLANE KEEPS CLAIMING RUNNING·IDLE — THE USER SEES AN ERROR DUMP YGGTERM SHOULD HAVE STAMPED, AND THE METADATA LIES ABOUT IT (owner-reported 2026-09-20 ~08:10 with a screenshot)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
