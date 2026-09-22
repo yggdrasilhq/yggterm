@@ -173,6 +173,8 @@ def install_links(spec, bin_dir, out, source_dir=None):
 
 def build_manifest(spec, files, ssot, commit):
     bin_dir = replica_dir()
+    # the shipment list ships with the tar, so it is a replica too - manifest it
+    hashed = sorted(set(files) | {LIST_NAME})
     return {
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source_commit": commit,
@@ -180,7 +182,7 @@ def build_manifest(spec, files, ssot, commit):
         "tier_base": spec["tier_base"],
         "owner_managed": spec.get("owner_managed", []),
         "executable": spec["executable"],
-        "files": {name: sha256(bin_dir / name) for name in files},
+        "files": {name: sha256(bin_dir / name) for name in hashed},
     }
 
 
@@ -354,7 +356,8 @@ def verify_local():
             drift.append(f"missing: {name}")
         elif sha256(f) != digest:
             drift.append(f"drifted: {name}")
-    on_disk = {p.name for p in bin_dir.iterdir()} if bin_dir.is_dir() else set()
+    on_disk = {p.name for p in bin_dir.iterdir()
+               if p.is_file() and not p.is_symlink()} if bin_dir.is_dir() else set()
     for extra in sorted(on_disk - set(manifest["files"])):
         drift.append(f"unmanifested: {extra}")
     base = local_bin()
@@ -369,7 +372,7 @@ def verify_local():
 
 
 def cmd_verify(args):
-    if not args.hosts:
+    if not args.hosts and not args.fleet:
         out, ok = verify_local()
         emit(out, args)
         sys.exit(0 if ok else 1)
@@ -420,7 +423,9 @@ def main():
     p.set_defaults(fn=cmd_finalize)
 
     p = sub.add_parser("verify", help="exit 0 when replicas match the manifest")
-    p.add_argument("--hosts", help="verify across the fleet")
+    p.add_argument("--hosts", help="comma list to verify across the fleet")
+    p.add_argument("--fleet", action="store_true",
+                   help="verify the ~/.yggterm/auth/.fleet-hosts list")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_verify)
 

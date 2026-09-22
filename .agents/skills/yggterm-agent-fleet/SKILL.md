@@ -1440,11 +1440,12 @@ ephemeral and the verb set is law. The fix is a dispersal plane:
   the war the fs spec's one-owner law forbids.
 - **Ship it:**
   `ygg-disperse.py install` (this host) ·
-  `ygg-disperse.py install --hosts` (fleet fan-out over the ssh self-pipe —
-  tar through the pipe, finalize remotely; no repo, no `/tmp` staging
-  needed on the target) ·
-  `ygg-disperse.py verify` / `verify --hosts` (exit 0 only when every
-  replica matches the manifest AND every base-tier link resolves).
+  `ygg-disperse.py install --fleet` (or `install --hosts a,b,c`; fan-out
+  over the ssh self-pipe — tar through the pipe, finalize remotely; no
+  repo, no `/tmp` staging needed on the target) ·
+  `ygg-disperse.py verify` / `verify --fleet` / `verify --hosts a,b,c`
+  (exit 0 only when every replica matches the manifest AND every
+  base-tier link resolves).
 - **Dispersal is part of shipping a verb** — a merge that changes a fleet
   verb without re-dispersing is an undeployed deploy. A hand-staged copy
   met on the way (an old `~/.local/bin/ygg-auth.py`, the 2026-09-22
