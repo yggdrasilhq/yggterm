@@ -59,6 +59,7 @@ def main():
     check("manifest records a repo commit", man.get("source_commit") not in (None, ""),
           str(man.get("source_commit")))
     check("manifest hashes every file", set(man["files"]) == set(ALL_FILES))
+    check("shipment list manifested", "ygg-verbs.json" in man["files"])
     links_ok = all((root / "localbin" / n).is_symlink() for n in SPEC["tier_base"])
     check("base tier PATH-linked", links_ok)
     resolves = all((root / "localbin" / n).resolve() == bin_dir / n
@@ -150,6 +151,12 @@ def main():
                   for n in SPEC.get("owner_managed", [])))
     r = run("verify", env_extra=env)
     check("verify green with owner-managed present", r.returncode == 0, r.stdout[:300])
+
+    # 10. a bytecode-cache directory in the replica tree is not drift
+    (bin_dir / "__pycache__").mkdir()
+    (bin_dir / "__pycache__" / "junk.pyc").write_text("x")
+    r = run("verify", env_extra=env)
+    check("verify ignores __pycache__", r.returncode == 0, r.stdout[:300])
 
     print()
     if FAILURES:
