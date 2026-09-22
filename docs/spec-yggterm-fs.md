@@ -27,6 +27,10 @@ agent action.
 6. **Scratch is prefixed.** `scratchpad/` is shared between seats and
    hosts-in-spirit: every scratch name carries a unique prefix. Never a
    bare `tmp/`.
+7. **Dispersed verbs are replicas.** The ygg verb fleet installs to
+   `bin/ygg/` as replicas of the repo SSOT — provenance-recorded,
+   drift-checked, never hand-edited; `ygg-disperse` is the only writer.
+   See `docs/spec-ygg-verb-dispersal.md`.
 
 ## The target layout
 
@@ -34,11 +38,13 @@ agent action.
 ~/.yggterm/
   apps/            # ynpm: generations, registration, rollback (ynpm-owned; nothing else writes here)
   bin/             # the GUI binary + rollback siblings (deploy-owned)
+    ygg/           #   dispersed ygg verb replicas (ygg-disperse-owned; spec-ygg-verb-dispersal.md)
   bridge/          # per-subsession mailboxes (the fleet bridge)
   cli-staging/     # managed-CLI download staging
   config/          # configuration, one subdir per tool
     ydesign/       #   projects.json (the ydesign registry, 1.0.0)
     ynpm/          #   channel + recipe state
+    ygg-verbs/     #   dispersal manifest (provenance of the bin/ygg replicas)
   kasten/          # the zettelkasten data
   logs/            # daemon.log, launch logs, incident snapshots (rotating)
   managed-cli/     # per-CLI adapter state + dist

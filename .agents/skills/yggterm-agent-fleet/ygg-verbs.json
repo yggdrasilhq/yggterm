@@ -1,0 +1,73 @@
+{
+  "_doc": [
+    "SSOT shipment list for the dispersed ygg verbs (spec: docs/spec-ygg-verb-dispersal.md).",
+    "tier_base: required and PATH-linked on EVERY fleet host - the daemon-independent verbs an agent seat needs anywhere.",
+    "tier_gui: ships in the same identical shipment to every host, but only means anything where the yggterm GUI/daemon lives (the GUI hosts: dev/oc locally).",
+    "owner_managed: shipped into bin/ygg/ for completeness but NEVER linked or adopted - ygg-memory self-disperses its runners",
+    "  (sync-fleet scp's them to ~/.local/bin + ~/.yggterm/bin and unlinks symlinks by design) and bootstrap.sh installs ygg-memory-sync.",
+    "  Two owners on one path is a war the fs spec's one-owner law forbids.",
+    "executable: files installed with mode 0755; everything else 0644."
+  ],
+  "tier_base": [
+    "ygg-disperse.py",
+    "ygg-auth.py",
+    "ygg-board.py",
+    "ygg-procfind.sh",
+    "repo-doctor.py"
+  ],
+  "owner_managed": [
+    "ygg-memory",
+    "ygg-memory.py",
+    "ygg-memory-sync"
+  ],
+  "tier_gui": [
+    "ygg_row.py",
+    "ygg_rowarg.py",
+    "ygg_bridge.py",
+    "ygg_appctl.py",
+    "ygg_plane.py",
+    "ygg_host.py",
+    "ygg_transcript.py",
+    "cli-stores.json",
+    "ygg-spawn.py",
+    "ygg-babysit.py",
+    "ygg-deliver.py",
+    "ygg-fold.py",
+    "ygg-land.py",
+    "ygg-claim.sh",
+    "ygg-panic.py",
+    "ygg-unwedge.sh",
+    "ygg-booter.py",
+    "ygg-monitor.py",
+    "ygg-ci.py",
+    "bootstrap.sh"
+  ],
+  "executable": [
+    "ygg-disperse.py",
+    "ygg-auth.py",
+    "ygg-memory",
+    "ygg-memory-sync",
+    "ygg-board.py",
+    "ygg-procfind.sh",
+    "repo-doctor.py",
+    "ygg_row.py",
+    "ygg_rowarg.py",
+    "ygg_bridge.py",
+    "ygg_appctl.py",
+    "ygg_plane.py",
+    "ygg_host.py",
+    "ygg_transcript.py",
+    "ygg-spawn.py",
+    "ygg-babysit.py",
+    "ygg-deliver.py",
+    "ygg-fold.py",
+    "ygg-land.py",
+    "ygg-claim.sh",
+    "ygg-panic.py",
+    "ygg-unwedge.sh",
+    "ygg-booter.py",
+    "ygg-monitor.py",
+    "ygg-ci.py",
+    "bootstrap.sh"
+  ]
+}

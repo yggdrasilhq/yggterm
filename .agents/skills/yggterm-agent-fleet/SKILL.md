@@ -1415,6 +1415,47 @@ Origin: the owner's switch-chatgpt.py prototype on the litellm LXC
 gemini-3.8-flash-high consult (cooldown state, refresh-race guard, umask 077
 landed from its verdicts). Tests: `tests/test_ygg_auth_rotation.py`.
 
+## 3g. ygg-disperse — the fleet verb dispersal plane (base, spec-ygg-verb-dispersal.md)
+
+The ygg verbs are fleet law, so they ship to EVERY fleet host — not just the
+hosts with a repo checkout. Dream ACK-a0bd107330 (2026-09-22): a practice
+seat hand-staged `ygg-auth.py` into `/tmp` to switch an account; `/tmp` is
+ephemeral and the verb set is law. The fix is a dispersal plane:
+
+- **Replica tree:** `~/.yggterm/bin/ygg/` on every fleet host, written only
+  by `ygg-disperse.py`; provenance in
+  `~/.yggterm/config/ygg-verbs/manifest.json` (source commit + per-file
+  sha256). Replicas are never hand-edited — the repo SSOT wins, drift is
+  fixed by re-running install.
+- **Tiers** (`ygg-verbs.json`, decided in the repo): `tier_base` is the
+  daemon-independent set that must WORK on every host (ygg-auth,
+  ygg-board, repo-doctor, ygg-procfind, ygg-disperse) and gets PATH links
+  in `~/.local/bin`; `tier_gui` (row/bridge/ci/booter/monitor…) rides in
+  the same identical shipment but only means anything where the yggterm
+  GUI daemon lives (dev/oc + the local seat host). `owner_managed` (the ygg-memory runner
+  pair + `ygg-memory-sync`) ships into `bin/ygg/` but is NEVER linked or
+  adopted — ygg-memory's own `sync-fleet` disperses its runners and
+  unlinks symlinks at `~/.local/bin`/`~/.yggterm/bin` BY DESIGN, and
+  `bootstrap.sh` installs `ygg-memory-sync`; two owners on one path is
+  the war the fs spec's one-owner law forbids.
+- **Ship it:**
+  `ygg-disperse.py install` (this host) ·
+  `ygg-disperse.py install --hosts` (fleet fan-out over the ssh self-pipe —
+  tar through the pipe, finalize remotely; no repo, no `/tmp` staging
+  needed on the target) ·
+  `ygg-disperse.py verify` / `verify --hosts` (exit 0 only when every
+  replica matches the manifest AND every base-tier link resolves).
+- **Dispersal is part of shipping a verb** — a merge that changes a fleet
+  verb without re-dispersing is an undeployed deploy. A hand-staged copy
+  met on the way (an old `~/.local/bin/ygg-auth.py`, the 2026-09-22
+  `~/.yggterm/bin` root staging) is adopted: replaced by SSOT bytes or a
+  link, differing bytes preserved under `config/ygg-verbs/` — except
+  owner-managed files, which are left to their owner.
+
+Acceptance (owner, ACK-a0bd107330): on ANY fleet host, `~/.yggterm` carries
+the ygg verbs and `ygg-auth.py status` works without hand-staging.
+Tests: `tests/test_ygg_disperse.py`.
+
 ## 4. Correspondence — any session can reach any other
 
 A row is an address. That is the whole mechanism, and it needs no new protocol:
