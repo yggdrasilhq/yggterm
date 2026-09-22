@@ -58,7 +58,8 @@ def main():
     man = json.loads(manifest.read_text())
     check("manifest records a repo commit", man.get("source_commit") not in (None, ""),
           str(man.get("source_commit")))
-    check("manifest hashes every file", set(man["files"]) == set(ALL_FILES))
+    check("manifest hashes every file",
+          set(man["files"]) == set(ALL_FILES) | {"ygg-verbs.json"})
     check("shipment list manifested", "ygg-verbs.json" in man["files"])
     links_ok = all((root / "localbin" / n).is_symlink() for n in SPEC["tier_base"])
     check("base tier PATH-linked", links_ok)

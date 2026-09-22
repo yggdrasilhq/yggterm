@@ -248,10 +248,12 @@ def install_local(args):
     out = {"host": hostname(), "commit": commit, "ssot": str(ssot)}
     for name in files:
         shutil.copy2(ssot / name, bin_dir / name)
+    shutil.copy2(ssot / LIST_NAME, bin_dir / LIST_NAME)
     normalize_modes(spec, files)
     adopt_root_copies(files, out, spec.get("owner_managed", ()))
     out["installed"] = len(files)
-    out["pruned"] = sorted(prev - set(files))
+    current = set(files) | {LIST_NAME}
+    out["pruned"] = sorted(prev - current)
     for name in out["pruned"]:
         (bin_dir / name).unlink(missing_ok=True)
 
