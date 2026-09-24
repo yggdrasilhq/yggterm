@@ -3241,6 +3241,39 @@ impl PtySessionRuntime {
                                         &launch_command_label,
                                         &hit,
                                     );
+                                    if let Some(contract_line) =
+                                        agent_session_error_contract_translation(
+                                            &hit,
+                                            &launch_command_label,
+                                            &key_label,
+                                        )
+                                    {
+                                        trace_terminal_event(
+                                            "agent_session_error_translated_to_contract",
+                                            serde_json::json!({
+                                                "path": key_label,
+                                                "pattern": hit.pattern,
+                                            }),
+                                        );
+                                        let contract_seq =
+                                            reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                        let mut retained =
+                                            reader_retained_bytes.load(Ordering::SeqCst);
+                                        chunks.push_back(TerminalChunk {
+                                            seq: contract_seq,
+                                            data: format!("{contract_line}\r\n"),
+                                        });
+                                        retained = retained.saturating_add(
+                                            chunks.back().map(|chunk| chunk.data.len()).unwrap_or(0),
+                                        );
+                                        trim_chunk_buffer(
+                                            &mut chunks,
+                                            &mut retained,
+                                            MAX_CHUNKS,
+                                            MAX_BUFFER_BYTES,
+                                        );
+                                        reader_retained_bytes.store(retained, Ordering::SeqCst);
+                                    }
                                 }
                                 reader_runtime_output_seen.store(true, Ordering::SeqCst);
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
@@ -3340,6 +3373,30 @@ impl PtySessionRuntime {
                                 .scan(&strip_terminal_control_sequences(&data), now_millis())
                             {
                                 record_agent_session_error(&key_label, &launch_command_label, &hit);
+                                if let Some(contract_line) =
+                                    agent_session_error_contract_translation(
+                                        &hit,
+                                        &launch_command_label,
+                                        &key_label,
+                                    )
+                                {
+                                    trace_terminal_event(
+                                        "agent_session_error_translated_to_contract",
+                                        serde_json::json!({
+                                            "path": key_label,
+                                            "pattern": hit.pattern,
+                                        }),
+                                    );
+                                    let contract_seq = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
+                                    chunks.push_back(TerminalChunk {
+                                        seq: contract_seq,
+                                        data: format!("{contract_line}\r\n"),
+                                    });
+                                    retained = retained.saturating_add(chunks.back().map(|chunk| chunk.data.len()).unwrap_or(0));
+                                    trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
+                                    reader_retained_bytes.store(retained, Ordering::SeqCst);
+                                }
                             }
                             if !saw_any_output {
                                 saw_any_output = true;
@@ -4880,6 +4937,40 @@ fn agent_session_error_in_line(line: &str) -> Option<AgentSessionErrorHit> {
         uuid,
         sample: truncate_terminal_trace_sample(&normalized),
     })
+}
+
+/// Translate a noise-safe CLI-worded session refusal into yggterm's OWN
+/// contract wording, so the remote launch-refusal planes can learn it.
+///
+/// The [11.160]/[11.162] learn arm classifies only yggterm's own contract
+/// lines (`no terminal spec for session:` / `terminal session not found:`) —
+/// a CLI's own error output must never trip the stamp, because a rendered
+/// conversation can mention errors in prose. That law left the [11.162]
+/// owner row unstamped when the pipeline moved one layer deeper: the peer's
+/// runtime record was repaired, the resume reached the CLI itself, and the
+/// CLI refused in its OWN words (`conversation … not found`) — classified
+/// here by the noise-safe scanner, recorded in agent-incidents.jsonl, and
+/// then DROPPED: the row kept claiming `running·idle` and respawning.
+///
+/// The scanner's terness gate already separates a real CLI refusal line from
+/// prose, and `--require-existing` marks the stream as a resume the caller
+/// demanded MUST exist — on that shape a `session_not_found` verdict is the
+/// CLI's honest final answer, so yggterm speaks it in its own contract words
+/// onto the row's stream. The learn arm reads the same ring and stamps; the
+/// funnel gate refuses every later launch by name. Returned line carries the
+/// `Error: ` prefix the family matcher strips and the session key the row
+/// actually asked for.
+fn agent_session_error_contract_translation(
+    hit: &AgentSessionErrorHit,
+    launch_command: &str,
+    key_label: &str,
+) -> Option<String> {
+    if hit.pattern != "session_not_found" || !launch_command.contains("--require-existing") {
+        return None;
+    }
+    Some(format!(
+        "Error: terminal session not found: {key_label}"
+    ))
 }
 
 /// First canonical 8-4-4-4-12 UUID in the text, if any. Byte-safe: every
@@ -9191,6 +9282,60 @@ line-two on the real screen\r\n\
         );
         assert!(agent_session_error_in_line("cargo build finished in 3.2s").is_none());
         assert!(agent_session_error_in_line("file not found: ./missing.txt").is_none());
+    }
+
+    #[test]
+    fn the_contract_translation_scopes_the_session_not_found_verdict_to_required_existing_resumes() {
+        let hit = |pattern| AgentSessionErrorHit {
+            pattern,
+            uuid: None,
+            sample: "sample".to_string(),
+        };
+        let launch = "ssh <host> 'yggterm server remote resume-agy <id> <cwd> --require-existing'";
+        let translated = agent_session_error_contract_translation(
+            &hit("session_not_found"),
+            launch,
+            "remote-agy://<host>/<id>",
+        )
+        .expect("a required-existing resume whose CLI answered not-found translates");
+        assert_eq!(
+            translated,
+            "Error: terminal session not found: remote-agy://<host>/<id>"
+        );
+        // A transient/healthy verdict never becomes a stamp — only a session
+        // that cannot come back may speak the contract's missing-session words.
+        assert!(agent_session_error_contract_translation(
+            &hit("session_already_in_use"),
+            launch,
+            "remote-agy://<host>/<id>",
+        )
+        .is_none());
+        // Without --require-existing the stream is not a demanded resume, so
+        // the CLI's own words stay the CLI's own words (pickers, fresh spawns).
+        assert!(agent_session_error_contract_translation(
+            &hit("session_not_found"),
+            "ssh <host> 'yggterm server remote start-agy <id> <cwd>'",
+            "remote-agy://<host>/<id>",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_translated_contract_line_is_the_learn_arms_record_gone_vocabulary() {
+        // THE LOCK: the [11.162] translation exists so the funnel's learn arm
+        // (`remote_stream_launch_refusal`, which classifies only yggterm's own
+        // contract wordings) can hear a CLI-worded refusal. If the learned
+        // vocabulary drifts, the translation must fail loudly here, not
+        // silently stop stamping.
+        let (family, line) = crate::remote_stream_launch_refusal(
+            b"Error: terminal session not found: remote-agy://<host>/<id>\r\n",
+        )
+        .expect("the translated line classifies");
+        assert_eq!(family, crate::REMOTE_PEER_RECORD_GONE_STATUS_PREFIX);
+        assert_eq!(
+            line,
+            "terminal session not found: remote-agy://<host>/<id>"
+        );
     }
 
     #[test]
