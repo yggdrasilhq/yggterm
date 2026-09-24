@@ -9976,6 +9976,68 @@ impl DaemonRuntime {
         }
     }
 
+    /// Tear down a refused remote runtime EVEN WHEN ITS PROCESSES LINGER
+    /// ([11.162]). `remove_dead_refused_remote_runtime` demands a NOT-RUNNING
+    /// session, but the measured record-gone engine is a CLI that answered
+    /// "does not exist" to `--require-existing` and then STAYED ALIVE — the
+    /// runtime keeps reading `running`, the plane keeps claiming
+    /// `idle · Kept alive`, and the reaper no-ops forever. The NAMED-failure
+    /// law says that CLI is not a running session. Same recipe as the close
+    /// verb: a best-effort peer shutdown request for remote-agent rows, then
+    /// a graceful-with-force local removal so the wrapper pty cannot outlive
+    /// the decision.
+    fn teardown_refused_remote_runtime(&mut self, path: &str) {
+        let runtime_path = self.terminal_runtime_key_for_path(path);
+        if !self.terminals.has_session(&runtime_path) {
+            return;
+        }
+        // ⛔ THE HANDED-OVER LAW: a parked reader means another daemon is
+        // serving this pty and we only still hold a descriptor. Stamping the
+        // row is still ours to do (the learn arm did it before calling), but
+        // the kill belongs to whoever owns the pty.
+        if self
+            .terminals
+            .park_reader(&runtime_path)
+            .is_some_and(|park| park.is_parked())
+        {
+            return;
+        }
+        let force_after =
+            std::time::Duration::from_secs(CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS);
+        if let Some((machine, session_id, kind)) =
+            self.server.remote_agent_pty_target_for_path(path)
+        {
+            let _ = request_remote_agent_session_shutdown(&machine, &session_id, kind, force_after);
+        }
+        let stop_command = self.server.terminal_stop_command(path);
+        match self.terminals.remove_session_gracefully_with_force_after(
+            &runtime_path,
+            stop_command.as_deref(),
+            force_after,
+        ) {
+            Ok(true) => {
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "refused_remote_runtime_torn_down",
+                        serde_json::json!({ "path": path, "runtime": runtime_path }),
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    path = %path,
+                    runtime = %runtime_path,
+                    error = %error,
+                    "refused remote runtime teardown failed"
+                );
+            }
+        }
+    }
+
     /// The last visible line the dead runtime left on screen — the frozen error
     /// frame, which for a failed launch wrapper IS the diagnosis and is about to
     /// become the only surviving copy of it.
@@ -10763,10 +10825,31 @@ impl DaemonRuntime {
             // survives). Learn it into the family stamp, remove the dead
             // wrapper so the raw frame stops being served, and refuse the
             // mount. Every tick after this is refused by the gate at the top.
+            //
+            // ⛔ THE [11.162] STAMP-AT-TRANSLATE-TIME FALLBACK. The ring is
+            // per-generation: each spawn mints a fresh ring, the reader's
+            // injected contract line dies with the generation it answered,
+            // and the refused CLI LINGERS past its own refusal (measured on
+            // the owner's medgraph row: wrapper + child alive minutes after
+            // `session_not_found`, runtime reading `running`, plane claiming
+            // `idle · Kept alive`). So the learn arm ALSO consults the
+            // translate-time marker the reader recorded on this runtime —
+            // same vocabulary, round-tripped through the same classifier —
+            // and the teardown below no longer demands a NOT-RUNNING runtime:
+            // a CLI that answered "does not exist" to `--require-existing`
+            // is not a running session, whatever its process state says.
+            let learned_refusal =
+                crate::remote_stream_launch_refusal(remote_stream_text.as_bytes()).or_else(
+                    || {
+                        self.terminals
+                            .session_translated_launch_refusal(&runtime_path)
+                            .and_then(|line| {
+                                crate::remote_stream_launch_refusal(line.as_bytes())
+                            })
+                    },
+                );
             if crate::session_path_is_remote_agent(path)
-                && !remote_stream_text.is_empty()
-                && let Some((refusal_family, refusal_line)) =
-                    crate::remote_stream_launch_refusal(remote_stream_text.as_bytes())
+                && let Some((refusal_family, refusal_line)) = learned_refusal
             {
                 let host = self
                     .server
@@ -10790,11 +10873,16 @@ impl DaemonRuntime {
                             "path": path,
                             "machine": host,
                             "family": refusal_family,
+                            "source": if remote_stream_text.is_empty() {
+                                "translate_marker"
+                            } else {
+                                "runtime_ring"
+                            },
                             "refusal": refusal_line,
                         }),
                     );
                 }
-                self.remove_dead_refused_remote_runtime(path);
+                self.teardown_refused_remote_runtime(path);
                 let _ = self.persist_state_only();
                 bail!("{refusal_line}");
             }
@@ -31465,6 +31553,69 @@ mod tests {
         assert!(
             consult < refuse && refuse < birth,
             "consult the close record, then refuse the underdetermined, THEN birth — the ordering is the law"
+        );
+    }
+
+    #[test]
+    fn the_learn_arm_stamps_from_the_translate_marker_and_tears_down_a_lingering_runtime() {
+        // [11.162] stamp leg, measured on the owner's medgraph row: the ring
+        // is per-generation (the injected contract line dies with the
+        // generation it answered) and the refused CLI LINGERS past its own
+        // refusal, so the ring-only, dead-only learn arm never fires — the
+        // row keeps `running·idle` and every ensure re-spawns. The arm must
+        // fall back to the translate-time marker the reader recorded on the
+        // runtime, and the teardown must not demand a NOT-RUNNING session: a
+        // CLI that answered "does not exist" to `--require-existing` is not
+        // a running session.
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let funnel = daemon_fn_body(
+            source,
+            "    fn ensure_terminal_for_path_with_initial_size_and_seed(",
+        );
+        let learn_arm = funnel
+            .split("THE [11.160] LEARN ARM")
+            .nth(1)
+            .expect("the learn arm block");
+        assert!(
+            learn_arm.contains("session_translated_launch_refusal(&runtime_path)"),
+            "the learn arm must consult the translate-time marker — the ring \
+             it classified before is per-generation and the refusal line dies \
+             with the generation that answered"
+        );
+        assert!(
+            learn_arm.contains(".or_else("),
+            "the marker is a FALLBACK: the ring is still classified first, so \
+             the evidence shapes stay (ring truth, then marker truth)"
+        );
+        assert!(
+            learn_arm.contains("self.teardown_refused_remote_runtime(path);"),
+            "the learned refusal must tear the runtime down even while its \
+             processes linger — remove_dead_refused_remote_runtime no-ops on \
+             a running session and the loop lives"
+        );
+        assert!(
+            !learn_arm.contains("remove_dead_refused_remote_runtime"),
+            "the dead-only reaper must not sit in the learn arm: the measured \
+             engine is a lingering live CLI, not a dead wrapper"
+        );
+        assert!(
+            learn_arm.contains("\"translate_marker\""),
+            "the trace must name its evidence source — a stamp learned off the \
+             marker vs off the ring is exactly the distinction the next seat \
+             will need"
+        );
+        let teardown = daemon_fn_body(source, "    fn teardown_refused_remote_runtime(");
+        assert!(
+            teardown.contains("park_reader(&runtime_path)")
+                && teardown.contains("is_parked()"),
+            "the teardown must respect the handed-over law: a parked reader \
+             means another daemon owns the pty and only the stamp is ours"
+        );
+        assert!(
+            teardown.contains("remove_session_gracefully_with_force_after"),
+            "the local removal must be graceful-with-force — the same recipe \
+             as the close verb, so the wrapper pty cannot outlive the decision"
         );
     }
 

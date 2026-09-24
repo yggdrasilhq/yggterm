@@ -1302,6 +1302,16 @@ impl TerminalManager {
             .is_some_and(|session| session.has_runtime_output())
     }
 
+    /// The translated `--require-existing` refusal this session's CURRENT
+    /// runtime carries, if any ([11.162] stamp-at-translate-time). The ensure
+    /// funnel's learn arm falls back to this when the ring it would classify
+    /// no longer holds the injected contract line.
+    pub fn session_translated_launch_refusal(&self, key: &str) -> Option<String> {
+        self.sessions
+            .get(key)
+            .and_then(|session| session.translated_launch_refusal())
+    }
+
     pub fn session_hit_eof_without_output(&self, key: &str) -> bool {
         self.sessions
             .get(key)
@@ -2362,6 +2372,13 @@ struct PtySessionRuntime {
     runtime_output_seen: Arc<AtomicBool>,
     eof_without_output: Arc<AtomicBool>,
     attach_ready_seen: Arc<AtomicBool>,
+    /// The last contract line this runtime's reader TRANSLATED from a CLI's
+    /// own `--require-existing` refusal ([11.162] stamp-at-translate-time).
+    /// The injected ring line dies with this runtime's generation and the
+    /// ensure's learn arm can read only the CURRENT ring — this marker is the
+    /// per-generation survivor the learn arm falls back to. `None` = this
+    /// runtime never translated a refusal.
+    translated_launch_refusal: Arc<Mutex<Option<String>>>,
     resize_count: Arc<AtomicU64>,
     last_resize_seq: Arc<AtomicU64>,
     current_cols: Arc<AtomicU16>,
@@ -3115,6 +3132,8 @@ impl PtySessionRuntime {
         let runtime_output_seen = Arc::new(AtomicBool::new(false));
         let eof_without_output = Arc::new(AtomicBool::new(false));
         let attach_ready_seen = Arc::new(AtomicBool::new(false));
+        let translated_launch_refusal: Arc<Mutex<Option<String>>> =
+            Arc::new(Mutex::new(None));
         let resize_count = Arc::new(AtomicU64::new(0));
         let last_resize_seq = Arc::new(AtomicU64::new(0));
         let current_cols = Arc::new(AtomicU16::new(initial_cols));
@@ -3146,6 +3165,7 @@ impl PtySessionRuntime {
         let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
         let reader_eof_without_output = Arc::clone(&eof_without_output);
         let reader_attach_ready_seen = Arc::clone(&attach_ready_seen);
+        let reader_translated_launch_refusal = Arc::clone(&translated_launch_refusal);
         let reader_screen_state = Arc::clone(&screen_state);
         let app_declares = Arc::new(Mutex::new(AppDeclareLog::new()));
         let osc_title = Arc::new(Mutex::new(String::new()));
@@ -3255,6 +3275,19 @@ impl PtySessionRuntime {
                                                 "pattern": hit.pattern,
                                             }),
                                         );
+                                        // [11.162] Stamp-at-translate-time: the
+                                        // injected ring line dies with THIS
+                                        // runtime's generation (the next spawn
+                                        // mints a fresh ring), so the verdict is
+                                        // also recorded on the runtime itself,
+                                        // where the ensure's learn arm can find
+                                        // it even after the ring it painted is
+                                        // gone.
+                                        if let Ok(mut slot) =
+                                            reader_translated_launch_refusal.lock()
+                                        {
+                                            *slot = Some(contract_line.clone());
+                                        }
                                         let contract_seq =
                                             reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                                         let mut retained =
@@ -3387,6 +3420,17 @@ impl PtySessionRuntime {
                                             "pattern": hit.pattern,
                                         }),
                                     );
+                                    // [11.162] Stamp-at-translate-time: the
+                                    // injected ring line dies with THIS
+                                    // runtime's generation (the next spawn
+                                    // mints a fresh ring), so the verdict is
+                                    // also recorded on the runtime itself,
+                                    // where the ensure's learn arm can find it
+                                    // even after the ring it painted is gone.
+                                    if let Ok(mut slot) = reader_translated_launch_refusal.lock()
+                                    {
+                                        *slot = Some(contract_line.clone());
+                                    }
                                     let contract_seq = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                                     let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
                                     chunks.push_back(TerminalChunk {
@@ -3529,6 +3573,7 @@ impl PtySessionRuntime {
             runtime_output_seen,
             eof_without_output,
             attach_ready_seen,
+            translated_launch_refusal,
             resize_count,
             last_resize_seq,
             current_cols,
@@ -3678,6 +3723,17 @@ impl PtySessionRuntime {
 
     fn has_runtime_output(&self) -> bool {
         self.runtime_output_seen.load(Ordering::SeqCst)
+    }
+
+    /// The contract line this runtime's reader translated from a CLI's own
+    /// `--require-existing` refusal, if it did ([11.162]). Per-generation
+    /// truth: `None` for a runtime that never translated one, and the value
+    /// dies with the runtime — exactly like the ring line it mirrors.
+    fn translated_launch_refusal(&self) -> Option<String> {
+        self.translated_launch_refusal
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Is this runtime a STAND-IN rather than the session's working pty?
@@ -9335,6 +9391,42 @@ line-two on the real screen\r\n\
         assert_eq!(
             line,
             "terminal session not found: remote-agy://<host>/<id>"
+        );
+    }
+
+    #[test]
+    fn the_reader_records_the_translated_refusal_on_the_runtime_for_the_learn_arm() {
+        // [11.162] stamp-at-translate-time: the injected ring line is
+        // per-generation and the ensure's learn arm reads only the CURRENT
+        // ring — the marker on the runtime is the survivor the learn arm
+        // falls back to. BOTH reader translate sites must record it (a
+        // refusal can arrive in a streamed chunk or in the EOF flush), the
+        // runtime getter must read the shared slot, and the manager accessor
+        // must expose it under the runtime key the ensure holds.
+        let source = include_str!("terminal.rs");
+        for site in source
+            .match_indices("\"agent_session_error_translated_to_contract\"")
+            .map(|(at, _)| &source[at..])
+        {
+            let window = site
+                .split("reader_runtime_output_seen.store(true")
+                .next()
+                .unwrap_or(site);
+            assert!(
+                window.contains("reader_translated_launch_refusal"),
+                "every translate site must record the verdict on the runtime \
+                 before the pass ends — a site that only injects the ring line \
+                 loses the refusal with the generation"
+            );
+        }
+        assert!(
+            source.contains("translated_launch_refusal: Arc<Mutex<Option<String>>>"),
+            "the runtime carries the marker on a shared slot, exactly like the \
+             other reader-written facts (runtime_output_seen and friends)"
+        );
+        assert!(
+            source.contains("pub fn session_translated_launch_refusal(&self, key: &str)"),
+            "the manager accessor is the ensure funnel's door to the marker"
         );
     }
 
