@@ -15731,10 +15731,10 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
             // lookup (agy ids read through `~/.codex`); the keyed index asks
             // agy's OWN db on the machine that will exec the CLI, so a
             // definitive miss is honest evidence there.
-            match antigravity_local_db_holds_conversation(session_id) {
+            return match antigravity_local_db_holds_conversation(session_id) {
                 Some(holds) => Ok(holds),
                 None => Ok(true),
-            }
+            };
         }
         _ => {}
     }
