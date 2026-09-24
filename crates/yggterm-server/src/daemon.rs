@@ -10541,11 +10541,29 @@ impl DaemonRuntime {
                 }
             };
             if let Some(error) = peer_missing_error {
-                let refusal = format!(
-                    "peer session gone — the owning host reports this runtime \
-                     missing ({error}); closed there? Re-open the row to start \
-                     a fresh session."
-                );
+                // ⛔ THE [11.165] MEMO-TEXT SPLIT. The memo stamped every
+                // cause "peer session gone" — the binary-missing class wore a
+                // session-gone Status (filed in the [11.158] entry,
+                // 2026-09-20). Classify the peer's own words and let each
+                // family speak its truth; the evidence ({error}) rides in
+                // both texts.
+                let binary_missing = crate::remote_stream_launch_refusal(error.as_bytes())
+                    .is_some_and(|(family, _)| {
+                        family == crate::REMOTE_CLI_BINARY_MISSING_STATUS_PREFIX
+                    });
+                let refusal = if binary_missing {
+                    format!(
+                        "launch refused — the CLI binary was missing on the \
+                         owning host when this runtime was last asked for \
+                         ({error}); an install may heal it — the row retries."
+                    )
+                } else {
+                    format!(
+                        "peer session gone — the owning host reports this runtime \
+                         missing ({error}); closed there? Re-open the row to start \
+                         a fresh session."
+                    )
+                };
                 if let Ok(home) = crate::resolve_yggterm_home() {
                     append_trace_event(
                         &home,
@@ -10560,8 +10578,19 @@ impl DaemonRuntime {
                         }),
                     );
                 }
-                self.server
-                    .record_launch_refusal_for_path(path, &refusal, "peer session gone");
+                if binary_missing
+                    && let Some(host) = self.server.remote_agent_cli_host_display_for_path(path)
+                {
+                    // The [11.160] family stamp: fingerprint-pinned and
+                    // healable by the evidence clear, like every other
+                    // binary-missing refusal.
+                    self.server.record_remote_cli_binary_missing_refusal_for_path(
+                        path, &refusal, &host,
+                    );
+                } else {
+                    self.server
+                        .record_launch_refusal_for_path(path, &refusal, "peer session gone");
+                }
                 let _ = self.persist_state_only();
                 bail!("{refusal}");
             }
@@ -31616,6 +31645,38 @@ mod tests {
             teardown.contains("remove_session_gracefully_with_force_after"),
             "the local removal must be graceful-with-force — the same recipe \
              as the close verb, so the wrapper pty cannot outlive the decision"
+        );
+    }
+
+    #[test]
+    fn the_peer_missing_memo_names_the_binary_missing_family_instead_of_session_gone() {
+        // [11.165]: the [11.153] memo arm stamped every cause "peer session
+        // gone" — the binary-missing class wore a session-gone Status (filed
+        // in the [11.158] entry, 2026-09-20). The arm must classify the
+        // peer's own words, stamp a classified binary-missing through the
+        // [11.160] family stamp (fingerprint-pinned, healable by the evidence
+        // clear), and keep the [11.153] text verbatim for everything else.
+        let source = daemon_product_source();
+        let arm = source
+            .split("THE [11.165] MEMO-TEXT SPLIT")
+            .nth(1)
+            .expect("the memo arm")
+            .split("remote_saved_session_preflight_elided_runtime_launch")
+            .next()
+            .expect("the arm through its stamp — the window must reach past \
+             the trace event to the record call itself");
+        assert!(
+            arm.contains("remote_stream_launch_refusal(error.as_bytes())"),
+            "the memo must classify the peer's own words — a hard-coded cause              is the mis-naming the field caught"
+        );
+        assert!(
+            arm.contains("record_remote_cli_binary_missing_refusal_for_path"),
+            "a classified binary-missing memo stamps the [11.160] family — \
+             fingerprint-pinned and healable, not the generic verb"
+        );
+        assert!(
+            arm.contains("\"peer session gone\""),
+            "the unclassified default keeps the [11.153] text verbatim"
         );
     }
 
