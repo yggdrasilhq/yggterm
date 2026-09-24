@@ -262,7 +262,7 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use yggterm_core::AppManifest;
-use yggterm_core::agent_cli::{AGENT_CLIS, agent_cli_descriptor};
+use yggterm_core::agent_cli::{AGENT_CLIS, ResumeMissingIdBehavior, agent_cli_descriptor};
 use yggterm_core::{
     AgentLaunchOptions, PerfSpan, SessionStore, SessionTitleStore, TranscriptRole,
     WorkspaceDocument, WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
@@ -12543,6 +12543,24 @@ impl YggtermServer {
         {
             anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
         }
+
+        // ⛔ THE [11.165] DEFINITIVE-MISS GATE, the peer-side twin of the
+        // wrapper gate: before composition, on the store's DEFINITIVE word
+        // only, and never for a row whose runtime this daemon holds (the
+        // live half above wins — the 2026-08-28 stranding law). Without it
+        // the ensure composed `agy --conversation <id>` for an id the store
+        // provably lacks and the CLI painted its fabrication warning into a
+        // fresh PTY under `--require-existing`.
+        if !live_runtime_held
+            && remote_require_existing_needs_definitive_vouch(kind)
+            && remote_require_existing_definitive_miss_refuses(
+                kind,
+                require_existing,
+                local_agent_store_vouches_for_session(kind, session_id),
+            )
+        {
+            anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
+        }
         if saved_session_exists {
             let mut external_processes =
                 external_agent_resume_processes_for_session(kind, session_id);
@@ -15732,6 +15750,19 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
             // require-existing gates only (the wrapper + the fresh-start
             // hazard it exists for), never at the shared predicate — see the
             // [11.165] pending-bugs entry.
+            return Ok(true);            // ⛔ [11.165] THE PREDICATE STAYS FAIL-OPEN ON PURPOSE: a
+            // definitive miss read here also reaches the server-side ensure's
+            // birth composition and the rebind's rebuild vouch — flipping
+            // this predicate blindly rewrote fresh self-minting rows into
+            // id-less births and surfaced a machine-sensitive test
+            // (`a_rebound_agy_row_restores_as_the_resume_its_conversation_names`
+            // masks its vouch behind the repoint path; measured DBG-VOUCH
+            // Some(false) on a host whose real ~/.gemini/antigravity-cli
+            // exists, the fixture db living under ENV_YGGTERM_HOME where the
+            // vouch never looks). THE DEFINITIVE-MISS GATES LIVE AT THE
+            // CONSUMERS — the wrapper gate and its peer-side twin refuse on
+            // the three-valued vouch where the absent-id resume measurably
+            // fabricates (the descriptor's resume_missing_id_behavior).
             return Ok(true);
         }
         _ => {}
@@ -16186,9 +16217,48 @@ fn remote_require_existing_refusal_allowed(
 /// to list its own sessions. The picker lists only real sessions and starts
 /// nothing silently, so `--require-existing`'s intent (never fabricate a
 /// session) survives. Birth-id kinds (Claude Code and the resume-flag births)
-/// keep the refusal: their stores ARE keyed by the row id, so absence is real.
+/// keep the refusal: their stores ARE keyed by the row id, so absence is real./// to list its own sessions. The picker lists only real sessions and starts
+/// nothing silently, so `--require-existing`'s intent (never fabricate a
+/// session) survives — ⛔ EXCEPT where that premise was measured false: agy
+/// self-mints AND fabricates a fresh conversation on an absent-id resume
+/// (agy 1.2.10, 2026-09-25). For that class the definitive-miss gate
+/// (`remote_require_existing_needs_definitive_vouch`) restores the refusal on
+/// the store's three-valued word. Birth-id kinds (Claude Code and the
+/// resume-flag births) keep the refusal: their stores ARE keyed by the row
+/// id, so absence is real.
 fn remote_resume_absent_opens_picker(kind: SessionKind) -> bool {
     agent_cli_descriptor(kind).is_some_and(|descriptor| !descriptor.id_assigned_at_birth)
+}
+
+/// Whether THIS kind's `--require-existing` resume needs the store's
+/// definitive word before the launch composes. True only for the
+/// picker-skipped kinds whose absent-id resume MEASURABLY fabricates a fresh
+/// conversation — the descriptor's `ResumeMissingIdBehavior::Fabricates`.
+/// Picker kinds need no gate (the picker starts nothing); clean refusers need
+/// none (the CLI says no itself, exit non-zero); adopts-latest is [11.134]'s
+/// surface. Cheap by contract: callers pay the vouch's fs cost only when this
+/// answers yes.
+fn remote_require_existing_needs_definitive_vouch(kind: SessionKind) -> bool {
+    remote_resume_absent_opens_picker(kind)
+        && agent_cli_descriptor(kind).is_some_and(|descriptor| {
+            descriptor.resume_missing_id_behavior == Some(ResumeMissingIdBehavior::Fabricates)
+        })
+}
+
+/// The definitive-miss refusal decision, given the vouch's word. `Some(false)`
+/// is the ONLY refusing word: the store was consulted and the id is not there,
+/// so the resume would fabricate — the exact betrayal `--require-existing`
+/// exists to prevent. `None` (no store on this host, unreadable, locked)
+/// fails open — "I could not check" has never been evidence of absence — and
+/// `Some(true)` resumes exactly as before.
+fn remote_require_existing_definitive_miss_refuses(
+    kind: SessionKind,
+    require_existing: bool,
+    store_vouch: Option<bool>,
+) -> bool {
+    require_existing
+        && store_vouch == Some(false)
+        && remote_require_existing_needs_definitive_vouch(kind)
 }
 
 /// Whether a HELD live row may re-spawn through `resume <row id>` when the
@@ -18034,6 +18104,110 @@ mod restored_runtime_repair_tests {
             body[gate_at..].contains("restored_codex_runtime_launch_repair_refused_store_miss"),
             "the refusal must carry a named trace — an untraced repair refusal              is the silent-fresh-spawn class all over again"
         );
+    }
+
+    #[test]
+    fn require_existing_definitive_miss_refuses_only_on_the_stores_definitive_word() {
+        // [11.165]: the gate consumes the store's THREE-valued word at the
+        // require-existing consumers. Some(false) = consulted and absent (the
+        // resume would fabricate) → refuse. None = could not check → the
+        // oldest fail-open law. Some(true) = there, resume. No requirement, no
+        // refusal.
+        let agy = SessionKind::Antigravity;
+        assert!(remote_require_existing_definitive_miss_refuses(agy, true, Some(false)));
+        assert!(!remote_require_existing_definitive_miss_refuses(agy, true, None));
+        assert!(!remote_require_existing_definitive_miss_refuses(agy, true, Some(true)));
+        assert!(!remote_require_existing_definitive_miss_refuses(agy, false, Some(false)));
+    }
+
+    #[test]
+    fn only_the_measured_fabricator_reaches_for_the_definitive_vouch() {
+        // The probe is only worth its fs cost where the CLI's absent-id resume
+        // measurably fabricates. Pickers start nothing; clean refusers say no
+        // themselves; adopts-latest is [11.134]'s surface; birth-id kinds keep
+        // the two-valued gate.
+        assert!(remote_require_existing_needs_definitive_vouch(SessionKind::Antigravity));
+        assert!(!remote_require_existing_needs_definitive_vouch(SessionKind::Codex));
+        assert!(!remote_require_existing_needs_definitive_vouch(SessionKind::Muse));
+        assert!(!remote_require_existing_needs_definitive_vouch(SessionKind::OpenCode));
+        assert!(!remote_require_existing_needs_definitive_vouch(SessionKind::ClaudeCode));
+    }
+
+    #[test]
+    fn the_absent_resume_behavior_table_carries_its_measurements() {
+        // The classification the [11.165] design asked to settle: agy's
+        // `id_assigned_at_birth:false` did NOT imply a picker — the absent-id
+        // resume warns, runs, and mints a fresh conversation (measured live
+        // twice; the second on 1.2.10 with the store delta as witness).
+        let behavior = |kind: SessionKind| {
+            agent_cli_descriptor(kind)
+                .unwrap()
+                .resume_missing_id_behavior
+        };
+        assert_eq!(
+            behavior(SessionKind::Antigravity),
+            Some(ResumeMissingIdBehavior::Fabricates)
+        );
+        assert_eq!(
+            behavior(SessionKind::Muse),
+            Some(ResumeMissingIdBehavior::Refuses)
+        );
+        assert_eq!(
+            behavior(SessionKind::Codex),
+            Some(ResumeMissingIdBehavior::Refuses)
+        );
+        assert_eq!(
+            behavior(SessionKind::OpenCode),
+            Some(ResumeMissingIdBehavior::AdoptsLatest)
+        );
+    }
+
+    fn source_body_after(source: &str, anchor: &str) -> String {
+        let rest = source
+            .split(anchor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("anchor missing: {anchor}"));
+        let fn_at = rest.find("\nfn ").unwrap_or(rest.len());
+        let pub_fn_at = rest.find("\npub fn ").unwrap_or(rest.len());
+        let end = fn_at.min(pub_fn_at);
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn the_definitive_miss_gate_sits_at_both_require_existing_consumers_only() {
+        // [11.165]: the shared predicate stays fail-open (the ensure's birth
+        // composition and the rebind's rebuild vouch read it); the refusal
+        // lives at the wrapper gate and its peer-side twin, behind the cheap
+        // fabricator predicate, on the three-valued vouch alone.
+        let source = include_str!("lib.rs");
+        let predicate = source_body_after(source, "fn remote_saved_agent_session_exists(");
+        let agy_arm = predicate
+            .split("SessionKind::Antigravity =>")
+            .nth(1)
+            .expect("the antigravity arm")
+            .split("_ => {}")
+            .next()
+            .expect("the arm body");
+        assert!(
+            agy_arm.contains("return Ok(true);"),
+            "the shared predicate must stay fail-open for Antigravity"
+        );
+        assert!(
+            agy_arm.contains("THE DEFINITIVE-MISS GATES LIVE AT THE"),
+            "the predicate's comment must point at the consumer gates"
+        );
+        for anchor in [
+            "pub fn run_remote_resume_agent(",
+            "    fn ensure_remote_runtime_agent_session(\n        &mut self,",
+        ] {
+            let body = source_body_after(source, anchor);
+            assert!(
+                body.contains("remote_require_existing_needs_definitive_vouch(kind)")
+                    && body.contains("local_agent_store_vouches_for_session(kind, session_id)")
+                    && body.contains("remote_resume_missing_saved_session_error(kind, session_id)"),
+                "both require-existing consumers must carry the definitive-miss gate: {anchor}"
+            );
+        }
     }
 
     #[test]
@@ -23809,6 +23983,23 @@ pub fn run_remote_resume_agent(
         && remote_resume_requires_missing_saved_session_failure(
             require_existing,
             saved_session_exists,
+        )
+    {
+        anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
+    }
+
+    // ⛔ THE [11.165] DEFINITIVE-MISS GATE — the picker skip above is unsound
+    // for the one self-minting kind whose absent-id resume measurably
+    // FABRICATES (agy: warns, exit 0, fresh conversation under a new id —
+    // measured twice, the second on 1.2.10 with the store delta as witness).
+    // On the store's DEFINITIVE word the refusal fires here, before the
+    // ledger and before any composition, so zero bytes reach the CLI. A live
+    // runtime never reaches this line (bridged above); `None` fails open.
+    if remote_require_existing_needs_definitive_vouch(kind)
+        && remote_require_existing_definitive_miss_refuses(
+            kind,
+            require_existing,
+            local_agent_store_vouches_for_session(kind, session_id),
         )
     {
         anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));

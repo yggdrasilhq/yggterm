@@ -40,6 +40,32 @@ pub enum ResumeSelector {
     Subcommand(&'static str),
 }
 
+/// What a CLI does when RESUMED with an id its OWN store lacks — MEASURED per
+/// kind, never inferred. The inference WAS the bug: `id_assigned_at_birth:
+/// false` (self-minting) was made to carry the picker skip, and a self-minter
+/// with no picker rode it into a silent fresh spawn under `--require-existing`
+/// ([11.165], agy, measured twice). A new CLI answers this from a live
+/// absent-id probe, or leaves `None` and keeps the fail-open behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMissingIdBehavior {
+    /// Opens the CLI's own session picker: real sessions only, starts nothing.
+    Picker,
+    /// Exits non-zero without starting anything (muse 2026-08-20: exit 1
+    /// `retained session not found`; codex 2026-09-06: `ERROR: No saved
+    /// session found with ID`).
+    Refuses,
+    /// Warns and runs anyway on a FRESH conversation under a NEW id — the
+    /// exact fabrication `--require-existing` exists to prevent. Measured
+    /// agy 1.2.10 (2026-09-25): `warning: conversation "…" not found` on
+    /// stderr, exit 0, the turn ran, and the store gained a conversation the
+    /// requested id never named (60 → 61 dbs).
+    Fabricates,
+    /// Attaches a DIFFERENT (latest) existing session instead ([11.134],
+    /// opencode `--session`) — no fabrication, but the wrong conversation;
+    /// that surface is [11.134]'s to settle. Consumed by no gate yet.
+    AdoptsLatest,
+}
+
 /// Who decides a session's title.
 ///
 /// Data, because the answer used to be `matches!(self, SessionKind::ClaudeCode)`
@@ -662,6 +688,12 @@ pub struct AgentCliDescriptor {
     /// This one bit is what decides whether the poll runs — it used to be a
     /// per-CLI code fork.
     pub id_assigned_at_birth: bool,
+    /// MEASURED behavior when this CLI is RESUMED with an id its own store
+    /// lacks. `None` = unmeasured: every consumer fails open. The
+    /// `--require-existing` definitive-miss gate consumes
+    /// [`ResumeMissingIdBehavior::Fabricates`] — see
+    /// `remote_require_existing_needs_definitive_vouch` (yggterm-server).
+    pub resume_missing_id_behavior: Option<ResumeMissingIdBehavior>,
     /// The token the remote wrapper subcommands are built from:
     /// `resume-<slug>`, `start-<slug>`, `terminate-<slug>`,
     /// `<slug>-session-exists`.
@@ -1871,6 +1903,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Codex launches bare and discovers its ULID later, so the synthesized
         // `local://<uuid4>` has to be rebound once the transcript appears.
         id_assigned_at_birth: false,
+        // ⭐ MEASURED 2026-09-06: `codex resume <absent-id>` → `ERROR: No saved
+        // session found with ID` — refuses, starts nothing.
+        resume_missing_id_behavior: Some(ResumeMissingIdBehavior::Refuses),
         wrapper_slug: Some("codex"),
         // ⚠ HISTORICAL, and deliberately not `remote-codex://`: this string is
         // in every persisted state file on the fleet. The slug drives new CLIs;
@@ -2104,6 +2139,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // the cached/rollout chain answers.
         title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
+        // Unmeasured (the wrapper is availability-gated); fail-open.
+        resume_missing_id_behavior: None,
         // ⛔ LOCAL-ONLY, and this is the declaration that says so. It replaces
         // the `matches!(kind, CodexLiteLlm)` that the scheme lock, both arm
         // matrices and the wrapper tables each carried their own copy of.
@@ -2233,6 +2270,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // CC launches with `--session-id <uuid>`, so the row id IS the
         // transcript id from birth and no rebind poll is needed.
         id_assigned_at_birth: true,
+        // Unmeasured for this table; a birth-id kind keeps the two-valued gate.
+        resume_missing_id_behavior: None,
         // ⚠ HISTORICAL `cc`, not `claude-code`: `resume-cc` / `start-cc` are in
         // the Connect strings the metadata rail shows the user and in scripts.
         wrapper_slug: Some("cc"),
@@ -2506,6 +2545,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `pi --session-id <id>` creates the session if it is missing
         // (`src/main.ts`), the closest analogue to Claude Code's birth id.
         id_assigned_at_birth: true,
+        // Unmeasured; birth-id kind — the first gate already refuses on absence.
+        resume_missing_id_behavior: None,
         wrapper_slug: Some("pi"),
         remote_row_scheme: Some("remote-pi://"),
         runtime_key_scheme: Some("pi-runtime://"),
@@ -2660,6 +2701,11 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // session and never learn it). Minting over the RPC first is still
         // the only safe order, and yggterm may still not assume a birth id.
         id_assigned_at_birth: false,
+        // ⭐ MEASURED ([11.134], suite 10/10): unknown `--session` silently falls
+        // back to the LATEST session — neither picker nor fresh fabrication; that
+        // surface is [11.134]'s. The store is a declared scan gap, so no
+        // membership vouch can fire here either.
+        resume_missing_id_behavior: Some(ResumeMissingIdBehavior::AdoptsLatest),
         wrapper_slug: Some("opencode"),
         remote_row_scheme: Some("remote-opencode://"),
         runtime_key_scheme: Some("opencode-runtime://"),
@@ -2807,6 +2853,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // `qwen --session-id <uuid>` — but a collision is FATAL, so the caller
         // must mint a fresh uuid, never reuse a row id it already used.
         id_assigned_at_birth: true,
+        // Unmeasured; birth-id kind.
+        resume_missing_id_behavior: None,
         wrapper_slug: Some("qwen"),
         remote_row_scheme: Some("remote-qwen://"),
         runtime_key_scheme: Some("qwen-runtime://"),
@@ -2982,6 +3030,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // caller-supplied id at birth is honoured. Its id is a directory name
         // verbatim, with no format validation.
         id_assigned_at_birth: true,
+        // Unmeasured; birth-id kind.
+        resume_missing_id_behavior: None,
         wrapper_slug: Some("kimi"),
         remote_row_scheme: Some("remote-kimi://"),
         runtime_key_scheme: Some("kimi-runtime://"),
@@ -3173,6 +3223,9 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // session name and never generates over it.
         title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
+        // ⭐ MEASURED 2026-08-20: exits 1 with `retained session not found` —
+        // refuses, starts nothing.
+        resume_missing_id_behavior: Some(ResumeMissingIdBehavior::Refuses),
         wrapper_slug: Some("muse"),
         remote_row_scheme: Some("remote-muse://"),
         runtime_key_scheme: Some("muse-runtime://"),
@@ -3360,6 +3413,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // Antigravity store writes summaries/previews into conversation_summaries.db.
         title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
+        // ⭐ MEASURED 2026-08-20 and again on 1.2.10 (2026-09-25): warns
+        // `conversation "…" not found` on stderr, exits 0, runs the turn, and the
+        // store gains a FRESH conversation under a NEW id — the requested id is
+        // nowhere. The picker premise read off self-minting was false; the
+        // definitive-miss gate exists for exactly this kind.
+        resume_missing_id_behavior: Some(ResumeMissingIdBehavior::Fabricates),
         wrapper_slug: Some("agy"),
         remote_row_scheme: Some("remote-agy://"),
         runtime_key_scheme: Some("agy-runtime://"),
@@ -3631,6 +3690,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // true; ⚠ a collision is an ERROR, exactly like qwen, so a caller must
         // mint a fresh uuid and never reuse a row id it has already spent.
         id_assigned_at_birth: true,
+        // Unmeasured; birth-id kind.
+        resume_missing_id_behavior: None,
         wrapper_slug: Some("grok"),
         remote_row_scheme: Some("remote-grok://"),
         runtime_key_scheme: Some("grok-runtime://"),
@@ -3869,6 +3930,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // desktop's own generated titles) — yggterm never invents one.
         title_authority: TitleAuthority::Store,
         id_assigned_at_birth: false,
+        // Unmeasured for this table; the 0.5.1 contract is `--resume`.
+        resume_missing_id_behavior: None,
         // Fleet spawning (owner directive 2026-09-08): the remote wrapper
         // arms (`resume-zcode-tui`, `start-zcode-tui`,
         // `zcode-tui-session-exists`) are generated from this slug, and the
@@ -4021,6 +4084,8 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // appeared on the binary. The row id is not the session id at
         // birth.
         id_assigned_at_birth: false,
+        // Unmeasured for this table.
+        resume_missing_id_behavior: None,
         wrapper_slug: Some("devin"),
         remote_row_scheme: Some("remote-devin://"),
         runtime_key_scheme: Some("devin-runtime://"),
