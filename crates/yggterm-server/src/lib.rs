@@ -15715,26 +15715,24 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
             return remote_saved_codex_session_exists(session_id);
         }
         SessionKind::Antigravity => {
-            // ⛔ THE [11.165] DEFINITIVE-MISS ARM. The keyed index is
-            // three-valued and this predicate is two-valued, so the mapping is
-            // the whole design: Some(true) → true (resume it); None → true
-            // (the 2026-08-19 fail-open stands — an unreadable store, or a
-            // host where the CLI never ran, must never false-death a live
-            // session); Some(false) → FALSE. The old unconditional `Ok(true)`
-            // folded Some(false) into the None case's fear, so every
-            // definitive miss became a CLI-time failure: the CLI either
-            // refuses in its own words (the loop the [11.162] stamp family
-            // exists for) or — agy, measured 2026-08-20 — WARNS `conversation
-            // not found` and fresh-starts under `--require-existing`, the
-            // silent fresh spawn this campaign exists to kill. The 2026-08-19
-            // false-death this arm originally feared was the WRONG-STORE
-            // lookup (agy ids read through `~/.codex`); the keyed index asks
-            // agy's OWN db on the machine that will exec the CLI, so a
-            // definitive miss is honest evidence there.
-            return match antigravity_local_db_holds_conversation(session_id) {
-                Some(holds) => Ok(holds),
-                None => Ok(true),
-            };
+            if antigravity_local_db_holds_conversation(session_id) == Some(true) {
+                return Ok(true);
+            }
+            // ⛔ [11.165] OWED DESIGN (kept fail-open on purpose for now): a
+            // definitive miss (Some(false)) read here also reaches the
+            // server-side ensure's birth composition (12535) and the
+            // rebind's rebuild vouch — flipping this predicate blindly
+            // rewrote fresh self-minting rows into id-less births and
+            // surfaced a machine-sensitive test
+            // (`a_rebound_agy_row_restores_as_the_resume_its_conversation_names`
+            // masks its vouch behind the repoint path; measured DBG-VOUCH
+            // Some(false) on a host whose real ~/.gemini/antigravity-cli
+            // exists, the fixture db living under ENV_YGGTERM_HOME where the
+            // vouch never looks). The honest flip belongs at the
+            // require-existing gates only (the wrapper + the fresh-start
+            // hazard it exists for), never at the shared predicate — see the
+            // [11.165] pending-bugs entry.
+            return Ok(true);
         }
         _ => {}
     }
@@ -18035,30 +18033,6 @@ mod restored_runtime_repair_tests {
         assert!(
             body[gate_at..].contains("restored_codex_runtime_launch_repair_refused_store_miss"),
             "the refusal must carry a named trace — an untraced repair refusal              is the silent-fresh-spawn class all over again"
-        );
-    }
-
-    #[test]
-    fn the_antigravity_saved_session_probe_answers_a_definitive_store_miss() {
-        // [11.165]: the agy arm's unconditional Ok(true) folded the index's
-        // Some(false) into the None case's fail-open, so a definitive miss
-        // became a CLI-time failure (refuse-and-loop, or the measured
-        // warn-and-fresh-start under --require-existing). The mapping must be
-        // explicit: Some → its value, None → the fail-open.
-        let source = include_str!("lib.rs");
-        let arm = source
-            .split("fn remote_saved_agent_session_exists(")
-            .nth(1)
-            .expect("the probe fn")
-            .split("\nfn ")
-            .next()
-            .expect("the probe body");
-        let agy_at = arm
-            .find("match antigravity_local_db_holds_conversation(session_id)")
-            .expect("the agy arm must consult the three-valued index");
-        assert!(
-            arm[agy_at..].contains("None => Ok(true)"),
-            "the unreadable-store fail-open must stay: None is not absence"
         );
     }
 
