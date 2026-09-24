@@ -690,8 +690,8 @@ pub(crate) fn refusal_remedy_for_family(status_prefix: &str) -> &'static str {
     if status_prefix == REMOTE_PEER_RECORD_GONE_STATUS_PREFIX {
         "the machine that owns this session no longer holds the \
          runtime's record, so the same resume can never attach. \
-         The conversation itself is safe in the CLI's own store — \
-         re-open the row to start a fresh session on it."
+         If the conversation survives at all, it is in the CLI's \
+         own store — re-open the row to start a fresh session on it."
     } else {
         "the CLI binary was missing on the machine that owns this \
          session. An install may be in flight — the row retries and \
@@ -15715,18 +15715,26 @@ fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> any
             return remote_saved_codex_session_exists(session_id);
         }
         SessionKind::Antigravity => {
-            if antigravity_local_db_holds_conversation(session_id) == Some(true) {
-                return Ok(true);
+            // ⛔ THE [11.165] DEFINITIVE-MISS ARM. The keyed index is
+            // three-valued and this predicate is two-valued, so the mapping is
+            // the whole design: Some(true) → true (resume it); None → true
+            // (the 2026-08-19 fail-open stands — an unreadable store, or a
+            // host where the CLI never ran, must never false-death a live
+            // session); Some(false) → FALSE. The old unconditional `Ok(true)`
+            // folded Some(false) into the None case's fear, so every
+            // definitive miss became a CLI-time failure: the CLI either
+            // refuses in its own words (the loop the [11.162] stamp family
+            // exists for) or — agy, measured 2026-08-20 — WARNS `conversation
+            // not found` and fresh-starts under `--require-existing`, the
+            // silent fresh spawn this campaign exists to kill. The 2026-08-19
+            // false-death this arm originally feared was the WRONG-STORE
+            // lookup (agy ids read through `~/.codex`); the keyed index asks
+            // agy's OWN db on the machine that will exec the CLI, so a
+            // definitive miss is honest evidence there.
+            match antigravity_local_db_holds_conversation(session_id) {
+                Some(holds) => Ok(holds),
+                None => Ok(true),
             }
-            // Antigravity's store is a per-host SQLite DB; a `remote-agy://oc/<id>`
-            // names a session on `oc`, not on this host. A local DB miss is
-            // therefore not proof of absence — the scan already proved it exists
-            // on the remote, and the CLI itself is the real authority for a
-            // remote id. Return `true` to avoid the `store_scan_gap` false-death
-            // (`yggterm: saved Codex session … is no longer available` measured
-            // 2026-08-19 for `remote-agy://oc/2cc9…`). A bad remote id then fails
-            // loudly at `agy --conversation` time, not as a phantom Codex miss.
-            return Ok(true);
         }
         _ => {}
     }
@@ -16862,6 +16870,18 @@ pub(crate) fn remote_stream_launch_refusal(bytes: &[u8]) -> Option<(&'static str
             || lower.contains("terminal session not found:")
         {
             REMOTE_PEER_RECORD_GONE_STATUS_PREFIX
+        } else if lower.contains("yggterm: saved")
+            && lower.contains("is no longer available on this machine")
+        {
+            // THE [11.165] WRAPPER WORDING. `remote_resume_missing_saved_session_error`
+            // is yggterm's OWN contract line — the wrapper and the peer-side
+            // ensure refusing a `--require-existing` resume whose saved
+            // session the store definitively lacks (the [11.165] Antigravity
+            // flip). It used to ride the ring unclassified, so the learn arm
+            // could not stamp it and the ensure retried the same doomed spawn
+            // under a plane that claimed `idle · Kept alive`. It is the
+            // record-gone family in the store's own words.
+            REMOTE_PEER_RECORD_GONE_STATUS_PREFIX
         } else {
             return None;
         };
@@ -17735,6 +17755,32 @@ fn refresh_restored_remote_runtime_codex_launch_command(
                 return false;
             }
         }
+    } else if local_agent_store_vouches_for_session(session.kind, &session_id) == Some(false) {
+        // ⛔ THE [11.165] RE-ARM GATE. The `already_resume` short-circuit was
+        // total: a record whose launch already names the id skipped the store
+        // probe forever, so the birth arm re-normalized and re-armed a record
+        // whose conversation the CLI's own store no longer holds on EVERY
+        // sweep (`restored_codex_runtime_launch_repaired`, measured twice
+        // across peer rotations on the [11.162] medgraph row) — the engine
+        // that kept a dead runtime record answering the peer's ensure ask and
+        // feeding the CLI-worded refusal loop. The vouch is three-valued and
+        // this repair is local-only by construction (remote-agent schemes are
+        // refused at the top), so a DEFINITIVE local miss refuses the repair
+        // by name; `None` (unreadable store) keeps today's behavior — never
+        // treat None as absence.
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_runtime",
+                "restored_codex_runtime_launch_repair_refused_store_miss",
+                serde_json::json!({
+                    "key": key,
+                    "session_id": session_id,
+                }),
+            );
+        }
+        return false;
     }
     let Some(runtime_key) = remote_runtime_agent_session_key(session.kind, &session_id) else {
         return false;
@@ -17933,18 +17979,102 @@ mod restored_runtime_repair_tests {
 
     /// The positive control: a genuinely runtime-keyed restored row — the one
     /// this repair exists for — still repairs.
+    fn codex_session_for_repair(key_path: &str, launch_command: &str) -> ManagedSessionView {
+        let mut session = agy_session(key_path, launch_command);
+        session.kind = SessionKind::Codex;
+        session.metadata = vec![SessionMetadataEntry {
+            label: "Codex Session",
+            value: "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011".to_string(),
+        }];
+        session
+    }
+
     #[test]
     fn a_runtime_keyed_restored_row_still_repairs() {
-        let key = "agy-runtime://3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
-        let mut session = agy_session(
-            key,
-            "agy --dangerously-skip-permissions --conversation 3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011",
-        );
+        // ⛔ The fixture is CODEX on purpose ([11.165]): the re-arm gate made
+        // the already-resume arm consult the store vouch, and an Antigravity
+        // fixture would read the tester's OWN agy db — a unit test that
+        // passes or fails on the machine's data is not a test. Codex carries
+        // no keyed membership index (vouch `None`, never treated as absence),
+        // so the positive control is deterministic on every machine; the
+        // definitive-miss refusal is locked by the source-scan tests below
+        // plus the membership index's own fixture tests.
+        let id = "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
+        let key = format!("codex-runtime://{id}");
+        let mut session = codex_session_for_repair(&key, &format!("codex resume {id}"));
         session.source = SessionSource::LiveLocal;
-        let repaired = refresh_restored_remote_runtime_codex_launch_command(key, &mut session);
+        let repaired = refresh_restored_remote_runtime_codex_launch_command(&key, &mut session);
         assert!(repaired, "the restored daemon-runtime case must keep working");
         assert_eq!(session.session_path, key);
         assert_eq!(session.source, SessionSource::LiveLocal);
+    }
+
+    #[test]
+    fn the_repair_re_arm_gate_sits_inside_the_already_resume_arm() {
+        // [11.165]: the probe skip WAS the engine — a record whose launch
+        // already names the id never consulted the store again, so the birth
+        // arm re-armed it on every sweep. The gate must chain onto the
+        // `if !already_resume` (the same decision point), refuse on a
+        // DEFINITIVE miss only, and name itself on the trace.
+        let source = include_str!("lib.rs");
+        let body = source
+            .split("fn refresh_restored_remote_runtime_codex_launch_command(")
+            .nth(1)
+            .expect("the repair fn")
+            .split("\nfn ")
+            .next()
+            .expect("the repair body");
+        let gate_at = body
+            .find("} else if local_agent_store_vouches_for_session(session.kind, &session_id) == Some(false) {")
+            .expect("the re-arm gate must chain onto the already-resume decision");
+        let probe_at = body.find("if !already_resume {").expect("the probe decision");
+        assert!(
+            probe_at < gate_at,
+            "the gate rides the already-resume arm — before it, the probe arm              would consult the store twice; after it, the chaining is a lie"
+        );
+        assert!(
+            body[gate_at..].contains("restored_codex_runtime_launch_repair_refused_store_miss"),
+            "the refusal must carry a named trace — an untraced repair refusal              is the silent-fresh-spawn class all over again"
+        );
+    }
+
+    #[test]
+    fn the_antigravity_saved_session_probe_answers_a_definitive_store_miss() {
+        // [11.165]: the agy arm's unconditional Ok(true) folded the index's
+        // Some(false) into the None case's fail-open, so a definitive miss
+        // became a CLI-time failure (refuse-and-loop, or the measured
+        // warn-and-fresh-start under --require-existing). The mapping must be
+        // explicit: Some → its value, None → the fail-open.
+        let source = include_str!("lib.rs");
+        let arm = source
+            .split("fn remote_saved_agent_session_exists(")
+            .nth(1)
+            .expect("the probe fn")
+            .split("\nfn ")
+            .next()
+            .expect("the probe body");
+        let agy_at = arm
+            .find("match antigravity_local_db_holds_conversation(session_id)")
+            .expect("the agy arm must consult the three-valued index");
+        assert!(
+            arm[agy_at..].contains("None => Ok(true)"),
+            "the unreadable-store fail-open must stay: None is not absence"
+        );
+    }
+
+    #[test]
+    fn the_wrapper_missing_saved_wording_classifies_record_gone() {
+        // [11.165]: the wrapper's own named refusal must be stampable by the
+        // learn arm — an unclassified contract line leaves the ensure
+        // retrying the same doomed spawn under a lying plane.
+        let line = remote_resume_missing_saved_session_error(
+            SessionKind::Antigravity,
+            "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011",
+        );
+        let (family, stripped) = crate::remote_stream_launch_refusal(line.as_bytes())
+            .expect("the wrapper's own wording classifies");
+        assert_eq!(family, crate::REMOTE_PEER_RECORD_GONE_STATUS_PREFIX);
+        assert!(stripped.contains("is no longer available on this machine"));
     }
 
     /// ⛔ BUG B2 SELF-RECOVERY GATE (owner-caught 2026-09-02, "sessions opened
