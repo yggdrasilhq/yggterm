@@ -17822,6 +17822,11 @@ fn run_remote_agent_identity_poll_chore(
     // birth alias each carries — the reset-to-birth pass reads both.
     let mut live_identity_ids: HashSet<String> = HashSet::new();
     let mut alias_by_real_id: HashMap<String, String> = HashMap::new();
+    // Keys whose machine ANSWERED this tick. A dead_id verdict is only
+    // legal on an answer: a failed query contributes no identities, so an
+    // unanswered machine's rows would all read dead against an empty set
+    // ([11.166]). Unmeasured is not dead.
+    let mut answered_keys: HashSet<String> = HashSet::new();
     let (targets, excluded, yggterm_home) = {
         let runtime = lock_daemon_runtime(runtime, "remote_agent_identity_poll_read");
         let (targets, excluded) = runtime.server.live_remote_agent_identity_poll_view();
@@ -17913,6 +17918,13 @@ fn run_remote_agent_identity_poll_chore(
                 continue;
             }
         };
+        // The machine answered this tick: its rows may be judged dead. A
+        // failed query above `continue`s before this line, so its rows keep
+        // the identity they carry — the strip is never fed an unmeasured
+        // machine ([11.166]).
+        for target in group {
+            answered_keys.insert(target.key.clone());
+        }
         // A row whose current id names a live transcript the owner has aliased
         // back to this row's birth is healthy. Drop it BEFORE the attempt
         // budget — it costs nothing and proves nothing is wrong — and reset
@@ -18035,6 +18047,7 @@ fn run_remote_agent_identity_poll_chore(
             decision.chosen = Some(identity.session_id.clone());
         }
     }
+    let mut refused_resets: Vec<(String, String, &'static str)> = Vec::new();
     for target in machines
         .values()
         .flatten()
@@ -18049,6 +18062,17 @@ fn run_remote_agent_identity_poll_chore(
         }
         if let Some(decision) = decisions.get_mut(&target.key) {
             decision.verdict = "exhausted";
+            if !answered_keys.contains(&target.key) {
+                decision.arm = "machine_unanswered";
+            }
+        }
+        // ⛔ THE [11.166] ANSWER GUARD. Only a machine that ANSWERED this
+        // tick may hand out a dead_id verdict: a failed query contributes
+        // no identities, and an empty live set must never read as "nothing
+        // is live" — a transport blip across the budget window used to be
+        // able to strip every bound id on that machine.
+        if !answered_keys.contains(&target.key) {
+            continue;
         }
         // Last resort for a drifted row (the path still carries its birth):
         // the budget is spent, nothing vouched an alias, and the id it
@@ -18062,9 +18086,57 @@ fn run_remote_agent_identity_poll_chore(
                 .get(&target.current_id)
                 .is_some_and(|alias_birth| alias_birth != birth);
             let dead_id = !live_identity_ids.contains(&target.current_id);
+            // ⛔ THE [11.166] STORE VOUCH. FD-LIVE is a process verdict, not
+            // a store one: a codex conversation outlives its process by
+            // design, and the drive measured this reset firing on a rollout
+            // the peer store HOLDS — the row then forgot the id the store
+            // knew, and the [11.155] gate closed it peer-session-gone on a
+            // birth-id miss. Before stripping a dead-looking id, ask the
+            // peer's own store the SAME structured question the close gate
+            // trusts. An id the store holds is resumable: never stripped —
+            // the ensure/resume paths own its fate and the [11.160]
+            // binary-missing learn arm keeps its window. An inconclusive
+            // ask never strips either. A definitive miss strips, and the
+            // trace names the store's answer. The ask is once per row: an
+            // exhausted row leaves the poll after this pass either way.
+            let store_ask = if dead_id {
+                Some(crate::fetch_remote_saved_agent_session_exists(
+                    target.kind,
+                    &target.ssh_target,
+                    target.ssh_prefix.as_deref(),
+                    &target.current_id,
+                ))
+            } else {
+                None
+            };
+            match store_ask {
+                Some(Ok(true)) => {
+                    if let Some(decision) = decisions.get_mut(&target.key) {
+                        decision.arm = "store_holds_id";
+                    }
+                    refused_resets.push((
+                        target.key.clone(),
+                        target.current_id.clone(),
+                        "store_holds_id",
+                    ));
+                    continue;
+                }
+                Some(Err(_)) => {
+                    if let Some(decision) = decisions.get_mut(&target.key) {
+                        decision.arm = "store_ask_inconclusive";
+                    }
+                    refused_resets.push((
+                        target.key.clone(),
+                        target.current_id.clone(),
+                        "store_ask_inconclusive",
+                    ));
+                    continue;
+                }
+                Some(Ok(false)) | None => {}
+            }
             if dead_id || foreign_alias {
                 resets.push((target.key.clone(), birth.to_string(), target.current_id.clone(),
-                    if dead_id { "dead_id" } else { "foreign_alias" }));
+                    if dead_id { "dead_id_store_miss" } else { "foreign_alias" }));
             }
         }
     }
@@ -18153,6 +18225,21 @@ fn run_remote_agent_identity_poll_chore(
         }
         if applied_resets > 0 {
             runtime.persist()?;
+        }
+    }
+    for (key, held_id, reason) in &refused_resets {
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "persistence",
+                "agent_identity_reset_refused",
+                serde_json::json!({
+                    "session_path": key,
+                    "held_id": held_id,
+                    "reason": reason,
+                }),
+            );
         }
     }
 
@@ -31754,6 +31841,67 @@ mod tests {
             funnel.contains("self.startborn_peer_gone_ask(path)"),
             "the second look must run through the helper that asks the alive \
              verb under a fresh memo — never a heuristic"
+        );
+    }
+
+    #[test]
+    fn the_identity_reset_never_strips_an_id_the_peer_store_holds() {
+        // [11.166]: the recency arm reset a bound row to its BIRTH id on a
+        // dead_id that was only an FD-LIVE verdict — the peer store still
+        // held the rollout — and the [11.155] gate then closed the row
+        // peer-session-gone on a store miss for an id the store never knew.
+        // The reset pass must ask the peer store before it strips, refuse a
+        // held id and an inconclusive ask by name, and never judge a row
+        // dead whose machine did not answer this tick.
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let chore = daemon_fn_body(
+            source,
+            "fn run_remote_agent_identity_poll_chore(",
+        );
+        let answered = chore
+            .find("answered_keys.contains(&target.key)")
+            .expect("the reset pass must consult this tick's answered set");
+        let ask = chore
+            .find("crate::fetch_remote_saved_agent_session_exists(")
+            .expect("the reset must ask the peer store before it strips an id");
+        let holds = chore
+            .find("\"store_holds_id\"")
+            .expect("a store-held id must refuse the reset by name");
+        let inconclusive = chore
+            .find("\"store_ask_inconclusive\"")
+            .expect("an inconclusive store ask must refuse the reset by name");
+        let strip = chore
+            .find("resets.push((target.key.clone(), birth.to_string()")
+            .expect("a definitive store miss still strips to the birth id");
+        assert!(
+            answered < ask && ask < holds && holds < inconclusive
+                && inconclusive < strip,
+            "answer guard, then the store ask, then the two named refusals, \
+             then the strip — the store question must sit inside the dead_id \
+             arm, ahead of every reset"
+        );
+        assert!(
+            chore.contains("\"dead_id_store_miss\""),
+            "a strip that survived the vouch must name the store's answer on \
+             the trace — dead_id alone no longer tells the truth"
+        );
+        let refusal_trace = chore
+            .find("agent_identity_reset_refused")
+            .expect("a refused reset must be named on the trace");
+        assert!(
+            refusal_trace > strip,
+            "the refusal trace rides the post-pass loop, after the reset \
+             application block"
+        );
+        let helper = daemon_fn_body(
+            source,
+            "    fn remote_saved_session_peer_gone(",
+        );
+        assert!(
+            helper.contains("crate::fetch_remote_saved_agent_session_exists"),
+            "the reset and the close gate must trust the SAME structured \
+             store question — not two heuristics that can disagree"
         );
     }
 
