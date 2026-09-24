@@ -236,6 +236,13 @@ pub fn relay_peer_anomaly(home_dir: &Path, machine_key: &str, notice: &AnomalyNo
 /// relay's ONLY contract with a peer. Tolerant by construction: an old peer
 /// predating the field, a dead daemon's error object, and transport garbage
 /// all answer empty, never an error.
+///
+/// ⛔ THE ANTI-STORM CONTRACT: only ORIGIN notices (relayed_from empty) come
+/// back. A notice that is itself a relay MUST NOT cross another host, or the
+/// pair of daemons each pulling the other's status mints
+/// `jojo/dev/X`, then `dev/jojo/dev/X`, … — unbounded id growth that the
+/// file latch can never catch, one rung per relay tick. A relayed notice is
+/// already on its way to a GUI; relaying a relay is the storm.
 pub fn anomalies_from_status_json(payload: &str) -> Vec<AnomalyNotice> {
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
         return Vec::new();
@@ -246,6 +253,7 @@ pub fn anomalies_from_status_json(payload: &str) -> Vec<AnomalyNotice> {
     raw.iter()
         .filter_map(|entry| serde_json::from_value::<AnomalyNotice>(entry.clone()).ok())
         .filter(|notice| !notice.seen)
+        .filter(|notice| notice.relayed_from.is_none())
         .collect()
 }
 
@@ -413,6 +421,14 @@ mod tests {
         let parsed = anomalies_from_status_json(&payload);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].kind, "ledger_growth");
+        // A RELAYED notice never crosses another host — the anti-storm
+        // contract (jojo/dev/X must not become dev/jojo/dev/X).
+        let relayed = json!({ "anomalies": [json!({
+            "id": "dev/bridge_rss_high:1", "kind": "k", "severity": "warning",
+            "title": "t", "detail": "", "first_seen_ms": 1, "seen": false,
+            "relayed_from": "dev" })] })
+            .to_string();
+        assert!(anomalies_from_status_json(&relayed).is_empty());
         // A seen notice does not relay.
         let seen = json!({ "anomalies": [json!({
             "id": "k:1", "kind": "k", "severity": "warning", "title": "t",
