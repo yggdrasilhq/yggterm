@@ -3507,6 +3507,11 @@ pub struct ServerRuntimeStatus {
     pub preserved_terminal_owner_count: usize,
     #[serde(default)]
     pub preserved_terminal_owner_keys: Vec<String>,
+    /// [11.164] Unseen host anomalies (newest first, capped) — the GUI's
+    /// status poll drains these into toasts and acks them by id. Empty is
+    /// the quiet case; a pre-field peer deserializes empty, which is honest.
+    #[serde(default)]
+    pub anomalies: Vec<crate::host_anomaly::AnomalyNotice>,
     /// Keys of the DORMANT (stored, non-live) Live Sessions rows this daemon
     /// holds — the rows with no owned PTY. B4: a hot-restart hands off live PTY
     /// rows but NOT dormant rows, so a successor needs to see a predecessor's
@@ -6633,6 +6638,7 @@ impl DaemonRuntime {
     }
 
     fn status_payload(&self) -> ServerRuntimeStatus {
+        let anomaly_notices = crate::host_anomaly::recent_anomalies(self.store.home_dir(), 20);
         let terminal_stats = self.terminals.stats();
         let payload_stats = self.server.payload_stats();
         let preserved_owner_keys = self.preserved_terminal_owner_keys();
@@ -6692,6 +6698,7 @@ impl DaemonRuntime {
         let on_disk_build_id = current_build_id();
         let started_at_ms = *DAEMON_STARTED_AT_MS;
         ServerRuntimeStatus {
+            anomalies: anomaly_notices,
             server_version: SERVER_PROTOCOL_VERSION.to_string(),
             server_build_id: current_build_id(),
             server_pid: std::process::id(),
@@ -18921,6 +18928,64 @@ fn retire_stale_preserved_owners_once(
 }
 
 /// The pass thread. Kill-switch: `YGGTERM_DISABLE_STALE_OWNER_RETIRE=1`.
+/// [11.164] The host-anomaly watchdog: one detached thread for the daemon's
+/// whole life. Two detectors, both cheap:
+///
+/// - self-RSS with hysteresis (fire on a rising crossing of
+///   `DAEMON_RSS_HIGH_BYTES`, re-arm only under LOW) — the "headless daemon
+///   eating the host" class, reported while there is still a host left to
+///   report from;
+/// - the ownership-ledger size, sampled every tenth tick — the [11.163]
+///   doubling grew for DAYS before any read quarantined it; a 1 MB early
+///   warning arrives while it is still KBs of recoverable state.
+///
+/// Every fire goes through `report_anomaly`: the ytrace probe always, the
+/// status-wire notice deduped by the plane.
+fn spawn_host_anomaly_watchdog(home_dir: PathBuf) {
+    std::thread::spawn(move || {
+        let mut rss_fired = false;
+        let mut tick: u64 = 0;
+        loop {
+            tick += 1;
+            if let Some(rss) = crate::host_anomaly::own_rss_bytes() {
+                if rss >= crate::host_anomaly::DAEMON_RSS_HIGH_BYTES && !rss_fired {
+                    rss_fired = true;
+                    crate::host_anomaly::report_anomaly(
+                        &home_dir,
+                        "daemon_rss_high",
+                        "error",
+                        "Daemon RSS crossed 1.5 GB",
+                        serde_json::json!({
+                            "rss_bytes": rss,
+                            "pid": std::process::id(),
+                        }),
+                    );
+                } else if rss < crate::host_anomaly::DAEMON_RSS_LOW_BYTES && rss_fired {
+                    rss_fired = false;
+                }
+            }
+            if tick % 10 == 0 {
+                let path = crate::ownership_ledger::ledger_path(&home_dir);
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.len() >= crate::host_anomaly::LEDGER_GROWTH_WARN_BYTES {
+                        crate::host_anomaly::report_anomaly(
+                            &home_dir,
+                            "ledger_growth",
+                            "warning",
+                            "Ownership ledger growing past 1 MB",
+                            serde_json::json!({
+                                "bytes": meta.len(),
+                                "cap": crate::ownership_ledger::LEDGER_MAX_BYTES,
+                            }),
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+}
+
 fn spawn_stale_owner_retirement(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
     if parse_self_retire_handoff_disabled(
         std::env::var("YGGTERM_DISABLE_STALE_OWNER_RETIRE")
@@ -27519,6 +27584,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             // stale preserved owners whose bytes predate the drain's
             // signals. One pass per minute, kill-switched.
             spawn_stale_owner_retirement(home_dir.clone(), runtime.clone());
+        // [11.164] The anomaly watchdog: self-RSS crossing + ledger-growth
+        // pre-warn, reporting into the anomaly plane so the GUI surfaces what
+        // [11.163] let grow to 111 GB in silence.
+        spawn_host_anomaly_watchdog(home_dir.clone());
         loop {
             let mut start_migration_drain = false;
             if drain_unix_client_outcomes(

@@ -211,6 +211,20 @@ pub fn load(home_dir: &Path) -> Vec<OwnershipRecord> {
                 "quarantine_path": quarantined.display().to_string(),
             }),
         );
+        // The [11.163] class reached 111 GB before a human noticed. The
+        // quarantine is the detector; the anomaly plane is the siren — the
+        // daemon's next status payload carries it and the GUI toasts it.
+        crate::host_anomaly::report_anomaly(
+            home_dir,
+            "ledger_oversize",
+            "error",
+            "Ownership ledger runaway — quarantined",
+            serde_json::json!({
+                "bytes": meta.len(),
+                "cap": LEDGER_MAX_BYTES,
+                "quarantine_path": quarantined.display().to_string(),
+            }),
+        );
         return Vec::new();
     }
     let Ok(bytes) = fs::read(&path) else {
@@ -794,6 +808,12 @@ mod tests {
             .filter(|name| name.contains("oversize"))
             .collect();
         assert_eq!(quarantined.len(), 1, "one quarantine copy, for the human");
+        // [11.164] The quarantine is also the detector: the anomaly plane must
+        // carry the notice so the GUI can surface it.
+        let anomalies = crate::host_anomaly::recent_anomalies(&home, 20);
+        assert_eq!(anomalies.len(), 1, "the oversize quarantine must fire an anomaly");
+        assert_eq!(anomalies[0].kind, "ledger_oversize");
+        assert_eq!(anomalies[0].severity, "error");
         save(&home, &[died_with_me_record(now_ms())]).unwrap();
         assert!(matches!(
             lookup(&home, SessionKind::Codex, "sess-abc"),

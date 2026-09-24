@@ -35850,6 +35850,58 @@ impl ShellState {
     ///
     /// ⛔ `silent` may only SUPPRESS the chime. There is deliberately no way to force
     /// sound on: a user who turned it off is not overridden by a caller.
+    /// [11.164] The anomaly drain: unseen host anomalies from the daemon's
+    /// status payload become toasts — Warning/Error tone straight from the
+    /// record's severity — and are acked straight into the local anomaly
+    /// plane file, so the next status poll stops carrying them. The latch is
+    /// process-local: a GUI restart re-toasts a still-unseen anomaly once,
+    /// which is the honest behavior for something the human may never have
+    /// looked at. No new wire verb — the GUI shares the daemon's home, so
+    /// the ack is a local file write through the same plane.
+    fn drain_host_anomaly_notifications(
+        &mut self,
+        anomalies: &[yggterm_server::host_anomaly::AnomalyNotice],
+    ) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        fn shown_latch() -> &'static Mutex<HashSet<String>> {
+            static LATCH: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            LATCH.get_or_init(|| Mutex::new(HashSet::new()))
+        }
+        if anomalies.is_empty() {
+            return;
+        }
+        let fresh: Vec<&yggterm_server::host_anomaly::AnomalyNotice> = anomalies
+            .iter()
+            .filter(|notice| !shown_latch().lock().map(|latch| latch.contains(&notice.id)).unwrap_or(false))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        for notice in &fresh {
+            if let Ok(mut latch) = shown_latch().lock() {
+                latch.insert(notice.id.clone());
+            }
+            let tone = match notice.severity.as_str() {
+                "error" => NotificationTone::Error,
+                _ => NotificationTone::Warning,
+            };
+            let origin = match &notice.relayed_from {
+                Some(host) => format!("on {host}"),
+                None => "on this machine".to_string(),
+            };
+            self.push_notification(
+                tone,
+                format!("Host anomaly — {}", notice.title),
+                format!("{origin}: {}", notice.detail),
+            );
+        }
+        let ids: Vec<String> = fresh.iter().map(|notice| notice.id.clone()).collect();
+        if let Some(home) = resolve_yggterm_home().ok() {
+            yggterm_server::host_anomaly::mark_anomalies_seen(&home, &ids);
+        }
+    }
+
     fn push_notification_with(
         &mut self,
         tone: NotificationTone,
@@ -43920,6 +43972,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 match outcome {
                     Ok(((snapshot, message), runtime_status)) => {
                         if let Some(runtime_status) = runtime_status {
+                            shell.drain_host_anomaly_notifications(&runtime_status.anomalies);
                             shell.set_latest_runtime_status(Some(runtime_status));
                         }
                         if let Some(pending) = shell.version_convergence_pending_restart() {

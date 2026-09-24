@@ -83,6 +83,7 @@ pub mod hot_restart_repair;
 mod host;
 mod live_row_tombstones;
 pub mod ownership_ledger;
+pub mod host_anomaly;
 mod profile_write_lock;
 // Level (b) increment 1: owning a PTY we did not spawn — the Owned/Adopted
 // child split and a MasterPty over a received fd. Not yet wired to any
@@ -40595,6 +40596,7 @@ mod tests {
         terminal_session_keys: Vec<String>,
     ) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            anomalies: Vec::new(),
             pending_input_drafts: None,
             server_build_commit: String::new(),
             daemon_started_at_ms: 0,
@@ -57492,6 +57494,7 @@ terminal_window_id: None,
     #[cfg(target_os = "linux")]
     fn server_runtime_status_for_stale_probe() -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            anomalies: Vec::new(),
             pending_input_drafts: None,
             server_build_commit: String::new(),
             daemon_started_at_ms: 0,
@@ -57596,6 +57599,7 @@ terminal_window_id: None,
         std::os::unix::fs::symlink(&legacy_socket, &current_socket).expect("link current socket");
         let endpoint = ServerEndpoint::UnixSocket(current_socket.clone());
         let status = ServerRuntimeStatus {
+            anomalies: Vec::new(),
             pending_input_drafts: None,
             server_build_commit: String::new(),
             daemon_started_at_ms: 0,
