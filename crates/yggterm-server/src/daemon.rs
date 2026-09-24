@@ -18986,6 +18986,82 @@ fn spawn_host_anomaly_watchdog(home_dir: PathBuf) {
     });
 }
 
+/// How often the peer relay scans each known remote machine, how many
+/// machines one tick may touch, and the budget on each ask. Deliberately
+/// LAZY: one short `server status` per machine per tick, machines taken
+/// from the live remote-machine snapshots, none when the daemon knows no
+/// remote machines at all.
+const PEER_ANOMALY_RELAY_TICK_SECS: u64 = 300;
+const PEER_ANOMALY_RELAY_MAX_MACHINES_PER_TICK: usize = 4;
+const PEER_ANOMALY_RELAY_STATUS_TIMEOUT_MS: u64 = 10_000;
+
+/// [11.164 v2] The peer relay: an anomaly on a HEADLESS peer (dev has no GUI
+/// to drain its own status wire) would otherwise toast nobody, ever. Every
+/// tick, ask each known remote machine's CLI for its `server status` payload
+/// — the same wire the v1 plane already serves — and relay its unseen notices
+/// into THIS home's plane with `relayed_from` set, so the LOCAL GUI's drain
+/// toasts "on <host>" and acks locally. The peer's plane is never written and
+/// never acked remotely: its own GUI drain (if it ever grows one) stays the
+/// ack path. Dedupe is the plane file itself (machine-prefixed ids), so a
+/// peer that never acks cannot storm us.
+fn spawn_peer_anomaly_relay(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(
+            PEER_ANOMALY_RELAY_TICK_SECS,
+        ));
+        // Snapshot the machine list UNDER the lock; do every ssh hop OUTSIDE
+        // it — the relay must never hold the runtime lock on a network call.
+        let machines: Vec<(String, String, Option<String>)> = {
+            let guard = lock_daemon_runtime(&runtime, "peer_anomaly_relay_pass");
+            guard
+                .server
+                .remote_machines()
+                .iter()
+                .map(|machine| {
+                    (
+                        machine.machine_key.clone(),
+                        machine.ssh_target.clone(),
+                        machine.prefix.clone(),
+                    )
+                })
+                .collect()
+        };
+        for (machine_key, ssh_target, prefix) in machines
+            .into_iter()
+            .take(PEER_ANOMALY_RELAY_MAX_MACHINES_PER_TICK)
+        {
+            let payload = match crate::run_remote_yggterm_command_with_timeout(
+                &ssh_target,
+                prefix.as_deref(),
+                &["server", "status"],
+                None,
+                PEER_ANOMALY_RELAY_STATUS_TIMEOUT_MS,
+            ) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            let mut relayed = 0usize;
+            for notice in crate::host_anomaly::anomalies_from_status_json(&payload) {
+                if crate::host_anomaly::relay_peer_anomaly(&home_dir, &machine_key, &notice) {
+                    relayed += 1;
+                }
+            }
+            if relayed > 0 {
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "anomaly",
+                    "peer_anomaly_relay_tick",
+                    serde_json::json!({
+                        "machine_key": machine_key,
+                        "relayed": relayed,
+                    }),
+                );
+            }
+        }
+    });
+}
+
 fn spawn_stale_owner_retirement(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
     if parse_self_retire_handoff_disabled(
         std::env::var("YGGTERM_DISABLE_STALE_OWNER_RETIRE")
@@ -27588,6 +27664,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // pre-warn, reporting into the anomaly plane so the GUI surfaces what
         // [11.163] let grow to 111 GB in silence.
         spawn_host_anomaly_watchdog(home_dir.clone());
+        // [11.164 v2] The peer relay: headless peers' anomalies reach a GUI
+        // host through this daemon's scan of their status payloads.
+        spawn_peer_anomaly_relay(home_dir.clone(), runtime.clone());
         loop {
             let mut start_migration_drain = false;
             if drain_unix_client_outcomes(

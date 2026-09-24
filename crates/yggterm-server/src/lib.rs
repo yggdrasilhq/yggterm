@@ -25762,7 +25762,62 @@ fn bridge_remote_runtime_session_stdio(
     // OR chunks — is the daemon serving this runtime's own screen.
     let mut snapshot_proof_of_life = false;
     let registry_home = resolve_yggterm_home().ok();
+    // [11.164 v2] THE BRIDGE-RSS WATCHDOG. The [11.163] vehicle was THIS
+    // process class (a wrapper streaming a row PTY) ballooning to 290 GB
+    // while the daemon's own watchdog — same anomaly plane, different
+    // process — could not see it. Sample own RSS every 2 s: a crossing of
+    // BRIDGE_RSS_HIGH_BYTES reports the anomaly (the ytrace probe + the
+    // plane file + the status wire, same as any detector) and flips this
+    // bridge's stop flag, which the loop below answers with a NAMED bail —
+    // unwinding runs the raw-mode guard's Drop and restores the terminal.
+    // The thread exits on the same flag, so a bridge that ends normally
+    // leaves nothing behind.
+    {
+        let rss_stop = stop.clone();
+        let rss_home = registry_home.clone();
+        let rss_path = path.to_string();
+        // Battery-only override of BRIDGE_RSS_HIGH_BYTES — the
+        // YGGTERM_EXTERNAL_ACTIVE_WAIT_DEADLINE_MS precedent: a probe seat
+        // drives a REAL fire end-to-end at a tiny threshold; production
+        // wrappers never set it and get the constant.
+        let rss_high_bytes: u64 = std::env::var("YGGTERM_BRIDGE_RSS_HIGH_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(crate::host_anomaly::BRIDGE_RSS_HIGH_BYTES);
+        std::thread::spawn(move || loop {
+            if rss_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if let Some(rss) = crate::host_anomaly::own_rss_bytes()
+                && rss >= rss_high_bytes
+            {
+                if let Some(home) = rss_home.as_deref() {
+                    crate::host_anomaly::report_anomaly(
+                        home,
+                        "bridge_rss_high",
+                        "error",
+                        "Bridge RSS crossed its limit",
+                        json!({
+                            "rss_bytes": rss,
+                            "threshold_bytes": rss_high_bytes,
+                            "pid": std::process::id(),
+                            "path": rss_path,
+                        }),
+                    );
+                }
+                rss_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        });
+    }
     loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!(
+                "yggterm: bridge for {session_id} stopping itself: wrapper RSS crossed \
+                 1 GB (bridge_rss_high) — the anomaly plane has the numbers"
+            );
+        }
         if let Some((cols, rows)) = current_tty_size()
             && last_size != Some((cols, rows))
         {
@@ -37446,6 +37501,57 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "the bound must actually bound: took {elapsed:?}"
+        );
+    }
+
+    /// ⛔ THE BRIDGE WATCHDOG MUST FIRE AND MUST BAIL BY NAME ([11.164 v2]).
+    /// The [11.163] vehicle was a wrapper at 290 GB the daemon watchdog could
+    /// not see; the bridge now watches ITSELF. The lock pins the chain: the
+    /// thread samples own RSS against the threshold, reports the named
+    /// anomaly, flips the bridge stop flag — and the stream loop ANSWERS the
+    /// flag with a named bail BEFORE its first read (unwinding runs the
+    /// raw-mode guard's Drop and restores the terminal). Kill either half and
+    /// a runaway wrapper is invisible again.
+    #[test]
+    fn the_bridge_rss_watchdog_reports_and_the_loop_bails_by_name() {
+        let source = include_str!("lib.rs");
+        let fn_start = source
+            .find("fn bridge_remote_runtime_session_stdio(")
+            .expect("bridge_remote_runtime_session_stdio must exist");
+        let body_len = source[fn_start..]
+            .find("\nfn ")
+            .expect("the bridge is followed by another fn");
+        let body = &source[fn_start..fn_start + body_len];
+        assert!(
+            body.contains("bridge_rss_high"),
+            "the bridge must report the bridge_rss_high anomaly"
+        );
+        assert!(
+            body.contains("own_rss_bytes()"),
+            "the bridge watchdog must sample own RSS"
+        );
+        assert!(
+            body.contains("BRIDGE_RSS_HIGH_BYTES"),
+            "the bridge watchdog must threshold on the named constant"
+        );
+        // The stream loop answers the flag INSIDE the loop, before the first
+        // read — the watchdog must never race the read that could hang.
+        let home_anchor = body
+            .find("let registry_home = resolve_yggterm_home().ok();")
+            .expect("the bridge keeps its registry home");
+        let main_loop = body[home_anchor..]
+            .find("\n    loop {")
+            .expect("the bridge stream loop must exist");
+        let loop_head = &body[home_anchor + main_loop..];
+        let check = loop_head.find("bridge_rss_high").expect(
+            "the loop must answer the watchdog's stop flag by name",
+        );
+        let first_read = loop_head
+            .find("terminal_read_with_local_daemon_recovery")
+            .expect("the loop must still read the stream");
+        assert!(
+            check < first_read,
+            "the stop check must precede the first terminal read in the bridge loop"
         );
     }
 

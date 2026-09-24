@@ -185,6 +185,70 @@ pub fn mark_anomalies_seen(home_dir: &Path, ids: &[String]) -> usize {
     flipped
 }
 
+/// Relay one peer machine's unseen notice into THIS host's plane: the id is
+/// prefixed with the machine key (the GUI's dedupe latch and the ack both key
+/// on it), `relayed_from` names the machine, and the onset timestamp is the
+/// PEER's — the onset is the fact a human needs. Returns true when a record
+/// was written; an id already present in ANY seen state collapses silently —
+/// the file IS the latch, so a headless peer that never acks its own notices
+/// cannot re-relay-storm us on every scan.
+pub fn relay_peer_anomaly(home_dir: &Path, machine_key: &str, notice: &AnomalyNotice) -> bool {
+    let relayed = AnomalyNotice {
+        id: format!("{machine_key}/{}", notice.id),
+        kind: notice.kind.clone(),
+        severity: notice.severity.clone(),
+        title: notice.title.clone(),
+        detail: notice.detail.clone(),
+        first_seen_ms: notice.first_seen_ms,
+        seen: false,
+        relayed_from: Some(machine_key.to_string()),
+    };
+    let mut records = load_all(home_dir);
+    if records.iter().any(|record| record.id == relayed.id) {
+        return false;
+    }
+    append_trace_event(
+        home_dir,
+        "server",
+        "anomaly",
+        "peer_anomaly_relayed",
+        serde_json::json!({
+            "relayed_from": machine_key,
+            "peer_id": notice.id,
+            "kind": notice.kind,
+            "severity": notice.severity,
+            "first_seen_ms": notice.first_seen_ms,
+        }),
+    );
+    records.push(relayed);
+    while records.len() > ANOMALY_MAX_RECORDS {
+        let drop_index = records
+            .iter()
+            .position(|r| r.seen)
+            .unwrap_or(0);
+        records.remove(drop_index);
+    }
+    save_all(home_dir, &records);
+    true
+}
+
+/// Parse the `anomalies` out of a peer's `server status` payload — the
+/// relay's ONLY contract with a peer. Tolerant by construction: an old peer
+/// predating the field, a dead daemon's error object, and transport garbage
+/// all answer empty, never an error.
+pub fn anomalies_from_status_json(payload: &str) -> Vec<AnomalyNotice> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return Vec::new();
+    };
+    let Some(raw) = value.get("anomalies").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    raw.iter()
+        .filter_map(|entry| serde_json::from_value::<AnomalyNotice>(entry.clone()).ok())
+        .filter(|notice| !notice.seen)
+        .collect()
+}
+
 fn shorten_detail(detail: &str) -> String {
     if detail.len() <= 400 {
         detail.to_string()
@@ -221,6 +285,17 @@ pub fn own_rss_bytes() -> Option<u64> {
 pub const DAEMON_RSS_HIGH_BYTES: u64 = 1500 * 1024 * 1024;
 pub const DAEMON_RSS_LOW_BYTES: u64 = 1000 * 1024 * 1024;
 pub const LEDGER_GROWTH_WARN_BYTES: u64 = 1024 * 1024;
+
+/// A bridge wrapper (`yggterm-headless server remote resume-*` streaming a
+/// row PTY) has one job — copy bytes between socket and stdio — and a healthy
+/// one lives in the tens of MB. The [11.163] incident class is a wrapper
+/// BALLOONING (it parsed a 111 GB ownership ledger and reached 150-290 GB
+/// RSS); 1 GB is ~100x a healthy bridge and still catches the runaway long
+/// before the host is in danger. One fire ends the bridge: the report lands,
+/// the stop flag flips, and the bridge loop bails BY NAME so the raw-mode
+/// guard's Drop restores the terminal. Never process::exit — it skips that
+/// Drop.
+pub const BRIDGE_RSS_HIGH_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -291,6 +366,64 @@ mod tests {
         fs::write(anomalies_path(&home), format!("{{not json\n{line}\n")).unwrap();
         assert_eq!(recent_anomalies(&home, 20).len(), 1);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_peer_relay_prefixes_the_id_names_the_machine_and_latches_on_it() {
+        let home = scratch_home("relay");
+        let peer = AnomalyNotice {
+            id: format!("daemon_rss_high:{}", now_ms()),
+            kind: "daemon_rss_high".to_string(),
+            severity: "error".to_string(),
+            title: "Daemon RSS crossed 1.5 GB".to_string(),
+            detail: "rss_bytes=1610612736".to_string(),
+            first_seen_ms: now_ms() - 5_000,
+            seen: false,
+            relayed_from: None,
+        };
+        assert!(relay_peer_anomaly(&home, "dev", &peer), "first relay lands");
+        assert!(
+            !relay_peer_anomaly(&home, "dev", &peer),
+            "the id is the latch — a peer that never acks cannot storm us"
+        );
+        let records = load_all(&home);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, format!("dev/{}", peer.id));
+        assert_eq!(records[0].relayed_from.as_deref(), Some("dev"));
+        assert_eq!(
+            records[0].first_seen_ms, peer.first_seen_ms,
+            "the PEER's onset is the fact a human needs"
+        );
+        assert!(!records[0].seen);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn peer_status_payloads_parse_tolerantly() {
+        let notice = json!({
+            "id": "ledger_growth:1",
+            "kind": "ledger_growth",
+            "severity": "warning",
+            "title": "t",
+            "detail": "d",
+            "first_seen_ms": 1,
+            "seen": false
+        });
+        let payload = json!({ "server_version": "3.2.113", "anomalies": [notice] }).to_string();
+        let parsed = anomalies_from_status_json(&payload);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, "ledger_growth");
+        // A seen notice does not relay.
+        let seen = json!({ "anomalies": [json!({
+            "id": "k:1", "kind": "k", "severity": "warning", "title": "t",
+            "detail": "", "first_seen_ms": 1, "seen": true })] })
+            .to_string();
+        assert!(anomalies_from_status_json(&seen).is_empty());
+        // An OLD peer predates the field; a dead daemon answers an error
+        // object; garbage is garbage. All empty, none an error.
+        assert!(anomalies_from_status_json("{\"server_version\":\"3.1.0\"}").is_empty());
+        assert!(anomalies_from_status_json("{\"running\":false,\"error\":\"no daemon\"}").is_empty());
+        assert!(anomalies_from_status_json("not json at all").is_empty());
     }
 
     #[test]
