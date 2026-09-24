@@ -52,7 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use yggterm_core::SessionKind;
+use yggterm_core::{SessionKind, append_trace_event};
 
 /// An `adopted` record survives at most this long even with its adopter
 /// alive. The ledger exists to serve the reattach window around a swap; a
@@ -66,6 +66,19 @@ pub const ADOPTED_RECORD_TTL_MS: u64 = 60 * 60 * 1000;
 /// either been resumed (the record consumed) or long since exited, and a
 /// stale record would lie about ownership.
 pub const DIED_WITH_ME_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// A ledger past this size is not a ledger any more — it is a runaway
+/// writer's output. A healthy ledger is tens of kilobytes (records are TTL'd
+/// ephemera: `died_with_me` lives 5 minutes, `adopted` one hour), so the cap
+/// sits orders of magnitude above any honest state. It exists because the
+/// read side is whole-file: `load` reads and parses EVERY record, and parsing
+/// allocates multiples of the file size in the process — measured 2026-09-24,
+/// a 111 GB ledger (the file had doubled on every daemon cold exit) turned
+/// each `resume-codex` attach into a 150-290 GB-RSS process. Past the cap the
+/// file is quarantined aside untouched and the ledger answers honestly empty:
+/// records this old are garbage by the staleness law, and `NoAnswer` is the
+/// designed fall-back to pre-ledger behaviour.
+pub const LEDGER_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// What the predecessor witnessed about one owned row, per §4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +189,31 @@ pub fn record_is_still_true(record: &OwnershipRecord, now: u64) -> bool {
 }
 
 pub fn load(home_dir: &Path) -> Vec<OwnershipRecord> {
-    let Ok(bytes) = fs::read(ledger_path(home_dir)) else {
+    let path = ledger_path(home_dir);
+    if let Ok(meta) = fs::metadata(&path)
+        && meta.len() > LEDGER_MAX_BYTES
+    {
+        // Quarantine, never parse: every record in a file this size is long
+        // past its TTL, but reading it would allocate multiples of its size
+        // (the 2026-09-24 incident — see [`LEDGER_MAX_BYTES`]). Rename is
+        // instant even at 111 GB and keeps the evidence for a human.
+        let quarantined = PathBuf::from(format!("{}.oversize.{}", path.display(), now_ms()));
+        let renamed = fs::rename(&path, &quarantined).is_ok();
+        append_trace_event(
+            home_dir,
+            "server",
+            "ownership_ledger",
+            "ledger_reset_oversize",
+            serde_json::json!({
+                "bytes": meta.len(),
+                "cap": LEDGER_MAX_BYTES,
+                "quarantined": renamed,
+                "quarantine_path": quarantined.display().to_string(),
+            }),
+        );
+        return Vec::new();
+    }
+    let Ok(bytes) = fs::read(&path) else {
         return Vec::new();
     };
     serde_json::from_slice::<Vec<OwnershipRecord>>(&bytes).unwrap_or_default()
@@ -215,6 +252,26 @@ pub fn record_handoff(home_dir: &Path, records: Vec<OwnershipRecord>) -> io::Res
     write_records(home_dir, records)
 }
 
+/// The cold-exit writer: merge the dying rows into the ledger and save the
+/// result as the ENTIRE next ledger state, in one step.
+///
+/// [`merge_exit_records`] output is already the whole next state — it must be
+/// saved directly, never round-tripped through [`record_handoff`], whose
+/// load-filter-extend re-reads the file and appends the already-merged
+/// existing records a SECOND time. That round-trip was the measured
+/// 2026-09-24 defect: the ledger doubled on every daemon cold exit, reaching
+/// 111 GB on the build host in three days, and every resume wrapper that
+/// parsed it allocated multiples of the file in RSS. This is the only verb
+/// the exit path may use.
+pub fn save_exit_merge(
+    home_dir: &Path,
+    dying: Vec<OwnershipRecord>,
+    writer_pid: u32,
+) -> io::Result<()> {
+    let records = merge_exit_records(load(home_dir), dying, writer_pid);
+    save(home_dir, &records)
+}
+
 /// Ask the ledger who owns `(kind, session_id)` NOW. Staleness is re-derived
 /// here — an invalid record prunes itself from the file (best-effort) and
 /// answers [`LedgerAnswer::NoAnswer`].
@@ -224,11 +281,17 @@ pub fn lookup(home_dir: &Path, kind: SessionKind, session_id: &str) -> LedgerAns
     let mut newest: Option<&OwnershipRecord> = None;
     let mut stale = Vec::<OwnershipRecord>::new();
     for record in &records {
-        if record.kind != kind || record.session_id != session_id {
-            continue;
-        }
+        // Staleness is re-derived for EVERY record on every read, never only
+        // for the queried session: an expired record that nobody ever asks
+        // about must still leave the ledger (the compaction half of the
+        // staleness law — its absence fed the 2026-09-24 growth defect, where
+        // records for never-reattached rows accumulated one batch per daemon
+        // exit).
         if !record_is_still_true(record, now) {
             stale.push(record.clone());
+            continue;
+        }
+        if record.kind != kind || record.session_id != session_id {
             continue;
         }
         newest = Some(match newest {
@@ -669,5 +732,99 @@ mod tests {
                 by_start_time: 7
             }
         );
+    }
+
+    /// The 2026-09-24 growth defect, pinned: feeding `merge_exit_records`
+    /// output through `record_handoff` (load-filter-extend) appended the
+    /// already-merged existing records a second time, so the file grew by its
+    /// own size on every daemon cold exit. `save_exit_merge` must land the
+    /// existing records exactly once each plus the dying rows.
+    #[test]
+    fn an_exit_merge_saved_directly_never_duplicates_the_existing_ledger() {
+        let home = scratch_home("exit-merge-single");
+        let now = now_ms();
+        let mut foreign_a = died_with_me_record(now - 1_000);
+        foreign_a.written_by_pid = 111;
+        foreign_a.session_id = "sess-foreign-a".to_string();
+        let mut foreign_b = adopted_record(now, 222);
+        foreign_b.session_id = "sess-foreign-b".to_string();
+        save(&home, &[foreign_a, foreign_b]).unwrap();
+        let dying = died_with_me_records(
+            &[(
+                "codex://sess-dying".to_string(),
+                SessionKind::Codex,
+                "sess-dying".to_string(),
+                vec!["resume".to_string(), "sess-dying".to_string()],
+            )],
+            now,
+            std::process::id(),
+            "test",
+        );
+        save_exit_merge(&home, dying, std::process::id()).unwrap();
+        let records = load(&home);
+        let mut ids: Vec<&str> = records.iter().map(|r| r.session_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["sess-dying", "sess-foreign-a", "sess-foreign-b"],
+            "each existing record must survive exactly once, plus the dying rows"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The blast-radius guard: a runaway ledger must never be parsed. Past
+    /// [`LEDGER_MAX_BYTES`] the file is quarantined aside and the ledger
+    /// answers honestly empty; writes work again immediately after.
+    #[test]
+    fn an_oversize_ledger_is_quarantined_and_answers_empty() {
+        let home = scratch_home("oversize-quarantine");
+        let path = ledger_path(&home);
+        let mut blob = vec![b'x'; (LEDGER_MAX_BYTES + 1) as usize];
+        blob[0] = b'[';
+        fs::write(&path, &blob).unwrap();
+        assert_eq!(
+            lookup(&home, SessionKind::Codex, "sess-abc"),
+            LedgerAnswer::NoAnswer
+        );
+        assert!(!path.exists(), "the oversize file must be quarantined aside");
+        let quarantined: Vec<String> = fs::read_dir(&home)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains("oversize"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "one quarantine copy, for the human");
+        save(&home, &[died_with_me_record(now_ms())]).unwrap();
+        assert!(matches!(
+            lookup(&home, SessionKind::Codex, "sess-abc"),
+            LedgerAnswer::DiedWithMe { .. }
+        ));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The compaction half of the staleness law: an expired record must leave
+    /// the ledger on ANY read, not wait for someone to query its exact
+    /// session — records for rows that never reattach used to accumulate one
+    /// batch per daemon exit forever.
+    #[test]
+    fn lookup_prunes_expired_records_of_every_session_not_just_the_queried_one() {
+        let home = scratch_home("prune-all-expired");
+        let now = now_ms();
+        let mut expired_other = died_with_me_record(now - DIED_WITH_ME_TTL_MS - 1);
+        expired_other.session_id = "sess-expired-other".to_string();
+        let live = died_with_me_record(now);
+        save(&home, &[expired_other, live]).unwrap();
+        assert!(matches!(
+            lookup(&home, SessionKind::Codex, "sess-abc"),
+            LedgerAnswer::DiedWithMe { .. }
+        ));
+        let records = load(&home);
+        assert_eq!(
+            records.len(),
+            1,
+            "the expired record of the OTHER session must be pruned too"
+        );
+        assert_eq!(records[0].session_id, "sess-abc");
+        let _ = fs::remove_dir_all(&home);
     }
 }

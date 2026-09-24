@@ -24709,12 +24709,12 @@ fn record_dying_rows_in_ownership_ledger(home_dir: &Path, runtime: &Arc<Mutex<Da
         std::process::id(),
         SERVER_PROTOCOL_VERSION,
     );
-    let records = crate::ownership_ledger::merge_exit_records(
-        crate::ownership_ledger::load(home_dir),
-        dying,
-        std::process::id(),
-    );
-    match crate::ownership_ledger::record_handoff(home_dir, records) {
+    // save_exit_merge, NOT record_handoff: the merge output IS the entire
+    // next ledger state. record_handoff would load the file AGAIN and append
+    // the already-merged existing records a second time — the file grew by
+    // its own size on every cold exit (41 KB -> 111 GB on the build host,
+    // measured 2026-09-24).
+    match crate::ownership_ledger::save_exit_merge(home_dir, dying, std::process::id()) {
         Ok(()) => append_trace_event(
             home_dir,
             "daemon",
