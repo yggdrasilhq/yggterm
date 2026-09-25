@@ -30887,3 +30887,63 @@ explicit-close, no tombstone in the peer trace; the store still answers for
 the id) and the row pair unchanged — the codex row stays a codex row, no
 Shell twin at holder:gone. If the peer still closes, the defect stands;
 read the same trace pair to name the firing arm.
+
+## [11.168] TERMINAL IDENTITY IS HOST-GLOBAL AND LAST-WRITER-WINS: ANY CLIENT'S THEME SYNC FLIPS EVERY ROW'S COLOR WORLD MID-LIFE — DARK-ANSWERED CLIS ON A LIGHT RENDERER DRAW ILLEGIBLE GREY (the owner's "ALL light themes" report, measured 2026-09-25)
+
+**Status:** OPEN
+
+Filed 2026-09-25 ~18:00 on `lane/trace/osc11-light-theme` (the muse lab host
+seat, zcode on jojo, work FROM dev; board plan ACK-a3a9028b9b, correction
+ACK-82bdd60cf2). The owner: every LIGHT terminal theme renders the CLIs' grey
+meta text ("Thought for …", ASCII diagrams) near-illegible; dark themes are
+fine.
+
+MEASURED, end to end. The theme assets and renderer are innocent: the
+screenshot's content bg is #feffff (Apple System Colors Light applied), body
+text #000000, the user message #0a84ff = palette 12 EXACT. The illegible
+"Thought for 12s" line is #98989d and the diagram #d0d0d0 (= xterm 256-grey
+252) — DARK-palette meta greys the CLI chose because it believed the terminal
+was dark. The answer plane is the DAEMON: `TerminalProtocolFilter`
+(yggterm-server/src/terminal.rs) intercepts OSC `10;?`/`11;?`/`4;?` in the pty
+read stream (codex rows query OSC 10+11 — traced
+`protocol_color_response_sent queries:["10","11"]`; agy never queries and
+reads `COLORFGBG`/`YGGTERM_APPEARANCE` from its env instead) and answers from
+`TerminalProtocolProfile::from_launch_command` — the `YGGTERM_TERMINAL_COLOR_*`
+exports embedded in the row's launch command, else the daemon's process-global
+env. THE FLIP, live in the integration host's trace: agy-runtime 2da4824e answered
+appearance=light at 16:58:48 UTC; a `sync_terminal_identity` request landed
+17:00:28 (held the runtime lock 1724 ms sweeping launch commands); the same
+runtime answered appearance=DARK at 17:00:30; the owner screenshotted the
+illegible grey at 17:01 local. The frontend half is NOT the gap (the first
+plan's onColor wiring): xterm.js fires `onColor` with no listener, but its
+queries never reach the webview — the daemon strips and answers them first.
+
+ROOT CAUSE: the terminal identity (appearance + 18 color exports) is one
+process-global, last-writer-wins daemon env. Every client sync rewrites it
+host-wide (`initial_server_sync` sends appearance-ONLY, no profile; theme
+changes send the client profile), and `SyncTerminalIdentity` SWEEPS every
+remote agent row's stored launch command, re-embedding the exports from the
+current global. One differently-themed client on a host repaints every row's
+NEXT respawn in ITS theme: light renderer + dark identity = the report.
+
+LANDED IN THIS FIX (same lane): the identity rides the ROW —
+`carried_terminal_identity_exports` extracts the `export KEY=…` segments a
+row's launch command already carries (matcher `is_terminal_identity_env_key`
+kept adjacent to the writers in managed_cli), and the identity sweep
+(`refresh_remote_codex_terminal_identity_launch_command`, which covers EVERY
+remote agent row by scheme) re-embeds THOSE verbatim instead of re-reading the
+global; only a row born without identity exports is filled from the current
+global. The pre-existing sweep test that encoded the flip as a feature
+(`refresh_terminal_identity_updates_restored_remote_launch_commands`: "sync
+dark → assert the row's command turns 15;0") is rewritten to the carry law.
+
+STILL OPEN (fix directions): (a) BIRTH-TIME PER-CLIENT IDENTITY — a row born
+while a foreign theme holds the global still inherits it; spawn/ensure
+requests should carry the spawning client's profile (wire-additive,
+serde-default — rides the [11.145] re-stamp, owner GO pending) and the peer
+daemon should stamp the runtime with it, covering the peer-side managed spawn
+(`ManagedLauncher::shell_exports` still reads the peer global);
+(b) `initial_server_sync` sends appearance-ONLY — it should carry the client
+profile like the theme-change path; (c) frontend `onColor` answer as backstop
+for non-daemon-rendered paths; (d) OSC 4 slots 16-255 are never answered.
+
