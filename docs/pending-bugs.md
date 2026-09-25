@@ -30727,11 +30727,47 @@ CAVEAT AMENDED: the start-born metadata label does NOT survive a
 persist/restore round-trip (a crafted server-state row and the competitor
 daemon's boot restore both lost it — restored rows re-enter the store ask,
 which closes them honestly; measured). The ghost class therefore exists
-only within the birth daemon's lifetime. END-TO-END CLOSE CHAIN (fresh
-memo + two spaced alive nos -> PeerSessionGone) OWED: the memo-arming
-resize rides the spawn-carrying funnel, and on the muse lab host every
-spawn-carrying verb is blocked by [11.159] (filed this sitting). Proof
-resumes when [11.159] lands.
+only within the birth daemon's lifetime.
+
+DRIVE 2026-09-25 (the muse lab host seat, work FROM dev; board claim
+ACK-469fecca1d; [11.159] landed so the named blocker is gone): the
+end-to-end close chain RAN and is MEASURED UNREACHABLE for the
+runtime-death class — the compound verdict's TWO INSTRUMENTS DISAGREE.
+(1) THE FUNNEL ROUTING IS LIVE-CONFIRMED: an ensure of the start-born
+probe row (remote codex row on dev, trust cleared, healthy) with its
+runtime dead traced
+`remote_saved_session_peer_close_probe_inconclusive` naming the
+start-born refusal and routed into the compound arm. (2) HEAL-BY-FRESH-START
+MEASURED TWICE: with the launch binary present, killing the runtime TUI
+(by exact pid) makes the next client-driven launch respawn codex under
+the SAME minted key — the row heals; the ghost requires the launch to
+fail. (3) WITH THE LAUNCH MADE TO FAIL (the peer's codex generation held
+aside) the ghost state is REAL — the row is kept, preserved — but THE
+MEMO NEVER ARMS: the peer daemon ACCEPTS the start, registers a terminal
+session whose inner launch failed, and RETAINS it as an exited husk;
+`server terminal resize` then answers `accepted:true` for the husk (the
+resize path checks MAP PRESENCE only, terminal.rs sessions.get — no
+liveness read) while `agent-runtime-alive` answers process-truth `false`
+(a bogus-key control answers `terminal session not found` correctly, so
+the husk is the whole difference). `remote_pty_resize_unownable` can
+therefore never fire on a runtime death, `startborn_peer_gone_ask`
+Disarms silently forever, and the compound close
+(`remote_saved_session_startborn_peer_close_learned`) is unreachable for
+exactly the class this entry names. (4) The falsifier wording is
+corrected: launches are refused by the [11.160] remote-gate negative
+cache, not "by the memo window" — the memo never arms on this shape.
+(5) The provisioner re-measured: one launch hop kicks
+`ynpm install @openai/codex` on the peer (drive-2 finding (a) again);
+blocking the install (read-only ynpm dirs) makes the hold stick, and the
+failed install left codex unresolvable on the peer until hand-restored —
+operational hazard for any future hold-based drive. FIX DIRECTIONS
+(owner call, both re-scope the verdict's instruments): (a) the peer
+resize answer must treat an exited husk as not-found (or a named husk
+verdict the forward's classifier maps to unownable) so the memo arms on
+runtime death; or (b) the compound verdict drops the memo requirement and
+takes `agent-runtime-alive=false` on two spaced asks PLUS the [11.160]
+refusal witness as the evidence pair. Status stays OPEN — the deployed
+compound close cannot fire as built.
 
 ## ⛔ [11.160] A REMOTE ROW'S LAUNCH REFUSAL PAINTS RAW INTO THE VIEWPORT WHILE THE STATE PLANE KEEPS CLAIMING RUNNING·IDLE — THE USER SEES AN ERROR DUMP YGGTERM SHOULD HAVE STAMPED, AND THE METADATA LIES ABOUT IT (owner-reported 2026-09-20 ~08:10 with a screenshot)
 
