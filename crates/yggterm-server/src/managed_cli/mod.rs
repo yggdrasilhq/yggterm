@@ -1277,6 +1277,25 @@ pub(crate) fn normalize_terminal_identity_color(value: &str) -> Option<String> {
     Some(format!("#{hex}").to_ascii_lowercase())
 }
 
+/// Every env key the terminal-identity exporters write — the matcher the
+/// row-carried-identity extractor reads ([11.168]). Kept adjacent to the
+/// writers so a new export cannot land without joining the carry set.
+pub(crate) fn is_terminal_identity_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "TERM"
+            | "COLORTERM"
+            | "TERM_PROGRAM"
+            | "TERM_PROGRAM_VERSION"
+            | "YGGTERM_TERM_PROGRAM"
+            | "YGGTERM_APPEARANCE"
+            | ENV_YGGTERM_TERMINAL_APPEARANCE
+            | "COLORFGBG"
+            | ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND
+            | ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND
+    ) || ENV_YGGTERM_TERMINAL_COLOR_PALETTE.contains(&key)
+}
+
 pub(crate) fn terminal_identity_color_profile_from_environment()
 -> Option<TerminalIdentityColorProfile> {
     let foreground =

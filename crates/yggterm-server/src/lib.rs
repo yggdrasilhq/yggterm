@@ -241,6 +241,7 @@ use codex_cli::{
     refresh_local_managed_cli,
     summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
+    is_terminal_identity_env_key,
 };
 pub use codex_cli::{
     ManagedCliRefreshMode, sync_terminal_identity_appearance,
@@ -17387,12 +17388,32 @@ fn remote_ssh_launch_command_with_extra_exports(
     args: &[&str],
     extra_exports: &[String],
 ) -> String {
+    remote_ssh_launch_command_with_identity_exports(
+        ssh_target,
+        prefix,
+        binary_expr,
+        args,
+        extra_exports,
+        &terminal_identity_shell_exports_for_remote(),
+    )
+}
+
+/// The identity exports ride the ROW on re-composition — see
+/// [`carried_terminal_identity_exports`]; only births pass the global env.
+fn remote_ssh_launch_command_with_identity_exports(
+    ssh_target: &str,
+    prefix: Option<&str>,
+    binary_expr: &str,
+    args: &[&str],
+    extra_exports: &[String],
+    identity_exports: &[String],
+) -> String {
     let mut inner = String::from(binary_expr);
     for arg in args {
         inner.push(' ');
         inner.push_str(&shell_single_quote(arg));
     }
-    let mut env_exports = terminal_identity_shell_exports_for_remote();
+    let mut env_exports = identity_exports.to_vec();
     env_exports.extend(extra_exports.iter().cloned());
     let env_exports = env_exports.join(" && ");
     let inner = if env_exports.is_empty() {
@@ -17511,6 +17532,50 @@ fn agent_launch_options_remote_exports(launch: &AgentLaunchOptions) -> Vec<Strin
         codex_cli::ENV_YGGTERM_AGENT_LAUNCH_OPTIONS,
         shell_single_quote(&encoded)
     )]
+}
+
+/// The terminal-identity exports a row's NEXT launch must carry.
+///
+/// ⚖ A row that already carries identity exports keeps them VERBATIM; the
+/// host-global env they would otherwise be re-read from is last-writer-wins
+/// across every client of the host, and one differently-themed client's
+/// `SyncTerminalIdentity` flips it host-wide. Re-reading it at re-composition
+/// repoints an EXISTING row at a foreign identity mid-life — measured
+/// 2026-09-25: a dark sync swept a light agy row's launch command, and its
+/// next keep-alive respawn drew dark-palette greys on the owner's light
+/// theme (the illegible-grey report; the row's OSC 10/11 answers and the
+/// CLI's own COLORFGBG read both ride these exports). Only a row born
+/// without identity exports inherits the current global.
+fn carried_terminal_identity_exports(launch_command: Option<&str>) -> Vec<String> {
+    let carried = launch_command
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(terminal_identity_exports_in_command)
+        .unwrap_or_default();
+    if carried.is_empty() {
+        terminal_identity_shell_exports_for_remote()
+    } else {
+        carried
+    }
+}
+
+/// The `export KEY=…` segments of a launch command whose key is a
+/// terminal-identity key, verbatim (quoting preserved). The exporters join
+/// segments with ` && `, and the identity exports are written by
+/// `terminal_identity_env_pairs`/`shell_exports*` — the only writers this
+/// command grammar has.
+fn terminal_identity_exports_in_command(launch_command: &str) -> Vec<String> {
+    launch_command
+        .split(" && ")
+        .filter(|segment| {
+            let Some(rest) = segment.strip_prefix("export ") else {
+                return false;
+            };
+            let key = rest.split('=').next().unwrap_or("").trim();
+            is_terminal_identity_env_key(key)
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str) -> String {
@@ -17675,12 +17740,21 @@ fn refresh_remote_codex_terminal_identity_launch_command(
         exports.extend(configured_extra_args_remote_exports(session.kind));
         exports
     };
-    let launch_command = remote_ssh_launch_command_with_extra_exports(
+    // [11.168] The terminal identity rides the ROW: a re-composition must
+    // carry the exports the row already has. The host-global env they would
+    // otherwise be re-read from is last-writer-wins across every client of
+    // the host — one dark-mode client's SyncTerminalIdentity flipped a light
+    // agy row dark mid-conversation (measured 2026-09-25, the owner's
+    // illegible-grey report). Only a row born without identity exports
+    // inherits the current global.
+    let identity_exports = carried_terminal_identity_exports(Some(&session.launch_command));
+    let launch_command = remote_ssh_launch_command_with_identity_exports(
         &ssh_target,
         prefix.as_deref(),
         &remote_binary,
         args.as_slice(),
         &extra_exports,
+        &identity_exports,
     );
     let changed = session.launch_command != launch_command;
     session.launch_command = launch_command;
@@ -49559,6 +49633,71 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn a_recomposed_row_carries_its_identity_exports_verbatim() {
+        let previous = "export TERM='xterm-256color' && export YGGTERM_APPEARANCE='light' && export COLORFGBG='0;15' && export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7' && export NPM_CONFIG_PREFIX='/x' && exec codex resume abc";
+        let carried = carried_terminal_identity_exports(Some(previous));
+        assert!(carried.contains(&"export YGGTERM_APPEARANCE='light'".to_string()));
+        assert!(carried.contains(&"export COLORFGBG='0;15'".to_string()));
+        assert!(carried.contains(&"export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7'".to_string()));
+        assert!(!carried
+            .iter()
+            .any(|segment| segment.contains("NPM_CONFIG_PREFIX")));
+        // The rebuilt command embeds the carried exports, not the global env's.
+        // (The ssh assembler re-quotes values, so assert keys and raw values,
+        // never whole export segments.)
+        let command = remote_ssh_launch_command_with_identity_exports(
+            "rebuild-target",
+            None,
+            "yggterm",
+            &[
+                "server",
+                "remote",
+                "resume-codex",
+                "abc",
+                "/tmp",
+                "--require-existing",
+            ],
+            &[],
+            &carried,
+        );
+        assert!(command.contains("export YGGTERM_APPEARANCE="));
+        assert!(command.contains("0;15"));
+        assert!(command.contains("#f7f7f7"));
+    }
+
+    #[test]
+    fn a_row_without_identity_exports_inherits_the_current_global() {
+        // Reads the process-global identity env — serialize against the
+        // guard-takers like every other test that touches it.
+        let _guard = terminal_identity_test_guard();
+        let carried = carried_terminal_identity_exports(Some("exec codex resume abc"));
+        assert!(!carried.is_empty());
+        let appearance_export = carried
+            .iter()
+            .find(|segment| segment.starts_with("export YGGTERM_TERMINAL_APPEARANCE="))
+            .expect("global identity exports carry the appearance");
+        // Structural, not value-specific: the fallback IS the global
+        // exporter's output, whatever appearance this host currently carries.
+        let global = terminal_identity_shell_exports_for_remote();
+        assert!(global.iter().any(|segment| segment == appearance_export));
+    }
+
+    #[test]
+    fn the_identity_key_matcher_covers_the_exporters_exact_key_set() {
+        assert!(is_terminal_identity_env_key("COLORFGBG"));
+        assert!(is_terminal_identity_env_key("YGGTERM_APPEARANCE"));
+        assert!(is_terminal_identity_env_key("YGGTERM_TERMINAL_APPEARANCE"));
+        assert!(is_terminal_identity_env_key(
+            "YGGTERM_TERMINAL_COLOR_BACKGROUND"
+        ));
+        assert!(is_terminal_identity_env_key("YGGTERM_TERMINAL_COLOR_15"));
+        assert!(is_terminal_identity_env_key("TERM_PROGRAM"));
+        assert!(!is_terminal_identity_env_key("NPM_CONFIG_PREFIX"));
+        assert!(!is_terminal_identity_env_key("YGGTERM_AGENT_LAUNCH_OPTIONS"));
+        assert!(!is_terminal_identity_env_key("YGGTERM_HOME"));
+    }
+
+    #[test]
     fn clear_session_preview_for_loading_drops_stale_preview_content() {
         let mut session = build_session(
             SessionKind::SshShell,
@@ -55360,12 +55499,60 @@ terminal_window_id: None,
                 session.launch_command
             );
 
+            // [11.168] THE OLD LAW HERE WAS THE FLIP ITSELF: sync dark → the
+            // sweep rewrote every remote row's exports to dark, and the row's
+            // next respawn drew dark-palette greys on its light theme —
+            // measured live 2026-09-25 (a light agy row answered light at
+            // 16:58:48, a dark sync landed 17:00:28, the same runtime answered
+            // dark at 17:00:30, the owner screenshotted the illegible grey at
+            // 17:01). The new law: the identity rides the ROW — a re-composition
+            // may change the command's SHAPE (birth → resume, extra exports)
+            // but must carry the row's identity exports through verbatim.
             crate::sync_terminal_identity_appearance("dark");
-            assert_eq!(server.refresh_terminal_identity_launch_commands(), 1);
+            let _ = server.refresh_terminal_identity_launch_commands();
             let session = server
                 .sessions
                 .get("remote-session://dev/abc123")
                 .expect("refreshed session");
+            // The ssh assembler re-quotes values (`'` → `'\''`), so assert
+            // the key and the raw value, never a whole quoted segment.
+            assert!(
+                session.launch_command.contains("YGGTERM_APPEARANCE=")
+                    && session.launch_command.contains("light"),
+                "carried appearance must survive the sweep: {}",
+                session.launch_command
+            );
+            assert!(
+                session.launch_command.contains("0;15")
+                    && !session.launch_command.contains("15;0"),
+                "{}",
+                session.launch_command
+            );
+
+            // The heal half is unchanged: a row born WITHOUT identity exports
+            // (a legacy raw command) IS filled from the current global.
+            let stripped = session
+                .launch_command
+                .split(" && ")
+                .filter(|segment| {
+                    let Some(rest) = segment.strip_prefix("export ") else {
+                        return true;
+                    };
+                    let key = rest.split('=').next().unwrap_or("").trim();
+                    !is_terminal_identity_env_key(key)
+                })
+                .collect::<Vec<_>>()
+                .join(" && ");
+            server
+                .sessions
+                .get_mut("remote-session://dev/abc123")
+                .expect("session to strip")
+                .launch_command = stripped;
+            assert_eq!(server.refresh_terminal_identity_launch_commands(), 1);
+            let session = server
+                .sessions
+                .get("remote-session://dev/abc123")
+                .expect("healed session");
             assert!(
                 session
                     .launch_command
