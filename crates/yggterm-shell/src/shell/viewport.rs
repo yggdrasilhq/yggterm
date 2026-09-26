@@ -20112,11 +20112,31 @@ fn terminal_input_line_border(theme: &TerminalTheme) -> String {
         .unwrap_or_else(|| "rgba(255,255,255,0.14)".to_string())
 }
 fn terminal_minimum_contrast_ratio(theme: &TerminalTheme) -> f32 {
-    let _ = theme;
-    // Preserve the terminal application's ANSI palette exactly. xterm.js'
-    // contrast rewrite path makes Codex TUI colors look washed out compared
-    // with native terminals such as Ghostty.
-    1.0
+    // LIGHT THEMES CARRY A CONTRAST FLOOR; DARK THEMES PRESERVE THE PALETTE.
+    //
+    // The old law here was a blanket 1.0 ("preserve the CLI's palette
+    // exactly; the contrast rewrite washes Codex TUI colors"). [11.168]
+    // measured why that law can no longer hold on light backgrounds: the
+    // identity answer fixes the CLIs that ASK (codex queries OSC 10/11 and
+    // now hears "light"), but agy-class CLIs have NO detection surface at
+    // all — no theme flag, no settings key, no OSC query (the binary never
+    // sends `]11;?`), no COLORFGBG read — and paint their bundled DARK
+    // palette everywhere, Ghostty included. Their grey meta text lands at
+    // ~2.2:1 on a light background: the owner's "illegible grey" report,
+    // unfixable by any identity signal because the CLI never listens.
+    //
+    // So the renderer carries the readability instead — ON LIGHT THEMES
+    // ONLY. xterm.js divides the required ratio by 2 for SGR-2 dim text
+    // (`minimumContrastRatio/(isDim()?2:1)` in the vendored bundle), so the
+    // floor is 6.0: ordinary text gets 6:1 and dim meta text gets the 3:1
+    // that turns "very light to the point of illegibility" into readable.
+    // Dark themes keep 1.0 — the palette-exact behavior the old comment
+    // protected, and where the owner reports no problem.
+    if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
+        6.0
+    } else {
+        1.0
+    }
 }
 fn relative_terminal_luminance_from_hex(color: &str) -> Option<f32> {
     let (red, green, blue) = parse_terminal_hex_rgb(color)?;
