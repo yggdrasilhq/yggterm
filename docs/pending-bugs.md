@@ -29415,6 +29415,22 @@ mount_open vs 0.6-1.0 s warm). The seconds live in UI-plane congestion
 daemon. The original queued-gap reading above is superseded by this
 paragraph.
 
+> **SPAWN BASELINE ADDENDUM (2026-09-26 ~23:15-23:35 IST, jojo, direct build
+> e76fa55c ≈ origin/main tip, LOADED desktop — cli floor 118 ms, two other
+> ux-speed seats probing concurrently — compare like-for-like):** uxprobe
+> spawn ×6 bare-prompt scratch rows: verb→paint (`first_frame`) p50 2719 ms
+> (batch 1) / 2138 ms (batch 2), max 7329 ms — the max iter's daemon alone
+> took 5002 ms under concurrent probing; open_to_write 447-949 ms,
+> write_to_frame 26-164 ms; `blank_frames_before_write` positive 5/6
+> (2-6 frames — the mount blank-flash number). 1/6 iterations created the row
+> (daemon_processed 691 ms) but NO `terminal_open_attempt` fired within the
+> probe timeout — zero milestones, the UI-plane starvation class, with the
+> concurrent seats as confounder; re-run on a quiet night before treating
+> any of this as the action's floor. close ×3: 773/866/5496 ms to gone,
+> one `verified:false` ("row did not leave the live order") — the close
+> accuracy assert CAUGHT it, which is the probe working. First_frame fired
+> 5/6 on idle shells — see [11.113] half 4, closed by this lane.
+
 **DRAG ARM: ROOT-CAUSED + FIX LANDED 2026-09-15** (`lane/uxspeed/drag-cold`,
 same sitting): the cold begin was `resolve_app_control_row`'s snapshot-miss
 fallback — a just-created session is not yet a promoted live view in the
