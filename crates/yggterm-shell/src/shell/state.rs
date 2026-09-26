@@ -58570,13 +58570,34 @@ fn push_remote_machine_rows(
             .map(|session| (session.session_path.clone(), session.session_id.clone()))
             .collect::<Vec<_>>(),
     );
+    // ⛔ ONE title-store open per merge, not one per scanned session: the
+    // opening variant runs a fresh SQLite Connection::open PLUS the schema
+    // DDL batch, and this loop runs once per scanned session — 6.7k opens
+    // ≈1.1 s per uncached merge on a fleet-size desktop (push_remote_ms
+    // 1155.9 of a 1175 ms merge profile, 2026-09-26 — the [11.117] fix
+    // leg). The copy path learned this same lesson already
+    // (background_copy_job_for_target reuses one resolver) and the label
+    // path regrew it; `_with_saved_title` exists for exactly this shape.
+    let title_store = resolve_yggterm_home()
+        .ok()
+        .and_then(|home| yggterm_core::SessionTitleStore::open(&home).ok());
+    let saved_title = |session: &RemoteScannedSession| -> Option<String> {
+        title_store
+            .as_ref()
+            .and_then(|store| store.get_title(&session.session_id).ok())
+            .flatten()
+    };
     let session_labels = machine
         .scanned_sessions
         .iter()
         .map(|session| {
             (
                 session.session_path.clone(),
-                remote_scanned_session_label(session, &remote_short_ids),
+                remote_scanned_session_label_with_saved_title(
+                    session,
+                    &remote_short_ids,
+                    saved_title(session).as_deref(),
+                ),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -58590,7 +58611,13 @@ fn push_remote_machine_rows(
             let label = session_labels
                 .get(&scanned.session_path)
                 .cloned()
-                .unwrap_or_else(|| remote_scanned_session_label(scanned, &remote_short_ids));
+                .unwrap_or_else(|| {
+                    remote_scanned_session_label_with_saved_title(
+                        scanned,
+                        &remote_short_ids,
+                        saved_title(scanned).as_deref(),
+                    )
+                });
             rows.push(BrowserRow {
                 kind: BrowserRowKind::Session,
                 full_path: scanned.session_path.clone(),

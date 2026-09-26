@@ -27123,6 +27123,64 @@ console.log('ok');
     }
 
     #[test]
+    fn push_remote_machine_rows_opens_the_title_store_once_per_merge() {
+        // The [11.117] fix leg: the merge's label map used to open the
+        // sqlite title store PER SCANNED SESSION — a fresh Connection::open
+        // plus the schema DDL batch each — 6.7k opens ≈ 1.1 s of
+        // push_remote per uncached merge on a fleet-size desktop.
+        let sessions: Vec<RemoteScannedSession> = (0..25)
+            .map(|ix| RemoteScannedSession {
+                kind: None,
+                session_path: format!("remote-session://pi-raspberry/019c{ix:04}"),
+                session_id: format!("019c{ix:04}"),
+                // Session 0 keeps an empty cwd so it lands in
+                // root_session_indices and is emitted as a session row
+                // directly; the rest nest into collapsed folders.
+                cwd: if ix == 0 {
+                    String::new()
+                } else {
+                    format!("/srv/app/dir{}", ix % 3)
+                },
+                started_at: "2026-09-26T10:00:00Z".to_string(),
+                modified_epoch: 123,
+                event_count: 22,
+                user_message_count: 11,
+                assistant_message_count: 10,
+                title_hint: format!("real title {ix}"),
+                recent_context: String::new(),
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: false,
+                title_is_explicit: false,
+                storage_path: String::new(),
+            })
+            .collect();
+        let machine = SidebarRemoteMachine {
+            key: "pi-raspberry".to_string(),
+            label: "raspberry".to_string(),
+            health: MachineHealth::Healthy,
+            remote_deploy_state: RemoteDeployState::Ready,
+            scanned_sessions: sessions,
+            workspace_folders: Vec::new(),
+            needs_resort: false,
+        };
+        let expanded: HashSet<String> =
+            HashSet::from(["__remote_machine__/pi-raspberry".to_string()]);
+        let before = yggterm_core::session_title_store_open_count();
+        let mut rows = Vec::new();
+        push_remote_machine_rows(&mut rows, &machine, &expanded);
+        let opens = yggterm_core::session_title_store_open_count() - before;
+        assert!(
+            rows.iter().any(|row| row.kind == BrowserRowKind::Session),
+            "the merge must still emit the machine's session rows"
+        );
+        assert_eq!(
+            opens, 1,
+            "one merge = one title-store open, not one per scanned session              (25 sessions would have opened 25 sqlite connections)"
+        );
+    }
+
+    #[test]
     fn merged_sidebar_rows_include_saved_ssh_machine_roots() {
         let expanded_paths = HashSet::from(["__remote_machine__/pi-raspberry".to_string()]);
         let rows = merged_sidebar_rows(
