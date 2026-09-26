@@ -864,6 +864,16 @@ dioxus.send(out);
             settle = None
             forced = None
             reveal = None
+            # [11.172] THE REVEAL RAISE ENDS. A switch served as a raise of a
+            # retained host never fires the mount chain: it fires
+            # terminal_mount/reveal_served (the Rust raise marker) and
+            # xterm_paint/reveal (the stamp script's paint truth — visibility
+            # geometry + buffer content, NO xterm re-init). Both are honest
+            # ends in their own families; settle cannot follow a raise (the
+            # settle recheck belongs to the mount chain), so the raise's break
+            # does not wait for one.
+            reveal_served = None
+            paint_reveal = None
             deadline = time.time() + self.timeout_s
             t_loop = time.time()
             while time.time() < deadline:
@@ -913,10 +923,17 @@ dioxus.send(out);
                                 "reveal_ready", "reveal_forced_incomplete",
                                 "reveal_failed"):
                             reveal = e
+                        elif (reveal_served is None and c == "terminal_mount"
+                                and n == "reveal_served"):
+                            reveal_served = e
+                        elif (paint_reveal is None and c == "xterm_paint"
+                                and n == "reveal"):
+                            paint_reveal = e
                 if activation is not None and (
                         first_frame is not None or forced is not None
-                        or reveal is not None) and (
-                        settle is not None or time.time() - t_loop > 4.0):
+                        or reveal is not None or paint_reveal is not None) and (
+                        settle is not None or paint_reveal is not None
+                        or time.time() - t_loop > 4.0):
                     break
                 time.sleep(0.05)
             window = evs
@@ -934,6 +951,9 @@ dioxus.send(out);
             if activation is not None:
                 if mount_begin is not None:
                     it["mount_begin_ms"] = mount_begin.get("ts_ms", 0) - t_release
+                if reveal_served is not None:
+                    it["reveal_served_ms"] = (reveal_served.get("ts_ms", 0)
+                                              - t_release)
                 if first_frame is not None:
                     it["first_frame_ms"] = first_frame.get("ts_ms", 0) - t_release
                     fp = first_frame.get("payload") or {}
@@ -943,6 +963,23 @@ dioxus.send(out);
                     if not fp.get("rows_painted"):
                         acc.append("first_frame painted no rows — not paint "
                                    "truth (rows_painted=%r)" % fp.get("rows_painted"))
+                elif paint_reveal is not None:
+                    # [11.172] the raise's paint truth: the retained canvas
+                    # is visible and holds content WITHOUT any re-init.
+                    it["paint_reveal_ms"] = (paint_reveal.get("ts_ms", 0)
+                                             - t_release)
+                    rp = paint_reveal.get("payload") or {}
+                    it["reveal_visible"] = rp.get("visible")
+                    it["reveal_content_rows"] = rp.get("content_rows")
+                    it["reveal_rows"] = rp.get("rows")
+                    if rp.get("visible") is not True:
+                        acc.append("reveal stamp says the host is not "
+                                   "visible — the raise did not paint "
+                                   "(visible=%r)" % (rp.get("visible"),))
+                    if not rp.get("content_rows"):
+                        acc.append("reveal stamp found no content rows — "
+                                   "the retained canvas is empty "
+                                   "(content_rows=%r)" % (rp.get("content_rows"),))
                 else:
                     acc.append("no xterm_paint/first_frame for the clicked row "
                                "within the window — the felt switch has no "
@@ -984,11 +1021,13 @@ dioxus.send(out);
         ready = [i for i in out["iterations"]
                  if i.get("reveal_name") == "reveal_ready"]
         out["reveal_ready_rate"] = len(ready) / len(out["iterations"])
-        # [11.171] THE FALSIFIER: >=7/8 clicks report a paint-truth end
-        # (first_frame with rows painted). This rate is the number the door's
+        # [11.171]+[11.172] THE FALSIFIER: >=7/8 clicks report a paint-truth
+        # end — first_frame with rows painted (a mount) or xterm_paint/reveal
+        # with content (a raise). This rate is the number the door's
         # activation→paint column exists to carry.
         ends = [i for i in out["iterations"]
-                if i.get("first_frame_ms") is not None]
+                if i.get("first_frame_ms") is not None
+                or i.get("paint_reveal_ms") is not None]
         out["paint_end_rate"] = len(ends) / len(out["iterations"])
         completes = [i for i in ends if i.get("settle_complete")]
         out["settle_complete_rate"] = (

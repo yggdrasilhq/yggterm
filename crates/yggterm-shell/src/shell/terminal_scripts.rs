@@ -15578,6 +15578,71 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         moz_font_smoothing = moz_font_smoothing,
     )
 }
+/// The reveal-raise paint stamp ([11.172]): a switch served as a CSS reveal of
+/// an already-mounted host skips the bootstrap entirely, so the mount script's
+/// `xterm_paint/mount_open` -> `first_frame` chain never fires. The probe's
+/// paint-truth pairing needs an honest end marker from the raise path itself —
+/// THIS script is that marker. It reads the live registry entry (no xterm
+/// construction, no tap installation), reports the host's visibility geometry
+/// and buffer content, and emits ONE `xterm_paint/reveal` event in the same
+/// family the probe already watches. Kept deliberately tiny: the eval round
+/// trip is PART of the number the falsifier measures.
+pub fn terminal_reveal_stamp_script(session_path: &str, host_id: &str) -> String {
+    format!(
+        r#"
+        (() => {{
+            const hostId = {host_id:?};
+            const sessionPath = {session_path:?};
+            const emit = (name, payload) => {{
+                try {{
+                    if (window.ytrace && window.ytrace.emit) window.ytrace.emit({{ category: "xterm_paint", name, payload }});
+                }} catch (_error) {{}}
+            }};
+            let entry = null;
+            try {{
+                const registry = window.__yggtermXtermHosts || {{}};
+                entry = Object.values(registry)
+                    .filter((candidate) => candidate && candidate.term && candidate.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0))[0] || null;
+            }} catch (_error) {{}}
+            if (!entry) {{
+                emit("reveal_missing", {{ host_id: hostId, session_path: sessionPath, reason: "registry_entry_not_found" }});
+                return;
+            }}
+            const term = entry.term;
+            let contentRows = 0;
+            try {{
+                const active = term.buffer && term.buffer.active;
+                const rows = Math.max(1, Number(term.rows || 0));
+                if (active) {{
+                    for (let row = 0; row < rows; row += 1) {{
+                        const line = active.getLine(active.viewportY + row);
+                        if (line && line.length) contentRows += 1;
+                    }}
+                }}
+            }} catch (_error) {{}}
+            let visible = false;
+            try {{
+                const host = document.getElementById(hostId);
+                if (host) {{
+                    const style = window.getComputedStyle(host);
+                    const rect = host.getBoundingClientRect();
+                    visible = style.visibility !== "hidden" && Number(style.opacity) > 0 && rect.width > 0 && rect.height > 0;
+                }}
+            }} catch (_error) {{}}
+            emit("reveal", {{
+                host_id: hostId,
+                session_path: sessionPath,
+                mounted_at: Number(entry.mountedAt || 0),
+                rows: Number(term.rows || 0),
+                cols: Number(term.cols || 0),
+                content_rows: contentRows,
+                visible,
+            }});
+        }})();
+        "#
+    )
+}
 fn terminal_scroll_to_line_script(session_path: &str, line_index: usize) -> String {
     format!(
         r#"
