@@ -53821,6 +53821,71 @@ async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
 /// walks the open chord. Routing every ALT interaction through here is what makes
 /// it independent of which surface holds DOM focus (§13.1, invariant 11).
 fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::Value) {
+    // The chord-identity half of [11.113] gap 3 (ux-speed campaign): the
+    // input-latency chain's `input/keystroke` carries SHAPE only by law, so a
+    // chord — alt tap, accelerator, claimed shell chord, dialog key — was
+    // unidentifiable in the trace plane and chorded bulk actions (the
+    // alt,E,O close-all) were unmeasurable end-to-end. This bridge NEVER sees
+    // PTY typing (invariant 7 lets plain keys through untouched when nothing
+    // matches), so every face below is a command chord, a claimed shell
+    // chord, or a dialog/nav key: identity is content-safe by construction.
+    // Form field VALUES are never carried; the derive face reports a count
+    // only, never the walked elements' labels.
+    let chord_face = if msg.get("tap").and_then(|value| value.as_bool()) == Some(true) {
+        Some("tap")
+    } else if msg.get("accel").is_some() {
+        Some("accel")
+    } else if msg.get("chord").is_some() {
+        Some("chord")
+    } else if msg.get("page_menu").is_some() {
+        Some("page_menu")
+    } else if msg.get("modal_key").is_some() {
+        Some("modal_key")
+    } else if msg.get("menu_key").is_some() {
+        Some("menu_key")
+    } else if msg.get("follow_modal").is_some() {
+        Some("follow_modal")
+    } else if msg.get("derive").is_some() {
+        Some("derive")
+    } else if msg.get("key").is_some() {
+        Some("walk_key")
+    } else {
+        // An unrecognized bridge message is not a chord; stay silent rather
+        // than emit noise on every future message kind.
+        None
+    };
+    if let Some(face) = chord_face {
+        let (overlay_active, modal_open) = {
+            let shell = state.read();
+            (shell.alt_overlay_active, shell.top_modal().is_some())
+        };
+        yggterm_core::perf::ytrace_emit_event(
+            "shell",
+            "ui",
+            "chord",
+            serde_json::json!({
+                "face": face,
+                "key": msg
+                    .get("key")
+                    .or_else(|| msg.get("modal_key"))
+                    .or_else(|| msg.get("menu_key"))
+                    .and_then(|value| value.as_str()),
+                "accel": msg.get("accel"),
+                "chord": msg.get("chord").and_then(|value| value.as_str()),
+                "page_menu_item": msg
+                    .get("page_menu")
+                    .and_then(|menu| menu.get("id"))
+                    .and_then(|value| value.as_str()),
+                "follow_modal": msg.get("follow_modal").and_then(|value| value.as_str()),
+                "derive_count": msg
+                    .get("derive")
+                    .and_then(|value| value.as_array())
+                    .map(|elements| elements.len()),
+                "overlay_active": overlay_active,
+                "modal_open": modal_open,
+            }),
+        );
+    }
     if msg.get("tap").and_then(|value| value.as_bool()) == Some(true) {
         state.with_mut_counted(|shell| {
             if shell.alt_overlay_active {

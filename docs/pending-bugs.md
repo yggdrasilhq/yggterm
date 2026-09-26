@@ -29305,6 +29305,32 @@ asserts on app-state truth because the trace pairs do not exist.
 > identity in `input/keystroke` (half 3) and `first_frame` never firing for
 > idle shells + settle as the documented paint marker (half 4).
 
+> **LANDED IN CODE (2026-09-26 ~23:30 IST, lane/uxspeed/chord-close-all — the
+> CHORD half, half 3; LIVE PROOF OWED until the GUI rotates and the probe
+> asserts the faces):** the keytip bridge is the ONE terminus every chord
+> crosses, so `keytip_apply_bridge_message` now emits `shell/ui/chord`
+> (always-sampled, wall clock, registered in perf.rs beside the input-latency
+> probes) with face + identity: `tap`, `accel` (the full ctrl/alt/shift/meta
+> mods + key), claimed `chord` id, `page_menu_item`, `modal_key`,
+> `menu_key`, `follow_modal`, `walk_key` — plus `overlay_active`/`modal_open`
+> at receive time. Content-safe by construction and by law kept narrower than
+> the entry's suggested shape: the bridge NEVER sees PTY typing (invariant 7
+> lets plain keys through untouched), so identity is not a typing leak;
+> form field values are never carried, and the derive face reports a COUNT
+> only, never the walked elements' labels. Behavioral lock
+> `chord_bridge_emits_identity_event_at_the_one_terminus` (faces classified,
+> accel identity carried, no derive labels, unrecognized messages silent) +
+> `ui_chord_probe_is_registered_always_sampled` in yggterm-core. The
+> ux-speed probe gains the `closeall` action (Live Sessions group row real
+> menu → Close All… → bulk confirm dialog, cancel + survivors assert, chord
+> leg asserting the ui/chord faces, confirm leg gated to scratch-only
+> screens). STILL OPEN in this entry: `first_frame` never firing for idle
+> shells + settle as the documented paint marker (half 4). Live falsifier:
+> uxprobe `--actions closeall` on the rotated build reports
+> `chord_faces: [tap, walk_key, walk_key/menu_key, ...]` and the tap→
+> overlay→menu walls land; until rotation the chord leg reports the honest
+> `NO ui/chord events` refusal.
+
 ## ⛔ [11.114] TERMINAL SPAWN/CLOSE/DRAG ARE SECONDS-CLASS, NOT MILLISECOND-CLASS — MEASURED COST LADDER FOR SPAWN: ~0.6s DAEMON PROCESSING → ~0.6-1.0s QUEUED GAP → ~2.1s MOUNT ENSURE → +0.5s SETTLE (measured 2026-09-14 late on the GUI host, synthetic scratch rows, tools/uxspeed/uxprobe.py)
 
 **Status:** OPEN
