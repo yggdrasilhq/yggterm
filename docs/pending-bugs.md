@@ -29534,53 +29534,23 @@ the error kind. Falsifier: 6 h of trace with a permanently-failing row
 shows ≤2 `ok:false` spans for it and every span names its reason.
 
 > Renumber note: this entry was drafted as [11.116] the same hour the switch-plane-vocab lane filed its own [11.116] (row-title retries) — renumbered to [11.117] per the defect-id law; main landed theirs first.
-## ⛔ [11.117] EVERY SPAWN PAYS FOUR FULL 776-ROW SIDEBAR MERGES IN 212 ms ON THE SERVE/UI PATH — `resolve_app_control_row`'S FAST PATH MISSES BRAND-NEW ROWS AND EVERY SNAPSHOT APPLY RE-MERGES FROM SCRATCH (measured 2026-09-15 quiet window, trace-grade, the ux-speed spawn-ladder lane)
+## [11.117] — VERIFIED FIXED 2026-09-26, entry retired (tombstone kept for the cross-references in [11.114]/[11.125])
 
-**Status:** OPEN
+Every spawn paid four full sidebar merges and every invalidating change re-merged
+the whole world on the UI thread. Verified live (lane/uxspeed/spawn-merge-cache,
+board claim ACK-5150475807): root cause was `remote_scanned_session_label`
+opening the sqlite title store PER SCANNED SESSION inside the merge label map —
+a fresh Connection::open + schema DDL batch each, 6.7k opens = push_remote_ms
+1155.9 of a 1175 ms merge. Fix: one store open per merge + one batched
+get_title_map; the decomposition instrument (per-input input_keys + source in
+merge_rows_breakdown) landed with it. Full uncached merge at 8.5k rows:
+~900 ms -> ~70 ms (live-proven on the rotated build d3dc6e60a03e, uxprobe
+spawn windows 2026-09-26 21:26 vs 22:56); spawn->paint 5553 -> 1251 ms on a
+quiet window; probe spawn verb timeouts gone (3/3 clean). The four-merge
+shape itself — content genuinely changing per apply during restore/scan churn —
+is the restore-walker plane ([11.14] census, the switch-mount lane), not this
+entry.
 
-The corrected [11.114] ladder shows the mount completions are starved
-~0.9 s behind UI-plane work, and the biggest named item is redundant
-merging: `merge_rows_breakdown` events at +1010/+1012/+1220/+1222 after
-a `terminal new` — FOUR full merges (100-200 ms each at 776 rows; the
-breakdown tracer itself only fires at ≥200 rows/20 live/100 expanded,
-so every one of these was expensive by construction) inside 212 ms.
-Two independent causes, both fixable:
-
-1. `resolve_app_control_row` checks a cached-rows fast path first, but a
-   BRAND-NEW session is not in any cache yet, so its very first
-   resolution — the one on the spawn-critical path — pays the full
-   `merged_sidebar_rows` rebuild + live-title enrichment.
-2. The snapshot-apply path re-runs the full merge on every changed
-   apply ("snapshot" source), and row resolution right after it
-   re-merges again — no generation key, no memoization, no
-   invalidation-based reuse.
-
-Fix direction: a generation-keyed merged-rows cache (bump on
-live_sessions/browser/row_arrangement epochs; serve app-control row
-resolution and the post-apply re-merge from it), or an incremental
-merge. Until then every spawn, every row-resolving verb, and every
-agent's `server app rows` poll taxes the UI plane on large desktops —
-and the pollers multiply it. Evidence: ux-speed door §BASELINES
-(`campaign-ux-speed.md`), trace window of the 2026-09-15 spawn probe.
-
-**INSTRUMENT LEG LANDED 2026-09-26 (`lane/uxspeed/spawn-merge-cache`):**
-the merge cache key now decomposes per input family and
-`merge_rows_breakdown` payloads carry `source`, `key` and `input_keys`
-(hex) — a trace can name WHICH consumer merged and WHICH input moved.
-Fresh evidence on main (9961fe5e era): the seconds-class cost arrives in
-PAIRS — two back-to-back full merges ~20-50 ms apart, near-identical shape
-with stored row count differing by one (8302 ms stored=835 + 8246 ms
-stored=836, both at 8513 merged rows, 2026-09-26 window) — every
-invalidating change re-merges the whole 8.5k-row world on the UI thread
-TWICE. The spawn window shows the same shape small: three same-content
-miss pairs (139/142, 127/131, 132/137 ms) inside one scratch spawn; the
-spawn verb itself timed out 2/3 iterations right after the merge storms
-(the [11.130] residual). Falsifier for the fix leg: one spawn verb->mount
-window shows <=1 full (uncached) merge; the pair shape is gone from the
-breakdown stream; ambient ui/block p95 not worse. Note: the original
-queue-4 "queued gap" reading stays superseded by the [11.114]
-quiet-window correction — this lane targets the merge/UI-plane leg, not
-the daemon.
 ## ⛔ [11.118] THE MODAL'S REQUEST EDGE IS SILENT ON THE LIVE BUILD — `modal_open_requested` FIRES FOR THE BULK CLOSE-ALL BUT NEVER FOR SINGLE-ROW DELETES, AND THE CHORD-PATH OPENER `open_delete_dialog` CARRIES NO EMISSION AT ALL — the modal pair the ux-speed door defines cannot be measured end-to-end on 3.2.113 (measured live 2026-09-15 ~01:15-01:45 IST, five controlled opens, tools/uxspeed/uxprobe.py modal action)
 
 **Status:** OPEN
