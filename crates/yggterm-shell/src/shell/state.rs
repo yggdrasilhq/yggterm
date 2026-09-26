@@ -58581,11 +58581,21 @@ fn push_remote_machine_rows(
     let title_store = resolve_yggterm_home()
         .ok()
         .and_then(|home| yggterm_core::SessionTitleStore::open(&home).ok());
+    // One batched load, not one prepare+query per session (the last ~135 ms
+    // of the old push_remote burn).
+    let saved_titles = title_store
+        .as_ref()
+        .and_then(|store| {
+            let ids = machine
+                .scanned_sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>();
+            store.get_title_map(&ids).ok()
+        })
+        .unwrap_or_default();
     let saved_title = |session: &RemoteScannedSession| -> Option<String> {
-        title_store
-            .as_ref()
-            .and_then(|store| store.get_title(&session.session_id).ok())
-            .flatten()
+        saved_titles.get(&session.session_id).cloned()
     };
     let session_labels = machine
         .scanned_sessions

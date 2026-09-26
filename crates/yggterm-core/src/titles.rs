@@ -285,6 +285,33 @@ impl SessionTitleStore {
         Ok(Self { conn })
     }
 
+    /// One query per CHUNK instead of one prepare+query per session: the
+    /// sidebar merge asks for every scanned session's title (6.7k on a
+    /// fleet-size desktop), and per-session calls measured ~135 ms of
+    /// push_remote per uncached merge even after the per-session OPEN was
+    /// removed (the [11.117] fix leg, 2026-09-26).
+    pub fn get_title_map(
+        &self,
+        session_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::with_capacity(session_ids.len());
+        let mut unique = session_ids.to_vec();
+        unique.sort();
+        unique.dedup();
+        for chunk in unique.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT session_id, title FROM session_titles WHERE session_id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+            while let Some(row) = rows.next()? {
+                out.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_title(&self, session_id: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
