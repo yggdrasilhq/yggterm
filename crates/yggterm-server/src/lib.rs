@@ -13770,6 +13770,38 @@ impl YggtermServer {
                         "Launch",
                         user_visible_launch_command(&session.launch_command),
                     );
+                } else if !terminal_identity_exports.is_empty()
+                    && agent_cli_descriptor(session.kind).is_some()
+                {
+                    // [11.168] leg 3b, LIVE-FALSIFIED 2026-09-26 on the muse
+                    // lab host: a TURNLESS local agent row (no Storage stamp
+                    // yet — the transcript does not exist until its first
+                    // turn) takes NEITHER arm above, so its command stayed the
+                    // birth compose THIS daemon built from ITS global — the
+                    // row re-identified at the very first post-restart read
+                    // (born under a light global, theme swept dark, restart
+                    // → dark at the first spec). A restore of an EXISTING row
+                    // is not a fresh birth: recompose the birth shape — an
+                    // id only for a kind born WITH one — carrying the row's
+                    // persisted exports.
+                    let cwd = session_metadata_value(session, "Cwd")
+                        .or_else(|| target.cwd.clone())
+                        .unwrap_or_else(local_default_cwd);
+                    let birth_id = agent_cli_descriptor(session.kind)
+                        .is_some_and(|descriptor| descriptor.id_assigned_at_birth)
+                        .then_some(id.as_str());
+                    session.launch_command = agent_launch_command_with_options_and_identity(
+                        session.kind,
+                        Some(&cwd),
+                        birth_id,
+                        &agent_launch_options,
+                        Some(&terminal_identity_exports),
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Launch",
+                        user_visible_launch_command(&session.launch_command),
+                    );
                 }
             }
             // ⛔ PUT THE TOKEN BACK ON THE ROW, or the round-trip survives
@@ -50654,6 +50686,53 @@ terminal_window_id: None,
             None,
         );
         assert!(command.contains("APPEARANCE='dark'"), "{command}");
+    }
+
+    /// [11.168] leg 3b, the LIVE-FALSIFIED shape: a turnless local codex row
+    /// (no Storage stamp, not rebound) restored under a dark global keeps the
+    /// light identity it persisted — its birth shape recomposes from the
+    /// carried exports instead of the successor's global.
+    #[test]
+    fn a_turnless_restored_row_recomposes_its_birth_shape_with_persisted_exports() {
+        let _guard = terminal_identity_test_guard();
+        crate::sync_terminal_identity_appearance("dark");
+        let mut server = test_server();
+        let exports = vec![
+            "export YGGTERM_APPEARANCE='light'".to_string(),
+            "export COLORFGBG='0;15'".to_string(),
+            "export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7'".to_string(),
+        ];
+        server.restore_live_session(crate::PersistedLiveSession {
+            app_launch: None,
+            terminal_identity_exports: exports,
+            key: "local://abd1".to_string(),
+            id: "abd1".to_string(),
+            title: "turnless probe".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/srv/app".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        });
+        let command = server
+            .sessions
+            .get("local://abd1")
+            .map(|session| session.launch_command.clone())
+            .expect("the row restored");
+        assert!(command.contains("APPEARANCE='light'"), "{command}");
+        assert!(command.contains("#f7f7f7"), "{command}");
+        assert!(
+            !command.contains("15;0") && !command.contains("#262a33"),
+            "the dark global must not leak into a turnless restored row: {command}"
+        );
     }
 
     /// [11.168] leg 3: the persisted field round-trips, and an old state file
