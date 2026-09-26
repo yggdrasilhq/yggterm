@@ -1619,7 +1619,7 @@ mod tests {
     /// sidebar contribution declared at `declared_ms` — the zombie-surface
     /// sweep fixture ([[campaign-libyggterm]] Phase 0.2).
     fn shell_with_contribution(session_path: &str, declared_ms: u64) -> ShellState {
-        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let bootstrap = tests::test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.upsert_sidebar_contribution(
@@ -70486,4 +70486,135 @@ mod web_surface_immersion_locks {
         }
     }
 
+
+    // ------------------------------------------------------------------
+    // [11.172] THE REVEAL RAISE. A switch to a host that is already
+    // mounted, Ready, daemon-owned, and not transport-degraded is served
+    // as a CSS reveal (no bootstrap, no xterm re-init). These locks pin
+    // the eligibility predicate and the raise's instrument contract.
+    // ------------------------------------------------------------------
+
+    fn shell_with_a_ready_retained_host(session_path: &str) -> ShellState {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.window_focused = true;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.terminal_sessions_reached_ready
+            .insert(session_path.to_string());
+        shell
+    }
+
+    #[test]
+    fn a_switch_to_a_mounted_ready_daemon_owned_host_is_reveal_eligible() {
+        let session_path = "local://reveal-eligible-host-test";
+        let shell = shell_with_a_ready_retained_host(session_path);
+        // No runtime status snapshot means "cannot prove the PTY is gone" —
+        // the daemon_owns arm reads true, the same default the reuse arm of
+        // resolve_active_open_mount_epoch grants.
+        assert!(
+            shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a mounted host with ready history must raise, not remount"
+        );
+    }
+
+    #[test]
+    fn a_host_that_never_reached_ready_is_not_reveal_eligible() {
+        let session_path = "local://reveal-never-ready-host-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        shell.terminal_sessions_reached_ready.remove(session_path);
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a first mount must bootstrap; a never-ready host has no canvas to raise"
+        );
+    }
+
+    #[test]
+    fn a_transport_degraded_surface_is_not_reveal_eligible() {
+        let session_path = "local://reveal-degraded-host-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        shell.set_terminal_surface_status(
+            session_path,
+            true,
+            false,
+            0,
+            "reveal-degraded-lock",
+        );
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a degraded surface must take the recovery path, not a raise"
+        );
+    }
+
+    #[test]
+    fn a_host_whose_runtime_the_daemon_loses_is_not_reveal_eligible() {
+        let session_path = "local://reveal-dead-runtime-host-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        // An explicit runtime status that owns SOMEONE ELSE's keys proves
+        // the snapshot path is live while this session's PTY is not.
+        let status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "reveal-lock",
+            "host_kind": "local",
+            "host_detail": "reveal-lock",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "owned_terminal_session_keys": ["local://someone-else"],
+        }))
+        .expect("runtime status fixture parses");
+        shell.latest_runtime_status = Some(status);
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a host whose PTY the daemon no longer holds must bootstrap, not raise"
+        );
+    }
+
+    #[test]
+    fn the_reveal_branch_skips_the_bootstrap_and_latches_ready() {
+        // The raise must (a) swallow the bootstrap candidate BEFORE the lease,
+        // (b) latch the open attempt Ready with the reveal reason (the same
+        // latch the mount's attach_ready path uses), (c) say reveal_served,
+        // and (d) stamp paint truth with the tiny script — the mount chain's
+        // first_frame deliberately never fires on a raise.
+        for needle in [
+            "let reveal_raise_eligible = bootstrap_schedule_candidate",
+            "shell.mark_terminal_open_attempt_ready_for_session(&session_path, \"reveal_retained_host\",)",
+            "\"terminal_mount\", \"reveal_served\"",
+            "terminal_reveal_stamp_script(&session_path, &host_id,)",
+            "let bootstrap_schedule_candidate = bootstrap_schedule_candidate && !reveal_raise_eligible",
+        ] {
+            assert!(
+                seam_contains(SHELL_SOURCE, needle),
+                "the reveal raise lost a load-bearing wire: {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reveal_stamp_reports_paint_truth_without_reinitializing_xterm() {
+        let script = terminal_reveal_stamp_script("local://stamp-test", "host-id-stamp-test");
+        // The stamp reads the LIVE registry entry and emits one event in the
+        // xterm_paint family — no Terminal construction, no tap install.
+        for needle in [
+            "__yggtermXtermHosts",
+            "sessionPath",
+            "content_rows",
+            "reveal_missing",
+            "xterm_paint",
+        ] {
+            assert!(
+                script.contains(needle),
+                "the reveal stamp lost {needle:?}"
+            );
+        }
+        assert!(
+            !script.contains("new window.Terminal"),
+            "the reveal stamp must never re-initialize xterm — that is the bootstrap"
+        );
+        assert!(
+            script.contains("local://stamp-test"),
+            "the stamp must carry the session identity (the [11.171] join key)"
+        );
+    }
 }

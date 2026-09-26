@@ -5520,6 +5520,49 @@ fn TerminalCanvas(
     if bootstrap_schedule_candidate {
         *bootstrap_task_identity.borrow_mut() = combined_bootstrap_key.clone();
     }
+    // [11.172] THE REVEAL RAISE. A switch to a row whose host is already
+    // mounted, Ready, daemon-owned, and not degrading does NOT need the
+    // bootstrap again: the premount keep-set held the host at a stable epoch,
+    // its BackgroundTrickle reads kept the canvas current while it was hidden,
+    // and the renderer flips the CSS visibility. Re-running the bootstrap
+    // anyway re-initialized xterm behind the ~0.9 s mount-eval wait — p50
+    // 1.34 s click-to-first-glyph for the most frequent UX action. So: latch
+    // the open attempt Ready (same latch the mount's attach_ready path uses —
+    // it drives the switch-gate histogram), say `reveal_served` in the trace,
+    // stamp paint truth with the tiny reveal script (the mount script's
+    // `mount_open`/`first_frame` chain deliberately never fires here), and
+    // swallow this candidate so no lease and no bootstrap task exist. A first
+    // mount, a fault recovery, an in-flight attach, or a degraded surface
+    // fails the predicate and takes the bootstrap path unchanged.
+    let reveal_raise_eligible = bootstrap_schedule_candidate
+        && state.with(|shell| shell.terminal_host_ready_for_reveal_raise(&session_path));
+    if reveal_raise_eligible {
+        *bootstrap_task_identity.borrow_mut() = combined_bootstrap_key.clone();
+        state.with_mut_counted(|shell| {
+            shell.mark_terminal_open_attempt_ready_for_session(
+                &session_path,
+                "reveal_retained_host",
+            );
+        });
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "reveal_served",
+            json!({
+                "session_path": session_path.clone(),
+                "host_id": host_id.clone(),
+                "mount_epoch": mount_epoch,
+                "mount_identity": mount_identity.clone(),
+                "open_request_id": latest_open_request_id,
+            }),
+        );
+        let _ = document::document().eval(terminal_reveal_stamp_script(
+            &session_path,
+            &host_id,
+        ));
+    }
+    let bootstrap_schedule_candidate = bootstrap_schedule_candidate && !reveal_raise_eligible;
     let should_schedule_bootstrap = bootstrap_schedule_candidate
         && state.with_mut_counted(|shell| {
             acquire_terminal_bootstrap_lease(

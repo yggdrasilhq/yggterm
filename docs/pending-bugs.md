@@ -20,7 +20,7 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-09-27 on `lane/uxspeed/switch-paint-marker` (zcode
 sess_1cbee766-d95d-455a-b83d-995b87c7050f on jojo, work FROM dev) — the lane
@@ -51,6 +51,32 @@ content, not remount it — either keep per-row surfaces alive across switches
 active view today) or make the reattach path skip the full JS eval wait. The
 probe consumes the result unchanged: `first_frame_ms` should collapse from
 ~1.3 s to ms-class.
+
+
+FIXED IN CODE 2026-09-27 (lane/uxspeed/switch-raise-retained, the ux-speed
+campaign): the REVEAL RAISE. The raise arm sits in TerminalCanvas's bootstrap
+decision, ahead of the lease: when
+`terminal_host_ready_for_reveal_raise` (the SSOT
+`terminal_session_host_reusable_for_reveal` — sticky ready history, daemon
+owns the runtime, stable host epoch — plus a transport-degraded guard) says
+the host is already alive, the switch (a) swallows the bootstrap candidate
+so no lease and no mount task exist, (b) latches the open attempt Ready via
+`mark_terminal_open_attempt_ready_for_session(.., "reveal_retained_host")` —
+the same latch the mount's attach path uses, so the input gate opens and the
+HOT/COLD switch-gate histogram still gets its sample, (c) emits
+`terminal_mount/reveal_served` {session_path, host_id, mount_epoch}, and (d)
+stamps paint truth with a deliberately tiny eval — `xterm_paint/reveal`
+{visible, rows, content_rows} read off the live `__yggtermXtermHosts`
+registry entry; the mount chain's mount_open/first_frame/settle correctly
+never fire on a raise, so uxprobe `switch` now accepts BOTH end families
+(first_frame with rows painted, or reveal with content) for its
+paint-end falsifier. Behavioral locks: the predicate's four arms, the
+raise's wiring (seam), and the stamp's no-re-init contract (6 tests).
+Honest note kept from the [11.172] window decomposition: the ~890 ms
+eval-delivery leg (js_eval_created -> the script actually running, beside
+ui/block spans) is a SECOND cost this fix removes for the raise path by not
+dispatching the mount eval at all; whatever delivery latency remains on the
+tiny stamp eval will show up honestly in paint_reveal_ms.
 
 FALSIFIER: uxprobe `switch` on the rotated build reports
 activation→first_frame p50 ≤150 ms net (first_frame_ms − activation_ms),
