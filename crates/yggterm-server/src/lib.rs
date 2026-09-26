@@ -18089,6 +18089,26 @@ fn refresh_restored_remote_runtime_codex_launch_command(
     key: &str,
     session: &mut ManagedSessionView,
 ) -> bool {
+    refresh_restored_remote_runtime_codex_launch_command_in(
+        key,
+        session,
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// [`refresh_restored_remote_runtime_codex_launch_command`] against an explicit
+/// home — the test seam. The [11.165] re-arm gate consults the machine's REAL
+/// CLI store through the vouch, so the unseamed fn is host-sensitive by
+/// construction: the restored-opencode fixture red on a host whose live
+/// `~/.local/share/opencode/opencode.db` lacks the fixture id and green where
+/// the store is absent (measured muse-lab host vs dev, 2026-09-26). A unit
+/// test that consults the user's own store passes or fails on THEIR data —
+/// the `_in` twins exist so it never does.
+fn refresh_restored_remote_runtime_codex_launch_command_in(
+    key: &str,
+    session: &mut ManagedSessionView,
+    home: Option<&std::path::Path>,
+) -> bool {
     // ⛔ A REMOTE agent row is NOT a restored daemon runtime, and the
     // eligibility sniff below cannot tell them apart on its own: a healthy
     // remote row carries the same session-id metadata this function keys on,
@@ -18152,7 +18172,10 @@ fn refresh_restored_remote_runtime_codex_launch_command(
                 return false;
             }
         }
-    } else if local_agent_store_vouches_for_session(session.kind, &session_id) == Some(false) {
+    } else if home
+        .and_then(|home| local_agent_store_vouches_for_session_in(home, session.kind, &session_id))
+        == Some(false)
+    {
         // ⛔ THE [11.165] RE-ARM GATE. The `already_resume` short-circuit was
         // total: a record whose launch already names the id skipped the store
         // probe forever, so the birth arm re-normalized and re-armed a record
@@ -18415,15 +18438,26 @@ mod restored_runtime_repair_tests {
         // DEFINITIVE miss only, and name itself on the trace.
         let source = include_str!("lib.rs");
         let body = source
-            .split("fn refresh_restored_remote_runtime_codex_launch_command(")
+            .split("fn refresh_restored_remote_runtime_codex_launch_command_in(")
             .nth(1)
             .expect("the repair fn")
             .split("\nfn ")
             .next()
             .expect("the repair body");
         let gate_at = body
-            .find("} else if local_agent_store_vouches_for_session(session.kind, &session_id) == Some(false) {")
+            .find("local_agent_store_vouches_for_session_in(home, session.kind, &session_id)")
             .expect("the re-arm gate must chain onto the already-resume decision");
+        let wrapper = source
+            .split("fn refresh_restored_remote_runtime_codex_launch_command(")
+            .nth(1)
+            .expect("the repair wrapper")
+            .split("\nfn ")
+            .next()
+            .expect("the wrapper body");
+        assert!(
+            wrapper.contains("dirs::home_dir()"),
+            "production keeps consulting the machine's real store — only tests take the seam"
+        );
         let probe_at = body.find("if !already_resume {").expect("the probe decision");
         assert!(
             probe_at < gate_at,
@@ -18823,7 +18857,39 @@ mod restored_runtime_repair_tests {
             title_is_explicit: false,
             outline_prefix: None,
         };
-        let repaired = refresh_restored_remote_runtime_codex_launch_command(&key, &mut session);
+        // ⛔ THE [11.165] RE-ARM GATE made this repair consult the machine's
+        // REAL opencode store (already-resume arm → vouch), so the fixture id
+        // red on any host whose live store lacks it and green where the store
+        // is absent (measured muse-lab host vs dev, 2026-09-26). The test
+        // takes the `_in` seam with a SEEDED scratch store — vouched
+        // Some(true) is the honest positive path — and the same fixture locks
+        // the definitive-miss refusal for an id the store answers false for.
+        static STORE_FIXTURE_SEQ: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let seq = STORE_FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home =
+            std::env::temp_dir().join(format!("yggterm-oc-restore-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/opencode")).expect("fixture dirs");
+        let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
+            .expect("fixture db");
+        conn.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, \
+             directory TEXT, title TEXT, time_updated INTEGER, time_created INTEGER);",
+            [],
+        )
+        .expect("fixture schema");
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, title, \
+             time_updated, time_created) VALUES (?1, 'p1', NULL, '/tmp/workspace', 't', 1, 1);",
+            rusqlite::params![sid],
+        )
+        .expect("fixture row");
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            &key,
+            &mut session,
+            Some(&home),
+        );
         assert!(repaired, "a restored opencode runtime row is repaired");
         let restore = session
             .metadata
@@ -18840,6 +18906,23 @@ mod restored_runtime_repair_tests {
         assert!(
             preamble.contains(&format!("OpenCode session {sid}")),
             "the preamble names OpenCode, not Codex; got: {preamble}"
+        );
+        // The definitive-miss half: the same store, an id it does not hold —
+        // the gate refuses the repair instead of re-arming a phantom.
+        let absent = "ses_absent00000000000000000001";
+        let absent_key = format!("opencode-runtime://{absent}");
+        let mut absent_session = session.clone();
+        absent_session.id = absent.to_string();
+        absent_session.session_path = absent_key.clone();
+        absent_session.launch_command = format!("opencode2 --session {absent}");
+        let refused = refresh_restored_remote_runtime_codex_launch_command_in(
+            &absent_key,
+            &mut absent_session,
+            Some(&home),
+        );
+        assert!(
+            !refused,
+            "a store that was read and lacks the id refuses the repair"
         );
         assert!(
             !preamble.contains("Codex session"),
