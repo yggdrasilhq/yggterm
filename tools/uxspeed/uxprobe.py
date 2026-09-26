@@ -1222,6 +1222,11 @@ dioxus.send(out);
             if not (requested and shown):
                 time.sleep(0.25)
         payload = (requested or {}).get("payload") or {}
+        # ui_telemetry payloads NEST in ytrace (payload.payload — the
+        # closeall pair helper learned this first); without the unwrap the
+        # rows-assert reads None and passes vacuously
+        if isinstance(payload.get("payload"), dict):
+            payload = payload["payload"]
         shown_payload = (shown or {}).get("payload") or {}
         pair_ms = None
         if requested and shown:
