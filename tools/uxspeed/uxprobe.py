@@ -38,6 +38,13 @@ Actions:
            close-all closes ALL live sessions, so on any real desktop the
            probe refuses it and says so (blast-radius law).
 
+  switch — the felt switch: real pointer CLICKS on the pair's sidebar rows
+           (press+release, no threshold cross), alternating A→B; asserts the
+           user_gesture activation (latency + identity to == clicked row),
+           joins the reveal outcome by time-proximity (reveal_ready's
+           self-timed first_output_ms, or the honest incomplete/failed
+           marker), and counts the ambient churn inside each window
+
 Report: schema-keyed JSON, honest nulls for anything not measured.
 A p50 without its iteration count is not a measurement.
 
@@ -803,6 +810,112 @@ dioxus.send(out);
             out["iterations"].append(it)
         return summarize(out, key="felt_ms")
 
+    def action_switch(self, iters: int) -> dict:
+        """The felt switch: real pointer CLICKS on sidebar tree rows — press
+        and release at the row node, no threshold cross (a click must never
+        begin a drag) — so the switch enters through the SAME user-gesture
+        path a human's click takes (session/activation origin:user_gesture).
+        One scratch pair serves the whole action; clicks alternate A→B so
+        every click is a real switch, click 1 marked `cold` (the row's first
+        activation this GUI boot). Per iteration: the activation event's
+        latency + identity (to == the clicked row), the reveal outcome
+        (reveal_ready with its self-timed first_output_ms, or the honest
+        incomplete/failed marker — reveal events are joined by time-proximity
+        inside the window, the door's known pairing gap), and the ambient
+        churn inside the window (ui/block, merge_rows_breakdown) — the felt
+        cost line. Walls are overhead-inclusive (release verb wall included);
+        the report's cli_overhead_ms is the floor to subtract."""
+        rows_ready = self.ensure_two_scratch_rows()
+        if len(rows_ready) < 2:
+            return {"error": "could not establish two scratch rows",
+                    "iterations": []}
+        a_path, b_path = rows_ready
+        # make both nodes exist under the sidebar's virtualization, as felt does
+        self.verb("tree", "select", a_path)
+        self.verb("tree", "select", b_path)
+        time.sleep(0.2)
+        rects = self._row_rects([a_path, b_path])
+        if not rects.get(a_path) or not rects.get(b_path):
+            return {"error": "row nodes not rendered (virtualized out?)",
+                    "iterations": []}
+        out = {"iterations": []}
+        targets = [a_path, b_path] * iters
+        for i, path in enumerate(targets):
+            rect = rects[path]
+            x = rect["x"] + min(rect["w"] / 2, 120.0)
+            y = rect["y"] + rect["h"] / 2
+            it = {"cold": i == 0, "target": path}
+            acc: list[str] = []
+            rd = self.verb("pointer", "press", "--x", str(int(x)),
+                           "--y", str(int(y)))
+            it["down_ms"] = rd["wall_ms"]
+            t_release = now_ms()
+            rr = self.verb("pointer", "release")
+            it["up_ms"] = rr["wall_ms"]
+            activation = None
+            reveal = None
+            deadline = time.time() + self.timeout_s
+            while time.time() < deadline:
+                evs = self.ytrace_events(t_release, lines=900)
+                if activation is None:
+                    for e in evs:
+                        p = e.get("payload") or {}
+                        if (e.get("name") == "activation"
+                                and e.get("category") == "session"
+                                and p.get("origin") == "user_gesture"
+                                and str(p.get("to") or "").startswith(path)):
+                            activation = e
+                            break
+                if activation is not None and reveal is None:
+                    for e in evs:
+                        if e.get("category") == "reveal" and e.get(
+                                "name") in ("reveal_ready",
+                                            "reveal_forced_incomplete",
+                                            "reveal_failed"):
+                            reveal = e
+                            break
+                if activation is not None and (reveal is not None
+                                               or time.time() > deadline - (
+                                                   self.timeout_s - 3)):
+                    break
+                time.sleep(0.05)
+            window = evs
+            names = [e.get("name") for e in window]
+            it["ui_block_in_window"] = sum(1 for n in names if n == "block")
+            it["merge_events_in_window"] = sum(
+                1 for n in names if n == "merge_rows_breakdown")
+            if activation is None:
+                acc.append("no user_gesture activation for the clicked row "
+                           "within timeout — click did not switch (the "
+                           "[11.130] class: synthetic pointer events land "
+                           "but the gesture path does not fire)")
+            else:
+                it["activation_ms"] = activation.get("ts_ms", 0) - t_release
+            if activation is not None and reveal is None:
+                acc.append("no reveal_ready/incomplete/failed within the "
+                           "window — the reveal leg never reported (the "
+                           "door's pairing gap, honest null)")
+            if reveal is not None:
+                it["reveal_name"] = reveal.get("name")
+                it["reveal_ms"] = reveal.get("ts_ms", 0) - t_release
+                rp = (reveal.get("payload") or {}).get("payload",
+                     reveal.get("payload") or {})
+                it["reveal_first_output_ms"] = rp.get("first_output_ms")
+                if reveal.get("name") != "reveal_ready":
+                    acc.append(f"reveal did not reach clean ready: "
+                               f"{reveal.get('name')}")
+            if not (rd["ok"] and rr["ok"]):
+                acc.append("pointer verb failure press=%s release=%s"
+                           % (rd["ok"], rr["ok"]))
+            it["accuracy_failures"] = acc
+            out["iterations"].append(it)
+            # give the previous switch's churn room to drain before the next
+            time.sleep(0.6)
+        ready = [i for i in out["iterations"]
+                 if i.get("reveal_name") == "reveal_ready"]
+        out["reveal_ready_rate"] = len(ready) / len(out["iterations"])
+        return summarize(out, key="activation_ms")
+
     def action_group(self, iters: int) -> dict:
         rows_ready = self.ensure_two_scratch_rows()
         if len(rows_ready) < 2:
@@ -1265,7 +1378,7 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close,felt,closeall")
+                    default="spawn,drag,group,menu,modal,close,felt,closeall,switch")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -1299,6 +1412,8 @@ def main() -> int:
                 report["actions"]["drag"] = probe.action_drag(args.iters)
             elif action == "felt":
                 report["actions"]["felt"] = probe.action_felt(args.iters)
+            elif action == "switch":
+                report["actions"]["switch"] = probe.action_switch(args.iters)
             elif action == "group":
                 report["actions"]["group"] = probe.action_group(args.iters)
             elif action == "menu":
