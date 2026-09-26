@@ -18299,6 +18299,11 @@ struct ShellState {
     /// get WebKitGTK's own context menu (Copy/Cut/Paste), so the shell opens no
     /// menu at all over them.
     context_menu_surface: Option<ViewportMenuKind>,
+    /// When the CURRENT menu was raised (`current_millis()` at
+    /// `open_context_menu`). Consumed by `context_menu_close` and
+    /// `context_menu_activate` as `open_ms` — a menu's lifetime was
+    /// invisible to the trace plane before ([11.113] gap 2).
+    context_menu_opened_at_ms: Option<u64>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     server_daemon_detail: String,
@@ -20902,6 +20907,7 @@ impl ShellState {
             context_menu_context_row: None,
             context_menu_position: None,
             context_menu_surface: None,
+            context_menu_opened_at_ms: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: !has_initial_server_snapshot,
             server_daemon_detail: String::new(),
@@ -34408,6 +34414,7 @@ impl ShellState {
         // last dismissal would reopen mid-submenu on a row that may not even
         // have that opener.
         self.row_menu_page = None;
+        self.context_menu_opened_at_ms = Some(current_millis());
         self.record_ui_telemetry(
             "context_menu_open",
             json!({
@@ -34449,7 +34456,42 @@ impl ShellState {
     fn context_menu_keep_alive_plan(&self) -> Option<KeepAlivePlan> {
         self.snapshot().keep_alive_plan.clone()
     }
+    /// The activation half of the context-menu event family ([11.113] gap
+    /// 2): `context_menu_open` had no item-activation sibling, so
+    /// click→effect latency was unmeasurable. Called from the dispatch
+    /// choke points ONLY — page turns and disabled items never reach them,
+    /// so a submenu opening or an inert click is not an activation.
+    fn note_context_menu_activation(&mut self, action_id: &str) {
+        self.record_ui_telemetry(
+            "context_menu_activate",
+            json!({
+                "action": action_id,
+                "row_path": self.context_menu_row.as_ref().map(|row| row.full_path.clone()),
+                "row_kind": self.context_menu_row.as_ref().map(|row| format!("{:?}", row.kind)),
+                "surface": self.context_menu_surface.as_ref().map(|surface| format!("{:?}", surface)),
+                "open_ms": self.context_menu_opened_at_ms
+                    .map(|opened_at| current_millis().saturating_sub(opened_at)),
+            }),
+        );
+    }
     fn close_context_menu(&mut self) {
+        // The close half of `context_menu_open` ([11.113] gap 2): without
+        // it a menu's lifetime and its dismissal are invisible to the trace
+        // plane. Emitted only when a menu was actually open — defensive
+        // close calls from unrelated paths must stay silent.
+        if self.context_menu_row.is_some() || self.context_menu_position.is_some() {
+            self.record_ui_telemetry(
+                "context_menu_close",
+                json!({
+                    "row_path": self.context_menu_row.as_ref().map(|row| row.full_path.clone()),
+                    "row_kind": self.context_menu_row.as_ref().map(|row| format!("{:?}", row.kind)),
+                    "surface": self.context_menu_surface.as_ref().map(|surface| format!("{:?}", surface)),
+                    "open_ms": self.context_menu_opened_at_ms
+                        .map(|opened_at| current_millis().saturating_sub(opened_at)),
+                }),
+            );
+        }
+        self.context_menu_opened_at_ms = None;
         self.context_menu_row = None;
         self.context_menu_anchor_tracked = false;
         self.context_menu_context_row = None;
@@ -83275,22 +83317,43 @@ async fn probe_terminal_context_menu_for(session_path: &str) -> Value {
                     const style = window.getComputedStyle(host);
                     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                 }});
-                const entry = visibleEntries[0] || entries[0] || null;
+                // A background row's viewport surface mounts lazily: the
+                // registry entry can exist while its DOM host does not, and a
+                // row just ahead of focus may have neither yet. Both are worth
+                // a bounded wait — the instant `*_missing` refusal made this
+                // probe blind on exactly the rows it was asked to measure
+                // ([11.113] gap 2 / queue item 7). Honest refusal with the
+                // waited time when the surface never arrives.
+                const hostWaitStart = Date.now();
+                const hostDeadline = hostWaitStart + 3000;
+                const readEntries = () => Object.values(window.__yggtermXtermHosts || {{}})
+                    .filter((candidate) => candidate && candidate.term && candidate.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                let entry = visibleEntries[0] || entries[0] || null;
+                let host = entry ? document.getElementById(entry.hostId) : null;
+                while ((!entry || !host) && Date.now() < hostDeadline) {{
+                    await settle(50);
+                    const polled = readEntries();
+                    entry = polled.find((candidate) => document.getElementById(candidate.hostId)) || polled[0] || entry;
+                    host = entry ? document.getElementById(entry.hostId) : null;
+                }}
+                const hostWaitMs = Date.now() - hostWaitStart;
                 if (!entry) {{
                     dioxus.send({{
                         accepted: false,
                         reason: "terminal_host_missing",
                         session_path: sessionPath,
+                        host_wait_ms: hostWaitMs,
                     }});
                     return;
                 }}
-                const host = document.getElementById(entry.hostId);
                 if (!host) {{
                     dioxus.send({{
                         accepted: false,
                         reason: "terminal_host_dom_missing",
                         session_path: sessionPath,
                         host_id: entry.hostId,
+                        host_wait_ms: hostWaitMs,
                     }});
                     return;
                 }}
@@ -83328,6 +83391,7 @@ async fn probe_terminal_context_menu_for(session_path: &str) -> Value {
                     buttons: 0,
                 }}));
                 target.dispatchEvent(new MouseEvent('contextmenu', eventInit));
+                const menuWaitStart = Date.now();
                 let contextMenu = null;
                 let actionNodes = [];
                 const deadline = Date.now() + 2200;
@@ -83339,6 +83403,12 @@ async fn probe_terminal_context_menu_for(session_path: &str) -> Value {
                         break;
                     }}
                 }}
+                // Input→DOM latency for the menu itself ([11.113] gap 2):
+                // the overlay's paint-truth marker at probe granularity —
+                // null when the menu never appeared.
+                const menuWaitMs = contextMenu && actionNodes.length > 0
+                    ? Date.now() - menuWaitStart
+                    : null;
                 const menuRect = rectSummary(contextMenu);
                 const actions = actionNodes.map((node) => ({{
                     action: String(node.getAttribute('data-context-menu-action') || ''),
@@ -83396,6 +83466,8 @@ async fn probe_terminal_context_menu_for(session_path: &str) -> Value {
                     last_terminal_context_menu_y: Number(entry.lastTerminalContextMenuY || 0),
                     last_terminal_context_menu_reason: String(entry.lastTerminalContextMenuReason || ''),
                     no_paste_side_effect: noPasteSideEffect,
+                    menu_wait_ms: menuWaitMs,
+                    host_wait_ms: hostWaitMs,
                 }};
                 await closeContextMenu();
                 dioxus.send(result);

@@ -29284,6 +29284,27 @@ of them. Evidence, each measured on the GUI host tonight:
 Consumers: tools/uxspeed/uxprobe.py (landed with this entry) currently
 asserts on app-state truth because the trace pairs do not exist.
 
+> **LANDED (2026-09-26, lane/uxspeed/context-menu — the MENU half + the
+> probe's mounted-surface blindness):** `context_menu_close`
+> (row_path/row_kind/surface/open_ms) and `context_menu_activate`
+> (action/row_path/row_kind/surface/open_ms) now exist — emitted from
+> `close_context_menu` (guarded: defensive closes with no menu open stay
+> silent) and the two dispatch choke points in right_rail.rs (page turns and
+> disabled items never reach them, so a submenu opening or an inert click is
+> not an activation). `probe-context-menu` now WAITS up to 3 s for the lazy
+> viewport surface instead of the instant `terminal_host_dom_missing`
+> refusal, reports `host_wait_ms` and `menu_wait_ms` (right-click → menu
+> observed in DOM — the overlay's paint-truth marker at probe granularity),
+> and uxprobe's `menu` action asserts against the probe's REAL payload
+> (`actions`/`has_terminal_action`/`no_paste_side_effect`/`menu_rect`): the
+> old check read `data.items`, a field that never existed on this reply, so
+> every "pass" asserted against an empty set and proved nothing.
+> ⚠ sink caveat: the shared ui-telemetry dedup throttles payload-identical
+> events within 2 s — clicking the SAME item twice on one open menu inside
+> 2 s may emit only the first activation. STILL OPEN in this entry: chord
+> identity in `input/keystroke` (half 3) and `first_frame` never firing for
+> idle shells + settle as the documented paint marker (half 4).
+
 ## ⛔ [11.114] TERMINAL SPAWN/CLOSE/DRAG ARE SECONDS-CLASS, NOT MILLISECOND-CLASS — MEASURED COST LADDER FOR SPAWN: ~0.6s DAEMON PROCESSING → ~0.6-1.0s QUEUED GAP → ~2.1s MOUNT ENSURE → +0.5s SETTLE (measured 2026-09-14 late on the GUI host, synthetic scratch rows, tools/uxspeed/uxprobe.py)
 
 **Status:** OPEN

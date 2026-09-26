@@ -8592,6 +8592,27 @@ JSON.stringify({{
         }
     }
 
+    // [11.113] gap 2 (lane/uxspeed/context-menu): the menu's lifetime must be
+    // stamped on open and consumed on close (it becomes `open_ms` on the
+    // `context_menu_close` event), and a DEFENSIVE close with no menu open
+    // must stay safe and silent — no resurrected lifetime, no panic.
+    #[test]
+    fn context_menu_lifetime_stamped_on_open_and_consumed_on_close() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        let row = keep_alive_test_row("local://a", BrowserRowKind::Session);
+        assert!(shell.context_menu_opened_at_ms.is_none());
+        shell.open_context_menu(row, (24.0, 48.0));
+        assert!(shell.context_menu_row.is_some());
+        assert!(shell.context_menu_opened_at_ms.is_some());
+        shell.close_context_menu();
+        assert!(shell.context_menu_row.is_none());
+        assert!(shell.context_menu_opened_at_ms.is_none());
+        // Defensive close with nothing open: safe, and stays cleared.
+        shell.close_context_menu();
+        assert!(shell.context_menu_opened_at_ms.is_none());
+    }
+
     // The plan must be built from the sidebar's MERGED rows (cwd tree + Live
     // region), not from `browser.rows()`. Live sessions live only in the merged
     // list, so sourcing the cwd tree yielded `paths: []` and the menu rendered a
@@ -22698,6 +22719,47 @@ console.log('ok');
             "afterNativeClipboardPasteRequestCount === beforeNativeClipboardPasteRequestCount"
         ));
         assert!(probe.contains("terminal_right_click_paste_side_effect"));
+    }
+
+    // [11.113] gap 2 (lane/uxspeed/context-menu): a background row's viewport
+    // surface mounts lazily, so the probe must WAIT a bounded window for the
+    // host DOM instead of refusing instantly (`terminal_host_dom_missing` 3/3
+    // on 2026-09-14 made the probe blind on exactly the rows it was asked to
+    // measure), and both waits — surface wait and menu-observed-in-DOM — must
+    // ride the reply as honest numbers.
+    #[test]
+    fn terminal_context_menu_probe_waits_for_the_surface_and_reports_menu_wait() {
+        let source = SHELL_SOURCE;
+        let probe = source
+            .split("async fn probe_terminal_context_menu_for")
+            .nth(1)
+            .and_then(|suffix| suffix.split("async fn redraw_terminal_viewport_for").next())
+            .expect("context-menu probe implementation should be present");
+        assert!(probe.contains("const hostDeadline = hostWaitStart + 3000;"));
+        assert!(probe.contains("const hostWaitMs = Date.now() - hostWaitStart;"));
+        assert!(probe.contains("const menuWaitMs ="));
+        assert!(probe.contains("host_wait_ms: hostWaitMs,"));
+        assert!(probe.contains("menu_wait_ms: menuWaitMs,"));
+        // the honest refusal keeps its name, now carrying the waited time
+        assert!(probe.contains("reason: \"terminal_host_dom_missing\""));
+        assert!(probe.contains("reason: \"terminal_host_missing\""));
+    }
+
+    // [11.113] gap 2 (lane/uxspeed/context-menu): `context_menu_open` had NO
+    // close or item-activation siblings — a menu's lifetime and its
+    // click→effect latency were unmeasurable end to end. The family must have
+    // all three halves, and the activation halves must fire from the dispatch
+    // choke points only (page turns and disabled items never reach them).
+    #[test]
+    fn context_menu_event_family_has_close_and_activation_halves() {
+        let source = SHELL_SOURCE;
+        assert!(source.contains("record_ui_telemetry(\n                \"context_menu_close\","));
+        assert!(source.contains("fn note_context_menu_activation(&mut self, action_id: &str)"));
+        assert!(source.contains("\"context_menu_activate\","));
+        assert!(source
+            .contains("shell.note_context_menu_activation(id.as_str())"));
+        assert!(source
+            .contains("shell.note_context_menu_activation(action.as_str())"));
     }
 
     #[test]

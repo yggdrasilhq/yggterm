@@ -8429,6 +8429,8 @@ fn terminal_viewport_get_selection_script(session_path: &str) -> String {
 /// the terminal menu owes to match). Paste reuses the terminal paste; Select
 /// All highlights the buffer.
 fn dispatch_viewport_menu_action(mut state: Signal<ShellState>, action: String) {
+    // [11.113] gap 2: a REAL viewport-menu activation is about to dispatch.
+    state.with_mut_counted(|shell| shell.note_context_menu_activation(action.as_str()));
     let (surface, session_path, trace_home) = state.with_mut_counted(|shell| {
         let surface = shell.context_menu_surface;
         let session = shell.server.active_session_path().map(str::to_string);
@@ -8785,6 +8787,10 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             return;
         }
     }
+    // [11.113] gap 2: a REAL activation is about to dispatch. Emitted after
+    // the viewport and page-turn early returns — a submenu opening or an
+    // inert click is not an activation.
+    state.with_mut_counted(|shell| shell.note_context_menu_activation(id.as_str()));
     // A submenu leaf carries its opener's id as a prefix so node keys stay
     // unique across both levels; the verb below it is what dispatches.
     let id = match id.rsplit_once('/') {
