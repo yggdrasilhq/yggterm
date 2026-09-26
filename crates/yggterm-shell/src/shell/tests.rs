@@ -22441,6 +22441,7 @@ console.log('ok');
         assert!(warm.contains("await window.__yggtermMountFn();"));
 
         let probe = terminal_mount_fn_probe_script();
+        assert!(probe.starts_with("(function() { return "), "the probe must be an IIFE - a bare expression's completion value is dropped by the eval bridge and the warm path never engages");
         assert!(probe.contains("Boolean(window.__yggtermMountFn)"));
         assert!(probe.contains("__yggtermMountFnV === 1"));
 
