@@ -30911,8 +30911,20 @@ host global; a bare/fresh row passes the empty extraction and composes
 byte-identically to the pre-carry law (locked by test). Server lib 1584/2 on
 the lane with the failure set byte-identical to clean main on that host (the
 [11.145] stamp red, owner GO pending, plus
-`restored_opencode_row_names_opencode_in_its_restore_metadata`, red on clean
-main there too — environment-sensitive class, needs an owner). LIVE FALSIFIER RAN 2026-09-26 late (the muse lab host, deployed build
+`restored_opencode_row_names_opencode_in_its_restore_metadata` — ROOT-CAUSED
+AND FIXED 2026-09-26 late (lane/trace/restored-oc-red, the muse lab host
+seat): the [11.165] re-arm gate inside refresh_restored_remote_runtime_codex_launch_command
+consulted the machine's REAL opencode store through dirs::home_dir with no
+seam, so the fixture id red on any host whose live
+~/.local/share/opencode/opencode.db lacks it (muse lab host: Some(false) →
+refusal) and green where the store is absent (dev: None → fail-open) — same
+commit, red on one host and green on the other, measured. Fix: the repair fn
+gained its `_in` twin (production wrapper keeps dirs::home_dir, byte-identical
+gate semantics), the test takes the seam with a SEEDED scratch store
+(vouched-true positive) and now also locks the definitive-miss refusal; the
+source-scan lock pins the seamed gate line and that the wrapper keeps the real
+store. Suite on the lane: 1595/1 (the [11.145] stamp red only), deterministic
+on every host). LIVE FALSIFIER RAN 2026-09-26 late (the muse lab host, deployed build
 0b1e095b lineage carrying the funnel leg): a dark-born probe codex row with
 the global flipped light + forced daemon rotation + connect ensure came back
 LIGHT — THE HOLE REPRODUCED THROUGH THE NEXT HOP: restore_live_session's
