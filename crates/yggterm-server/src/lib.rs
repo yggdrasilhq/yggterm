@@ -17551,13 +17551,60 @@ fn carried_terminal_identity_exports(launch_command: Option<&str>) -> Vec<String
     let carried = launch_command
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(terminal_identity_exports_in_command)
+        .map(remote_identity_exports_payload)
+        .map(|text| terminal_identity_exports_in_command(&text))
         .unwrap_or_default();
     if carried.is_empty() {
         terminal_identity_shell_exports_for_remote()
     } else {
         carried
     }
+}
+
+/// [11.169] Recover the raw remote payload of a stored launch command before
+/// scraping it. A LiveSsh row's stored command is the ASSEMBLED form
+/// (`ssh … 'exec bash -lc <payload>'`, twice through [`shell_single_quote`]),
+/// so a verbatim `export KEY=…` scrape lifted the escaped quoting and the
+/// next composition quoted it again — one escaping layer per refresh,
+/// measured compounding a 2,790-char command to 56,716 chars / 36,584 quotes
+/// until `bash -c` could no longer parse the line (the owner's pre-existing
+/// remote agy rows painting `unexpected EOF while looking for matching`).
+/// Peel the wrapper — `exec bash -lc ` has the single writer
+/// [`login_shell_wrap`] — unwind every `'\''` layer to a fixpoint, and strip
+/// the payload's surviving structural quote pair. A once-assembled command
+/// then rescrapes byte-identically after recomposition (the fixpoint the old
+/// scrape never reached); an already-compounded command yields its clean
+/// segment subset, which the refresh rewrites into the once-assembled
+/// grammar — healed on the first pass, stable on the next.
+fn remote_identity_exports_payload(command: &str) -> String {
+    const MARKER: &str = "exec bash -lc ";
+    const ESCAPED_QUOTE: &str = "'\\''";
+    let Some(index) = command.find(MARKER) else {
+        return command.to_string();
+    };
+    let rest = &command[index + MARKER.len()..];
+    // Tail grammar after the marker: ESCAPED_QUOTE (sq(remote)'s opening
+    // quote, escaped by the outer wrap), the payload, ESCAPED_QUOTE again,
+    // then the outer wrap's own closing quote.
+    let body = rest
+        .strip_prefix(ESCAPED_QUOTE)
+        .map(|stripped| stripped.strip_suffix('\'').unwrap_or(stripped))
+        .and_then(|stripped| stripped.strip_suffix(ESCAPED_QUOTE))
+        .unwrap_or(rest);
+    unwind_shell_single_quote_escapes(body)
+}
+
+/// The `'\''` inverse of [`shell_single_quote`], applied to a fixpoint: one
+/// pass per nesting layer a composition folded in. Identity export values
+/// (`#rrggbb`, `0;15`, `light`, …) never contain the literal sequence, so
+/// the unwind cannot corrupt a live value.
+fn unwind_shell_single_quote_escapes(value: &str) -> String {
+    const ESCAPED_QUOTE: &str = "'\\''";
+    let mut current = value.to_string();
+    while current.contains(ESCAPED_QUOTE) {
+        current = current.replace(ESCAPED_QUOTE, "'");
+    }
+    current
 }
 
 /// The `export KEY=…` segments of a launch command whose key is a
@@ -49667,6 +49714,145 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn a_scrape_of_the_assembled_command_is_a_recomposition_fixpoint() {
+        // [11.169] The stored command of a LiveSsh row is the ASSEMBLED form.
+        // Compose one exactly as the funnel does, then re-carry from it: the
+        // segments must come back clean (no `'\''` layers) and recomposing
+        // from them must reproduce the command byte-for-byte — one refresh
+        // may rewrite, a second must change nothing.
+        let carried = vec![
+            "export YGGTERM_APPEARANCE='light'".to_string(),
+            "export COLORFGBG='0;15'".to_string(),
+            "export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7'".to_string(),
+        ];
+        let composed = remote_ssh_launch_command_with_identity_exports(
+            "rebuild-target",
+            None,
+            "yggterm",
+            &[
+                "server",
+                "remote",
+                "resume-codex",
+                "abc",
+                "/tmp",
+                "--require-existing",
+            ],
+            &[],
+            &carried,
+        );
+        let recarried = carried_terminal_identity_exports(Some(&composed));
+        assert_eq!(recarried, carried);
+        let recomposed = remote_ssh_launch_command_with_identity_exports(
+            "rebuild-target",
+            None,
+            "yggterm",
+            &[
+                "server",
+                "remote",
+                "resume-codex",
+                "abc",
+                "/tmp",
+                "--require-existing",
+            ],
+            &[],
+            &recarried,
+        );
+        assert_eq!(recomposed, composed);
+    }
+
+    #[test]
+    fn a_previously_compounded_command_heals_to_clean_carried_exports() {
+        // [11.169] The pre-fix defect: scraping the assembled command
+        // verbatim lifted `'\''` layers and the next composition quoted them
+        // again — measured 2,790 → 56,716 chars. Reproduce one compounding
+        // pass with the raw scraper, then assert the fixed carry law heals
+        // it: clean segments out, and the recomposed command rescrapes
+        // identically — the stable state the loop never reached.
+        let carried = vec![
+            "export YGGTERM_APPEARANCE='light'".to_string(),
+            "export COLORFGBG='0;15'".to_string(),
+        ];
+        let compose = |segments: &[String]| {
+            remote_ssh_launch_command_with_identity_exports(
+                "rebuild-target",
+                None,
+                "yggterm",
+                &[
+                    "server",
+                    "remote",
+                    "resume-codex",
+                    "abc",
+                    "/tmp",
+                    "--require-existing",
+                ],
+                &[],
+                segments,
+            )
+        };
+        let composed = compose(&carried);
+        let raw_scrape = terminal_identity_exports_in_command(&composed);
+        assert!(
+            raw_scrape
+                .iter()
+                .any(|segment| segment.contains("'\\''")),
+            "the raw scrape of an assembled command lifts escaped quoting — \
+             this is the layer the unwinding must absorb"
+        );
+        let compounded = compose(&raw_scrape);
+        assert!(compounded.len() > composed.len());
+        let healed = carried_terminal_identity_exports(Some(&compounded));
+        assert!(!healed.is_empty());
+        assert!(
+            healed
+                .iter()
+                .all(|segment| !segment.contains("'\\''")),
+            "healed segments must carry no escaping"
+        );
+        let healed_command = compose(&healed);
+        assert_eq!(
+            carried_terminal_identity_exports(Some(&healed_command)),
+            healed,
+            "the healed command is a recomposition fixpoint"
+        );
+    }
+
+    #[test]
+    fn the_escape_unwind_reaches_a_fixpoint_without_touching_plain_text() {
+        assert_eq!(
+            unwind_shell_single_quote_escapes("export COLORFGBG='0;15'"),
+            "export COLORFGBG='0;15'"
+        );
+        assert_eq!(unwind_shell_single_quote_escapes("'\\''"), "'");
+        // Two nesting layers of shell_single_quote over the same payload
+        // unwind to the payload wrapped in its bare structural quotes, and a
+        // second pass changes nothing.
+        let payload = "export YGGTERM_APPEARANCE='light' && exec codex resume abc";
+        let twice = shell_single_quote(&shell_single_quote(payload));
+        let once = unwind_shell_single_quote_escapes(&twice);
+        assert_eq!(once, format!("''{payload}''"));
+        assert_eq!(unwind_shell_single_quote_escapes(&once), once);
+    }
+
+    #[test]
+    fn the_payload_peeler_returns_the_raw_remote_of_an_assembled_command() {
+        // [11.169] The assembled grammar is ssh-wrapped twice through
+        // shell_single_quote; the peeler must hand back the payload the
+        // composer actually built, first segment included — the old verbatim
+        // scrape could never see the segment fused with the wrapper prefix.
+        let payload = "export YGGTERM_APPEARANCE='light' && export COLORFGBG='0;15' && exec yggterm server remote resume-codex abc /tmp --require-existing";
+        let assembled = format!(
+            "__yggterm_preamble; exec ssh -tt -o LogLevel=ERROR rebuild-target {}",
+            shell_single_quote(&format!("exec bash -lc {}", shell_single_quote(payload)))
+        );
+        assert_eq!(remote_identity_exports_payload(&assembled), payload);
+        // A raw-grammar command (no wrapper marker) passes through as-is.
+        assert_eq!(
+            remote_identity_exports_payload("export COLORFGBG='0;15' && exec codex resume abc"),
+            "export COLORFGBG='0;15' && exec codex resume abc"
+        );
+    }
+
+    #[test]
     fn a_row_without_identity_exports_inherits_the_current_global() {
         // Reads the process-global identity env — serialize against the
         // guard-takers like every other test that touches it.
@@ -55531,24 +55717,19 @@ terminal_window_id: None,
             );
 
             // The heal half is unchanged: a row born WITHOUT identity exports
-            // (a legacy raw command) IS filled from the current global.
-            let stripped = session
-                .launch_command
-                .split(" && ")
-                .filter(|segment| {
-                    let Some(rest) = segment.strip_prefix("export ") else {
-                        return true;
-                    };
-                    let key = rest.split('=').next().unwrap_or("").trim();
-                    !is_terminal_identity_env_key(key)
-                })
-                .collect::<Vec<_>>()
-                .join(" && ");
+            // (a legacy raw command — the pre-2.9.5 shape) IS filled from the
+            // current global. The command below carries no identity exports
+            // anywhere in its payload; a split-grammar strip of an assembled
+            // command would leave the wrapper-fused first segment behind,
+            // which the [11.169] payload peeler legitimately sees (a row that
+            // still carries identity is NOT healed to the global — that is
+            // the carry law, not a bug).
             server
                 .sessions
                 .get_mut("remote-session://dev/abc123")
                 .expect("session to strip")
-                .launch_command = stripped;
+                .launch_command = "ssh -tt -o LogLevel=ERROR dev 'claude --resume abc'"
+                .to_string();
             assert_eq!(server.refresh_terminal_identity_launch_commands(), 1);
             let session = server
                 .sessions
