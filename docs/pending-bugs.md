@@ -30881,6 +30881,25 @@ daemon should stamp the runtime with it, covering the peer-side managed spawn
 profile like the theme-change path; (c) frontend `onColor` answer as backstop
 for non-daemon-rendered paths; (d) OSC 4 slots 16-255 are never answered.
 
+FUNNEL-CARRY LEG LANDED IN CODE 2026-09-26 (lane/trace/11168-funnel-carry
+69afca26, worked on the muse lab host while the build host was offline —
+deploy + live proof owed when it returns; ygg-ci subscription owed too):
+the recompose hole above is CLOSED IN CODE — every recompose site that
+overwrites a stored launch command with the row's prior command in reach now
+keeps the row's carried identity exports: the ensure funnel's resume and
+picker arms, the START recompose twin, the three remote reconfigure fns
+(resume / new-codex / ssh-shell — the open, restore and scan lanes), and the
+direct-attach composer. Ordering is carried-verbatim > request appearance >
+host global; a bare/fresh row passes the empty extraction and composes
+byte-identically to the pre-carry law (locked by test). Server lib 1584/2 on
+the lane with the failure set byte-identical to clean main on that host (the
+[11.145] stamp red, owner GO pending, plus
+`restored_opencode_row_names_opencode_in_its_restore_metadata`, red on clean
+main there too — environment-sensitive class, needs an owner). LIVE FALSIFIER
+OWED on the deployed build: probe codex row born under theme A → `app theme`
+to theme B → force a daemon rotation → the respawned row's stored command
+must still carry A's exports.
+
 LIVE PROOF 2026-09-25 late (the muse lab host, build 18d45336e785 deployed
 fleet 23:36): a probe remote codex row born under the owner's light theme
 carried Apple System Colors Light exports VERBATIM in its launch command
