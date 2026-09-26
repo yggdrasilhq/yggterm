@@ -18,19 +18,43 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.171] THE FELT SWITCH HAS NO END MARKER ON THE COMMON PATH — A ROW-TO-ROW SWITCH BETWEEN ALREADY-MOUNTED ROWS EMITS THE ACTIVATION AND THEN GOES SILENT, SO ACTIVATION→PAINT IS UNMEASURABLE (filed 2026-09-27, uxprobe on the live jojo desktop)
+## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
 **Status:** OPEN
 
-Filed 2026-09-27 ~00:45 IST on `lane/uxspeed/switch-mount` (zcode sess_e86f7708-5295-4289-b87b-eee2595f89ea on jojo), following the campaign law that a missing end-marker is itself a finding.
+Filed 2026-09-27 on `lane/uxspeed/switch-paint-marker` (zcode
+sess_1cbee766-d95d-455a-b83d-995b87c7050f on jojo, work FROM dev) — the lane
+that landed [11.171]'s end marker. [11.171] is CLOSED with that proof per the
+verified-fix law (git remembers: 9ad18b4d put `session_path` on the whole
+`xterm_paint` family and taught uxprobe `switch` to pair
+activation→`terminal_mount/begin`→`xterm_paint/first_frame`→`settle` by
+host_id else session_path; live on rotated 58999b0b: 8/8 clicks report a
+paint-truth end, 8/8 accuracy, settle complete 7/8, first_frame
+p50 1340 max 1602 ms — the falsifier's ≥7/8 met and the door's
+activation→paint column filled).
 
-MEASURED (uxprobe `switch` action, build 8b387952, CLI floor 85 ms drift −8 ms — a clean window): 8 real pointer clicks alternating two scratch rows, 8/8 accuracy (every click fired `session/activation` `origin:user_gesture` with `to` == the clicked row; activation_ms p50 315 max 346 wall, ≈200–230 net of the verb overhead). And then NOTHING: 0/8 windows saw `reveal_ready`, `reveal_forced_incomplete` OR `reveal_failed` within the 12 s probe windows.
+MEASURED (n=8, floor 108 ms): click→activation p50 220 max 252 ms wall
+(≈110 net) → `terminal_mount/begin` +433 → `xterm_paint/first_frame` +1340
+(max 1602) → `xterm_paint/settle` +2165. The DOMINANT leg is
+activation→mount_open: switching to a row whose surface ALREADY EXISTS tears
+it down and remounts it — every switch window carries `xterm_screen/reset`,
+`frame_cache_captured`/`frame_cache_restored`, `ghost_frame_attached` and a
+>0.9 s js_wait for the mount eval (`terminal_mount/js_wait_begin` →
+`js_ready`), then a ~0.8 s settle tail. The rows are alive throughout
+(`mount_epoch_reused` / `reused_live_host` fire in the same window): the
+content path is proven fast (frame-cache restore; `open_to_write` p50 ~90 ms
+warm), the cost is the detach→reattach structure itself.
 
-THE GAP: `reveal_ready` fired exactly 2× in the surrounding 20 min — both OUTSIDE every click window — i.e. the reveal leg self-reports on first-reveal-after-boot (and keyed label/kind, the door's known pairing gap), NOT on row-to-row switches. The common-case switch therefore has a begin (activation) and no end: the felt activation→paint number for the most frequent UX action cannot be measured by events until an end marker lands.
+FIX DIRECTION: a switch to an already-mounted row should RAISE retained
+content, not remount it — either keep per-row surfaces alive across switches
+(hide/show instead of detach/attach; the xterm surface mounts only on the
+active view today) or make the reattach path skip the full JS eval wait. The
+probe consumes the result unchanged: `first_frame_ms` should collapse from
+~1.3 s to ms-class.
 
-FIX DIRECTION: a switch-scoped paint-truth end marker — either a reveal-style self-timed event emitted on re-activation of an already-mounted row, or joining the existing frame health family (`frame_window`/`frame_hash_probe`) to the activation as the pair. The probe (tools/uxspeed/uxprobe.py `switch` action) already joins by time-proximity and will consume the marker unchanged.
-
-FALSIFIER: uxprobe `switch` reports a reveal/paint end for ≥7/8 clicks with paint-truth (self-timed first_output or frame record), and the baseline row in the campaign door fills its activation→paint column.
+FALSIFIER: uxprobe `switch` on the rotated build reports
+activation→first_frame p50 ≤150 ms net (first_frame_ms − activation_ms),
+settle complete ≥7/8, zero accuracy failures.
 
 ## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
 
