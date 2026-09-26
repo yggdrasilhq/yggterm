@@ -16,6 +16,12 @@ Actions:
            the target (server app pointer + dom-eval rects); asserts the
            felt-path falsifiers from the trace (no merges pre-begin/in-drag),
            the reorder, and records app-render counts for [11.129]
+  shiftdrag — the shift-drag vertical: a RANGE selection (tree select
+           paths+anchor = the shift+click ExtendRange twin), then a REAL
+           pointer drag of the whole set onto a target outside it; asserts
+           tree_drag_begin.drag_paths carries exactly the set, the family
+           completes, the set lands contiguous in order, and the [11.129]
+           render attribution
   group  — server app row-set --into / --out on two scratch rows
   menu   — server app terminal probe-context-menu on a scratch row
   modal  — the delete-confirm dialog on a scratch row, opened through the
@@ -716,6 +722,92 @@ dioxus.send(out);
     def _events_between(self, t0: int, t1: int) -> list[dict]:
         return [e for e in self.ytrace_events(t0) if e.get("ts_ms", 0) <= t1]
 
+    def render_attribution(self, t0: int, t1: int, hover_steps: int) -> dict:
+        """[11.129] gesture-scoped render attribution. The falsifier: on the
+        fixed build the drag-pointer stream re-renders the ghost LEAF only
+        (DragGhost / RowDragGhost read the small drag_ghost_pointer signal);
+        the `app` component pays only the gesture's real edges (press,
+        release), never per pointer step. Honesty: component_window events
+        are AGGREGATES (~2.5-7 s windows) so a gesture's windows also hold
+        ambient churn — the report carries both the per-component sums and
+        the app-renders-per-hover-step ratio, and the caller contrasts
+        against the ambient windows this helper also returns."""
+        evs = self.ytrace_events(max(0, t0 - 15000))
+        wins = [e for e in evs
+                if e.get("name") == "component_window"
+                and t0 <= e.get("ts_ms", 0) <= t1 + 1500]
+        pre = sorted((e for e in evs
+                      if e.get("name") == "component_window"
+                      and e.get("ts_ms", 0) < t0),
+                     key=lambda e: e.get("ts_ms", 0))[-1:]
+        def per_component(windows):
+            sums: dict[str, int] = {}
+            for w in windows:
+                for c in (w.get("payload", {}) or {}).get("components", []):
+                    name = c.get("component") or "?"
+                    sums[name] = sums.get(name, 0) + int(c.get("renders") or 0)
+            return sums
+        sums = per_component(wins)
+        ambient_wins = sorted((e for e in evs
+                               if e.get("name") == "component_window"
+                               and e.get("ts_ms", 0) < t0),
+                              key=lambda e: e.get("ts_ms", 0))[-3:]
+        ambient = per_component(ambient_wins)
+        ghost = sums.get("DragGhost", 0) + sums.get("RowDragGhost", 0)
+        app = sums.get("app", 0)
+        ambient_app = (ambient.get("app", 0) / len(ambient_wins)
+                       if ambient_wins else None)
+        causes = sorted(
+            ((c.get("site"), int(c.get("writes") or 0),
+              int(c.get("renders_preceded") or 0))
+             for w in wins
+             for c in (w.get("payload", {}) or {}).get("causes", [])),
+            key=lambda t: -t[2])
+        return {
+            "component_windows_in_gesture": len(wins),
+            "component_window_ms_total": sum(
+                int((w.get("payload", {}) or {}).get("window_ms") or 0)
+                for w in wins),
+            "app_renders_in_gesture_windows": app,
+            "ghost_leaf_renders_in_gesture_windows": ghost,
+            "ghost_per_hover_step": round(ghost / hover_steps, 2)
+                                    if hover_steps else None,
+            "app_renders_per_hover_step": round(app / hover_steps, 2)
+                                          if hover_steps else None,
+            "ambient_app_renders_mean3": (round(ambient_app, 1)
+                                          if ambient_app is not None else None),
+            "components_seen": sums,
+            "top_causes_by_renders": [
+                {"site": s, "writes": w, "renders_preceded": r}
+                for s, w, r in causes[:8]],
+            "max_site_writes": max((w for _, w, _ in causes), default=0),
+        }
+
+    def assert_render_attribution(self, ra: dict, hover_steps: int = 0) -> list[str]:
+        """[11.129] falsifier reads: the ghost LEAF re-rendered with the
+        pointer stream (the drag_ghost_pointer signal's subscribers), and no
+        ShellState write site shows a per-move storm (the old whole-shell
+        tax paired writes-with-steps on update_drag_pointer; the fix keeps
+        only the gesture's real edges — begin, hover-target change, clear —
+        in ShellState)."""
+        acc: list[str] = []
+        if ra["component_windows_in_gesture"] == 0:
+            acc.append("no component_window in the gesture window "
+                       "(render attribution unmeasurable this iteration)")
+            return acc
+        if not ra["ghost_leaf_renders_in_gesture_windows"]:
+            acc.append("ghost leaf never re-rendered in the gesture windows "
+                       "(ghost card missing, or the pointer stream writes "
+                       "nothing — [11.129] regression?)")
+        storm_floor = max(4, int(hover_steps or 0))
+        if ra["max_site_writes"] > storm_floor:
+            acc.append(
+                "a ShellState write site wrote %d× in the gesture windows "
+                "(floor %d) — a per-move whole-shell storm site looks "
+                "present ([11.129] regression?)" % (ra["max_site_writes"],
+                                                    storm_floor))
+        return acc
+
     def action_felt(self, iters: int) -> dict:
         """The felt drag: real pointer events, not the drag verbs. A FRESH
         scratch pair per iteration (no drag-back restore to go wrong): press
@@ -776,17 +868,24 @@ dioxus.send(out);
                 time.sleep(0.05)
                 it["hover_steps"] += 1
             self.verb("pointer", "release")
+            t_release = now_ms()
             flipped, flip_ms = self.wait_order(b_path, a_path)
             it["felt_ms"] = now_ms() - t_down
             it["reorder_settle_ms"] = flip_ms
+            it["paths"] = {"a": a_path, "b": b_path}
             evs = self._events_between(t_down, now_ms())
+            gesture_evs = [e for e in evs
+                           if e.get("ts_ms", 0) <= t_release]
             names = [e.get("name") for e in evs]
-            begins = [e["ts_ms"] for e in evs
+            begins = [e["ts_ms"] for e in gesture_evs
                       if e.get("name") == "tree_drag_begin"]
             it["drag_events"] = sorted({n for n in names
                                         if n and "drag" in n.lower()})
             it["merge_events_in_drag"] = sum(
-                1 for n in names if n == "merge_rows_breakdown")
+                1 for e in gesture_evs if e.get("name") == "merge_rows_breakdown")
+            it["merge_events_post_release"] = sum(
+                1 for e in evs if e.get("ts_ms", 0) > t_release
+                and e.get("name") == "merge_rows_breakdown")
             it["merges_in_drag_detail"] = [
                 {"ts_offset_ms": e.get("ts_ms", 0) - t_down,
                  "rows": (e.get("payload", {}).get("payload",
@@ -806,6 +905,164 @@ dioxus.send(out);
                            " %s" % it["dwell_drag_events"])
             if not flipped:
                 acc.append("drop did not land A after B within timeout")
+            it["render_attribution"] = self.render_attribution(
+                t_down, t_release, it["hover_steps"])
+            acc.extend(self.assert_render_attribution(
+                it["render_attribution"], it["hover_steps"]))
+            it["accuracy_failures"] = acc
+            out["iterations"].append(it)
+        return summarize(out, key="felt_ms")
+
+    def _ui_payload(self, e: dict) -> dict:
+        p = e.get("payload", {})
+        return p.get("payload", p) if isinstance(p, dict) else {}
+
+    def wait_relative_order(self, expected: list[str],
+                            timeout_s: float = 6.0) -> tuple[bool, int | None]:
+        """True iff the expected paths sit in exactly this relative order.
+        NOT contiguity — on a live desktop other seats' rows legally interleave
+        between ours, and demanding contiguity manufactured false failures."""
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout_s:
+            idx = self.rows_order_indices(tuple(expected))
+            seq = [idx[p] for p in expected]
+            if all(s is not None for s in seq) and seq == sorted(seq):
+                return True, int((time.perf_counter() - t0) * 1000)
+            time.sleep(0.3)
+        return False, None
+
+    def _stable_rects(self, paths: list[str], tries: int = 4) -> dict | None:
+        """Sidebar rects, fetched twice and required equal — the sidebar
+        smooth-scrolls after a tree select, and a rect fetched mid-scroll
+        points at the WRONG ROW (the shiftdrag driver's first lesson)."""
+        last = None
+        for _ in range(tries):
+            r = self._row_rects(paths)
+            if r and all(r.get(p) for p in paths):
+                if last == r:
+                    return r
+                last = r
+            time.sleep(0.25)
+        return last if last and all(last.get(p) for p in paths) else None
+
+    def action_shiftdrag(self, iters: int) -> dict:
+        """The owner's goal names SHIFT-DRAG. Yggterm semantics (the sidebar
+        row's onmousedown guard refuses to start a drag with any modifier
+        held): shift+click EXTENDS the range selection
+        (TreeSelectionMode::ExtendRange) and a plain drag then carries the
+        WHOLE selected set (tree_drag_begin {anchor, drag_paths}). So the
+        felt shift-drag = a multi-row range selection, then a REAL pointer
+        drag of the set onto a target outside it. Selection setup rides the
+        `tree select <paths…> --anchor` verb (SetTreeSelection — setup, not
+        the measured action); the measured action is the pointer drag of the
+        set. Asserts the begin payload carries exactly the set anchored on
+        the pressed row, the family completes, the set lands after the
+        target in set order, and the [11.129] render attribution."""
+        out = {"iterations": []}
+        for i in range(iters):
+            rows = [self.spawn_scratch_row(i * 4 + k) for k in range(4)]
+            paths = [r.get("path") for r in rows if "path" in r]
+            if len(paths) < 4:
+                out["iterations"].append({"accuracy_failures": [
+                    "spawn failed: %s" % [r.get("error") for r in rows
+                                          if "error" in r]]})
+                continue
+            a_path, b_path, c_path, d_path = paths
+            acc = []
+            ok0, _ = self.wait_relative_order([a_path, b_path, c_path, d_path])
+            if not ok0:
+                acc.append("scratch rows did not settle in spawn order")
+            rs = self.verb("tree", "select", a_path, b_path, c_path,
+                           "--anchor", a_path)
+            if not rs["ok"]:
+                acc.append("set-selection verb failed: %s" % rs.get("error"))
+            time.sleep(0.4)
+            it = {"hover_steps": 0, "attempts": 1}
+            begins: list[dict] = []
+            dp = None
+            landed = False
+            for attempt in (1, 2):
+                rects = self._stable_rects([a_path, d_path])
+                ra, rd = (rects or {}).get(a_path), (rects or {}).get(d_path)
+                if not ra or not rd:
+                    acc.append("row node not rendered (virtualized out?) "
+                               "— rects missing")
+                    break
+                ax = ra["x"] + min(ra["w"] / 2, 120.0)
+                ay = ra["y"] + ra["h"] / 2
+                dx = rd["x"] + min(rd["w"] / 2, 120.0)
+                dy = rd["y"] + rd["h"] * 0.75
+                it = {"hover_steps": 0, "attempts": attempt}
+                t_down = now_ms()
+                rpress = self.verb("pointer", "press", "--x", str(int(ax)),
+                                   "--y", str(int(ay)))
+                it["down_ms"] = rpress["wall_ms"]
+                self.verb("pointer", "move", "--x", str(int(ax)),
+                          "--y", str(int(ay + 40)))
+                for s_i in range(1, 6):
+                    y = ay + 40 + (dy - ay - 40) * s_i / 5
+                    self.verb("pointer", "move", "--x", str(int(dx)),
+                              "--y", str(int(y)))
+                    time.sleep(0.05)
+                    it["hover_steps"] += 1
+                self.verb("pointer", "release")
+                t_release = now_ms()
+                landed, settle_ms = self.wait_relative_order(
+                    [d_path, a_path, b_path, c_path])
+                it["felt_ms"] = now_ms() - t_down
+                it["reorder_settle_ms"] = settle_ms
+                evs = self._events_between(t_down, now_ms())
+                gesture_evs = [e for e in evs
+                               if e.get("ts_ms", 0) <= t_release]
+                names = [e.get("name") for e in evs]
+                begins = [self._ui_payload(e) for e in gesture_evs
+                          if e.get("name") == "tree_drag_begin"]
+                it["drag_events"] = sorted({n for n in names
+                                            if n and "drag" in n.lower()})
+                it["merge_events_in_drag"] = sum(
+                    1 for e in gesture_evs
+                    if e.get("name") == "merge_rows_breakdown")
+                it["merge_events_post_release"] = sum(
+                    1 for e in evs if e.get("ts_ms", 0) > t_release
+                    and e.get("name") == "merge_rows_breakdown")
+                dp = begins[-1].get("drag_paths") if begins else None
+                it["begin_drag_paths"] = dp
+                it["begin_anchor"] = (begins[-1].get("anchor")
+                                      if begins else None)
+                it["paths"] = {"a": a_path, "b": b_path, "c": c_path,
+                               "d": d_path}
+                if begins and begins[-1].get("anchor") not in (None, a_path):
+                    # The press landed on a different row than the rect said
+                    # (scroll shifted under us) — one honest retry.
+                    acc.append("attempt %d pressed %s, expected %s "
+                               "(rect staleness)" % (
+                                   attempt, begins[-1].get("anchor"), a_path))
+                    it["attempts"] = attempt
+                    if attempt == 1:
+                        time.sleep(0.5)
+                        continue
+                break
+            if not begins:
+                acc.append("no tree_drag_begin in the gesture window")
+            else:
+                if set(dp or []) != {a_path, b_path, c_path}:
+                    acc.append("tree_drag_begin.drag_paths != the selected "
+                               "set: %s" % dp)
+                if begins[-1].get("anchor") != a_path:
+                    acc.append("tree_drag_begin.anchor != %s: %s"
+                               % (a_path, begins[-1].get("anchor")))
+            for need in ("tree_drag_hover", "tree_drag_ended",
+                         "live_session_reorder_succeeded",
+                         "live_session_reorder_persisted"):
+                if need not in it["drag_events"]:
+                    acc.append("drag family missing %s" % need)
+            if not landed:
+                acc.append("drop did not land the set after D in set order "
+                           "within timeout")
+            it["render_attribution"] = self.render_attribution(
+                t_down, t_release, it["hover_steps"])
+            acc.extend(self.assert_render_attribution(
+                it["render_attribution"], it["hover_steps"]))
             it["accuracy_failures"] = acc
             out["iterations"].append(it)
         return summarize(out, key="felt_ms")
@@ -1496,7 +1753,7 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close,felt,closeall,switch")
+                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -1530,6 +1787,8 @@ def main() -> int:
                 report["actions"]["drag"] = probe.action_drag(args.iters)
             elif action == "felt":
                 report["actions"]["felt"] = probe.action_felt(args.iters)
+            elif action == "shiftdrag":
+                report["actions"]["shiftdrag"] = probe.action_shiftdrag(args.iters)
             elif action == "switch":
                 report["actions"]["switch"] = probe.action_switch(args.iters)
             elif action == "group":

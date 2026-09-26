@@ -3349,6 +3349,7 @@ fn DragGhost(
     /// step subscribes and re-renders this leaf, never the shell.
     ghost_pointer: ReadOnlySignal<Option<(f64, f64)>>,
 ) -> Element {
+    let _render_span = crate::render_attribution::ComponentRenderSpan::start("DragGhost");
     let Some((x, y)) = ghost_pointer.cloned() else {
         return rsx! {};
     };
@@ -3403,6 +3404,7 @@ fn RowDragGhost(
     palette: DragGhostPalette,
     ghost_pointer: ReadOnlySignal<Option<(f64, f64)>>,
 ) -> Element {
+    let _render_span = crate::render_attribution::ComponentRenderSpan::start("RowDragGhost");
     let Some((x, y)) = ghost_pointer.cloned() else {
         return rsx! {};
     };
