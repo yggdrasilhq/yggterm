@@ -7,7 +7,9 @@ on self-created scratch rows only. Blast-radius law: rows not created by
 this run are never mutated; teardown removes exactly what the run spawned.
 
 Actions:
-  spawn  — server app terminal new → wait first_frame in ytrace
+  spawn  — server app terminal new → wait the paint ladder in ytrace
+         (first_frame | settle | mount_open — first_frame is write-scoped and
+         does not fire on a mount that never receives a byte)
   drag   — server app drag begin/hover/drop reorder of two scratch rows
   felt   — the REAL input-plane drag: pointer down on a scratch row, dwell
            under the 6px threshold, cross it, hover across rows, release on

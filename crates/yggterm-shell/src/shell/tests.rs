@@ -10989,6 +10989,175 @@ console.log('ok');
         }
     }
 
+    /// ⭐ [11.113] HALF 4 (ux-speed first-frame-idle lane) — THE IDLE MOUNT.
+    /// The sibling coverage test drives the WRITE path; this one drives the
+    /// mount that never receives a byte (a row still connecting, a silent
+    /// command, a queued session) and pins the contract the spawn-latency
+    /// consumer stands on: the SETTLE is the mount's terminal paint record and
+    /// must fire even when there is nothing to paint, reporting `painted:false`
+    /// — while `first_frame` stays ABSENT, because "no first_frame" is the
+    /// never-painted tell the native side joins on `host_id`
+    /// (docs/observability.md §xterm_paint). Live re-verify 2026-09-26 (jojo,
+    /// direct build e76fa55c): 5/6 bare-prompt uxprobe spawns emitted
+    /// `first_frame` and their settles read painted:true / complete:true /
+    /// rows_with_content:1 — the 2026-09-14 "0/2 idle spawns" reading does NOT
+    /// reproduce on current main. What this test buys is the guarantee that
+    /// the honest-blind case STAYS honest: a settle that skipped idle mounts
+    /// would make every silent row read as a mount that never painted at all,
+    /// and a first_frame invented from a byteless frame would make "the glyphs
+    /// arrived" mean "nothing happened".
+    #[test]
+    fn the_idle_mount_settles_honest_and_first_frame_stays_absent() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let start = script
+            .find("const YGG_PAINT_SETTLE_MS")
+            .expect("the paint block must be in the composed script");
+        let end = script[start..]
+            .find("const recvTerminalCommand")
+            .expect("the paint block must end before the command loop")
+            + start;
+        let block = &script[start..end];
+        assert!(
+            block.contains("paintNoteMountOpen") && block.len() > 4_000,
+            "the extracted block does not look like the paint chain ({} bytes)",
+            block.len()
+        );
+        // Same synthetic-mount harness as the coverage test above, kept
+        // self-contained on purpose: the two tests pin different halves of the
+        // paint contract and are expected to diverge, not to share a fixture.
+        let harness = r#"// ── harness ──────────────────────────────────────────────────────────
+const emitted = [];
+let clock = 0;
+const timers = [];
+const VIEWPORT_ROWS = 24;
+const CONTENT_ROWS = 20;
+const ytrace = {
+    emit: (record) => emitted.push(record),
+    span: (category, name, ctx) => ({
+        finish: (payload) => emitted.push({
+            category, name, kind: 'span',
+            payload: Object.assign({}, ctx || {}, payload || {}),
+        }),
+    }),
+    window: (category, name, payload) => emitted.push({ category, name, kind: 'window', payload }),
+};
+const hostId = 'yggterm-terminal-fixture-m7';
+const term = {
+    rows: VIEWPORT_ROWS,
+    cols: 80,
+    element: { getBoundingClientRect: () => ({ width: 800, height: 400 }) },
+    write: (data, callback) => { if (callback) { callback(); } },
+    _core: {},
+    buffer: {
+        active: {
+            viewportY: 0,
+            getLine: (index) => ({
+                translateToString: () => (index < CONTENT_ROWS ? 'content' : ''),
+            }),
+        },
+    },
+};
+const host = null;
+const document = { hidden: false };
+const window = {
+    performance: { now: () => clock },
+    setTimeout: (fn, ms) => { timers.push({ at: clock + Math.max(0, Number(ms) || 0), fn }); },
+};
+const runTimersUpTo = (target) => {
+    for (;;) {
+        timers.sort((a, b) => a.at - b.at);
+        const next = timers.find((t) => t.at <= target);
+        if (!next) { clock = target; return; }
+        timers.splice(timers.indexOf(next), 1);
+        clock = next.at;
+        next.fn();
+    }
+};
+"#;
+        let driver = r#"// ── the drive ────────────────────────────────────────────────────────
+const fail = (message) => { console.error('FAIL: ' + message); process.exit(1); };
+const settleRecords = () => emitted.filter((r) => r.category === 'xterm_paint' && r.name === 'settle');
+const need = (actual, expected, what) => {
+    if (actual !== expected) { fail(what + ': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual)); }
+};
+
+// THE IDLE MOUNT: the session never writes a byte. The fixture ships a
+// buffer with CONTENT_ROWS of text; a bare prompt holds one row, a row
+// still connecting holds none — override to the honest empty buffer.
+term.buffer.active.getLine = (index) => ({ translateToString: () => '' });
+
+clock = 5;
+paintNoteHostReady();
+clock = 40;
+paintNoteMountOpen({});
+if (!emitted.some((r) => r.name === 'mount_open')) { fail('no mount_open record'); }
+
+// Frames happen anyway — compositor nudges, resizes, a focus repaint. The
+// write-scoped law: byteless frames are counted as blank, never latched.
+clock = 60; paintNoteFrame(0, VIEWPORT_ROWS - 1, VIEWPORT_ROWS);
+clock = 80; paintNoteFrame(0, VIEWPORT_ROWS - 1, VIEWPORT_ROWS);
+if (emitted.some((r) => r.name === 'first_frame')) {
+    fail('an idle mount invented a first_frame from a byteless frame');
+}
+
+// The settle must fire ANYWAY — it is the mount's terminal paint record.
+runTimersUpTo(40 + 1200);
+const settle = settleRecords()[0];
+if (!settle) { fail('an idle mount produced no settle record'); }
+need(settle.payload.painted, false, 'no bytes, no paint');
+need(settle.payload.complete, false, 'an unpainted mount is not complete');
+need(settle.payload.writes, 0, 'the record must say no write happened');
+need(settle.payload.frames, 2, 'the byteless frames are still counted');
+need(settle.payload.blank_frames_before_write, 2, 'the blank count must reach the settle record');
+need(settle.payload.rows_with_content, 0, 'an empty buffer holds no content rows');
+need(settle.payload.rows_content_unpainted, 0, 'nothing can be unpainted when nothing holds content');
+
+// A visible, incomplete mount spends its one recheck — and the recheck must
+// ALSO refuse to invent paint: silence at 4 s is still silence.
+runTimersUpTo(40 + 4000);
+need(settleRecords().length, 2, 'an idle visible mount costs settle + one recheck');
+need(settleRecords()[1].payload.recheck, true, 'the second record must identify itself as a recheck');
+need(settleRecords()[1].payload.painted, false, 'the recheck must not invent paint either');
+
+// The absence law the native join depends on, checked at the end of time:
+if (emitted.some((r) => r.name === 'first_frame')) {
+    fail('first_frame appeared without a write');
+}
+// The budget, checked rather than asserted in prose: an idle mount costs
+// mount_open + settle + one recheck, and NEVER a first_frame.
+need(emitted.filter((r) => r.category === 'xterm_paint').length, 3,
+     'an idle mount must cost mount_open + settle + at most one recheck');
+console.log('ok');
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-paint-idle-selftest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("paint-idle-selftest.js");
+        std::fs::write(
+            &path,
+            format!("(() => {{\n{harness}\n{block}\n{driver}\n}})();\n"),
+        )
+        .expect("write the paint idle self-test");
+        let run = std::process::Command::new("node").arg(&path).output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match run {
+            Ok(output) => assert!(
+                output.status.success(),
+                "the paint idle-mount self-test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(_) => eprintln!("node not available; paint idle-mount self-test skipped"),
+        }
+    }
+
     #[test]
     fn the_replay_script_marks_its_wipe_and_refill_and_captures_the_reseed() {
         // ⚠ THE ONE PATH THE SANDBOX COULD NOT TRIGGER. A retained replay needs
