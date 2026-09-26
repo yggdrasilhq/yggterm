@@ -30947,3 +30947,21 @@ daemon should stamp the runtime with it, covering the peer-side managed spawn
 profile like the theme-change path; (c) frontend `onColor` answer as backstop
 for non-daemon-rendered paths; (d) OSC 4 slots 16-255 are never answered.
 
+LIVE PROOF 2026-09-25 late (the muse lab host, build 18d45336e785 deployed
+fleet 23:36): a probe remote codex row born under the owner's light theme
+carried Apple System Colors Light exports VERBATIM in its launch command
+(#feffff background, 0;15, palette 12 #0a84ff — the exact theme). `server app
+theme dark` fired a REAL `sync_terminal_identity` + sweep, and the row's
+stored command STAYED light (0;15/#feffff, zero 15;0) while a SECOND row born
+during the dark window carried dark (15;0) — birth follows the current global;
+existing rows no longer flip on a theme sync. Theme restored light (daemon env
+COLORFGBG back to 0;15); both probe rows removed, records verified gone, no
+peer processes left on the integration host. NEW MEASURED HOLE: the daemon
+rotated mid-proof and the DARK-BORN row RESPAWNED LIGHT — the
+rotation-respawn recomposes the launch command from the CURRENT global (the
+ensure-funnel recompose, [11.157]), so a respawn during a foreign-theme era
+still re-identifies a row; the funnel's recompose should run the same
+`carried_terminal_identity_exports` preserve (the row's previous stored
+command is in reach at recompose time). That funnel leg, the birth-time
+per-client identity, the `initial_server_sync` appearance-only sync, the
+frontend `onColor` backstop, and OSC 4 slots 16-255 stay open above.
