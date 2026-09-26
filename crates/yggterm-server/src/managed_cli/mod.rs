@@ -2297,15 +2297,14 @@ mod tests {
             ),
         );
         let paths = provision_test_paths("mock-registry");
-        // The fetcher must talk to the MOCK, never the real registry.
-        // SAFETY: test process, single-threaded for this env key — the
-        // registry base is read only by this test's installs.
-        unsafe {
-            std::env::set_var("YGGTERM_NPM_REGISTRY_BASE", registry.url());
-        }
+        // The fetcher must talk to the MOCK, never the real registry —
+        // passed as a value through the env-as-value seam, the process
+        // env untouched.
+        let registry_base = registry.url();
 
         let install_and_version = |prefix: &Path, package: &str, tag: &str| -> String {
-            run_direct_install(&paths, prefix, package, tag).expect("install succeeds");
+            run_direct_install(&paths, prefix, package, tag, &registry_base)
+                .expect("install succeeds");
             let bin = prefix.join("bin").join("mock");
             let mut version_command = std::process::Command::new(&bin);
             version_command.arg("--version");
@@ -2356,14 +2355,16 @@ mod tests {
 
         // FAILURE shapes never install.
         let broken_prefix = paths.prefix.join("gen-broken");
-        let error = run_direct_install(&paths, &broken_prefix, "mock-broken", "latest")
+        let error =
+            run_direct_install(&paths, &broken_prefix, "mock-broken", "latest", &registry_base)
             .expect_err("a vendor script that leaves a dead binary must fail the install");
         assert!(
             error.to_string().contains("does not run"),
             "the failure must come from the publish gate, naming the dead binary: {error}"
         );
         let missing_prefix = paths.prefix.join("gen-missing");
-        let error = run_direct_install(&paths, &missing_prefix, "mock-missing-dep", "latest")
+        let error =
+            run_direct_install(&paths, &missing_prefix, "mock-missing-dep", "latest", &registry_base)
             .expect_err("a missing platform dependency must fail the install");
         assert!(
             error.to_string().contains("mock-missing-dep-linux-x64"),
@@ -2392,10 +2393,6 @@ mod tests {
             "a binary that answers --version must pass the publish gate"
         );
 
-        // SAFETY: see the set_var note above.
-        unsafe {
-            std::env::remove_var("YGGTERM_NPM_REGISTRY_BASE");
-        }
         let _ = std::fs::remove_dir_all(&paths.home);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4864,6 +4861,7 @@ fn install_one_npm_cli(
                 &staged,
                 package,
                 yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+                &npm_registry_base(),
             ),
             Ok(None) => run_npm_install(paths, npm, &staged, package, background),
             Err(error) => {
@@ -4878,6 +4876,7 @@ fn install_one_npm_cli(
                 &staged,
                 package,
                 yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+                &npm_registry_base(),
             )
         } else {
             run_npm_install(paths, npm, &staged, package, background)
@@ -4928,6 +4927,7 @@ fn install_one_npm_cli(
                 &prefix,
                 package,
                 yggterm_core::agent_cli::npm_dist_tag(tool.descriptor().kind).unwrap_or("latest"),
+                &npm_registry_base(),
             )
         } else {
             run_npm_install(paths, npm, &prefix, package, background)
@@ -4982,8 +4982,15 @@ fn optional_native_package_for(package: &str) -> Option<String> {
 /// install shapes against a local server; production always resolves to the
 /// real registry.
 fn npm_registry_base() -> String {
-    std::env::var("YGGTERM_NPM_REGISTRY_BASE")
-        .ok()
+    npm_registry_base_in(std::env::var("YGGTERM_NPM_REGISTRY_BASE").ok().as_deref())
+}
+
+/// Env-as-value twin (`npm_registry_base` keeps the env read for
+/// production): the override arrives as an argument so the mock-registry
+/// test points the fetcher at its local server without writing the
+/// process global — the declared-env gate's direction of travel.
+fn npm_registry_base_in(explicit: Option<&str>) -> String {
+    explicit
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://registry.npmjs.org".to_string())
@@ -5032,6 +5039,7 @@ fn fetch_platform_optional_dependencies(
     package: &str,
     package_dir: &Path,
     skip: &[&str],
+    registry_base: &str,
 ) -> Result<()> {
     let manifest_path = package_dir.join("package.json");
     let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
@@ -5058,8 +5066,7 @@ fn fetch_platform_optional_dependencies(
                      {range:?} — cannot fetch the native binary this machine needs"
                 );
             };
-            let dep_base = npm_registry_base();
-            let manifest_url = format!("{dep_base}/{dep_package}/{}", dep_version);
+            let manifest_url = format!("{registry_base}/{dep_package}/{}", dep_version);
             let meta_output = std::process::Command::new(curl)
                 .arg("-fsSL")
                 .arg(&manifest_url)
@@ -5377,6 +5384,7 @@ fn run_direct_install(
     prefix: &Path,
     package: &str,
     dist_tag: &str,
+    registry_base: &str,
 ) -> Result<()> {
     // Direct registry fetch — no npm, no cache, no tmpfs leak. Isolated from
     // system binaries: every CLI lands in its own generation under
@@ -5391,7 +5399,6 @@ fn run_direct_install(
     // `claude`/`grok` keeps its old inode through the swap; new launches see
     // the new symlink. No in-place overwrite of a live binary.
     let curl = curl_binary().context("curl is required for direct fetch")?;
-    let registry_base = npm_registry_base();
     let registry_url = format!(
         "{registry_base}/{}/{}",
         package.replace('/', "%2F"),
@@ -5488,7 +5495,15 @@ fn run_direct_install(
             &native_version,
         );
     }
-    fetch_platform_optional_dependencies(&curl, &staging, prefix, package, &package_dir, &skip)?;
+    fetch_platform_optional_dependencies(
+        &curl,
+        &staging,
+        prefix,
+        package,
+        &package_dir,
+        &skip,
+        registry_base,
+    )?;
     // Run the vendor's own install scripts. Without them the finalize step
     // never happens: claude's install.cjs, opencode's postinstall.mjs and
     // codex-litellm's scripts/install.js each put the native binary in place,
