@@ -40064,6 +40064,13 @@ mod tests {
     /// expensive part of the problem — a flake whose cause is one of twenty
     /// invisible globals cannot be reasoned about — so adding a twenty-first is
     /// made a deliberate act with this comment attached to it.
+    ///
+    /// 2026-09-27: every declared-env mutator and the known reader-victims
+    /// now serialize on `declared_env_test_lock`, which stops the observed
+    /// cross-talk (the load-flicker victims named in the [11.168] leg-2/leg-3
+    /// door updates; reproduced live on clean main with a 16-thread collision
+    /// run of the mutator set) without pretending the globals are safe.
+    /// Threading the seams is still the only complete fix.
     #[test]
     fn the_process_globals_this_binarys_tests_mutate_are_all_declared() {
         // Sanctioned because they already exist, NOT because they are safe.
@@ -42274,11 +42281,18 @@ mod tests {
         );
     }
 
-    /// Serializes the ENV_YGGTERM_HOME redirection across tests: the var is a
-    /// process global, so two tests setting it concurrently hand each other a
-    /// stranger's temp home mid-arrange (seen live when both anchor-vouch tests
-    /// ran together).
-    fn env_yggterm_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Serializes every DECLARED process-global env redirection (the
+    /// `the_process_globals_this_binarys_tests_mutate_are_all_declared`
+    /// inventory) across tests: an env var is a process global, so two tests
+    /// setting it concurrently hand each other a stranger's temp home
+    /// mid-arrange (seen live when both anchor-vouch tests ran together;
+    /// re-measured 2026-09-27 — two unlocked YGGTERM_HOME setters went red
+    /// under a 16-thread collision run and passed in isolation), and any test
+    /// whose product path READS the var goes red when a setter's window
+    /// overlaps its own. Declared-env mutators and known reader-victims hold
+    /// this for their whole body. The lock is the stopgap; threading the seam
+    /// as an argument remains the fix (see the gate's doc).
+    fn declared_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -42301,7 +42315,7 @@ mod tests {
     /// five `ses_guard_degrade` births around one daemon swap.
     #[test]
     fn an_anchor_resume_vouches_to_the_session_the_mirror_saw_it_viewing() {
-        let _env = env_yggterm_home_test_lock();
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-vouch-{}-{}",
             std::process::id(),
@@ -42392,7 +42406,7 @@ mod tests {
     /// conversation abandoned by the empty-window answer.
     #[test]
     fn a_stampless_anchor_resumes_the_newest_store_session_for_its_cwd() {
-        let _env = env_yggterm_home_test_lock();
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-cand-{}-{}",
             std::process::id(),
@@ -42509,7 +42523,7 @@ mod tests {
     /// resume names A. The store tier is for stampless rows only.
     #[test]
     fn the_store_candidate_loses_to_the_focus_vouch() {
-        let _env = env_yggterm_home_test_lock();
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-vcr-{}-{}",
             std::process::id(),
@@ -42588,7 +42602,7 @@ mod tests {
     /// the service would reject.
     #[test]
     fn an_anchor_without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom() {
-        let _env = env_yggterm_home_test_lock();
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-novouch-{}-{}",
             std::process::id(),
@@ -43328,6 +43342,7 @@ mod tests {
     /// itself would assert nothing about the path that failed to write one.
     #[test]
     fn a_row_dropped_from_the_state_file_leaves_a_record_saying_so() {
+        let _env = declared_env_test_lock();
         use crate::live_row_tombstones::{LiveRowTombstones, RowDeparture};
 
         let home = std::env::temp_dir().join(format!(
@@ -43806,6 +43821,7 @@ mod tests {
     // with id/metadata re-collapsed onto that single identity.
     #[test]
     fn local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id() {
+        let _env = declared_env_test_lock();
         let mut server = test_server();
         let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/user"), None);
         let row_id = path.strip_prefix("local://").expect("local path").to_string();
@@ -46655,6 +46671,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn saved_session_does_not_attach_when_visible_screen_is_invalid() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-attach-{}-{}",
             std::process::id(),
@@ -46698,6 +46715,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn saved_session_does_not_attach_when_idle_surface_directory_mismatches() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-attach-cwd-{}-{}",
             std::process::id(),
@@ -46752,6 +46770,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn runtime_output_mismatch_detects_wrong_saved_session_buffer() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-runtime-mismatch-{}-{}",
             std::process::id(),
@@ -46795,6 +46814,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn runtime_output_mismatch_detects_wrong_codex_runtime_buffer() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-runtime-codex-key-mismatch-{}-{}",
             std::process::id(),
@@ -46841,6 +46861,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn runtime_output_match_allows_correct_saved_session_buffer() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-runtime-match-{}-{}",
             std::process::id(),
@@ -47379,6 +47400,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_metadata_mirror_round_trips_sessions() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-mirror-{}-{}",
             std::process::id(),
@@ -52643,6 +52665,7 @@ terminal_window_id: None,
     /// row lands, and the tombstone must survive the restore.
     #[test]
     fn a_closed_row_in_a_stale_snapshot_does_not_restore_and_keeps_its_tombstone() {
+        let _env = declared_env_test_lock();
         use crate::live_row_tombstones::{LiveRowTombstones, now_secs};
 
         let home = std::env::temp_dir().join(format!(
@@ -54828,6 +54851,7 @@ terminal_window_id: None,
 
     #[test]
     fn a_row_whose_launch_process_died_stops_reading_as_idle() {
+        let _env = declared_env_test_lock();
         // The husk: a launch that spawned a PTY, printed an error frame and
         // exited before its CLI could take input. The row kept
         // `launch_phase: Running` over a dead process, so it read as IDLE — a
@@ -54975,6 +54999,7 @@ terminal_window_id: None,
 
     #[test]
     fn a_rebound_muse_row_resumes_the_real_session_across_a_restart() {
+        let _env = declared_env_test_lock();
         // The falsifier, end to end at the state layer: a row born with the
         // yggterm uuid must, once bound to the id its CLI actually minted,
         // still carry that id after a restart AND resume it rather than the
@@ -55069,6 +55094,7 @@ terminal_window_id: None,
 
     #[test]
     fn a_rebound_agy_row_restores_as_the_resume_its_conversation_names() {
+        let _env = declared_env_test_lock();
         // The owner-reported restart bug, end to end at the state layer: agy
         // mints its conversation id POST-first-turn (`id_assigned_at_birth:
         // false`), so the birth command carries no id and the runtime-identity
@@ -55090,9 +55116,11 @@ terminal_window_id: None,
         std::fs::write(conversations.join(format!("{minted}.db")), b"SQLite format 3\0").unwrap();
 
         let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        // ⛔ set_var is unsafe in this edition and PROCESS-global: the suite's
-        // own `the_process_globals_this_binarys_tests_mutate_are_all_declared`
-        // gate documents that these tests are only sound single-threaded.
+        // ⛔ set_var is unsafe in this edition and PROCESS-global: the
+        // `declared_env_test_lock` above serializes this window against every
+        // other declared-env mutator and known victim; the
+        // `the_process_globals_this_binarys_tests_mutate_are_all_declared`
+        // gate owns the inventory and the `_in` seams remain the real fix.
         unsafe {
             std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &fixture_root);
         }
@@ -56825,6 +56853,7 @@ terminal_window_id: None,
 
     #[test]
     fn restored_daemon_owned_codex_runtime_resumes_saved_session_identity() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-restored-runtime-resume-{}-{}",
             std::process::id(),
@@ -56914,6 +56943,7 @@ terminal_window_id: None,
 
     #[test]
     fn fresh_daemon_owned_codex_runtime_without_saved_session_keeps_fresh_launch() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-fresh-runtime-launch-{}-{}",
             std::process::id(),
@@ -58489,6 +58519,7 @@ terminal_window_id: None,
 
     #[test]
     fn remote_saved_codex_session_exists_checks_codex_home() -> Result<()> {
+        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-resume-{}-{}",
             std::process::id(),
@@ -58785,6 +58816,7 @@ terminal_window_id: None,
     // three scenarios serially and restores what it found.
     #[test]
     fn an_exported_app_control_target_survives_a_flagless_verb() {
+        let _env = declared_env_test_lock();
         let previous_pid = std::env::var_os("YGGTERM_APP_CONTROL_PID");
         let previous_client = std::env::var_os("YGGTERM_APP_CONTROL_CLIENT");
 
