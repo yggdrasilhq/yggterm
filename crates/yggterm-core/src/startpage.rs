@@ -105,6 +105,7 @@ pub fn kind_has_dedicated_scanner(kind: crate::SessionKind) -> bool {
         crate::SessionKind::OpenCode
             | crate::SessionKind::Antigravity
             | crate::SessionKind::Devin
+            | crate::SessionKind::MimoCode
     )
 }
 
@@ -297,6 +298,10 @@ pub fn scan_all_durable_sessions(home: &Path) -> Vec<StartpageDurableRow> {
         }
         if descriptor.kind == crate::SessionKind::Devin {
             scan_devin_sessions(home, &mut out);
+            continue;
+        }
+        if descriptor.kind == crate::SessionKind::MimoCode {
+            scan_mimo_sessions(home, &mut out);
             continue;
         }
         if descriptor.session_store_globs.is_empty() {
@@ -580,6 +585,106 @@ fn scan_devin_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
             effective_title,
             detail: None,
             kind: crate::SessionKind::Devin,
+            modified_epoch_ms: epoch_ms,
+            storage_path: db_path.display().to_string(),
+            display_path,
+        });
+    }
+}
+
+
+/// MiMo Code's durable projection: ONE SQLite db at a fixed path (the
+/// opencode/devin posture, measured 2026-09-26 on the muse lab host).
+/// `session` carries the id (`ses_…`), the cwd (`directory`), the
+/// self-title present at row creation, and EPOCH-MILLIS timestamps.
+/// ⚠ the auto-import hazard: first launch fills this table with Claude
+/// Code sessions too (`claude_import`), so rows here are NOT all mimo
+/// births — they keep their original epochs, so recency ordering still
+/// answers "what was the owner in lately" honestly.
+fn scan_mimo_sessions(home: &Path, out: &mut Vec<StartpageDurableRow>) {
+    let db_path = home.join(".local/share/mimocode/mimocode.db");
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return;
+    };
+    let Ok(mut stmt) = conn
+        .prepare("SELECT id, directory, title, time_updated, time_created FROM session")
+    else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let directory: String = row.get(1)?;
+        let title: Option<String> = row.get(2)?;
+        let updated: i64 = row.get(3)?;
+        let created: i64 = row.get(4)?;
+        Ok((id, directory, title, updated, created))
+    }) else {
+        return;
+    };
+    for row in rows.flatten() {
+        let (session_id, directory, raw_title, updated, created) = row;
+        if session_id.trim().is_empty() {
+            continue;
+        }
+        let cwd = if directory.trim().is_empty() {
+            home.display().to_string()
+        } else {
+            directory.clone()
+        };
+        // Milliseconds on both columns (measured against the live store:
+        // 1790389012214 = the intake probe's own row). Guard the math.
+        let epoch_ms = if updated > 0 {
+            updated as u128
+        } else if created > 0 {
+            created as u128
+        } else {
+            0
+        };
+        let title = raw_title.as_deref().unwrap_or("").trim();
+        let filtered_title = if title.is_empty()
+            || crate::looks_like_generated_fallback_title(title)
+            || crate::looks_like_low_signal_generated_copy(title)
+        {
+            None
+        } else {
+            Some(title.to_string())
+        };
+        let descriptor = crate::agent_cli::agent_cli_descriptor(crate::SessionKind::MimoCode);
+        let is_store_auth = descriptor.map(|d| d.title_is_store_authoritative()).unwrap_or(false);
+        let generated_title = if is_store_auth && filtered_title.is_some() {
+            None
+        } else {
+            StartpageDurableRow::load_generated_title(&session_id)
+        };
+        let filtered_gen = generated_title.clone().filter(|s| {
+            !crate::looks_like_generated_fallback_title(s)
+                && !crate::looks_like_low_signal_generated_copy(s)
+        });
+        let effective_title = if is_store_auth {
+            filtered_title.clone().or(filtered_gen.clone())
+        } else {
+            filtered_gen.clone().or(filtered_title.clone())
+        };
+        let display_path = descriptor
+            .and_then(|d| d.remote_row_scheme)
+            .map(|s| format!("{}{}", s, session_id))
+            .unwrap_or_else(|| db_path.display().to_string());
+        out.push(StartpageDurableRow {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            title: filtered_title,
+            generated_title: filtered_gen,
+            effective_title,
+            detail: None,
+            kind: crate::SessionKind::MimoCode,
             modified_epoch_ms: epoch_ms,
             storage_path: db_path.display().to_string(),
             display_path,

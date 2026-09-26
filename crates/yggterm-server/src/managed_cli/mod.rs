@@ -137,6 +137,12 @@ pub enum ManagedCliTool {
     // registered CLI; the version probe is the first thing the first
     // install exercises.
     Devin,
+    // The 2026-09-26 intake: Xiaomi's MiMo Code (`mimo`, npm
+    // @mimo-ai/cli, an OpenCode fork). MEASURED-PARTIAL — screen/launch/
+    // store surface measured on the muse lab host; turns credential-gated.
+    // Npm-provisionable by contract, so it holds a row like every other
+    // registered CLI.
+    Mimo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +249,7 @@ impl ManagedCliTool {
             Self::GrokBuild => SessionKind::GrokBuild,
             Self::ZcodeTui => SessionKind::ZcodeTui,
             Self::Devin => SessionKind::Devin,
+            Self::Mimo => SessionKind::MimoCode,
         }
     }
 
@@ -270,6 +277,7 @@ impl ManagedCliTool {
             SessionKind::GrokBuild => Self::GrokBuild,
             SessionKind::ZcodeTui => Self::ZcodeTui,
             SessionKind::Devin => Self::Devin,
+            SessionKind::MimoCode => Self::Mimo,
             SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => return None,
         })
     }

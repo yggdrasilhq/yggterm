@@ -2,26 +2,26 @@
   "_doc": [
     "Where each agent CLI keeps a session's transcript, and WHERE IN THAT PATH THE",
     "",
-    "\u26d4 `icon_kind` IS THE SPELLING A ROW REPORTS, AND IT IS NOT ALWAYS THE SLUG.",
+    "⛔ `icon_kind` IS THE SPELLING A ROW REPORTS, AND IT IS NOT ALWAYS THE SLUG.",
     "A codex row's `icon_kind` is the historical `session`, which ships on the wire",
     "and may not be renamed. A resolver that matched a row's kind against these KEYS",
-    "therefore never narrowed for codex \u2014 410 of 742 live rows on 2026-08-22 \u2014 and",
+    "therefore never narrowed for codex — 410 of 742 live rows on 2026-08-22 — and",
     "fell through to trying every declared store, which was right only by luck.",
     "`session_kind_for_row` in yggterm-core is the one owner of this question and",
     "the Rust lock makes it ratify every alias here.",
-    "SESSION ID SITS \u2014 the one thing the fleet verbs need that the CLI registry does",
+    "SESSION ID SITS — the one thing the fleet verbs need that the CLI registry does",
     "not already publish on a row.",
     "",
-    "\u26d4 THIS FILE IS NOT A SECOND COPY OF THE REGISTRY. `store_globs` is transcribed",
+    "⛔ THIS FILE IS NOT A SECOND COPY OF THE REGISTRY. `store_globs` is transcribed",
     "from `AgentCliDescriptor::session_store_globs` and is checked against it by",
     "`the_fleet_transcript_table_matches_the_registry` in yggterm-core, which FAILS",
     "the build if the two drift. The registry stays the owner of where a store is;",
     "this file adds only the id position, expressed as `{id}` inside the glob.",
     "",
-    "\u26a0 Every template here was resolved against a REAL store, not a fixture: a genuine",
+    "⚠ Every template here was resolved against a REAL store, not a fixture: a genuine",
     "session id taken from disk, substituted in, and required to return exactly the",
     "file it came from. A CLI with no store, or one whose store has never been seen on",
-    "a real machine, says so rather than guessing \u2014 an unverified template that looks",
+    "a real machine, says so rather than guessing — an unverified template that looks",
     "plausible is the failure this whole area keeps repeating.",
     "",
     "`verified_on_disk` means exactly that and nothing weaker."
@@ -75,7 +75,7 @@
       "transcript": ".qwen/projects/*/chats/{id}.jsonl",
       "format": "jsonl",
       "verified_on_disk": false,
-      "note": "\u26d4 UNVERIFIED AND THE ONLY ONE THAT LOOKS WRONG. 27 sessions across two hosts hold ONLY `<id>.runtime.json` sidecars \u2014 a pid/cwd marker with no title and no conversation \u2014 and zero `.jsonl` files. Every one of them was an unauthenticated probe that never exchanged a message, so this cannot yet be told apart from `a transcript appears only once a session says something`. Settle it by authenticating this CLI and running ONE exchange; until then neither this template nor the registry's live reader has been shown to resolve a real session."
+      "note": "⛔ UNVERIFIED AND THE ONLY ONE THAT LOOKS WRONG. 27 sessions across two hosts hold ONLY `<id>.runtime.json` sidecars — a pid/cwd marker with no title and no conversation — and zero `.jsonl` files. Every one of them was an unauthenticated probe that never exchanged a message, so this cannot yet be told apart from `a transcript appears only once a session says something`. Settle it by authenticating this CLI and running ONE exchange; until then neither this template nor the registry's live reader has been shown to resolve a real session."
     },
     "muse": {
       "store_globs": [
@@ -97,7 +97,7 @@
       "transcript": ".gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript_full.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
-      "note": "The id names a directory several levels above the file, and every session's file has the SAME name \u2014 which is why slicing a row's path for its id collapsed five rows onto one. The `.db` in the store is a summaries index, not the transcript."
+      "note": "The id names a directory several levels above the file, and every session's file has the SAME name — which is why slicing a row's path for its id collapsed five rows onto one. The `.db` in the store is a summaries index, not the transcript."
     },
     "grok-build": {
       "store_globs": [
@@ -115,7 +115,7 @@
       "transcript": null,
       "format": null,
       "verified_on_disk": false,
-      "note": "Declares no store in the registry. Nothing to resolve, and saying so is the honest answer \u2014 a guessed path here would read as measured."
+      "note": "Declares no store in the registry. Nothing to resolve, and saying so is the honest answer — a guessed path here would read as measured."
     },
     "kimi": {
       "store_globs": [
@@ -144,6 +144,14 @@
       "format": null,
       "verified_on_disk": false,
       "note": "MEASURED 2026-09-16 (devin-battery suite on 3000.10.27, 8/8 twice live): the store is ONE SQLite db, ~/.local/share/devin/cli/sessions.db (WAL; tables sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state). Session ids are word-word SLUGS (scythe-snowplow); sessions.title = the first prompt (eager self-titling); a row exists only for a COMPLETED turn - a turnless session leaves session_locks/<slug>.lock (pid) and no row. Transcripts live inside the db (message_nodes), so there is no per-session transcript PATH to declare - empty globs are the SHAPE (opencode posture), not a gap."
+    },
+    "mimo": {
+      "store_globs": [],
+      "icon_kind": "mimo",
+      "transcript": null,
+      "format": null,
+      "verified_on_disk": true,
+      "note": "MEASURED-PARTIAL 2026-09-26 (mimo intake on the muse lab host, 0.1.15): the store is ONE SQLite db, ~/.local/share/mimocode/mimocode.db (WAL; session/project/permission/claude_import/... tables). Session ids are ses_... (opencode law); title + title_source present at row creation (eager, 'fallback'); timestamps epoch-ms. Transcripts live inside the db - empty globs are the SHAPE (opencode/devin posture). HAZARD: first launch AUTO-IMPORTS Claude Code sessions (claude_import table) so ses_ rows exist for conversations mimo never ran."
     }
   }
 }

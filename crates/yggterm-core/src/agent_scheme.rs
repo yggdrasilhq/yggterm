@@ -285,6 +285,28 @@ pub const SESSION_PATH_SCHEMES: &[SchemeDescriptor] = &[
         legacy: false,
         example: "devin-runtime://00000000-0000-4000-8000-00000000d301",
     },
+    // ── The 2026-09-26 intake. MiMo Code (Xiaomi's `mimo`, npm
+    // @mimo-ai/cli, an OpenCode fork) registers MEASURED-PARTIAL: the
+    // screen/launch/store surface measured on the muse lab host, real
+    // turns credential-gated. Same twin-scheme shape as every wrapper CLI.
+    SchemeDescriptor {
+        prefix: "remote-mimo://",
+        role: SchemeRole::RowIdentity,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::MimoCode),
+        agent: true,
+        legacy: false,
+        example: "remote-mimo://devhost/00000000-0000-4000-8000-00000000d400",
+    },
+    SchemeDescriptor {
+        prefix: "mimo-runtime://",
+        role: SchemeRole::RuntimeKey,
+        locality: SchemeLocality::Remote,
+        kind: Some(SessionKind::MimoCode),
+        agent: true,
+        legacy: false,
+        example: "mimo-runtime://00000000-0000-4000-8000-00000000d401",
+    },
     // ── Non-agent (registered so shared predicates can be locked too) ──────
     SchemeDescriptor {
         prefix: "live::",

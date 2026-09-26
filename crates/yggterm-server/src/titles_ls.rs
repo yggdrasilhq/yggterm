@@ -169,6 +169,7 @@ impl KindLabel for StartpageDurableRow {
             yggterm_core::SessionKind::GrokBuild => "grok",
             yggterm_core::SessionKind::ZcodeTui => "zcode_tui",
             yggterm_core::SessionKind::Devin => "devin",
+            yggterm_core::SessionKind::MimoCode => "mimo",
             yggterm_core::SessionKind::Kimi => "kimi",
             yggterm_core::SessionKind::OpenCode => "opencode",
             yggterm_core::SessionKind::Shell => "shell",

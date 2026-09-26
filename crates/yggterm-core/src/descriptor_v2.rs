@@ -231,7 +231,7 @@ pub fn rebind_chain(kind: SessionKind) -> &'static [RebindStrategy] {
         | SessionKind::QwenCode
         | SessionKind::GrokBuild
         | SessionKind::Pi
-        | SessionKind::Devin => {
+        | SessionKind::Devin | SessionKind::MimoCode => {
             const CHAIN: &[RebindStrategy] = &[RebindStrategy::StoreIndex];
             CHAIN
         }
@@ -271,6 +271,7 @@ pub fn supports_pty_fd_handoff(kind: SessionKind) -> bool {
         | SessionKind::GrokBuild
         | SessionKind::Pi
         | SessionKind::Devin
+        | SessionKind::MimoCode
         | SessionKind::Shell
         | SessionKind::SshShell
         | SessionKind::Document => true,
