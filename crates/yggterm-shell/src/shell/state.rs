@@ -46914,7 +46914,13 @@ fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
           }};
           switch (String(command.action || '')) {{
             case 'move':
-              transition(command.x, command.y, 0);
+              // [11.130] a mid-gesture move carries the pointer's HELD
+              // buttons — a real mouse's moves always do. A literal 0 here
+              // disarms every held-button move gate, so a press…move…release
+              // verb sequence never promotes the pending drag until the
+              // release's own transition (begin at release, zero hovers,
+              // every drop tree_drop_ignored).
+              transition(command.x, command.y, Number(pointerState.buttons) || 0);
               break;
             case 'press':
               press(command.x, command.y, command.button);
