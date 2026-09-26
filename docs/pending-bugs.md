@@ -29304,6 +29304,27 @@ asserts on app-state truth because the trace pairs do not exist.
 > 2 s may emit only the first activation. STILL OPEN in this entry: chord
 > identity in `input/keystroke` (half 3) and `first_frame` never firing for
 > idle shells + settle as the documented paint marker (half 4).
+>
+> **LIVE-PROVEN (2026-09-26 ~22:50-23:00 IST, jojo GUI rotated onto a build
+> containing this lane):** uxprobe menu 5 iterations on a fresh activated
+> scratch row — 4/5 `accepted:true` with `menu_wait_ms` 81/93/87/249 ms
+> (right-click → menu observed in DOM, the paint-truth marker) and
+> `host_wait_ms` 0; 1/5 an HONEST refusal `terminal_host_dom_missing` with
+> `host_wait_ms: 3054` — the bounded wait working as designed (a receipt
+> with the waited time instead of the old instant blind refusal). The trace
+> window now carries `context_menu_open` AND `context_menu_close` (payload
+> `open_ms: 420` on a real dismissal), and `context_menu_activate` fired 4×
+> through the modal action's real Delete clicks (`action: delete-session`,
+> `open_ms` 239-792 — the menu's age at activation). The ytrace block
+> detector immediately consumed the new event for stall attribution
+> ("last_activity before the gap: ui_telemetry/context_menu_close").
+> Menu walls (focus + probe CLI round trip) p50 619 ms / max 3.9 s on a
+> floor of 59-111 ms — the wall is CLI-round-trip-dominated; `menu_wait_ms`
+> is the action latency. Zero probe rows left behind, verified per run.
+> BEFORE (pre-lane build, same probe): the menu appeared 5/5 with the right
+> `viewport-*` items and a visible rect, but the old probe refused all 5 —
+> its stale terminal-action predicate (`redraw-terminal`/`keep-alive`
+> names the current menu does not carry) and no waits at all.
 
 ## ⛔ [11.114] TERMINAL SPAWN/CLOSE/DRAG ARE SECONDS-CLASS, NOT MILLISECOND-CLASS — MEASURED COST LADDER FOR SPAWN: ~0.6s DAEMON PROCESSING → ~0.6-1.0s QUEUED GAP → ~2.1s MOUNT ENSURE → +0.5s SETTLE (measured 2026-09-14 late on the GUI host, synthetic scratch rows, tools/uxspeed/uxprobe.py)
 
