@@ -40214,6 +40214,15 @@ mod tests {
     /// run of the mutator set) without pretending the globals are safe.
     /// Threading the seams is still the only complete fix.
     ///
+    /// 2026-09-27 (third pass): the scan DERIVES its file list — it walks
+    /// src/**/*.rs (src/bin excluded: separate process images) instead of
+    /// four include_str! files, closing the blind-spot class (dream
+    /// ACK-9c4ddac5a6 materialized). The walk immediately surfaced one
+    /// undeclared mutator, YGGTERM_NPM_REGISTRY_BASE (managed_cli's
+    /// mock-registry test); it left via the env-as-value seam
+    /// (`npm_registry_base_in`) before it was ever declared — the DECLARED
+    /// population did not grow.
+    ///
     /// 2026-09-27 (second pass): PATH and YGGTERM_GOVERNOR left the list —
     /// their readers take env-as-value twins and their last mutator tests
     /// stopped touching the process. The pty-inheritance contract tests
@@ -40254,8 +40263,9 @@ mod tests {
             "HOME",
             "ENV_YGGTERM_HOME",
             // The terminal-identity population: sync_terminal_identity_
-            // appearance_with_profile (managed_cli — a file the scanner below
-            // does not see, dream ACK-9c4ddac5a6) writes TERM*, the appearance
+            // appearance_with_profile (managed_cli — inside the scan's
+            // derived walk since the third pass, dream ACK-9c4ddac5a6)
+            // writes TERM*, the appearance
             // pair, COLORFGBG and the palette keys as process state so every
             // child PTY inherits one identity. These are contract mutations,
             // declared so the list stays truthful about the binary's real
@@ -40298,13 +40308,45 @@ mod tests {
             concat!("env::", "set_var("),
             concat!("env::", "remove_var("),
         ];
+        // DERIVED, never enumerated (dream ACK-9c4ddac5a6): the walk covers
+        // every .rs file under src/ so a new env-mutating file cannot join a
+        // blind spot — managed_cli/mod.rs alone sat outside the old four-file
+        // list carrying 42 sites (measured 2026-09-27, daemon.rs 6 more,
+        // build_identity.rs 3). src/bin is excluded on purpose: those files
+        // compile into separate process images, whose env state never enters
+        // this test's process, so their mutations cannot cross-contaminate a
+        // sibling test.
+        let mut sources: Vec<String> = Vec::new();
+        fn collect_rs_sources(dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    if path.file_name() == Some(std::ffi::OsStr::new("bin")) {
+                        continue;
+                    }
+                    collect_rs_sources(&path, out);
+                } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+                    if let Ok(source) = std::fs::read_to_string(&path) {
+                        out.push(source);
+                    }
+                }
+            }
+        }
+        collect_rs_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut sources);
+        // Tripwire: a walk that read nothing would scan nothing and pass
+        // green — prove the crate's own file came back before trusting it.
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.contains("the_process_globals_this_binarys_tests_mutate")),
+            "the declared-env scanner walked no source — the gate would lie green"
+        );
         let mut found: Vec<String> = Vec::new();
-        for source in [
-            include_str!("lib.rs"),
-            include_str!("terminal.rs"),
-            include_str!("audio_cli.rs"),
-            include_str!("resource_governor.rs"),
-        ] {
+        for source in &sources {
             for line in source.lines() {
                 if line.trim_start().starts_with("//") {
                     continue;

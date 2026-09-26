@@ -856,6 +856,18 @@ fn locality_does_not_fork_the_invocation() {
     // (direct spawn vs login-shell-wrapped ssh). The command itself must be the
     // same string on both arms — if it is not, some caller above the transport
     // seam is branching on locality.
+    //
+    // Sixth reader-victim (2026-09-27, the env-seam-scanner collision loop,
+    // control-proven red on clean main with the same set): the builders read
+    // YGGTERM_HOME, so one side of a twin pair was composed inside a vouch
+    // test's temp-home window (`yggterm-oc-vouch-…` in the composed command)
+    // while the other saw the real home — a fork that does not exist. This
+    // test spans BOTH declared populations (it writes the terminal-identity
+    // env below and reads the home redirection here), so it holds both
+    // guards — declared OUTER, identity INNER, the only two-guard holder and
+    // a one-way order (nothing takes the identity guard and then the
+    // declared lock).
+    let _declared = crate::tests::declared_env_test_lock();
     let _env = crate::codex_cli::env_test_guard();
 
     for arm in ARMS {
