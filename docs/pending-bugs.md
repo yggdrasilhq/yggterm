@@ -30912,10 +30912,26 @@ byte-identically to the pre-carry law (locked by test). Server lib 1584/2 on
 the lane with the failure set byte-identical to clean main on that host (the
 [11.145] stamp red, owner GO pending, plus
 `restored_opencode_row_names_opencode_in_its_restore_metadata`, red on clean
-main there too — environment-sensitive class, needs an owner). LIVE FALSIFIER
-OWED on the deployed build: probe codex row born under theme A → `app theme`
-to theme B → force a daemon rotation → the respawned row's stored command
-must still carry A's exports.
+main there too — environment-sensitive class, needs an owner). LIVE FALSIFIER RAN 2026-09-26 late (the muse lab host, deployed build
+0b1e095b lineage carrying the funnel leg): a dark-born probe codex row with
+the global flipped light + forced daemon rotation + connect ensure came back
+LIGHT — THE HOLE REPRODUCED THROUGH THE NEXT HOP: restore_live_session's
+re-derivation (the locality builder) recomposed the persisted command from
+the CURRENT global BEFORE any ensure ran, and the fixed funnel then
+faithfully carried the already-flipped exports. LEG 2 LANDED IN CODE
+(69919e74, rebased onto the [11.169] peeler): the carry law threads through
+the locality builder chain — from_vouch/_for_locality identity twins (CC
+transcript arm, CC re-birth arm, SshShell attach arm, both default vouch
+arms), agent_launch + cc_fresh twins — applied at restore_live_session's
+rebound arm (the measured leak), the opencode vouch re-point,
+focus_live_session's kind correction, the persisted-entry kind correction,
+and the stored-row live-focus builder; the restore sites scrape through the
+[11.169] peeler (`funnel_carried_identity_exports`), never the raw splitter.
+build_session (the stored-open VIEW builder — a re-birth by the [11.156]
+law) deliberately stays on the pre-carry law. The restore test and the
+extended source-scan lock ride the same commit. FALSIFIER RERUN on the
+deployed leg-2 build owed (same recipe: dark-born row survives a
+light-flipped rotation).
 
 LIVE PROOF 2026-09-25 late (the muse lab host, build 18d45336e785 deployed
 fleet 23:36): a probe remote codex row born under the owner's light theme
