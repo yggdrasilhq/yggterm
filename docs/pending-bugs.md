@@ -30952,3 +30952,47 @@ refused `session_not_found` (trace live_session_birth 13:18:04, resume_refusal
 13:18:05), the conversation id was a phantom agy never held, so the row never
 had a turn and nothing was lost. The [11.157] phantom-id family through the
 remote start path; close-and-reopen replaces the row.
+
+RESTORE/RESTART LEGS (2+3) LANDED IN CODE 2026-09-26. LEG 2 (commit 69919e74,
+lane/trace/11168-funnel-carry, merged 206ea3b0): the falsifier on the leg-1
+build reproduced the hole through the NEXT hop — the restore/re-open
+re-derivation recomposed the persisted launch command from the CURRENT global
+before any ensure ran — and threaded the carry law through the locality
+builder chain (the `_with_identity` compose twins), applied at every site
+where the row's prior in-memory command is in reach: the restore rebound arm,
+the opencode vouch re-point, the focus kind corrections, the stored-row
+live-focus builder. LEG 3 (lane/trace/11168-startup-rewriter, zcode on the
+muse lab host, work FROM dev; cites the deploy+falsifier handoff
+ACK-e97d765475): the deploy seat's open question ("which startup-window
+writer recomposes a LOCAL agent row's stored command") is ANSWERED FROM THAT
+SEAT'S OWN TRACE — there is NO hidden writer. The probe row
+(cwd /tmp/falsifier-11168) read DARK exports at its first post-restart spec
+(ts 1790434981783, 3.7 s after its app-control birth 1790434978051) and LIGHT
+at ts 1790435160381 — the light flip coincides with that seat's OWN
+`set_ui_theme zed_light` at 1790435131679 plus the forced
+`headless-cli-restart` at 1790435133300 (the handoff note's "global still
+dark" at the light reading was a misread — the trace shows zed_light landed
+before it). A local row's stored command is a stamp of whatever global held
+at its last compose; theme flips between composes ARE the flip-flop. Leg 3
+closes what leg 2 structurally cannot: a COLD restart boots an empty session
+map, so the in-memory command leg 2 scrapes was JUST BORN from the global —
+the persisted record is the only lawful source. THE FIX: the identity rides
+the persisted row — `PersistedLiveSession.terminal_identity_exports`
+(serde-default empty; an old state file reads bare = the pre-carry behavior,
+byte-identical), scraped through the peeler at persist
+(`persisted_live_session_from_managed`), preferred by BOTH restore arms over
+the in-memory scrape (persisted > in-memory > global), and applied at the two
+compose sites leg 2 left on the global: the restore transcript arm and the
+local CC re-derive (`refresh_local_cc_relaunch_launch_command`). Fresh BIRTHS
+still pass the global BY LAW — the birth-time per-client identity leg stays
+owner-gated. Locks: behavior tests (restore carry + extraction fixpoint, the
+byte law, the serde round-trip/old-file default) and a structural lock
+(`the_restore_recompose_consults_the_rows_persisted_exports`) pinning both
+restore arms, the CC re-derive and the persist scrape. Server lib on the lane
+1593/1 — the only red is clean main's own [11.145] stamp red (clean main's
+second red on that host is the env-flicker class:
+`local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id`, red under
+full-suite load, green isolated). LIVE FALSIFIER OWED on the deployed build:
+a local codex probe row born under theme A → `app theme` to theme B → force a
+same-build daemon restart → the restored row's stored command STILL carries
+A's exports; a second restart under A returns A.
