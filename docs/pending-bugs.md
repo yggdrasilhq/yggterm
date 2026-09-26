@@ -72,11 +72,21 @@ never fire on a raise, so uxprobe `switch` now accepts BOTH end families
 (first_frame with rows painted, or reveal with content) for its
 paint-end falsifier. Behavioral locks: the predicate's four arms, the
 raise's wiring (seam), and the stamp's no-re-init contract (6 tests).
-Honest note kept from the [11.172] window decomposition: the ~890 ms
-eval-delivery leg (js_eval_created -> the script actually running, beside
-ui/block spans) is a SECOND cost this fix removes for the raise path by not
-dispatching the mount eval at all; whatever delivery latency remains on the
-tiny stamp eval will show up honestly in paint_reveal_ms.
+LIVE, on the rotated build 0e6d09d5503e (2026-09-27 ~04:10 IST, jojo
+desktop, uxprobe `switch` n=16, floor 79 ms): the raise ENGAGES — 10/13 warm
+switches served as reveals (reveal_served + xterm_paint/reveal with
+visible=true and content_rows=63 on every one, accuracy failures 0 on every
+raise); activation→paint-end p50 430 ms / max 515 vs the remount path's p50
+997 on the same run (2.3x), against [11.172]'s pre-fix 1340 ms. Two honest
+residuals keep this FIXED IN CODE — LIVE PROOF OWED: (1) the falsifier's
+p50 <=150 ms net is NOT met — the residual ~430 ms is the DELIVERY plane
+(click -> render -> the ~1.6 KB stamp eval running), the same dispatch-plane
+starvation [11.116] named, now the whole remaining felt cost of a raise;
+(2) paint ends missing on 3/16 iterations (stamp event outside the probe's
+read window — probe-side window tuning, not a product miss). The refused
+raise is on the record per click (terminal_mount/reveal_raise_refused with
+the four predicate arms): every refusal in this run was honest
+(was_ever_ready=false — a row whose ready never latched must bootstrap).
 
 FALSIFIER: uxprobe `switch` on the rotated build reports
 activation→first_frame p50 ≤150 ms net (first_frame_ms − activation_ms),
