@@ -678,6 +678,8 @@ dioxus.send(out);
                 "menu_wait_ms": data.get("menu_wait_ms"),
                 "host_wait_ms": data.get("host_wait_ms"),
                 "item_count": len(items) if items else None,
+                "action_names": action_names or None,
+                "menu_rect": data.get("menu_rect"),
                 "has_terminal_action": data.get("has_terminal_action"),
                 "no_paste_side_effect": data.get("no_paste_side_effect"),
                 "accuracy_failures": acc,
