@@ -641,20 +641,40 @@ dioxus.send(out);
             menu_ms = now_ms() - t0
             reply = r.get("json") or {}
             data = reply.get("data") or {}
-            items = data.get("items") or data.get("menu_items") or []
+            # The terminal probe's accuracy payload is the menu's own action
+            # list (`actions`/`action_names`/`has_terminal_action`) — `items`
+            # never existed on this reply, so every "pass" here asserted
+            # against an empty set and proved nothing ([11.113] gap 2 lane).
+            items = data.get("actions") or []
+            action_names = data.get("action_names") or []
             acc = []
             if not r["ok"]:
                 acc.append(f"probe-context-menu failed: {r.get('error')}")
-            elif not items:
-                acc.append("menu reply refused or empty: accepted=%s reason=%s"
-                           % (data.get("accepted"), data.get("reason")))
+            elif not data.get("accepted"):
+                acc.append("menu refused: reason=%s host_wait_ms=%s"
+                           % (data.get("reason"), data.get("host_wait_ms")))
+            else:
+                if not data.get("has_terminal_action"):
+                    acc.append("terminal action absent from menu: %s"
+                               % action_names)
+                if not data.get("no_paste_side_effect"):
+                    acc.append("right-click leaked a paste side effect")
+                if not data.get("menu_rect"):
+                    acc.append("menu_rect missing (menu not visibly placed)")
+                if data.get("menu_wait_ms") is None:
+                    acc.append("menu never observed in DOM (menu_wait_ms null)")
             events = sorted({n for ev in self.ytrace_events(t0)
                              if isinstance((n := ev.get("name")), str)
                              and "menu" in n.lower()})
             out["iterations"].append({
                 "menu_open_ms": menu_ms,
                 "cli_ms": r["wall_ms"],
+                # input→DOM truth from inside the webview ([11.113] gap 2)
+                "menu_wait_ms": data.get("menu_wait_ms"),
+                "host_wait_ms": data.get("host_wait_ms"),
                 "item_count": len(items) if items else None,
+                "has_terminal_action": data.get("has_terminal_action"),
+                "no_paste_side_effect": data.get("no_paste_side_effect"),
                 "accuracy_failures": acc,
                 "trace_events_in_window": events or None,
             })
