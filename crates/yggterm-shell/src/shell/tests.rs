@@ -11216,8 +11216,22 @@ console.log('ok');
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        assert!(script.contains("fontSize: 13"));
-        assert!(script.contains("lineHeight: 1"));
+        assert!(script.contains("fontSize: (__mp.theme.fontSize)"));
+        assert!(script.contains("lineHeight: (__mp.theme.lineHeight)"));
+        assert!(
+            terminal_mount_params_json(
+                "yggterm-terminal-test",
+                &theme,
+                true,
+                false,
+                "test_reason",
+                false,
+                ("\x1b[A", "\x1b[B", 0),
+                None,
+            )
+            .contains("\"fontSize\":13.0"),
+            "the constructor's font size rides the mount params"
+        );
         assert!(script.contains("convertEol: false"));
         assert!(
             !script.contains("convertEol: true"),
@@ -11340,8 +11354,22 @@ console.log('ok');
             Some("alternate"),
         );
         assert!(
-            buffer_seeded.contains("lastKnownBufferKindSeed = \"alternate\";"),
+            buffer_seeded.contains("(String(__mp.lastKnownBufferKindSeed || ''))"),
             "the seed must be assigned before the mount script body"
+        );
+        assert!(
+            terminal_mount_params_json(
+                "yggterm-terminal-test",
+                &theme,
+                true,
+                false,
+                "test_reason",
+                false,
+                ("\x1b[A", "\x1b[B", 0),
+                Some("alternate"),
+            )
+            .contains("\"lastKnownBufferKindSeed\":\"alternate\""),
+            "the seed value rides the mount params - the warm path's only payload"
         );
         assert!(
             buffer_seeded.contains("bufferTransitionCount === 0"),
@@ -21912,7 +21940,9 @@ console.log('ok');
             ("\x1b[A", "\x1b[B", 0),
             None,
         );
-        assert!(script.contains("const canvasRendererEnabled = false;"));
+        assert!(script.contains(
+            "const canvasRendererEnabled = (Boolean(__mp.canvasRendererEnabled));"
+        ));
         assert!(script.contains("let webglAddonAvailable = Boolean(window.WebglAddon"));
         assert!(script.contains("if (canvasRendererEnabled && webglAddonAvailable"));
     }
@@ -22014,8 +22044,26 @@ console.log('ok');
             ("\x1b[A", "\x1b[B", 0),
             None,
         );
-        assert!(disabled.contains("const canvasRendererEnabled = false;"));
-        assert!(enabled.contains("const canvasRendererEnabled = true;"));
+        assert!(disabled.contains(
+            "const canvasRendererEnabled = (Boolean(__mp.canvasRendererEnabled));"
+        ));
+        assert!(
+            terminal_mount_params_json(
+                "yggterm-terminal-test",
+                &theme,
+                true,
+                false,
+                "test_reason",
+                false,
+                ("\x1b[A", "\x1b[B", 0),
+                None,
+            )
+            .contains("\"canvasRendererEnabled\":false"),
+            "the runtime gate decision rides the mount params"
+        );
+        assert!(enabled.contains(
+            "const canvasRendererEnabled = (Boolean(__mp.canvasRendererEnabled));"
+        ));
         assert!(enabled.contains(
             "window.__yggtermXtermCanvasRendererEnabled = Boolean(canvasRendererEnabled);"
         ));
@@ -22345,7 +22393,69 @@ console.log('ok');
             ("\x1b[A", "\x1b[B", 0),
             None,
         );
-        assert!(script.contains("const canvasRendererEnabled = true;"));
+        assert!(script.contains(
+            "const canvasRendererEnabled = (Boolean(__mp.canvasRendererEnabled));"
+        ));
+        assert!(
+            terminal_mount_params_json(
+                "yggterm-terminal-test",
+                &theme,
+                true,
+                true,
+                "test_reason",
+                false,
+                ("\x1b[A", "\x1b[B", 0),
+                None,
+            )
+            .contains("\"canvasRendererEnabled\":true"),
+            "the opt-in decision rides the mount params"
+        );
+    }
+
+    #[test]
+    fn terminal_mount_warm_eval_is_tiny_and_version_locked() {
+        // [11.172]: the warm path exists so a felt switch parses ~1 KB of JS
+        // instead of re-parsing the ~500 KB mount body on the web process'
+        // main thread. The size IS the contract; the version is what keeps a
+        // stale installed body from serving a changed template.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let params = terminal_mount_params_json(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            false,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
+        assert!(params.contains("\"hostId\":\"yggterm-terminal-test\""));
+
+        let warm = terminal_mount_warm_eval_script(&params);
+        assert!(
+            warm.len() < 4_096,
+            "the warm eval must stay tiny, got {} bytes",
+            warm.len()
+        );
+        assert!(warm.contains("__yggtermMountParams ="));
+        assert!(warm.contains("await window.__yggtermMountFn();"));
+
+        let probe = terminal_mount_fn_probe_script();
+        assert!(probe.contains("Boolean(window.__yggtermMountFn)"));
+        assert!(probe.contains("__yggtermMountFnV === 1"));
+
+        let cold = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(cold.contains("window.__yggtermMountFnV = 1"));
+        assert!(cold.contains("window.__yggtermMountFn = async () =>"));
+        assert!(cold.contains("const __mp = window.__yggtermMountParams || {};"));
+        assert!(cold.contains("await window.__yggtermMountFn();"));
+        // The body must read its identity from the per-mount params, never
+        // bake it in: a baked host id would silently serve one session's
+        // mount fn to another after the fn is cached in the page.
+        assert!(
+            !cold.contains("const hostId = \""),
+            "the mount fn body must not bake the host id"
+        );
     }
 
     #[test]

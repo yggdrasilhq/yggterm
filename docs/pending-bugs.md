@@ -82,6 +82,23 @@ FALSIFIER: uxprobe `switch` on the rotated build reports
 activation→first_frame p50 ≤150 ms net (first_frame_ms − activation_ms),
 settle complete ≥7/8, zero accuracy failures.
 
+PROGRESS 2026-09-27 ~04:20 IST (switch-raise lane, leg 1 LANDED, fix
+direction corrected by event-resolution measurement): the dominant leg is
+NOT the construction — it is the ~513 ms main-thread PARSE of the
+re-evaluated mount script (the ui/block witness brackets the stall from
+eval dispatch to the eval's first statement; the construction itself is
+~3 ms; the restore/reseed tail ~170 ms). WebKit never cache-hits the parse
+because the rendered script text differs per call (host id/theme
+interpolated in). Leg 1: the mount body is installed once per document as
+a version-keyed `window.__yggtermMountFn`; a ~1 KB warm eval sets the
+per-mount params (`window.__yggtermMountParams`, snapshotted at fn entry)
+and invokes it; a version probe gates the warm path (miss = cold
+reinstall, byte-for-byte the old behavior). Leg 1 falsifier:
+`terminal_mount/mount_eval_warm` fires on switches, the per-switch ui/block
+disappears, first_frame p50 drops by the parse block. Leg 2 (raise — skip
+the construction/reseed and the Rust Ready→Reset handshake on an
+already-live surface) remains the path to the ≤150 ms net falsifier.
+
 ## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
 
 **Status:** OPEN

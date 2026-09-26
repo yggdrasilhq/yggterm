@@ -6080,31 +6080,74 @@ fn TerminalCanvas(
                 state.with(|shell| initial_terminal_grid_for_mount(shell, &session_path));
             let initial_buffer_kind =
                 state.with(|shell| shell.mount_buffer_kind_seed(&session_path));
-            let mut eval = terminal_document.eval(terminal_eval_script_with_pinned_grid_seeded(
-                &host_id,
-                &theme,
-                terminal_initial_programmatic_focus(
-                    snapshot.active_view_mode,
-                    snapshot.active_session_path.as_deref(),
-                    &session_path,
-                    is_remote_resume_session,
-                    &snapshot.right_panel_mode,
-                    snapshot.search_focused,
-                    snapshot.command_mode_active,
-                    titlebar_transient_focus_blocking(
-                        snapshot.titlebar_new_menu_open,
-                        snapshot.titlebar_session_menu_open,
-                        snapshot.titlebar_overflow_menu_open,
-                    ),
-                    snapshot.tree_rename_active,
-                    snapshot.web_find_bar_focused,
+            let initial_input_focus = terminal_initial_programmatic_focus(
+                snapshot.active_view_mode,
+                snapshot.active_session_path.as_deref(),
+                &session_path,
+                is_remote_resume_session,
+                &snapshot.right_panel_mode,
+                snapshot.search_focused,
+                snapshot.command_mode_active,
+                titlebar_transient_focus_blocking(
+                    snapshot.titlebar_new_menu_open,
+                    snapshot.titlebar_session_menu_open,
+                    snapshot.titlebar_overflow_menu_open,
                 ),
-                pinned_grid,
-                initial_grid,
-                yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
-                yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
-                initial_buffer_kind.as_deref(),
-            ));
+                snapshot.tree_rename_active,
+                snapshot.web_find_bar_focused,
+            );
+            // [11.172] The mount body is ~500 KB of JS; re-evaluating the
+            // rendered script per activation RE-PARSED it on the web process'
+            // main thread — the felt switch's dominant leg (ui/block witness:
+            // ~513 ms stall from eval dispatch to the eval's first statement,
+            // 2026-09-27; the construction itself is ~3 ms). The body is
+            // installed once per document as a versioned
+            // `window.__yggtermMountFn`; this probe gates the ~1 KB warm
+            // invoke on that exact version and any miss reinstalls cold (one
+            // parse — exactly today's behavior).
+            let mount_fn_installed = document::eval(&terminal_mount_fn_probe_script())
+                .await
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let mount_script = if mount_fn_installed {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "mount_eval_warm",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "host_id": host_id.clone(),
+                    }),
+                );
+                format!(
+                    "{}{}",
+                    terminal_mount_grid_prefix(pinned_grid, initial_grid),
+                    terminal_mount_warm_eval_script(&terminal_mount_params_json(
+                        &host_id,
+                        &theme,
+                        initial_input_focus,
+                        terminal_xterm_canvas_renderer_enabled(),
+                        &terminal_xterm_renderer_policy_reason(),
+                        yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
+                        yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
+                        initial_buffer_kind.as_deref(),
+                    ))
+                )
+            } else {
+                terminal_eval_script_with_pinned_grid_seeded(
+                    &host_id,
+                    &theme,
+                    initial_input_focus,
+                    pinned_grid,
+                    initial_grid,
+                    yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
+                    yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
+                    initial_buffer_kind.as_deref(),
+                )
+            };
+            let mut eval = terminal_document.eval(mount_script);
             append_trace_event(
                 &trace_home,
                 "ui",
