@@ -15900,6 +15900,7 @@ fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
         // declares the remote arm (remote-devin://), so a remote devin
         // runtime is a real registry row by the same law as zcode-tui's.
         SessionKind::Devin => RemoteRuntimeKind::Devin,
+        SessionKind::MimoCode => RemoteRuntimeKind::Mimo,
         SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => {
             RemoteRuntimeKind::Shell
         }

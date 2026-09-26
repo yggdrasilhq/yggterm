@@ -32,6 +32,15 @@ pub enum SessionKind {
     /// store layout is unknown and its descriptor carries availability-record
     /// posture only — the qwen/pi precedent.
     Devin,
+    /// `mimo` — Xiaomi's MiMo Code (`@mimo-ai/cli` on npm, MIT), an OpenCode
+    /// fork with a diverged surface (`serve`/`attach`, `session list`, `db`,
+    /// `export`/`import`). Registered MEASURED-PARTIAL (2026-09-26, the muse
+    /// lab host, 0.1.15): screen/launch/store surface measured live; real
+    /// turns are credential-gated (`Invalid API Key`), so working phrases
+    /// and titling-live stay availability posture until an authed turn.
+    /// ⚠ store hazard: FIRST LAUNCH auto-imports Claude Code sessions
+    /// (`claude_import`), so the store holds `ses_` rows mimo never ran.
+    MimoCode,
     Shell,
     SshShell,
     Document,
@@ -55,6 +64,7 @@ impl SessionKind {
         SessionKind::GrokBuild,
         SessionKind::ZcodeTui,
         SessionKind::Devin,
+        SessionKind::MimoCode,
         SessionKind::Shell,
         SessionKind::SshShell,
         SessionKind::Document,
@@ -132,13 +142,14 @@ mod tests {
                 SessionKind::GrokBuild => 9,
                 SessionKind::ZcodeTui => 10,
                 SessionKind::Devin => 11,
-                SessionKind::Shell => 12,
-                SessionKind::SshShell => 13,
-                SessionKind::Document => 14,
+                SessionKind::MimoCode => 12,
+                SessionKind::Shell => 13,
+                SessionKind::SshShell => 14,
+                SessionKind::Document => 15,
             };
             assert_eq!(index, slot, "{kind:?} is listed out of order in ALL");
         }
-        assert_eq!(SessionKind::ALL.len(), 15);
+        assert_eq!(SessionKind::ALL.len(), 16);
     }
 
     // The rendered-view question, answered once. Before this, a plain shell

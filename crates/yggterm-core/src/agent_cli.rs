@@ -4294,6 +4294,196 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         pty_echo_confirms_input: false,
         remote_live_store_title: Some(DEVIN_REMOTE_TITLE_PROBE),
     },
+// ── The 2026-09-26 intake. Xiaomi's MiMo Code: the `mimo` command,
+    // npm `@mimo-ai/cli` (MIT), an OpenCode fork with a diverged surface
+    // (`serve`/`attach`, `session list`, `db`, `export`/`import`,
+    // `providers`). MEASURED-PARTIAL on the muse lab host's 0.1.15 install
+    // (the mimo intake seat, tools/probe-battery/suites/mimo.js + live
+    // --help/store probes): trust gate, composer, footer, store and launch
+    // flags measured live; REAL TURNS ARE CREDENTIAL-GATED (`mimo run`
+    // answers `Error: Invalid API Key` — and exits rc 0, a lying rc), so
+    // working phrases and resume rederive stay honest empties until an
+    // authed turn. ⚠ STORE HAZARD: FIRST LAUNCH runs a one-time migration
+    // AND auto-imports Claude Code sessions (the `claude_import` table;
+    // `mimo session import-claude` is the manual twin), so the store holds
+    // `ses_` rows mimo never ran — a scanner keyed by cwd can false-hit an
+    // imported row; recency saves the title reader (imports keep their
+    // original epoch), but any future membership/cold-restore consumer
+    // must filter by provenance.
+    AgentCliDescriptor {
+        kind: SessionKind::MimoCode,
+        display_name: "MiMo Code",
+        session_metadata_label: "MiMo Code Session",
+        slug: "mimo",
+        binary_name: "mimo",
+        // MEASURED: npm `@mimo-ai/cli` (bin `mimo`); the ynpm generation dir
+        // on the muse lab host is `mimo-ai__cli` — the scope/slug law holds.
+        install: CliInstall::Npm("@mimo-ai/cli"),
+        // MEASURED off `mimo --help`: the CLI ships its own updater.
+        update: CliUpdate::SelfCommand(&["upgrade"]),
+        icon_glyph: "MC_",
+        // Provisional — Xiaomi's product orange darkened to clear the WCAG
+        // AA 4.5:1 floor against white (the raw #ff6a00 lands at ~2.9:1);
+        // not a hex sampled from the running product.
+        brand_color: "#9a3412",
+        menu_hint: 'i',
+        // The owner titling law's default: Store. MEASURED SCHEMA: the
+        // session table carries `title` AND `title_source`
+        // ('fallback'|'generated'|'user') + `title_revision` — title
+        // authority is first-class in the store — and rows self-title at
+        // creation (title = the prompt text, title_source 'fallback', the
+        // codex eager-titling law). The reader below ships with this
+        // registration, so the authority is real rather than nominal.
+        title_authority: TitleAuthority::Store,
+        // MEASURED shape: `ses_…` ids minted by the CLI (the opencode law,
+        // third instance — the suffix is mixed hex/base62, not opencode's).
+        // The ROW id is not the session id at birth; the store row appears
+        // at first prompt submission (a `mimo run` attempt that then fails
+        // on auth STILL writes its row — measured), while a turnless TUI
+        // launch writes none.
+        id_assigned_at_birth: false,
+        // Unmeasured — the [11.165] fact type; None fails open.
+        resume_missing_id_behavior: None,
+        wrapper_slug: Some("mimo"),
+        remote_row_scheme: Some("remote-mimo://"),
+        runtime_key_scheme: Some("mimo-runtime://"),
+        // ⛔ UNMEASURED (credential-gated): no working turn has been driven,
+        // so there are no working needles. Availability posture — the first
+        // authed seat fills this table (the qwen/pi precedent, devin's
+        // 2026-09-16 debt-pay lesson).
+        working_screen_phrases: &[],
+        working_screen_negations: &[],
+        limit_wait_screen_phrases: &[],
+        question_picker_screen_phrases: &[],
+        background_agent_hint_screen_phrases: &[],
+        // MEASURED (0.1.15, fresh cwd, probe suite): the gate is a RADIO
+        // prompt, not devin's menu — `Quick safety check: Is this a project
+        // you created or one you trust?` with `● Yes, I trust this folder`
+        // as the highlighted row (Enter grants); the splash sparkles
+        // (✦/✧) and the wordmark paint behind it. A resumed `-s <id>` arms
+        // the SAME gate on the session's directory before any rederive
+        // (measured). `--trust` skips the gate BY FLAG (measured --help).
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "quick safety check",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "yes, i trust this folder",
+                also_any: &[],
+            },
+        ],
+        plan_limit_choice_screen_phrases: &[],
+        // MEASURED off `mimo --help`: `-s, --session <id>` continues by id,
+        // `-c, --continue` the last session, `--fork` branches when
+        // continuing. Top-level, unlike opencode 2.x which LOST its
+        // top-level flags (the fork KEPT them; `-m/--model provider/model`
+        // too).
+        resume_selector: ResumeSelector::Flag("--session"),
+        // Unmeasured either way; the resume targets the id, and the measured
+        // gate arms per directory without re-rooting the selector.
+        resume_re_roots_with_cwd: false,
+        // MEASURED off `mimo --help` (`-m, --model … in the format of
+        // provider/model`; `mimo models` lists mimo/mimo-auto,
+        // xiaomi/mimo-v2.5 … v2.6-pro-ultraspeed at 1M/1.05M windows).
+        model_flag: Some("--model"),
+        // MEASURED live (probe suite, 0.1.15): the composer is the
+        // OPENCODE BOX — `┃` U+2503 gutters, `┗` corner, a mode row INSIDE
+        // the box (`Build · MiMo Auto (MiMo-V2.5)`), placeholder
+        // `Type your message... (type / for commands)`. The [11.133]
+        // opencode consumer shape, second CLI — the draft guard must read
+        // the gutter-box law, and the placeholder needles below keep the
+        // vendor suggestion from reading as a draft.
+        composer_marker: '\u{2503}',
+        composer_region_label: None,
+        composer_placeholder_needles: &[
+            "type your message...",
+            "type / for commands",
+        ],
+        // MEASURED idle footer (one line below the box): `tab switch mode
+        // ctrl+p settings  @ attach file  $ subagent  / commands`. Tab
+        // cycles Build/Plan/Compose (the `● Tip` line names it). The
+        // mid-turn footer is UNMEASURED (credential-gated).
+        composer_footer_hints: &[
+            "tab switch mode",
+            "ctrl+p settings",
+            "@ attach file",
+            "$ subagent",
+            "/ commands",
+        ],
+        working_footer_hints: &[],
+        // MEASURED off `mimo --help`: `--dangerously-skip-permissions`
+        // (alias `--yolo`) auto-approves; `--never-ask` is a DISTINCT
+        // measured mode ("auto-decide without asking, permissions
+        // excluded") with no enum slot yet — unwired like devin's `smart`.
+        // Build/Plan/Compose are IN-TUI tab modes, not launch flags.
+        permission_modes: &[
+            (AgentPermissionMode::Default, &[]),
+            (
+                AgentPermissionMode::Bypass,
+                &["--dangerously-skip-permissions"],
+            ),
+        ],
+        overridden_flags: &[
+            ("--model", FlagArity::TakesValue, OverriddenBy::Model),
+            (
+                "--dangerously-skip-permissions",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
+        ],
+        extra_args_slug: "mimo",
+        permission_presets: &[
+            PermissionPreset {
+                id: "build",
+                label: "Build (mimo's default)",
+                args: "",
+                explanation: "MiMo Code's own default posture; permission asks ride the                               TUI.",
+                is_default: true,
+            },
+            PermissionPreset {
+                id: "yolo",
+                label: "YOLO: approve all tools",
+                args: "--dangerously-skip-permissions",
+                explanation: "Auto-approves permissions that are not explicitly denied —                               mimo's own spelling (alias `--yolo`), the unattended-delegate                               posture.",
+                is_default: false,
+            },
+        ],
+        permission_provenance: PermissionProvenance::Measured,
+        // UNMEASURED (credential-gated): the only measured resume paint is
+        // the trust gate that arms BEFORE any rederive. Flip on the first
+        // authed resume measurement.
+        content_rederives_on_resume: false,
+        // MEASURED: ONE SQLite database — ~/.local/share/mimocode/
+        // mimocode.db (WAL; tables session, project, permission,
+        // permission_grant, account, account_state, inbox, part,
+        // actor_registry, claude_import, history FTS, …). No per-session
+        // file tree, so the globs stay empty BY SHAPE (the opencode/devin
+        // posture). `session` carries id (`ses_…`), project_id, parent_id,
+        // slug, directory, title, title_source, title_revision,
+        // time_created/time_updated (EPOCH-MS — measured 1790389012214),
+        // workspace_id, … Locks live OUTSIDE the db:
+        // ~/.local/state/mimocode/locks/<sha1>.lock/ with heartbeat +
+        // meta.json — hash-named, NOT slug-named.
+        session_store_globs: &[],
+        store_excluded_name_fragments: &[],
+        durable_store_files: &[".local/share/mimocode/mimocode.db"],
+        store_scan_gap: None,
+        store_home_env_override: None,
+        read_store_entry: read_no_store_entry,
+        store_membership_index: Some(mimo_store_holds_session),
+        // MEASURED off `mimo --help`: `-s/--session <id>` is the resume
+        // flag a resumed spawn carries in argv.
+        live_session_argv_flag: Some("--session"),
+        live_session_marker: None,
+        read_live_store_title: Some(read_mimo_live_store_title),
+        // Input contract: line-discipline defaults — UNMEASURED (no authed
+        // turn has been driven through the wrapper). Flip only on a live
+        // measurement ([11.141] holds the bar).
+        submit_byte_own_chunk: false,
+        pty_echo_confirms_input: true,
+        remote_live_store_title: Some(MIMO_REMOTE_TITLE_PROBE),
+    },
 ];
 
 fn modified_epoch_ms_of(path: &Path) -> u128 {
@@ -5635,6 +5825,43 @@ fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<Strin
 /// per session id — the opencode reader's shape at devin's own path. A
 /// turnless session has no row, so the read answers None and the row keeps
 /// its birth name: honest, not silent-by-bug.
+/// [`AgentCliDescriptor::read_live_store_title`] for MiMo Code: the one
+/// SQLite store's own `title` column (measured 2026-09-26: rows self-title
+/// at creation, `title_source` 'fallback'; imports keep their original
+/// epoch, so newest-per-id is import-safe). Fixed db path relative to $HOME.
+fn read_mimo_live_store_title(home: &Path, session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let db_path = home.join(".local/share/mimocode/mimocode.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let Ok(mut stmt) = conn.prepare("SELECT title FROM session WHERE id = ?1 LIMIT 1") else {
+        return None;
+    };
+    let mut rows = stmt.query(rusqlite::params![session_id]).ok()?;
+    if let Ok(Some(row)) = rows.next() {
+        let title: Option<String> = row.get(0).ok();
+        if let Some(title) = title
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|s| !crate::looks_like_generated_fallback_title(s))
+            .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+        {
+            return Some(title);
+        }
+    }
+    None
+}
+
 fn read_devin_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     if session_id.trim().is_empty() {
         return None;
@@ -5703,6 +5930,42 @@ conn.close()
 const DEVIN_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
     script: DEVIN_REMOTE_TITLE_SCRIPT,
     locators: RemoteStoreLocators::HomeRelative(".local/share/devin/cli/sessions.db"),
+    choose: first_non_empty_candidate,
+};
+
+/// MiMo Code's remote twin: the shared mimocode.db's own `title` column
+/// (measured 2026-09-26: self-titled at row creation). Fixed db path
+/// relative to the remote $HOME; no store globs, so the locators list is
+/// empty and the script never uses argv's locator half — the devin shape.
+const MIMO_REMOTE_TITLE_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+argv = sys.argv[1:]
+if '--' not in argv:
+    sys.exit(0)
+ids = [v for v in argv[argv.index('--') + 1:] if v.strip()]
+if not ids:
+    sys.exit(0)
+db = os.path.expanduser('~/.local/share/mimocode/mimocode.db')
+if not os.path.exists(db):
+    sys.exit(0)
+conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+cur = conn.cursor()
+for sid in ids:
+    try:
+        cur.execute('SELECT title FROM session WHERE id = ?', (sid,))
+        row = cur.fetchone()
+    except Exception:
+        row = None
+    if row and row[0] and str(row[0]).strip():
+        print(json.dumps({'session_id': sid, 'candidates': [str(row[0]).strip()]}, ensure_ascii=False))
+conn.close()
+"#;
+
+/// The remote probe wiring for the script above (first non-empty candidate
+/// wins).
+const MIMO_REMOTE_TITLE_PROBE: RemoteStoreTitleProbe = RemoteStoreTitleProbe {
+    script: MIMO_REMOTE_TITLE_SCRIPT,
+    locators: RemoteStoreLocators::HomeRelative(".local/share/mimocode/mimocode.db"),
     choose: first_non_empty_candidate,
 };
 
@@ -7261,6 +7524,30 @@ pub fn opencode_store_index_holds_session(home: &Path, session_id: &str) -> Opti
 /// own answer about this id, not a claim that the session does not exist —
 /// the resume universe is wider than the sessions table. Absent db = the
 /// host cannot answer (`None`), never a verdict.
+pub fn mimo_store_holds_session(home: &Path, session_id: &str) -> Option<bool> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let conn = open_cli_index_readonly(&home.join(".local/share/mimocode/mimocode.db"))?;
+    match conn.query_row(
+        "SELECT 1 FROM session WHERE id = ?1;",
+        rusqlite::params![session_id],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Some(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// ⚠ MIMO STORE HAZARD (measured 2026-09-26): the store answers `true` for
+/// rows the auto-import put there (first launch imports Claude Code
+/// sessions into the same `session` table), so a store YES proves the id
+/// exists, not that mimo ever ran it. The [11.155]/[11.166] consumers only
+/// ask "does the peer store hold this id", which an imported row still
+/// answers honestly for a claude-imported conversation — fine; a future
+/// cold-restore consumer must filter by provenance instead.
+
 pub fn devin_store_holds_session(home: &Path, session_id: &str) -> Option<bool> {
     if session_id.trim().is_empty() {
         return None;

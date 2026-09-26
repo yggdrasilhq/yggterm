@@ -45,6 +45,7 @@ pub enum RemoteRuntimeKind {
     // so the variant lands with the registration — the
     // additive-on-the-wire law above covers it.
     Devin,
+    Mimo,
 }
 
 impl RemoteRuntimeKind {
@@ -68,6 +69,7 @@ impl RemoteRuntimeKind {
             Self::GrokBuild => "grok_build",
             Self::ZcodeTui => "zcode_tui",
             Self::Devin => "devin",
+            Self::Mimo => "mimo",
         }
     }
 
@@ -84,6 +86,7 @@ impl RemoteRuntimeKind {
             "grok_build" => Self::GrokBuild,
             "zcode_tui" => Self::ZcodeTui,
             "devin" => Self::Devin,
+            "mimo" => Self::Mimo,
             // Unrecognized values stay codex: a row written by a NEWER daemon
             // than this one must still read back as *something*, and codex is
             // the value this column held for its whole history.

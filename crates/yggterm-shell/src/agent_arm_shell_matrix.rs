@@ -167,6 +167,9 @@ fn arm_session_id(kind: SessionKind) -> &'static str {
         // 2026-09-16: `scythe-snowplow`), not uuids — the fixture keeps that
         // shape so the mount-identity tests exercise the real law.
         SessionKind::Devin => "brass-lantern",
+        // MiMo's ids are `ses_…` its mimocode.db mints (measured 2026-09-26,
+        // the opencode law) — the fixture keeps that shape.
+        SessionKind::MimoCode => "ses_mimofixture001aZ",
         // The matrix is derived from AGENT_CLIS, so a new CLI reaching here
         // without an id is the same class of miss the table exists to catch.
         other => panic!("{other:?} is in the arm matrix but has no fixture session id"),
@@ -485,6 +488,34 @@ const SHELL_ARMS: &[ShellArm] = &[
         kind: SessionKind::Devin,
         locality: Locality::Remote,
         row_scheme: "remote-devin://",
+        remote_resume_readiness: true,
+        scanned_sidebar_row: true,
+        remote_runtime_by_scheme: true,
+        cold_launch_discriminated: true,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },    // ── MimoCode joins AT REGISTRATION (the [11.145] devin lesson paid
+    // forward: the shell arms land WITH the intake, not as a later red):
+    // Local is the plain shell row every class-C/B CLI gets; Remote is the
+    // standard machinery (wrapper_slug `mimo` → remote-mimo:// rows,
+    // generated start/resume verbs).
+    ShellArm {
+        kind: SessionKind::MimoCode,
+        locality: Locality::Local,
+        row_scheme: "local://",
+        remote_resume_readiness: false,
+        scanned_sidebar_row: false,
+        remote_runtime_by_scheme: false,
+        cold_launch_discriminated: false,
+        applicable: true,
+        replay_screen_fallback_on_initial_read: true,
+        codex_like: false,
+    },
+    ShellArm {
+        kind: SessionKind::MimoCode,
+        locality: Locality::Remote,
+        row_scheme: "remote-mimo://",
         remote_resume_readiness: true,
         scanned_sidebar_row: true,
         remote_runtime_by_scheme: true,

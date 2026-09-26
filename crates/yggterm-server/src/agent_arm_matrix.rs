@@ -515,6 +515,36 @@ const ARMS: &[Arm] = &[
         resume_selector_token: "--resume",
         re_roots_with_cwd: false,
         store_globs: &[],
+    },    // ── The 11.6.13 registration (2026-09-26, lane/integration/mimo-intake).
+    // MEASURED-PARTIAL on the muse lab host (0.1.15): launch/resume flags off
+    // the binary's own --help (top-level `-s/--session`, `-m/--model` — the
+    // fork KEPT what opencode 2.x lost); the store is ONE SQLite db, so the
+    // store_globs cells stay EMPTY BY SHAPE (opencode/devin posture).
+    Arm {
+        kind: SessionKind::MimoCode,
+        locality: Locality::Local,
+        row_scheme: Some("local://"),
+        runtime_scheme: None,
+        remote_resume_subcommand: None,
+        remote_start_subcommand: None,
+        write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
+        binary: "mimo",
+        resume_selector_token: "--session",
+        re_roots_with_cwd: false,
+        store_globs: &[],
+    },
+    Arm {
+        kind: SessionKind::MimoCode,
+        locality: Locality::Remote,
+        row_scheme: Some("remote-mimo://"),
+        runtime_scheme: Some("mimo-runtime://"),
+        remote_resume_subcommand: Some("resume-mimo"),
+        remote_start_subcommand: Some("start-mimo"),
+        write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
+        binary: "mimo",
+        resume_selector_token: "--session",
+        re_roots_with_cwd: false,
+        store_globs: &[],
     },
 ];
 
