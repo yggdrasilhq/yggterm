@@ -29494,6 +29494,25 @@ merge. Until then every spawn, every row-resolving verb, and every
 agent's `server app rows` poll taxes the UI plane on large desktops —
 and the pollers multiply it. Evidence: ux-speed door §BASELINES
 (`campaign-ux-speed.md`), trace window of the 2026-09-15 spawn probe.
+
+**INSTRUMENT LEG LANDED 2026-09-26 (`lane/uxspeed/spawn-merge-cache`):**
+the merge cache key now decomposes per input family and
+`merge_rows_breakdown` payloads carry `source`, `key` and `input_keys`
+(hex) — a trace can name WHICH consumer merged and WHICH input moved.
+Fresh evidence on main (9961fe5e era): the seconds-class cost arrives in
+PAIRS — two back-to-back full merges ~20-50 ms apart, near-identical shape
+with stored row count differing by one (8302 ms stored=835 + 8246 ms
+stored=836, both at 8513 merged rows, 2026-09-26 window) — every
+invalidating change re-merges the whole 8.5k-row world on the UI thread
+TWICE. The spawn window shows the same shape small: three same-content
+miss pairs (139/142, 127/131, 132/137 ms) inside one scratch spawn; the
+spawn verb itself timed out 2/3 iterations right after the merge storms
+(the [11.130] residual). Falsifier for the fix leg: one spawn verb->mount
+window shows <=1 full (uncached) merge; the pair shape is gone from the
+breakdown stream; ambient ui/block p95 not worse. Note: the original
+queue-4 "queued gap" reading stays superseded by the [11.114]
+quiet-window correction — this lane targets the merge/UI-plane leg, not
+the daemon.
 ## ⛔ [11.118] THE MODAL'S REQUEST EDGE IS SILENT ON THE LIVE BUILD — `modal_open_requested` FIRES FOR THE BULK CLOSE-ALL BUT NEVER FOR SINGLE-ROW DELETES, AND THE CHORD-PATH OPENER `open_delete_dialog` CARRIES NO EMISSION AT ALL — the modal pair the ux-speed door defines cannot be measured end-to-end on 3.2.113 (measured live 2026-09-15 ~01:15-01:45 IST, five controlled opens, tools/uxspeed/uxprobe.py modal action)
 
 **Status:** OPEN

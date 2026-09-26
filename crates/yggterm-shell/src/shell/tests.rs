@@ -24906,6 +24906,7 @@ console.log('ok');
             &expanded,
             collapsed,
             arrangement,
+            "test",
         )
         .into_iter()
         .filter(|row| row.kind == BrowserRowKind::Session)
@@ -26968,6 +26969,97 @@ console.log('ok');
             Some("cargo test Runs the focused regression suite.")
         );
     }
+    #[test]
+    fn sidebar_merge_cache_key_parts_set_order_and_decomposition_laws() {
+        let empty_arrangement = yggterm_core::row_set_outline::RowArrangement::default();
+        // Two independently built instances of the SAME membership may iterate
+        // in different orders (RandomState is seeded per instance, so a
+        // rebuilt set is NOT order-identical to the stored one); the sorts in
+        // the input hashers are load-bearing — the key law must not care.
+        let words: Vec<String> = (0..32)
+            .map(|ix| format!("p/{:04}", (ix * 7919) % 1024))
+            .collect();
+        let a: HashSet<String> = words.iter().cloned().collect();
+        let b: HashSet<String> = words.iter().rev().cloned().collect();
+        let ka = sidebar_merge_cache_key_parts(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &a,
+            &HashSet::new(),
+            &empty_arrangement,
+        );
+        let kb = sidebar_merge_cache_key_parts(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &b,
+            &HashSet::new(),
+            &empty_arrangement,
+        );
+        assert_eq!(
+            ka.key, kb.key,
+            "same set membership must give the same key regardless of instance iteration order"
+        );
+        // One extra expanded path moves the key AND only the expanded input.
+        let c: HashSet<String> = a
+            .iter()
+            .cloned()
+            .chain(std::iter::once("p/novel".to_string()))
+            .collect();
+        let kc = sidebar_merge_cache_key_parts(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &c,
+            &HashSet::new(),
+            &empty_arrangement,
+        );
+        assert_ne!(ka.key, kc.key);
+        assert_ne!(ka.input_keys[5], kc.input_keys[5]);
+        for ix in (0..SIDEBAR_MERGE_INPUT_COUNT).filter(|ix| *ix != 5) {
+            assert_eq!(
+                ka.input_keys[ix], kc.input_keys[ix],
+                "input {ix} moved when only expanded_paths changed"
+            );
+        }
+        // Stored-row order is shape: the same rows in a different order must
+        // move the stored_rows input (the merged list follows the order).
+        let r1 = split_test_row(BrowserRowKind::Group, "grp/one", 0);
+        let r2 = split_test_row(BrowserRowKind::Group, "grp/two", 0);
+        let k12 = sidebar_merge_cache_key_parts(
+            &[r1.clone(), r2.clone()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &empty_arrangement,
+        );
+        let k21 = sidebar_merge_cache_key_parts(
+            &[r2, r1],
+            &[],
+            &[],
+            &[],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &empty_arrangement,
+        );
+        assert_ne!(
+            k12.key, k21.key,
+            "stored-row order is shape and must stay key-visible"
+        );
+        assert_ne!(k12.input_keys[0], k21.input_keys[0]);
+    }
+
     #[test]
     fn merged_sidebar_rows_include_saved_ssh_machine_roots() {
         let expanded_paths = HashSet::from(["__remote_machine__/pi-raspberry".to_string()]);
@@ -31222,6 +31314,7 @@ console.log('ok');
             &expanded,
             &HashSet::new(),
             &yggterm_core::row_set_outline::RowArrangement::default(),
+            "test",
         );
 
         assert!(rows.iter().any(|row| {
@@ -31278,6 +31371,7 @@ console.log('ok');
             &expanded,
             &HashSet::new(),
             &yggterm_core::row_set_outline::RowArrangement::default(),
+            "test",
         );
         assert!(rows.iter().any(|row| {
             row.full_path == "__remote_folder__/practice/home/user/git/samplers"
