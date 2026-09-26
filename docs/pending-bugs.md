@@ -29305,9 +29305,13 @@ asserts on app-state truth because the trace pairs do not exist.
 > identity in `input/keystroke` (half 3) and `first_frame` never firing for
 > idle shells + settle as the documented paint marker (half 4).
 
-> **LANDED IN CODE (2026-09-26 ~23:30 IST, lane/uxspeed/chord-close-all — the
-> CHORD half, half 3; LIVE PROOF OWED until the GUI rotates and the probe
-> asserts the faces):** the keytip bridge is the ONE terminus every chord
+> **LANDED + LIVE-PROVEN (2026-09-26 ~23:30 IST landed, ~00:30 IST proven,
+> lane/uxspeed/chord-close-all — the CHORD half, half 3; rotated build
+> 1b8d65be, uxprobe `--actions closeall` n=5 accuracy-failures 0, `ui/chord`
+> faces (tap, walk_key, derive) asserted from ytrace every iteration, tap→
+> overlay 80-126 ms and walk-key→row-menu 285-636 ms measured through the
+> REAL bridge; the confirm→rows-gone leg stays probe-gated to scratch-only
+> screens):** the keytip bridge is the ONE terminus every chord
 > crosses, so `keytip_apply_bridge_message` now emits `shell/ui/chord`
 > (always-sampled, wall clock, registered in perf.rs beside the input-latency
 > probes) with face + identity: `tap`, `accel` (the full ctrl/alt/shift/meta
@@ -29325,11 +29329,7 @@ asserts on app-state truth because the trace pairs do not exist.
 > menu → Close All… → bulk confirm dialog, cancel + survivors assert, chord
 > leg asserting the ui/chord faces, confirm leg gated to scratch-only
 > screens). STILL OPEN in this entry: `first_frame` never firing for idle
-> shells + settle as the documented paint marker (half 4). Live falsifier:
-> uxprobe `--actions closeall` on the rotated build reports
-> `chord_faces: [tap, walk_key, walk_key/menu_key, ...]` and the tap→
-> overlay→menu walls land; until rotation the chord leg reports the honest
-> `NO ui/chord events` refusal.
+> shells + settle as the documented paint marker (half 4).
 
 ## ⛔ [11.114] TERMINAL SPAWN/CLOSE/DRAG ARE SECONDS-CLASS, NOT MILLISECOND-CLASS — MEASURED COST LADDER FOR SPAWN: ~0.6s DAEMON PROCESSING → ~0.6-1.0s QUEUED GAP → ~2.1s MOUNT ENSURE → +0.5s SETTLE (measured 2026-09-14 late on the GUI host, synthetic scratch rows, tools/uxspeed/uxprobe.py)
 
