@@ -44902,6 +44902,41 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // The cap is a real reduction vs the flat retry: >= 16x the base interval.
         assert!(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS >= BACKGROUND_COPY_RETRY_MS * 16);
     }
+    // Regression guard for the hard-failure title loop ([11.116], measured 2026-09-15):
+    // two permanently unreachable remote rows burned 38 ok:false generations EACH over
+    // 6 h on the flat 5-min retry. The first burn stays on the ordinary ladder's first
+    // step; from the give-up streak on, the row holds the daily re-probe floor.
+    #[test]
+    fn title_error_retry_gives_the_row_a_daily_reprobe_after_two_hard_failures() {
+        assert_eq!(title_error_retry_ms(1), BACKGROUND_COPY_RETRY_MS); // 5m first burn
+        assert_eq!(title_error_retry_ms(2), COPY_TITLE_ERROR_REPROBE_MS); // give-up floor
+        assert_eq!(title_error_retry_ms(3), COPY_TITLE_ERROR_REPROBE_MS);
+        assert_eq!(title_error_retry_ms(99), COPY_TITLE_ERROR_REPROBE_MS);
+    }
+    // The ok:false span must name its reason ([11.116]'s "inarticulate failure" half):
+    // refusal vs timeout vs unreachable store has to be readable off the trace alone.
+    #[test]
+    fn title_span_error_reason_names_hard_failures_and_stays_silent_on_success() {
+        #[derive(Debug)]
+        struct DummyError;
+        impl std::fmt::Display for DummyError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "store unreachable")
+            }
+        }
+        let join_error = DummyError;
+        assert_eq!(
+            title_span_error_reason(Err::<&Result<(), DummyError>, _>(&join_error)).as_deref(),
+            Some("store unreachable")
+        );
+        let inner: Result<(), DummyError> = Err(DummyError);
+        assert_eq!(
+            title_span_error_reason(Ok::<_, &DummyError>(&inner)).as_deref(),
+            Some("store unreachable")
+        );
+        let inner: Result<(), DummyError> = Ok(());
+        assert_eq!(title_span_error_reason(Ok::<_, &DummyError>(&inner)), None);
+    }
     // Render-loop CPU fix (2026-06-16): the peek-only snapshot gate decides via this pure
     // predicate; it must agree exactly with whether retarget actually mutates, or the gate
     // either misses a real reschedule or wakes the root for a no-op.

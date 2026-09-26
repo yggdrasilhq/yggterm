@@ -1365,6 +1365,47 @@ fn no_title_backoff_ms(streak: u32) -> u64 {
         .unwrap_or(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS)
         .min(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS)
 }
+
+/// Consecutive HARD title-generation failures (transport/LLM/store errors —
+/// not the no-usable-title case above, which has its own backoff) before the
+/// passive loop gives the row the long re-probe floor. Two permanently
+/// unreachable remote rows burned 38 `ok:false` generations EACH over 6 h
+/// (p50 456 ms per attempt, ~every 5 min, the 2026-09-15 measurement) on a
+/// flat retry that could never succeed. Two burns keep a transient blip
+/// recoverable; past that the row waits out COPY_TITLE_ERROR_REPROBE_MS.
+const COPY_TITLE_ERROR_GIVEUP_STREAK: u32 = 2;
+/// Re-probe floor for a row that reached the give-up streak: one re-check
+/// per day. A success, a force regen, or an LLM settings change re-arms it
+/// sooner (the streak clears on each).
+const COPY_TITLE_ERROR_REPROBE_MS: u64 = 86_400_000;
+
+/// Passive retry delay after `streak` consecutive hard failures, counting
+/// the failure that just landed: the first burn retries on the ordinary
+/// no-title ladder's first step (5 min), and from
+/// COPY_TITLE_ERROR_GIVEUP_STREAK on the row holds the daily re-probe floor
+/// instead of a ladder it can never climb out of.
+fn title_error_retry_ms(streak: u32) -> u64 {
+    if streak >= COPY_TITLE_ERROR_GIVEUP_STREAK {
+        COPY_TITLE_ERROR_REPROBE_MS
+    } else {
+        no_title_backoff_ms(streak.saturating_sub(1))
+    }
+}
+
+/// The reason a title-generation span failed, lifted onto the perf payload so
+/// a trace reader can tell refusal from timeout from unreachable store (the
+/// "failure is inarticulate" half of [11.116]). `None` on success — including
+/// the no-usable-title outcome, which is a completed generation that found
+/// nothing to title.
+fn title_span_error_reason<T, E: std::fmt::Display, J: std::fmt::Display>(
+    outcome: Result<&Result<T, E>, &J>,
+) -> Option<String> {
+    match outcome {
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(error) => Some(error.to_string()),
+        Ok(Ok(_)) => None,
+    }
+}
 const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATION";
 const TERMINAL_RECIPE_DRAG_ENV: &str = "YGGTERM_ENABLE_TERMINAL_RECIPE_DRAG";
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
@@ -18346,6 +18387,13 @@ struct ShellState {
     // 2026-06-15). Reset to 0 on a successful title so a session that later gets content
     // re-titles promptly.
     copy_title_no_title_streak: HashMap<String, u32>,
+    // Per-session count of consecutive HARD passive title-generation failures (the
+    // Ok(Err)/Err arms: unreachable store, dead remote, LLM error). Two burns put the
+    // row on the daily re-probe floor (title_error_retry_ms) instead of the flat 5-min
+    // retry that produced the 38-failures-per-row-per-6h storm measured 2026-09-15.
+    // Cleared on success, on a force regen, and with the other passive-copy state on an
+    // LLM settings change.
+    copy_title_error_streak: HashMap<String, u32>,
     title_autogen_retry_after_ms: HashMap<String, u64>,
     title_autogen_retry_pending: HashSet<String>,
     native_clipboard_owner: Option<Rc<RefCell<NativeClipboardOwner>>>,
@@ -20940,6 +20988,7 @@ impl ShellState {
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
             copy_title_no_title_streak: HashMap::new(),
+            copy_title_error_streak: HashMap::new(),
             title_autogen_retry_after_ms: HashMap::new(),
             title_autogen_retry_pending: HashSet::new(),
             native_clipboard_owner: None,
@@ -33678,6 +33727,7 @@ impl ShellState {
         self.settings.litellm_endpoint = value;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
+        self.copy_title_error_streak.clear();
         self.reset_passive_copy_generation_gate();
         self.persist_settings();
         self.last_action = "updated LiteLLM endpoint".to_string();
@@ -33686,6 +33736,7 @@ impl ShellState {
         self.settings.litellm_api_key = value;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
+        self.copy_title_error_streak.clear();
         self.reset_passive_copy_generation_gate();
         self.persist_settings();
         self.last_action = "updated LiteLLM API key".to_string();
@@ -33694,6 +33745,7 @@ impl ShellState {
         self.settings.interface_llm_model = value;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
+        self.copy_title_error_streak.clear();
         self.reset_passive_copy_generation_gate();
         self.persist_settings();
         self.last_action = "updated interface llm".to_string();
@@ -37674,6 +37726,14 @@ fn spawn_title_generation_for_target(
     if !should_start {
         return;
     }
+    if force {
+        // An explicit regen re-learns from scratch: a give-up streak earned by
+        // the passive loop must not turn the user's own next failure into an
+        // instant day-long silence.
+        safe_shell_mut(state, "title_generation_force_relearn", |shell| {
+            shell.copy_title_error_streak.remove(&session_path)
+        });
+    }
     let job_key = format!("copy:title:{session_path}");
     let job_title = if announce {
         "Generating Title"
@@ -37759,6 +37819,7 @@ fn spawn_title_generation_for_target(
             "force": force,
             "announce": announce,
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+            "error": title_span_error_reason(outcome.as_ref()),
         }));
         let emit_completion = announce;
         let persist_request = safe_shell_mut(state, "title_generation_finish", |shell| {
@@ -37771,6 +37832,8 @@ fn spawn_title_generation_for_target(
                 // The session produced a usable title -> reset the no-title backoff streak
                 // so if it is ever legitimately re-titled later it starts from the fast cadence.
                 shell.copy_title_no_title_streak.remove(&session_path);
+                // ...and reset the hard-failure give-up streak the same way.
+                shell.copy_title_error_streak.remove(&session_path);
                 // A success imposes a cooldown rather than clearing the backoff: if the
                 // freshly-generated title later gets clobbered back to a fallback (the
                 // remote-scan/mirror round-trip class), the passive scan must NOT
@@ -37856,13 +37919,20 @@ fn spawn_title_generation_for_target(
                         .passive_copy_failures
                         .insert(background_copy_retry_key("title", &session_path));
                 }
-                shell.copy_retry_after_ms.insert(
-                    background_copy_retry_key("title", &session_path),
-                    current_millis() + BACKGROUND_COPY_RETRY_MS,
-                );
+                let error_streak = {
+                    let streak = shell
+                        .copy_title_error_streak
+                        .entry(session_path.clone())
+                        .or_insert(0);
+                    *streak = streak.saturating_add(1);
+                    *streak
+                };
+                let retry_key = background_copy_retry_key("title", &session_path);
+                let retry_after_ms = current_millis() + title_error_retry_ms(error_streak);
+                shell.copy_retry_after_ms.insert(retry_key, retry_after_ms);
                 schedule_active_retry = !force;
                 shell.last_action = format!("title generation failed: {error}");
-                warn!(session_path=%target.session_path, error=%error, "title generation failed");
+                warn!(session_path=%target.session_path, error=%error, streak=error_streak, gave_up=error_streak >= COPY_TITLE_ERROR_GIVEUP_STREAK, "title generation failed");
                 if announce {
                     shell.finish_job_notification(
                         &job_key,
@@ -37883,13 +37953,20 @@ fn spawn_title_generation_for_target(
                         .passive_copy_failures
                         .insert(background_copy_retry_key("title", &session_path));
                 }
-                shell.copy_retry_after_ms.insert(
-                    background_copy_retry_key("title", &session_path),
-                    current_millis() + BACKGROUND_COPY_RETRY_MS,
-                );
+                let error_streak = {
+                    let streak = shell
+                        .copy_title_error_streak
+                        .entry(session_path.clone())
+                        .or_insert(0);
+                    *streak = streak.saturating_add(1);
+                    *streak
+                };
+                let retry_key = background_copy_retry_key("title", &session_path);
+                let retry_after_ms = current_millis() + title_error_retry_ms(error_streak);
+                shell.copy_retry_after_ms.insert(retry_key, retry_after_ms);
                 schedule_active_retry = !force;
                 shell.last_action = format!("title generation task failed: {error}");
-                warn!(session_path=%target.session_path, error=%error, "title generation task join failed");
+                warn!(session_path=%target.session_path, error=%error, streak=error_streak, gave_up=error_streak >= COPY_TITLE_ERROR_GIVEUP_STREAK, "title generation task join failed");
                 if announce {
                     shell.finish_job_notification(
                         &job_key,

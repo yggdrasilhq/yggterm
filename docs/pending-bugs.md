@@ -29657,7 +29657,31 @@ different toolchains, on/off pair measured).
 
 ## ⛔ [11.116] ROW TITLE GENERATION RETRIES FOREVER AGAINST TWO PERMANENTLY-FAILING REMOTE ROWS — 68% OF ATTEMPTS FAIL, p50 456 ms PER ATTEMPT, AND THE ok:false TRACE CARRIES NO REASON (measured 2026-09-15 ~00:15-01:15 IST on the GUI host, ux-speed switch-plane investigation)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+> **FIXED IN CODE (2026-09-27 ~03:25 IST, lane/uxspeed/title-retry-giveup
+> 1dd9799a, a zcode seat on the muse lab host, work FROM dev; shell lib
+> 2169/2 with the failure set byte-identical to clean main at 3f3c747e — the
+> two are the pre-existing idle-mount/paint-coverage reds):** the two
+> hard-failure arms (`Ok(Err)`/`Err` — the arm class the dead rows live in)
+> now keep a per-row consecutive-failure streak
+> (`copy_title_error_streak`): the first burn retries on the ordinary 5-min
+> step, and from the second consecutive failure on the row holds a DAILY
+> re-probe floor (`COPY_TITLE_ERROR_REPROBE_MS`) instead of a flat 5-min
+> ladder it can never climb out of. Success, a force regen (the user's own
+> next failure must not buy instant day-long silence), and the LLM settings
+> changes clear the streak. The `ok:false` span now NAMES its reason
+> (`error` on the perf payload via `title_span_error_reason`; the warn
+> carries `streak` + `gave_up`). Falsifier math: a fresh permanently-failing
+> row burns exactly 2 spans (t0, t0+5m) and then one re-probe per day — any
+> 6 h window holds ≤2, and every span carries `error`. Natural pre-fix
+> evidence on the record: `remote-cc://oc/d47381a8…` — the SAME row this
+> entry named on 2026-09-15 — burned 8 more `ok:false` spans across
+> 09-24→09-26 in the live generations (26 title spans total in the window).
+> LIVE PROOF OWED: on the rotated build that row burns ≤2 spans with
+> `error` present and then goes silent for a day. Scope note: the
+> precis/summary twins still retry flat on `BACKGROUND_COPY_RETRY_MS` —
+> same disease one plane over, unowned.
 
 Filed 2026-09-15 ~01:30 IST on `lane/uxspeed/switch-plane-vocab` (ux-speed
 campaign, the [11.87] switch-plane seat's follow-on investigation).
