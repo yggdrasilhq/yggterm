@@ -628,7 +628,12 @@ dioxus.send(out);
         return summarize(out, key="into_commit_ms")
 
     def action_menu(self, iters: int) -> dict:
-        rows_ready = self.ensure_two_scratch_rows()
+        # The terminal viewport menu lives on the xterm surface, and the
+        # surface mounts ONLY on the active view — a --no-activate scratch
+        # row has no host in the webview registry at all (measured live
+        # 2026-09-26: terminal_host_missing 3/3), so the probe must land on
+        # an ACTIVATED row — queue item 7's mounted-surface discipline.
+        rows_ready = self.ensure_scratch_rows(1, activate=True)
         if not rows_ready:
             return {"error": "no scratch row to probe", "iterations": []}
         path = rows_ready[0]
@@ -673,6 +678,8 @@ dioxus.send(out);
                 "menu_wait_ms": data.get("menu_wait_ms"),
                 "host_wait_ms": data.get("host_wait_ms"),
                 "item_count": len(items) if items else None,
+                "action_names": action_names or None,
+                "menu_rect": data.get("menu_rect"),
                 "has_terminal_action": data.get("has_terminal_action"),
                 "no_paste_side_effect": data.get("no_paste_side_effect"),
                 "accuracy_failures": acc,
