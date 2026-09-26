@@ -5697,13 +5697,18 @@ impl YggtermServer {
                 // key with no directory ([11.156] class).
                 .or(entry_cwd)
                 .unwrap_or_else(|| session_preview_cwd(path));
-            entry.launch_command = stored_session_launch_command_for_locality(
-                kind,
-                &resolved_cwd,
-                &resolved_session_id,
-                !session_path_is_remote(path),
-                ssh_target_from_session_path(path),
-            );
+            let carried_entry_identity =
+                funnel_carried_identity_exports(Some(&entry.launch_command));
+            entry.launch_command =
+                stored_session_launch_command_for_locality_with_options_and_identity(
+                    kind,
+                    &resolved_cwd,
+                    &resolved_session_id,
+                    !session_path_is_remote(path),
+                    ssh_target_from_session_path(path),
+                    &AgentLaunchOptions::default(),
+                    Some(&carried_entry_identity),
+                );
         }
         entry.kind = kind;
         entry.backend = self.backend;
@@ -8574,19 +8579,30 @@ impl YggtermServer {
             && agent_cli_descriptor(session.kind).is_some()
         {
             if let Some(cwd) = session_metadata_value(session, "Cwd") {
+                let carried_repoint_identity =
+                    funnel_carried_identity_exports(Some(&session.launch_command));
                 session.launch_command = if vouch_from_store {
-                    stored_session_launch_command_for_locality(
+                    stored_session_launch_command_for_locality_with_options_and_identity(
                         session.kind,
                         &cwd,
                         session_id,
                         true,
                         None,
+                        &AgentLaunchOptions::default(),
+                        Some(&carried_repoint_identity),
                     )
                 } else {
-                    stored_session_launch_command_service_vouched(
+                    // The service-vouched twin composes through the same
+                    // identity-aware builder with the carried exports.
+                    stored_session_launch_command_from_vouch_with_identity(
                         session.kind,
                         &cwd,
                         session_id,
+                        true,
+                        None,
+                        &AgentLaunchOptions::default(),
+                        None,
+                        Some(&carried_repoint_identity),
                     )
                 };
             }
@@ -9749,13 +9765,18 @@ impl YggtermServer {
                         if session.kind != correct_kind {
                             session.kind = correct_kind;
                             let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
-                            session.launch_command = stored_session_launch_command_for_locality(
-                                correct_kind,
-                                &cwd,
-                                &session.id,
-                                !session_path_is_remote(&storage_path),
-                                ssh_target_from_session_path(&storage_path),
-                            );
+                            let carried_focus_identity =
+                                funnel_carried_identity_exports(Some(&session.launch_command));
+                            session.launch_command =
+                                stored_session_launch_command_for_locality_with_options_and_identity(
+                                    correct_kind,
+                                    &cwd,
+                                    &session.id,
+                                    !session_path_is_remote(&storage_path),
+                                    ssh_target_from_session_path(&storage_path),
+                                    &AgentLaunchOptions::default(),
+                                    Some(&carried_focus_identity),
+                                );
                             if session.session_path.starts_with("codex-runtime://") {
                                 session.session_path = format!("local://{}", session.id);
                                 new_key = Some(session.session_path.clone());
@@ -13688,14 +13709,23 @@ impl YggtermServer {
                     let cwd = session_metadata_value(session, "Cwd")
                         .or_else(|| target.cwd.clone())
                         .unwrap_or_else(local_default_cwd);
-                    session.launch_command = stored_session_launch_command_for_locality_with_options(
-                        session.kind,
-                        &cwd,
-                        &id,
-                        true,
-                        None,
-                        &agent_launch_options,
-                    );
+                    // [11.168]: the restore re-derivation carries the row's
+                    // persisted identity exports — the restore recompose ran
+                    // BEFORE any ensure and was the leak that re-identified a
+                    // dark-born probe row light after the rotation (falsifier
+                    // 2026-09-26, muse lab host).
+                    let carried_restore_identity =
+                        funnel_carried_identity_exports(Some(&session.launch_command));
+                    session.launch_command =
+                        stored_session_launch_command_for_locality_with_options_and_identity(
+                            session.kind,
+                            &cwd,
+                            &id,
+                            true,
+                            None,
+                            &agent_launch_options,
+                            Some(&carried_restore_identity),
+                        );
                     upsert_session_metadata(
                         &mut session.metadata,
                         "Launch",
@@ -13847,13 +13877,18 @@ impl YggtermServer {
         if !stored.title.trim().is_empty() {
             live.title = stored.title.clone();
         }
-        live.launch_command = stored_session_launch_command_for_locality(
-            stored.kind,
-            &cwd,
-            &session_id,
-            true,
-            None,
-        );
+        let carried_stored_focus_identity =
+            funnel_carried_identity_exports(Some(&stored.launch_command));
+        live.launch_command =
+            stored_session_launch_command_for_locality_with_options_and_identity(
+                stored.kind,
+                &cwd,
+                &session_id,
+                true,
+                None,
+                &AgentLaunchOptions::default(),
+                Some(&carried_stored_focus_identity),
+            );
         live.preview = stored.preview.clone();
         live.rendered_sections = stored.rendered_sections.clone();
         live.terminal_lines = vec![
@@ -37013,14 +37048,36 @@ fn agent_launch_command_with_options(
     session_id: Option<&str>,
     launch: &AgentLaunchOptions,
 ) -> String {
+    agent_launch_command_with_options_and_identity(kind, cwd, session_id, launch, None)
+}
+
+/// [11.168] twin: a RE-composed agent launch carries the row's own identity
+/// exports (`Some`, possibly empty = bare row — the raw extraction, the prior
+/// command is in reach at every caller) instead of re-reading the host
+/// global. `None` composes byte-identically to the pre-carry law.
+fn agent_launch_command_with_options_and_identity(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+    launch: &AgentLaunchOptions,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
     let action = session_id.map_or(ManagedCliAction::Launch, |session_id| {
         ManagedCliAction::Resume {
             session_id,
             persistent: false,
         }
     });
-    managed_cli_shell_command_full(kind, cwd, action, None, launch)
-        .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
+    managed_cli_shell_command_configured_with_identity(
+        kind,
+        cwd,
+        action,
+        None,
+        launch,
+        None,
+        carried_identity_exports,
+    )
+    .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
 }
 
 /// A FRESH Claude Code session must be BORN with its identity: launch
@@ -37044,9 +37101,26 @@ fn claude_code_fresh_launch_command_with_options(
     session_id: &str,
     launch: &AgentLaunchOptions,
 ) -> String {
+    claude_code_fresh_launch_command_with_identity(cwd, session_id, launch, None)
+}
+
+/// [11.168] twin: a re-birth inside the same row keeps the row's terminal
+/// world — the carried identity exports ride the fresh `--session-id` launch.
+fn claude_code_fresh_launch_command_with_identity(
+    cwd: Option<&str>,
+    session_id: &str,
+    launch: &AgentLaunchOptions,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
     format!(
         "{} --session-id {}",
-        agent_launch_command_with_options(SessionKind::ClaudeCode, cwd, None, launch),
+        agent_launch_command_with_options_and_identity(
+            SessionKind::ClaudeCode,
+            cwd,
+            None,
+            launch,
+            carried_identity_exports
+        ),
         shell_single_quote(session_id)
     )
 }
@@ -37221,10 +37295,35 @@ fn stored_session_launch_command_for_locality_with_options(
     ssh_target: Option<&str>,
     launch: &AgentLaunchOptions,
 ) -> String {
+    stored_session_launch_command_for_locality_with_options_and_identity(
+        kind,
+        cwd,
+        session_id,
+        is_local,
+        ssh_target,
+        launch,
+        None,
+    )
+}
+
+/// [11.168] twin: the restore/re-open re-derivation carries the row's own
+/// identity exports (`Some`, possibly empty = bare row — the raw extraction
+/// from the persisted/stored command, which the caller holds) instead of
+/// re-reading the host global. `None` composes byte-identically to the
+/// pre-carry law.
+fn stored_session_launch_command_for_locality_with_options_and_identity(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    is_local: bool,
+    ssh_target: Option<&str>,
+    launch: &AgentLaunchOptions,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
     let vouch = is_local
         .then(|| local_agent_store_vouches_for_session(kind, session_id))
         .flatten();
-    stored_session_launch_command_from_vouch(
+    stored_session_launch_command_from_vouch_with_identity(
         kind,
         cwd,
         session_id,
@@ -37232,6 +37331,7 @@ fn stored_session_launch_command_for_locality_with_options(
         ssh_target,
         launch,
         vouch,
+        carried_identity_exports,
     )
 }
 
@@ -37269,20 +37369,53 @@ fn stored_session_launch_command_from_vouch(
     launch: &AgentLaunchOptions,
     vouch: Option<bool>,
 ) -> String {
+    stored_session_launch_command_from_vouch_with_identity(
+        kind,
+        cwd,
+        session_id,
+        is_local,
+        ssh_target,
+        launch,
+        vouch,
+        None,
+    )
+}
+
+/// [11.168] twin: the re-derived stored-open/restore command carries the row's
+/// own identity exports (`Some`, possibly empty = bare row) instead of
+/// re-reading the host global. `None` composes byte-identically to the
+/// pre-carry law.
+fn stored_session_launch_command_from_vouch_with_identity(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    is_local: bool,
+    ssh_target: Option<&str>,
+    launch: &AgentLaunchOptions,
+    vouch: Option<bool>,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
+    let carried = carried_identity_exports.unwrap_or_default();
     match kind {
         SessionKind::ClaudeCode if is_local => match local_cc_resume_cwd(session_id) {
             // Resume in the cwd the TRANSCRIPT records, never the row's cwd: CC keys its
             // project dir on the process cwd, and a relaunch path can hand us a row whose
             // cwd has been defaulted to $HOME — which makes CC search the wrong project
             // dir and refuse a session that is sitting right there.
-            Some(transcript_cwd) => agent_launch_command_with_options(
+            Some(transcript_cwd) => agent_launch_command_with_options_and_identity(
                 kind,
                 Some(&transcript_cwd),
                 Some(session_id),
                 launch,
+                Some(&carried),
             ),
             // No transcript: nothing to resume. Re-birth the row with its own id.
-            None => claude_code_fresh_launch_command_with_options(Some(cwd), session_id, launch),
+            None => claude_code_fresh_launch_command_with_identity(
+                Some(cwd),
+                session_id,
+                launch,
+                Some(&carried),
+            ),
         },
         SessionKind::Document => "document web view".to_string(),
         SessionKind::Shell => {
@@ -37308,7 +37441,13 @@ fn stored_session_launch_command_from_vouch(
         SessionKind::SshShell => match ssh_target {
             Some(target) if !target.trim().is_empty() => {
                 let remote_binary = preferred_remote_binary_fallback();
-                remote_ssh_launch_command(
+                let identity_exports = if carried.is_empty() {
+                    // Pre-carry law for a bare row: the host global.
+                    terminal_identity_shell_exports_for_remote()
+                } else {
+                    carried.to_vec()
+                };
+                remote_ssh_launch_command_with_identity_exports(
                     target,
                     None,
                     &remote_binary,
@@ -37319,6 +37458,8 @@ fn stored_session_launch_command_from_vouch(
                         cwd,
                         crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
                     ],
+                    &[],
+                    &identity_exports,
                 )
             }
             // No `ssh://` path in reach — not a shape the stored-open
@@ -37389,7 +37530,13 @@ fn stored_session_launch_command_from_vouch(
                             yggterm_core::cli_plane::CliLaunchContractBreach::StoreAbsentRebirth,
                         );
                     }
-                    agent_launch_command_with_options(kind, Some(cwd), birth_id, launch)
+                    agent_launch_command_with_options_and_identity(
+                        kind,
+                        Some(cwd),
+                        birth_id,
+                        launch,
+                        Some(&carried),
+                    )
                 }
                 // Vouched for, or unanswerable. ⛔ `None` must behave exactly like
                 // `Some(true)`: re-birthing because a store could not be READ
@@ -37406,7 +37553,13 @@ fn stored_session_launch_command_from_vouch(
                         ),
                         false,
                     );
-                    agent_launch_command_with_options(kind, Some(cwd), Some(session_id), launch)
+                    agent_launch_command_with_options_and_identity(
+                        kind,
+                        Some(cwd),
+                        Some(session_id),
+                        launch,
+                        Some(&carried),
+                    )
                 }
             }
         }
@@ -50171,6 +50324,36 @@ terminal_window_id: None,
         );
     }
 
+    /// The RESTORE re-derivation (the arm the live falsifier caught: a
+    /// dark-born probe row respawned LIGHT after the rotation because the
+    /// locality builder recomposed from the current global before any ensure
+    /// ran) carries the row's persisted identity exports through the rebuilt
+    /// command.
+    #[test]
+    fn the_restore_rederivation_carries_the_rows_identity_exports() {
+        let _guard = terminal_identity_test_guard();
+        crate::sync_terminal_identity_appearance("light");
+        let previous = "export YGGTERM_TERMINAL_APPEARANCE='dark' && export COLORFGBG='15;0' && export YGGTERM_TERMINAL_COLOR_BACKGROUND='#262a33' && exec codex resume abc";
+        let carried = terminal_identity_exports_in_command(previous);
+        let command = stored_session_launch_command_for_locality_with_options_and_identity(
+            SessionKind::Codex,
+            "/srv/app",
+            "abc123",
+            true,
+            None,
+            &AgentLaunchOptions::default(),
+            Some(&carried),
+        );
+        assert!(command.contains("APPEARANCE="), "{command}");
+        assert!(command.contains("dark"), "{command}");
+        assert!(command.contains("15;0"), "{command}");
+        assert!(command.contains("#262a33"), "{command}");
+        assert!(
+            !command.contains("0;15") && !command.contains("light"),
+            "the light global must not leak into a carried row: {command}"
+        );
+    }
+
     /// The open/restore reconfigure lane (`configure_remote_resume_live_session`
     /// — the arm `open_remote_scanned_session_with_view_and_kind` and
     /// `restore_live_session` both ride) keeps a themed row's identity exports
@@ -50274,6 +50457,14 @@ terminal_window_id: None,
             "fn configure_remote_resume_live_session(",
             "fn configure_remote_new_codex_live_session(",
             "fn configure_remote_ssh_shell_live_session(",
+            // The [11.168] falsifier found the NEXT leak: the restore
+            // re-derivation recomposed from the global BEFORE any ensure ran,
+            // so the fixed funnel faithfully carried the already-flipped
+            // exports. Every recompose arm of the restore/open lane is locked
+            // the same way.
+            "fn restore_live_session(",
+            "fn focus_live_session(",
+            "fn focus_or_create_live_runtime_for_stored_session(",
         ] {
             let body = body_of(name);
             assert!(
