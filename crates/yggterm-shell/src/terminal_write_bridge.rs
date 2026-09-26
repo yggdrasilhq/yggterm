@@ -2,6 +2,24 @@ use crate::terminal_write_policy::terminal_output_contains_codex_welcome_surface
 
 const TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES: usize = 256 * 1024;
 
+/// Flood staging ([11.170]): once this much output has crossed the bridge since
+/// its last flush, plain (marker-less) volume stops riding the per-chunk
+/// immediate path and starts staging under the bridge's frame cadence instead.
+/// Measured 2026-09-26 (uxspeed render-batch lane, A/B perf capture dd-armB-wk):
+/// under a plain `yes` stream the WebKitWebProcess burned 53.5% of cycles in
+/// clock_gettime syscall machinery plus ~36% in JS — per-chunk eval dispatches
+/// (glib main-loop wake + the JS write handler's Date.now reads), because the
+/// frame-marker predicate in terminal_write_should_frame_budget never matches
+/// marker-less output. The latch is volume-based so it needs no policy input:
+/// small interactive output stays immediate until 8 KiB has crossed, then the
+/// flood coalesces. Resets on every flush, so short bursts never arm it.
+const TERMINAL_FLOOD_STAGE_BYTES: usize = 8 * 1024;
+/// Flood staging only arms on the fast cadences (active ≈16ms, flood ≈66ms).
+/// A relaxed budget (animation 250-1000ms, idle 4000ms) must never HOLD plain
+/// output that long — those surfaces keep their existing per-chunk path and
+/// their own JS-side budgeting.
+const TERMINAL_FLOOD_STAGE_MAX_FRAME_MS: u64 = 66;
+
 /// Coalesces terminal output into frame-budget batches before handing it to the
 /// webview's `term.write`. This is now a PURE IPC batcher: it only reduces the
 /// number of Rust→JS eval round-trips on bursty output.
@@ -22,6 +40,7 @@ pub(crate) struct TerminalWriteBridge {
     last_frame_flush_ms: u64,
     alt_screen_active: bool,
     cursor_hidden_active: bool,
+    volume_since_flush: usize,
 }
 
 impl TerminalWriteBridge {
@@ -32,6 +51,7 @@ impl TerminalWriteBridge {
             last_frame_flush_ms: 0,
             alt_screen_active: false,
             cursor_hidden_active: false,
+            volume_since_flush: 0,
         }
     }
 
@@ -62,8 +82,21 @@ impl TerminalWriteBridge {
             || (frame_mode_active
                 && !exits_alt_screen
                 && !terminal_output_contains_codex_welcome_surface(&data));
+        self.volume_since_flush = self.volume_since_flush.saturating_add(data.len());
+        // Flood staging ([11.170]): sustained plain output with no TUI frame
+        // markers never satisfies the marker-based predicate, so before this
+        // latch every chunk of a flood paid its own Rust→JS eval (glib wake +
+        // clock reads in the renderer). Once enough volume has crossed since
+        // the last flush AND the surface is on a fast cadence, volume stages
+        // under the same frame budget as marker-bearing frames. Codex welcome
+        // surfaces keep the immediate path exactly as the predicate does.
+        let flood_stage = !effective_frame_budget
+            && self.frame_ms > 0
+            && self.frame_ms <= TERMINAL_FLOOD_STAGE_MAX_FRAME_MS
+            && self.volume_since_flush >= TERMINAL_FLOOD_STAGE_BYTES
+            && !terminal_output_contains_codex_welcome_surface(&data);
 
-        if !effective_frame_budget || self.frame_ms == 0 {
+        if !(effective_frame_budget || flood_stage) {
             let mut writes = Vec::new();
             if let Some(pending) = self.flush_all(now_ms) {
                 writes.push(pending);
@@ -113,6 +146,7 @@ impl TerminalWriteBridge {
             return None;
         }
         self.last_frame_flush_ms = now_ms;
+        self.volume_since_flush = 0;
         Some(std::mem::take(&mut self.pending))
     }
 

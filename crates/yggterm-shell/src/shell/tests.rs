@@ -55364,6 +55364,124 @@ Shared connection to 192.0.2.14 closed.\r\n";
         );
     }
     #[test]
+    fn terminal_write_bridge_flood_latch_stages_markerless_volume() {
+        // [11.170]: plain volume (a build log, `yes`) carries no TUI frame
+        // markers, so the marker-based predicate never budgets it and every
+        // chunk paid its own Rust→JS eval. Sustained volume must latch the
+        // bridge into staging under the same frame cadence. The bridge's
+        // cold start (last_frame_flush_ms == 0) flushes the first staged
+        // chunk immediately — cadence holding starts from the next one.
+        let mut bridge = TerminalWriteBridge::new(16);
+        let chunk = "a".repeat(3000);
+        assert_eq!(
+            bridge.stage_or_immediate(chunk.clone(), 1_000, false),
+            vec![chunk.clone()]
+        );
+        assert_eq!(
+            bridge.stage_or_immediate(chunk.clone(), 1_001, false),
+            vec![chunk.clone()]
+        );
+        // 9_000 bytes have now crossed: the latch arms. This chunk stages and
+        // the cold-start cadence flushes it in the same call.
+        assert_eq!(
+            bridge.stage_or_immediate(chunk.clone(), 1_002, false),
+            vec![chunk.clone()]
+        );
+        // Below threshold again: immediate.
+        assert_eq!(
+            bridge.stage_or_immediate(chunk.clone(), 1_003, false),
+            vec![chunk.clone()]
+        );
+        assert_eq!(
+            bridge.stage_or_immediate(chunk.clone(), 1_004, false),
+            vec![chunk.clone()]
+        );
+        // Re-armed mid-flood: this chunk stages and HELDS for the cadence.
+        assert!(bridge.stage_or_immediate(chunk.clone(), 1_005, false).is_empty());
+        assert_eq!(bridge.pending_for_test(), chunk);
+        assert_eq!(
+            bridge.flush_due(1_021).as_deref(),
+            Some(chunk.as_str()),
+            "staged flood bytes flush under the active frame budget"
+        );
+        assert_eq!(
+            bridge.stage_or_immediate("b".to_string(), 1_022, false),
+            vec!["b".to_string()],
+            "after a flush the latch is cold: small output is immediate again"
+        );
+    }
+
+    #[test]
+    fn terminal_write_bridge_flood_latch_is_byte_exact_under_sustained_flood() {
+        // Accuracy co-equal with speed: whatever the staging decision per
+        // chunk, the concatenated forwarded stream must equal the input.
+        let mut bridge = TerminalWriteBridge::new(16);
+        let chunk = "x".repeat(4096);
+        let mut sent = Vec::new();
+        let mut forwarded = Vec::new();
+        for index in 0..12 {
+            let now_ms = 1_000 + index * 4;
+            sent.push(chunk.clone());
+            forwarded.extend(bridge.stage_or_immediate(chunk.clone(), now_ms, false));
+            if let Some(data) = bridge.flush_due(now_ms + 1) {
+                forwarded.push(data);
+            }
+        }
+        // The live loop's pre-select flush_due tick drains the tail in
+        // production; the test drains explicitly.
+        if let Some(data) = bridge.flush_due(10_000) {
+            forwarded.push(data);
+        }
+        assert_eq!(
+            forwarded.concat(),
+            sent.concat(),
+            "no byte may be lost, duplicated or reordered by flood staging"
+        );
+    }
+
+    #[test]
+    fn terminal_write_bridge_flood_latch_needs_a_fast_cadence() {
+        // A relaxed budget (idle 4000ms) must never HOLD plain output that
+        // long; those surfaces keep the immediate path and their own JS-side
+        // budgeting.
+        let mut bridge = TerminalWriteBridge::new(4000);
+        let chunk = "a".repeat(2500);
+        for now_ms in [1_000, 1_001, 1_002, 1_003] {
+            assert_eq!(
+                bridge.stage_or_immediate(chunk.clone(), now_ms, false),
+                vec![chunk.clone()],
+                "relaxed frame budget must not flood-stage"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_write_bridge_flood_latch_never_stages_codex_welcome() {
+        let mut bridge = TerminalWriteBridge::new(16);
+        let chunk = "a".repeat(2500);
+        for now_ms in [1_000, 1_001, 1_002] {
+            let _ = bridge.stage_or_immediate(chunk.clone(), now_ms, false);
+        }
+        // Fourth chunk crosses 8 KiB; cold-start cadence flushes it here.
+        assert_eq!(
+            bridge.stage_or_immediate(chunk.clone(), 1_003, false),
+            vec![chunk.clone()]
+        );
+        // Re-arm: fifth..seventh cross 7500, eighth crosses the threshold and
+        // holds pending under the cadence.
+        for now_ms in [1_004, 1_005, 1_006] {
+            let _ = bridge.stage_or_immediate(chunk.clone(), now_ms, false);
+        }
+        let eighth = "a".repeat(2500);
+        assert!(bridge.stage_or_immediate(eighth.clone(), 1_007, false).is_empty());
+        let welcome = "OpenAI Codex — type /model to change the model".to_string();
+        assert_eq!(
+            bridge.stage_or_immediate(welcome.clone(), 1_008, false),
+            vec![eighth.clone(), welcome.clone()],
+            "the codex welcome surface keeps its immediate path, draining pending first"
+        );
+    }
+    #[test]
     fn input_hot_caps_write_frame_budget_to_responsive_cadence() {
         // Regression: held key printed "gggg…" once a second. CC echoes each
         // keystroke as a composer repaint; once animation relaxed the budget to
