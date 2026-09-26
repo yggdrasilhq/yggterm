@@ -30257,55 +30257,43 @@ lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
 > spawn-and-reap primitive stays as a dream (dreams/features
 > ACK-02191b62c8): one abandoned Child on a bad day re-opens this.
 
-## ⛔ [11.129] EVERY DRAG-POINTER STATE WRITE RE-RENDERS THE WHOLE SHELL — `ShellState` IS ONE DIOXUS SIGNAL, SO THE GHOST CARD'S 8px STEP (window-level move handler → `update_drag_pointer` → full-state write) PAIRS WITH A FULL `app` COMPONENT RENDER WHOSE COST SCALES WITH THE TREE THE GHOST CROSSES (measured 2026-09-15 ~18:40 IST, live build 33b5e89b, the ux-speed drag-feel lane; trace `dioxus_render/component_window`)
+## ⛔ [11.174] THE FELT SHIFT-DRAG COMMITS NOTHING — A MULTI-ROW RANGE SELECTION DRAGS AS A SET (begin carries all 3 paths, the ghost promises Move item +2), AND THE DROP ENDS THE GESTURE WITHOUT ANY PERSIST, REORDER, OR ARRANGE — FIVE GESTURES, ZERO COMMITS (measured 2026-09-27 ~03:45-04:55 IST, uxprobe shiftdrag on rotated build d709917d8d9b, live jojo desktop, the ux-speed drag-proof-accuracy lane)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-Falsifier: on a QUIET window (floor <100 ms), gesture-scoped render
-attribution — `app` renders inside `tree_drag_begin..ended` — shows the
-per-8px move stream contributing ~zero `app` renders, the ghost leaf
-re-rendering instead.
+The owner's sole goal names shift-drag. Yggterm semantics (the sidebar
+onmousedown guard refuses a drag under any modifier): shift+click extends a
+range selection and a plain drag carries the WHOLE set. The driver
+(tools/uxspeed/uxprobe.py shiftdrag — range selection via tree select
+paths+anchor, then a REAL pointer drag onto a non-member row's After band)
+measured, 3 iterations × 2 runs, every gesture identical:
 
-⚠ MEASUREMENT HONESTY (2026-09-15 ~22:55 IST): the first before/after was
-INCONCLUSIVE, and the entry's original before-numbers over-attributed.
-`app` renders of 2-11x per ~2.5s run window (max spikes 157-223 ms) are
-dominated by spawn-promotion/teardown churn, not pointer moves; inside
-the actual `tree_drag_begin..ended` windows the before-build measured 0
-`app` renders across 3 windows (the per-move write is throttled to 8px
-and the synthetic gesture windows are short). The architecture claim
-stands (one big signal ⇒ any subscriber re-renders per ghost write; the
-≤1-frame drag bar cannot be promised at owner-scale trees), but the
-probe-scale win is NOT demonstrated — the falsifier above needs the
-quiet-window gesture-scoped run, ideally with a natural (human) drag.
+- tree_drag_begin {anchor: pressed row, drag_paths: exactly the 3-row set} ✓
+- DragGhost leaf re-renders with the pointer stream (11 renders/gesture) ✓ —
+  the ghost paints Move item +2 (the promise)
+- tree_drag_hover fires with targets; tree_drag_ended fires {paths: 3} ✓
+- live_session_persist_dropped: **0**; row_set_arranged: none; the sidebar
+  order is UNCHANGED after every gesture (wait_relative_order timeout) ✗
 
-Same lane, a gate-ordering hardening shipped here: `drag_hover_update_needed`
-checked 8px pointer travel BEFORE comparing target/placement, so a
-Before->After band flip inside the travel bubble could never reach
-`set_drag_hover_target`. Placement/target change wins first now.
-⚠ CORRECTED same sitting: the drop failures the felt driver caught on
-4835284c were NOT this — they are [11.130] (the synthetic hover chain
-never fires at all; the run5 "passes" that motivated the first
-attribution were wait_order false positives). The ordering fix stands on
-its own correctness.
+So the set drag is ACCEPTED, VISUALLY PROMISED, and silently discarded at
+release. Single-row felt drags on the same build commit fine
+(live_session_persist_dropped fires; order flips in ~206 ms), so the defect
+is specific to the multi-row set drop path. Suspected sites (for the fixing
+seat): the end-drag arrangement/reorder split in state.rs (the
+apply_row_set_drop vs the reorder fall-through around the
+ONLY an INTO drop ends here comment) — the set drop resolves a target and
+an ended-with-paths event, then neither the arrangement branch nor the
+reorder branch claims it. Falsifier for the fix: with the fix live, uxprobe
+shiftdrag --iters 3 on a quiet window reports commit_persist_events ≥ 1 per
+gesture with the set landed after the target in set order (accuracy 3/3).
 
-The ghost card and the drag pointer live in the ONE `Signal<ShellState>`
-(`with_mut_counted` = `Signal::with_mut` — every write marks all subscribers).
-The window-level move handler updates the pointer at best every 8px, so a drag
-produces a stream of full-shell renders; `component_window` in the probe's drag
-windows shows `app` at ~7-11 ms mean per render on a scratch-scale tree, and
-render causes include the drag write sites (state.rs ~86049 region). At the
-owner's 2583-row vdom the per-render cost scales with the sidebar the ghost
-merely crosses — the residual felt lag AFTER [11.127]/[11.128] remove the
-merges, and the same tax rides EVERY high-frequency pointer interaction
-(resize drags, rail drags), not just row drags. Fix direction (architecture,
-its own lane): split the drag pointer (and any per-frame visual state) into a
-dedicated signal consumed by a leaf ghost component, or paint the ghost outside
-dioxus (GTK overlay), so a pointer step re-renders the ghost alone; the
-campaign bar is drag tracking ≤1 frame (16.7 ms), which a whole-shell render
-cannot promise at any tree size. Instrument note: `component_window` aggregates
-per ~2.5 s window (window_ms 2506) — per-render attribution exists in its
-`components` array; a per-write render counter would make drag-window
-measurement exact (the [11.113] instrument family).
+Filed 2026-09-27 ~05:05 IST by zcode sess_f46e835c on jojo, lane
+lane/uxspeed/drag-proof-accuracy (claim ACK-bee6712954).
+> ⚠ ID RENUMBER (the defect-id law — the earlier filing keeps the id):
+> briefly filed as [11.173] at ~05:05; the activation-stall lane's
+> warm-mount-gate entry claimed [11.173] at 05:03 and is on main first,
+> so THIS entry renumbers to [11.174].
+
 
 ## ⛔ [11.134] OPENCODE 2.0.3 SILENTLY FALLS BACK TO THE LATEST SESSION ON AN UNKNOWN `--session` ID — THE BETA-ERA OUTRIGHT REFUSAL IS GONE, SO A CALLER THAT MINTS IDS OUT-OF-BAND CAN BIND THE WRONG SESSION AND NEVER LEARN IT (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
 
