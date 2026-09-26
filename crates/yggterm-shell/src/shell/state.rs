@@ -51594,17 +51594,20 @@ fn preview_run_cache_key(rows: &[(usize, SessionPreviewBlock)]) -> u64 {
     }
     hasher.finish()
 }
-fn sidebar_merge_cache_key(
+// One sub-hash per merge input, in key order (see SIDEBAR_MERGE_INPUT_COUNT).
+// The decomposition exists for the breakdown payload: when the same-shaped
+// world merges twice back-to-back (the 2026-09-26 spawn-window pairs, and the
+// seconds-class ambient pairs at 8.5k rows), the trace can name WHICH input
+// family moved instead of leaving the next seat to diff the world by hand.
+pub(crate) const SIDEBAR_MERGE_INPUT_COUNT: usize = 8;
+
+// Input order in SidebarMergeKeyParts::input_keys: stored_rows,
+// stored_projection_rows, remote_machines, ssh_targets, live_sessions,
+// expanded_paths, collapsed_row_set_heads, row_arrangement.
+fn hash_merge_input_stored_rows(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
     stored_rows: &[BrowserRow],
-    stored_projection_rows: &[BrowserRow],
-    remote_machines: &[RemoteMachineSnapshot],
-    ssh_targets: &[SshConnectTarget],
-    live_sessions: &[ManagedSessionView],
-    expanded_paths: &HashSet<String>,
-    collapsed_row_set_heads: &HashSet<String>,
-    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
-) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+) {
     for row in stored_rows {
         match row.kind {
             BrowserRowKind::Group => 1_u8,
@@ -51612,22 +51615,27 @@ fn sidebar_merge_cache_key(
             BrowserRowKind::Session => 3_u8,
             BrowserRowKind::Document => 4_u8,
         }
-        .hash(&mut hasher);
-        row.full_path.hash(&mut hasher);
-        row.label.hash(&mut hasher);
-        row.detail_label.hash(&mut hasher);
-        row.document_kind.hash(&mut hasher);
-        row.group_kind.hash(&mut hasher);
-        row.session_title.hash(&mut hasher);
-        row.depth.hash(&mut hasher);
-        row.host_label.hash(&mut hasher);
-        row.descendant_sessions.hash(&mut hasher);
-        row.expanded.hash(&mut hasher);
-        row.session_id.hash(&mut hasher);
-        row.session_cwd.hash(&mut hasher);
-        0xfe_u8.hash(&mut hasher);
+        .hash(hasher);
+        row.full_path.hash(hasher);
+        row.label.hash(hasher);
+        row.detail_label.hash(hasher);
+        row.document_kind.hash(hasher);
+        row.group_kind.hash(hasher);
+        row.session_title.hash(hasher);
+        row.depth.hash(hasher);
+        row.host_label.hash(hasher);
+        row.descendant_sessions.hash(hasher);
+        row.expanded.hash(hasher);
+        row.session_id.hash(hasher);
+        row.session_cwd.hash(hasher);
+        0xfe_u8.hash(hasher);
     }
-    0xf0_u8.hash(&mut hasher);
+}
+
+fn hash_merge_input_projection_rows(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    stored_projection_rows: &[BrowserRow],
+) {
     for row in stored_projection_rows {
         match row.kind {
             BrowserRowKind::Group => 1_u8,
@@ -51635,54 +51643,72 @@ fn sidebar_merge_cache_key(
             BrowserRowKind::Session => 3_u8,
             BrowserRowKind::Document => 4_u8,
         }
-        .hash(&mut hasher);
-        row.full_path.hash(&mut hasher);
-        row.label.hash(&mut hasher);
-        row.group_kind.hash(&mut hasher);
-        row.session_cwd.hash(&mut hasher);
-        0xef_u8.hash(&mut hasher);
+        .hash(hasher);
+        row.full_path.hash(hasher);
+        row.label.hash(hasher);
+        row.group_kind.hash(hasher);
+        row.session_cwd.hash(hasher);
+        0xef_u8.hash(hasher);
     }
+}
+
+fn hash_merge_input_remote_machines(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    remote_machines: &[RemoteMachineSnapshot],
+) {
     for machine in remote_machines {
-        machine.machine_key.hash(&mut hasher);
-        machine.label.hash(&mut hasher);
-        machine.ssh_target.hash(&mut hasher);
-        machine.prefix.hash(&mut hasher);
+        machine.machine_key.hash(hasher);
+        machine.label.hash(hasher);
+        machine.ssh_target.hash(hasher);
+        machine.prefix.hash(hasher);
         match machine.health {
             RemoteMachineHealth::Healthy => 1_u8,
             RemoteMachineHealth::Cached => 2_u8,
             RemoteMachineHealth::Offline => 3_u8,
         }
-        .hash(&mut hasher);
+        .hash(hasher);
         match machine.remote_deploy_state {
             RemoteDeployState::NotRequired => 1_u8,
             RemoteDeployState::Planned => 2_u8,
             RemoteDeployState::CopyingBinary => 3_u8,
             RemoteDeployState::Ready => 4_u8,
         }
-        .hash(&mut hasher);
-        machine.sessions.len().hash(&mut hasher);
+        .hash(hasher);
+        machine.sessions.len().hash(hasher);
         for session in &machine.sessions {
-            session.session_path.hash(&mut hasher);
-            session.session_id.hash(&mut hasher);
-            session.cwd.hash(&mut hasher);
-            session.started_at.hash(&mut hasher);
-            session.modified_epoch.hash(&mut hasher);
-            session.title_hint.hash(&mut hasher);
-            0xfd_u8.hash(&mut hasher);
+            session.session_path.hash(hasher);
+            session.session_id.hash(hasher);
+            session.cwd.hash(hasher);
+            session.started_at.hash(hasher);
+            session.modified_epoch.hash(hasher);
+            session.title_hint.hash(hasher);
+            0xfd_u8.hash(hasher);
         }
-        0xfc_u8.hash(&mut hasher);
+        0xfc_u8.hash(hasher);
     }
+}
+
+fn hash_merge_input_ssh_targets(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    ssh_targets: &[SshConnectTarget],
+) {
     for target in ssh_targets {
-        target.label.hash(&mut hasher);
-        target.ssh_target.hash(&mut hasher);
-        target.prefix.hash(&mut hasher);
-        target.cwd.hash(&mut hasher);
-        0xfb_u8.hash(&mut hasher);
+        target.label.hash(hasher);
+        target.ssh_target.hash(hasher);
+        target.prefix.hash(hasher);
+        target.cwd.hash(hasher);
+        0xfb_u8.hash(hasher);
     }
+}
+
+fn hash_merge_input_live_sessions(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    live_sessions: &[ManagedSessionView],
+) {
     for session in live_sessions {
-        session.session_path.hash(&mut hasher);
-        session.id.hash(&mut hasher);
-        session.title.hash(&mut hasher);
+        session.session_path.hash(hasher);
+        session.id.hash(hasher);
+        session.title.hash(hasher);
         // A CACHE KEY, so it only has to be injective. The shipped numbers are
         // pinned (changing one invalidates every cached sidebar merge for no
         // reason) and a new kind takes the next free value from its position in
@@ -51701,36 +51727,54 @@ fn sidebar_merge_cache_key(
                     .unwrap_or(u8::MAX as usize - 7) as u8,
             ),
         }
-        .hash(&mut hasher);
-        session.host_label.hash(&mut hasher);
-        session.ssh_target.hash(&mut hasher);
-        session.ssh_prefix.hash(&mut hasher);
+        .hash(hasher);
+        session.host_label.hash(hasher);
+        session.ssh_target.hash(hasher);
+        session.ssh_prefix.hash(hasher);
         // ⛔ THE SEAT DECIDES SHAPE, NOT ONLY TEXT. Before row sets it only
         // reached the label, which `enrich_sidebar_rows_with_live_titles`
         // re-composes AFTER this cache — so a missing hash here cost nothing.
         // The seat now decides which rows nest under which, and that is built
         // inside the cached merge: leave it out and reseating a delegate would
         // leave the outline drawn the old way until some unrelated field moved.
-        session.outline_prefix.hash(&mut hasher);
+        session.outline_prefix.hash(hasher);
         for entry in &session.metadata {
-            entry.label.hash(&mut hasher);
-            entry.value.hash(&mut hasher);
-            0xf0_u8.hash(&mut hasher);
+            entry.label.hash(hasher);
+            entry.value.hash(hasher);
+            0xf0_u8.hash(hasher);
         }
-        0xfa_u8.hash(&mut hasher);
+        0xfa_u8.hash(hasher);
     }
+}
+
+fn hash_merge_input_expanded_paths(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    expanded_paths: &HashSet<String>,
+) {
     let mut expanded = expanded_paths.iter().collect::<Vec<_>>();
     expanded.sort();
     for path in expanded {
-        path.hash(&mut hasher);
-        0xf9_u8.hash(&mut hasher);
+        path.hash(hasher);
+        0xf9_u8.hash(hasher);
     }
+}
+
+fn hash_merge_input_collapsed_heads(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    collapsed_row_set_heads: &HashSet<String>,
+) {
     let mut collapsed = collapsed_row_set_heads.iter().collect::<Vec<_>>();
     collapsed.sort();
     for path in collapsed {
-        path.hash(&mut hasher);
-        0xf7_u8.hash(&mut hasher);
+        path.hash(hasher);
+        0xf7_u8.hash(hasher);
     }
+}
+
+fn hash_merge_input_row_arrangement(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
+) {
     // ⛔ THE HAND-BUILT ARRANGEMENT IS AN INPUT TO THE ROW LIST, so a drag that
     // forms a set must miss this cache. Same lesson the seat taught an hour
     // earlier: anything that decides SHAPE has to be in the key, and a
@@ -51738,20 +51782,98 @@ fn sidebar_merge_cache_key(
     let mut heads = row_arrangement.sets.heads().collect::<Vec<_>>();
     heads.sort_unstable();
     for head in heads {
-        head.hash(&mut hasher);
+        head.hash(hasher);
         for member in row_arrangement.sets.members_of(head) {
-            member.hash(&mut hasher);
+            member.hash(hasher);
         }
-        0xf6_u8.hash(&mut hasher);
+        0xf6_u8.hash(hasher);
     }
     let mut detached = row_arrangement.detached.iter().collect::<Vec<_>>();
     detached.sort();
     for path in detached {
-        path.hash(&mut hasher);
-        0xf5_u8.hash(&mut hasher);
+        path.hash(hasher);
+        0xf5_u8.hash(hasher);
     }
+}
+
+fn sidebar_merge_cache_key(
+    stored_rows: &[BrowserRow],
+    stored_projection_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_stored_rows(&mut hasher, stored_rows);
+    0xf0_u8.hash(&mut hasher);
+    hash_merge_input_projection_rows(&mut hasher, stored_projection_rows);
+    hash_merge_input_remote_machines(&mut hasher, remote_machines);
+    hash_merge_input_ssh_targets(&mut hasher, ssh_targets);
+    hash_merge_input_live_sessions(&mut hasher, live_sessions);
+    hash_merge_input_expanded_paths(&mut hasher, expanded_paths);
+    hash_merge_input_collapsed_heads(&mut hasher, collapsed_row_set_heads);
+    hash_merge_input_row_arrangement(&mut hasher, row_arrangement);
     hasher.finish()
 }
+
+/// The merge cache key split per input. `key` is the cache's lookup key; the
+/// `input_keys` ride the breakdown payload as the WHICH-INPUT-MOVED
+/// instrument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidebarMergeKeyParts {
+    key: u64,
+    input_keys: [u64; SIDEBAR_MERGE_INPUT_COUNT],
+}
+
+fn sidebar_merge_cache_key_parts(
+    stored_rows: &[BrowserRow],
+    stored_projection_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
+) -> SidebarMergeKeyParts {
+    let mut input_keys = [0_u64; SIDEBAR_MERGE_INPUT_COUNT];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_stored_rows(&mut hasher, stored_rows);
+    input_keys[0] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_projection_rows(&mut hasher, stored_projection_rows);
+    input_keys[1] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_remote_machines(&mut hasher, remote_machines);
+    input_keys[2] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_ssh_targets(&mut hasher, ssh_targets);
+    input_keys[3] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_live_sessions(&mut hasher, live_sessions);
+    input_keys[4] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_expanded_paths(&mut hasher, expanded_paths);
+    input_keys[5] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_collapsed_heads(&mut hasher, collapsed_row_set_heads);
+    input_keys[6] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_merge_input_row_arrangement(&mut hasher, row_arrangement);
+    input_keys[7] = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (ix, part) in input_keys.iter().enumerate() {
+        ix.hash(&mut hasher);
+        part.hash(&mut hasher);
+    }
+    SidebarMergeKeyParts {
+        key: hasher.finish(),
+        input_keys,
+    }
+}
+
 fn sidebar_search_cache_key(rows: &[BrowserRow], query: &str, mode: u8) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     mode.hash(&mut hasher);
@@ -56198,6 +56320,7 @@ fn merged_sidebar_rows(
         expanded_paths,
         &HashSet::new(),
         &yggterm_core::row_set_outline::RowArrangement::default(),
+        "merged_sidebar_rows",
     )
 }
 fn merged_sidebar_rows_with_projection_rows(
@@ -56209,6 +56332,7 @@ fn merged_sidebar_rows_with_projection_rows(
     expanded_paths: &HashSet<String>,
     collapsed_row_set_heads: &HashSet<String>,
     row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
+    source: &str,
 ) -> Vec<BrowserRow> {
     let remote_session_count = remote_machines
         .iter()
@@ -56216,7 +56340,7 @@ fn merged_sidebar_rows_with_projection_rows(
         .sum::<usize>();
     let total_started_at = Instant::now();
     let key_started_at = Instant::now();
-    let key = sidebar_merge_cache_key(
+    let parts = sidebar_merge_cache_key_parts(
         stored_rows,
         stored_projection_rows,
         remote_machines,
@@ -56226,6 +56350,20 @@ fn merged_sidebar_rows_with_projection_rows(
         collapsed_row_set_heads,
         row_arrangement,
     );
+    let key = parts.key;
+    // The decomposition IS the instrument: a breakdown payload can name WHICH
+    // input family moved between two back-to-back merges instead of leaving
+    // the next seat to diff 8.5k rows by hand (the 2026-09-26 pairs).
+    let input_keys = serde_json::json!({
+        "stored_rows": format!("{:016x}", parts.input_keys[0]),
+        "stored_projection_rows": format!("{:016x}", parts.input_keys[1]),
+        "remote_machines": format!("{:016x}", parts.input_keys[2]),
+        "ssh_targets": format!("{:016x}", parts.input_keys[3]),
+        "live_sessions": format!("{:016x}", parts.input_keys[4]),
+        "expanded_paths": format!("{:016x}", parts.input_keys[5]),
+        "collapsed_row_set_heads": format!("{:016x}", parts.input_keys[6]),
+        "row_arrangement": format!("{:016x}", parts.input_keys[7]),
+    });
     let key_ms = key_started_at.elapsed().as_secs_f64() * 1000.0;
     let cache_lookup_started_at = Instant::now();
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
@@ -56238,6 +56376,9 @@ fn merged_sidebar_rows_with_projection_rows(
                 remote_session_count,
                 json!({
                     "cache_hit": true,
+                    "source": source,
+                    "key": format!("{:016x}", key),
+                    "input_keys": input_keys,
                     "key_ms": key_ms,
                     "cache_lookup_ms": cache_lookup_started_at.elapsed().as_secs_f64() * 1000.0,
                     "uncached_ms": 0.0,
@@ -56281,6 +56422,9 @@ fn merged_sidebar_rows_with_projection_rows(
         remote_session_count,
         json!({
             "cache_hit": false,
+            "source": source,
+            "key": format!("{:016x}", key),
+            "input_keys": input_keys,
             "key_ms": key_ms,
             "cache_lookup_ms": cache_lookup_ms,
             "uncached_ms": uncached_ms,
@@ -56409,6 +56553,7 @@ fn merged_sidebar_rows_traced(
             expanded_paths,
             collapsed_row_set_heads,
             row_arrangement,
+            source,
         );
     }
     let perf_home = perf_home_dir(settings_path);
@@ -56422,6 +56567,7 @@ fn merged_sidebar_rows_traced(
         expanded_paths,
         collapsed_row_set_heads,
         row_arrangement,
+        source,
     );
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let meta = || {
