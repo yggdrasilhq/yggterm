@@ -15594,8 +15594,16 @@ pub fn terminal_reveal_stamp_script(session_path: &str, host_id: &str) -> String
             const hostId = {host_id:?};
             const sessionPath = {session_path:?};
             const emit = (name, payload) => {{
+                // The tracer is window.__yggtermTrace; `ytrace` is a LEXICAL
+                // global from trace_emitter.js — `window.ytrace` is always
+                // undefined, and guarding on it silently dropped every stamp
+                // (measured live 2026-09-27: six raises, zero paint ends).
                 try {{
-                    if (window.ytrace && window.ytrace.emit) window.ytrace.emit({{ category: "xterm_paint", name, payload }});
+                    const tracer = (window.__yggtermTrace && window.__yggtermTrace.emit)
+                        ? window.__yggtermTrace
+                        : ((typeof ytrace !== "undefined" && ytrace && ytrace.emit) ? ytrace : null);
+                    if (tracer) tracer.emit({{ category: "xterm_paint", name, payload }});
+                    else window.__yggtermRevealStampLost = {{ name, payload }};
                 }} catch (_error) {{}}
             }};
             let entry = null;
