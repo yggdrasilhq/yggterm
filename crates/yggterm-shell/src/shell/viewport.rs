@@ -5534,8 +5534,40 @@ fn TerminalCanvas(
     // swallow this candidate so no lease and no bootstrap task exist. A first
     // mount, a fault recovery, an in-flight attach, or a degraded surface
     // fails the predicate and takes the bootstrap path unchanged.
+    let (raise_has_host, raise_was_ready, raise_daemon_owns, raise_degraded) = state
+        .with(|shell| {
+            (
+                shell.terminal_session_host_id(&session_path).is_some(),
+                shell.terminal_session_was_ever_ready(&session_path),
+                shell.daemon_owns_session_runtime(&session_path),
+                shell
+                    .terminal_surface_status_for_path(&session_path)
+                    .is_some_and(|status| status.transport_degraded),
+            )
+        });
     let reveal_raise_eligible = bootstrap_schedule_candidate
         && state.with(|shell| shell.terminal_host_ready_for_reveal_raise(&session_path));
+    if bootstrap_schedule_candidate && !reveal_raise_eligible {
+        // THE REFUSED RAISE, ON THE RECORD ([11.172] live-proof leg): the
+        // candidate ran and the predicate said no — exactly once per click
+        // (the dedup key below consumes the candidate either way), so this is
+        // one event per switch, not one per render.
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "reveal_raise_refused",
+            json!({
+                "session_path": session_path.clone(),
+                "host_id": host_id.clone(),
+                "mount_epoch": mount_epoch,
+                "has_host_epoch": raise_has_host,
+                "was_ever_ready": raise_was_ready,
+                "daemon_owns_runtime": raise_daemon_owns,
+                "transport_degraded": raise_degraded,
+            }),
+        );
+    }
     if reveal_raise_eligible {
         *bootstrap_task_identity.borrow_mut() = combined_bootstrap_key.clone();
         state.with_mut_counted(|shell| {
