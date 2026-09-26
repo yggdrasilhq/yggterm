@@ -29669,6 +29669,40 @@ entry measures; both make the 15s snapshot cycle expensive), trace-fixing
 queue item 7 (render residues — the whole-root family, distinct: renders
 are 11ms here).
 
+**A/B EXECUTED (2026-09-26 ~13:20-13:35Z, jojo, the dispatch-driver lane,
+claim ACK-c2708a3d49): the storm is SPLIT — the WebKitWebProcess plane IS
+PTY-output-driven (×8 clock reads, ~25% clock-machinery cycles from a plain
+`yes` stream into a scratch row), the GUI-process plane is NOT (rate FELL
+under the same stream).**
+
+Meter: `perf stat -e syscalls:sys_enter_clock_gettime` exact counts + sampled
+profiles, GUI pid 36769 (fresh build 38e62f79f3d5) + its WebKitWebProcess
+44026. Arm A (restore-churn window, no synthetic traffic): GUI 198,059
+reads/20s ≈ 9.9k/s; WebKit 31,914/20s ≈ 1.6k/s; sampled clock machinery in
+GUI ≈ 5% (_copy_to_user 3.68% + SYSRETQ 0.99% + read_hpet 0.24%).
+Arm B (`timeout yes` streaming ~1 line-stream through the scratch row's PTY,
+GUI CPU 30.6%): GUI 51,353/20s ≈ **2.6k/s (4× LOWER than churn arm)**;
+WebKit 265,804/20s ≈ **13.3k/s (8× HIGHER)**; WebKit sampled clock machinery
+≈ **25%+** (_copy_to_user 17.15% + read_hpet 7.35% + SYSRETQ residual),
+callers `__clock_gettime` inlined in WebKit/glib dispatch.
+
+**Consequences:**
+1. The DOM-write/IPC path IS a dispatch-rate driver FOR THE RENDERER PLANE —
+   render-path batching (fewer, larger writes per frame) directly shrinks the
+   WebKit-side clock storm. This is OUR code-side lever and it is REAL.
+2. The [11.119] metronome's GUI-main-thread face does NOT scale with PTY
+   output — its driver is something else (restore/refresh machinery is the
+   standing suspect: arm A's churn ran 9.9k/s vs 2.6k/s while streaming).
+   The main-thread storm hunt needs a capture DURING a metronome phase, not
+   under synthetic PTY load.
+3. Baseline for the desk today: even "quiet" GUI carries ~2.6-9.9k clock
+   reads/s ≈ ~1.3µs each on this hpet-only box — the owner-level TSC
+   rehabilitation remains the global lever (fix-direction (i), unchanged).
+
+Artifacts: /tmp/dd-armA.data, /tmp/dd-armB.data, /tmp/dd-armB-lbr.data,
+/tmp/dd-armB-wk.data (jojo, host-local). Scratch row torn down verified
+(removed exactly once, zero `yes` processes left).
+
 ## ⛔ [11.120] THE ui-BLOCK WATCHDOG'S MID-STALL WAIT CAPTURE IS BYTE-ABSENT FROM EVERY GUI BINARY IN THE FIELD WHILE ITS OWN SOURCE AND NEIGHBOR LITERALS ARE PRESENT — STALLS CAN NEVER NAME WHAT THE THREAD WAS DOING (found 2026-09-15 ~01:30 IST, GUI host + dev, the ux-speed metronome lane)
 
 **Status:** OPEN
@@ -30937,3 +30971,39 @@ refused `session_not_found` (trace live_session_birth 13:18:04, resume_refusal
 13:18:05), the conversation id was a phantom agy never held, so the row never
 had a turn and nothing was lost. The [11.157] phantom-id family through the
 remote start path; close-and-reopen replaces the row.
+
+## ⛔ [11.161] THE DAEMON ABORTS THE WHOLE PROCESS WHILE SPAWNING A TERMINAL — `ensure_terminal_for_path` → `PtySessionRuntime::spawn` → `Command::spawn` ENDS IN `std::process::abort` UNDER MEMORY PRESSURE, SO A FAILED PTY SPAWN KILLS THE DAEMON AND EVERY SESSION BEHIND IT (core-captured 2026-09-26 11:33:06Z on jojo, the ux-speed dispatch-driver lane; incident post ACK-03036bc968)
+
+**Status:** OPEN
+
+**The core (jojo, /var/lib/systemd/coredump/core.yggterm-daemon-.1000.adad2ba1f857434196708f90a9a1a011.4115221.1790422386000000.zst, 3.9M):**
+`yggterm-headless server daemon` (build 38e62f79f3d5 = main of 2026-09-26) died SIGABRT (si_code SI_TKILL) inside a request:
+
+```
+std::sys::pal::unix::abort_internal ← std::process::abort
+  ← std::sys::process::unix::…::Command::spawn ← std::process::Command::spawn
+  ← portable_pty::unix::UnixSlavePty::spawn_command
+  ← yggterm_server::terminal::PtySessionRuntime::spawn
+  ← yggterm_server::terminal::TerminalManager::ensure_session_with_size
+  ← DaemonRuntime::ensure_terminal_for_path_with_initial_size_and_seed
+  ← handle_request → daemon_request_response → handle_unix_stream
+```
+
+**Context:** the desktop was memory-starved (~350MB available at measurement
+minutes later; an 11GB-RSS runaway sim + chronic [11.108]-class pressure).
+fork/PTY-spawn under near-zero memory must FAIL — it must not be able to take
+the daemon down. GUI journal falls silent 11:36:28Z; the whole jojo stack (GUI
++ daemon) was down ~90 min until a seat rebooted it (clients:0 → clients:1,
+rows restored, no data lost — restore held).
+
+**Fix shape:** the PTY-spawn path must return an error to the requesting
+client (`ensure_terminal_for_path` refuses gracefully, session marked failed,
+no daemon death). Where exactly `abort` is invoked needs a code read of the
+std/pre_exec interplay (frames say the abort runs in the spawn path itself,
+not a panic unwinding) — but the OBSERVABLE contract is already wrong: a
+per-request spawn failure kills the process. Add a stress test: spawn a PTY
+under a constrained cgroup / RLIMIT_AS and assert daemon survives.
+
+**Falsifier:** under induced memory pressure, `ensure_terminal_for_path` for a
+new row returns an error surface (row shows a clean failure state) and the
+daemon pid survives; `interactive_request` traffic continues.
