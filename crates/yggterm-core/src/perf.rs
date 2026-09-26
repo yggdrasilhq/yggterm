@@ -86,6 +86,14 @@ pub fn ytrace_provider() -> &'static ytrace::Provider {
             // and leaves the user unable to type. This probe is the difference,
             // and it is a SUSPICION rather than a verdict — see the emitter.
             "input/unconsumed",
+            // The chord plane ([11.113] gap 3, ux-speed campaign): every
+            // keytip-bridge message — alt tap, matched accelerator, claimed
+            // shell chord, dialog/nav key, chord-walk letter — carries its
+            // IDENTITY (face + mods + key), which `input/keystroke`
+            // deliberately does not. Content-safe by construction: the bridge
+            // never sees PTY typing (invariant 7), only command chords and
+            // dialog keys.
+            "ui/chord",
         ] {
             p.register(probe, ytrace::Clock::Wall, ytrace::Sample::always());
         }
@@ -1322,6 +1330,23 @@ mod tests {
         }
         assert_eq!(shape["chars"], 22);
         assert_eq!(shape["has_enter"], true);
+    }
+
+    #[test]
+    fn ui_chord_probe_is_registered_always_sampled() {
+        // The chord-identity probe ([11.113] gap 3, ux-speed) must stay on
+        // the always-sampled wall-clock list: a sampled chord plane makes
+        // every chorded action's latency chain unprovable.
+        let source = include_str!("perf.rs");
+        let block = source
+            .split("The chord plane")
+            .nth(1)
+            .and_then(|rest| rest.split("];").next())
+            .expect("chord-plane registration block");
+        assert!(
+            block.contains("\"ui/chord\""),
+            "ui/chord missing from the always-sampled probe list"
+        );
     }
 
     #[test]

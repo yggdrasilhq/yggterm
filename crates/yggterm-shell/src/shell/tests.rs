@@ -22762,6 +22762,47 @@ console.log('ok');
             .contains("shell.note_context_menu_activation(action.as_str())"));
     }
 
+    /// [11.113] gap 3 (ux-speed chord-close-all lane): the keytip bridge is
+    /// the ONE terminus every chord crosses, so the identity event must live
+    /// there — face + mods + key — or chorded bulk actions stay unmeasurable
+    /// end to end. The plane never sees PTY typing, so identity is
+    /// content-safe; the derive face must carry a COUNT (never walked
+    /// labels), and unrecognized bridge messages must stay silent.
+    #[test]
+    fn chord_bridge_emits_identity_event_at_the_one_terminus() {
+        let source = SHELL_SOURCE;
+        assert!(source
+            .contains("ytrace_emit_event(\n            \"shell\",\n            \"ui\",\n            \"chord\","));
+        for face in [
+            "\"tap\"",
+            "\"accel\"",
+            "\"chord\"",
+            "\"page_menu\"",
+            "\"modal_key\"",
+            "\"menu_key\"",
+            "\"follow_modal\"",
+            "\"derive\"",
+            "\"walk_key\"",
+        ] {
+            assert!(
+                source.contains(&format!("Some({face})")),
+                "chord face {face} not classified at the bridge terminus"
+            );
+        }
+        assert!(
+            source.contains("\"accel\": msg.get(\"accel\")"),
+            "the accel face must carry the full mods+key identity"
+        );
+        assert!(source.contains("\"derive_count\""));
+        assert!(
+            !source.contains("\"derive_label\""),
+            "the derive face must never carry walked element labels"
+        );
+        assert!(source.contains(
+            "An unrecognized bridge message is not a chord; stay silent"
+        ));
+    }
+
     #[test]
     fn terminal_select_probe_uses_xterm_pointer_gesture_not_dom_range() {
         let source = SHELL_SOURCE;

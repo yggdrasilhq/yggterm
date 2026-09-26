@@ -24,6 +24,17 @@ Actions:
            Cancel button; the row must survive the cancel
   close  — server app session remove of the scratch rows (the teardown,
            instrumented — every spawned row is closed exactly once)
+  closeall — the bulk-close vertical: the Live Sessions group row's REAL
+           menu → Close All… → the bulk confirm dialog, timed as
+           menu_open / click_to_mount / the in-app modal pair
+           (modal_open_requested{bulk:true} → modal/shown), then CANCELLED
+           with a survivors assert (cancel accuracy). The chord leg drives
+           the REAL alt-tap bridge (synthetic KeyboardEvents on window) for
+           tap→overlay→row-menu walls and asserts the ui/chord identity
+           events ([11.113] gap 3 instrument). The CONFIRM leg runs ONLY
+           when every live session on screen is a probe scratch row —
+           close-all closes ALL live sessions, so on any real desktop the
+           probe refuses it and says so (blast-radius law).
 
 Report: schema-keyed JSON, honest nulls for anything not measured.
 A p50 without its iteration count is not a measurement.
@@ -184,6 +195,198 @@ while (Date.now() < deadline) {
     }
 }
 refuse("delete_overlay_did_not_close");
+"""
+
+
+# The bulk-close vertical (chord-close-all lane): the Live Sessions group
+# row (__live_sessions__) offers exactly one menu action — Close All… — which
+# opens the bulk delete-confirm dialog. One dom-eval does right-click → menu
+# → item click → overlay mount so the deltas are in-page walls. CANCELLED by
+# the caller through MODAL_CANCEL_JS; the confirm leg has its own script.
+CLOSEALL_OPEN_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const refuse = (reason, extra) => dioxus.send(
+    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+if (document.querySelector('[data-delete-confirm-overlay]')) {{
+    refuse("delete_overlay_already_open");
+    return;
+}}
+const PATH = '__live_sessions__';
+const row = await (async () => {{
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {{
+        const n = document.querySelector(
+            '[data-sidebar-row-path="' + PATH + '"]');
+        if (n) return n;
+        await settle(50);
+    }}
+    return null;
+}})();
+if (!row) {{
+    refuse("live_sessions_group_row_missing");
+    return;
+}}
+const rect = row.getBoundingClientRect();
+if (!(rect.width > 0 && rect.height > 0)) {{
+    refuse("live_sessions_group_row_not_visible");
+    return;
+}}
+const cx = Number((rect.left + rect.width / 2).toFixed(2));
+const cy = Number((rect.top + rect.height / 2).toFixed(2));
+const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                button: 2, buttons: 2, detail: 1 }};
+const t_open = Date.now();
+row.dispatchEvent(new MouseEvent('mousedown', init));
+row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('contextmenu', init));
+let menu = null, closeAll = null;
+const openDeadline = Date.now() + 1500;
+while (Date.now() < openDeadline) {{
+    await settle(40);
+    menu = document.querySelector('[data-context-menu="1"]');
+    closeAll = menu?.querySelector(
+        '[data-context-menu-action="close-all-live-sessions"]') || null;
+    if (menu && closeAll) break;
+}}
+if (!menu || !closeAll) {{
+    refuse("menu_or_close_all_item_not_observed", {{ session_path: PATH }});
+    return;
+}}
+const menu_open_ms = Date.now() - t_open;
+await settle(120);
+const clickInit = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 }};
+closeAll.dispatchEvent(new MouseEvent('mousedown', clickInit));
+closeAll.dispatchEvent(new MouseEvent('mouseup',
+    {{ ...clickInit, buttons: 0 }}));
+closeAll.dispatchEvent(new MouseEvent('click', clickInit));
+const t_click = Date.now();
+const mountDeadline = t_click + 1500;
+let overlay = null;
+while (Date.now() < mountDeadline) {{
+    await settle(20);
+    overlay = document.querySelector('[data-delete-confirm-overlay]');
+    if (overlay) break;
+}}
+if (!overlay) {{
+    refuse("delete_overlay_did_not_mount", {{ menu_open_ms }});
+    return;
+}}
+const t_mounted = Date.now();
+const dialog = overlay.querySelector('[data-delete-confirm-dialog]');
+dioxus.send({{
+    accepted: true,
+    menu_open_ms,
+    click_to_mount_ms: t_mounted - t_click,
+    dispatch_to_mount_ms: t_mounted - t_open,
+    overlay_count: document.querySelectorAll(
+        '[data-delete-confirm-overlay]').length,
+    dialog_title: String(overlay.querySelector(
+        '[data-delete-confirm-title]')?.textContent || ''),
+    action_label: String(overlay.querySelector(
+        '[data-delete-confirm-action]')?.textContent || ''),
+    unkept_button_present: !!overlay.querySelector(
+        '[data-delete-confirm-unkept-action]'),
+    dialog_text: String(dialog?.textContent || '').slice(0, 400),
+}});
+"""
+
+# The CONFIRM leg of close-all — gated by the caller (only when every live
+# session on screen is a probe scratch row). Clicks the dialog's real
+# confirm button and waits for the overlay to drop.
+CLOSEALL_CONFIRM_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const t0 = Date.now();
+const refuse = (reason) => dioxus.send(
+    { accepted: false, reason });
+const confirm = document.querySelector('[data-delete-confirm-action]');
+if (!confirm) { refuse("confirm_button_missing"); return; }
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
+               button: 0, buttons: 1 };
+confirm.dispatchEvent(new MouseEvent('mousedown', init));
+confirm.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+confirm.dispatchEvent(new MouseEvent('click', init));
+const deadline = Date.now() + 10000;
+while (Date.now() < deadline) {
+    await settle(50);
+    if (!document.querySelector('[data-delete-confirm-overlay]')) {
+        dioxus.send({ accepted: true,
+                      confirm_to_gone_ms: Date.now() - t0 });
+        return;
+    }
+}
+refuse("delete_overlay_did_not_close");
+"""
+
+# The chord leg: drives the REAL alt-tap bridge listeners with synthetic
+# KeyboardEvents on window (they are window-level capture listeners, exactly
+# what a real key hits) and walks ALT-tap → E → Escape. Asserts the overlay
+# and the row menu open through the chord path — the walls the chord
+# instrument exists to measure — and leaves every container closed again.
+# No menu item is ever fired here.
+CHORD_LEG_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const refuse = (reason, extra) => dioxus.send(
+    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+const q = (sel) => !!document.querySelector(sel);
+if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {{
+    refuse("menu_or_overlay_already_open");
+    return;
+}}
+const kd = (key, code) => window.dispatchEvent(new KeyboardEvent('keydown',
+    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+const ku = (key, code) => window.dispatchEvent(new KeyboardEvent('keyup',
+    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+const t_tap = Date.now();
+kd('Alt', 'AltLeft');
+ku('Alt', 'AltLeft');
+let overlaySeen = false;
+const ovDeadline = Date.now() + 1500;
+while (Date.now() < ovDeadline) {{
+    await settle(40);
+    if (q('[data-yggterm-keytip-breadcrumb]')) {{ overlaySeen = true; break; }}
+}}
+if (!overlaySeen) {{
+    refuse("alt_overlay_did_not_open", {{ tap_to_overlay_ms: null }});
+    return;
+}}
+const tap_to_overlay_ms = Date.now() - t_tap;
+const t_e = Date.now();
+kd('e', 'KeyE');
+let menuSeen = false;
+const mDeadline = Date.now() + 1500;
+while (Date.now() < mDeadline) {{
+    await settle(40);
+    if (q('[data-yggterm-menu-open]')) {{ menuSeen = true; break; }}
+}}
+const walk_to_menu_ms = menuSeen ? Date.now() - t_e : null;
+kd('Escape', 'Escape');
+let menuClosed = false;
+const gDeadline = Date.now() + 1500;
+while (Date.now() < gDeadline) {{
+    await settle(40);
+    if (!q('[data-yggterm-menu-open]')) {{ menuClosed = true; break; }}
+}}
+let overlayClosed = !q('[data-yggterm-keytip-breadcrumb]');
+if (!overlayClosed) {{
+    kd('Escape', 'Escape');
+    const d2 = Date.now() + 1000;
+    while (Date.now() < d2) {{
+        await settle(40);
+        if (!q('[data-yggterm-keytip-breadcrumb]')) {{ overlayClosed = true; break; }}
+    }}
+}}
+dioxus.send({{
+    accepted: true,
+    overlay_seen: true,
+    menu_seen: menuSeen,
+    tap_to_overlay_ms,
+    walk_to_menu_ms,
+    escape_closed_menu: menuClosed,
+    overlay_closed: overlayClosed,
+}});
 """
 
 
@@ -794,6 +997,7 @@ dioxus.send(out);
                 "shown_ts_ms": (shown or {}).get("ts_ms"),
                 "pair_ms": pair_ms,
                 "requested_rows": payload.get("rows"),
+                "requested_bulk": payload.get("bulk"),
                 "requested_kind": payload.get("kind"),
                 "shown_kind": shown_payload.get("kind")}
 
@@ -810,6 +1014,190 @@ dioxus.send(out);
                 "accuracy_failures": [] if ok else ["row did not leave the live order"],
             })
         return summarize(out, key="close_to_gone_ms")
+
+    def chord_events_from_trace(self, since_ms: int,
+                                timeout_s: float = 5.0) -> dict:
+        """The ui/chord identity events ([11.113] gap 3 instrument): every
+        bridge chord message since since_ms with its face + key. On a build
+        without the instrument this returns chord_events=False HONESTLY —
+        the falsifier rerun happens after the GUI rotates onto the
+        instrument build, not before."""
+        deadline = time.time() + timeout_s
+        events = []
+        while time.time() < deadline:
+            events = [e for e in self.ytrace_events(since_ms)
+                      if e.get("category") == "ui" and e.get("name") == "chord"]
+            if events:
+                break
+            time.sleep(0.25)
+        faces = [{"face": (e.get("payload") or {}).get("face"),
+                  "key": (e.get("payload") or {}).get("key"),
+                  "ts_ms": e.get("ts_ms")}
+                 for e in events]
+        return {"chord_events": bool(events), "faces": faces}
+
+    def live_session_paths(self) -> list[str]:
+        """Sidebar rows of kind Session — the close-all blast radius."""
+        return [r.get("full_path") for r in self.rows()
+                if r.get("kind") == "Session" and r.get("full_path")]
+
+    def action_closeall(self, iters: int) -> dict:
+        """The bulk-close vertical. CANCEL legs measure + assert; the CONFIRM
+        leg runs once, ONLY when every live session on screen is a probe
+        scratch row (close-all closes ALL live sessions — blast-radius law)."""
+        out = {"iterations": []}
+        scratch = self.ensure_scratch_rows(2, activate=True)
+        if not scratch:
+            return {"error": "no scratch rows to protect", "iterations": []}
+        scratch_set = set(scratch)
+        pre = [p for p in self.live_session_paths() if p not in scratch_set]
+        out["pre_existing_live_sessions"] = len(pre)
+        confirm_allowed = not pre
+        out["confirm_leg"] = ("run" if confirm_allowed else
+                              "refused: pre_existing_live_sessions>0 "
+                              "(close-all closes ALL live sessions; "
+                              "blast-radius law)")
+        for i in range(iters):
+            acc = []
+            self.verb("tree", "select", "__live_sessions__")
+            time.sleep(0.15)
+            t0 = now_ms()
+            r = self.verb("dom-eval", CLOSEALL_OPEN_JS, timeout=20)
+            open_wall_ms = now_ms() - t0
+            result = ((r.get("json") or {}).get("data") or {}).get("result") or {}
+            if not r["ok"]:
+                acc.append(f"dom-eval failed: {r.get('error')}")
+            if result.get("dom_eval_error"):
+                acc.append(f"script error: {result['dom_eval_error']}")
+            if not result.get("accepted"):
+                acc.append(f"close-all open refused: {result.get('reason')}")
+            if result.get("accepted"):
+                if result.get("overlay_count") != 1:
+                    acc.append("overlay_count=%s (want exactly 1)"
+                               % result.get("overlay_count"))
+                if result.get("dialog_title") != "Close Live Sessions?":
+                    acc.append("dialog_title=%r (want Close Live Sessions?)"
+                               % result.get("dialog_title"))
+                if result.get("action_label") != "Close All Sessions":
+                    acc.append("action_label=%r (want Close All Sessions)"
+                               % result.get("action_label"))
+            pair = self.modal_pair_from_trace(t0)
+            if result.get("accepted"):
+                if pair.get("pair_ms") is None:
+                    acc.append("no modal_open_requested → modal/shown pair "
+                               "in ytrace within window")
+                else:
+                    if pair.get("requested_kind") not in ("delete", None):
+                        acc.append("requested kind=%s (want delete)"
+                                   % pair.get("requested_kind"))
+                    if pair.get("requested_bulk") is not True:
+                        acc.append("requested bulk=%s (want true — this is "
+                                   "the bulk close path)"
+                                   % pair.get("requested_bulk"))
+                    if pair.get("shown_kind") not in ("delete", None):
+                        acc.append("modal/shown kind=%s (want delete)"
+                                   % pair.get("shown_kind"))
+            # CANCEL — and EVERY live session must survive it
+            cancel = {}
+            if result.get("accepted"):
+                rc = self.verb("dom-eval", MODAL_CANCEL_JS, timeout=10)
+                cancel = ((rc.get("json") or {}).get("data")
+                          or {}).get("result") or {}
+                if not cancel.get("accepted"):
+                    acc.append(f"cancel failed: {cancel.get('reason')}")
+                else:
+                    time.sleep(0.2)
+                    live = set(self.live_session_paths())
+                    lost_pre = [p for p in pre if p not in live]
+                    lost_scratch = [p for p in scratch if p not in live]
+                    if lost_pre:
+                        acc.append("PRE-EXISTING SESSIONS CLOSED BY A "
+                                   "CANCELLED CLOSE-ALL: %s" % lost_pre[:5])
+                    if lost_scratch:
+                        acc.append("scratch rows gone after cancel: %s"
+                                   % lost_scratch)
+            # chord leg — the instrument's live half (non-destructive)
+            chord = {}
+            if result.get("accepted"):
+                self.verb("tree", "select", scratch[0])
+                time.sleep(0.15)
+                tc = now_ms()
+                rc = self.verb("dom-eval", CHORD_LEG_JS, timeout=15)
+                chord = ((rc.get("json") or {}).get("data")
+                         or {}).get("result") or {}
+                if not r["ok"]:
+                    acc.append(f"chord dom-eval failed: {rc.get('error')}")
+                if not chord.get("accepted"):
+                    acc.append(f"chord leg refused: {chord.get('reason')} "
+                               "(walk letters may differ — honest refusal)")
+                else:
+                    if not chord.get("menu_seen"):
+                        acc.append("chord walk did not open the row menu "
+                                   "(badge letter drift?)")
+                    if not chord.get("overlay_closed"):
+                        acc.append("alt overlay left open after Escape")
+                cev = self.chord_events_from_trace(tc)
+                chord["trace"] = cev
+                if not cev.get("chord_events"):
+                    acc.append("NO ui/chord events in ytrace — build not "
+                               "rotated onto the chord instrument yet")
+            out["iterations"].append({
+                "open_wall_ms": open_wall_ms,
+                "menu_open_ms": result.get("menu_open_ms"),
+                "click_to_mount_ms": result.get("click_to_mount_ms"),
+                "dispatch_to_mount_ms": result.get("dispatch_to_mount_ms"),
+                "pair_ms": pair.get("pair_ms"),
+                "requested_rows": pair.get("requested_rows"),
+                "requested_bulk": pair.get("requested_bulk"),
+                "shown_kind": pair.get("shown_kind"),
+                "dialog_title": result.get("dialog_title"),
+                "unkept_button_present": result.get("unkept_button_present"),
+                "cancel_to_gone_ms": cancel.get("cancel_to_gone_ms"),
+                "chord_tap_to_overlay_ms": chord.get("tap_to_overlay_ms"),
+                "chord_walk_to_menu_ms": chord.get("walk_to_menu_ms"),
+                "chord_faces": [f.get("face") for f in
+                                (chord.get("trace") or {}).get("faces", [])],
+                "accuracy_failures": acc,
+            })
+        # THE CONFIRM LEG — only on a screen whose live sessions are all ours
+        confirm_result = {"ran": False}
+        if confirm_allowed:
+            confirm_result = {"ran": True}
+            self.verb("tree", "select", "__live_sessions__")
+            time.sleep(0.15)
+            r = self.verb("dom-eval", CLOSEALL_OPEN_JS, timeout=20)
+            result = ((r.get("json") or {}).get("data")
+                      or {}).get("result") or {}
+            if not result.get("accepted"):
+                confirm_result.update({"closed": False,
+                                       "error": result.get("reason")})
+            else:
+                rc = self.verb("dom-eval", CLOSEALL_CONFIRM_JS, timeout=20)
+                confirm = ((rc.get("json") or {}).get("data")
+                           or {}).get("result") or {}
+                confirm_result.update(confirm)
+                if confirm.get("accepted"):
+                    gone_by = time.time() + 20
+                    still = list(scratch)
+                    while time.time() < gone_by and still:
+                        live = set(self.live_session_paths())
+                        still = [p for p in still if p in live]
+                        if still:
+                            time.sleep(0.15)
+                    confirm_result["rows_gone"] = not still
+                    confirm_result["survivors"] = still
+                    if not still:
+                        # verified gone — teardown has nothing to close
+                        self.spawned_paths = [p for p in self.spawned_paths
+                                              if p not in scratch_set]
+                    else:
+                        confirm_result["accuracy_failures"] = [
+                            "scratch rows survived close-all: %s" % still]
+                else:
+                    confirm_result["accuracy_failures"] = [
+                        f"confirm failed: {confirm.get('reason')}"]
+        out["confirm_leg_result"] = confirm_result
+        return summarize(out, key="dispatch_to_mount_ms")
 
     # ---- waiters --------------------------------------------------------
 
@@ -875,7 +1263,7 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close,felt")
+                    default="spawn,drag,group,menu,modal,close,felt,closeall")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -917,6 +1305,8 @@ def main() -> int:
                 report["actions"]["modal"] = probe.action_modal(args.iters)
             elif action == "close":
                 report["actions"]["close"] = probe.action_close()
+            elif action == "closeall":
+                report["actions"]["closeall"] = probe.action_closeall(args.iters)
             else:
                 report["actions"][action] = {"error": f"unknown action {action}"}
             log(f"  {json.dumps(report['actions'][action], default=str)[:300]}")
