@@ -267,12 +267,15 @@ fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
 /// this binary's body compiles. A mismatch (page older/newer than the code,
 /// a document reload, a body change) simply reinstalls cold.
 fn terminal_mount_fn_probe_script() -> String {
-    // ⛔ The completion VALUE is what crosses the eval bridge: the script must
-    // be an IIFE whose return carries the answer (a bare expression's
-    // completion value is dropped by the function wrapper — the first live
-    // run answered false on every mount and the warm path never engaged).
+    // ⛔ The eval bridge wraps every script in a function body: a value
+    // crosses ONLY via a TOP-LEVEL `return`. A bare expression's completion
+    // value AND an IIFE's return are BOTH dropped — both prior shapes
+    // answered false on every live mount, so the warm path never engaged and
+    // every activation re-parsed the ~500 KB body (live-proven 2026-09-27:
+    // dom-eval `return 1+1` → 2, `1+1` → null, IIFE → null;
+    // mount_eval_warm count on the live build: 0).
     format!(
-        "(function() {{ return Boolean(window.__yggtermMountFn) && window.__yggtermMountFnV === {TERMINAL_MOUNT_FN_VERSION}; }})()"
+        "return Boolean(window.__yggtermMountFn) && window.__yggtermMountFnV === {TERMINAL_MOUNT_FN_VERSION};"
     )
 }
 

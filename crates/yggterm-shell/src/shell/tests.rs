@@ -14925,6 +14925,10 @@ console.log('ok');
         }
         assert!(script.contains("CSS.highlights"), "{script}");
         assert!(script.contains("document.createRange"), "{script}");
+        // The match label crosses the awaited eval bridge: only a top-level
+        // `return` carries a value (an IIFE's return is dropped — the
+        // 3/17-style counter once read empty forever).
+        assert!(script.trim_start().starts_with("return "), "{script}");
 
         // The stepper's direction reaches the script as a number, and stepping
         // wraps rather than running off either end.
@@ -22441,7 +22445,14 @@ console.log('ok');
         assert!(warm.contains("await window.__yggtermMountFn();"));
 
         let probe = terminal_mount_fn_probe_script();
-        assert!(probe.starts_with("(function() { return "), "the probe must be an IIFE - a bare expression's completion value is dropped by the eval bridge and the warm path never engages");
+        // ⛔ Bridge contract (live-proven 2026-09-27): the eval bridge wraps
+        // every script in a function body and ONLY a top-level `return`
+        // carries a value across — a bare expression AND an IIFE are both
+        // dropped. The IIFE shape here once answered false on every live
+        // mount (mount_eval_warm count: 0) and every activation re-parsed
+        // the ~500 KB body.
+        assert!(probe.trim_start().starts_with("return "), "the probe must cross the eval bridge via a top-level return - bare expressions and IIFE returns are both dropped");
+        assert!(!probe.trim_start().starts_with("("), "an IIFE probe answers null on the live bridge");
         assert!(probe.contains("Boolean(window.__yggtermMountFn)"));
         assert!(probe.contains("__yggtermMountFnV === 1"));
 

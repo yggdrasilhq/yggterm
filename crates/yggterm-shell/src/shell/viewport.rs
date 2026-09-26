@@ -2970,8 +2970,10 @@ fn preview_find_script(session_path: &str, needle: &str, step: Option<PillStep>)
         Some(PillStep::Next) => "1",
         None => "0",
     };
+    // ⛔ top-level `return` — the ONLY shape whose value crosses the eval
+    // bridge (an IIFE's return is dropped; see terminal_mount_fn_probe_script).
     format!(
-        r#"(function() {{
+        r#"return (function() {{
 {lookup}
   const needle = {needle_literal};
   const step = {step_literal};
