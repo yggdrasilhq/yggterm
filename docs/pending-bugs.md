@@ -18,6 +18,20 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.171] THE FELT SWITCH HAS NO END MARKER ON THE COMMON PATH — A ROW-TO-ROW SWITCH BETWEEN ALREADY-MOUNTED ROWS EMITS THE ACTIVATION AND THEN GOES SILENT, SO ACTIVATION→PAINT IS UNMEASURABLE (filed 2026-09-27, uxprobe on the live jojo desktop)
+
+**Status:** OPEN
+
+Filed 2026-09-27 ~00:45 IST on `lane/uxspeed/switch-mount` (zcode sess_e86f7708-5295-4289-b87b-eee2595f89ea on jojo), following the campaign law that a missing end-marker is itself a finding.
+
+MEASURED (uxprobe `switch` action, build 8b387952, CLI floor 85 ms drift −8 ms — a clean window): 8 real pointer clicks alternating two scratch rows, 8/8 accuracy (every click fired `session/activation` `origin:user_gesture` with `to` == the clicked row; activation_ms p50 315 max 346 wall, ≈200–230 net of the verb overhead). And then NOTHING: 0/8 windows saw `reveal_ready`, `reveal_forced_incomplete` OR `reveal_failed` within the 12 s probe windows.
+
+THE GAP: `reveal_ready` fired exactly 2× in the surrounding 20 min — both OUTSIDE every click window — i.e. the reveal leg self-reports on first-reveal-after-boot (and keyed label/kind, the door's known pairing gap), NOT on row-to-row switches. The common-case switch therefore has a begin (activation) and no end: the felt activation→paint number for the most frequent UX action cannot be measured by events until an end marker lands.
+
+FIX DIRECTION: a switch-scoped paint-truth end marker — either a reveal-style self-timed event emitted on re-activation of an already-mounted row, or joining the existing frame health family (`frame_window`/`frame_hash_probe`) to the activation as the pair. The probe (tools/uxspeed/uxprobe.py `switch` action) already joins by time-proximity and will consume the marker unchanged.
+
+FALSIFIER: uxprobe `switch` reports a reveal/paint end for ≥7/8 clicks with paint-truth (self-timed first_output or frame record), and the baseline row in the campaign door fills its activation→paint column.
+
 ## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
 
 **Status:** OPEN
@@ -3205,6 +3219,51 @@ surface still on screen while the new mount has not painted; broken TUI paint is
 painted partially. Both are what "a mount begins with an empty surface" looks like to the eye
 rather than to the trace. ⚠ If they turn out to have independent roots they split out — but
 filing three entries for one symptom chain is what made this look half-fixed once already.
+
+### ⭐ 2026-09-26 REFRESH (a zcode seat on the muse lab host, app 3.2.113 build 38e62f79f3d5, the boot after the daemon SIGABRT) — THE MOUNT CHURN IS GONE; THE CHURN MOVED UP TO THE LAUNCH-REQUEST LAYER, AND THE WAVE LEAVES THE GUI HOT AND CONTROL-DEAF
+
+Census over the 50 minutes spanning the stack restore (daemon ~11:45Z, GUI ~13:15Z), measured
+from the live trace, window-reconstructed, no synthetic input:
+
+| what | the 3.1.26 entry (1.3 min) | now (50 min) |
+|---|---|---|
+| `terminal_mount/begin` (full mounts) | 5 | **0** |
+| `terminal_mount/bootstrap_reset` | 7 | 4 |
+| `retained_rehydrate_begin` / `-skipped_live_connected` | — | 6 / 4 |
+| `ensure_retry` / `daemon_ensure_timeout_proceeding` | — | 17 / 6 |
+| `request_terminal_launch_for_active_begin` | 13 | **660** (bursts: 109 in 1.4 s, 212 in 30 s) |
+| `live_session_birth` | — | **960** |
+| `session/activation` (all origins) | — | 36 total, ~32 of them during the boot minute; steady-state ~0 |
+| `reveal_ready` | — | **0** — the clean-ready path did not complete once in the window |
+
+1. **The LEGENDARY mechanism as written did not fire.** No row was torn down and re-mounted
+   on a ~20 s cadence; zero full mounts in the window. Whatever the felt symptom's fate, the
+   mount half of this entry needs re-verdicting by the owner on the current build.
+2. **The churn now lives one layer up**: the restore walker re-requests terminal launches per
+   round across the whole row set — 719 `request_terminal_launch_for_active_begin` events
+   scanned across 12+ distinct rows (per-row repeats 3–26). With a peer host DARK (dev
+   no-route from ~11:50Z during this window) the dev-targeted rows amplify ~5× (12–26 repeats
+   vs 3–9 for local/guihost rows): every ensure against a dead peer burns its timeout and the
+   walker comes back around. A peer outage turns a boot restore into a minutes-long
+   launch storm, and everything felt in that window pays for it.
+3. **The wave leaves the GUI hot and deaf**: at 19-min GUI uptime — 3.9 GB RSS, ~49% CPU,
+   `ui/block` ×112 in 5 min at p50 **523 ms**, `render/gui` spans to 46 s, and app-control
+   verbs (`server app rows`) timing out at 15 s. That is the [11.38] heat class arriving with
+   the restore wave. No felt-action baseline (switch included) is measurable in this state;
+   the switch quiet-window baseline (below) waits for a settled or freshly booted GUI.
+4. **The owed instrument landed**: `tools/uxspeed/uxprobe.py` has a `switch` action (this
+   lane) — real pointer CLICKS on sidebar tree rows (press+release, no threshold cross),
+   asserting the `user_gesture` activation (latency + identity to == clicked row), joining
+   the reveal outcome by time-proximity, and counting the ambient churn per window. First
+   functional clicks fired 2026-09-26 ~13:27Z; the quiet-window baseline run is pending a
+   quiet GUI (the launch-probe attempt under the wave starved on trace pulls — honest abort).
+
+**Status stays OPEN with the scope narrowed**: the mount churn is (pending the owner's felt
+re-verdict) fixed on 3.2.113; the open halves are (a) the restore walker's launch-request
+storm under peer outage, (b) the post-wave hot/deaf GUI state, (c) the felt switch cost and
+its quiet-window baseline. The falsifier for (a): a peer outage during a boot restore
+produces ≤1 `request_terminal_launch_for_active_begin` per row per restore round (no 5×
+amplification), and `ensure_retry` against a dead peer stops after a bounded count.
 
 ### ⭐ THE MOUNT→PAINT SPAN NOW EXISTS — 2026-08-21, `xterm_paint`
 
