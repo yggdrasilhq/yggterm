@@ -36393,6 +36393,50 @@ fn remote_resume_should_force_restart_after_codex_rejected_surface(
         && !force_remote_restart_attempted
         && !restart_protected_runtime
 }
+/// A runtime START under a remote-resume watch is a replacement: somebody
+/// restarted (or respawned) the child the watch was reading. The escalation to
+/// a force_remote restart judges the runtime it has been watching, so its
+/// accumulated evidence (hard-fail deadline already burned, prompt-only
+/// surface observed) dies with the replaced child and must be re-earned
+/// against the fresh one. [11.167] measured the failure without this: a shell
+/// escalation fired ONE SECOND after a plain user restart and terminated the
+/// peer codex session, because the watch carried its stale hard-fail state
+/// across the replacement. The hot-update handoff — the escalation's design
+/// target — never cycles the runtime (the preserved PTY survives the daemon
+/// swap), so a rising edge never fires there and the handoff recovery is
+/// unchanged.
+fn remote_resume_should_rearm_after_runtime_replace(
+    is_remote_resume_session: bool,
+    last_runtime_running: bool,
+    runtime_running: bool,
+) -> bool {
+    is_remote_resume_session && !last_runtime_running && runtime_running
+}
+#[cfg(test)]
+mod remote_resume_runtime_replace_rearm_locks {
+    use super::*;
+    /// The whole truth table. The load-bearing rows: the rising edge is the
+    /// ONLY shape that re-arms (a steady runtime must not reset a watch that
+    /// is legitimately burning toward its escalation, and a dying runtime is
+    /// owned by the ensure/missing-runtime machinery, not by the resume
+    /// watch), and a non-remote-resume session has no watch to re-arm.
+    #[test]
+    fn the_runtime_replace_rearm_table_is_exactly_this() {
+        for (is_remote, last, now, want) in [
+            (true, false, true, true),  // rising edge: a fresh runtime started
+            (true, true, true, false),  // steady live: keep burning the window
+            (true, false, false, false), // steady dead: ensure machinery owns it
+            (true, true, false, false), // falling edge: teardown, not a start
+            (false, false, true, false), // local session: no resume watch
+        ] {
+            assert_eq!(
+                remote_resume_should_rearm_after_runtime_replace(is_remote, last, now),
+                want,
+                "is_remote={is_remote} last_running={last} now_running={now}"
+            );
+        }
+    }
+}
 fn remote_resume_should_linger_for_progressing_runtime(
     hard_failed_remote_resume: bool,
     runtime_running: bool,

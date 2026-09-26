@@ -11449,6 +11449,37 @@ fn TerminalCanvas(
                                 resync_required,
                                 screen_hash,
                             )) => {
+                                // [11.167] A runtime START under this watch is a
+                                // replacement: the child the watch accumulated its
+                                // hard-fail evidence against is gone. Re-arm the
+                                // escalation budget so a force_remote restart must
+                                // be re-earned against the FRESH runtime — without
+                                // this, a plain user restart inherited a stale
+                                // burned deadline and the escalation fired one
+                                // second later, terminating the peer codex
+                                // session (measured 2026-09-25). The hot-update
+                                // handoff never cycles the runtime, so its
+                                // recovery is unchanged.
+                                if remote_resume_should_rearm_after_runtime_replace(
+                                    is_remote_resume_session,
+                                    last_runtime_running,
+                                    runtime_running,
+                                ) {
+                                    remote_resume_hard_fail_deadline_ms = current_millis()
+                                        .saturating_add(REMOTE_TERMINAL_RESUME_HARD_FAIL_MS);
+                                    resume_recovery_attempts = 0;
+                                    remote_resume_prompt_only_observed = false;
+                                    remote_resume_codex_rejected_surface_observed = false;
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "resume_watch_rearmed_runtime_replaced",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                        }),
+                                    );
+                                }
                                 // One successful daemon read is enough to
                                 // clear transport uncertainty and wake the
                                 // writer's retained queue. It is NOT enough to
