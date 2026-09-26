@@ -18,6 +18,20 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.171] THE FELT SWITCH HAS NO END MARKER ON THE COMMON PATH — A ROW-TO-ROW SWITCH BETWEEN ALREADY-MOUNTED ROWS EMITS THE ACTIVATION AND THEN GOES SILENT, SO ACTIVATION→PAINT IS UNMEASURABLE (filed 2026-09-27, uxprobe on the live jojo desktop)
+
+**Status:** OPEN
+
+Filed 2026-09-27 ~00:45 IST on `lane/uxspeed/switch-mount` (zcode sess_e86f7708-5295-4289-b87b-eee2595f89ea on jojo), following the campaign law that a missing end-marker is itself a finding.
+
+MEASURED (uxprobe `switch` action, build 8b387952, CLI floor 85 ms drift −8 ms — a clean window): 8 real pointer clicks alternating two scratch rows, 8/8 accuracy (every click fired `session/activation` `origin:user_gesture` with `to` == the clicked row; activation_ms p50 315 max 346 wall, ≈200–230 net of the verb overhead). And then NOTHING: 0/8 windows saw `reveal_ready`, `reveal_forced_incomplete` OR `reveal_failed` within the 12 s probe windows.
+
+THE GAP: `reveal_ready` fired exactly 2× in the surrounding 20 min — both OUTSIDE every click window — i.e. the reveal leg self-reports on first-reveal-after-boot (and keyed label/kind, the door's known pairing gap), NOT on row-to-row switches. The common-case switch therefore has a begin (activation) and no end: the felt activation→paint number for the most frequent UX action cannot be measured by events until an end marker lands.
+
+FIX DIRECTION: a switch-scoped paint-truth end marker — either a reveal-style self-timed event emitted on re-activation of an already-mounted row, or joining the existing frame health family (`frame_window`/`frame_hash_probe`) to the activation as the pair. The probe (tools/uxspeed/uxprobe.py `switch` action) already joins by time-proximity and will consume the marker unchanged.
+
+FALSIFIER: uxprobe `switch` reports a reveal/paint end for ≥7/8 clicks with paint-truth (self-timed first_output or frame record), and the baseline row in the campaign door fills its activation→paint column.
+
 ## ⛔ THE 11.6.x CLI-INTEGRATION FAMILY — per-CLI ids (owner scheme 2026-09-10; the stone: [`cli-integration-layer.md`](cli-integration-layer.md))
 
 **Status:** OPEN
