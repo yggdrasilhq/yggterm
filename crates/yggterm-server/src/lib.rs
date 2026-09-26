@@ -1704,6 +1704,9 @@ fn persisted_live_session_from_managed(
         created_by: session_metadata_value(session, CREATED_BY_METADATA_LABEL),
         ephemeral: session_metadata_value(session, EPHEMERAL_METADATA_LABEL),
         agent_launch_options: session.agent_launch_options.clone(),
+        terminal_identity_exports: funnel_carried_identity_exports(Some(
+            &session.launch_command,
+        )),
         title_is_explicit: session.title_is_explicit,
         outline_prefix: session.outline_prefix.clone(),
         // ONE encoding: the `Source` stamp an app launch writes IS the
@@ -4935,6 +4938,18 @@ pub struct PersistedLiveSession {
     /// user's default (expensive) tier — the exact trap this feature closes.
     #[serde(default, skip_serializing_if = "AgentLaunchOptions::is_empty")]
     pub agent_launch_options: AgentLaunchOptions,
+    /// The terminal-identity exports the row's launch command carried at
+    /// persist time, scraped verbatim
+    /// ([`funnel_carried_identity_exports`]). [11.168] leg 3: the in-memory
+    /// carry (leg 2) cannot survive a COLD restart — there the session map is
+    /// born from the global compose, so scraping the row's current command at
+    /// the restore recompose carries the global right back. Persisted so the
+    /// restore recompose re-applies the row's OWN exports, the same survival
+    /// rule [`Self::agent_launch_options`] already follows. `#[serde(default)]`
+    /// so an older state file reads empty, which composes byte-identically to
+    /// the pre-carry behaviour (a bare row still inherits the global).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_identity_exports: Vec<String>,
     /// Whether [`Self::title`] was set by a human. Persisted because the whole
     /// point of the flag is to survive the daemon that learned it — a row
     /// outlives many daemons, and a rename that does not survive a restart is
@@ -6498,6 +6513,7 @@ impl YggtermServer {
         }
         self.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: session_id.to_string(),
             title: "untitled session".to_string(),
@@ -6933,11 +6949,16 @@ impl YggtermServer {
         // rebuild — which fires ~1 ms after a delegate row is born, before its
         // first launch — silently drops `--model`/`--permission-mode` and the
         // row runs on the user's default tier (guihost, 2026-08-06).
-        let launch_command = stored_session_launch_command_with_options(
+        // [11.168] leg 3: the re-derive carries the row's OWN exports — this
+        // refresh fires between a local CC row's birth and its relaunch, and
+        // composing from the host global re-identified the row mid-life.
+        let identity_exports = funnel_carried_identity_exports(Some(&session.launch_command));
+        let launch_command = stored_session_launch_command_with_options_and_identity(
             SessionKind::ClaudeCode,
             &cwd,
             &current_id,
             &session.agent_launch_options,
+            Some(&identity_exports),
         );
         let changed = session.launch_command != launch_command || session.id != current_id;
         if !changed {
@@ -13202,6 +13223,7 @@ impl YggtermServer {
             created_by,
             ephemeral,
             agent_launch_options,
+            terminal_identity_exports,
             title_is_explicit,
             outline_prefix,
             app_launch,
@@ -13679,8 +13701,22 @@ impl YggtermServer {
                     // re-derived from its own token in the block below, which runs
                     // for every app row rather than only the ones that happen to
                     // have a transcript.
-                    session.launch_command =
-                        stored_session_launch_command(session.kind, &cwd, &id);
+                    // [11.168] leg 3: the recompose carries the row's
+                    // identity — the PERSISTED exports first (they survive a
+                    // cold restart, where the in-memory command was just born
+                    // from the global compose), else the row's current
+                    // command, else the global (bare row, byte-identical).
+                    let carried_transcript_identity = if terminal_identity_exports.is_empty() {
+                        funnel_carried_identity_exports(Some(&session.launch_command))
+                    } else {
+                        terminal_identity_exports.clone()
+                    };
+                    session.launch_command = stored_session_launch_command_with_identity(
+                        session.kind,
+                        &cwd,
+                        &id,
+                        Some(&carried_transcript_identity),
+                    );
                 }
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -13714,8 +13750,11 @@ impl YggtermServer {
                     // BEFORE any ensure and was the leak that re-identified a
                     // dark-born probe row light after the rotation (falsifier
                     // 2026-09-26, muse lab host).
-                    let carried_restore_identity =
-                        funnel_carried_identity_exports(Some(&session.launch_command));
+                    let carried_restore_identity = if terminal_identity_exports.is_empty() {
+                        funnel_carried_identity_exports(Some(&session.launch_command))
+                    } else {
+                        terminal_identity_exports.clone()
+                    };
                     session.launch_command =
                         stored_session_launch_command_for_locality_with_options_and_identity(
                             session.kind,
@@ -37612,6 +37651,48 @@ fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str)
     stored_session_launch_command_for_locality(kind, cwd, session_id, true, None)
 }
 
+/// [`stored_session_launch_command`] carrying the ROW's identity exports
+/// ([11.168]): the restore recompose re-applies what the row carried instead
+/// of re-reading the host global. `None` ⇒ byte-identical to the pre-carry
+/// law.
+fn stored_session_launch_command_with_identity(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
+    stored_session_launch_command_from_vouch_with_identity(
+        kind,
+        cwd,
+        session_id,
+        true,
+        None,
+        &AgentLaunchOptions::default(),
+        None,
+        carried_identity_exports,
+    )
+}
+
+/// [`stored_session_launch_command_with_options`] carrying the ROW's identity
+/// exports ([11.168]) — the local CC relaunch re-derive's compose.
+fn stored_session_launch_command_with_options_and_identity(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    launch: &AgentLaunchOptions,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
+    stored_session_launch_command_for_locality_with_options_and_identity(
+        kind,
+        cwd,
+        session_id,
+        true,
+        None,
+        launch,
+        carried_identity_exports,
+    )
+}
+
 fn local_default_cwd() -> String {
     dirs::home_dir()
         .map(|path| path.display().to_string())
@@ -39557,6 +39638,7 @@ mod tests {
         let path = "remote-cc://dev/9f1c2d3e-4b5a-6c7d-8e9f-0a1b2c3d4e5f";
         let live = PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: path.to_string(),
             id: "9f1c2d3e-4b5a-6c7d-8e9f-0a1b2c3d4e5f".to_string(),
             title: "an agent mid-turn".to_string(),
@@ -39618,6 +39700,7 @@ mod tests {
     fn remote_cc_keep_alive_sessions_are_recoverable_like_codex() {
         let cc = PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-cc://practice/8247344a-6764-4c06-9cf5-d74757ee09d0".to_string(),
             id: "8247344a-6764-4c06-9cf5-d74757ee09d0".to_string(),
             title: "cc keep-alive".to_string(),
@@ -40028,6 +40111,7 @@ mod tests {
         };
         let persisted = crate::PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "local://abc".to_string(),
             id: "abc".to_string(),
             title: "delegate".to_string(),
@@ -40045,6 +40129,7 @@ mod tests {
             title_is_explicit: false,
             outline_prefix: None,
         };
+
         let round_tripped: crate::PersistedLiveSession =
             serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
         assert_eq!(round_tripped.agent_launch_options, options);
@@ -43323,6 +43408,7 @@ mod tests {
             title_is_explicit: false,
             outline_prefix: None,
             app_launch: Some("app:ychrome:new".to_string()),
+            terminal_identity_exports: Vec::new(),
         };
 
         for restart in 1..=2 {
@@ -50433,6 +50519,139 @@ terminal_window_id: None,
         );
     }
 
+    /// [11.168] leg 3: a restored LOCAL row recomposes with the exports IT
+    /// carried, not the host global. The flip-flop class: the persisted form
+    /// never carried the command, so every restore recompose re-read the
+    /// global and a row re-identified at its first post-restart compose
+    /// (measured on a local codex probe row, 2026-09-26: dark exports at the
+    /// first post-restart spec, light at the second).
+    #[test]
+    fn a_restored_local_row_recomposes_with_its_persisted_identity_exports() {
+        let _guard = terminal_identity_test_guard();
+        crate::sync_terminal_identity_appearance("dark");
+        let carried = vec![
+            "export YGGTERM_APPEARANCE='light'".to_string(),
+            "export COLORFGBG='0;15'".to_string(),
+            "export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7'".to_string(),
+        ];
+        let command = stored_session_launch_command_with_identity(
+            SessionKind::Codex,
+            "/srv/app",
+            "abc123",
+            Some(&carried),
+        );
+        assert!(command.contains("APPEARANCE='light'"), "{command}");
+        assert!(command.contains("0;15"), "{command}");
+        assert!(command.contains("#f7f7f7"), "{command}");
+        assert!(
+            !command.contains("15;0") && !command.contains("#262a33"),
+            "the dark global must not leak into a carried row: {command}"
+        );
+        // The extraction fixpoint: the recomposed command carries exactly the
+        // exports the row persisted, so the next restart re-applies the same
+        // identity instead of drifting.
+        assert_eq!(
+            funnel_carried_identity_exports(Some(&command)),
+            carried,
+            "the restore recompose is an extraction fixpoint"
+        );
+    }
+
+    /// [11.168] AND THE BYTE LAW: an old state file (or a bare row) persists
+    /// no exports, and an empty carry composes exactly like the pre-carry
+    /// law — the global is read, nothing else changes.
+    #[test]
+    fn an_old_state_file_without_identity_exports_still_restores_from_the_global() {
+        let _guard = terminal_identity_test_guard();
+        crate::sync_terminal_identity_appearance("dark");
+        let command = stored_session_launch_command_with_identity(
+            SessionKind::Codex,
+            "/srv/app",
+            "abc123",
+            None,
+        );
+        assert!(command.contains("APPEARANCE='dark'"), "{command}");
+    }
+
+    /// [11.168] leg 3: the persisted field round-trips, and an old state file
+    /// that predates it reads EMPTY (bare), never a guess.
+    #[test]
+    fn identity_exports_survive_the_persist_round_trip_and_default_empty() {
+        let _guard = terminal_identity_test_guard();
+        let exports = vec!["export YGGTERM_APPEARANCE='light'".to_string()];
+        let persisted = crate::PersistedLiveSession {
+            terminal_identity_exports: exports.clone(),
+            ..serde_json::from_str::<crate::PersistedLiveSession>(
+                r#"{"key":"local://x","id":"x","title":"t","kind":"codex","ssh_target":"localhost","cwd":"/srv/app"}"#,
+            )
+            .expect("old-shape json")
+        };
+        let round_tripped: crate::PersistedLiveSession =
+            serde_json::from_str(&serde_json::to_string(&persisted).expect("serialise"))
+                .expect("deserialise");
+        assert_eq!(round_tripped.terminal_identity_exports, exports);
+        let old_shape: crate::PersistedLiveSession = serde_json::from_str(
+            r#"{"key":"local://x","id":"x","title":"t","kind":"codex","ssh_target":"localhost","cwd":"/srv/app"}"#,
+        )
+        .expect("an old state file without the field deserialises");
+        assert!(old_shape.terminal_identity_exports.is_empty());
+    }
+
+    /// [11.168] leg 3 structural lock: the restore recompose, the local CC
+    /// re-derive and the persist scrape must all consult the row's carried
+    /// exports — leg 2 covered the re-open/focus sites and the rebound arm;
+    /// this locks the rest, so a refactor that silently re-reads the host
+    /// global fails here, not on the owner's light theme.
+    #[test]
+    fn the_restore_recompose_consults_the_rows_persisted_exports() {
+        let source = include_str!("lib.rs");
+        let restore_body = source
+            .split("pub fn restore_live_session(")
+            .nth(1)
+            .expect("restore_live_session")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of restore_live_session");
+        assert!(
+            restore_body.contains("terminal_identity_exports.is_empty()"),
+            "both restore arms must prefer the PERSISTED exports — the in-memory              command at a cold restart was just born from the global"
+        );
+        assert!(
+            restore_body.contains("stored_session_launch_command_with_identity(")
+                && restore_body
+                    .contains("stored_session_launch_command_for_locality_with_options_and_identity("),
+            "both restore arms must compose through the carried-identity twins"
+        );
+        assert!(
+            !restore_body.contains("stored_session_launch_command(")
+                && !restore_body
+                    .contains("stored_session_launch_command_for_locality_with_options("),
+            "the restore recompose must never re-read the host global for a row that carries exports"
+        );
+        let cc_body = source
+            .split("pub fn refresh_local_cc_relaunch_launch_command(")
+            .nth(1)
+            .expect("refresh_local_cc_relaunch_launch_command")
+            .split("\n    pub fn ")
+            .next()
+            .expect("the end of refresh_local_cc_relaunch_launch_command");
+        assert!(
+            cc_body.contains("funnel_carried_identity_exports(Some(&session.launch_command))"),
+            "the local CC re-derive must carry the row's own exports"
+        );
+        let persist_body = source
+            .split("fn persisted_live_session_from_managed(")
+            .nth(1)
+            .expect("persisted_live_session_from_managed")
+            .split("\nfn ")
+            .next()
+            .expect("the end of persisted_live_session_from_managed");
+        assert!(
+            persist_body.contains("terminal_identity_exports: funnel_carried_identity_exports(Some("),
+            "the persisted record must scrape the row's command at persist time"
+        );
+    }
+
     /// The funnel's recompose sites are locked structurally: every arm that
     /// overwrites a stored launch command must consult the row's own exports
     /// first, and the ensure arms must compose through the carried-identity
@@ -50884,6 +51103,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
                     app_launch: None,
+                    terminal_identity_exports: Vec::new(),
                     key: stale_path.clone(),
                     id: "missing".to_string(),
                     title: "Stale Live".to_string(),
@@ -50937,6 +51157,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
                     app_launch: None,
+                    terminal_identity_exports: Vec::new(),
                     key: stale_path.clone(),
                     id: "missing-runtime".to_string(),
                     title: "Temporary Update Restore".to_string(),
@@ -51019,6 +51240,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
                     app_launch: None,
+                    terminal_identity_exports: Vec::new(),
                     key: kept_path.clone(),
                     id: "kept-runtime".to_string(),
                     title: "Kept Restore".to_string(),
@@ -51107,6 +51329,7 @@ terminal_window_id: None,
         });
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: remote_path.clone(),
             id: "abc123".to_string(),
             title: "Restore Live Remote".to_string(),
@@ -51253,6 +51476,7 @@ terminal_window_id: None,
         let kept_remote = remote_scanned_session_path("dev", "kept-samplenotes");
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: kept_remote.clone(),
             id: "kept-samplenotes".to_string(),
             title: "samplenotes".to_string(),
@@ -51299,6 +51523,7 @@ terminal_window_id: None,
             );
             server.restore_live_session(PersistedLiveSession {
                 app_launch: None,
+                terminal_identity_exports: Vec::new(),
                 key: row_key,
                 id,
                 title: "invented integration row".to_string(),
@@ -51334,6 +51559,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: "00000000-0000-4000-8000-000000000099".to_string(),
             title: "invented Muse row".to_string(),
@@ -51531,6 +51757,7 @@ terminal_window_id: None,
         let protected_runtime = "local://00000000-0000-4000-8000-000000000073";
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: protected_runtime.to_string(),
             id: "00000000-0000-4000-8000-000000000073".to_string(),
             title: "Owner named this row".to_string(),
@@ -51607,6 +51834,7 @@ terminal_window_id: None,
         );
         let row = |id: &str| PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: format!("local://{id}"),
             id: id.to_string(),
             title: id.to_string(),
@@ -51667,6 +51895,7 @@ terminal_window_id: None,
         );
         let row = |id: &str| PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: format!("local://{id}"),
             id: id.to_string(),
             title: id.to_string(),
@@ -51947,6 +52176,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "local://update-shell".to_string(),
             id: "update-shell".to_string(),
             title: "Update Shell".to_string(),
@@ -52052,6 +52282,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
                     app_launch: None,
+                    terminal_identity_exports: Vec::new(),
                     key: "local://old-shell".to_string(),
                     id: "old-shell".to_string(),
                     title: "Old unkept shell".to_string(),
@@ -52104,6 +52335,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
                     app_launch: None,
+                    terminal_identity_exports: Vec::new(),
                     key: "local://agent-row".to_string(),
                     id: "agent-row".to_string(),
                     title: "Live agent row".to_string(),
@@ -52191,6 +52423,7 @@ terminal_window_id: None,
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
                     app_launch: None,
+                    terminal_identity_exports: Vec::new(),
                     key: "local::old-shell".to_string(),
                     id: "old-shell".to_string(),
                     title: "Old unkept shell".to_string(),
@@ -52265,6 +52498,7 @@ terminal_window_id: None,
         let kept = crate::remote_cc_session_path("dev", "kept-row");
         let row = |key: String| PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key,
             id: "row-id".to_string(),
             title: "a row".to_string(),
@@ -52376,6 +52610,7 @@ terminal_window_id: None,
         let key = crate::remote_cc_session_path("dev", "adopt-me");
         let row = |title: &str| PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: key.clone(),
             id: "adopt-me".to_string(),
             title: title.to_string(),
@@ -52485,6 +52720,7 @@ terminal_window_id: None,
         let unkept = crate::remote_cc_session_path("dev", "user-unkept");
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: unkept.clone(),
             id: "user-unkept".to_string(),
             title: "unkept".to_string(),
@@ -52814,6 +53050,7 @@ terminal_window_id: None,
                 live_sessions: vec![
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: remote_path.clone(),
                         id: "kept-remote".to_string(),
                         title: "Kept Remote".to_string(),
@@ -52835,6 +53072,7 @@ terminal_window_id: None,
                     },
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: "local://update-shell".to_string(),
                         id: "update-shell".to_string(),
                         title: "Update Shell".to_string(),
@@ -52888,6 +53126,7 @@ terminal_window_id: None,
                 live_sessions: vec![
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: "local::dead-shell".to_string(),
                         id: "dead-shell".to_string(),
                         title: "Smoke Local Shell".to_string(),
@@ -52907,6 +53146,7 @@ terminal_window_id: None,
                     },
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: "codex-runtime://dead-codex".to_string(),
                         id: "dead-codex".to_string(),
                         title: "Remote Codex 019d1518".to_string(),
@@ -52926,6 +53166,7 @@ terminal_window_id: None,
                     },
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: "document::dead-doc".to_string(),
                         id: "dead-doc".to_string(),
                         title: "local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
@@ -52991,6 +53232,7 @@ terminal_window_id: None,
                 live_sessions: vec![
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: "local::first-shell".to_string(),
                         id: "first-shell".to_string(),
                         title: "First shell".to_string(),
@@ -53010,6 +53252,7 @@ terminal_window_id: None,
                     },
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: "local::second-shell".to_string(),
                         id: "second-shell".to_string(),
                         title: "Second shell".to_string(),
@@ -53134,6 +53377,7 @@ terminal_window_id: None,
                 live_sessions: vec![
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: first_path.clone(),
                         id: "abc123".to_string(),
                         title: "First remote".to_string(),
@@ -53153,6 +53397,7 @@ terminal_window_id: None,
                     },
                     PersistedLiveSession {
                         app_launch: None,
+                        terminal_identity_exports: Vec::new(),
                         key: second_path.clone(),
                         id: "def456".to_string(),
                         title: "Second remote".to_string(),
@@ -53284,6 +53529,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: storage_path.to_string(),
             id: "stored-codex-id".to_string(),
             title: "Stored Codex".to_string(),
@@ -53329,6 +53575,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "codex-runtime://runtime-session".to_string(),
             id: "runtime-session".to_string(),
             title: "Runtime Session".to_string(),
@@ -53389,6 +53636,7 @@ terminal_window_id: None,
         let key = "remote-cc://practice/53991819-a835-4bd2-b5c4-76a67631f33c";
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: key.to_string(),
             id: "53991819-a835-4bd2-b5c4-76a67631f33c".to_string(),
             title: "practice cc".to_string(),
@@ -53466,6 +53714,7 @@ terminal_window_id: None,
 
             let persisted = PersistedLiveSession {
                 app_launch: None,
+                terminal_identity_exports: Vec::new(),
                 key: original,
                 id: session_id.to_string(),
                 title: format!("Example {} Work", descriptor.display_name),
@@ -53518,6 +53767,7 @@ terminal_window_id: None,
         let key = "live::0197c95a-0000-7000-8000-0000000000a5";
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: key.to_string(),
             id: "0197c95a-0000-7000-8000-0000000000a5".to_string(),
             title: "Jyas SSH Terminal".to_string(),
@@ -53560,6 +53810,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: "synthetic-runtime".to_string(),
             title: "Remote Codex synthetic".to_string(),
@@ -53653,6 +53904,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: wrong.to_string(),
             title: "collapse victim".to_string(),
@@ -53724,6 +53976,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: birth.to_string(),
             title: "order-lost row".to_string(),
@@ -53778,6 +54031,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: rebirth.to_string(),
             title: "re-birthed".to_string(),
@@ -53828,6 +54082,7 @@ terminal_window_id: None,
         ] {
             server.restore_live_session(PersistedLiveSession {
                 app_launch: None,
+                terminal_identity_exports: Vec::new(),
                 key: key.clone(),
                 id: birth.to_string(),
                 title: "row".to_string(),
@@ -53962,6 +54217,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: wrong.to_string(),
             title: "stale".to_string(),
@@ -54020,6 +54276,7 @@ terminal_window_id: None,
         server.remote_machines = vec![remote_machine_with_scanned_session("dev", real_id, true)];
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "Kaustav work".to_string(),
@@ -54134,6 +54391,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "Remote Codex 0dce9c47".to_string(),
@@ -54261,6 +54519,7 @@ terminal_window_id: None,
         }];
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "muhurta".to_string(),
@@ -54333,6 +54592,7 @@ terminal_window_id: None,
         }];
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
             title: "samplenotes webapp".to_string(),
@@ -54418,6 +54678,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: "00000000-0000-4000-8000-00000000husk".to_string(),
             title: "New Muse Code Session".to_string(),
@@ -54503,6 +54764,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: row_uuid.to_string(),
             title: "agy-runtime://00000000-0000-4000-8000-00000000ag00".to_string(),
@@ -54566,6 +54828,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: row_uuid.to_string(),
             title: "New Muse Code Session".to_string(),
@@ -54681,6 +54944,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: row_uuid.to_string(),
             title: "agy-runtime://00000000-0000-4000-8000-00000000a600".to_string(),
@@ -54804,6 +55068,7 @@ terminal_window_id: None,
         );
         let persisted = PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: birth_id.to_string(),
             title: "New Codex Session".to_string(),
@@ -54885,6 +55150,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.to_string(),
             id: "synthetic-runtime".to_string(),
             title: "Local Codex synthetic".to_string(),
@@ -55567,6 +55833,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://guihost/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Example".to_string(),
@@ -55632,6 +55899,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://dev/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Remote Session".to_string(),
@@ -56283,6 +56551,7 @@ terminal_window_id: None,
             crate::sync_terminal_identity_appearance("light");
             server.restore_live_session(PersistedLiveSession {
                 app_launch: None,
+                terminal_identity_exports: Vec::new(),
                 key: "remote-session://dev/abc123".to_string(),
                 id: "abc123".to_string(),
                 title: "Restored".to_string(),
@@ -56420,6 +56689,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: "abc123".to_string(),
             title: "Restored Remote Codex".to_string(),
@@ -56503,6 +56773,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: runtime_key.clone(),
             id: "fresh123".to_string(),
             title: "Fresh Remote Codex".to_string(),
@@ -56611,6 +56882,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://dev/fresh-codex".to_string(),
             id: "fresh-codex".to_string(),
             title: "Yggterm".to_string(),
@@ -56674,6 +56946,7 @@ terminal_window_id: None,
 
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://dev/synthetic-runtime".to_string(),
             id: "synthetic-runtime".to_string(),
             title: "Update-restored Codex".to_string(),
@@ -56748,6 +57021,7 @@ terminal_window_id: None,
         });
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://dev/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
@@ -56830,6 +57104,7 @@ terminal_window_id: None,
         });
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://guihost/live-1".to_string(),
             id: "live-1".to_string(),
             title: "Live 1".to_string(),
@@ -56849,6 +57124,7 @@ terminal_window_id: None,
         });
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://guihost/live-2".to_string(),
             id: "live-2".to_string(),
             title: "Live 2".to_string(),
@@ -56918,6 +57194,7 @@ terminal_window_id: None,
         });
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://guihost/live-2".to_string(),
             id: "live-2".to_string(),
             title: "Live 2".to_string(),
@@ -57452,6 +57729,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "remote-session://dev/abc123".to_string(),
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
@@ -57484,6 +57762,7 @@ terminal_window_id: None,
         let path = "remote-session://dev/abc123";
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: path.to_string(),
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
@@ -57520,6 +57799,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "local://codex".to_string(),
             id: "codex".to_string(),
             title: "Codex".to_string(),
@@ -57539,6 +57819,7 @@ terminal_window_id: None,
         });
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "local://shell".to_string(),
             id: "shell".to_string(),
             title: "Shell".to_string(),
@@ -57573,6 +57854,7 @@ terminal_window_id: None,
         );
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
+            terminal_identity_exports: Vec::new(),
             key: "codex-runtime://cleanup-me".to_string(),
             id: "cleanup-me".to_string(),
             title: "Cleanup Me".to_string(),
