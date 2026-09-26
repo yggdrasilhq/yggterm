@@ -12760,11 +12760,11 @@ impl YggtermServer {
         // as the sweep: a row that already carries identity exports keeps
         // them verbatim; a bare/fresh row passes None and inherits exactly
         // the pre-carry fallback (request appearance, else the global).
-        let carried_identity_exports = self
-            .sessions
-            .get(&key)
-            .map(|session| terminal_identity_exports_in_command(&session.launch_command))
-            .unwrap_or_default();
+        let carried_identity_exports = funnel_carried_identity_exports(
+            self.sessions
+                .get(&key)
+                .map(|session| session.launch_command.as_str()),
+        );
         let launch_command = if resumable {
             remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
                 kind,
@@ -12968,11 +12968,11 @@ impl YggtermServer {
         // recompose of an EXISTING row keeps the row's identity exports
         // verbatim; a fresh row passes None and inherits the pre-carry
         // fallback.
-        let start_carried_identity_exports = self
-            .sessions
-            .get(&key)
-            .map(|session| terminal_identity_exports_in_command(&session.launch_command))
-            .unwrap_or_default();
+        let start_carried_identity_exports = funnel_carried_identity_exports(
+            self.sessions
+                .get(&key)
+                .map(|session| session.launch_command.as_str()),
+        );
         let composed = codex_cli::managed_cli_shell_command_configured_with_identity(
             kind,
             cwd,
@@ -17643,6 +17643,21 @@ fn carried_terminal_identity_exports(launch_command: Option<&str>) -> Vec<String
     } else {
         carried
     }
+}
+
+/// The funnel recompose's carried-identity extraction: PEEL the stored
+/// command before scraping it. A LiveSsh row's stored command is the
+/// assembled ssh grammar, and the verbatim splitter lifts `'\''` layers the
+/// identity composers then re-quote — one escaping layer per recompose (the
+/// measured [11.169] compounding). An unwrapped command passes through; an
+/// empty result keeps the pre-carry fallback, because the callers hand
+/// `Some(&[])` to the identity composers and empty must stay byte-identical
+/// to `None`.
+fn funnel_carried_identity_exports(launch_command: Option<&str>) -> Vec<String> {
+    launch_command
+        .map(remote_identity_exports_payload)
+        .map(|payload| terminal_identity_exports_in_command(&payload))
+        .unwrap_or_default()
 }
 
 /// [11.169] Recover the raw remote payload of a stored launch command before
@@ -50108,6 +50123,54 @@ terminal_window_id: None,
         assert_eq!(from_none, from_empty);
     }
 
+    /// [11.169] The funnel arms scrape the row's STORED command, which for a
+    /// LiveSsh row is the ASSEMBLED grammar — the raw splitter lifts `'\''`
+    /// layers and the identity composers quote them back in, one escaping
+    /// layer per recompose (measured 2,790 → 56,716 chars). The funnel
+    /// extraction peels first: an assembled command carries the same clean
+    /// segments as its payload (fused first segment included), and the
+    /// recomposed command rescrapes to the same segments — the fixpoint the
+    /// raw funnel scrape never reached.
+    #[test]
+    fn the_funnel_extraction_of_an_assembled_command_is_the_peeler_fixpoint() {
+        let _guard = terminal_identity_test_guard();
+        let payload = "export YGGTERM_TERMINAL_APPEARANCE='light' && export COLORFGBG='0;15' && exec codex resume abc";
+        let assembled = format!(
+            "__yggterm_preamble; exec ssh -tt -o LogLevel=ERROR rebuild-target {}",
+            shell_single_quote(&format!("exec bash -lc {}", shell_single_quote(payload)))
+        );
+        let carried = funnel_carried_identity_exports(Some(&assembled));
+        assert_eq!(
+            funnel_carried_identity_exports(Some(payload)),
+            carried,
+            "an assembled command and its payload must carry the same clean segments"
+        );
+        assert!(
+            carried.iter().any(|segment| segment.contains("light")),
+            "the fused first identity segment must survive the peel: {carried:?}"
+        );
+        assert!(
+            carried
+                .iter()
+                .all(|segment| !segment.contains("'\\''")),
+            "funnel extraction must carry no escaping layers: {carried:?}"
+        );
+        let recomposed =
+            remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
+                SessionKind::Codex,
+                "abc123",
+                Some("/srv/app"),
+                None,
+                None,
+                Some(&carried),
+            );
+        assert_eq!(
+            funnel_carried_identity_exports(Some(&recomposed)),
+            carried,
+            "the funnel recompose is an extraction fixpoint"
+        );
+    }
+
     /// The open/restore reconfigure lane (`configure_remote_resume_live_session`
     /// — the arm `open_remote_scanned_session_with_view_and_kind` and
     /// `restore_live_session` both ride) keeps a themed row's identity exports
@@ -50214,8 +50277,27 @@ terminal_window_id: None,
         ] {
             let body = body_of(name);
             assert!(
-                body.contains("launch_command)"),
+                body.contains("launch_command"),
                 "{name} must extract the row's carried identity exports from its prior command before recomposing"
+            );
+        }
+        // [11.169] A raw scrape of a STORED command re-arms the escaping
+        // compounding: LiveSsh rows store the assembled double-quoted grammar,
+        // and the lifted `'\''` layers are re-quoted by the identity
+        // composers on every recompose. The funnel arms must extract through
+        // the peeler helper.
+        for name in [
+            "fn ensure_remote_runtime_agent_session(",
+            "fn start_remote_runtime_agent_session(",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("funnel_carried_identity_exports("),
+                "{name} must scrape through the peeler helper, never the raw splitter"
+            );
+            assert!(
+                !body.contains("terminal_identity_exports_in_command("),
+                "{name} must not scrape the stored command verbatim"
             );
         }
         let ensure = body_of("fn ensure_remote_runtime_agent_session(");
