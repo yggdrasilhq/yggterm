@@ -30825,6 +30825,36 @@ DRIVE-2 2026-09-25 (the muse lab host seat, zcode on jojo, work FROM dev; board 
 
 **Status:** OPEN
 
+**ROOT CAUSE NAMED + FIX IN CODE 2026-09-25 (the fixing seat,
+lane/integration/11167-restart-arm 7af450c8):** the peer kill is the SHELL's
+resume-recovery escalation. From the drive-1 trace pair (jojo
+09-24 22:30:26–27Z, session 2cde78a5): the seat's plain `terminal_restart`
+(force_remote=false) at 22:30:26, then `ui force_remote_restart_begin
+{reason: "codex_prompt_only_surface"}` ONE SECOND later at 22:30:27 with a
+SECOND `terminal_restart` request — this time force_remote=true — and the
+guarded daemon arm (`ServerRequest::TerminalRestart` →
+`terminate_remote_agent_session`) legally crossed the hop: dev's
+terminate-codex + peer tombstone land the same second; the [11.155] gate then
+closed the local row on the birth-minted (fake) id and the Shell
+session-path-key row followed. The entry's candidates are FALSIFIED as the
+killer: (a) peer-side supervision — the kill was an explicit guarded
+terminate, not a disconnect reaction; (b) the re-birth half — downstream
+effect of the close, not the killer. MECHANISM: the escalation predicate
+(`remote_resume_should_force_restart_after_codex_prompt_only_surface`)
+requires a hard-failed resume, but the watch's hard-fail state (deadline
+burned, prompt-only observed) belongs to the DEAD pre-restart runtime and
+survives the replacement — the first fresh frame escalates instantly. FIX:
+`remote_resume_should_rearm_after_runtime_replace` — a runtime START under
+the watch (rising edge) re-arms the hard-fail budget (60s deadline, recovery
+attempts, prompt-only/rejected surface flags) so the escalation must be
+re-earned against the fresh runtime; the hot-update handoff (the design
+target) never cycles the runtime and is unchanged. Truth-table +
+wiring locks (`a_runtime_start_rearms_the_remote_resume_watch_before_the_hard_fail_gate`);
+shell suite 2151/0. LIVE PROOF owed: (i) the stale-state leg — plain restart
+on a dead-peer row shows `resume_watch_rearmed_runtime_replaced` and NO
+escalation for the fresh 60s window; (ii) the live-peer leg — plain restart
+on a bound row with a real turn terminates no peer session.
+
 Filed 2026-09-25 (a zcode seat on the muse lab host, work FROM dev; board
 claim ACK-32b774ae68). Measured by the [11.160] drive-1 seat (board
 ACK-b61a4f19b9), which recorded it as finding (5) prose in [11.160] — never

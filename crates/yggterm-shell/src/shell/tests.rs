@@ -67637,6 +67637,54 @@ mod resume_gate_wiring_locks {
              input and dropping the toast — a partial release is still a hostage"
         );
     }
+
+    /// THE ESCALATION MUST BE RE-EARNED AGAINST THE RUNTIME IT JUDGES.
+    /// [11.167], measured 2026-09-25: a plain (force_remote=false) user restart
+    /// replaced the runtime, but the resume watch carried its stale hard-fail
+    /// state (deadline burned while the row sat dead, prompt-only surface
+    /// observed) across the replacement — so the shell's force_remote
+    /// escalation fired ONE SECOND after the restart and terminated the peer
+    /// codex session. The read loop must re-arm the watch when the runtime
+    /// under it STARTS, before the hard-fail gate can be derived in that same
+    /// iteration, and the re-arm must clear every input the escalation reads.
+    #[test]
+    fn a_runtime_start_rearms_the_remote_resume_watch_before_the_hard_fail_gate() {
+        let source = product(&shell_source());
+        let rearm = slice_between(
+            &source,
+            "if remote_resume_should_rearm_after_runtime_replace(",
+            "if terminal_transport_degraded {",
+        );
+        for needle in [
+            "remote_resume_should_rearm_after_runtime_replace(",
+            "is_remote_resume_session",
+            "last_runtime_running",
+            "runtime_running",
+            "REMOTE_TERMINAL_RESUME_HARD_FAIL_MS",
+            "resume_recovery_attempts = 0",
+            "remote_resume_prompt_only_observed = false",
+            "remote_resume_codex_rejected_surface_observed = false",
+            "\"resume_watch_rearmed_runtime_replaced\"",
+        ] {
+            assert!(
+                rearm.contains(needle),
+                "the runtime-replace re-arm lost `{needle}` — a plain restart will \
+                 again inherit the dead runtime's burned escalation budget"
+            );
+        }
+        let rearm_ask = source
+            .find("if remote_resume_should_rearm_after_runtime_replace(")
+            .expect("the re-arm call is findable");
+        let hard_fail_gate = source
+            .find("let hard_failed_remote_resume = is_remote_resume_session")
+            .expect("the hard-fail derivation is findable");
+        assert!(
+            rearm_ask < hard_fail_gate,
+            "the re-arm must sit in the read loop BEFORE the sweep's hard-fail \
+             derivation — a gate derived from stale state in the same iteration \
+             is the one-second escalation all over again"
+        );
+    }
 }
 
 /// The placement rule is a pure function BECAUSE the loop that calls it holds a
