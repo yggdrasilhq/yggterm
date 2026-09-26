@@ -40213,6 +40213,18 @@ mod tests {
     /// door updates; reproduced live on clean main with a 16-thread collision
     /// run of the mutator set) without pretending the globals are safe.
     /// Threading the seams is still the only complete fix.
+    ///
+    /// 2026-09-27 (second pass): PATH and YGGTERM_GOVERNOR left the list —
+    /// their readers take env-as-value twins and their last mutator tests
+    /// stopped touching the process. The pty-inheritance contract tests
+    /// (COLUMNS/LINES/NO_COLOR in terminal.rs) hold the lock now too. What
+    /// remains stays for a NAMED reason (see the list): deep-flow redirection
+    /// (HOME/ENV_YGGTERM_HOME), production writers (the app-control export,
+    /// the managed_cli identity sync), and the child-env composition contract.
+    /// Known edge: the identity population serializes on a SECOND guard
+    /// (codex_cli::env_test_guard) — deliberate today (its scan test names it
+    /// the one identity guard); the day a reader-victim spans the two
+    /// populations, unifying the guards is the fix.
     #[test]
     fn the_process_globals_this_binarys_tests_mutate_are_all_declared() {
         // Sanctioned because they already exist, NOT because they are safe.
@@ -40226,27 +40238,54 @@ mod tests {
             // whose read sits behind a server method or a full
             // restore/start flow — too deep to thread as an argument.
             "CODEX_HOME",
+            // 2026-09-27: PATH and YGGTERM_GOVERNOR LEFT this list — their
+            // readers take env-as-value twins (resolve_player_in /
+            // run_audio_command_in; is_governor_enabled_in +
+            // ResourceGovernor::tick_in) and their last mutator tests stopped
+            // touching the process. Every entry below carries the reason it
+            // still cannot follow.
+            //
+            // HOME + ENV_YGGTERM_HOME: eight full-flow tests (anchor vouch,
+            // store-candidate tier, focus vouch, phantom degrade, state-file
+            // record, metadata-mirror round trip, stale-snapshot tombstone,
+            // rebound agy restore) redirect where the DEEP product readers
+            // resolve their files; threading a home through the ensure funnel
+            // and the restore chains is per-variable work across a long list.
+            "HOME",
+            "ENV_YGGTERM_HOME",
+            // The terminal-identity population: sync_terminal_identity_
+            // appearance_with_profile (managed_cli — a file the scanner below
+            // does not see, dream ACK-9c4ddac5a6) writes TERM*, the appearance
+            // pair, COLORFGBG and the palette keys as process state so every
+            // child PTY inherits one identity. These are contract mutations,
+            // declared so the list stays truthful about the binary's real
+            // population; tests over them serialize on
+            // codex_cli::env_test_guard, not the lock below.
             "COLORFGBG",
             "COLORTERM",
-            "COLUMNS",
-            "HOME",
-            "LINES",
-            "NO_COLOR",
-            "PATH",
             "TERM",
             "TERM_PROGRAM",
             "TERM_PROGRAM_VERSION",
             "YGGTERM_APPEARANCE",
-            "YGGTERM_APP_CONTROL_CLIENT",
-            "YGGTERM_APP_CONTROL_PID",
-            "YGGTERM_GOVERNOR",
             "YGGTERM_TERM_PROGRAM",
-            // Referenced through their constants rather than spelled.
             "ENV_YGGTERM_TERMINAL_APPEARANCE",
             "ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND",
             "ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND",
+            // The pty-inheritance contract: a child must never receive a
+            // stale size or a color kill from the daemon's env. The process
+            // env IS the fixture medium (the child env is composed from it),
+            // so the tests cannot pass a value; they hold the lock instead.
+            "COLUMNS",
+            "LINES",
+            "NO_COLOR",
+            // The CLI exports its resolved GUI target to the worker through
+            // the env: apply_app_control_target_overrides WRITES these as its
+            // contract, and the A5 test drives that write end-to-end.
+            // Production writer, not a test convenience.
+            "YGGTERM_APP_CONTROL_CLIENT",
+            "YGGTERM_APP_CONTROL_PID",
+            // Referenced through their constants rather than spelled.
             "ENV_YGGTERM_CC_EXTRA_ARGS",
-            "ENV_YGGTERM_HOME",
             // A loop restoring a captured (key, value) pair — the key is whatever
             // that test captured, and the values it can hold are already above.
             "key",

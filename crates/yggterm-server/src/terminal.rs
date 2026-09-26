@@ -5941,9 +5941,11 @@ mod screen_width_tests {
     /// the daemon's own environment carries it.
     #[test]
     fn the_pty_child_env_never_carries_a_stale_terminal_size() {
+        let _env = crate::tests::declared_env_test_lock();
         let key = format!("test-pty-env-{}", std::process::id());
         // SAFETY: single-threaded test mutation of the process env for these
-        // two keys; restored before returning.
+        // two keys; restored before returning. The lock serializes this window
+        // against every other declared-env mutator in the binary.
         let saved_columns = std::env::var("COLUMNS").ok();
         let saved_lines = std::env::var("LINES").ok();
         unsafe {
@@ -9014,6 +9016,10 @@ line-two on the real screen\r\n\
 
     #[test]
     fn spawned_terminal_shell_removes_no_color_from_child_env() {
+        // NO_COLOR belongs to the terminal-identity population (managed_cli's
+        // identity sync writes it process-wide), so this test serializes on
+        // the same guard the identity tests hold, not the declared-gates lock.
+        let _env = crate::codex_cli::env_test_guard();
         let previous = std::env::var_os("NO_COLOR");
         unsafe {
             std::env::set_var("NO_COLOR", "1");

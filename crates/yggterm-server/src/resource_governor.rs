@@ -26,9 +26,13 @@ fn is_ssh_row(key: &str) -> bool {
 }
 
 fn is_governor_enabled() -> bool {
-    std::env::var("YGGTERM_GOVERNOR")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(true)
+    is_governor_enabled_in(std::env::var("YGGTERM_GOVERNOR").ok())
+}
+
+/// The env-as-value twin: the disable signal arrives as a value, so a test
+/// can exercise the disabled arm without mutating the process env.
+fn is_governor_enabled_in(value: Option<String>) -> bool {
+    value.map(|v| v != "0" && !v.is_empty()).unwrap_or(true)
 }
 
 fn is_ssh_detach_enabled() -> bool {
@@ -94,7 +98,18 @@ impl ResourceGovernor {
         park_fn: &dyn Fn(&str) -> bool,
         unpark_fn: &dyn Fn(&str) -> bool,
     ) -> Vec<String> {
-        if !is_governor_enabled() {
+        self.tick_in(rows, park_fn, unpark_fn, is_governor_enabled())
+    }
+
+    /// The env-as-value twin of [`tick`]: the enable flag arrives as a value.
+    pub fn tick_in(
+        &mut self,
+        rows: &[(String, Option<u32>)],
+        park_fn: &dyn Fn(&str) -> bool,
+        unpark_fn: &dyn Fn(&str) -> bool,
+        enabled: bool,
+    ) -> Vec<String> {
+        if !enabled {
             return Vec::new();
         }
         let now = Instant::now();
@@ -305,11 +320,36 @@ mod tests {
     }
     #[test]
     fn governor_respects_env_disable() {
-        unsafe { std::env::set_var("YGGTERM_GOVERNOR", "0"); }
+        // Env-as-value: the disable signal is passed in; the wiring that makes
+        // production tick() read the env is pinned by the source test below.
+        assert!(is_governor_enabled_in(None), "unset stays enabled");
+        assert!(is_governor_enabled_in(Some("1".to_string())));
+        assert!(!is_governor_enabled_in(Some("0".to_string())));
+        assert!(!is_governor_enabled_in(Some(String::new())));
         let mut gov = ResourceGovernor::new(std::path::PathBuf::from("/tmp"));
         let rows = vec![("local://x".to_string(), Some(1u32))];
-        let out = gov.tick(&rows, &|_| false, &|_| false);
+        let out = gov.tick_in(
+            &rows,
+            &|_| false,
+            &|_| false,
+            is_governor_enabled_in(Some("0".to_string())),
+        );
         assert!(out.is_empty(), "disabled governor should not act");
-        unsafe { std::env::remove_var("YGGTERM_GOVERNOR"); }
+    }
+
+    #[test]
+    fn the_governor_tick_still_consults_the_process_env() {
+        // A source read, honestly labeled: it proves the wiring (production
+        // tick consults the env through is_governor_enabled), nothing more;
+        // the behaviour claims live in the test above.
+        let source = include_str!("resource_governor.rs");
+        let tick_wrapper = source
+            .split("pub fn tick(")
+            .nth(1)
+            .expect("the tick wrapper must exist");
+        assert!(
+            tick_wrapper.contains("is_governor_enabled()"),
+            "the tick wrapper must consult the process env via is_governor_enabled()"
+        );
     }
 }

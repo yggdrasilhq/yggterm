@@ -101,13 +101,19 @@ pub const PLAYER_CANDIDATES: &[AudioPlayer] = &[
 /// Deliberately NOT `<binary> --version`: some of these open the audio device
 /// on startup, and a probe that makes noise or blocks is worse than no probe.
 pub fn resolve_player() -> Option<&'static AudioPlayer> {
-    PLAYER_CANDIDATES
-        .iter()
-        .find(|player| binary_on_path(player.binary))
+    resolve_player_in(std::env::var_os("PATH").as_deref())
 }
 
-fn binary_on_path(binary: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
+/// The env-as-value twin: the PATH the lookup consults arrives as a value, so
+/// a test can exercise the empty-PATH arm without mutating the process env.
+pub fn resolve_player_in(path_var: Option<&std::ffi::OsStr>) -> Option<&'static AudioPlayer> {
+    PLAYER_CANDIDATES
+        .iter()
+        .find(|player| binary_on_path_in(player.binary, path_var))
+}
+
+fn binary_on_path_in(binary: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = path_var else {
         return false;
     };
     std::env::split_paths(&path).any(|dir| {
@@ -306,6 +312,12 @@ fn play_once(player: &AudioPlayer, wav: &[u8]) -> Result<()> {
 
 /// `yggterm server app audio <play|tune> …`
 pub fn run_audio_command(args: &[String]) -> Result<()> {
+    run_audio_command_in(args, std::env::var_os("PATH").as_deref())
+}
+
+/// The env-as-value twin of [`run_audio_command`]: the PATH consulted when
+/// resolving a player arrives as a value.
+pub fn run_audio_command_in(args: &[String], path_var: Option<&std::ffi::OsStr>) -> Result<()> {
     let subcommand = args.get(3).map(String::as_str).unwrap_or("");
     if matches!(subcommand, "" | "--help" | "-h" | "help") {
         print_audio_help();
@@ -332,7 +344,7 @@ pub fn run_audio_command(args: &[String]) -> Result<()> {
     }
 
     let request = parse_play_request(args)?;
-    let Some(player) = resolve_player() else {
+    let Some(player) = resolve_player_in(path_var) else {
         // Degrade honestly: name every binary we looked for, so the fix is
         // obvious and nobody concludes "the audio path is broken".
         let looked_for = PLAYER_CANDIDATES
@@ -618,14 +630,9 @@ mod tests {
         // The failure mode this guards: "the command returned 0 and I heard
         // nothing". If no player exists the command must FAIL and say which
         // binaries it looked for.
-        let saved = std::env::var_os("PATH");
-        unsafe { std::env::set_var("PATH", "/nonexistent-for-this-test") };
-        let resolved = resolve_player();
-        let err = run_audio_command(&argv(&["audio", "play"]));
-        match saved {
-            Some(path) => unsafe { std::env::set_var("PATH", path) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
+        let path_var = Some(std::ffi::OsStr::new("/nonexistent-for-this-test"));
+        let resolved = resolve_player_in(path_var);
+        let err = run_audio_command_in(&argv(&["audio", "play"]), path_var);
         assert!(
             resolved.is_none(),
             "no player should resolve on an empty PATH"
