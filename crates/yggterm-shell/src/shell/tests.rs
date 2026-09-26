@@ -67684,6 +67684,22 @@ mod resume_gate_wiring_locks {
              derivation — a gate derived from stale state in the same iteration \
              is the one-second escalation all over again"
         );
+        // THE ERROR PATH IS PART OF THE EDGE. A restart's kill→respawn gap can
+        // surface as read ERRORS, not as running=false — [11.144]'s lesson
+        // generalizes: a witness that silently skips its observation keeps the
+        // stale verdict. The error arm must mark the runtime unobserved so the
+        // next good read is an honest rising edge.
+        let error_mark = source
+            .find("last_runtime_running = false;")
+            .expect("the read-error runtime-unobserved marking is gone");
+        let marking_gate = source[..error_mark]
+            .rfind("if is_remote_resume_session {")
+            .expect("the error arm's remote-resume gate moved — re-anchor this lock");
+        assert!(
+            error_mark - marking_gate < 120,
+            "the unobserved-runtime marking must be gated to remote-resume \
+             watches — a local shell row's read errors mean something else"
+        );
     }
 }
 
