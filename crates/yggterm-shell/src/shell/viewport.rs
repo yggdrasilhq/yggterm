@@ -14238,6 +14238,18 @@ fn TerminalCanvas(
                                 }
                             }
                             Err(error) => {
+                                // [11.167] A failed read means the runtime under
+                                // this watch is UNOBSERVED — the restart gap
+                                // between the killed child and the respawned one
+                                // surfaces here, not as running=false. Mark it so
+                                // the next successful read is an honest rising
+                                // edge and re-arms the escalation budget; without
+                                // this, a restart whose gap reads as errors never
+                                // re-arms and the stale hard-fail state survives
+                                // anyway.
+                                if is_remote_resume_session {
+                                    last_runtime_running = false;
+                                }
                                 let attached_or_visible = traced_attach_ready
                                     || terminal_overlay_dismissed()
                                     || terminal_live_host_connected()
