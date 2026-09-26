@@ -741,7 +741,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 ytrace.emit({{
                     category: "xterm_paint",
                     name: "first_frame",
-                    payload: detail,
+                    payload: Object.assign({{ session_path: host.getAttribute("data-terminal-session-path") || "" }}, detail || {{}}),
                 }});
             }} catch (_error) {{}}
         }};
@@ -780,6 +780,10 @@ fn terminal_eval_script_with_canvas_renderer(
                 const recheckScheduled = !recheck && !complete && visible === true;
                 ytrace.window("xterm_paint", "settle", {{
                     host_id: hostId,
+                    // [11.171]: the paint family self-identifies its session, so
+                    // a switch's activation→paint pair joins on session_path
+                    // directly instead of bridging through the mount epoch.
+                    session_path: host.getAttribute("data-terminal-session-path") || "",
                     window_ms: windowMs,
                     deadline_ms: deadlineMs,
                     // How late the timer was. An overshoot past a frame or two
@@ -857,7 +861,7 @@ fn terminal_eval_script_with_canvas_renderer(
         const paintNoteMountOpen = (detail) => {{
             try {{
                 paintChain.openedAtMs = paintNow();
-                paintChain.openSpan = ytrace.span("xterm_paint", "first_frame", {{ host_id: hostId }});
+                paintChain.openSpan = ytrace.span("xterm_paint", "first_frame", {{ host_id: hostId, session_path: host.getAttribute("data-terminal-session-path") || "" }});
                 paintCoverageReset(Number((term && term.rows) || 0), '');
                 const tapped = paintInstallWriteTaps();
                 ytrace.emit({{
@@ -865,6 +869,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     name: "mount_open",
                     payload: Object.assign({{
                         host_id: hostId,
+                        session_path: host.getAttribute("data-terminal-session-path") || "",
                         rows: Number((term && term.rows) || 0),
                         cols: Number((term && term.cols) || 0),
                         // The mount's own cost, split where it is spendable:

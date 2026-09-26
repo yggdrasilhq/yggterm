@@ -10782,12 +10782,26 @@ JSON.stringify({{
             // exists to tell apart from a paint.
             "paintChain.blankFrames += 1;",
             "blank_frames_before_write:",
+            // [11.171]: the paint family self-identifies its session. The felt
+            // switch (activation → paint) pairs `session/activation` against
+            // the paint chain, and that pair joins on session_path — not on a
+            // host_id → mount_epoch bridge through `terminal_mount/begin`.
+            "session_path: host.getAttribute(\"data-terminal-session-path\") || \"\"",
         ] {
             assert!(
                 script.contains(marker),
                 "the composed script must carry `{marker}`"
             );
         }
+        assert!(
+            script
+                .matches("session_path: host.getAttribute(\"data-terminal-session-path\") || \"\"")
+                .count()
+                >= 3,
+            "mount_open, the first_frame span and settle must EACH self-identify \
+             their session ([11.171]); a paint record only a host_id can name is \
+             a switch end-marker no activation can be paired with"
+        );
         // ⛔ RATIONED LIKE EVERY OTHER PROBE HERE. One record at the surface,
         // one at the first frame, one settle, and at most one recheck — bounded
         // by the MOUNT RATE, never by output volume. A per-frame paint record

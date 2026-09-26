@@ -818,13 +818,19 @@ dioxus.send(out);
         One scratch pair serves the whole action; clicks alternate A→B so
         every click is a real switch, click 1 marked `cold` (the row's first
         activation this GUI boot). Per iteration: the activation event's
-        latency + identity (to == the clicked row), the reveal outcome
-        (reveal_ready with its self-timed first_output_ms, or the honest
-        incomplete/failed marker — reveal events are joined by time-proximity
-        inside the window, the door's known pairing gap), and the ambient
-        churn inside the window (ui/block, merge_rows_breakdown) — the felt
-        cost line. Walls are overhead-inclusive (release verb wall included);
-        the report's cli_overhead_ms is the floor to subtract."""
+        latency + identity (to == the clicked row), then the [11.171] END
+        MARKER — the common-path switch remounts the surface and the paint
+        chain reports it (terminal_mount/begin {session_path, host_id} →
+        xterm_paint/first_frame {open_to_write_ms, rows_painted} →
+        xterm_paint/settle {painted, complete, rows_content_unpainted}),
+        paired by host_id else session_path, never by time-proximity alone;
+        terminal_mount/reveal_forced_incomplete is the honest incomplete end
+        (the ui/reveal family covers only first-reveal-after-boot). Plus the
+        ambient churn inside the window (ui/block, merge_rows_breakdown) —
+        the felt cost line. Walls are overhead-inclusive (release verb wall
+        included); the report's cli_overhead_ms is the floor to subtract.
+        paint_end_rate is the falsifier number: >=7/8 clicks must report a
+        first_frame end with rows painted."""
         rows_ready = self.ensure_two_scratch_rows()
         if len(rows_ready) < 2:
             return {"error": "could not establish two scratch rows",
@@ -853,10 +859,15 @@ dioxus.send(out);
             rr = self.verb("pointer", "release")
             it["up_ms"] = rr["wall_ms"]
             activation = None
+            mount_begin = None
+            first_frame = None
+            settle = None
+            forced = None
             reveal = None
             deadline = time.time() + self.timeout_s
+            t_loop = time.time()
             while time.time() < deadline:
-                evs = self.ytrace_events(t_release, lines=900)
+                evs = self.ytrace_events(t_release, lines=1200)
                 if activation is None:
                     for e in evs:
                         p = e.get("payload") or {}
@@ -866,17 +877,46 @@ dioxus.send(out);
                                 and str(p.get("to") or "").startswith(path)):
                             activation = e
                             break
-                if activation is not None and reveal is None:
+                if activation is not None:
+                    # [11.171] THE END MARKER. The common-path switch remounts
+                    # the surface, and the paint chain reports it:
+                    # terminal_mount/begin {session_path, host_id} →
+                    # xterm_paint/first_frame {session_path, paint truth} →
+                    # xterm_paint/settle {complete, coverage}. Pair by host_id
+                    # from THIS window's mount_begin when it is present, else by
+                    # session_path — never by time-proximity alone, so the
+                    # previous switch's settle recheck cannot impersonate this
+                    # one. terminal_mount/reveal_forced_incomplete is the
+                    # honest incomplete end (the ui/reveal family only covers
+                    # first-reveal-after-boot).
+                    host_id = (mount_begin or {}).get("payload", {}).get("host_id")
+                    act_ts = activation.get("ts_ms", 0)
                     for e in evs:
-                        if e.get("category") == "reveal" and e.get(
-                                "name") in ("reveal_ready",
-                                            "reveal_forced_incomplete",
-                                            "reveal_failed"):
+                        p = e.get("payload") or {}
+                        sp = str(p.get("session_path") or "")
+                        ts = e.get("ts_ms", 0)
+                        n, c = e.get("name"), e.get("category")
+                        identity = sp.startswith(path) or (
+                            host_id is not None and p.get("host_id") == host_id)
+                        if ts < act_ts or not identity:
+                            continue
+                        if mount_begin is None and c == "terminal_mount" and n == "begin":
+                            mount_begin = e
+                            host_id = host_id or p.get("host_id")
+                        elif first_frame is None and c == "xterm_paint" and n == "first_frame":
+                            first_frame = e
+                        elif settle is None and c == "xterm_paint" and n == "settle":
+                            settle = e
+                        elif forced is None and c == "terminal_mount" and n == "reveal_forced_incomplete":
+                            forced = e
+                        elif reveal is None and c == "reveal" and n in (
+                                "reveal_ready", "reveal_forced_incomplete",
+                                "reveal_failed"):
                             reveal = e
-                            break
-                if activation is not None and (reveal is not None
-                                               or time.time() > deadline - (
-                                                   self.timeout_s - 3)):
+                if activation is not None and (
+                        first_frame is not None or forced is not None
+                        or reveal is not None) and (
+                        settle is not None or time.time() - t_loop > 4.0):
                     break
                 time.sleep(0.05)
             window = evs
@@ -891,19 +931,49 @@ dioxus.send(out);
                            "but the gesture path does not fire)")
             else:
                 it["activation_ms"] = activation.get("ts_ms", 0) - t_release
-            if activation is not None and reveal is None:
-                acc.append("no reveal_ready/incomplete/failed within the "
-                           "window — the reveal leg never reported (the "
-                           "door's pairing gap, honest null)")
-            if reveal is not None:
-                it["reveal_name"] = reveal.get("name")
-                it["reveal_ms"] = reveal.get("ts_ms", 0) - t_release
-                rp = (reveal.get("payload") or {}).get("payload",
-                     reveal.get("payload") or {})
-                it["reveal_first_output_ms"] = rp.get("first_output_ms")
-                if reveal.get("name") != "reveal_ready":
-                    acc.append(f"reveal did not reach clean ready: "
-                               f"{reveal.get('name')}")
+            if activation is not None:
+                if mount_begin is not None:
+                    it["mount_begin_ms"] = mount_begin.get("ts_ms", 0) - t_release
+                if first_frame is not None:
+                    it["first_frame_ms"] = first_frame.get("ts_ms", 0) - t_release
+                    fp = first_frame.get("payload") or {}
+                    it["open_to_write_ms"] = fp.get("open_to_write_ms")
+                    it["write_to_frame_ms"] = fp.get("write_to_frame_ms")
+                    it["rows_painted"] = fp.get("rows_painted")
+                    if not fp.get("rows_painted"):
+                        acc.append("first_frame painted no rows — not paint "
+                                   "truth (rows_painted=%r)" % fp.get("rows_painted"))
+                else:
+                    acc.append("no xterm_paint/first_frame for the clicked row "
+                               "within the window — the felt switch has no "
+                               "paint end ([11.171] unfixed on this build)")
+                if settle is not None:
+                    it["settle_ms"] = settle.get("ts_ms", 0) - t_release
+                    sp = settle.get("payload") or {}
+                    it["settle_painted"] = sp.get("painted")
+                    it["settle_complete"] = sp.get("complete")
+                    it["open_to_frame_ms"] = sp.get("open_to_frame_ms")
+                    it["rows_content_unpainted"] = sp.get("rows_content_unpainted")
+                    if not sp.get("painted"):
+                        acc.append("settle says painted=false — no frame after "
+                                   "bytes reached the canvas")
+                    elif sp.get("complete") is False:
+                        acc.append("settle incomplete: rows_content_unpainted="
+                                   "%r (partial paint, the eye sees it)" %
+                                   sp.get("rows_content_unpainted"))
+                if forced is not None and first_frame is None:
+                    it["forced_incomplete_ms"] = forced.get("ts_ms", 0) - t_release
+                    acc.append("switch ended forced-incomplete (reveal never "
+                               "became meaningful within the deadline)")
+                if reveal is not None:
+                    it["reveal_name"] = reveal.get("name")
+                    it["reveal_ms"] = reveal.get("ts_ms", 0) - t_release
+                    rp = (reveal.get("payload") or {}).get("payload",
+                         reveal.get("payload") or {})
+                    it["reveal_first_output_ms"] = rp.get("first_output_ms")
+                    if reveal.get("name") != "reveal_ready":
+                        acc.append(f"reveal did not reach clean ready: "
+                                   f"{reveal.get('name')}")
             if not (rd["ok"] and rr["ok"]):
                 acc.append("pointer verb failure press=%s release=%s"
                            % (rd["ok"], rr["ok"]))
@@ -914,6 +984,15 @@ dioxus.send(out);
         ready = [i for i in out["iterations"]
                  if i.get("reveal_name") == "reveal_ready"]
         out["reveal_ready_rate"] = len(ready) / len(out["iterations"])
+        # [11.171] THE FALSIFIER: >=7/8 clicks report a paint-truth end
+        # (first_frame with rows painted). This rate is the number the door's
+        # activation→paint column exists to carry.
+        ends = [i for i in out["iterations"]
+                if i.get("first_frame_ms") is not None]
+        out["paint_end_rate"] = len(ends) / len(out["iterations"])
+        completes = [i for i in ends if i.get("settle_complete")]
+        out["settle_complete_rate"] = (
+            len(completes) / len(ends) if ends else None)
         return summarize(out, key="activation_ms")
 
     def action_group(self, iters: int) -> dict:
