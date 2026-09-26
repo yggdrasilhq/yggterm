@@ -647,10 +647,34 @@ impl ManagedCliPaths {
         tool: ManagedCliTool,
         terminal_appearance: Option<&str>,
     ) -> String {
-        let mut exports = terminal_appearance
-            .and_then(normalize_terminal_appearance)
-            .map(terminal_identity_shell_exports_for_appearance)
-            .unwrap_or_else(terminal_identity_shell_exports);
+        self.shell_exports_with_terminal_appearance_and_identity(
+            tool,
+            terminal_appearance,
+            None,
+        )
+    }
+
+    /// The identity exports a RE-COMPOSITION must embed, in priority order:
+    /// the row's own carried exports (verbatim — [11.168]), then the request's
+    /// appearance, then the host global. A bare/fresh row passes `None` and
+    /// composes byte-identically to the pre-carry law.
+    fn shell_exports_with_terminal_appearance_and_identity(
+        &self,
+        tool: ManagedCliTool,
+        terminal_appearance: Option<&str>,
+        carried_identity_exports: Option<&[String]>,
+    ) -> String {
+        let carried = carried_identity_exports
+            .map(|exports| !exports.is_empty())
+            .unwrap_or(false);
+        let mut exports = if carried {
+            carried_identity_exports.unwrap_or_default().to_vec()
+        } else {
+            terminal_appearance
+                .and_then(normalize_terminal_appearance)
+                .map(terminal_identity_shell_exports_for_appearance)
+                .unwrap_or_else(terminal_identity_shell_exports)
+        };
         exports.extend([
             format!(
                 "export NPM_CONFIG_PREFIX={}",
@@ -5659,6 +5683,30 @@ pub(crate) fn managed_cli_shell_command_configured(
     launch: &AgentLaunchOptions,
     configured_override: Option<&str>,
 ) -> Result<String> {
+    managed_cli_shell_command_configured_with_identity(
+        kind,
+        cwd,
+        action,
+        terminal_appearance,
+        launch,
+        configured_override,
+        None,
+    )
+}
+
+/// [`managed_cli_shell_command_configured`] with the row's carried identity
+/// exports ([11.168]): a RE-COMPOSITION of an existing row embeds the exports
+/// the row already carries, verbatim, instead of re-reading the host global.
+/// `None`/empty composes byte-identically to the pre-carry law.
+pub(crate) fn managed_cli_shell_command_configured_with_identity(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    action: ManagedCliAction<'_>,
+    terminal_appearance: Option<&str>,
+    launch: &AgentLaunchOptions,
+    configured_override: Option<&str>,
+    carried_identity_exports: Option<&[String]>,
+) -> Result<String> {
     let Some(tool) = ManagedCliTool::from_session_kind(kind) else {
         anyhow::bail!("session kind does not use a managed Codex CLI");
     };
@@ -5668,7 +5716,11 @@ pub(crate) fn managed_cli_shell_command_configured(
     if let Some(preamble) = best_effort_cwd_shell_prefix(cwd) {
         parts.push(preamble);
     }
-    parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
+    parts.push(paths.shell_exports_with_terminal_appearance_and_identity(
+        tool,
+        terminal_appearance,
+        carried_identity_exports,
+    ));
     let extra_args = composed_cli_extra_args_with(kind, launch, configured_override)?;
     // Invocation SHAPE is descriptor data now (harness spec §3, phase 1): which
     // CLI takes `--resume <id>` vs `resume <id>`, and which re-roots with
