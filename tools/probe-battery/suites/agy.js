@@ -20,6 +20,35 @@
 //   ⚠ 1.2.3 EXITED code=0 ~1.3s after the first tool approval in run 1, a
 //   crash log flashing in crashes/ and auto-removed within minutes — the
 //   suite records the post-approval liveness explicitly.
+//
+// Measured live against 1.2.11 (2026-09-26 re-pair seat, baseline +
+// verification runs on the muse lab host):
+//   ⭐ the conversations-db flush-while-live is NONDETERMINISTIC on 1.2.11 —
+//   the baseline run's sentinel was IN the db while the child lived, the
+//   verification run's was not until exit. Attribution therefore asks BOTH
+//   arms (conversations db + brain/<id>/.system_generated/logs/*.jsonl) and
+//   NAMES the arm that answered (attributed_via) — the brain jsonl is the
+//   live-stream arm and answered the verification run.
+//   ⭐ presence locks LEAK (49 stale on this host beside the run's child)
+//   and are EMPTY files — existence alone reads lies; liveness = fd-held
+//   RIGHT NOW (proven in-suite: the run's own child held its lock, the 49
+//   leaked locks are held by nobody). The fact now reads live/stale, not a
+//   bare list.
+//   ⭐ crashes/ grows ZERO-BYTE crash_<pid>_<uuid>.log shells during
+//   ordinary turns (both runs caught their own child's shell, pid-matched)
+//   — recorded with size; a shell is not crash evidence, only a non-empty
+//   log is.
+//   ⭐ TRUSTED folder: the question picker NEVER DRAWS — 1.2.11
+//   auto-approves the tool call (baseline: the write landed while the probe
+//   burned its full 180s picker wait). The probe now bails the moment the
+//   file lands and names the drift.
+//   ⭐ resume of a COMPLETED conversation: the rederive paints (the needle
+//   is scroll-safe: reply token or prompt head — the head-only check
+//   false-negatived on a scrolled two-turn transcript) and the child's
+//   post-rederive exit is INTERMITTENT — the baseline child self-exited
+//   code 0 within seconds (the 1.2.3 exit-0 candidate), the verification
+//   child stayed alive; recorded either way as resumed_child_self_exit.
+//
 // Auth is assumed (antigravity-oauth-token); a login that never completes
 // degrades the turn facts to honest nulls, kimi-suite style.
 //
@@ -124,6 +153,109 @@ module.exports = {
         }
       } catch (_) {}
       return null;
+    };
+    // 1.2.7+ live arm: transcripts stream to brain/<id>/.system_generated/logs/*.jsonl
+    // while the child runs; the conversations db only flushes at exit (the 09-20
+    // re-pair note). The brain dir NAME is the session id.
+    const findSentinelBrain = (needle) => {
+      const brainDir = path.join(AGY_HOME, 'brain');
+      try {
+        for (const id of fs.readdirSync(brainDir)) {
+          const logsDir = path.join(brainDir, id, '.system_generated', 'logs');
+          let found = null;
+          try {
+            for (const f of fs.readdirSync(logsDir).filter((f) => f.endsWith('.jsonl'))) {
+              try {
+                if (fs.readFileSync(path.join(logsDir, f)).includes(needle)) {
+                  found = id;
+                  break;
+                }
+              } catch (_) {}
+            }
+          } catch (_) {}
+          if (found) return found;
+        }
+      } catch (_) {}
+      return null;
+    };
+    // Presence locks are EMPTY files (no pid, no heartbeat payload) that LEAK
+    // (43/44 stale on the muse lab host, 09-20) — the honest liveness signal is
+    // who holds the lock as an open fd RIGHT NOW (verified: a live agy child
+    // holds its lock; stale leaked locks are held by nobody). One /proc sweep
+    // answers every lock at once.
+    const presenceLockHolders = () => {
+      const holders = {}; // abs lock path -> [pids]
+      let pids = [];
+      try {
+        pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+      } catch (_) {
+        return null;
+      }
+      for (const pid of pids) {
+        let fds = [];
+        try {
+          fds = fs.readdirSync(`/proc/${pid}/fd`);
+        } catch (_) {
+          continue; // raced exit or no permission
+        }
+        for (const fd of fds) {
+          let tgt = null;
+          try {
+            tgt = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+          } catch (_) {
+            continue;
+          }
+          if (tgt.includes('/presence/') && tgt.endsWith('.lock')) {
+            (holders[tgt] = holders[tgt] || []).push(Number(pid));
+          }
+        }
+      }
+      return holders;
+    };
+    const presenceFacts = (holders) => {
+      const dir = path.join(AGY_HOME, 'presence');
+      let names;
+      try {
+        names = fs.readdirSync(dir).filter((f) => f.endsWith('.lock')).sort();
+      } catch (_) {
+        return null;
+      }
+      const live = [];
+      const stale = [];
+      for (const f of names) {
+        const abs = path.join(dir, f);
+        const pids = holders ? holders[abs] || [] : [];
+        (pids.length ? live : stale).push({ id: f.replace(/\.lock$/, ''), held_by_pids: pids });
+      }
+      return {
+        total: names.length,
+        live: live.map((l) => l.id),
+        live_pids: live.reduce((a, l) => a.concat(l.held_by_pids), []),
+        stale_count: stale.length,
+        stale_sample: stale.slice(0, 3).map((l) => l.id),
+      };
+    };
+    // crashes/ grows zero-byte `crash_<pid>_<uuid>.log` SHELLS during ordinary
+    // turns (1.2.3/1.2.7/1.2.11) — a shell is not crash evidence; only a
+    // non-empty log is. Record both, never conflate them.
+    const crashScan = () => {
+      const crashDir = path.join(AGY_HOME, 'crashes');
+      let entries;
+      try {
+        entries = fs.readdirSync(crashDir);
+      } catch (_) {
+        return null;
+      }
+      return entries.map((f) => {
+        let bytes = null;
+        let age_s = null;
+        try {
+          const st = fs.statSync(path.join(crashDir, f));
+          bytes = st.size;
+          age_s = Math.max(0, Math.round((Date.now() - st.mtimeMs) / 1000));
+        } catch (_) {}
+        return { file: f, bytes, zero_byte_shell: bytes === 0, age_s };
+      });
     };
 
     ctx.drive = new ctx.Drive({
@@ -238,7 +370,8 @@ module.exports = {
       };
       ctx.facts.store_pre_turn = {
         conversations: dirList(path.join(AGY_HOME, 'conversations'), '.db'),
-        presence_locks: dirList(path.join(AGY_HOME, 'presence'), '.lock')?.map((f) => f.replace(/\.lock$/, '')),
+        presence_locks: presenceFacts(presenceLockHolders()),
+        crashes: crashScan(),
       };
       if (!ctx.facts.composer_idle.marker_observed) {
         throw new Error('declared composer marker > not drawn — re-measure before any descriptor edit');
@@ -333,8 +466,12 @@ module.exports = {
       drive.write('\r');
       const echoed = await drive.waitFor(() => drive.screen().includes(pickerPrompt.slice(0, 24)), 10000, 200);
       if (!echoed) return 'picker prompt never echoed — composer not taking input; skipped';
+      const pickFile = path.join(ctx.cwd, 'agy-battery-pick.txt');
       const pickerSeen = await drive.waitFor(
         () => {
+          // 1.2.11 drift: a TRUSTED folder auto-approves the write — no picker
+          // will ever come once the file lands; bail instead of burning 180s.
+          if (fs.existsSync(pickFile)) return true;
           const s = drive.screen().toLowerCase();
           return s.includes(PICKER_NEEDLE) || s.includes(PICKER_ALSO);
         },
@@ -344,22 +481,23 @@ module.exports = {
       drive.snap('picker');
       const screen = drive.screen();
       const low = screen.toLowerCase();
+      const fileLanded = fs.existsSync(pickFile);
+      const pickerShown = pickerSeen && !fileLanded; // file landed first ⇒ no picker ever drew
       const sameLine = low
         .split('\n')
         .some((l) => l.includes(PICKER_NEEDLE) && l.includes(PICKER_ALSO));
       ctx.facts.question_picker = {
-        picker_seen: pickerSeen,
+        picker_seen: pickerShown,
         needle_line: screen.split('\n').find((l) => l.toLowerCase().includes(PICKER_NEEDLE))?.trim() ?? null,
         also_line: screen.split('\n').find((l) => l.toLowerCase().includes(PICKER_ALSO))?.trim() ?? null,
         declared_same_line_shape: sameLine,
         working_needle_also_visible: phraseHits(screen, WORKING_NEEDLES).filter((h) => h.observed).map((h) => h.needle),
       };
-      if (!pickerSeen) {
-        const autoRan = fs.existsSync(path.join(ctx.cwd, 'agy-battery-pick.txt'));
+      if (!pickerShown) {
         ctx.facts.question_picker.approved = false;
-        ctx.facts.question_picker.auto_approved_under_trust = autoRan;
-        return autoRan
-          ? 'picker never shown; the write RAN anyway — auto-approved under a trusted folder (drift evidence)'
+        ctx.facts.question_picker.auto_approved_under_trust = fileLanded;
+        return fileLanded
+          ? 'no picker — the write RAN under a trusted folder (1.2.11 auto-approve drift)'
           : 'picker never shown and no file — the turn stalled or auto-denied; read the snap';
       }
       drive.write('\r'); // approve the highlighted choice; the turn continues
@@ -380,8 +518,11 @@ module.exports = {
     });
 
     // 6. store side-car: attribute THIS conversation by sentinel-in-content
-    //    (never mtime), in BOTH liveness states — the db flushes at exit
-    //    (run 1), so read while live AND after the child is gone.
+    //    (never mtime), in BOTH liveness states. 1.2.7+ streams the turn to
+    //    brain/<id>/.system_generated/logs/*.jsonl while live; the
+    //    conversations db flushes at exit (run 1) — both arms are asked and
+    //    the answering arm is NAMED. The child's presence lock is read for
+    //    fd-holders BEFORE the kill (the locks leak, existence alone lies).
     let turnSessionId = null;
     await ctx.probe('store-side-car', async () => {
       const convDir = path.join(AGY_HOME, 'conversations');
@@ -390,15 +531,30 @@ module.exports = {
         return 'no ~/.gemini/antigravity-cli/conversations at all';
       }
       const childAlive = drive.exitCode === null;
-      const sentinelLive = findSentinelDb(sentinel);
+      const sentinelDbLive = findSentinelDb(sentinel);
+      const sentinelBrainLive = findSentinelBrain(sentinel);
+      // the run's lock is named by its SESSION id (the attributed one), never
+      // the sentinel — read its fd-holders BEFORE the kill
+      const liveId = sentinelDbLive ?? sentinelBrainLive;
+      const holders = presenceLockHolders();
+      const runLockPath = liveId ? path.join(AGY_HOME, 'presence', `${liveId}.lock`) : null;
+      const presenceHeldWhileLive =
+        runLockPath && fs.existsSync(runLockPath) ? (holders ? holders[runLockPath] || [] : null) : null;
       if (childAlive) {
         await drive.killChild(); // crash semantics; the flush is what run 1 measured
         await new Promise((r) => setTimeout(r, 2500));
       }
-      turnSessionId = findSentinelDb(sentinel) ?? sentinelLive;
-      const presenceLock = turnSessionId
-        ? fs.existsSync(path.join(AGY_HOME, 'presence', `${turnSessionId}.lock`))
-        : null;
+      const sentinelDbPost = findSentinelDb(sentinel);
+      const sentinelBrainPost = findSentinelBrain(sentinel);
+      turnSessionId = sentinelDbPost ?? sentinelBrainPost ?? sentinelDbLive ?? sentinelBrainLive;
+      const attributedVia =
+        sentinelDbPost || sentinelDbLive
+          ? 'conversations-db'
+          : sentinelBrainPost || sentinelBrainLive
+            ? 'brain-jsonl'
+            : null;
+      const lockPath = turnSessionId ? path.join(AGY_HOME, 'presence', `${turnSessionId}.lock`) : null;
+      const presenceLock = turnSessionId ? fs.existsSync(lockPath) : null;
       const summaries = sqliteDump(
         path.join(AGY_HOME, 'conversation_summaries.db'),
         60,
@@ -411,21 +567,31 @@ module.exports = {
       ctx.facts.store = {
         root_exists: true,
         conversation_db_count: dirList(convDir, '.db')?.length ?? null,
-        sentinel_matches_live_child: sentinelLive,
+        sentinel_matches_live_child: !!(sentinelDbLive || sentinelBrainLive),
+        attributed_via_live: sentinelDbLive
+          ? 'conversations-db'
+          : sentinelBrainLive
+            ? 'brain-jsonl'
+            : null,
         turn_session_id: turnSessionId,
-        db_flushed_while_child_alive: !!sentinelLive,
+        attributed_via: attributedVia,
+        db_flushed_while_child_alive: !!sentinelDbLive,
+        brain_jsonl_live: !!sentinelBrainLive,
         new_since_pre_turn: turnSessionId
           ? !(ctx.facts.store_pre_turn?.conversations ?? []).includes(`${turnSessionId}.db`)
           : null,
         presence_lock: presenceLock,
+        presence_lock_held_while_live: presenceHeldWhileLive,
+        crashes_post_run: crashScan(),
         summaries_db: {
           exists: summaries.exists,
           tables: summaries.tables,
           row_for_turn_session: summariesHit,
         },
       };
-      if (!turnSessionId) return 'sentinel not found in any conversation db even after exit — was the turn persisted?';
-      return `session ${turnSessionId} (flushed while live: ${!!sentinelLive}); summaries row: ${summariesHit}`;
+      if (!turnSessionId)
+        return 'sentinel not in any conversations db NOR any brain transcript even after exit — was the turn persisted?';
+      return `session ${turnSessionId} (via ${attributedVia}; db flushed while live: ${!!sentinelDbLive}, brain live: ${!!sentinelBrainLive}; lock held while live: ${presenceHeldWhileLive ? 'pids ' + presenceHeldWhileLive.join(',') : 'NO'}); summaries row: ${summariesHit}`;
     });
 
     // 7. flag surface: agy --help re-asked of the installed binary — the
@@ -482,22 +648,54 @@ module.exports = {
         return s.trim().length > 0 && !/signing in/i.test(s);
       }, 60000);
       if (!painted) throw new Error('resumed agy never painted');
-      // content_rederives_on_resume: the prior turn's prompt must come back.
+      // content_rederives_on_resume: the prior transcript must come back.
+      // The scroll-safe needle is the REPLY TOKEN (unique, near the
+      // transcript tail) or the prompt head — on 1.2.11 a two-turn
+      // transcript scrolls the first prompt off-screen and the head-only
+      // check false-negatived while the rederive was ON SCREEN (baseline
+      // run 2026-09-26: rederive painted, fact said false).
       const rederived = await resumedDrive.waitFor(
-        () => resumedDrive.screen().includes(prompt.slice(0, 24)),
+        () => {
+          const s = resumedDrive.screen();
+          return s.includes(prompt.slice(0, 24)) || s.includes(replyToken);
+        },
         90000,
         500,
       );
+      // 1.2.11: a resumed COMPLETED conversation rederives, idles a beat,
+      // then self-exits (the 1.2.3 exit-0 candidate again). Watch briefly
+      // and record the exit — the panic probe null-skips on a dead child,
+      // so here is where the drift must be written down.
+      let selfExit = null;
+      const selfDeadline = Date.now() + 10000;
+      while (Date.now() < selfDeadline) {
+        if (resumedDrive.exitCode !== null) {
+          selfExit = resumedDrive.exitCode;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
       await new Promise((r) => setTimeout(r, 2000));
       resumedDrive.snap('resumed');
-      const lockBack = fs.existsSync(path.join(AGY_HOME, 'presence', `${turnSessionId}.lock`));
+      const runLock = path.join(AGY_HOME, 'presence', `${turnSessionId}.lock`);
+      const lockExists = fs.existsSync(runLock);
+      const lockHolders = lockExists ? presenceLockHolders() : null;
+      // existence alone reads lies (the locks leak) — live means fd-held NOW
+      const lockBack = lockExists && !!lockHolders && (lockHolders[runLock] || []).length > 0;
       ctx.facts.resume = {
         resumed_session_id: turnSessionId,
         rederived: !!rederived,
+        resumed_child_self_exit: selfExit,
         presence_lock_after_resume: lockBack,
+        presence_lock_exists: lockExists,
       };
+      if (selfExit !== null) {
+        return rederived
+          ? `rederived ok; child SELF-EXITED code ${selfExit} (the 1.2.3 exit-0 candidate, live again on 1.2.11); presence lock fd-held: ${lockBack}`
+          : `never rederived and child self-exited code ${selfExit}`;
+      }
       return rederived
-        ? `rederived ok; presence lock re-created: ${lockBack}`
+        ? `rederived ok; child alive; presence lock fd-held: ${lockBack}`
         : 'resumed but prior transcript never rederived';
     });
 
