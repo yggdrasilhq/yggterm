@@ -237,6 +237,7 @@ use codex_cli::{
     current_time_ms, ensure_local_managed_cli, ensure_local_managed_cli_for_focus,
     remove_local_managed_cli,
     local_agent_cli_missing_binary_refusal, managed_cli_shell_command_configured,
+    managed_cli_shell_command_configured_with_identity,
     managed_cli_shell_command_full,
     refresh_local_managed_cli,
     summarize_managed_cli_report, sync_terminal_identity_env,
@@ -12750,16 +12751,31 @@ impl YggtermServer {
         // conversation, instead of a row that can never reach one.
         let resumable = saved_session_in_store
             || (live_runtime_held && live_held_row_resumes_by_row_id(kind, saved_session_in_store));
+        // ⛔ [11.168] THE FUNNEL RECOMPOSE MUST NOT RE-IDENTIFY THE ROW. This
+        // arm rewrites the stored launch command on every ensure (rotation
+        // respawn, keep-alive, focus) — composing it from the host global
+        // flipped a row born under one client's theme to whatever client
+        // synced last (measured: the dark-born probe row respawned LIGHT
+        // after the mid-proof rotation). The identity rides the ROW, same law
+        // as the sweep: a row that already carries identity exports keeps
+        // them verbatim; a bare/fresh row passes None and inherits exactly
+        // the pre-carry fallback (request appearance, else the global).
+        let carried_identity_exports = self
+            .sessions
+            .get(&key)
+            .map(|session| terminal_identity_exports_in_command(&session.launch_command))
+            .unwrap_or_default();
         let launch_command = if resumable {
-            remote_persistent_resume_shell_command_with_terminal_appearance_configured(
+            remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
                 kind,
                 session_id,
                 cwd,
                 terminal_appearance,
                 configured_extra_args,
+                Some(&carried_identity_exports),
             )
         } else {
-            remote_resume_picker_shell_command_with_terminal_appearance_configured(
+            remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity(
                 kind,
                 session_id,
                 cwd,
@@ -12767,6 +12783,7 @@ impl YggtermServer {
                 true,
                 terminal_appearance,
                 configured_extra_args,
+                Some(&carried_identity_exports),
             )
         };
         let home = resolve_yggterm_home()?;
@@ -12947,13 +12964,23 @@ impl YggtermServer {
         // `agent_launch_command_with_options` does: it exists for a host whose
         // managed layout cannot be resolved at all, and a command that silently
         // ran on the wrong model would be worse than one visibly missing flags.
-        let composed = codex_cli::managed_cli_shell_command_configured(
+        // The carried-exports law is the resume arm's ([11.168]): this START
+        // recompose of an EXISTING row keeps the row's identity exports
+        // verbatim; a fresh row passes None and inherits the pre-carry
+        // fallback.
+        let start_carried_identity_exports = self
+            .sessions
+            .get(&key)
+            .map(|session| terminal_identity_exports_in_command(&session.launch_command))
+            .unwrap_or_default();
+        let composed = codex_cli::managed_cli_shell_command_configured_with_identity(
             kind,
             cwd,
             ManagedCliAction::Launch,
             terminal_appearance,
             launch,
             configured_extra_args,
+            Some(&start_carried_identity_exports),
         );
         let launch_command = if kind == SessionKind::ClaudeCode {
             composed
@@ -15142,7 +15169,12 @@ impl YggtermServer {
         session.remote_deploy_state = remote_deploy_state;
         session.ssh_target = Some(target.ssh_target.clone());
         session.ssh_prefix = target.prefix.clone();
-        session.launch_command = remote_ssh_launch_command(
+        // [11.168]: the ssh attach recompose keeps the row's own identity
+        // exports verbatim (the helper's global fallback IS the pre-carry law
+        // for a bare row).
+        let identity_exports =
+            carried_terminal_identity_exports(Some(&session.launch_command));
+        session.launch_command = remote_ssh_launch_command_with_identity_exports(
             &target.ssh_target,
             target.prefix.as_deref(),
             remote_binary,
@@ -15153,6 +15185,8 @@ impl YggtermServer {
                 launch_cwd.as_str(),
                 crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
             ],
+            &[],
+            &identity_exports,
         );
         session.terminal_lines = vec![
             format!("$ {}", session.launch_command),
@@ -16497,13 +16531,40 @@ fn remote_resume_picker_shell_command_with_terminal_appearance_configured(
     terminal_appearance: Option<&str>,
     configured_extra_args: Option<&str>,
 ) -> String {
-    let base = managed_cli_shell_command_configured(
+    remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity(
+        kind,
+        session_id,
+        cwd,
+        prefix,
+        persistent,
+        terminal_appearance,
+        configured_extra_args,
+        None,
+    )
+}
+
+/// [11.168]: the ensure funnel's re-composition of an EXISTING row passes the
+/// identity exports that row already carries (`Some`, possibly empty = bare —
+/// the raw [`terminal_identity_exports_in_command`] extraction) so a respawn
+/// never re-identifies from the host global mid-life.
+fn remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity(
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    prefix: Option<&str>,
+    persistent: bool,
+    terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
+    let base = managed_cli_shell_command_configured_with_identity(
         kind,
         cwd,
         ManagedCliAction::ResumePicker { persistent },
         terminal_appearance,
         &AgentLaunchOptions::default(),
         configured_extra_args,
+        carried_identity_exports,
     )
     .unwrap_or_else(|_| {
         let descriptor = agent_cli_descriptor(kind);
@@ -16552,6 +16613,28 @@ fn remote_persistent_resume_shell_command_with_terminal_appearance_configured(
     terminal_appearance: Option<&str>,
     configured_extra_args: Option<&str>,
 ) -> String {
+    remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
+        kind,
+        session_id,
+        cwd,
+        terminal_appearance,
+        configured_extra_args,
+        None,
+    )
+}
+
+/// [11.168] twin: the ensure funnel's RESUME recompose carries the row's own
+/// identity exports (`Some` = the raw extraction, possibly empty = bare row)
+/// instead of re-reading the host global. `None` composes byte-identically to
+/// the pre-carry law.
+fn remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
+    kind: SessionKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
     // Per [[spec-agent-cli-wrapper-render-parity]]: render the same as a
     // clean `codex resume <UUID>` / `claude --resume <UUID>`. A previous
     // version of this wrapper prefixed `stty raw -echo opost onlcr` here,
@@ -16560,12 +16643,13 @@ fn remote_persistent_resume_shell_command_with_terminal_appearance_configured(
     // cursor landing on the status bar instead of the input prompt row).
     // The TUI sets raw mode itself; we no longer pre-set anything and let
     // the agent CLI own the terminal state.
-    persistent_agent_resume_command_with_terminal_appearance_configured(
+    persistent_agent_resume_command_with_terminal_appearance_configured_with_identity(
         kind,
         cwd,
         session_id,
         terminal_appearance,
         configured_extra_args,
+        carried_identity_exports,
     )
 }
 
@@ -17649,6 +17733,33 @@ fn remote_direct_attach_launch_command(
     _expected_fragments: &[String],
     extra_exports: &[String],
 ) -> String {
+    remote_direct_attach_launch_command_with_identity(
+        ssh_target,
+        prefix,
+        session_id,
+        remote_binary_expr,
+        cwd,
+        _expected_fragments,
+        extra_exports,
+        None,
+    )
+}
+
+/// [11.168] twin: the direct attach composed FOR an existing row carries that
+/// row's identity exports (`Some`, possibly empty = bare row — raw
+/// extraction, the caller has the stored command in reach). `None` falls back
+/// to the host global, the pre-carry law.
+#[allow(clippy::too_many_arguments)]
+fn remote_direct_attach_launch_command_with_identity(
+    ssh_target: &str,
+    prefix: Option<&str>,
+    session_id: &str,
+    remote_binary_expr: &str,
+    cwd: &str,
+    _expected_fragments: &[String],
+    extra_exports: &[String],
+    carried_identity_exports: Option<&[String]>,
+) -> String {
     let mut helper_command = String::from(remote_binary_expr);
     for arg in [
         "server",
@@ -17661,7 +17772,14 @@ fn remote_direct_attach_launch_command(
         helper_command.push(' ');
         helper_command.push_str(&shell_single_quote(arg));
     }
-    let mut env_exports = terminal_identity_shell_exports_for_remote();
+    let carried = carried_identity_exports
+        .map(|exports| !exports.is_empty())
+        .unwrap_or(false);
+    let mut env_exports = if carried {
+        carried_identity_exports.unwrap_or_default().to_vec()
+    } else {
+        terminal_identity_shell_exports_for_remote()
+    };
     env_exports.extend(extra_exports.iter().cloned());
     let env_exports = env_exports.join(" && ");
     let inner = if env_exports.is_empty() {
@@ -19296,8 +19414,12 @@ fn configure_remote_resume_live_session(
     session.remote_deploy_state = remote_deploy_state;
     session.ssh_target = Some(target.ssh_target.clone());
     session.ssh_prefix = target.prefix.clone();
+    // [11.168]: a re-open/restore reconfigure keeps the row's own identity
+    // exports verbatim (the helper's global fallback IS the pre-carry law for
+    // a bare row) — computed before the overwrite below consumes the field.
+    let identity_exports = carried_terminal_identity_exports(Some(&session.launch_command));
     let extra_exports = remote_agent_start_exports(session.kind, &AgentLaunchOptions::default());
-    session.launch_command = remote_ssh_launch_command_with_extra_exports(
+    session.launch_command = remote_ssh_launch_command_with_identity_exports(
         &target.ssh_target,
         target.prefix.as_deref(),
         remote_binary,
@@ -19310,6 +19432,7 @@ fn configure_remote_resume_live_session(
             "--require-existing",
         ],
         &extra_exports,
+        &identity_exports,
     );
     session.terminal_lines = vec![
         format!("$ {}", session.launch_command),
@@ -19398,8 +19521,12 @@ fn configure_remote_new_codex_live_session(
     session.remote_deploy_state = remote_deploy_state;
     session.ssh_target = Some(target.ssh_target.clone());
     session.ssh_prefix = target.prefix.clone();
+    // [11.168]: same carried law as the resume reconfigure — a restore of a
+    // themed row keeps the row's own identity exports (the helper's global
+    // fallback IS the pre-carry law for a bare row).
+    let identity_exports = carried_terminal_identity_exports(Some(&session.launch_command));
     let extra_exports = remote_agent_start_exports(SessionKind::Codex, &AgentLaunchOptions::default());
-    session.launch_command = remote_ssh_launch_command_with_extra_exports(
+    session.launch_command = remote_ssh_launch_command_with_identity_exports(
         &target.ssh_target,
         target.prefix.as_deref(),
         remote_binary,
@@ -19411,6 +19538,7 @@ fn configure_remote_new_codex_live_session(
             launch_cwd.unwrap_or(""),
         ],
         &extra_exports,
+        &identity_exports,
     );
     session.terminal_lines = vec![
         format!("$ {}", session.launch_command),
@@ -36938,7 +37066,28 @@ fn persistent_agent_resume_command_with_terminal_appearance_configured(
     terminal_appearance: Option<&str>,
     configured_extra_args: Option<&str>,
 ) -> String {
-    managed_cli_shell_command_configured(
+    persistent_agent_resume_command_with_terminal_appearance_configured_with_identity(
+        kind,
+        cwd,
+        session_id,
+        terminal_appearance,
+        configured_extra_args,
+        None,
+    )
+}
+
+/// [11.168] twin: a RE-COMPOSED resume embeds the row's carried identity
+/// exports verbatim (`Some` = the raw extraction, possibly empty = bare row);
+/// `None` composes byte-identically to the pre-carry law.
+fn persistent_agent_resume_command_with_terminal_appearance_configured_with_identity(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: &str,
+    terminal_appearance: Option<&str>,
+    configured_extra_args: Option<&str>,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
+    managed_cli_shell_command_configured_with_identity(
         kind,
         cwd,
         ManagedCliAction::Resume {
@@ -36948,6 +37097,7 @@ fn persistent_agent_resume_command_with_terminal_appearance_configured(
         terminal_appearance,
         &AgentLaunchOptions::default(),
         configured_extra_args,
+        carried_identity_exports,
     )
     .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, Some(session_id)))
 }
@@ -49882,6 +50032,209 @@ terminal_window_id: None,
         assert!(!is_terminal_identity_env_key("NPM_CONFIG_PREFIX"));
         assert!(!is_terminal_identity_env_key("YGGTERM_AGENT_LAUNCH_OPTIONS"));
         assert!(!is_terminal_identity_env_key("YGGTERM_HOME"));
+    }
+
+    // ── [11.168] THE FUNNEL RECOMPOSE CARRIES THE ROW'S IDENTITY ──
+
+    /// The ensure funnel's RESUME recompose of a row born under one theme must
+    /// keep that theme's exports even while a foreign theme holds the host
+    /// global — measured live 2026-09-25/26: a dark-born probe row respawned
+    /// LIGHT after the mid-proof rotation, because the funnel composed from
+    /// the current global instead of the row's own command. The sweep carry
+    /// law, applied at the funnel: the row's exports win over BOTH the
+    /// request appearance and the global.
+    #[test]
+    fn the_funnel_resume_recompose_carries_the_rows_identity_exports() {
+        let _guard = terminal_identity_test_guard();
+        crate::sync_terminal_identity_appearance("dark");
+        let previous = "export YGGTERM_TERMINAL_APPEARANCE='light' && export COLORFGBG='0;15' && export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7' && export NPM_CONFIG_PREFIX='/x' && exec codex resume abc";
+        let carried = terminal_identity_exports_in_command(previous);
+        assert!(
+            carried.iter().any(|segment| segment.contains("light")),
+            "the extractor must find the row's appearance export"
+        );
+        // The request appearance is Some(dark) here on purpose: the row's own
+        // exports outrank whatever the ensure request names.
+        for appearance in [None, Some("dark")] {
+            let command =
+                remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
+                    SessionKind::Codex,
+                    "abc123",
+                    Some("/srv/app"),
+                    appearance,
+                    None,
+                    Some(&carried),
+                );
+            // Keys + raw values, never whole quoted segments (the composers
+            // re-quote).
+            assert!(command.contains("APPEARANCE="), "{command}");
+            assert!(command.contains("light"), "{command}");
+            assert!(command.contains("0;15"), "{command}");
+            assert!(command.contains("#f7f7f7"), "{command}");
+            assert!(!command.contains("15;0"), "{command}");
+            assert!(
+                !command.contains("NPM_CONFIG_PREFIX='/x'"),
+                "carried extraction is identity-only, the composer regenerates the rest: {command}"
+            );
+        }
+    }
+
+    /// A bare/fresh row (no identity exports — the empty extraction) composes
+    /// BYTE-IDENTICALLY to the pre-carry law: `None` and `Some(&[])` must
+    /// agree, so no birth changes shape because of this defect's fix.
+    #[test]
+    fn the_funnel_recompose_of_a_bare_row_is_byte_identical_to_the_pre_carry_law() {
+        // The fallback reads the process-global identity env — serialize
+        // against the guard-takers.
+        let _guard = terminal_identity_test_guard();
+        let from_none =
+            remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
+                SessionKind::Codex,
+                "abc123",
+                Some("/srv/app"),
+                None,
+                None,
+                None,
+            );
+        let from_empty =
+            remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
+                SessionKind::Codex,
+                "abc123",
+                Some("/srv/app"),
+                None,
+                None,
+                Some(&[]),
+            );
+        assert_eq!(from_none, from_empty);
+    }
+
+    /// The open/restore reconfigure lane (`configure_remote_resume_live_session`
+    /// — the arm `open_remote_scanned_session_with_view_and_kind` and
+    /// `restore_live_session` both ride) keeps a themed row's identity exports
+    /// through the ssh recompose while a foreign theme holds the global.
+    #[test]
+    fn a_remote_resume_reconfigure_keeps_the_rows_carried_identity_exports() {
+        let _guard = terminal_identity_test_guard();
+        crate::sync_terminal_identity_appearance("dark");
+        let mut session = ManagedSessionView {
+            id: "abc123".to_string(),
+            session_path: "remote-session://dev/abc123".to_string(),
+            title: "Restored".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "dev".to_string(),
+            source: SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::RemoteBootstrap,
+            remote_deploy_state: RemoteDeployState::Ready,
+            launch_command: "export YGGTERM_TERMINAL_APPEARANCE='light' && export COLORFGBG='0;15' && export YGGTERM_TERMINAL_COLOR_BACKGROUND='#f7f7f7' && exec ssh -tt dev 'codex resume abc123'".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![],
+            preview: SessionPreview {
+                older_available: false,
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            last_activity_epoch_ms: None,
+            ssh_target: Some("dev".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+            working: None,
+            limit_wait: false,
+            awaiting_user_choice: false,
+            input_unanswered_ms: None,
+            pty_in_alternate_screen: None,
+            agent_launch_options: AgentLaunchOptions::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+        configure_remote_resume_live_session(
+            &mut session,
+            "remote-session://dev/abc123",
+            "abc123",
+            "Restored",
+            &SshConnectTarget {
+                label: "dev".to_string(),
+                kind: SessionKind::Codex,
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                cwd: Some("/srv/app".to_string()),
+            },
+            "$HOME/.yggterm/bin/yggterm",
+            RemoteDeployState::Ready,
+            None,
+            UiTheme::ZedLight,
+        );
+        let command = session.launch_command.clone();
+        assert!(command.contains("APPEARANCE="), "{command}");
+        assert!(command.contains("light"), "{command}");
+        assert!(command.contains("0;15"), "{command}");
+        assert!(command.contains("#f7f7f7"), "{command}");
+        assert!(
+            !command.contains("15;0"),
+            "the dark global must not leak into a carried row: {command}"
+        );
+    }
+
+    /// The funnel's recompose sites are locked structurally: every arm that
+    /// overwrites a stored launch command must consult the row's own exports
+    /// first, and the ensure arms must compose through the carried-identity
+    /// twins — a future composer refactor that silently re-reads the global
+    /// fails here, not on the owner's light theme.
+    #[test]
+    fn every_funnel_recompose_site_consults_the_rows_carried_exports() {
+        let source = include_str!("lib.rs");
+        let body_of = |name: &str| -> String {
+            source
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} vanished from lib.rs"))
+                .split("\nfn ")
+                .next()
+                .expect("function body")
+                .to_string()
+        };
+        for name in [
+            "fn ensure_remote_runtime_agent_session(",
+            "fn start_remote_runtime_agent_session(",
+            "fn configure_remote_resume_live_session(",
+            "fn configure_remote_new_codex_live_session(",
+            "fn configure_remote_ssh_shell_live_session(",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("launch_command)"),
+                "{name} must extract the row's carried identity exports from its prior command before recomposing"
+            );
+        }
+        let ensure = body_of("fn ensure_remote_runtime_agent_session(");
+        assert!(
+            ensure.contains("remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(")
+                && ensure
+                    .contains("remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity("),
+            "the ensure resume and picker arms must compose through the carried-identity twins"
+        );
+        assert!(
+            !ensure
+                .contains("remote_persistent_resume_shell_command_with_terminal_appearance_configured(\n"),
+            "no bare global-embedding composer may remain in the ensure funnel"
+        );
+        let start = body_of("fn start_remote_runtime_agent_session(");
+        assert!(
+            start.contains("managed_cli_shell_command_configured_with_identity("),
+            "the start recompose must compose through the carried-identity twin"
+        );
     }
 
     #[test]
