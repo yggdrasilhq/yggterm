@@ -29372,6 +29372,15 @@ timeout — the report carries start/end overhead floors as the load proxy.
 Re-run quiet before tuning any single stage; the ladder is the map of
 where the seconds live. Campaign door: `campaign-ux-speed.md` §BASELINES.
 
+**[11.117]** (four full sidebar merges per spawn; re-merge-the-world per
+invalidating change) was VERIFIED FIXED 2026-09-26 and its entry deleted per
+the heading law — root cause was the merge label map opening the sqlite title
+store PER SCANNED SESSION (6.7k Connection::open+DDL batches, ~0.9 s per
+uncached merge); one-open + batched get_title_map took the full uncached
+merge at 8.5k rows from ~900 ms to ~70 ms, live-proven on the rotated build
+(lane/uxspeed/spawn-merge-cache, board ACK-5150475807 -> ACK-d4ef90cdb3;
+full story in the ux-speed door, ns -home-pi-gh-yggterm).
+
 **⛔ CORRECTION (2026-09-15 quiet window, instrument-grade — the stage
 names above were load-window artifacts):** with the desktop quiet
 (cli floor 73 ms) the daemon is NOT a cost: `terminal new` daemon work
@@ -29534,23 +29543,6 @@ the error kind. Falsifier: 6 h of trace with a permanently-failing row
 shows ≤2 `ok:false` spans for it and every span names its reason.
 
 > Renumber note: this entry was drafted as [11.116] the same hour the switch-plane-vocab lane filed its own [11.116] (row-title retries) — renumbered to [11.117] per the defect-id law; main landed theirs first.
-## [11.117] — VERIFIED FIXED 2026-09-26, entry retired (tombstone kept for the cross-references in [11.114]/[11.125])
-
-Every spawn paid four full sidebar merges and every invalidating change re-merged
-the whole world on the UI thread. Verified live (lane/uxspeed/spawn-merge-cache,
-board claim ACK-5150475807): root cause was `remote_scanned_session_label`
-opening the sqlite title store PER SCANNED SESSION inside the merge label map —
-a fresh Connection::open + schema DDL batch each, 6.7k opens = push_remote_ms
-1155.9 of a 1175 ms merge. Fix: one store open per merge + one batched
-get_title_map; the decomposition instrument (per-input input_keys + source in
-merge_rows_breakdown) landed with it. Full uncached merge at 8.5k rows:
-~900 ms -> ~70 ms (live-proven on the rotated build d3dc6e60a03e, uxprobe
-spawn windows 2026-09-26 21:26 vs 22:56); spawn->paint 5553 -> 1251 ms on a
-quiet window; probe spawn verb timeouts gone (3/3 clean). The four-merge
-shape itself — content genuinely changing per apply during restore/scan churn —
-is the restore-walker plane ([11.14] census, the switch-mount lane), not this
-entry.
-
 ## ⛔ [11.118] THE MODAL'S REQUEST EDGE IS SILENT ON THE LIVE BUILD — `modal_open_requested` FIRES FOR THE BULK CLOSE-ALL BUT NEVER FOR SINGLE-ROW DELETES, AND THE CHORD-PATH OPENER `open_delete_dialog` CARRIES NO EMISSION AT ALL — the modal pair the ux-speed door defines cannot be measured end-to-end on 3.2.113 (measured live 2026-09-15 ~01:15-01:45 IST, five controlled opens, tools/uxspeed/uxprobe.py modal action)
 
 **Status:** OPEN
