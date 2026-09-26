@@ -30899,3 +30899,41 @@ still re-identifies a row; the funnel's recompose should run the same
 command is in reach at recompose time). That funnel leg, the birth-time
 per-client identity, the `initial_server_sync` appearance-only sync, the
 frontend `onColor` backstop, and OSC 4 slots 16-255 stay open above.
+
+LIVE-REPORT FOLLOW-UP 2026-09-26 (the owner: "no difference in light themes"):
+the sweep-carry leg was real but insufficient — the remaining grey belongs to
+CLIs WITH NO DETECTION SURFACE. Measured at binary+PTY level on the live
+Antigravity CLI: the child env carries the full light identity
+(#feffff/0;15/YGGTERM_APPEARANCE=light) and it still draws dark greys; the
+219MB binary has ZERO COLORFGBG references and never sends OSC 10/11/12
+queries at startup (PTY capture: DA1 `\e[c` only, then it paints); no theme
+flag in --help; settings keys are altScreenMode/modelProvider/notifications/
+output_format/shortcut_used/executionMode (planting "theme": "light" in
+settings.json changes nothing); it paints a bundled fixed truecolor palette —
+the same on Ghostty, on any theme, light or dark. No identity signal reaches a
+CLI that never listens.
+
+LANDED (leg 2, lane/trace/light-contrast a8f98aed → main 5a8f834bbef3
+deployed fleet 15:36): the renderer carries the readability ON LIGHT THEMES —
+`terminal_minimum_contrast_ratio` returns 6.0 when the terminal theme
+background luminance exceeds 0.72 (xterm halves the required ratio for SGR-2
+dim text, so dim meta text gets 3:1 — the difference between "very light to
+the point of illegibility" and readable), and 1.0 on dark themes (the
+palette-exact old law stands where the owner reports no problem). The blanket
+1.0 rationale ("Codex TUI washed out") is superseded on light themes only, by
+the measured agy evidence. Render-side, so EXISTING rows re-render readable
+when the GUI rotates — no CLI respawn needed. Full shell lib suite 2151/0.
+
+PROOF CAVEAT (honest): the shadow-client pixel witness is inconclusive — the
+headless shadow resolves a dark terminal theme (3024 Night, bg #090300) where
+the floor is inactive by design. The named observation for the render leg:
+on the light-themed GUI, an agy row's grey meta text renders at >=3:1
+(visibly darker) versus ~2.2:1 before; if light-theme brand colors now look
+over-muted, the floor is one constant (6.0) to tune.
+
+ALSO MEASURED while proving: a "New dev Antigravity" row showing the
+peer-missing error was BORN BROKEN at 13:18 the same day — first spawn already
+refused `session_not_found` (trace live_session_birth 13:18:04, resume_refusal
+13:18:05), the conversation id was a phantom agy never held, so the row never
+had a turn and nothing was lost. The [11.157] phantom-id family through the
+remote start path; close-and-reopen replaces the row.
