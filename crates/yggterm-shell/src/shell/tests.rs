@@ -22999,6 +22999,24 @@ console.log('ok');
     }
 
     #[test]
+    fn app_control_pointer_script_move_carries_persisted_held_buttons() {
+        // [11.130]: the felt driver's press..move..release is three separate
+        // verb invocations; the held button lives in the persisted pointer
+        // state, and every mid-gesture move MUST carry it -- a literal 0
+        // disarms the held-button move gates, so the drag begins only at the
+        // release's own transition (zero hovers, every drop ignored).
+        let script = app_control_pointer_script(&AppControlPointerCommand::Move {
+            x: 10.0,
+            y: 20.0,
+        });
+        assert!(script.contains("case 'move':"));
+        assert!(script.contains(
+            "transition(command.x, command.y, Number(pointerState.buttons) || 0);"
+        ));
+        assert!(!script.contains("transition(command.x, command.y, 0);"));
+    }
+
+    #[test]
     fn app_control_key_script_prefers_active_tree_rename_input() {
         let script = app_control_key_script(&AppControlKeyCommand::Type {
             text: "htop".to_string(),
