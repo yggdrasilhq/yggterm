@@ -9172,7 +9172,7 @@ JSON.stringify({{
         let mut shell = ShellState::new(bootstrap);
         let mut status = runtime_status_for_test(&current_version(), 0, 4242);
         status.hot_restart_pending = true;
-        shell.latest_runtime_status = Some(status);
+        shell.latest_runtime_status = Some(status.clone());
         assert!(
             shell.version_convergence_pending_restart().is_none(),
             "same version + daemon_pending must never produce a restart — the restart cannot clear the flag"
@@ -70549,24 +70549,37 @@ mod web_surface_immersion_locks {
     }
 
     #[test]
-    fn a_host_whose_runtime_the_daemon_loses_is_not_reveal_eligible() {
-        let session_path = "local://reveal-dead-runtime-host-test";
+    fn a_remote_host_whose_runtime_the_daemon_loses_is_not_reveal_eligible() {
+        // Daemon ownership gates REMOTE rows only: the live refused-raise
+        // diagnostics (build 7963105a) proved the runtime-status ownership
+        // list does not cover local sessions, so demanding it there refused
+        // every local raise while the rows were demonstrably alive.
+        let session_path = "remote-cc://dev/reveal-dead-runtime-host-test";
         let mut shell = shell_with_a_ready_retained_host(session_path);
         // An explicit runtime status that owns SOMEONE ELSE's keys proves
         // the snapshot path is live while this session's PTY is not.
         let status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
             "server_version": "reveal-lock",
-            "host_kind": "local",
+            "host_kind": "remote",
             "host_detail": "reveal-lock",
             "embedded_surface_supported": false,
             "bridge_enabled": false,
-            "owned_terminal_session_keys": ["local://someone-else"],
+            "owned_terminal_session_keys": ["remote-cc://someone-else"],
         }))
         .expect("runtime status fixture parses");
-        shell.latest_runtime_status = Some(status);
+        shell.latest_runtime_status = Some(status.clone());
         assert!(
             !shell.terminal_host_ready_for_reveal_raise(session_path),
-            "a host whose PTY the daemon no longer holds must bootstrap, not raise"
+            "a remote host whose PTY the daemon no longer holds must bootstrap, not raise"
+        );
+        // And the same liveness proof must NOT gate a local row: the same
+        // snapshot that lacks this row's key must still raise it.
+        let local_path = "local://reveal-local-runtime-unlisted-test";
+        let mut local_shell = shell_with_a_ready_retained_host(local_path);
+        local_shell.latest_runtime_status = Some(status);
+        assert!(
+            local_shell.terminal_host_ready_for_reveal_raise(local_path),
+            "a local row is alive by canvas + ready history; the runtime list does not apply"
         );
     }
 

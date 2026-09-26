@@ -30910,16 +30910,36 @@ impl ShellState {
     /// mounted at a stable epoch and their BackgroundTrickle reads keep the
     /// canvas current while hidden — yet every open request still re-ran the
     /// full bootstrap (xterm re-init + the ~0.9 s mount eval wait), p50 1.34 s
-    /// click-to-first-glyph. This predicate is the raise arm and it is
-    /// DELIBERATELY `terminal_session_host_reusable_for_reveal` + a degraded
-    /// guard, nothing more: that SSOT already carries the house findings
-    /// (sticky ready history survives hide; a stale `attach_in_flight` marker
-    /// must NOT block a reveal because a switch itself sets it for the target;
-    /// daemon ownership is the live-PTY proof). First mounts, never-ready
-    /// hosts, dead runtimes, and transport-degraded surfaces stay on the
-    /// bootstrap path.
+    /// click-to-first-glyph.
+    ///
+    /// Liveness proof, per the live refused-raise diagnostics (build
+    /// 7963105a, 2026-09-27): a canvas holding a stable host epoch PLUS sticky
+    /// ready history is alive — `daemon_owns_session_runtime` must NOT gate
+    /// LOCAL rows, because the daemon's runtime-status ownership list does not
+    /// cover local sessions (every local raise refused on that arm while the
+    /// very same rows remounted fine). It stays a hard gate for REMOTE rows
+    /// (`terminal_session_uses_remote_runtime`), where a missing PTY is real
+    /// and the canvas cannot be trusted. A latched failure or a RECOVERING
+    /// attempt means the retained-fault lane owns the row — a merely PENDING
+    /// attempt is the click's own demand and is what the raise SATISFIES
+    /// (latching it Ready), so it is not a veto. First mounts, never-ready
+    /// hosts, and transport-degraded surfaces stay on the bootstrap path.
     fn terminal_host_ready_for_reveal_raise(&self, session_path: &str) -> bool {
-        if !self.terminal_session_host_reusable_for_reveal(session_path) {
+        if !self.terminal_session_host_id(session_path).is_some()
+            || !self.terminal_session_was_ever_ready(session_path)
+        {
+            return false;
+        }
+        if let Some(attempt) = self.latest_terminal_open_attempt_for_path(session_path) {
+            if attempt.latched_failure_reason.is_some()
+                || matches!(attempt.state, TerminalOpenAttemptState::Recovering)
+            {
+                return false;
+            }
+        }
+        if self.terminal_session_uses_remote_runtime(session_path)
+            && !self.daemon_owns_session_runtime(session_path)
+        {
             return false;
         }
         !self
