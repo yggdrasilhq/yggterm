@@ -30929,9 +30929,15 @@ and the stored-row live-focus builder; the restore sites scrape through the
 [11.169] peeler (`funnel_carried_identity_exports`), never the raw splitter.
 build_session (the stored-open VIEW builder — a re-birth by the [11.156]
 law) deliberately stays on the pre-carry law. The restore test and the
-extended source-scan lock ride the same commit. FALSIFIER RERUN on the
-deployed leg-2 build owed (same recipe: dark-born row survives a
-light-flipped rotation).
+extended source-scan lock ride the same commit. FALSIFIER RERUN RAN on the deployed leg-2 build (5821bab): the row STILL
+flipped (light-born → dark across flip + rotation + connect) — the trace
+shows the spawn re-ran the STORED command verbatim, so the flip rides the
+RESTORE arm for LOCAL CODEX rows (the Storage branch of restore_live_session;
+leg 2 fixed only the rebound arm for self-minting kinds) composing from the
+current global before spawn. THIRD-LEG RESIDUAL: thread the carried
+extraction (peeler) through the local-codex restore Storage branch the same
+way; the flip-rotate-snapshot instrument is the verdict. Probe row removed,
+owner theme restored, board ACK-4e162ef249.
 
 LIVE PROOF 2026-09-25 late (the muse lab host, build 18d45336e785 deployed
 fleet 23:36): a probe remote codex row born under the owner's light theme
