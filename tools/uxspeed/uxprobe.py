@@ -206,77 +206,94 @@ refuse("delete_overlay_did_not_close");
 CLOSEALL_OPEN_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
-if (document.querySelector('[data-delete-confirm-overlay]')) {{
+    Object.assign({ accepted: false, reason }, extra || {}));
+if (document.querySelector('[data-delete-confirm-overlay]')) {
     refuse("delete_overlay_already_open");
     return;
-}}
+}
+// a stray open menu (ours from a failed iteration, or the operator's) would
+// swallow the right-click — click-away first, exactly like the modal script
+const dismiss = async () => {
+    try {
+        const t = document.elementFromPoint(3, 3) || document.body;
+        const b = { bubbles: true, cancelable: true, composed: true,
+                     view: window, clientX: 3, clientY: 3, screenX: 3,
+                     screenY: 3, button: 0, buttons: 1 };
+        t.dispatchEvent(new MouseEvent('mousedown', b));
+        t.dispatchEvent(new MouseEvent('mouseup', { ...b, buttons: 0 }));
+        t.dispatchEvent(new MouseEvent('click', { ...b, buttons: 0 }));
+        await settle(80);
+    } catch (_e) {}
+};
+await dismiss();
 const PATH = '__live_sessions__';
-const row = await (async () => {{
+const row = await (async () => {
     const deadline = Date.now() + 1500;
-    while (Date.now() < deadline) {{
+    while (Date.now() < deadline) {
         const n = document.querySelector(
             '[data-sidebar-row-path="' + PATH + '"]');
         if (n) return n;
         await settle(50);
-    }}
+    }
     return null;
-}})();
-if (!row) {{
+})();
+if (!row) {
     refuse("live_sessions_group_row_missing");
     return;
-}}
+}
 const rect = row.getBoundingClientRect();
-if (!(rect.width > 0 && rect.height > 0)) {{
+if (!(rect.width > 0 && rect.height > 0)) {
     refuse("live_sessions_group_row_not_visible");
     return;
-}}
+}
 const cx = Number((rect.left + rect.width / 2).toFixed(2));
 const cy = Number((rect.top + rect.height / 2).toFixed(2));
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
                 clientX: cx, clientY: cy, screenX: cx, screenY: cy,
-                button: 2, buttons: 2, detail: 1 }};
+                button: 2, buttons: 2, detail: 1 };
 const t_open = Date.now();
 row.dispatchEvent(new MouseEvent('mousedown', init));
-row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+row.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, closeAll = null;
-const openDeadline = Date.now() + 1500;
-while (Date.now() < openDeadline) {{
+// bounded UNDER the app's ~3 s dom-eval timeout: a stage that misses must
+// come back as an honest refusal, never as a killed eval
+const openDeadline = Date.now() + 1100;
+while (Date.now() < openDeadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     closeAll = menu?.querySelector(
         '[data-context-menu-action="close-all-live-sessions"]') || null;
     if (menu && closeAll) break;
-}}
-if (!menu || !closeAll) {{
-    refuse("menu_or_close_all_item_not_observed", {{ session_path: PATH }});
+}
+if (!menu || !closeAll) {
+    refuse("menu_or_close_all_item_not_observed", { session_path: PATH });
     return;
-}}
+}
 const menu_open_ms = Date.now() - t_open;
 await settle(120);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 closeAll.dispatchEvent(new MouseEvent('mousedown', clickInit));
 closeAll.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 closeAll.dispatchEvent(new MouseEvent('click', clickInit));
 const t_click = Date.now();
-const mountDeadline = t_click + 1500;
+const mountDeadline = t_click + 1100;
 let overlay = null;
-while (Date.now() < mountDeadline) {{
+while (Date.now() < mountDeadline) {
     await settle(20);
     overlay = document.querySelector('[data-delete-confirm-overlay]');
     if (overlay) break;
-}}
-if (!overlay) {{
-    refuse("delete_overlay_did_not_mount", {{ menu_open_ms }});
+}
+if (!overlay) {
+    refuse("delete_overlay_did_not_mount", { menu_open_ms });
     return;
-}}
+}
 const t_mounted = Date.now();
 const dialog = overlay.querySelector('[data-delete-confirm-dialog]');
-dioxus.send({{
+dioxus.send({
     accepted: true,
     menu_open_ms,
     click_to_mount_ms: t_mounted - t_click,
@@ -290,7 +307,7 @@ dioxus.send({{
     unkept_button_present: !!overlay.querySelector(
         '[data-delete-confirm-unkept-action]'),
     dialog_text: String(dialog?.textContent || '').slice(0, 400),
-}});
+});
 """
 
 # The CONFIRM leg of close-all — gated by the caller (only when every live
@@ -329,56 +346,56 @@ refuse("delete_overlay_did_not_close");
 CHORD_LEG_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+    Object.assign({ accepted: false, reason }, extra || {}));
 const q = (sel) => !!document.querySelector(sel);
-if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {{
+if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {
     refuse("menu_or_overlay_already_open");
     return;
-}}
+}
 const kd = (key, code) => window.dispatchEvent(new KeyboardEvent('keydown',
-    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+    { key, code, bubbles: true, cancelable: true, composed: true }));
 const ku = (key, code) => window.dispatchEvent(new KeyboardEvent('keyup',
-    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+    { key, code, bubbles: true, cancelable: true, composed: true }));
 const t_tap = Date.now();
 kd('Alt', 'AltLeft');
 ku('Alt', 'AltLeft');
 let overlaySeen = false;
 const ovDeadline = Date.now() + 1500;
-while (Date.now() < ovDeadline) {{
+while (Date.now() < ovDeadline) {
     await settle(40);
-    if (q('[data-yggterm-keytip-breadcrumb]')) {{ overlaySeen = true; break; }}
-}}
-if (!overlaySeen) {{
-    refuse("alt_overlay_did_not_open", {{ tap_to_overlay_ms: null }});
+    if (q('[data-yggterm-keytip-breadcrumb]')) { overlaySeen = true; break; }
+}
+if (!overlaySeen) {
+    refuse("alt_overlay_did_not_open", { tap_to_overlay_ms: null });
     return;
-}}
+}
 const tap_to_overlay_ms = Date.now() - t_tap;
 const t_e = Date.now();
 kd('e', 'KeyE');
 let menuSeen = false;
 const mDeadline = Date.now() + 1500;
-while (Date.now() < mDeadline) {{
+while (Date.now() < mDeadline) {
     await settle(40);
-    if (q('[data-yggterm-menu-open]')) {{ menuSeen = true; break; }}
-}}
+    if (q('[data-yggterm-menu-open]')) { menuSeen = true; break; }
+}
 const walk_to_menu_ms = menuSeen ? Date.now() - t_e : null;
 kd('Escape', 'Escape');
 let menuClosed = false;
 const gDeadline = Date.now() + 1500;
-while (Date.now() < gDeadline) {{
+while (Date.now() < gDeadline) {
     await settle(40);
-    if (!q('[data-yggterm-menu-open]')) {{ menuClosed = true; break; }}
-}}
+    if (!q('[data-yggterm-menu-open]')) { menuClosed = true; break; }
+}
 let overlayClosed = !q('[data-yggterm-keytip-breadcrumb]');
-if (!overlayClosed) {{
+if (!overlayClosed) {
     kd('Escape', 'Escape');
     const d2 = Date.now() + 1000;
-    while (Date.now() < d2) {{
+    while (Date.now() < d2) {
         await settle(40);
-        if (!q('[data-yggterm-keytip-breadcrumb]')) {{ overlayClosed = true; break; }}
-    }}
-}}
-dioxus.send({{
+        if (!q('[data-yggterm-keytip-breadcrumb]')) { overlayClosed = true; break; }
+    }
+}
+dioxus.send({
     accepted: true,
     overlay_seen: true,
     menu_seen: menuSeen,
@@ -386,7 +403,7 @@ dioxus.send({{
     walk_to_menu_ms,
     escape_closed_menu: menuClosed,
     overlay_closed: overlayClosed,
-}});
+});
 """
 
 
@@ -988,8 +1005,17 @@ dioxus.send(out);
                     shown = e
             if not (requested and shown):
                 time.sleep(0.25)
-        payload = (requested or {}).get("payload") or {}
-        shown_payload = (shown or {}).get("payload") or {}
+        # ytrace payloads NEST (the door's known trap): ui_telemetry records
+        # ride the telemetry wrapper, so the event's own fields live at
+        # payload.payload. Measured live 2026-09-26: pair_ms paired fine but
+        # rows/bulk read None and the modal lane's rows-assert passed
+        # vacuously against the empty set.
+        payload = ((requested or {}).get("payload") or {})
+        if isinstance(payload.get("payload"), dict):
+            payload = payload["payload"]
+        shown_payload = ((shown or {}).get("payload") or {})
+        if isinstance(shown_payload.get("payload"), dict):
+            shown_payload = shown_payload["payload"]
         pair_ms = None
         if requested and shown:
             pair_ms = shown["ts_ms"] - requested["ts_ms"]
@@ -1059,8 +1085,13 @@ dioxus.send(out);
                               "blast-radius law)")
         for i in range(iters):
             acc = []
-            self.verb("tree", "select", "__live_sessions__")
-            time.sleep(0.15)
+            # NO tree-select here: the group row is a ROOT row, always
+            # rendered at the sidebar's top, and selecting it fires a
+            # seconds-class merged-sidebar rebuild ([11.117] family) that
+            # starves the eval past the app's dom-eval timeout. Measured
+            # live on jojo 2026-09-26: with the select, 3/3 evals died
+            # dom_eval_timeout; without, the menu opens in <1 s.
+            time.sleep(0.2)
             t0 = now_ms()
             r = self.verb("dom-eval", CLOSEALL_OPEN_JS, timeout=20)
             open_wall_ms = now_ms() - t0
@@ -1120,7 +1151,10 @@ dioxus.send(out);
             chord = {}
             if result.get("accepted"):
                 self.verb("tree", "select", scratch[0])
-                time.sleep(0.15)
+                # the select's merged-sidebar rebuild must SETTLE before the
+                # chord walls are measured, or the walls time the merge, not
+                # the chord
+                time.sleep(1.5)
                 tc = now_ms()
                 rc = self.verb("dom-eval", CHORD_LEG_JS, timeout=15)
                 chord = ((rc.get("json") or {}).get("data")
@@ -1163,8 +1197,7 @@ dioxus.send(out);
         confirm_result = {"ran": False}
         if confirm_allowed:
             confirm_result = {"ran": True}
-            self.verb("tree", "select", "__live_sessions__")
-            time.sleep(0.15)
+            time.sleep(0.2)
             r = self.verb("dom-eval", CLOSEALL_OPEN_JS, timeout=20)
             result = ((r.get("json") or {}).get("data")
                       or {}).get("result") or {}
