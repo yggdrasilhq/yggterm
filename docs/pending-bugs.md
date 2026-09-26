@@ -29352,6 +29352,32 @@ asserts on app-state truth because the trace pairs do not exist.
 > overlay→menu walls land; until rotation the chord leg reports the honest
 > `NO ui/chord events` refusal.
 
+> **RE-VERIFIED + CLOSED (2026-09-26, lane/uxspeed/first-frame-idle — the
+> HALF-4 arm):** the 09-14 "first_frame never fires for idle shells (0/2)"
+> reading does NOT reproduce on current main. Live on jojo (direct build
+> e76fa55c ≈ origin/main tip), uxprobe spawn ×6 on bare-prompt scratch rows:
+> 5/6 emitted `first_frame` as the paint marker (open_to_write 447-949 ms,
+> write_to_frame 26-164 ms, blank_frames_before_write 2-6), and their settle
+> records read painted:true / complete:true / rows_with_content:1 (the bare
+> prompt) / unpainted:0 / writes:1 — the prompt's single write crosses the
+> tapped route and the instrument is honest end to end on idle shells. The
+> sixth iteration was a DIFFERENT finding: row created+queued but NO
+> `terminal_open_attempt` fired within the probe timeout (zero milestones —
+> the UI-plane starvation/[11.38] class; two other ux-speed seats probing
+> the same desktop are the confounder; NOT an idle-shell paint gap). LANDED
+> on the lane: the idle-mount contract lock
+> `the_idle_mount_settles_honest_and_first_frame_stays_absent` (a mount that
+> never receives a byte still settles with painted:false, first_frame stays
+> absent — the never-painted tell the native side joins on host_id — and the
+> budget is mount_open + settle + one recheck), so the honest-blind case
+> cannot silently regress. `xterm_paint/settle` stands as the documented
+> paint-ready spawn marker (docs/observability.md §xterm_paint; the uxprobe
+> paint ladder falls back first_frame → settle → mount_open). For the door's
+> baseline table: blank_frames_before_write positive 5/6 (2-6 frames) — the
+> mount blank-flash class is real and now has its number. STILL OPEN in this
+> entry: chord identity in `input/keystroke` (half 3 — the chord-close-all
+> lane's; its bridge locks are already on main).
+
 ## ⛔ [11.114] TERMINAL SPAWN/CLOSE/DRAG ARE SECONDS-CLASS, NOT MILLISECOND-CLASS — MEASURED COST LADDER FOR SPAWN: ~0.6s DAEMON PROCESSING → ~0.6-1.0s QUEUED GAP → ~2.1s MOUNT ENSURE → +0.5s SETTLE (measured 2026-09-14 late on the GUI host, synthetic scratch rows, tools/uxspeed/uxprobe.py)
 
 **Status:** OPEN
