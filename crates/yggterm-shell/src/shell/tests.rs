@@ -22155,10 +22155,14 @@ console.log('ok');
     }
 
     #[test]
-    fn terminal_minimum_contrast_ratio_preserves_native_ansi_palette() {
+    fn terminal_minimum_contrast_ratio_floors_light_themes_and_preserves_dark() {
+        // [11.168]: agy-class CLIs never detect the background and paint
+        // their bundled dark palette everywhere; on a light theme the
+        // renderer carries the readability floor (6.0, so SGR-2 dim text
+        // gets the halved 3.0), and dark themes keep the palette-exact 1.0.
         let light = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let dark = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
-        assert_eq!(terminal_minimum_contrast_ratio(&light), 1.0);
+        assert_eq!(terminal_minimum_contrast_ratio(&light), 6.0);
         assert_eq!(terminal_minimum_contrast_ratio(&dark), 1.0);
     }
 
