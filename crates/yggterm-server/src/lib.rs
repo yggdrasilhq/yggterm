@@ -42292,7 +42292,7 @@ mod tests {
     /// overlaps its own. Declared-env mutators and known reader-victims hold
     /// this for their whole body. The lock is the stopgap; threading the seam
     /// as an argument remains the fix (see the gate's doc).
-    fn declared_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn declared_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))

@@ -2651,6 +2651,7 @@ mod tests {
     /// pruning.
     #[test]
     fn removing_a_cli_a_process_is_running_from_is_refused() {
+        let _env = crate::tests::declared_env_test_lock(); // fifth reader-victim: presented live under load 2026-09-27, green isolated (the 09-19 named flake)
         let paths = provision_test_paths("remove-running");
         let tool = ManagedCliTool::QwenCode;
         let tool_marker = format!("{}.gen", tool.descriptor().slug);
