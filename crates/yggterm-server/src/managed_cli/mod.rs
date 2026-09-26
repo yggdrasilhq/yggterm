@@ -2467,6 +2467,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.home);
     }
 
+    /// Copy a fixture executable via an external `cp`, never in-process:
+    /// the write fd must not exist in THIS process's fd table while a
+    /// sibling test forks — the clone/vfork window duplicates the table, the
+    /// forked child carries the write fd until its own exec closes it, and
+    /// our spawn of the copy answers ETXTBSY. Measured ~20% of iterations
+    /// under a 16-thread collision loop and only when a heavy-spawning
+    /// sibling ran concurrently (2026-09-27, control-proven on clean main);
+    /// consult verdict D1 — eliminated by construction, because no sibling
+    /// can duplicate a fd that never existed here.
+    fn copy_executable_external(src: &str, dest: &Path) {
+        let status = std::process::Command::new("cp")
+            .arg(src)
+            .arg(dest)
+            .status()
+            .expect("run cp for fixture executable");
+        assert!(status.success(), "cp {src} failed: {status}");
+    }
+
     fn provision_test_paths(tag: &str) -> ManagedCliPaths {
         let tmp = std::env::temp_dir().join(format!(
             "ygg-provision-{tag}-{}-{}",
@@ -2609,7 +2627,7 @@ mod tests {
         // /proc/<pid>/exe points inside the tree, exactly as a CLI's native
         // helper does.
         let executable = live_gen.join("sleeper");
-        std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        copy_executable_external("/bin/sleep", &executable);
         let mut child = std::process::Command::new(&executable)
             .arg("30")
             .spawn()
@@ -2655,7 +2673,7 @@ mod tests {
         let tool_gen_bin = paths.cli_root().join(format!("{tool_marker}1")).join("bin");
         std::fs::create_dir_all(&tool_gen_bin).expect("create tool generation");
         let executable = tool_gen_bin.join(tool.binary_name());
-        std::fs::copy("/bin/sleep", &executable).expect("copy sleep");
+        copy_executable_external("/bin/sleep", &executable);
         std::os::unix::fs::symlink(&executable, paths.bin_dir.join(tool.binary_name()))
             .expect("publish symlink");
         let mut child = std::process::Command::new(&executable)
