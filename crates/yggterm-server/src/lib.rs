@@ -5490,6 +5490,18 @@ pub struct YggtermServer {
     /// being carried once it is older than a few poll ticks, and the row goes
     /// honestly dark instead of lying in either direction.
     working_last_informed: BTreeMap<String, (bool, u128)>,
+    /// The homes this server resolves its files under, resolved ONCE at birth:
+    /// `yggterm_home` from [`resolve_yggterm_home`] (the ENV_YGGTERM_HOME
+    /// override, else ~/.yggterm) and `user_home` from `dirs::home_dir()`.
+    /// The deep flow readers (the ensure funnel, the restore chains, the
+    /// persist/tombstone asks, the identity vouches) read these fields
+    /// instead of re-resolving the process env per site — the env-as-value
+    /// seam that let the declared-HOME flow tests stop mutating the process.
+    /// Production behavior is unchanged: the env never changes mid-process,
+    /// so birth-time resolution answers every site the per-call resolution
+    /// answered.
+    yggterm_home: Option<PathBuf>,
+    user_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5544,9 +5556,23 @@ impl YggtermServer {
             client_viewport_grid: None,
             preview_history_budgets: HashMap::new(),
             working_last_informed: BTreeMap::new(),
+            yggterm_home: resolve_yggterm_home().ok(),
+            user_home: dirs::home_dir(),
         };
 
         this
+    }
+
+    /// THE TEST SEAM for the two home fields: a test server rooted at one
+    /// scratch directory (every declared-HOME flow test plants its fixtures
+    /// under one temp home that serves as both the yggterm home and the user
+    /// home). Production never calls this — it resolves the process env once
+    /// in [`new`].
+    #[cfg(test)]
+    fn rooted_at(mut self, home: &Path) -> Self {
+        self.yggterm_home = Some(home.to_path_buf());
+        self.user_home = Some(home.to_path_buf());
+        self
     }
 
     pub fn backend(&self) -> TerminalBackend {
@@ -6081,7 +6107,7 @@ impl YggtermServer {
 
     pub fn request_terminal_launch_for_path(&mut self, path: &str, origin: ActivationOrigin) {
         let resolved_key = self.resolve_session_storage_key(path).map(str::to_string);
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -6119,7 +6145,7 @@ impl YggtermServer {
         // A stored path keeps the old flow: its ensure needs the
         // stored→live open that the launch performs.
         if preserved_active_path.is_none() && self.resolve_live_session_entry(path).is_some() {
-            if let Ok(home) = resolve_yggterm_home() {
+            if let Some(home) = self.yggterm_home.clone() {
                 append_trace_event(
                     &home,
                     "server",
@@ -6145,7 +6171,7 @@ impl YggtermServer {
                 matches!(session.source, SessionSource::LiveLocal | SessionSource::LiveSsh)
             })
         {
-            if let Ok(home) = resolve_yggterm_home() {
+            if let Some(home) = self.yggterm_home.clone() {
                 append_trace_event(
                     &home,
                     "server",
@@ -6984,7 +7010,7 @@ impl YggtermServer {
             "Launch",
             user_visible_launch_command(&session.launch_command),
         );
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -7045,7 +7071,7 @@ impl YggtermServer {
                 target.ssh_target
             )
         })?;
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -9280,7 +9306,7 @@ impl YggtermServer {
             if persist_drop_already_traced(key, reason) {
                 return;
             }
-            if let Ok(home) = resolve_yggterm_home() {
+            if let Some(home) = self.yggterm_home.clone() {
                 append_trace_event(
                     &home,
                     "server",
@@ -9429,7 +9455,7 @@ impl YggtermServer {
         store: Option<&SessionStore>,
         launch_active_terminal: bool,
     ) {
-        let perf_home = resolve_yggterm_home().ok();
+        let perf_home = self.yggterm_home.clone();
         let total_restore_perf = perf_home
             .clone()
             .map(|home| PerfSpan::start(home, "server", "restore_persisted_state"));
@@ -9468,10 +9494,19 @@ impl YggtermServer {
                 if is_loopback_ssh_target(&machine.ssh_target) {
                     return None;
                 }
-                let mirrored_sessions =
-                    load_remote_machine_sessions_from_mirror(&machine.machine_key)
-                        .or_else(|_| load_remote_machine_sessions_from_mirror(&legacy_machine_key))
-                        .unwrap_or_default();
+                let mirrored_sessions = perf_home
+                    .as_deref()
+                    .and_then(|home| {
+                        load_remote_machine_sessions_from_mirror_in(home, &machine.machine_key)
+                            .or_else(|_| {
+                                load_remote_machine_sessions_from_mirror_in(
+                                    home,
+                                    &legacy_machine_key,
+                                )
+                            })
+                            .ok()
+                    })
+                    .unwrap_or_default();
                 machine.sessions = if machine.sessions.is_empty() {
                     mirrored_sessions
                         .into_iter()
@@ -9533,7 +9568,11 @@ impl YggtermServer {
         }
         for machine in &mut self.remote_machines {
             if machine.sessions.is_empty()
-                && let Ok(mirrored) = load_remote_machine_sessions_from_mirror(&machine.machine_key)
+                && let Some(mirrored) = perf_home
+                    .as_deref()
+                    .and_then(|home| {
+                        load_remote_machine_sessions_from_mirror_in(home, &machine.machine_key).ok()
+                    })
                 && !mirrored.is_empty()
             {
                 machine.sessions = mirrored
@@ -9736,7 +9775,7 @@ impl YggtermServer {
         //
         // ⇒ Say what was restored, what the row's own kind implies, and what
         //   came out. When they disagree, the disagreement IS the bug report.
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             let active = self.active_session_path.clone();
             append_trace_event(
                 &home,
@@ -10417,7 +10456,7 @@ impl YggtermServer {
                 let refreshed_machine_key = self.remote_machines[entry_ix].machine_key.clone();
                 let pruned_live_sessions = self
                     .prune_stale_temporary_remote_live_sessions_after_scan(&refreshed_machine_key);
-                if let Ok(home) = resolve_yggterm_home() {
+                if let Some(home) = self.yggterm_home.clone() {
                     append_trace_event(
                         &home,
                         "server",
@@ -10459,7 +10498,7 @@ impl YggtermServer {
                     apps,
                     cli_presence,
                 };
-                if let Ok(home) = resolve_yggterm_home() {
+                if let Some(home) = self.yggterm_home.clone() {
                     append_trace_event(
                         &home,
                         "server",
@@ -10547,7 +10586,7 @@ impl YggtermServer {
                 self.active_view_mode = WorkspaceViewMode::Rendered;
             }
         }
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -11541,7 +11580,7 @@ impl YggtermServer {
     ) -> anyhow::Result<String> {
         let launch_terminal = view_mode != Some(WorkspaceViewMode::Rendered);
         let machine_key = normalize_machine_key(machine_key);
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -12440,7 +12479,7 @@ impl YggtermServer {
         // and the 2026-09-04 epoch-type falsification was invisible for
         // exactly that reason. Shapes only — cwd presence, never the path.
         #[cfg(not(test))]
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             yggterm_core::append_trace_event(
                 &home,
                 "daemon",
@@ -12466,8 +12505,11 @@ impl YggtermServer {
         // answered none on every live restore (falsified live 2026-09-04,
         // cli/store_candidate cwd_present:true answered:false). Same
         // expansion the remote probe scripts use (os.path.expanduser).
-        let home = dirs::home_dir()?;
-        yggterm_core::agent_cli::opencode_store_newest_session_for_directory(&home, cwd)
+        // The server's USER home, birth-resolved in [`YggtermServer::new`] —
+        // the fixture db a rooted_at test plants is reachable through the
+        // field, never through the process env.
+        let home = self.user_home.as_deref()?;
+        yggterm_core::agent_cli::opencode_store_newest_session_for_directory(home, cwd)
     }
 
     fn ensure_remote_runtime_agent_session(
@@ -12600,7 +12642,9 @@ impl YggtermServer {
             && remote_require_existing_definitive_miss_refuses(
                 kind,
                 require_existing,
-                local_agent_store_vouches_for_session(kind, session_id),
+                self.user_home
+                    .as_deref()
+                    .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, session_id)),
             )
         {
             anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
@@ -12649,7 +12693,7 @@ impl YggtermServer {
                     .iter()
                     .map(|process| process.pid)
                     .collect::<Vec<_>>();
-                if let Ok(home) = resolve_yggterm_home() {
+                if let Some(home) = self.yggterm_home.clone() {
                     append_trace_event(
                         &home,
                         "daemon",
@@ -12703,7 +12747,7 @@ impl YggtermServer {
                         })
                         .map(|(key, _)| key.clone());
                     if let Some(adopted) = adopted {
-                        if let Ok(home) = resolve_yggterm_home() {
+                        if let Some(home) = self.yggterm_home.clone() {
                             append_trace_event(
                                 &home,
                                 "daemon",
@@ -12722,7 +12766,7 @@ impl YggtermServer {
                         return Ok(adopted);
                     }
                 }
-                if let Ok(home) = resolve_yggterm_home() {
+                if let Some(home) = self.yggterm_home.clone() {
                     append_trace_event(
                         &home,
                         "daemon",
@@ -12828,7 +12872,10 @@ impl YggtermServer {
                 Some(&carried_identity_exports),
             )
         };
-        let home = resolve_yggterm_home()?;
+        let home = self
+            .yggterm_home
+            .clone()
+            .context("the yggterm home is unresolved on this host")?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
         let _ = registry.register_session(RemoteRuntimeSessionInput {
             session_id: Some(session_id.to_string()),
@@ -13037,7 +13084,10 @@ impl YggtermServer {
         } else {
             composed.unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
         };
-        let home = resolve_yggterm_home()?;
+        let home = self
+            .yggterm_home
+            .clone()
+            .context("the yggterm home is unresolved on this host")?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
         let _ = registry.register_session(RemoteRuntimeSessionInput {
             session_id: Some(session_id.to_string()),
@@ -14026,7 +14076,7 @@ impl YggtermServer {
 
     pub fn request_terminal_launch_for_active(&mut self) {
         if self.active_view_mode != WorkspaceViewMode::Terminal {
-            if let Ok(home) = resolve_yggterm_home() {
+            if let Some(home) = self.yggterm_home.clone() {
                 append_trace_event(
                     &home,
                     "server",
@@ -14057,7 +14107,7 @@ impl YggtermServer {
     /// use this direct path so background runtime plumbing cannot publish a
     /// transient activation that makes every GUI stash/reveal its WebKit page.
     fn request_terminal_launch_for_resolved_path(&mut self, raw_path: &str, path: &str) {
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -14166,7 +14216,7 @@ impl YggtermServer {
                 }
                 Err(error) => {
                     let error_str = error.to_string();
-                    if let Ok(home) = resolve_yggterm_home() {
+                    if let Some(home) = self.yggterm_home.clone() {
                         append_trace_event(
                             &home,
                             "server",
@@ -14242,7 +14292,7 @@ impl YggtermServer {
                 }
                 Ok(false) => Some((session.session_path.clone(), ssh_target, session_id)),
                 Err(error) => {
-                    if let Ok(home) = resolve_yggterm_home() {
+                    if let Some(home) = self.yggterm_home.clone() {
                         append_trace_event(
                             &home,
                             "server",
@@ -14268,7 +14318,7 @@ impl YggtermServer {
             if let Some(session) = self.sessions.get_mut(&stale_path) {
                 preserve_missing_saved_remote_live_session(session, &session_id);
             }
-            if let Ok(home) = resolve_yggterm_home() {
+            if let Some(home) = self.yggterm_home.clone() {
                 append_trace_event(
                     &home,
                     "server",
@@ -14486,7 +14536,7 @@ impl YggtermServer {
                                         RemoteDeployState::Planned
                                     }
                                 };
-                                if let Ok(home) = resolve_yggterm_home() {
+                                if let Some(home) = self.yggterm_home.clone() {
                                     append_trace_event(
                                         &home,
                                         "server",
@@ -14659,7 +14709,7 @@ impl YggtermServer {
                 Some(remote_deploy_state),
             );
         }
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -14738,7 +14788,7 @@ impl YggtermServer {
         // (`launch_now == true`) is a DELIBERATE re-entry: it inserts, and
         // the persist reconcile lifts the stale veto on the row now living.
         if !launch_now
-            && let Ok(home) = resolve_yggterm_home()
+            && let Some(home) = self.yggterm_home.clone()
             && !crate::live_row_closes_remembered_among(home.as_path(), [key]).is_empty()
         {
             append_trace_event(
@@ -14796,7 +14846,7 @@ impl YggtermServer {
         // prior active pointer so a phantom UUIDv4 spawn (user clicked an
         // EXISTING session, a NEW one appeared, e.g. local://fe0ea2be
         // 2026-06-10) pins its upstream on the next occurrence.
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = self.yggterm_home.clone() {
             append_trace_event(
                 &home,
                 "server",
@@ -18361,9 +18411,9 @@ fn refresh_restored_remote_runtime_codex_launch_command_in(
         // refused at the top), so a DEFINITIVE local miss refuses the repair
         // by name; `None` (unreadable store) keeps today's behavior — never
         // treat None as absence.
-        if let Ok(home) = resolve_yggterm_home() {
+        if let Some(home) = home {
             append_trace_event(
-                &home,
+                home,
                 "server",
                 "remote_runtime",
                 "restored_codex_runtime_launch_repair_refused_store_miss",
@@ -18479,9 +18529,9 @@ fn refresh_restored_remote_runtime_codex_launch_command_in(
         changed = true;
     }
 
-    if changed && let Ok(home) = resolve_yggterm_home() {
+    if changed && let Some(home) = home {
         append_trace_event(
-            &home,
+            home,
             "server",
             "remote_runtime",
             "restored_codex_runtime_launch_repaired",
@@ -18739,7 +18789,11 @@ mod restored_runtime_repair_tests {
             let body = source_body_after(source, anchor);
             assert!(
                 body.contains("remote_require_existing_needs_definitive_vouch(kind)")
-                    && body.contains("local_agent_store_vouches_for_session(kind, session_id)")
+                    && body.contains(if anchor.contains("ensure_remote") {
+                        "local_agent_store_vouches_for_session_in("
+                    } else {
+                        "local_agent_store_vouches_for_session(kind, session_id)"
+                    })
                     && body.contains("remote_resume_missing_saved_session_error(kind, session_id)"),
                 "both require-existing consumers must carry the definitive-miss gate: {anchor}"
             );
@@ -20947,8 +21001,14 @@ fn should_preserve_existing_remote_title(
 }
 
 fn open_remote_metadata_mirror_store() -> anyhow::Result<Connection> {
-    let home = resolve_yggterm_home()?;
-    let db_path = home.join(REMOTE_METADATA_MIRROR_DB_FILENAME);
+    open_remote_metadata_mirror_store_in(&resolve_yggterm_home()?)
+}
+
+/// [`open_remote_metadata_mirror_store`] against an explicit home — the
+/// env-as-value seam, so the mirror round-trip test never touches the
+/// process env.
+fn open_remote_metadata_mirror_store_in(yggterm_home: &Path) -> anyhow::Result<Connection> {
+    let db_path = yggterm_home.join(REMOTE_METADATA_MIRROR_DB_FILENAME);
     let conn = Connection::open(&db_path).with_context(|| {
         format!(
             "failed to open remote metadata mirror {}",
@@ -20995,7 +21055,17 @@ fn mirror_remote_machine_sessions(
     machine_key: &str,
     sessions: &[RemoteScannedSession],
 ) -> anyhow::Result<()> {
-    let mut conn = open_remote_metadata_mirror_store()?;
+    mirror_remote_machine_sessions_in(&resolve_yggterm_home()?, machine_key, sessions)
+}
+
+/// [`mirror_remote_machine_sessions`] against an explicit home — the
+/// env-as-value seam.
+fn mirror_remote_machine_sessions_in(
+    yggterm_home: &Path,
+    machine_key: &str,
+    sessions: &[RemoteScannedSession],
+) -> anyhow::Result<()> {
+    let mut conn = open_remote_metadata_mirror_store_in(yggterm_home)?;
     let tx = conn.transaction()?;
     tx.execute(
         "DELETE FROM remote_session_metadata WHERE machine_key = ?1",
@@ -21038,7 +21108,16 @@ fn mirror_remote_machine_sessions(
 fn load_remote_machine_sessions_from_mirror(
     machine_key: &str,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
-    let conn = open_remote_metadata_mirror_store()?;
+    load_remote_machine_sessions_from_mirror_in(&resolve_yggterm_home()?, machine_key)
+}
+
+/// [`load_remote_machine_sessions_from_mirror`] against an explicit home —
+/// the env-as-value seam.
+fn load_remote_machine_sessions_from_mirror_in(
+    yggterm_home: &Path,
+    machine_key: &str,
+) -> anyhow::Result<Vec<RemoteScannedSession>> {
+    let conn = open_remote_metadata_mirror_store_in(yggterm_home)?;
     let mut stmt = conn.prepare(
         "SELECT session_id, cwd, started_at, modified_epoch, event_count, user_message_count,
                 assistant_message_count, title_hint, recent_context, cached_precis,
@@ -40254,14 +40333,21 @@ mod tests {
             // touching the process. Every entry below carries the reason it
             // still cannot follow.
             //
-            // HOME + ENV_YGGTERM_HOME: eight full-flow tests (anchor vouch,
-            // store-candidate tier, focus vouch, phantom degrade, state-file
-            // record, metadata-mirror round trip, stale-snapshot tombstone,
-            // rebound agy restore) redirect where the DEEP product readers
-            // resolve their files; threading a home through the ensure funnel
-            // and the restore chains is per-variable work across a long list.
-            "HOME",
-            "ENV_YGGTERM_HOME",
+            // 2026-09-27 (fourth pass): HOME + ENV_YGGTERM_HOME LEFT — the
+            // server now carries birth-resolved `yggterm_home` + `user_home`
+            // fields (YggtermServer::new), the deep flow readers (the ensure
+            // funnel, the restore chains, the persist/tombstone asks, the
+            // identity vouches, the repair arms, the metadata mirror `_in`
+            // twins) read the fields, and the eight full-flow tests (anchor
+            // vouch, store-candidate tier, focus vouch, phantom degrade,
+            // state-file record, metadata-mirror round trip, stale-snapshot
+            // tombstone, rebound agy restore) inject a scratch home via
+            // `rooted_at` instead of mutating the process. HONEST BOUNDARY:
+            // the ytrace MIRROR (core's OnceLock provider behind
+            // append_trace_event) stays a process-global by design — it
+            // resolves its home once per process, so a suite run that wants a
+            // contained mirror invokes cargo with YGGTERM_HOME pointed at a
+            // scratch dir. The per-home event-trace file is fully threaded.
             // The terminal-identity population: sync_terminal_identity_
             // appearance_with_profile (managed_cli — inside the scan's
             // derived walk since the third pass, dream ACK-9c4ddac5a6)
@@ -42544,22 +42630,17 @@ mod tests {
     /// five `ses_guard_degrade` births around one daemon swap.
     #[test]
     fn an_anchor_resume_vouches_to_the_session_the_mirror_saw_it_viewing() {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-vouch-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&home).expect("create temp home");
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
 
         let anchor_id = "d4090efe-4e12-42d9-938d-66f61801d2e7";
         let anchor_key = format!("opencode-runtime://{anchor_id}");
         let viewed = "ses_f9dd04cfaffeYv8F8dLF6r74FX";
-        let mut server = test_server();
+        let mut server = test_server().rooted_at(&home);
         server.insert_live_session_with_launch(
             &anchor_key,
             anchor_id,
@@ -42588,15 +42669,6 @@ mod tests {
             )
             .expect("ensure the anchor");
 
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(&home);
 
         assert_eq!(ensured, anchor_key, "the anchor key must not move");
@@ -42635,29 +42707,18 @@ mod tests {
     /// conversation abandoned by the empty-window answer.
     #[test]
     fn a_stampless_anchor_resumes_the_newest_store_session_for_its_cwd() {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-cand-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(home.join(".local/share/opencode")).expect("temp home store dir");
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
         // ⛔ THE STORE TIER READS THE USER HOME (2026-09-04, measured: the
         // vouch must see the db opencode2 actually writes —
         // $HOME/.local/share/opencode — not resolve_yggterm_home(), which
-        // answered none on every live restore). The fixture db this test
-        // plants is therefore only reachable when HOME itself points at the
-        // scratch home for the ensure — the sanctioned HOME injection, held
-        // under the declared-env lock so the other HOME-setting test cannot
-        // race it.
-        let previous_user_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
+        // answered none on every live restore). The vouch reads the server's
+        // birth-resolved `user_home` field now, so rooted_at(&home) below is
+        // what makes the planted fixture db reachable — no process env.
         let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
             .expect("fixture store");
         conn.execute_batch(
@@ -42681,7 +42742,7 @@ mod tests {
 
         let anchor_id = "d4090efe-4e12-42d9-938d-66f61801d2e7";
         let anchor_key = format!("opencode-runtime://{anchor_id}");
-        let mut server = test_server();
+        let mut server = test_server().rooted_at(&home);
         server.insert_live_session_with_launch(
             &anchor_key,
             anchor_id,
@@ -42703,24 +42764,6 @@ mod tests {
             )
             .expect("ensure the stampless anchor");
 
-        if let Some(previous_user_home) = previous_user_home {
-            unsafe {
-                std::env::set_var("HOME", previous_user_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
-        }
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(&home);
 
         let newest = "ses_new000000000000000000000002";
@@ -42751,17 +42794,12 @@ mod tests {
     /// resume names A. The store tier is for stampless rows only.
     #[test]
     fn the_store_candidate_loses_to_the_focus_vouch() {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-vcr-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(home.join(".local/share/opencode")).expect("temp home store dir");
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
         let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
             .expect("fixture store");
         conn.execute_batch(
@@ -42778,7 +42816,7 @@ mod tests {
         let anchor_id = "d4090efe-4e12-42d9-938d-66f61801d2e7";
         let anchor_key = format!("opencode-runtime://{anchor_id}");
         let viewed = "ses_f9dd04cfaffeYv8F8dLF6r74FX";
-        let mut server = test_server();
+        let mut server = test_server().rooted_at(&home);
         server.insert_live_session_with_launch(
             &anchor_key,
             anchor_id,
@@ -42807,15 +42845,6 @@ mod tests {
             )
             .expect("ensure the anchor");
 
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(&home);
 
         let session = server.sessions.get(&ensured).expect("anchor row");
@@ -42830,21 +42859,16 @@ mod tests {
     /// the service would reject.
     #[test]
     fn an_anchor_without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom() {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-oc-novouch-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&home).expect("create temp home");
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
 
         let anchor_id = "4f0f1ab8-dba1-40b0-9698-02c8c88e8ccc";
         let anchor_key = format!("opencode-runtime://{anchor_id}");
-        let mut server = test_server();
+        let mut server = test_server().rooted_at(&home);
         server.insert_live_session_with_launch(
             &anchor_key,
             anchor_id,
@@ -42866,15 +42890,6 @@ mod tests {
             )
             .expect("ensure the anchor");
 
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(&home);
 
         assert_eq!(ensured, anchor_key);
@@ -43565,12 +43580,11 @@ mod tests {
     /// host showed: four `local://` rows dropped in one update-restart persist,
     /// two of them titled for the app rows the owner reported losing.
     ///
-    /// Driven through the REAL filter against a temp `YGGTERM_HOME`, because the
+    /// Driven through the REAL filter against a rooted_at scratch home, because the
     /// claim is that a write reaches a shared file — a test that built the record
     /// itself would assert nothing about the path that failed to write one.
     #[test]
     fn a_row_dropped_from_the_state_file_leaves_a_record_saying_so() {
-        let _env = declared_env_test_lock();
         use crate::live_row_tombstones::{LiveRowTombstones, RowDeparture};
 
         let home = std::env::temp_dir().join(format!(
@@ -43579,12 +43593,8 @@ mod tests {
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&home).expect("create temp home");
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
 
-        let mut server = test_server();
+        let mut server = test_server().rooted_at(&home);
         let row = server.start_command_session(
             Some("/home/user"),
             Some("a shell the user made"),
@@ -43601,15 +43611,6 @@ mod tests {
         let departures =
             LiveRowTombstones::load(&home, crate::live_row_tombstones::now_secs()).departures();
 
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(&home);
 
         assert!(
@@ -47584,17 +47585,12 @@ terminal_window_id: None,
 
     #[test]
     fn remote_metadata_mirror_round_trips_sessions() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-mirror-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&home)?;
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
 
         let sessions = vec![RemoteScannedSession {
             kind: None,
@@ -47614,18 +47610,9 @@ terminal_window_id: None,
             title_is_explicit: false,
             storage_path: "/home/user/.codex/sessions/test.jsonl".to_string(),
         }];
-        mirror_remote_machine_sessions("guihost", &sessions)?;
-        let loaded = load_remote_machine_sessions_from_mirror("guihost")?;
+        mirror_remote_machine_sessions_in(&home, "guihost", &sessions)?;
+        let loaded = load_remote_machine_sessions_from_mirror_in(&home, "guihost")?;
 
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(home);
 
         assert_eq!(loaded, sessions);
@@ -52849,7 +52836,6 @@ terminal_window_id: None,
     /// row lands, and the tombstone must survive the restore.
     #[test]
     fn a_closed_row_in_a_stale_snapshot_does_not_restore_and_keeps_its_tombstone() {
-        let _env = declared_env_test_lock();
         use crate::live_row_tombstones::{LiveRowTombstones, now_secs};
 
         let home = std::env::temp_dir().join(format!(
@@ -52858,10 +52844,6 @@ terminal_window_id: None,
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&home).expect("create temp home");
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
-        }
 
         let closed = crate::remote_cc_session_path("dev", "closed-row");
         let kept = crate::remote_cc_session_path("dev", "kept-row");
@@ -52893,7 +52875,8 @@ terminal_window_id: None,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
-        );
+        )
+        .rooted_at(&home);
         server.restore_persisted_state(
             PersistedDaemonState {
                 last_known_app_declares: Default::default(),
@@ -52923,15 +52906,6 @@ terminal_window_id: None,
             "the restore must not clear the row's own tombstone — a resurrected              row that clears its close makes the next stale snapshot permanent"
         );
 
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            }
-        }
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -55299,15 +55273,12 @@ terminal_window_id: None,
         // The store artefact the membership probe vouches by.
         std::fs::write(conversations.join(format!("{minted}.db")), b"SQLite format 3\0").unwrap();
 
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        // ⛔ set_var is unsafe in this edition and PROCESS-global: the
-        // `declared_env_test_lock` above serializes this window against every
-        // other declared-env mutator and known victim; the
-        // `the_process_globals_this_binarys_tests_mutate_are_all_declared`
-        // gate owns the inventory and the `_in` seams remain the real fix.
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &fixture_root);
-        }
+        // The restore/rebind flow reads the server's birth-resolved homes
+        // (rooted_at below), so the fixture store is reachable without
+        // touching the process env. The declared-env lock stays: this test
+        // still calls free-fn arm builders that READ YGGTERM_HOME, and a
+        // reader holds the lock so a future mutator cannot hand it a
+        // stranger's home mid-arrange (the sixth reader-victim lesson).
 
         let runtime_key = "local://00000000-0000-4000-8000-00000000a600";
         let row_uuid = "00000000-0000-4000-8000-00000000a600";
@@ -55315,7 +55286,8 @@ terminal_window_id: None,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
-        );
+        )
+        .rooted_at(&fixture_root);
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
             terminal_identity_exports: Vec::new(),
@@ -55418,14 +55390,6 @@ terminal_window_id: None,
             "a vouched id resumes through the descriptor selector: {resume}"
         );
 
-        unsafe {
-            std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-        }
-        if let Some(previous) = previous_home {
-            unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous);
-            }
-        }
         let _ = std::fs::remove_dir_all(&fixture_root);
     }
 
