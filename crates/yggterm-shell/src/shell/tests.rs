@@ -23056,6 +23056,47 @@ console.log('ok');
             .contains("shell.note_context_menu_activation(action.as_str())"));
     }
 
+    // [11.118] (lane/uxspeed/modal-request-edge): the modal pair's request
+    // edge was silent on the selection-dialog arm — and the row-scoped
+    // DELEGATED open (a context-menu delete on an already-selected row, the
+    // exact shape the context-menu probe and the ALT row-menu walk produce)
+    // rode it silently. Every opener that mounts the delete dialog must emit
+    // `modal_open_requested`, and the payload must name its opener.
+    #[test]
+    fn modal_request_edge_fires_from_every_delete_dialog_opener() {
+        let source = SHELL_SOURCE;
+        assert!(source.contains("fn open_delete_dialog_from"));
+        assert!(source
+            .contains("self.open_delete_dialog_from(hard_delete, \"row\")"));
+        assert!(source.contains("\"origin\": origin,"));
+        assert!(source.contains("\"origin\": \"row\","));
+    }
+
+    #[test]
+    fn context_menu_delete_on_selected_session_still_names_the_request() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(
+            test_browser_tree_with_local_group_sessions(),
+        ));
+        let alpha = shell
+            .browser
+            .search_rows()
+            .into_iter()
+            .find(|row| row.full_path.ends_with("/alpha.jsonl"))
+            .expect("alpha row");
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(alpha.full_path.clone());
+
+        shell.open_delete_dialog_for_row(&alpha, false);
+
+        let pending = shell.pending_delete.expect("pending delete");
+        assert_eq!(pending.session_paths.len(), 1);
+        assert!(pending.session_paths.contains(&alpha.full_path));
+        // the delegated open carries the request edge ([11.118])
+        assert!(shell
+            .recent_ui_telemetry
+            .contains_key("modal_open_requested"));
+    }
+
     /// [11.113] gap 3 (ux-speed chord-close-all lane): the keytip bridge is
     /// the ONE terminus every chord crosses, so the identity event must live
     /// there — face + mods + key — or chorded bulk actions stay unmeasurable

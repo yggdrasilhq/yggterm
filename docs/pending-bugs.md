@@ -29718,7 +29718,7 @@ shows ≤2 `ok:false` spans for it and every span names its reason.
 > Renumber note: this entry was drafted as [11.116] the same hour the switch-plane-vocab lane filed its own [11.116] (row-title retries) — renumbered to [11.117] per the defect-id law; main landed theirs first.
 ## ⛔ [11.118] THE MODAL'S REQUEST EDGE IS SILENT ON THE LIVE BUILD — `modal_open_requested` FIRES FOR THE BULK CLOSE-ALL BUT NEVER FOR SINGLE-ROW DELETES, AND THE CHORD-PATH OPENER `open_delete_dialog` CARRIES NO EMISSION AT ALL — the modal pair the ux-speed door defines cannot be measured end-to-end on 3.2.113 (measured live 2026-09-15 ~01:15-01:45 IST, five controlled opens, tools/uxspeed/uxprobe.py modal action)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Instrument gap; [11.113] family — the modal row of the door's event map is affected.
 
@@ -29768,6 +29768,40 @@ binary for the site's neighbouring literals, then a debug run); (b) add
 the missing `record_ui_telemetry("modal_open_requested", …)` to
 `open_delete_dialog` (chord path), kind `delete`, with the chord's shape
 in the payload so the chord path is distinguishable from the menu path.
+
+FIXED IN CODE 2026-09-27 (lane/uxspeed/modal-request-edge, the ux-speed
+campaign): ROOT CAUSE FOUND — NOT build divergence. The instrumented
+single-row site `open_delete_dialog_for_row` opens with a delegation:
+if the target row is ALREADY in `selected_tree_paths` it hands the open
+to `open_delete_dialog` — the selection-scoped opener, which carried no
+emission. The branch dates to 0e6cb9b4 (2026-08-17), so it is in every
+build since, including the measured 3.2.113 and today's live jojo build
+d709917d8d9b (merge-base proven). Both shapes that matter land there
+deterministically: the uxprobe modal recipe selects the row before the
+right-click, and the ALT row-menu walk acts on the selected row — so
+EVERY probe/keyboard single-row delete rode the silent branch while the
+bulk close-all (its own opener, instrumented) fired. LANDED: the
+selection arm is instrumented as `open_delete_dialog_from(hard_delete,
+origin)` with `record_ui_telemetry("modal_open_requested", {kind delete,
+rows, origin})` — origin "chord" for the selection route, "row" for the
+delegated row-scoped open and the direct row open, whose own payload
+gains the same field; the bulk close-all payload gains origin "row"; the
+FOURTH opener the entry did not know — `queue_remove_saved_ssh_target`
+(saves-ssh-target delete, sets `pending_delete` directly) — emits too,
+because it mounts the same `modal/shown {kind:delete}` overlay. Payload
+`rows` semantics unchanged (dialog item count), so the probe's
+`requested_rows == 1` assert holds. Tests: a source-assert lock
+(`modal_request_edge_fires_from_every_delete_dialog_opener`, the
+[11.113]-family shape) + a behavioral lock proving the DELEGATED open
+carries the request edge
+(`context_menu_delete_on_selected_session_still_names_the_request`).
+
+FALSIFIER (the observation that discharges this entry): on the rotated
+build, uxprobe `--actions modal` reports the
+`modal_open_requested → modal/shown` pair in ytrace on ≥4/5 iterations
+(pair_ms present, requested_rows 1, shown_kind delete) — the five
+controlled opens that were silent on 3.2.113. The delete-entry deletion
+then happens per the verified-fix law.
 
 **Meanwhile the driver's primary metric** is the DOM dispatch→mount wall
 (click→mount p50 25 ms / max 30, dispatch→mount p50 386 / max 458,

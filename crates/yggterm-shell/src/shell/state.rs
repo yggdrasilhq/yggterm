@@ -35443,6 +35443,12 @@ impl ShellState {
             current_millis().saturating_add(SIDEBAR_RENAME_AUTOSCROLL_SUPPRESS_MS);
     }
     fn open_delete_dialog(&mut self, hard_delete: bool) {
+        self.open_delete_dialog_from(hard_delete, "chord");
+    }
+    /// The selection-scoped delete dialog. `origin` names the opener in the
+    /// `modal_open_requested` payload so the chord/selection route and the
+    /// row-scoped delegation stay distinguishable in the trace.
+    fn open_delete_dialog_from(&mut self, hard_delete: bool, origin: &str) {
         let (document_paths, group_paths, mut labels) = self.selected_workspace_delete_paths();
         let (session_paths, session_labels) = self.selected_session_delete_paths();
         labels.extend(session_labels);
@@ -35461,6 +35467,22 @@ impl ShellState {
         {
             return;
         }
+        // THE REQUESTED EDGE of the modal probes, selection-dialog arm: the
+        // overlay's `modal/shown` mount event pairs with this ts_ms for the
+        // request→paint latency. The row-scoped opener's delegation lands
+        // here too — without this emission a context-menu delete on an
+        // already-selected row never names its request ([11.118]).
+        self.record_ui_telemetry(
+            "modal_open_requested",
+            json!({
+                "kind": "delete",
+                "rows": document_paths.len()
+                    + group_paths.len()
+                    + session_paths.len()
+                    + ssh_machine_keys.len(),
+                "origin": origin,
+            }),
+        );
         self.pending_delete = Some(PendingDeleteDialog {
             document_paths,
             group_paths,
@@ -35492,7 +35514,11 @@ impl ShellState {
     }
     fn open_delete_dialog_for_row(&mut self, row: &BrowserRow, hard_delete: bool) {
         if self.selected_tree_paths.contains(&row.full_path) {
-            self.open_delete_dialog(hard_delete);
+            // The row-scoped open delegates to the selection dialog here —
+            // the context menu and the ALT row-menu walk both land on the
+            // row the user is on, and this branch was the pair's silent
+            // path ([11.118]). The origin keeps it distinguishable.
+            self.open_delete_dialog_from(hard_delete, "row");
             return;
         }
         self.selected_tree_paths.clear();
@@ -35546,6 +35572,7 @@ impl ShellState {
                     + pending.document_paths.len()
                     + pending.group_paths.len()
                     + pending.ssh_machine_keys.len(),
+                "origin": "row",
             }),
         );
         self.pending_delete = Some(pending);
@@ -35592,6 +35619,7 @@ impl ShellState {
                 "kind": "delete",
                 "rows": session_paths.len(),
                 "bulk": true,
+                "origin": "row",
             }),
         );
         self.pending_delete = Some(PendingDeleteDialog {
@@ -59281,6 +59309,16 @@ fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow)
     };
     state.with_mut_counted(|shell| {
         shell.select_tree_row(&row, TreeSelectionMode::Replace);
+        // Same pair contract as the other delete-dialog openers: the dialog
+        // this mounts fires `modal/shown`, so the request edge must exist.
+        shell.record_ui_telemetry(
+            "modal_open_requested",
+            json!({
+                "kind": "delete",
+                "rows": 1,
+                "origin": "row",
+            }),
+        );
         shell.pending_delete = Some(PendingDeleteDialog {
             document_paths: Vec::new(),
             group_paths: Vec::new(),
