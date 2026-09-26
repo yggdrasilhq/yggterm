@@ -31051,3 +31051,21 @@ full-suite load, green isolated). LIVE FALSIFIER OWED on the deployed build:
 a local codex probe row born under theme A → `app theme` to theme B → force a
 same-build daemon restart → the restored row's stored command STILL carries
 A's exports; a second restart under A returns A.
+
+LEG 3B LANDED + LIVE FALSIFIER MET 2026-09-26 ~23:30 (commit 1217c1f3, build
+d3dc6e60a03e deployed, the muse lab host): the leg-3 falsifier run FALSIFIED
+leg 3's completeness first — the probe row came back DARK because a TURNLESS
+row (no Storage stamp — the transcript does not exist until its first turn;
+`is_local_codex_storage_session_path` refuses the bare `local://` key) takes
+NEITHER restore arm, kept the successor's birth compose, and the next persist
+then faithfully scraped the dark exports: the persisted record is only as
+honest as the stored command. Leg 3b adds the third restore arm for exactly
+that row — recompose the birth shape (an id only for a kind born WITH one)
+carrying the persisted exports; behavior test drives the falsified shape.
+FALSIFIER MET on the deployed build, BOTH directions: a fresh local codex row
+born LIGHT under the light global → `app theme dark` → forced same-build
+`daemon restart` → the restored row's stored command STILL light (zero 15;0,
+zero #262a33) → `app theme light` → second restart → STILL light. Probe row
+removed, zero probe rows remaining, theme restored light. The per-client
+birth identity, the appearance-only `initial_server_sync`, the frontend
+`onColor` backstop and OSC 4 slots 16-255 stay open above.
