@@ -98,6 +98,27 @@ fn terminal_eval_script_with_pinned_grid(
 /// alternate-scroll wheel gate re-opens after a switch-in ([startpage-hijack-D]
 /// sibling). The un-seeded wrapper stays for every caller that has nothing to
 /// say about buffers.
+/// The per-mount grid-seed prelude (birth grid + shadow pinned grid). Both
+/// eval shapes carry it ahead of the mount fn invocation - the seeds are
+/// window globals the body reads at construction time.
+fn terminal_mount_grid_prefix(
+    pinned_grid: Option<(u64, u64)>,
+    initial_grid: Option<(u64, u64)>,
+) -> String {
+    let mut prefix = String::new();
+    if let Some((cols, rows)) = initial_grid {
+        prefix.push_str(&format!(
+            "window.__yggtermInitialGrid = {{ cols: {cols}, rows: {rows} }};\n"
+        ));
+    }
+    if let Some((cols, rows)) = pinned_grid {
+        prefix.push_str(&format!(
+            "window.__yggtermShadowPinnedGrid = {{ cols: {cols}, rows: {rows} }};\n"
+        ));
+    }
+    prefix
+}
+
 fn terminal_eval_script_with_pinned_grid_seeded(
     host_id: &str,
     theme: &TerminalTheme,
@@ -118,20 +139,7 @@ fn terminal_eval_script_with_pinned_grid_seeded(
         alt_scroll,
         initial_buffer_kind,
     );
-    let mut prefix = String::new();
-    if let Some((cols, rows)) = initial_grid {
-        prefix.push_str(&format!(
-            "window.__yggtermInitialGrid = {{ cols: {cols}, rows: {rows} }};\n"
-        ));
-    }
-    if let Some((cols, rows)) = pinned_grid {
-        prefix.push_str(&format!(
-            "window.__yggtermShadowPinnedGrid = {{ cols: {cols}, rows: {rows} }};\n"
-        ));
-    }
-    if prefix.is_empty() {
-        return script;
-    }
+    let prefix = terminal_mount_grid_prefix(pinned_grid, initial_grid);
     format!("{prefix}{script}")
 }
 
@@ -171,6 +179,99 @@ fn initial_terminal_grid_for_mount(shell: &ShellState, session_path: &str) -> Op
 fn terminal_grid_is_usable_cells(cols: u64, rows: u64) -> bool {
     cols >= 20 && rows >= 4
 }
+/// [11.172] The page-cached mount function's version. The mount body is
+/// ~500 KB of JS; re-evaluating the rendered script on every activation
+/// RE-PARSES it on the web process' main thread — measured 2026-09-27 as the
+/// felt switch's dominant leg (the ui/block witness brackets a ~513 ms stall
+/// from eval dispatch to the eval's first statement; the construction itself
+/// is ~3 ms). The body is therefore installed ONCE as
+/// `window.__yggtermMountFn` and later activations eval a ~1 KB warm script
+/// that sets fresh params and invokes it. BUMP whenever the body template
+/// changes in ANY way: the probe gates the warm path on the exact version, so
+/// a bumped version merely reinstalls (one cold parse), while a stale fn
+/// serving a changed body would be a silent semantic drift.
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 1;
+
+/// The per-mount parameters the cached body reads through its `__mp`
+/// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
+/// and warm invoke) by the same builder so the two paths cannot drift.
+fn terminal_mount_params_json(
+    host_id: &str,
+    theme: &TerminalTheme,
+    initial_input_enabled: bool,
+    canvas_renderer_enabled: bool,
+    renderer_policy_reason: &str,
+    suppress_mouse_tracking: bool,
+    alt_scroll: (&'static str, &'static str, u32),
+    initial_buffer_kind: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "v": TERMINAL_MOUNT_FN_VERSION,
+        "hostId": host_id,
+        "theme": {
+            "background": theme.background,
+            "foreground": theme.foreground,
+            "cursor": theme.cursor,
+            "selection": theme.selection,
+            "black": theme.black,
+            "red": theme.red,
+            "green": theme.green,
+            "yellow": theme.yellow,
+            "blue": theme.blue,
+            "magenta": theme.magenta,
+            "cyan": theme.cyan,
+            "white": theme.white,
+            "brightBlack": theme.bright_black,
+            "brightRed": theme.bright_red,
+            "brightGreen": theme.bright_green,
+            "brightYellow": theme.bright_yellow,
+            "brightBlue": theme.bright_blue,
+            "brightMagenta": theme.bright_magenta,
+            "brightCyan": theme.bright_cyan,
+            "brightWhite": theme.bright_white,
+            "dimForeground": terminal_dim_foreground(theme),
+            "cursorMuted": terminal_cursor_muted(theme),
+            "cursorText": terminal_cursor_text(theme),
+            "inputLineBackground": terminal_input_line_background(theme),
+            "inputLineBorder": terminal_input_line_border(theme),
+            "minimumContrastRatio": terminal_minimum_contrast_ratio(theme),
+            "fontWeight": terminal_font_weight(theme),
+            "fontWeightBold": terminal_font_weight_bold(theme),
+            "lineHeight": terminal_font_line_height(theme),
+            "fontSize": theme.font_size,
+            "fontSmoothing": terminal_font_smoothing(theme),
+            "mozFontSmoothing": terminal_moz_font_smoothing(theme),
+        },
+        "initialInputEnabled": initial_input_enabled,
+        "canvasRendererEnabled": canvas_renderer_enabled,
+        "rendererPolicyReason": renderer_policy_reason,
+        "suppressMouseTracking": suppress_mouse_tracking,
+        "lastKnownBufferKindSeed": initial_buffer_kind.unwrap_or(""),
+        "altScrollUp": alt_scroll.0,
+        "altScrollDown": alt_scroll.1,
+        "altScrollAccumPx": alt_scroll.2,
+    })
+    .to_string()
+}
+
+/// The ~1 KB warm eval: fresh params + invoke of the already-installed (and
+/// version-probed) mount function. Parsing this is what a felt switch pays
+/// where it used to parse the whole body.
+fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
+    format!(
+        "window.__yggtermMountParams = {mount_params_json};\n        await window.__yggtermMountFn();"
+    )
+}
+
+/// The warm-path gate: the fn must be installed AND carry the exact version
+/// this binary's body compiles. A mismatch (page older/newer than the code,
+/// a document reload, a body change) simply reinstalls cold.
+fn terminal_mount_fn_probe_script() -> String {
+    format!(
+        "Boolean(window.__yggtermMountFn) && window.__yggtermMountFnV === {TERMINAL_MOUNT_FN_VERSION}"
+    )
+}
+
 fn terminal_eval_script_with_canvas_renderer(
     host_id: &str,
     theme: &TerminalTheme,
@@ -181,6 +282,16 @@ fn terminal_eval_script_with_canvas_renderer(
     alt_scroll: (&'static str, &'static str, u32),
     initial_buffer_kind: Option<&str>,
 ) -> String {
+    let mount_params_json = terminal_mount_params_json(
+        host_id,
+        theme,
+        initial_input_enabled,
+        canvas_renderer_enabled,
+        renderer_policy_reason,
+        suppress_mouse_tracking,
+        alt_scroll,
+        initial_buffer_kind,
+    );
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -188,53 +299,34 @@ fn terminal_eval_script_with_canvas_renderer(
     let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
     let webgl_bundle =
         serde_json::to_string(XTERM_WEBGL_JS).expect("serialize xterm webgl addon");
-    let background =
-        serde_json::to_string(&theme.background).expect("serialize terminal background");
-    let foreground =
-        serde_json::to_string(&theme.foreground).expect("serialize terminal foreground");
-    let cursor = serde_json::to_string(&theme.cursor).expect("serialize terminal cursor");
-    let selection = serde_json::to_string(&theme.selection).expect("serialize terminal selection");
-    let black = serde_json::to_string(&theme.black).expect("serialize terminal black");
-    let red = serde_json::to_string(&theme.red).expect("serialize terminal red");
-    let green = serde_json::to_string(&theme.green).expect("serialize terminal green");
-    let yellow = serde_json::to_string(&theme.yellow).expect("serialize terminal yellow");
-    let blue = serde_json::to_string(&theme.blue).expect("serialize terminal blue");
-    let magenta = serde_json::to_string(&theme.magenta).expect("serialize terminal magenta");
-    let cyan = serde_json::to_string(&theme.cyan).expect("serialize terminal cyan");
-    let white = serde_json::to_string(&theme.white).expect("serialize terminal white");
-    let bright_black =
-        serde_json::to_string(&theme.bright_black).expect("serialize terminal bright black");
-    let bright_red =
-        serde_json::to_string(&theme.bright_red).expect("serialize terminal bright red");
-    let bright_green =
-        serde_json::to_string(&theme.bright_green).expect("serialize terminal bright green");
-    let bright_yellow =
-        serde_json::to_string(&theme.bright_yellow).expect("serialize terminal bright yellow");
-    let bright_blue =
-        serde_json::to_string(&theme.bright_blue).expect("serialize terminal bright blue");
-    let bright_magenta =
-        serde_json::to_string(&theme.bright_magenta).expect("serialize terminal bright magenta");
-    let bright_cyan =
-        serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
-    let bright_white =
-        serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
-    let initial_input_enabled =
-        serde_json::to_string(&initial_input_enabled).expect("serialize initial input enabled");
-    let canvas_renderer_enabled =
-        serde_json::to_string(&canvas_renderer_enabled).expect("serialize canvas renderer flag");
-    let renderer_policy_reason =
-        serde_json::to_string(renderer_policy_reason).expect("serialize renderer policy reason");
-    let suppress_mouse_tracking =
-        serde_json::to_string(&suppress_mouse_tracking).expect("serialize mouse suppress flag");
-    let last_known_buffer_kind_seed = serde_json::to_string(
-        initial_buffer_kind.unwrap_or(""),
-    )
-    .expect("serialize last known buffer kind seed");
-    let alt_scroll_up =
-        serde_json::to_string(alt_scroll.0).expect("serialize alt-scroll up sequence");
-    let alt_scroll_down =
-        serde_json::to_string(alt_scroll.1).expect("serialize alt-scroll down sequence");
-    let alt_scroll_accum_px = alt_scroll.2;
+    let background = "(__mp.theme.background)".to_string();
+    let foreground = "(__mp.theme.foreground)".to_string();
+    let cursor = "(__mp.theme.cursor)".to_string();
+    let selection = "(__mp.theme.selection)".to_string();
+    let black = "(__mp.theme.black)".to_string();
+    let red = "(__mp.theme.red)".to_string();
+    let green = "(__mp.theme.green)".to_string();
+    let yellow = "(__mp.theme.yellow)".to_string();
+    let blue = "(__mp.theme.blue)".to_string();
+    let magenta = "(__mp.theme.magenta)".to_string();
+    let cyan = "(__mp.theme.cyan)".to_string();
+    let white = "(__mp.theme.white)".to_string();
+    let bright_black = "(__mp.theme.bright_black)".to_string();
+    let bright_red = "(__mp.theme.bright_red)".to_string();
+    let bright_green = "(__mp.theme.bright_green)".to_string();
+    let bright_yellow = "(__mp.theme.bright_yellow)".to_string();
+    let bright_blue = "(__mp.theme.bright_blue)".to_string();
+    let bright_magenta = "(__mp.theme.bright_magenta)".to_string();
+    let bright_cyan = "(__mp.theme.bright_cyan)".to_string();
+    let bright_white = "(__mp.theme.bright_white)".to_string();
+    let initial_input_enabled = "(Boolean(__mp.initialInputEnabled))".to_string();
+    let canvas_renderer_enabled = "(Boolean(__mp.canvasRendererEnabled))".to_string();
+    let renderer_policy_reason = "(String(__mp.rendererPolicyReason || ''))".to_string();
+    let suppress_mouse_tracking = "(Boolean(__mp.suppressMouseTracking))".to_string();
+    let last_known_buffer_kind_seed = "(String(__mp.lastKnownBufferKindSeed || ''))".to_string();
+    let alt_scroll_up = "(String(__mp.altScrollUp || ''))".to_string();
+    let alt_scroll_down = "(String(__mp.altScrollDown || ''))".to_string();
+    let alt_scroll_accum_px = "(__mp.altScrollAccumPx | 0)".to_string();
     let terminal_write_frame_ms = terminal_write_frame_ms();
     let terminal_active_write_frame_ms = terminal_active_write_frame_ms();
     let terminal_active_animation_write_frame_ms =
@@ -253,29 +345,20 @@ fn terminal_eval_script_with_canvas_renderer(
         TERMINAL_INLINE_STATUS_ANIMATION_LONG_AFTER_MS;
     let font_family =
         serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
-    let font_weight = serde_json::to_string(&terminal_font_weight(theme))
-        .expect("serialize terminal font weight");
-    let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
-        .expect("serialize terminal bold font weight");
-    let line_height = terminal_font_line_height(theme);
-    let dim_foreground = serde_json::to_string(&terminal_dim_foreground(theme))
-        .expect("serialize terminal dim foreground");
-    let cursor_muted = serde_json::to_string(&terminal_cursor_muted(theme))
-        .expect("serialize terminal muted cursor");
-    let cursor_text = serde_json::to_string(&terminal_cursor_text(theme))
-        .expect("serialize terminal cursor text");
-    let input_line_background = serde_json::to_string(&terminal_input_line_background(theme))
-        .expect("serialize terminal input line background");
-    let input_line_border = serde_json::to_string(&terminal_input_line_border(theme))
-        .expect("serialize terminal input line border");
+    let font_weight = "(__mp.theme.fontWeight)".to_string();
+    let font_weight_bold = "(__mp.theme.fontWeightBold)".to_string();
+    let line_height = "(__mp.theme.lineHeight)".to_string();
+    let dim_foreground = "(__mp.theme.dimForeground)".to_string();
+    let cursor_muted = "(__mp.theme.cursorMuted)".to_string();
+    let cursor_text = "(__mp.theme.cursorText)".to_string();
+    let input_line_background = "(__mp.theme.inputLineBackground)".to_string();
+    let input_line_border = "(__mp.theme.inputLineBorder)".to_string();
     let input_line_decoration_enabled =
         serde_json::to_string(&terminal_xterm_input_line_decoration_enabled())
             .expect("serialize xterm input line decoration flag");
-    let minimum_contrast_ratio = terminal_minimum_contrast_ratio(theme);
-    let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
-        .expect("serialize terminal font smoothing");
-    let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
-        .expect("serialize terminal moz font smoothing");
+    let minimum_contrast_ratio = "(__mp.theme.minimumContrastRatio)".to_string();
+    let font_smoothing = "(__mp.theme.fontSmoothing)".to_string();
+    let moz_font_smoothing = "(__mp.theme.mozFontSmoothing)".to_string();
     let terminal_passive_focus_watchdog_ms = TERMINAL_PASSIVE_FOCUS_WATCHDOG_MS;
     let terminal_input_dead_trace_ms = TERMINAL_INPUT_DEAD_TRACE_MS;
     let terminal_input_dead_trace_interval_ms = TERMINAL_INPUT_DEAD_TRACE_INTERVAL_MS;
@@ -292,9 +375,12 @@ fn terminal_eval_script_with_canvas_renderer(
         ""
     };
     format!(
-        r#"
+        r#"window.__yggtermMountParams = {mount_params_json};
+        window.__yggtermMountFnV = {TERMINAL_MOUNT_FN_VERSION};
+        window.__yggtermMountFn = async () => {{
+        const __mp = window.__yggtermMountParams || {{}};
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-        const hostId = {host_id:?};
+        const hostId = String(__mp.hostId || "");
         const terminalDioxusApi = typeof dioxus !== "undefined" ? dioxus : null;
         const terminalDioxusSend =
             terminalDioxusApi && typeof terminalDioxusApi.send === "function"
@@ -13088,11 +13174,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 emitHostHealth();
             }}
         }}
+        }};
+        await window.__yggtermMountFn();
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,
         frame_hash_probe_js = FRAME_HASH_PROBE_JS,
         terminal_frame_cache_js = TERMINAL_FRAME_CACHE_JS,
-        font_size = theme.font_size,
+        font_size = "(__mp.theme.fontSize)",
         background = background,
         foreground = foreground,
         cursor = cursor,
