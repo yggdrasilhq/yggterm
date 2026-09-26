@@ -30273,30 +30273,7 @@ fleet-wide, force a managed-CLI refresh foreground, and the agent bin must
 still answer 0.6.6 afterwards — trace shows `install.downgrade_refused` or
 `install.dev_link_kept`, never a 0.5.7 repoint.
 
-## ⛔ [11.130] A SYNTHETIC-POINTER FELT DRAG NEVER SETS THE DROP TARGET — EVERY `server app pointer` GESTURE ENDS `tree_drop_ignored/no_drag_hover_target` ON EVERY BUILD TESTED, SO THE FELT DRIVER CANNOT PROVE DROPS AND THE HOVER SIDE OF THE FELT PATH IS UNMEASURABLE (found 2026-09-15 ~23:20 IST, GUI host builds d2502162 and 337590a2, the ux-speed drag-felt lane)
-
-**Status:** OPEN
-
-The felt driver (tools/uxspeed/uxprobe.py `felt`) presses, dwells,
-crosses the threshold, and hovers across rows with real synthetic
-pointer events; `tree_drag_begin`/`tree_drag_ended` fire, but ZERO
-`tree_drag_hover` events ever do, and every release records
-`tree_drop_ignored {reason: no_drag_hover_target}` — measured on
-337590a219f7 (BEFORE this lane's changes, run5) and on d2502162e852
-(after), so it is not a regression of the ghost-signal split. The rows'
-hover wiring is `onmousemove -> on_drag_hover` (sidebar.rs ~2556, gated
-on the drag_active prop), and the pointer verb dispatches
-mousemove+pointermove with `buttons: 0` (DOM capture probe) — the
-synthetic event reduction either never wakes the rows' drag_active
-render, never satisfies a gate upstream of `set_drag_hover_target`, or
-misses an event type a real mouse produces (mouseover/mouseenter,
-button-carrying moves, drag capture). Real-mouse drags work (the owner
-uses them daily); verb-path drags work (explicit hover verb). Until
-named and fixed, the felt driver proves the drag's start and merge
-behavior but NOT its drop, and any felt-accuracy claim from it is
-invalid. Family: [11.113] instrument gaps; the pointer-verb help line
-also still lies about its action spellings (fixed this lane).
-> ⚠ ID COLLISION (flagged 2026-09-16, lane/integration/opencode-consumer): [11.133] and [11.134] were already on main from the opencode battery lane (78384f8e, 2026-09-16 ~00:53 IST — the composer marker + the --session fallback, each at its own heading above). These tombstone/server-state entries filed the same ids ~15h later and are unrenamed; per the defect-id law the LATER filing renumbers. The renumber belongs to the trace-fixing campaign (its [11.133]-[11.137] block cross-references internally). Until it lands, the bare id names TWO defects — grep both headings.
+> ⚠ ID COLLISION (its host entry [11.130] was VERIFIED AND DELETED 2026-09-26, the ux-speed felt-drop-accuracy lane): [11.133] and [11.134] were already on main from the opencode battery lane (78384f8e, 2026-09-16 ~00:53 IST — the composer marker + the --session fallback, each at its own heading above). These tombstone/server-state entries filed the same ids ~15h later and are unrenamed; per the defect-id law the LATER filing renumbers. The renumber belongs to the trace-fixing campaign (its [11.133]-[11.137] block cross-references internally). Until it lands, the bare id names TWO defects — grep both headings.
 
 ## ⛔ [11.133] COLD RESTORE NEVER ASKS THE TOMBSTONE PLANE — EVERY DELETED ROW A STALE server-state.json HOLDS COMES BACK AT EVERY DAEMON/GUI BIRTH, AND ITS RE-ENTRY CLEARS ITS OWN TOMBSTONE (measured live on jojo 2026-09-15 ~22:30-23:25 IST, the trace-fixing campaign; owner symptom: "on restart my row setup is nuked to an old form — I delete rows, launch a ychrome row, restart, and the old set comes back")
 
