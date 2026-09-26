@@ -83423,9 +83423,9 @@ async fn probe_terminal_context_menu_for(session_path: &str) -> Value {
                 const afterNativeClipboardPasteRequestCount = Number(entry.nativeClipboardPasteRequestCount || 0);
                 const actionNames = actions.map((item) => item.action);
                 // The accuracy marker for "this is the TERMINAL viewport
-                // menu, not some other menu". The menu)s own item ids moved
-                // to the  prefix (Copy/Paste/Select-All route by it
-                // in dispatch_row_menu_action); the legacy bare names stay
+                // menu, not some other menu". The menu item ids carry the
+                // viewport- prefix now (Copy/Paste/Select-All route by it in
+                // dispatch_row_menu_action); the legacy bare names stay
                 // accepted so a probe still reads an older build honestly.
                 const hasTerminalAction =
                     actionNames.some((name) => name.startsWith('viewport-'))
