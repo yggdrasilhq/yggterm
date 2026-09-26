@@ -16771,12 +16771,40 @@ fn codex_home_dir_name() -> &'static str {
         .unwrap_or(".codex")
 }
 
+/// The process env the remote codex store-read chain consults, as values —
+/// the test seam. `std::env::set_var` is process-global, so a test that
+/// points `CODEX_HOME` at a fixture store hands that store to every sibling
+/// test on every other thread (the DECLARED gate's doc); the `_in` twins of
+/// the read chain take this instead, and only the full-flow tests that
+/// cannot thread an argument still touch the globals.
+#[derive(Clone, Debug, Default)]
+struct RemoteCodexStoreEnv {
+    codex_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+}
+
+impl RemoteCodexStoreEnv {
+    fn from_process() -> Self {
+        Self {
+            codex_home: std::env::var_os("CODEX_HOME"),
+            home: std::env::var_os("HOME"),
+        }
+    }
+}
+
 fn resolve_remote_codex_home() -> std::path::PathBuf {
-    std::env::var_os("CODEX_HOME")
+    resolve_remote_codex_home_in(&RemoteCodexStoreEnv::from_process())
+}
+
+/// [`resolve_remote_codex_home`] against explicit env — the test seam.
+fn resolve_remote_codex_home_in(env: &RemoteCodexStoreEnv) -> std::path::PathBuf {
+    env.codex_home
+        .as_deref()
         .map(std::path::PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| {
-            std::env::var_os("HOME")
+            env.home
+                .as_deref()
                 .map(std::path::PathBuf::from)
                 .map(|home| home.join(codex_home_dir_name()))
         })
@@ -16784,8 +16812,19 @@ fn resolve_remote_codex_home() -> std::path::PathBuf {
 }
 
 fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
+    remote_saved_codex_session_exists_in(session_id, &RemoteCodexStoreEnv::from_process())
+}
+
+/// [`remote_saved_codex_session_exists`] against explicit env — the test seam.
+fn remote_saved_codex_session_exists_in(
+    session_id: &str,
+    env: &RemoteCodexStoreEnv,
+) -> anyhow::Result<bool> {
     let mut files = Vec::new();
-    collect_codex_session_files(&resolve_remote_codex_home().join("sessions"), &mut files)?;
+    collect_codex_session_files(
+        &resolve_remote_codex_home_in(env).join("sessions"),
+        &mut files,
+    )?;
     for path in files {
         if let Some((candidate_id, _cwd)) = read_codex_session_identity_fields(&path)?
             && candidate_id == session_id
@@ -17266,8 +17305,19 @@ fn remote_resume_seed_snapshot_prefill(bytes: &[u8]) -> Option<String> {
 
 
 fn remote_saved_session_match_fragments(session_id: &str) -> anyhow::Result<Vec<String>> {
+    remote_saved_session_match_fragments_in(session_id, &RemoteCodexStoreEnv::from_process())
+}
+
+/// [`remote_saved_session_match_fragments`] against explicit env — the test seam.
+fn remote_saved_session_match_fragments_in(
+    session_id: &str,
+    env: &RemoteCodexStoreEnv,
+) -> anyhow::Result<Vec<String>> {
     let mut files = Vec::new();
-    collect_codex_session_files(&resolve_remote_codex_home().join("sessions"), &mut files)?;
+    collect_codex_session_files(
+        &resolve_remote_codex_home_in(env).join("sessions"),
+        &mut files,
+    )?;
     for path in files {
         let Some((candidate_id, _cwd)) = read_codex_session_identity_fields(&path)? else {
             continue;
@@ -17308,8 +17358,19 @@ fn remote_saved_session_match_fragments(session_id: &str) -> anyhow::Result<Vec<
 }
 
 fn remote_saved_session_cwd(session_id: &str) -> anyhow::Result<Option<String>> {
+    remote_saved_session_cwd_in(session_id, &RemoteCodexStoreEnv::from_process())
+}
+
+/// [`remote_saved_session_cwd`] against explicit env — the test seam.
+fn remote_saved_session_cwd_in(
+    session_id: &str,
+    env: &RemoteCodexStoreEnv,
+) -> anyhow::Result<Option<String>> {
     let mut files = Vec::new();
-    collect_codex_session_files(&resolve_remote_codex_home().join("sessions"), &mut files)?;
+    collect_codex_session_files(
+        &resolve_remote_codex_home_in(env).join("sessions"),
+        &mut files,
+    )?;
     for path in files {
         let Some((candidate_id, cwd)) = read_codex_session_identity_fields(&path)? else {
             continue;
@@ -17326,7 +17387,20 @@ fn remote_snapshot_matches_saved_session_strict(
     session_id: &str,
     snapshot: &[u8],
 ) -> anyhow::Result<bool> {
-    let fragments = remote_saved_session_match_fragments(session_id)?;
+    remote_snapshot_matches_saved_session_strict_in(
+        session_id,
+        snapshot,
+        &RemoteCodexStoreEnv::from_process(),
+    )
+}
+
+/// [`remote_snapshot_matches_saved_session_strict`] against explicit env — the test seam.
+fn remote_snapshot_matches_saved_session_strict_in(
+    session_id: &str,
+    snapshot: &[u8],
+    env: &RemoteCodexStoreEnv,
+) -> anyhow::Result<bool> {
+    let fragments = remote_saved_session_match_fragments_in(session_id, env)?;
     Ok(remote_snapshot_matches_saved_session_fragments(
         &fragments, snapshot, false,
     ))
@@ -17389,12 +17463,30 @@ fn remote_snapshot_directory(bytes: &[u8]) -> Option<String> {
 }
 
 fn normalize_remote_snapshot_directory(value: &str) -> String {
+    normalize_remote_snapshot_directory_in(value, &RemoteCodexStoreEnv::from_process())
+}
+
+/// [`normalize_remote_snapshot_directory`] against explicit env — the test seam
+/// (the `~` expansion reads HOME).
+fn normalize_remote_snapshot_directory_in(value: &str, env: &RemoteCodexStoreEnv) -> String {
+    let home = || {
+        env.home
+            .as_deref()
+            .and_then(|home| home.to_str())
+            .map(|home| home.to_string())
+            .unwrap_or_default()
+    };
     let trimmed = value.trim();
     if trimmed == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| trimmed.to_string());
+        let home = home();
+        return if home.is_empty() {
+            trimmed.to_string()
+        } else {
+            home
+        };
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = home();
         if !home.is_empty() {
             return format!("{home}/{rest}");
         }
@@ -17406,13 +17498,26 @@ fn remote_snapshot_directory_matches_saved_session(
     session_id: &str,
     snapshot: &[u8],
 ) -> anyhow::Result<bool> {
-    let Some(expected_cwd) = remote_saved_session_cwd(session_id)? else {
+    remote_snapshot_directory_matches_saved_session_in(
+        session_id,
+        snapshot,
+        &RemoteCodexStoreEnv::from_process(),
+    )
+}
+
+/// [`remote_snapshot_directory_matches_saved_session`] against explicit env — the test seam.
+fn remote_snapshot_directory_matches_saved_session_in(
+    session_id: &str,
+    snapshot: &[u8],
+    env: &RemoteCodexStoreEnv,
+) -> anyhow::Result<bool> {
+    let Some(expected_cwd) = remote_saved_session_cwd_in(session_id, env)? else {
         return Ok(true);
     };
     let Some(snapshot_cwd) = remote_snapshot_directory(snapshot) else {
         return Ok(true);
     };
-    Ok(normalize_remote_snapshot_directory(&snapshot_cwd) == expected_cwd)
+    Ok(normalize_remote_snapshot_directory_in(&snapshot_cwd, env) == expected_cwd)
 }
 
 fn remote_saved_session_can_reuse_existing_multiplexer(
@@ -17450,6 +17555,23 @@ fn remote_saved_session_screen_is_attachable(
     visible_snapshot: &[u8],
     full_snapshot: &[u8],
 ) -> bool {
+    remote_saved_session_screen_is_attachable_in(
+        session_id,
+        saved_session_exists,
+        visible_snapshot,
+        full_snapshot,
+        &RemoteCodexStoreEnv::from_process(),
+    )
+}
+
+/// [`remote_saved_session_screen_is_attachable`] against explicit env — the test seam.
+fn remote_saved_session_screen_is_attachable_in(
+    session_id: &str,
+    saved_session_exists: bool,
+    visible_snapshot: &[u8],
+    full_snapshot: &[u8],
+    env: &RemoteCodexStoreEnv,
+) -> bool {
     if !saved_session_exists {
         if visible_snapshot.is_empty() {
             return false;
@@ -17468,9 +17590,13 @@ fn remote_saved_session_screen_is_attachable(
             visible_snapshot,
         )
         && (!remote_snapshot_has_codex_idle_frame(visible_snapshot)
-            || remote_snapshot_directory_matches_saved_session(session_id, visible_snapshot)
-                .unwrap_or(false))
-        && remote_snapshot_matches_saved_session_strict(session_id, visible_snapshot)
+            || remote_snapshot_directory_matches_saved_session_in(
+                session_id,
+                visible_snapshot,
+                env,
+            )
+            .unwrap_or(false))
+        && remote_snapshot_matches_saved_session_strict_in(session_id, visible_snapshot, env)
             .unwrap_or(false);
     if visible_attachable {
         return true;
@@ -17478,14 +17604,29 @@ fn remote_saved_session_screen_is_attachable(
     !full_snapshot.is_empty()
         && remote_saved_session_can_reuse_existing_multiplexer(saved_session_exists, full_snapshot)
         && (!remote_snapshot_has_codex_idle_frame(full_snapshot)
-            || remote_snapshot_directory_matches_saved_session(session_id, full_snapshot)
+            || remote_snapshot_directory_matches_saved_session_in(session_id, full_snapshot, env)
                 .unwrap_or(false))
-        && remote_snapshot_matches_saved_session_strict(session_id, full_snapshot).unwrap_or(false)
+        && remote_snapshot_matches_saved_session_strict_in(session_id, full_snapshot, env)
+            .unwrap_or(false)
 }
 
 pub(crate) fn remote_resume_runtime_output_mismatches_saved_session(
     session_id: &str,
     snapshot: &[u8],
+) -> bool {
+    remote_resume_runtime_output_mismatches_saved_session_in(
+        session_id,
+        snapshot,
+        &RemoteCodexStoreEnv::from_process(),
+    )
+}
+
+/// [`remote_resume_runtime_output_mismatches_saved_session`] against explicit
+/// env — the test seam.
+fn remote_resume_runtime_output_mismatches_saved_session_in(
+    session_id: &str,
+    snapshot: &[u8],
+    env: &RemoteCodexStoreEnv,
 ) -> bool {
     if snapshot.is_empty() {
         return false;
@@ -17493,14 +17634,14 @@ pub(crate) fn remote_resume_runtime_output_mismatches_saved_session(
     if remote_resume_snapshot_is_external_active_guard(snapshot) {
         return false;
     }
-    let saved_session_exists = match remote_saved_codex_session_exists(session_id) {
+    let saved_session_exists = match remote_saved_codex_session_exists_in(session_id, env) {
         Ok(value) => value,
         Err(_) => return false,
     };
     if !saved_session_exists {
         return false;
     }
-    !remote_saved_session_screen_is_attachable(session_id, true, snapshot, snapshot)
+    !remote_saved_session_screen_is_attachable_in(session_id, true, snapshot, snapshot, env)
 }
 
 fn remote_resume_runtime_output_mismatches_managed_session(
@@ -39904,11 +40045,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use yggterm_core::{AgentLaunchOptions, SessionTitleStore, TranscriptRole};
 
-    static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // (The CODEX_HOME_TEST_LOCK that stood here retired 2026-09-27: its last
+    // users either take the `RemoteCodexStoreEnv` seam or the
+    // declared-env lock — one lock law, not two.)
 
     // The terminal-identity env has ONE guard, and it lives with the module that
     // owns that env (`codex_cli`). This used to be a second `Mutex` declared
@@ -40077,6 +40219,12 @@ mod tests {
         // Removing one from this list by threading its seam is the direction of
         // travel; adding one is a decision to make the flake population larger.
         const DECLARED: &[&str] = &[
+            // 2026-09-27: the store-read chain (resolve_remote_codex_home →
+            // exists / cwd / match_fragments / attachable / output-mismatches)
+            // takes the `RemoteCodexStoreEnv` seam, and its unit tests pass
+            // the env as a value. What remains here are the three flow tests
+            // whose read sits behind a server method or a full
+            // restore/start flow — too deep to thread as an argument.
             "CODEX_HOME",
             "COLORFGBG",
             "COLORTERM",
@@ -42423,8 +42571,8 @@ mod tests {
         // answered none on every live restore). The fixture db this test
         // plants is therefore only reachable when HOME itself points at the
         // scratch home for the ensure — the sanctioned HOME injection, held
-        // under both env locks so the other HOME-setting test cannot race it.
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
+        // under the declared-env lock so the other HOME-setting test cannot
+        // race it.
         let previous_user_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &home);
@@ -42483,7 +42631,6 @@ mod tests {
                 std::env::remove_var("HOME");
             }
         }
-        drop(_codex_home_guard);
         if let Some(previous_home) = previous_home {
             unsafe {
                 std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
@@ -46671,7 +46818,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn saved_session_does_not_attach_when_visible_screen_is_invalid() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-attach-{}-{}",
             std::process::id(),
@@ -46687,26 +46833,21 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                 "{\"timestamp\":\"2026-03-20T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will create the pi account without a password.\"}]}}\n"
             ),
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
 
         let visible = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\nConversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.\n";
         let full = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\n: make a passwordless user pi\n\" I will create the pi account without a password.\n\nConversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.\n";
 
-        let attachable = remote_saved_session_screen_is_attachable("abc123", true, visible, full);
+        let attachable = remote_saved_session_screen_is_attachable_in(
+            "abc123",
+            true,
+            visible,
+            full,
+            &RemoteCodexStoreEnv {
+                codex_home: Some(home.clone().into_os_string()),
+                home: None,
+            },
+        );
 
-        if let Some(previous_codex_home) = previous_codex_home {
-            unsafe {
-                std::env::set_var("CODEX_HOME", previous_codex_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("CODEX_HOME");
-            }
-        }
         let _ = fs::remove_dir_all(home);
 
         assert!(!attachable);
@@ -46715,7 +46856,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn saved_session_does_not_attach_when_idle_surface_directory_mismatches() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-attach-cwd-{}-{}",
             std::process::id(),
@@ -46731,37 +46871,21 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                 "{\"timestamp\":\"2026-03-20T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will update the ThinkBook KMonad x-modifications layer to add your three media shortcuts.\"}]}}\n"
             ),
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        let previous_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-            std::env::set_var("HOME", "/home/user");
-        }
 
         let visible = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~/git\n\n: I want the media controls of the thinkbook to be in the x layer too.\n\" I will update the ThinkBook KMonad x-modifications layer to add your three media shortcuts.\n";
         let full = visible;
 
-        let attachable = remote_saved_session_screen_is_attachable("abc123", true, visible, full);
+        let attachable = remote_saved_session_screen_is_attachable_in(
+            "abc123",
+            true,
+            visible,
+            full,
+            &RemoteCodexStoreEnv {
+                codex_home: Some(home.clone().into_os_string()),
+                home: Some("/home/user".into()),
+            },
+        );
 
-        if let Some(previous_codex_home) = previous_codex_home {
-            unsafe {
-                std::env::set_var("CODEX_HOME", previous_codex_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("CODEX_HOME");
-            }
-        }
-        if let Some(previous_home) = previous_home {
-            unsafe {
-                std::env::set_var("HOME", previous_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = fs::remove_dir_all(home);
 
         assert!(!attachable);
@@ -46770,7 +46894,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn runtime_output_mismatch_detects_wrong_saved_session_buffer() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-runtime-mismatch-{}-{}",
             std::process::id(),
@@ -46786,26 +46909,18 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                 "{\"timestamp\":\"2026-03-20T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will run the two embedding calls with a minimal Python one-liner so we avoid JSON escaping bugs.\"}]}}\n"
             ),
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
 
         let wrong_runtime = b"> provide them with the current code and ensure they understand it to avoid further errors.\nInvestigating server process restarts\nThe server may have restarted while the user entered the code.\n";
 
-        let mismatches =
-            super::remote_resume_runtime_output_mismatches_saved_session("abc123", wrong_runtime);
+        let mismatches = super::remote_resume_runtime_output_mismatches_saved_session_in(
+            "abc123",
+            wrong_runtime,
+            &RemoteCodexStoreEnv {
+                codex_home: Some(home.clone().into_os_string()),
+                home: None,
+            },
+        );
 
-        if let Some(previous_codex_home) = previous_codex_home {
-            unsafe {
-                std::env::set_var("CODEX_HOME", previous_codex_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("CODEX_HOME");
-            }
-        }
         let _ = fs::remove_dir_all(home);
 
         assert!(mismatches);
@@ -46830,7 +46945,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                 "{\"timestamp\":\"2026-05-15T03:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I found the restored runtime was launching plain codex instead of resuming the saved session.\"}]}}\n"
             ),
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         unsafe {
             std::env::set_var("CODEX_HOME", &home);
@@ -46861,7 +46975,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn runtime_output_match_allows_correct_saved_session_buffer() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-runtime-match-{}-{}",
             std::process::id(),
@@ -46877,28 +46990,18 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                 "{\"timestamp\":\"2026-03-20T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will run the two embedding calls with a minimal Python one-liner so we avoid JSON escaping bugs.\"}]}}\n"
             ),
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
 
         let matching_runtime = b"> The prior command failed due quoting. I will re-run with simpler quoting and verify the LiteLLM stack.\n> I will run the two embedding calls with a minimal Python one-liner so we avoid JSON escaping bugs.\n";
 
-        let mismatches = super::remote_resume_runtime_output_mismatches_saved_session(
+        let mismatches = super::remote_resume_runtime_output_mismatches_saved_session_in(
             "abc123",
             matching_runtime,
+            &RemoteCodexStoreEnv {
+                codex_home: Some(home.clone().into_os_string()),
+                home: None,
+            },
         );
 
-        if let Some(previous_codex_home) = previous_codex_home {
-            unsafe {
-                std::env::set_var("CODEX_HOME", previous_codex_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("CODEX_HOME");
-            }
-        }
         let _ = fs::remove_dir_all(home);
 
         assert!(!mismatches);
@@ -56865,7 +56968,6 @@ terminal_window_id: None,
             sessions_dir.join("rollout-test.jsonl"),
             "{\"id\":\"abc123\",\"cwd\":\"/srv/app\"}\n",
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         unsafe {
             std::env::set_var("CODEX_HOME", &home);
@@ -56950,7 +57052,6 @@ terminal_window_id: None,
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(home.join("sessions"))?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
         let previous_codex_home = std::env::var_os("CODEX_HOME");
         unsafe {
             std::env::set_var("CODEX_HOME", &home);
@@ -58519,7 +58620,6 @@ terminal_window_id: None,
 
     #[test]
     fn remote_saved_codex_session_exists_checks_codex_home() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-remote-resume-{}-{}",
             std::process::id(),
@@ -58531,24 +58631,14 @@ terminal_window_id: None,
             sessions_dir.join("rollout-test.jsonl"),
             "{\"id\":\"abc123\",\"cwd\":\"/srv/app\"}\n",
         )?;
-        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
 
-        let exists = remote_saved_codex_session_exists("abc123")?;
-        let missing = remote_saved_codex_session_exists("missing")?;
+        let env = RemoteCodexStoreEnv {
+            codex_home: Some(home.clone().into_os_string()),
+            home: None,
+        };
+        let exists = remote_saved_codex_session_exists_in("abc123", &env)?;
+        let missing = remote_saved_codex_session_exists_in("missing", &env)?;
 
-        if let Some(previous_codex_home) = previous_codex_home {
-            unsafe {
-                std::env::set_var("CODEX_HOME", previous_codex_home);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("CODEX_HOME");
-            }
-        }
         let _ = fs::remove_dir_all(home);
 
         assert!(exists);
