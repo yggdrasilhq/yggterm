@@ -2253,11 +2253,14 @@ directly). FILLED, with the capture locked in
 directly (opencode with AND without `--auto`; zcode-tui confirmed from first-party
 source — no directory-trust gate exists). Their empty lists are now MEASURED-NONE, not
 UNMEASURED. **muse** and **antigravity** were found ALREADY FILLED by their own seats —
-the remaining-list below was stale on this entry. **kimi** is BLOCKED, not unmeasured:
-the binary migrated under the descriptor ([11.175]).
+the remaining-list below was stale on this entry. **kimi** is now MEASURED on the new
+CLI ([11.175], 2026-09-27 late): Kimi Code 2.1.1 HAS a gate — the per-directory
+"Trust this folder?" picker (plus the one-time migration picker on an unmigrated
+host); the drive stopped before answering it, and the filled phrases are locked in
+the descriptor.
 
 ⇒ Still unmeasured: `codex-litellm`, `pi`, `qwen-code` — availability-gated (no
-usable binary on any fleet host), plus kimi's NEW CLI after [11.175] is provisioned.
+usable binary on any fleet host).
 ⛔ **Do not copy codex's phrases across** — codex-litellm plausibly shares them and
 "plausibly" is what this doctrine exists to refuse. Each is cheap to measure the
 moment a binary exists: spawn a row into a directory it has never opened, in a
@@ -2284,9 +2287,12 @@ OCCURRENCE of the same defect, different glyph** — zcode-tui declared U+258F `
 0.5.9-era draft-caret reading), and the deployed 0.6.x parity line draws U+258C `▌`
 as the input head; `▏` drew NOWHERE on the live idle render. Corrected to `▌`
 (byte-checked 0x258c), locked in `a_composer_marker_is_the_glyph_that_cli_actually_draws`.
-opencode's `┃` U+2503 RE-VERIFIED live on the 2.0.3 render. Still unverified against
-a live render: grok (auth gate blocks the composer on this host right now), and the
-availability-gated tail.
+opencode's `┃` U+2503 RE-VERIFIED live on the 2.0.3 render. [11.175] late: the
+kimi-code intake re-measured kimi live — the `❯` era is dead there too (drawn
+NOWHERE on the 2.1.1 idle render; it survives only as the trust/migration PICKER's
+selection cursor); the box composer `│ >  │` declares `>` U+003E after box trim,
+now shared with agy. Still unverified against a live render: grok (auth gate blocks
+the composer on this host right now), and the availability-gated tail.
 
 ⇒ Recommended: measure the remaining markers the same cheap way, and treat a marker
 shared by most of the table as unproven until something has rendered it.
@@ -2295,32 +2301,36 @@ shared by most of the table as unproven until something has rendered it.
 
 **Status:** OPEN
 
-The descriptor's kimi block describes **kimi-cli 1.50.0** (the 09-11 c-tail fill:
+The descriptor's kimi block described **kimi-cli 1.50.0** (the 09-11 c-tail fill:
 md5(cwd) store buckets, `── input ──` region composer, no titles). On 2026-09-27 the
-muse lab host's `kimi` (re-pointed to the uv tool at ~04:52 local, provenance
-unrecorded) resolves to **1.52.0**, whose first output is:
+muse lab host's `kimi` (re-pointed to the uv tool ~06:53 local, symlink mtime)
+resolves to **1.52.0**, whose first output is:
 
     kimi-cli is no longer maintained. Please use the new Kimi Code CLI.
     Install: curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
     Running the Kimi Code install script...
 
 — and it RUNS the installer (measured live by the startup-gates audit drive:
-the rendered screen was the installer, not a TUI; `~/.kimi-code/` now holds the new
-CLI's bin/config/credentials). Consequences already true on this host:
+the rendered screen was the installer, not a TUI). ⛔ Side-effect class, named
+here and HIT AGAIN the same day: a probe drive answered the installer's flow and
+completed a config-only migration + binary update (0.27.0 → 2.1.1) with no ask —
+availability probes must not side-effect the host.
 
-- `suites/kimi.js` can no longer drive the 1.50.0 TUI — every kimi drive now lands in
-  the installer screen (the suite's region-label + U+276F-absence asserts will read it
-  as failures; they are measuring a DIFFERENT binary).
-- The whole kimi block (store globs, composer region label, resume contract,
-  working phrases) describes the dying line; the new **Kimi Code CLI** needs its own
-  measured block — schema v2 intake, not a patch of the old values.
-- ⛔ Side-effect class worth naming: a PROBE drive triggered a remote install script.
-  Availability probes must not side-effect the host; the shim converted a measurement
-  into an installation with no ask.
+⇒ LANDED 2026-09-27 (lane/integration/kimi-code-intake 2c45d990): the intake ran
+and the descriptor is re-derived for **Kimi Code 2.1.1** — old kimi-cli keeps NO
+descriptor. Measured facts now in the block: install = the vendor script (no
+registered CLI is Uv anymore); composer = rounded box `│ > text │` with marker
+`>` after box trim (region label GONE, ❯ drawn nowhere on idle); startup gates
+FILLED (per-directory trust picker + one-time migration picker; NO auth gate);
+id-at-birth TRUE→FALSE (`Session:` prints EMPTY, ids mint at first turn, a
+refused turn creates nothing, `-S <unknown-id>` errors "Session not found" — kimi
+moved to the self-minting class, absence opens the picker); resume selector
+`--session` (`--resume`/`-r` gone); store → `~/.kimi-code/sessions/wd_<basename>_
+<sha256(cwd)[0..12]>/session_<uuid>/` with the glob anchored on state.json and
+all three readers rewritten; `--yes/--auto-approve/--afk` gone (afk preset
+deleted). Suites/kimi.js rewritten and green 7/7 live on 2.1.1.
 
-⇒ Next seat: provision Kimi Code CLI deliberately, re-run the 11.6.6 intake recipe
-against it, and re-derive the block; decide whether old-kimi keeps a descriptor at
-all. ~~Rider: the host's `opencode2` ynpm generation has re-pointed to **2.0.3** (the
+⇒ ~~Rider: the host's `opencode2` ynpm generation has re-pointed to **2.0.3** (the
 [11.144]-era "production = 2.0.8/2.0.9" readings are stale AGAIN — third instance of
 the bin-re-point class); the startup-gates + opencode suites describe whatever binary
 PATH resolves, so re-verify before trusting version-specific facts.~~
@@ -2334,6 +2344,17 @@ model rotated server-side (Muse Spark 1.3 Free → LongCat 2.5 Preview Free, bot
 The discipline the rider asked for, made precise: version-specific facts must name the
 plane they measured — wrapper `ynpm/bin` vs login `~/.local/bin` ([11.177] carries the
 split and its silent-drift telemetry gap).
+
+⇒ RESIDUALS, all AUTH-GATED (the host CLI is unauthenticated — `LLM not set, send
+"/login" to login` measured verbatim; `login` is an interactive device-code flow
+= owner action): (1) the 2.1.1 STORE LAYOUT — the glob encodes the 0.27.0-measured
+shape, no 2.1.1 session exists anywhere to check; (2) working screen phrases —
+still DECLARED-unverified, never measured on any kimi line; (3) titling —
+state.json carries `title` but the birth value is the "New Session" placeholder;
+whether the CLI auto-titles past it is unmeasured; (4) content_rederives_on_resume.
+Plus the HOST INFRA half (owner): the uv shim at `~/.local/bin/kimi` still shadows
+`~/.kimi-code/bin` (PATH order) — every PATH-`kimi` row launch renders the
+installer; retire or re-point the shim deliberately.
 
 ## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
 
