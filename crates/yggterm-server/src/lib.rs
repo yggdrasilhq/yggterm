@@ -24916,9 +24916,13 @@ pub fn run_remote_resume_agent(
     // into the ensure, whose own ladder then finds the id vouched and stamps
     // the Conversation binding. `None` (unreadable store) never vouches.
     let mut session_id = session_id.to_string();
+    // ⛔ `saved_session_exists` is FAIL-OPEN for Antigravity BY DESIGN (the
+    // [11.165] predicate answers Ok(true) on a definitive miss; the gates
+    // live at the consumers) — so it can never gate this ladder. The
+    // THREE-VALUED vouch is the condition: Some(false) is the only word that
+    // means "the store was consulted and this id is not there".
     if kind == SessionKind::Antigravity
         && require_existing
-        && !saved_session_exists
         && local_agent_store_vouches_for_session(kind, &session_id) == Some(false)
         && let Some(dir) = cwd
         && let Some(user_home) = dirs::home_dir()
