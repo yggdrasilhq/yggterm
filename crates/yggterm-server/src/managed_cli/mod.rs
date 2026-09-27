@@ -4372,21 +4372,87 @@ fn vendor_script_stem(url: &str) -> String {
 /// ⛔ `Stdio::null()` on stdin is load-bearing, not tidiness: this runs on a
 /// background thread with no terminal, and an installer that stops to ask a
 /// question would otherwise block that thread for the daemon's lifetime.
-fn run_provision_command(mut command: Command, what: &str) -> Result<()> {
-    let output = command
+/// How long ONE provision step (an npm/uv/vendor/self update) may run before
+/// yggterm kills its process group and moves on. Generous because a real
+/// install can legitimately take minutes; bounded because the unbounded form
+/// was measured eating a machine for ~18 hours: the scheduled refresh walked
+/// into one stuck no-TTY child (`mimo upgrade` in an epoll wait) and held the
+/// install lock for 17h53m — every CLI spawn/restore on the host refused the
+/// whole time ([11.182], dev 2026-09-26→27).
+const MANAGED_CLI_INSTALL_STEP_TIMEOUT_SECS: u64 = 15 * 60;
+
+fn run_provision_command(command: Command, what: &str) -> Result<()> {
+    run_provision_command_with_deadline(command, what, MANAGED_CLI_INSTALL_STEP_TIMEOUT_SECS)
+}
+
+/// The body with the deadline injectable, so the wedge regression runs in
+/// seconds instead of the production quarter-hour.
+fn run_provision_command_with_deadline(
+    mut command: Command,
+    what: &str,
+    deadline_secs: u64,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("running {what}"))?;
-    if output.status.success() {
+        .stderr(Stdio::piped());
+    // The group leader trick: a kill of -pid reaches the installer AND the
+    // node/go grandchildren a stuck installer leaves behind, which a bare
+    // child-kill orphans mid-write.
+    let _ = command.process_group(0);
+    let mut child = command.spawn().with_context(|| format!("running {what}"))?;
+    // The stderr pipe MUST be drained while the child runs (a reader thread,
+    // the same shape `.output()` used) — a piped-and-unread child fills the
+    // 64 KB pipe and wedges itself in `anon_pipe_write`, LISTENING but never
+    // finishing: the [11.181] slow-fuse class, self-inflicted.
+    let mut stderr_pipe = child.stderr.take().context("provision stderr pipe")?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr_pipe, &mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(deadline_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => {
+                anyhow::bail!("{what} could not be waited on: {error}");
+            }
+        }
+    };
+    let Some(mut status) = status else {
+        // THE [11.182] DEADLINE. Kill the whole group, reap, and fail BY NAME
+        // — the walk continues (the caller collects failures per tool), the
+        // lock releases with this function, and the message is the one the
+        // trace/classifier can attribute.
+        let pid = child.id();
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        anyhow::bail!(
+            "{what} timed out after {deadline_secs}s and was killed with its process group \
+             (pid {pid}) — the [11.182] no-deadline wedge class"
+        );
+    };
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let stderr = stderr.trim().to_string();
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
-        anyhow::bail!("{what} exited with status {}", output.status);
+        anyhow::bail!("{what} exited with status {}", status);
     }
-    anyhow::bail!("{what} exited with status {}: {stderr}", output.status);
+    anyhow::bail!("{what} exited with status {}: {stderr}", status);
 }
 
 /// How long an install waits for another process to finish writing this
@@ -4524,6 +4590,19 @@ fn acquire_managed_cli_install_lock_waiting(
                         }),
                     );
                 }
+                // Holder provenance ([11.182]): the file is what a timed-out
+                // waiter reads to name WHO pins the toolchain. Best-effort —
+                // an unwritable lock file must not fail an acquired lock.
+                let _ = file.set_len(0);
+                let _ = std::io::Write::write_all(
+                    &mut &file,
+                    serde_json::to_string(&serde_json::json!({
+                        "pid": std::process::id(),
+                        "acquired_at_ms": current_time_ms(),
+                    }))
+                    .expect("holder json")
+                    .as_bytes(),
+                );
                 return Ok(ManagedCliInstallLock {
                     file,
                     home: home.to_path_buf(),
@@ -4536,9 +4615,19 @@ fn acquire_managed_cli_install_lock_waiting(
                     .with_context(|| format!("locking managed cli install {}", path.display()));
             }
             if std::time::Instant::now() >= deadline {
+                // THE [11.182] HONEST REFUSAL: name the holder, not just the
+                // wait. The lock file carries the holder's pid+started-at (the
+                // remote-scan lock's provenance pattern), so the refusal and
+                // every row it stamps can say WHO holds the toolchain and
+                // since when, instead of an anonymous 300000ms.
+                let holder = fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "unknown holder".to_string());
                 anyhow::bail!(
                     "another yggterm process has been installing managed CLIs for over {}ms \
-                     (lock {}); refusing to write the toolchain concurrently",
+                     (lock {} held by {holder}); refusing to write the toolchain concurrently",
                     wait_ms,
                     path.display()
                 );
@@ -4571,14 +4660,17 @@ fn install_latest(
     tools: &[ManagedCliTool],
     background: bool,
 ) -> Result<()> {
-    // ⛔ ONE WRITER PER MACHINE, across processes. Held for the WHOLE function
-    // rather than around the npm transactions alone: uv and the vendor scripts install
-    // into `~/.local/bin`, which every other lane also reads and writes, so the
-    // resource being serialised is "this machine's managed toolchain", not "the
-    // ynpm prefix". See [`ManagedCliInstallLock`] for the measurement.
-    let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
-
-    // ⛔ Each package gets its own ynpm transaction. The old implementation
+    // ⛔ ONE WRITER PER MACHINE, across processes — now ONE TOOL AT A TIME,
+    // not one WALK AT A TIME. The lock used to span the whole multi-CLI walk,
+    // so one hung step pinned the machine's toolchain for as long as it hung
+    // (measured: 17h53m behind one stuck `mimo upgrade`, [11.182]) while
+    // every spawn and restore on the host refused. The serialised resource is
+    // unchanged — "this machine's managed toolchain" ([`ManagedCliInstallLock`]
+    // for the two-writers-delete-one-CLI measurement) — it is now held per
+    // install step, so a waiter's worst case is one step's deadline, never a
+    // walk's.
+    //
+    // ⛔ Each package still gets its own transaction. The old implementation
     // batched npm CLIs in one prefix, so one bad package or interrupted npm
     // run could unlink every other CLI. ynpm owns per-package generations and
     // publishes only after its runs-before-publish gate.
@@ -4597,19 +4689,16 @@ fn install_latest(
     // no such case, so `?` was safe there and is not safe here.
     let mut failures: Vec<String> = Vec::new();
     for (tool, step) in per_tool {
-        let outcome = match step {
-            ProvisionStep::Npm => unreachable!("npm tools are dispatched above"),
-            ProvisionStep::Uv(package) => install_via_uv(paths, package),
-            ProvisionStep::VendorScript(url) => install_via_vendor_script(paths, url),
-            ProvisionStep::SelfUpdate(argv) => update_via_self_command(paths, tool, argv),
-        };
+        let outcome = install_one_step_under_lock(paths, tool, step);
         if let Err(error) = outcome {
             failures.push(format!("{}: {error}", tool.display_name()));
         }
     }
 
     for tool in npm_tools {
-        if let Err(error) = install_via_ynpm(paths, tool, background) {
+        let outcome = install_one_step_under_lock(paths, tool, ProvisionStep::Npm)
+            .and_then(|_| install_via_ynpm_publish(paths, tool, background));
+        if let Err(error) = outcome {
             failures.push(format!("{}: {error}", tool.display_name()));
         }
     }
@@ -4619,6 +4708,34 @@ fn install_latest(
     } else {
         anyhow::bail!("{}", failures.join("; "))
     }
+}
+
+/// ONE provision step under the per-tool install lock: acquire → step → drop,
+/// so the machine-wide toolchain write is still serialised across processes
+/// but no step can pin the lock past its own deadline.
+fn install_one_step_under_lock(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+    step: ProvisionStep,
+) -> Result<()> {
+    let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
+    match step {
+        ProvisionStep::Npm => Ok(()),
+        ProvisionStep::Uv(package) => install_via_uv(paths, package),
+        ProvisionStep::VendorScript(url) => install_via_vendor_script(paths, url),
+        ProvisionStep::SelfUpdate(argv) => update_via_self_command(paths, tool, argv),
+    }
+}
+
+/// The ynpm publish for one npm CLI, under the same per-tool lock — the
+/// generation swap is the toolchain write the lock exists to serialise.
+fn install_via_ynpm_publish(
+    paths: &ManagedCliPaths,
+    tool: ManagedCliTool,
+    background: bool,
+) -> Result<()> {
+    let _install_guard = acquire_managed_cli_install_lock(&paths.home)?;
+    install_via_ynpm(paths, tool, background)
 }
 
 /// Delegate one npm-backed CLI transaction to the standalone ynpm binary. The
@@ -7377,4 +7494,94 @@ pub(crate) fn summarize_managed_cli_report(
     }
 
     format!("{scope}: Codex tools already current")
+}
+
+#[cfg(test)]
+mod provision_deadline_tests {
+    use super::*;
+
+    /// THE [11.182] WEDGE REGRESSION: a hung installer child that ALSO fills
+    /// its stderr pipe must be killed at the deadline (never 18 hours), the
+    /// failure must be NAMED, and the walk must survive it. The child writes
+    /// far past the 64 KB pipe buffer and then sleeps forever — the exact
+    /// `mimo upgrade` shape (no TTY, epoll wait, 17h53m behind the lock).
+    #[test]
+    fn a_hung_chatty_installer_child_is_killed_at_the_deadline_and_named() {
+        let started = std::time::Instant::now();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("yes wedged-line | head -c 200000 >&2; sleep 300");
+        let error = run_provision_command_with_deadline(command, "mimo upgrade", 3)
+            .expect_err("a hung child must fail, never outlive the deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the deadline must bound the wait, took {elapsed:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("timed out after 3s"),
+            "the refusal names the deadline: {message}"
+        );
+        assert!(
+            message.contains("process group"),
+            "the refusal names the group kill: {message}"
+        );
+    }
+
+    /// A step that EXITS successfully still succeeds through the same path —
+    /// the deadline is a ceiling, not a change to the happy path. Chatty
+    /// stderr must drain concurrently, or the child wedges on its own pipe
+    /// (the [11.181] slow-fuse class) and this test times out with it.
+    #[test]
+    fn a_clean_step_still_succeeds_and_chatty_stderr_still_drains() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("yes clean-line | head -c 200000 >&2; exit 0");
+        run_provision_command_with_deadline(command, "clean upgrade", 20)
+            .expect("a clean (if chatty) step succeeds");
+    }
+
+    /// THE LOCK SPAN LAW ([11.182] defect 2): the walk no longer holds the
+    /// install lock across the whole multi-CLI walk — each step acquires and
+    /// drops its own guard.
+    #[test]
+    fn the_walk_holds_the_lock_per_step_never_for_the_whole_walk() {
+        let source = include_str!("mod.rs");
+        let walk = source
+            .split("fn install_latest(")
+            .nth(1)
+            .expect("the walk body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            !walk.contains("acquire_managed_cli_install_lock"),
+            "the walk body must not take the lock itself any more"
+        );
+        let step = source
+            .split("fn install_one_step_under_lock(")
+            .nth(1)
+            .expect("the per-step lock body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            step.contains("acquire_managed_cli_install_lock"),
+            "each step takes the lock"
+        );
+        let publish = source
+            .split("fn install_via_ynpm_publish(")
+            .nth(1)
+            .expect("the publish lock body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            publish.contains("acquire_managed_cli_install_lock"),
+            "the ynpm publish takes the lock"
+        );
+    }
 }
