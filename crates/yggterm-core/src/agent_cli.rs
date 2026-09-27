@@ -2985,68 +2985,75 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
     },
     AgentCliDescriptor {
         kind: SessionKind::Kimi,
-        display_name: "Kimi",
-        session_metadata_label: "Kimi Session",
+        display_name: "Kimi Code",
+        session_metadata_label: "Kimi Code Session",
         slug: "kimi",
         binary_name: "kimi",
-        // A Python CLI; `uv tool install` is what its own getting-started says.
-        install: CliInstall::Uv("kimi-cli"),
+        // ⛔⛔ [11.175] THE BINARY MIGRATED UNDER THE DESCRIPTOR (measured
+        // 2026-09-27, muse lab host). The vendor killed kimi-cli: the uv
+        // kimi-cli 1.52.0 binary is a DEPRECATION SHIM whose every interactive
+        // launch prints "kimi-cli is no longer maintained" and RUNS the
+        // code.kimi.com install script (network resolve + binary replace —
+        // measured live; it updated ~/.kimi-code/bin from 0.27.0 to 2.1.1
+        // mid-probe). The real CLI is Kimi Code, installed by that script to
+        // `~/.kimi-code/bin/kimi` (install dir `$KIMI_INSTALL_DIR`,
+        // default `~/.kimi-code`; the script PREPENDS `<install>/bin` to PATH
+        // in the shell rc unless KIMI_NO_MODIFY_PATH). Old kimi-cli keeps NO
+        // descriptor — the shim is an installer, not a CLI — and the vendor's
+        // own `migrate` verb (config.toml · REPL history · skills, optionally
+        // sessions) is the sanctioned path off it.
+        //
+        // ⚠ PATH HAZARD, measured on this host: `~/.local/bin/kimi` (the uv
+        // shim symlink) SHADOWED `~/.kimi-code/bin` because `.local/bin`
+        // preceded the install dir in PATH — `which kimi` answered the shim
+        // while the real CLI sat installed. A row launched as `kimi` renders
+        // an INSTALLER, never a TUI. Provisioning that re-points or retires
+        // the shim is host infra, owner-gated.
+        //
+        // Version lineage of this block, every claim dated: kimi-cli 1.49/1.50
+        // (2026-08/09 intakes), kimi-code 0.27.0 (the 2026-07-18 store this
+        // host still carried), kimi-code 2.1.1 (live-driven 2026-09-27 — the
+        // screen/gate/resume facts below). The 2.1.1 STORE LAYOUT is
+        // UNMEASURED: sessions are created on the first message and this
+        // host's CLI is unauthenticated (`LLM not set, send "/login" to
+        // login`, refusal measured verbatim), so no 2.1.1 session exists
+        // anywhere to read. The store fields carry the 0.27.0-measured layout,
+        // dated, until a credentialed host re-measures ([11.175] residual).
+        install: CliInstall::VendorScript("https://code.kimi.com/kimi-code/install.sh"),
         update: CliUpdate::Reinstall,
         icon_glyph: "K_",
         // Moonshot's deep blue (8.72:1).
         brand_color: "#1e40af",
         menu_hint: 'k',
-        // `state.json` carries `custom_title` with a `title_generated` flag and
-        // a 3-attempt cap — the CLI owns it.
-        // ⛔ WAS `Store`, OVER A STORE THAT HOLDS NO TITLE — and the two halves of
-        // yggterm already disagreed about that.
-        //
-        // `TitleAuthority::Store` makes `session_accepts_generated_copy` refuse
-        // this kind a generated title, on the reasoning that inventing one would
-        // disagree forever with the title the CLI wrote. That reasoning needs
-        // the CLI to have written one.
-        //
-        // ⭐ It does not. `startpage::scan_kimi_sessions` — which locates this
-        // store perfectly well, reversing its hashed bucket via the CLI's own
-        // config — says so in its own comment and falls back to a generated or
-        // heuristic title. Measured independently 2026-08-21 on a machine where
-        // this CLI has been launched: no key anywhere in a session's files is a
-        // title, a cwd or a session id.
-        //
-        // ⇒ So the SCAN path already treated this CLI as generating, while the
-        // LIVE path honoured the declaration and refused to generate. One CLI,
-        // two answers to "who names this row", and the live half's answer was
-        // "nobody" — the row wore its birth title for the life of the session.
-        //
-        // ⚠ Its store being empty of titles is why `read_live_store_title` is
-        // `None` here and why that is NOT the hole the store-authority lock
-        // hunts: there is nothing to read. This flips back only if the CLI
-        // starts writing a title, in the same commit as the reader for it.
-        // ⛔ FLIPPED BACK TO `Generated` 2026-09-11 (kimi 1.50.0, measured on
-        // the GUI host): the 1.50 store has NO state.json and NO title key anywhere —
-        // the 2026-09-05 owner-law premise ("kimi writes state.json title,
-        // measured end-to-end 2026-08-30") described 0.27.0's store and died
-        // with that layout. `Store` over a title-less store is exactly the
-        // split-brain the block above documents: the scan half generates, the
-        // live half refuses, and the row wears its birth title forever (the
-        // [11.96] shape agy ships). Flips back to `Store` the day kimi writes
-        // a title again, in the same commit as the reader for it.
+        // kimi-code's session `state.json` carries `title` + `isCustomTitle`
+        // (0.27.0 store, measured 2026-09-27 on the 2026-07-18 session: the
+        // pre-turn default is "New Session"). That default is a PLACEHOLDER,
+        // not a name — a Store authority would wear "New Session" on every
+        // never-prompted row (the birth-title shape). Stays Generated until a
+        // credentialed host shows the CLI auto-titling past the default; the
+        // state.json reader ships in the same commit either way.
         title_authority: TitleAuthority::Generated,
-        // `kimi -r <unknown-id>` CREATES that session rather than failing, so a
-        // caller-supplied id at birth is honoured. Its id is a directory name
-        // verbatim, with no format validation.
-        id_assigned_at_birth: true,
-        // Unmeasured; birth-id kind.
+        // ⛔ FLIPPED to `false` [11.175] (kimi-code 2.1.1, measured 2026-09-27,
+        // muse lab host): the welcome panel prints `Session:` EMPTY and says
+        // "No session yet — one will be created on your first message" — the
+        // id is minted at first TURN, and a refused turn creates nothing
+        // (store verified empty after the refusal). The old create-on-resume
+        // contract is dead too: `kimi -S <unknown-id>` fails with
+        // `error: failed to start shell: Session "…" not found.` where
+        // kimi-cli 1.50.0 created the session. A caller-supplied id at birth
+        // is refused, not honoured.
+        id_assigned_at_birth: false,
+        // Unmeasured on 2.1.1; the minted-at-first-turn shape above is the
+        // reason `None` (no caller id exists to be missing).
         resume_missing_id_behavior: None,
         wrapper_slug: Some("kimi"),
         remote_row_scheme: Some("remote-kimi://"),
         runtime_key_scheme: Some("kimi-runtime://"),
-        // ⚠ Kimi's main turn spinner draws a moon frame with EMPTY text, and
-        // its interrupt is Ctrl-C, not esc — there is no "esc to interrupt"
-        // affordance to match. These are the per-block spinners.
-        // ⚠ UNVERIFIED ON 1.50.0 (2026-09-10/11 groundwork, no kimi
-        // credentials on the probe host): the phrases stay as DECLARED, not
-        // falsified — the first credentialed host re-measures them.
+        // ⚠ kimi-cli's turn spinners ("composing…"/"thinking…"/"compacting…",
+        // `thought for ` completion) were 1.50.0 DECLARED-UNVERIFIED. Kimi-code
+        // 2.1.1 is unauthenticated on the only host that runs it, so the
+        // phrases stay DECLARED, not falsified — the first credentialed host
+        // re-measures ([11.175] residual, with the store layout).
         working_screen_phrases: &[
             ScreenWorkingPhrase {
                 needle: "composing...",
@@ -3068,48 +3075,72 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
-        // ⛔ STILL UNMEASURED — and the ground moved: 2026-09-27 the muse lab
-        // host's `kimi` resolves to the uv kimi-cli 1.52.0 DEPRECATION SHIM
-        // ("kimi-cli is no longer maintained. Please use the new Kimi Code
-        // CLI"), which AUTO-RUNS the code.kimi.com install script — the
-        // startup-gates drive rendered the installer, not a TUI, and
-        // ~/.kimi-code now holds the new CLI. The 1.50.0 facts in this block
-        // describe the dying line; the new Kimi Code CLI needs its own
-        // measured block before any value here is touched. ([11.175])
-        startup_gate_screen_phrases: &[],
+        // ⭐ FILLED [11.175] (kimi-code 2.1.1, live-driven 2026-09-27, muse lab
+        // host — the [11.6.6-b] empty list was the 1.50.0 reading). TWO gates,
+        // different scopes:
+        // • "Trust this folder?" — the PER-DIRECTORY trust picker (codex's
+        //   trust-gate class): ❯ Trust this folder / Enable project MCP
+        //   servers… / Don't trust / Exit Kimi Code. Asked again next launch.
+        //   Eats typed input like every picker; the suite answers it ONLY for
+        //   its own scratch dir, deliberately, logged.
+        // • "Migrate this data to kimi-code?" — the ONE-TIME kimi-cli→kimi-code
+        //   migration picker (measured chain: config picker, then a second
+        //   "Migrate chat sessions too?"). Gone once answered; never answered
+        //   by a probe ([11.175]: a probe answering it migrated a host).
+        // No AUTH gate: the unauthenticated launch renders the composer
+        // directly (the /login hint is a welcome-panel line, not a gate).
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "Trust this folder?",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "Migrate this data to kimi-code?",
+                also_any: &[],
+            },
+        ],
         plan_limit_choice_screen_phrases: &[],
-        // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on guihost (yggterm
-        // provisioned it via uv the same day): `--session,--resume  -S,-r`. The
-        // value was read from source at intake and is now MEASURED — recorded
-        // because an agreeing measurement is still a measurement, and the next
-        // reader should not have to re-run it to find that out.
-        resume_selector: ResumeSelector::Flag("--resume"),
+        // ⛔ FLIPPED [11.175] (kimi-code 2.1.1 `--help`, live 2026-09-27):
+        // `-S, --session [id]` — the `--resume` long form and bare `-r` are
+        // GONE. Without an id it opens an interactive PICKER (help text), a
+        // gate-class surface — resume verbs must always carry the id.
+        resume_selector: ResumeSelector::Flag("--session"),
         // `kimi -w <dir>` is how a new session is rooted; resume takes the id
         // and re-derives the work dir from its own metadata.
         resume_re_roots_with_cwd: false,
         model_flag: Some("--model"),
-        // ⛔ [11.6.6-b] FIXED 2026-09-14 (measured live on 1.50.0, muse lab
-        // host, node-pty + vendored xterm — tools/probe-battery
-        // suites/kimi.js): kimi's composer is a labeled rule region
-        // `── input ────…` with NO marker glyph (U+276F: zero hits on the
-        // idle screen). `composer_region_label` is the honest anchor the
-        // readiness gate now takes; the ❯ here is NOT drawn on 1.50.0 and
-        // stays only because the char field cannot say "none" (the
-        // drawable-glyph lock) — the region label, not this char, is what
-        // the gate matches. The welcome panel also prints `Session: <uuid>`
-        // on screen — a screen-level id source.
-        composer_marker: '\u{276f}',
-        composer_region_label: Some("input"),
+        // ⛔ FLIPPED [11.175] (kimi-code 2.1.1, live-driven 2026-09-27, muse
+        // lab host, node-pty + vendored xterm — probe-lab
+        // kimi-code-intake/artifacts, byte-checked): the `── input ──` rule
+        // region is GONE. The composer is a rounded box whose input row is
+        // `│ > <draft> │` — U+2502, space, U+003E, space, then the text, then
+        // the closing rule. The MARKER is the `>` prompt head: it is the first
+        // char of the box-trimmed row (`normalized_composer_lines` reduces
+        // `│ > text │` to `> text`), which is what both consumers anchor on —
+        // the raw row's first char is the light box rule, and a rule that the
+        // consumers' own normalization strips is chrome, not a glyph (the
+        // guard's gutter strip eats U+2502 by design — opencode's arm). The
+        // old `❯` U+276F is drawn NOWHERE on the idle screen (it is the
+        // trust/migration PICKER's selection cursor only). ⚠ `>` is shared
+        // with agy — the [99.1] census: sharing is the normal case; the kind
+        // rides with the session, the glyph never identifies the CLI.
+        composer_marker: '\u{3e}',
+        composer_region_label: None,
         composer_placeholder_needles: &[],
-        // `context:` is kimi's measured status footer under the region
-        // (`context: 0.0%`); `ctrl` matches the `ctrl-o: editor` hints row.
-        composer_footer_hints: &["ctrl", "kimi", "/help", "tab", "context:"],
+        // Measured 2.1.1 idle footer: a `…/<cwd>` line carrying `/goal for
+        // multi-step work with a clear finish line`, and the `context: 0`
+        // meter (the 1.50 `context:` fragment survives). These tell the
+        // readiness gate a CURRENT composer sits above them.
+        composer_footer_hints: &["/goal", "context:"],
         working_footer_hints: &["composing...", "thinking..."],
-        // MEASURED from the same `--help`: `--yolo,--yes,--auto-approve  -y`
-        // ("Automatically approve all actions"). kimi expresses no plan or
-        // accept-edits posture, so neither is mapped onto something close.
+        // MEASURED [11.175] from the live 2.1.1 `--help`: `-y, --yolo`
+        // ("Automatically approve all actions"), `--auto` ("Start in auto
+        // permission mode"), `--plan` ("Start in plan mode"). `--yes`,
+        // `--auto-approve` and `--afk` are GONE (1.49/1.50 readings — the afk
+        // preset died with the flag).
         permission_modes: &[
             (AgentPermissionMode::Default, &[]),
+            (AgentPermissionMode::Plan, &["--plan"]),
             (AgentPermissionMode::Bypass, &["--yolo"]),
         ],
         overridden_flags: &[
@@ -3119,20 +3150,24 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 FlagArity::Standalone,
                 OverriddenBy::PermissionMode,
             ),
-            ("--yes", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            ("-y", FlagArity::Standalone, OverriddenBy::PermissionMode),
             (
-                "--auto-approve",
+                "--auto",
                 FlagArity::Standalone,
                 OverriddenBy::PermissionMode,
             ),
-            ("-y", FlagArity::Standalone, OverriddenBy::PermissionMode),
-            ("--afk", FlagArity::Standalone, OverriddenBy::PermissionMode),
+            (
+                "--plan",
+                FlagArity::Standalone,
+                OverriddenBy::PermissionMode,
+            ),
         ],
         extra_args_slug: "kimi",
-        // ⭐ MEASURED 2026-08-13 on kimi 1.49.0, installed on all three fleet
-        // hosts. The extra-args spec filed these as `documented` because the
-        // binary was on no host on 2026-08-08 — it is now, so the row loses its
-        // "not verified here" marker. ⛔ No sandbox flag exists; none is invented.
+        // ⛔ RE-MEASURED [11.175] on kimi-code 2.1.1 `--help` (2026-09-27): the
+        // `afk` preset is DELETED — `--afk` no longer exists, and a preset
+        // whose flag the binary refuses would spawn a row that dies at argv
+        // parse. `skip` keeps `--yolo` (alias `-y`); no sandbox flag exists,
+        // none is invented.
         permission_presets: &[
             PermissionPreset {
                 id: "ask",
@@ -3146,61 +3181,50 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 label: "Skip checks",
                 args: "--yolo",
                 explanation: "Auto-approves all tool calls; you are still reachable for a \
-                              question the agent asks. Aliases: -y, --yes, --auto-approve.",
+                              question the agent asks. Alias: -y.",
                 is_default: true,
-            },
-            PermissionPreset {
-                id: "afk",
-                label: "Away from keyboard",
-                args: "--afk",
-                explanation: "Auto-approves AND auto-dismisses the agent's questions — nothing \
-                              can stop to ask you.",
-                is_default: false,
             },
         ],
         permission_provenance: PermissionProvenance::Measured,
-        // Resume replays only the last 5 turns to the screen; the full history
-        // stays on disk, so the PTY is NOT a faithful re-derivation.
+        // 1.50.0 measured false (replays only the last 5 turns). Kimi-code
+        // 2.1.1 is UNMEASURED — no session can exist unauthenticated — so the
+        // value rides with its date until a credentialed host drives a resume
+        // ([11.175] residual).
         content_rederives_on_resume: false,
-        // ⛔⛔ [11.6.6-a] THE STORE MOVED UNDER US AGAIN (measured 2026-09-11 on
-        // the GUI host, kimi 1.50.0): the 2026-08-30 destination is itself a dead
-        // store now. A fresh 1.50.0 session is
-        // `~/.kimi/sessions/<md5hex-of-cwd>/<session-uuid>/` holding ONLY
-        // `context.jsonl` (role/content lines, system prompt first) and
-        // `wire.jsonl` (line 1 `{"type":"metadata","protocol_version":"1.10"}`,
-        // then timestamped `TurnBegin{user_input}` / `TurnEnd{}` events);
-        // `find ~/.kimi -name state.json` is EMPTY. The bucket name is the
-        // md5 hex of the cwd — VERIFIED on this host (md5("/tmp") is a bucket
-        // name verbatim, and so is the home-dir bucket) — and the cwd itself is
-        // recoverable from context.jsonl's embedded system prompt ("current
-        // working directory is `<path>`"). Three layouts inside a year
-        // (`~/.kimi` hashed buckets → `~/.kimi-code` state.json → `~/.kimi`
-        // md5 buckets): every kimi store claim carries its date on purpose.
-        session_store_globs: &[".kimi/sessions/*/*/wire.jsonl"],
-        // One file per session BY the glob: context.jsonl is deliberately not
-        // matched (it would yield a second entry per session — the grok
-        // summary.json lesson); the reader reaches it as the matched file's
-        // sibling when it needs the cwd.
+        // ⛔ [11.175] STORE HOME MOVED FOR THE THIRD TIME (dated claims, four
+        // layouts inside a year — every kimi store claim carries its date on
+        // purpose): kimi-cli 1.50.0's `~/.kimi/sessions/<md5(cwd)>/<uuid>/`
+        // died with the line. Kimi-code lives under `~/.kimi-code/sessions/`
+        // in PER-WORKDIR buckets named `wd_<cwd-basename>_<sha256(cwd)[0..12]>`
+        // — VERIFIED on the 2026-07-18 store: the bucket for the repo
+        // checkout the July session ran in is `wd_yggterm_c30f488d4784`, and
+        // sha256 of that cwd starts c30f488d4784. One session dir
+        // `session_<uuid>/` holds `state.json` (createdAt,
+        // updatedAt, `title` + `isCustomTitle`, `workDir`, an `agents` map),
+        // `agents/main/wire.jsonl` (typed events, 0.27.0 wire carried
+        // protocol_version 1.4: metadata, config.update, tools.set_active_
+        // tools) and `logs/kimi-code.log`. 2.1.1 wrote a `sessions/.index-
+        // cache/scan.json` beside the buckets; no session exists on any host
+        // written by 2.1.1 (unauthenticated), so the LAYOUT above is the
+        // 0.27.0 measurement — the first credentialed host re-derives
+        // ([11.175] residual). The glob anchors on `state.json`: one per
+        // session, and the only file carrying id + cwd + title together.
+        session_store_globs: &[".kimi-code/sessions/*/*/state.json"],
         store_excluded_name_fragments: &[],
         durable_store_files: &[],
-        // None of the intakes relocates its home with an env var.
+        // None of the intakes relocates its home with an env var (the install
+        // script's KIMI_INSTALL_DIR/KIMI_CODE_HOME move the INSTALL, not a
+        // runtime store home — unmeasured as a runtime override).
         store_home_env_override: None,
         store_scan_gap: None,
         read_store_entry: read_kimi_store_entry,
         store_membership_index: None,
         live_session_argv_flag: None,
         live_session_marker: None,
-        // [11.6.6-a] left this None ("restored only together with a reader
-        // for a store that exists") — the reader EXISTS now (2026-09-19, the
-        // [11.145] red sweep): `read_kimi_live_store_title` below. 1.50.0's
-        // wire carries NO title key, so the honest read is None-by-shape and
-        // the title stays Generated — but the store IS measured, and `None`
-        // is documented to mean UNMEASURED, the exact hole the qwen reader's
-        // comment names (and the reason both full-coverage title locks ran
-        // red on main: kimi claimed a store with no reader). The reader
-        // scans the wire for a `title` string, so the day kimi writes titles
-        // it serves them with no further edit. The remote twin rides the
-        // same shape (a local reader with a remote arm owes the probe).
+        // [11.175] rewritten for the state.json store (same commit as the
+        // glob): the reader parses the session's `state.json` — `title` is
+        // served when it is not the "New Session" default and not id-shaped.
+        // The remote twin rides the same shape.
         read_live_store_title: Some(read_kimi_live_store_title),
         // Input contract: line-discipline defaults — a trailing \r rides with
         // the text and the pty echoes it back. The shell-row behavior and the
@@ -6086,87 +6110,80 @@ fn find_dir_by_name(root: &Path, depth: u8, name: &str) -> Option<PathBuf> {
 /// system prompt in the SIBLING `context.jsonl` ("current working directory
 /// is `<path>`", measured 2026-09-11): scrape the first backticked absolute
 /// path after the phrase, and fall back to home when kimi rewords it again.
+/// [`AgentCliDescriptor::read_store_entry`] for Kimi Code ([11.175], rewritten
+/// 2026-09-27 for the `~/.kimi-code` store). The glob anchors on the session's
+/// `state.json` (0.27.0-measured layout, dated in the descriptor): the parent
+/// dir is `session_<uuid>` — the id verbatim — and the file itself carries
+/// `workDir` (the cwd the 1.50 reader had to scrape out of a system prompt)
+/// plus `title`/`isCustomTitle`. Recency stays the file mtime: kimi-code
+/// touches state.json per turn (updatedAt), so no RFC3339 parse is owed.
 fn read_kimi_store_entry(path: &Path) -> Option<AgentStoreEntry> {
     let session_dir = path.parent()?;
     let session_id = session_dir.file_name()?.to_str()?.to_string();
     if session_id.is_empty() {
         return None;
     }
-    let cwd = std::fs::read_to_string(session_dir.join("context.jsonl"))
-        .ok()
-        .and_then(|text| {
-            const NEEDLE: &str = "current working directory is `";
-            text.find(NEEDLE).and_then(|at| {
-                let rest = &text[at + NEEDLE.len()..];
-                let end = rest.find('`')?;
-                let candidate = &rest[..end];
-                candidate.starts_with('/').then(|| candidate.to_string())
-            })
-        });
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    // workDir is the session's own record of its cwd; home is the fallback
+    // (the same never-empty law the 1.50 reader had).
+    let cwd = state
+        .get("workDir")
+        .and_then(|w| w.as_str())
+        .map(str::to_string)
+        .filter(|cwd| cwd.starts_with('/'));
     let cwd = match cwd {
         Some(cwd) => cwd,
-        // The same fallback the 0.27 reader had: home, never empty.
         None => dirs::home_dir()?.display().to_string(),
     };
-    // Recency from the wire.jsonl FILE: kimi appends a typed event per turn,
-    // so the mtime is the session's own clock without an RFC3339 parse.
+    let title = kimi_title_from_state(&state, &session_id);
     Some(AgentStoreEntry {
         session_id,
         cwd,
         modified_epoch_ms: modified_epoch_ms_of(path),
-        title: None,
+        title,
         detail: None,
     })
 }
 
-/// One title shape, two transports (the local reader below and the remote
-/// script both mean it): a non-empty string at `title` — top-level on a wire
-/// line or inside its `metadata` object. 1.50.0 ships no such key anywhere
-/// (measured [11.6.6-a]); the first line that ever does wins. An id-shaped
-/// value is not a title.
-fn kimi_title_from_wire_line(line: &str, session_id: &str) -> Option<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+/// The state.json `title` field as a title: a non-empty string that is
+/// neither the measured birth default ("New Session") nor id-shaped. The
+/// 0.27.0 store writes the default at session birth; a REAL name (custom or
+/// auto-titled) is what flips the title story back to Store — that
+/// measurement is owed by the first credentialed host ([11.175] residual).
+fn kimi_title_from_state(state: &serde_json::Value, session_id: &str) -> Option<String> {
+    let title = state.get("title").and_then(|t| t.as_str())?.trim();
+    if title.is_empty() || title == session_id || title == "New Session" {
         return None;
-    };
-    let metadata = value.get("metadata");
-    for holder in [Some(&value), metadata] {
-        let Some(holder) = holder else { continue };
-        let Some(title) = holder.get("title").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let title = title.trim();
-        if !title.is_empty() && title != session_id {
-            return Some(title.to_string());
-        }
     }
-    None
+    Some(title.to_string())
 }
 
-/// [`AgentCliDescriptor::read_live_store_title`] for Kimi. The session dir
-/// is `~/.kimi/sessions/<md5hex-of-cwd>/<session-uuid>/wire.jsonl` — the
-/// bucket encodes the cwd, so it cannot be derived from the id and every
-/// bucket is walked (the qwen shape). Every real 1.50.0 store answers None
-/// today (no title key), leaving the title Generated; the day kimi writes
-/// titles this serves them with no further edit — the flip-back the
-/// [11.6.6-a] door promised.
+/// [`AgentCliDescriptor::read_live_store_title`] for Kimi Code. The session
+/// dir is `~/.kimi-code/sessions/wd_<…>/<session-id>/state.json` — the bucket
+/// encodes the cwd, so it cannot be derived from the id and every bucket is
+/// walked (the qwen shape). Rewritten 2026-09-27 ([11.175]) from the
+/// 1.50.0 wire-scan: the title lives in state.json now (measured on the
+/// 2026-07-18 session), and `kimi_title_from_state` refuses the birth
+/// default, so an unauthenticated store answers None without pretending.
 fn read_kimi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     if session_id.trim().is_empty() {
         return None;
     }
     let descriptor = agent_cli_descriptor(SessionKind::Kimi)?;
-    // `store_roots` is the glob's literal prefix: `<home>/.kimi/sessions`
-    // itself — the md5 buckets sit directly under it.
+    // `store_roots` is the glob's literal prefix: `<home>/.kimi-code/sessions`
+    // itself — the wd_ buckets sit directly under it.
     for root in descriptor.store_roots_absolute(home) {
         let Ok(buckets) = std::fs::read_dir(&root) else {
             continue;
         };
         for bucket in buckets.flatten() {
-            let wire = bucket.path().join(session_id).join("wire.jsonl");
-            let Ok(text) = std::fs::read_to_string(&wire) else {
+            let state_path = bucket.path().join(session_id).join("state.json");
+            let Ok(text) = std::fs::read_to_string(&state_path) else {
                 continue;
             };
-            for line in text.lines() {
-                if let Some(title) = kimi_title_from_wire_line(line, session_id) {
+            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(title) = kimi_title_from_state(&state, session_id) {
                     return Some(title);
                 }
             }
@@ -6175,9 +6192,10 @@ fn read_kimi_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     None
 }
 
-/// Kimi's remote twin: the same wire-title shape, run on the session's host.
-/// Store globs ride argv (locators first, then `--`, then the ids) exactly
-/// like grok's script; a session dir whose name is the id is this id's.
+/// Kimi's remote twin: the same state.json title shape, run on the session's
+/// host. Store globs ride argv (locators first, then `--`, then the ids)
+/// exactly like grok's script; a session dir whose name is the id is this
+/// id's. Rewritten 2026-09-27 ([11.175]) from the 1.50.0 wire-scan.
 const KIMI_REMOTE_TITLE_SCRIPT: &str = r#"
 import json, os, sys
 from pathlib import Path
@@ -6195,21 +6213,12 @@ wanted = set(ids)
 def title_of(path, sid):
     try:
         with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
-            for line in handle:
-                try:
-                    value = json.loads(line)
-                except Exception:
-                    continue
-                holders = [value]
-                meta = value.get('metadata')
-                if isinstance(meta, dict):
-                    holders.append(meta)
-                for holder in holders:
-                    t = holder.get('title') if isinstance(holder, dict) else None
-                    if isinstance(t, str):
-                        t = t.strip()
-                        if t and t != sid:
-                            return t
+            state = json.load(handle)
+        t = state.get('title')
+        if isinstance(t, str):
+            t = t.strip()
+            if t and t != sid and t != 'New Session':
+                return t
     except Exception:
         return None
     return None
@@ -9932,32 +9941,47 @@ mod tests {
     }
 
     #[test]
-    fn a_kimi_store_entry_reads_the_150_layout() {
-        // kimi 1.50 moved BACK to ~/.kimi — md5-of-cwd buckets, a bare-uuid
-        // session directory, and NO state.json (measured 2026-09-11 on the GUI
-        // host, [11.6.6-a]). The glob anchors on wire.jsonl; the cwd survives only
-        // as prose in the sibling context.jsonl's system prompt; no file
-        // carries a title, so the entry's title is None by construction.
+    fn a_kimi_store_entry_reads_the_kimi_code_state_json_layout() {
+        // kimi-code moved the store to ~/.kimi-code/sessions/wd_<…>/<session>/
+        // ([11.175], 0.27.0-measured on the 2026-07-18 muse-lab session):
+        // state.json carries workDir + title together — no prose-scraping and
+        // no sibling-file fallback like the 1.50 layout needed. The bucket
+        // name is wd_<basename>_<sha256(cwd)[0..12]>; this fixture pins the
+        // reader, not the bucket scheme.
         let home =
             std::env::temp_dir().join(format!("yggterm-kimi-store-{}", uuid::Uuid::new_v4()));
         let session_dir = home
-            .join(".kimi/sessions/ee92353f161d4cf6e8cde85dd517c632")
-            .join("6c9d662b-d553-4d4e-a4f8-e10aeb810bbf");
+            .join(".kimi-code/sessions/wd_proj_c30f488d4784")
+            .join("session_f25e941b-4a38-4d6d-9f95-135cf9a2a6af");
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(
-            session_dir.join("wire.jsonl"),
-            "{\"type\": \"metadata\", \"protocol_version\": \"1.10\"}\n",
+            session_dir.join("state.json"),
+            r#"{"createdAt":"2026-07-18T07:57:45.701Z","updatedAt":"2026-07-18T07:57:45.701Z","title":"New Session","isCustomTitle":false,"agents":{},"custom":{},"workDir":"/home/user/proj"}"#,
         )
         .unwrap();
-        std::fs::write(
-            session_dir.join("context.jsonl"),
-            "{\"role\": \"_system_prompt\", \"content\": \"You are Kimi Code CLI. The current working directory is `/home/user/proj`. Consider it the project root.\"}\n",
-        )
-        .unwrap();
-        let entry = read_kimi_store_entry(&session_dir.join("wire.jsonl")).unwrap();
-        assert_eq!(entry.session_id, "6c9d662b-d553-4d4e-a4f8-e10aeb810bbf");
+        let entry = read_kimi_store_entry(&session_dir.join("state.json")).unwrap();
+        assert_eq!(entry.session_id, "session_f25e941b-4a38-4d6d-9f95-135cf9a2a6af");
         assert_eq!(entry.cwd, "/home/user/proj");
-        assert_eq!(entry.title, None, "the 1.50 store holds no title");
+        assert_eq!(
+            entry.title, None,
+            "the birth default \"New Session\" is a placeholder, not a title"
+        );
+        // A real name in the store IS served (the flip-back arm).
+        std::fs::write(
+            session_dir.join("state.json"),
+            r#"{"title":"Count to twelve","isCustomTitle":true,"workDir":"/home/user/proj"}"#,
+        )
+        .unwrap();
+        let entry = read_kimi_store_entry(&session_dir.join("state.json")).unwrap();
+        assert_eq!(entry.title.as_deref(), Some("Count to twelve"));
+        // A missing/relative workDir falls back to home, never empty.
+        std::fs::write(
+            session_dir.join("state.json"),
+            r#"{"title":"New Session","workDir":"relative/path"}"#,
+        )
+        .unwrap();
+        let entry = read_kimi_store_entry(&session_dir.join("state.json")).unwrap();
+        assert!(entry.cwd.starts_with('/'), "cwd never falls below an absolute path");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -11847,59 +11871,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Kimi's 1.50.0 wire carries NO title key ([11.6.6-a], measured on the
-    /// muse lab host) — the reader answers None and the title stays
-    /// Generated. The flip-back arm is pinned too: the day kimi writes a
-    /// `title` (top-level or inside the metadata line), the reader serves it
-    /// with no further edit; an id-shaped value is never a title.
+    /// Kimi-code's state.json carries `title` ([11.175], measured on the
+    /// 2026-07-18 muse-lab session) — but the birth value is the placeholder
+    /// "New Session", which is NOT a name. The reader serves a real title,
+    /// refuses the default and id-shaped values, and walks every wd_ bucket
+    /// (the bucket encodes the cwd, so the id alone cannot find the session).
     #[test]
-    fn kimi_reader_answers_none_on_the_titleless_store_and_flips_back_when_titles_arrive() {
+    fn kimi_reader_serves_state_json_titles_and_refuses_the_birth_default() {
         let home = std::env::temp_dir().join(format!("ygg-kimi-title-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        // The measured bucket: md5("/tmp") is a bucket name verbatim
-        // ([11.6.6-a] verified the scheme on the muse lab host).
         let dir = home
-            .join(".kimi/sessions/d42b9c5708f43d58ad2f22597e5cf586")
-            .join("kimi-title-session-1");
+            .join(".kimi-code/sessions/wd_tmp_d42b9c5708f4")
+            .join("session_kimi-title-1");
         std::fs::create_dir_all(&dir).unwrap();
-        let session_id = "kimi-title-session-1";
+        let session_id = "session_kimi-title-1";
         std::fs::write(
-            dir.join("wire.jsonl"),
-            concat!(
-                "{\"type\":\"metadata\",\"protocol_version\":\"1.10\"}\n",
-                "{\"type\":\"TurnBegin\",\"user_input\":\"hello\",\"ts\":1}\n",
-                "{\"type\":\"TurnEnd\",\"ts\":2}\n",
-            ),
+            dir.join("state.json"),
+            r#"{"title":"New Session","isCustomTitle":false,"workDir":"/tmp"}"#,
         )
         .unwrap();
         assert_eq!(
             read_kimi_live_store_title(&home, session_id),
             None,
-            "the measured 1.50.0 store has no title key: say so, do not pretend",
+            "the birth default \"New Session\" is a placeholder: say so, do not pretend",
         );
-        // The flip-back: a title on the metadata line is served.
+        // The flip-back: a real title in state.json is served.
         std::fs::write(
-            dir.join("wire.jsonl"),
-            "{\"type\":\"metadata\",\"protocol_version\":\"1.10\",\"title\":\"Count to twelve\"}\n",
+            dir.join("state.json"),
+            r#"{"title":"Count to twelve","isCustomTitle":true,"workDir":"/tmp"}"#,
         )
         .unwrap();
         assert_eq!(
             read_kimi_live_store_title(&home, session_id).as_deref(),
             Some("Count to twelve"),
-            "the day kimi writes titles the reader serves them, no edit needed",
+            "the day kimi-code writes a real title the reader serves it",
         );
-        // A top-level title wins; an id-shaped value is not a title.
+        // An id-shaped value is not a title.
         std::fs::write(
-            dir.join("wire.jsonl"),
-            concat!(
-                "{\"type\":\"event\",\"title\":\"kimi-title-session-1\"}\n",
-                "{\"type\":\"event\",\"title\":\"Top level\"}\n",
-            ),
+            dir.join("state.json"),
+            r#"{"title":"session_kimi-title-1","workDir":"/tmp"}"#,
         )
         .unwrap();
         assert_eq!(
-            read_kimi_live_store_title(&home, session_id).as_deref(),
-            Some("Top level"),
+            read_kimi_live_store_title(&home, session_id),
+            None,
             "an id-shaped value is not a title",
         );
         let _ = std::fs::remove_dir_all(&home);

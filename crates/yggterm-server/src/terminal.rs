@@ -10678,17 +10678,19 @@ line-two on the real screen\r\n\
         );
     }
 
-    /// ⛔ [11.6.6-b follow-up] THE DRAFT GUARD'S REGION ARM, END-TO-END ON A
-    /// LIVE PTY. kimi 1.50.0 draws no composer glyph; the owed region arm
-    /// anchors `composer_row_holds_text` on the `── input ──` label instead.
-    /// The unit fixtures in yggterm-core pin the classifier on the measured
-    /// screens; this test proves the daemon consumer path on a live session:
-    /// the vt100 grid a real pty produced (raw rows, blanks included) anchors
-    /// by the label, refuses while text sits in the region, and clears once it
-    /// is gone. bash's pty echo paints the typed rows, which is exactly the
-    /// echo-shaped grid kimi draws.
+    /// ⛔ [11.175] THE DRAFT GUARD'S MARKER ARM, END-TO-END ON A LIVE PTY,
+    /// kimi-code EDITION. kimi-code 2.1.1 replaced the 1.50 `── input ──`
+    /// region with the box row `│ >  │` (marker `>` after box trim; the empty
+    /// box is only readable because the [11.175] end-strip + the gutter
+    /// exception in the chrome rule keep the row in the scan). The unit
+    /// fixtures in yggterm-core pin the classifier on the measured screens;
+    /// this test proves the daemon consumer path on a live session: the vt100
+    /// grid a real pty produced (raw rows, blanks included) anchors on the
+    /// `>` head, refuses while text sits above the box row, and clears once
+    /// it is gone. bash's pty echo paints the typed rows, which is the
+    /// echo-shaped grid the composer region below the box reads.
     #[test]
-    fn a_kimi_region_composer_refuses_while_text_sits_and_clears_when_empty() {
+    fn a_kimi_box_composer_refuses_while_text_sits_and_clears_when_empty() {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -10713,39 +10715,40 @@ line-two on the real screen\r\n\
         drop(pair);
 
         let mut manager = TerminalManager::new();
-        let key = "local://kimi-region-draft-test";
+        let key = "local://kimi-box-draft-test";
         manager
             .adopt_session(key, "bash", None, 100, 24, master, pid, start, None)
             .expect("adopt_session");
 
-        // Paint the kimi composer shape: the labeled rule region. The command
-        // line itself echoes above it, but its `input` sits inside quotes and
-        // never trims to the bare label — no false anchor.
+        // Paint the kimi-code composer shape: the box input row. The command
+        // line itself echoes above it, but its `>` sits inside quotes after
+        // `printf` — the stripped echo row starts with `printf`, never with
+        // the marker — no false anchor.
         manager
-            .write(key, "printf '%s\\n' '── input ────────────'\r")
-            .expect("paint the region label");
-        let label = "\u{2500}\u{2500} input \u{2500}\u{2500}";
-        let mut label_painted = false;
+            .write(key, "printf '%s\\n' '│ >                                        │'\r")
+            .expect("paint the box row");
+        let box_prefix = "\u{2502} >";
+        let mut box_painted = false;
         for _ in 0..50 {
             if manager
                 .session_screen_plain_rows(key)
-                .is_some_and(|rows| rows.iter().any(|row| row.starts_with(label)))
+                .is_some_and(|rows| rows.iter().any(|row| row.starts_with(box_prefix)))
             {
-                label_painted = true;
+                box_painted = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(label_painted, "the region label never painted");
+        assert!(box_painted, "the box composer row never painted");
 
-        // Text sits in the region (the pty echo paints it below the label):
-        // the guard must refuse.
-        manager.write(key, "PROBE-REGION-DRAFT").expect("type the draft");
+        // Text sits in the composer region (the pty echo paints it below the
+        // box row): the guard must refuse.
+        manager.write(key, "PROBE-BOX-DRAFT").expect("type the draft");
         let mut echo_painted = false;
         for _ in 0..50 {
             if manager
                 .session_screen_plain_rows(key)
-                .is_some_and(|rows| rows.iter().any(|row| row.contains("PROBE-REGION-DRAFT")))
+                .is_some_and(|rows| rows.iter().any(|row| row.contains("PROBE-BOX-DRAFT")))
             {
                 echo_painted = true;
                 break;
@@ -10756,7 +10759,7 @@ line-two on the real screen\r\n\
         assert_eq!(
             manager.session_composer_holds_draft(key, Some(yggterm_core::SessionKind::Kimi)),
             Some(true),
-            "typed-but-unsent text below the region label is a draft"
+            "typed-but-unsent text in the box composer region is a draft"
         );
 
         // Backspace it away and the GRID layer must read empty — `Some(false)`,
@@ -10766,10 +10769,11 @@ line-two on the real screen\r\n\
         // is sticky by design ("a line edited down to nothing is still was
         // typed at"), and sticky-dominates-grid is the safe direction on the
         // runtime that SAW the typing. This half is the discriminator against
-        // a residue-happy region arm: the echo row is gone from the vt100
-        // grid, so only a correct label-anchor read answers Some(false).
+        // a residue-happy marker arm: the echo row is gone from the vt100
+        // grid, so only a correct `>`-anchor read — with the closing rule
+        // stripped, not read as a one-char draft — answers Some(false).
         manager
-            // "PROBE-REGION-DRAFT" is 18 chars; two spare so the erase is
+            // "PROBE-BOX-DRAFT" is 15 chars; two spare so the erase is
             // never short by one.
             .write(key, &"\x7f".repeat(20))
             .expect("backspace the draft");
@@ -10789,7 +10793,7 @@ line-two on the real screen\r\n\
         }
         assert!(
             cleared,
-            "the region never read empty after the backspaces; rows: {last_rows:?}"
+            "the box never read empty after the backspaces; rows: {last_rows:?}"
         );
         assert_eq!(
             manager.session_composer_holds_draft(key, Some(yggterm_core::SessionKind::Kimi)),
@@ -10798,13 +10802,13 @@ line-two on the real screen\r\n\
         );
 
         // The grid layer stays kind-scoped on the live rows: the same grid
-        // answers None for a marker-anchored kind (codex draws `›`, not a
-        // label region) — a label line must never anchor another CLI's guard.
+        // answers None for a marker-anchored kind (codex draws `›`, not `>`) —
+        // kimi-code's box row must never anchor another CLI's guard.
         let rows = manager.session_screen_plain_rows(key).expect("rows");
         assert_eq!(
             yggterm_core::composer_row_holds_text(Some(yggterm_core::SessionKind::Codex), &rows),
             None,
-            "kimi's region label must not anchor a marker-scoped guard"
+            "kimi-code's box row must not anchor a marker-scoped guard"
         );
         let _ = manager.shutdown_all(|_key| None::<String>);
     }

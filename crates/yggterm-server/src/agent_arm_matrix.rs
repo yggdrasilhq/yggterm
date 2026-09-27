@@ -305,13 +305,13 @@ const ARMS: &[Arm] = &[
         remote_start_subcommand: None,
         write_strategy_without_local_runtime: TerminalWriteStrategy::LocalRuntimeFallback,
         binary: "kimi",
-        resume_selector_token: "--resume",
+        // [11.175] kimi-code 2.1.1: `--resume`/`-r` are gone; `-S, --session [id]`.
+        resume_selector_token: "--session",
         re_roots_with_cwd: false,
-        // ⛔ EMPTY = declared gap (md5(cwd) buckets), see the descriptor.
-        // 11.6.6-a moved the store twice (kimi 1.50.0: `~/.kimi`, md5(cwd)
-        // buckets, `wire.jsonl` per session — the descriptor carries the
-        // measured glob); the matrix keeps both copies byte-identical.
-        store_globs: &[".kimi/sessions/*/*/wire.jsonl"],
+        // [11.175] kimi-code moved the store to ~/.kimi-code — state.json
+        // anchors the glob (0.27.0-measured layout, dated in the descriptor);
+        // the matrix keeps both copies byte-identical.
+        store_globs: &[".kimi-code/sessions/*/*/state.json"],
     },
     Arm {
         kind: SessionKind::Kimi,
@@ -322,11 +322,12 @@ const ARMS: &[Arm] = &[
         remote_start_subcommand: Some("start-kimi"),
         write_strategy_without_local_runtime: TerminalWriteStrategy::RemoteDirectFallback,
         binary: "kimi",
-        resume_selector_token: "--resume",
+        // [11.175] kimi-code 2.1.1: `--resume`/`-r` are gone; `-S, --session [id]`.
+        resume_selector_token: "--session",
         re_roots_with_cwd: false,
         // Same layout as the Local twin by construction — the transport
-        // differs, the store does not (11.6.6-a measured glob).
-        store_globs: &[".kimi/sessions/*/*/wire.jsonl"],
+        // differs, the store does not ([11.175] measured glob).
+        store_globs: &[".kimi-code/sessions/*/*/state.json"],
     },
     Arm {
         kind: SessionKind::Muse,
