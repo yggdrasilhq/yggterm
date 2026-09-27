@@ -52,6 +52,13 @@ window where a script containing a top-level `await` of a long-lived promise is
 silently dropped while `return`-probes pass. The [11.176] fix (streak-aware cold
 fallback) bounds the felt damage; this entry owns the root cause.
 
+LIVE-PROVEN 2026-09-27 ~11:20 IST on rotated jojo (d96c246121f5): uxprobe spawn
+4/4 painted (8.2-10.3 s, the warm-stall -> recover -> cold -> first_frame ladder),
+0 rows left behind, no permanent blanks. RESIDUAL (owned here): every fresh row's
+FIRST mount still pays the warm-stall + ~5 s recover + cold-paint tail — the fast
+warm path returns only after the streak resets; landing this entry's root cause is
+what buys the sub-second warm spawn back.
+
 ## ⛔ [11.177] THE MANAGED GENERATION RE-POINTS UNDER A STALE LOGIN-RESOLVED BINARY, AND THE EFFECTIVE-VERSION DRIFT EVENT CANNOT FIRE — THE REFRESH GATES ITS OWN DRIFT CHECK ON "INSTALL NOT DEFERRED" (measured 2026-09-27, muse lab host)
 
 **Status:** OPEN
