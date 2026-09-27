@@ -72,6 +72,44 @@ window's ensure-funnel diffs. ⚠ Owner-facing: while OPEN, every new
 terminal row on a rotated desktop is a coin flip for a permanent blank —
 worth LEGENDARY consideration.
 
+## ⛔ [11.177] THE MANAGED GENERATION RE-POINTS UNDER A STALE LOGIN-RESOLVED BINARY, AND THE EFFECTIVE-VERSION DRIFT EVENT CANNOT FIRE — THE REFRESH GATES ITS OWN DRIFT CHECK ON "INSTALL NOT DEFERRED" (measured 2026-09-27, muse lab host)
+
+**Status:** OPEN
+
+Opencode resolves TWO ways on this host at once, and only one of them is the
+binary a yggterm row runs. The login shell (`bash -lc`, the SSOT
+`login_shell_resolved_cli` names for remote launches and probes) resolves
+`~/.local/bin/opencode2` → **2.0.3**. The wrapper PATH a daemon-spawned LOCAL
+row gets (`launch_path_prefix`: managed `ynpm/bin` first) hands the same row
+**2.0.18** — the ynpm current generation, re-pointed 2026-09-26 07:05 and
+re-installed as `@opencode/cli@latest` 2026-09-27 09:35 by the background
+refresh (event trace, component `ynpm`). Local rows and remote launches run
+DIFFERENT opencode versions on one machine, and version-specific descriptor
+facts are only true of whichever binary the measurer happened to resolve.
+suites/opencode.js 12/12 twice on each (oc203-reverify lane): the declared
+facts hold on both TODAY — the split is a latent hazard, not a live defect.
+
+The reason the machine stays silent about it: `report_managed_cli_effective_version_drift`
+runs ONLY under `provisioner_available && install_error.is_none() &&
+!skipped_recently && !install_deferred`, and this host's background refreshes
+answer `deferred_background_install` — so the drift check is skipped on every
+such tick, precisely while the managed generation moves under a stale
+login-resolved binary. `grep -c '"name":"effective_cli_version_drift"'
+~/.yggterm/event-trace.jsonl` = **0**. The event's own doc names the failure
+it exists to catch — "the binary yggterm MAINTAINS is not the binary a
+session RUNS" — and that failure is live here, unnamed. (On the deferred
+path the refresh also keeps `after = before.clone()`, so the check has no
+fresh probe to compare even if it ran.)
+
+⇒ Fix direction: fire the effective-drift report from the path where a
+deferred install actually COMPLETES (the ynpm install-begin/end events show
+that path exists and runs), or schedule the check off the deferred tick, so a
+completed generation re-point always ends in either a fresh probe+report or
+an explicit skip that names itself. Rider: the 4th instance of the bin-re-point
+class ([11.144]-era 2.0.8/2.0.9 readings, the [11.175] rider's 2.0.3 reading —
+each was true of a DIFFERENT resolution plane); version-specific facts must
+name WHICH plane they measured (wrapper `ynpm/bin` vs login `~/.local/bin`).
+
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -564,6 +602,16 @@ PTY until it is mid-turn, read the working screen through
 `yggterm server gate-screen` (the §3 instrument, shipped), fix the needle,
 pin it with a descriptor test. Negations matter as much as needles: a
 completion trace must not arm the NEXT CLI that shares a footer word.
+
+⇒ PROGRESS 2026-09-27 (muse lab host, lane/integration/oc203-reverify):
+**OPENCODE LEG DISCHARGED — the needle was measured, not guessed.** Six real
+turn drives (2.0.3 ×3, managed 2.0.18 ×3 — see [11.177] for the two
+resolution planes): the declared needle `esc interrupt` painted mid-turn in
+ALL SIX, and the `esc to interrupt` long variant appeared in NONE (verbatim
+footer: `■■■■■⬝⬝⬝ esc interrupt … shift+tab agents  ctrl+p commands`;
+raw bytes byte-checked on 2.0.18). Opencode really paints the short form —
+the needle matches the binary, the working indicator fires, no descriptor
+edit needed. The audit's remaining CLIs stand unaudited.
 
 
 ## ⛔ [11.57] A REMOTE RUNTIME LOST TO A DAEMON HANDOVER IS UNOWNABLE FOREVER — THE RESIZE RE-QUEUE BURNS ITS RETRIES AGAINST A CORPSE AND THE ROW COMPOSTS ITS SCREEN
@@ -2272,10 +2320,20 @@ CLI's bin/config/credentials). Consequences already true on this host:
 
 ⇒ Next seat: provision Kimi Code CLI deliberately, re-run the 11.6.6 intake recipe
 against it, and re-derive the block; decide whether old-kimi keeps a descriptor at
-all. Rider: the host's `opencode2` ynpm generation has re-pointed to **2.0.3** (the
+all. ~~Rider: the host's `opencode2` ynpm generation has re-pointed to **2.0.3** (the
 [11.144]-era "production = 2.0.8/2.0.9" readings are stale AGAIN — third instance of
 the bin-re-point class); the startup-gates + opencode suites describe whatever binary
-PATH resolves, so re-verify before trusting version-specific facts.
+PATH resolves, so re-verify before trusting version-specific facts.~~
+⇒ RIDER DISCHARGED 2026-09-27 (lane/integration/oc203-reverify): the re-verify RAN and
+sharpened the finding — the host resolves opencode TWO ways at once: the login shell
+(remote launches + the managed probe's SSOT) resolves `~/.local/bin` → **2.0.3**, while
+the wrapper PATH (managed `ynpm/bin` first) hands daemon-spawned LOCAL rows **2.0.18**
+(4th bin-re-point instance; the rider's own 2.0.3 reading was the login plane).
+suites/opencode.js 12/12 TWICE on EACH — every declared fact holds on both; the free
+model rotated server-side (Muse Spark 1.3 Free → LongCat 2.5 Preview Free, both).
+The discipline the rider asked for, made precise: version-specific facts must name the
+plane they measured — wrapper `ynpm/bin` vs login `~/.local/bin` ([11.177] carries the
+split and its silent-drift telemetry gap).
 
 ## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
 

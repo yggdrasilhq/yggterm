@@ -28,6 +28,16 @@
 //           (content_rederives_on_resume is now true); the idle footer
 //           vocabulary is `shift+tab agents  ctrl+p commands`.
 //
+// ⭐ RE-CERTIFIED 2026-09-27 (muse lab host, oc203-reverify lane): 12/12
+// twice on 2.0.3 AND twice on the managed 2.0.18 generation — the wrapper
+// PATH (managed `ynpm/bin` first) runs 2.0.18 while the login shell resolves
+// 2.0.3, and every declared fact above HOLDS on both. The free built-in
+// model ROTATED server-side (Muse Spark 1.3 Free → LongCat 2.5 Preview
+// Free, both binaries; turns still complete with no provider auth). The
+// mid-turn footer paints the needle VERBATIM (`esc interrupt`, no "to") on
+// 2.0.18 — the [11.93] opencode suspect is discharged — and raw Ctrl+U over
+// a held draft ADMITS AND CLEARS on 2.0.18 (the [11.150] remedy holds).
+//
 // ⛔ ISOLATION MODEL (measured): the managed service port (49374) is
 // HOST-GLOBAL. A foreign opencode service holding it wedges the TUI forever —
 // the client retries `serve --service` indefinitely and the screen never
@@ -35,9 +45,10 @@
 // named fact instead of hanging). So every drive here runs against a SCRATCH
 // HOME: `opencode service set port <free>` relocates the managed port for
 // that HOME only; store, service registration and titling all follow. Probe
-// rows therefore never touch the real store. 2.0.3 also ships a free built-in
-// model (`Muse Spark 1.3 Free`) — turns COMPLETE without any provider auth,
-// so the turn probes are real, not honest nulls.
+// rows therefore never touch the real store. The line also ships a free
+// built-in model (`Muse Spark 1.3 Free` in 2026-09; rotated server-side to
+// `LongCat 2.5 Preview Free` by 2026-09-27) — turns COMPLETE without any
+// provider auth, so the turn probes are real, not honest nulls.
 //
 //   node run.js --suite suites/opencode.js --cwd <fresh-empty-dir> \
 //        [--suite-arg bin=opencode2]
@@ -509,8 +520,13 @@ module.exports = {
     });
 
     // 8. bogus session id — the beta-era law ("refuses an unknown --session
-    //    outright") is DEAD: 2.0.3 silently falls back to the most recent
+    //    outright") is DEAD: the binary silently falls back to the most recent
     //    session of the project. Recorded as the measured hazard it is.
+    //    2026-09-27: the fallback re-render lags first paint by tens of
+    //    seconds under host load — the same binary flipped classification
+    //    run-to-run on the old fixed 5s settle (measured twice each on 2.0.3
+    //    and 2.0.18). Poll for a DECIDED screen; only a screen that never
+    //    shows the resumed transcript inside the window classifies as virgin.
     await ctx.probe('bogus-session-fallback', async () => {
       const d3 = new ctx.Drive({
         command: bin,
@@ -520,25 +536,26 @@ module.exports = {
         label: 'opencode-bogus',
       });
       await d3.waitFor(() => d3.screen().trim().length > 0, 60000, 400);
-      await new Promise((r) => setTimeout(r, 5000));
+      await d3.waitFor(() => d3.screen().includes('tok/s') || d3.screen().includes('Build ·'), 45000, 1000);
+      await new Promise((r) => setTimeout(r, 1500));
       d3.snap('bogus-session');
       const screen = d3.screen();
       ctx.facts.bogus_session = {
         refused: false,
         virgin_composer_shown: screen.includes('Ask anything'),
         fell_back_to_recent_session: screen.includes('tok/s') || screen.includes('Build ·'),
-        note: 'the beta-era refusal is gone — an unknown --session silently resumes the latest session (mis-binding hazard for callers that mint ids out-of-band)',
+        note: 'no beta-era refusal: an unknown --session SOMETIMES silently resumes the latest session (mis-binding hazard for callers that mint ids out-of-band) and sometimes opens a fresh session — the fallback is racy (observed on 2.0.3 2026-09-15 and on 2.0.18 2026-09-27; 45s-window no-fallback runs on both the same day)',
       };
       await d3.killChild();
       if (ctx.facts.bogus_session.virgin_composer_shown) {
         ctx.facts.bogus_session.fell_back_to_recent_session = false;
         ctx.facts.bogus_session.refused = false;
-        return 'bogus id opened a VIRGIN composer — fallback behavior moved, re-measure';
+        return 'no fallback inside 45s — the bogus id opened on a FRESH session this run (the fallback is racy, not version-pinned)';
       }
       if (!ctx.facts.bogus_session.fell_back_to_recent_session) {
         throw new Error('bogus id neither fell back nor opened virgin — blank screen? re-measure');
       }
-      return 'bogus id SILENTLY RESUMED the latest session (measured 2.0.3 hazard, recorded)';
+      return 'bogus id SILENTLY RESUMED the latest session this run (racy fallback — measured on 2.0.3 2026-09-15 and 2.0.18 2026-09-27)';
     });
 
     // 9. flag surface — top-level help re-asked of the installed binary, and
