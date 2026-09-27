@@ -1337,8 +1337,22 @@ dioxus.send(out);
             return {"error": "row nodes not rendered (virtualized out?)",
                     "iterations": []}
         out = {"iterations": []}
-        targets = [a_path, b_path] * iters
-        for i, path in enumerate(targets):
+        confirmed_active: str | None = None
+
+        def _other(p: str) -> str:
+            return b_path if p == a_path else a_path
+
+        for i in range(iters):
+            # The blind A→B alternation assumed every click switches; one
+            # swallowed click ([11.130] class: events land, the gesture path
+            # does not fire) desynced it and every later click could hit the
+            # already-active row — the 6/16 no-activation cascade
+            # (2026-09-27). Target from the LAST CONFIRMED active row so a
+            # measured click is always a real switch; a swallowed click
+            # costs one unmeasured re-sync click at the bottom of the loop.
+            path = (_other(confirmed_active)
+                    if confirmed_active in (a_path, b_path)
+                    else (a_path if i % 2 == 0 else b_path))
             rect = rects[path]
             x = rect["x"] + min(rect["w"] / 2, 120.0)
             y = rect["y"] + rect["h"] / 2
@@ -1528,6 +1542,22 @@ dioxus.send(out);
                            % (rd["ok"], rr["ok"]))
             it["accuracy_failures"] = acc
             out["iterations"].append(it)
+            if activation is None:
+                # Swallowed click: the active state is unconfirmed, so the
+                # next measured click could hit the already-active row.
+                # Re-sync with one UNMEASURED click on the other row (the
+                # owed [11.130]-class probe artifact) and reset the
+                # confirmed state.
+                orect = rects[_other(path)]
+                self.verb("pointer", "press", "--x",
+                          str(int(orect["x"] + min(orect["w"] / 2, 120.0))),
+                          "--y", str(int(orect["y"] + orect["h"] / 2)))
+                self.verb("pointer", "release")
+                confirmed_active = None
+                out["swallowed_clicks"] = out.get("swallowed_clicks", 0) + 1
+                time.sleep(0.4)
+            else:
+                confirmed_active = path
             # give the previous switch's churn room to drain before the next
             time.sleep(0.6)
         ready = [i for i in out["iterations"]
