@@ -20,7 +20,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN; defused for spawns by the [11.176] fix — rig recipe included)
 
-**Status:** OPEN (root cause; the felt symptom is DEFUSED on lane/uxspeed/spawn-screen-fix)
+**Status:** OPEN
+
+Root cause open; the FELT SYMPTOM is defused on `lane/uxspeed/spawn-screen-fix`.
 
 Filed 2026-09-27 on `lane/uxspeed/spawn-screen-fix` (zcode sess_04fb9058 on jojo,
 work FROM dev) while fixing [11.176]. The [11.172/11.173] warm mount path dispatches
@@ -52,7 +54,9 @@ fallback) bounds the felt damage; this entry owns the root cause.
 
 ## ⛔ [11.176] A SPAWNED ROW'S SCREEN STAYS BLANK: THE DAEMON READS THE PROMPT BYTES (first_bytes CARRIES "pi@jojo:") BUT THE SCREEN BUFFER NEVER FILLS — INTERMITTENT, MOSTLY-ALWAYS ON CURRENT MAIN (measured 2026-09-27 ~06:30-08:00 IST, live jojo desktop)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (lane/uxspeed/spawn-screen-fix; root cause of the wedge split off as [11.178])
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Lane `lane/uxspeed/spawn-screen-fix`; the root cause of the wedge is split off as [11.178].
 
 Filed 2026-09-27 on `lane/uxspeed/spawn-ladder` (zcode
 sess_123bb054-e0c8-44e6-afbb-80694539daa0 on jojo, work FROM dev) while
