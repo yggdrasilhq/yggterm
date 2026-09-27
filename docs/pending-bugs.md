@@ -111,7 +111,7 @@ each was true of a DIFFERENT resolution plane); version-specific facts must
 name WHICH plane they measured (wrapper `ynpm/bin` vs login `~/.local/bin`).
 
 
-## ⛔ [11.178] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176]/[11.177] WEDGE OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
+## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
 **Status:** OPEN
 
@@ -160,10 +160,7 @@ refusal counter reads 0 for both row kinds across a probe batch.
 Instrument: the `reveal_raise_refused` payload (kind split local/remote)
 is the counter — no probe changes needed.
 
-ID NOTE: [11.177] was taken by the cli-integration lane (managed-generation
-re-point, merged in b7762588) while the spawn-screen-fix lane's memory cites
-[11.177] for the wedge root cause — the earlier filing keeps the id
-([11.174] precedent); the wedge-root-cause entry should renumber on merge.
+ID RESOLUTION: [11.177] is the cli-integration lane's merged entry (managed-generation re-point, b7762588); the spawn-screen-fix lane filed the wedge root cause as [11.178] (senior - their [11.176] status line + rig recipe + memory reference it); THIS entry is the renumber to [11.179] (2026-09-27 ~10:45, same-morning id race, resolved by senior-references).
 
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
