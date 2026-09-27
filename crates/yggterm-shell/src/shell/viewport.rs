@@ -6407,13 +6407,16 @@ fn TerminalCanvas(
             // The fetch now spawns off the loop behind an in-flight latch and
             // the decision/apply logic runs on this channel's own select
             // branch. Payload: (reason, reveal_incomplete, deadline_expired,
-            // screen — None when the fetch itself failed, which the inline
-            // path swallowed silently and the branch now traces).
+            // defer_chain_ms — the chain's age, read at spawn because the
+            // stamp resets before the apply branch runs; screen — None when
+            // the fetch itself failed, which the inline path swallowed
+            // silently and the branch now traces).
             let (screen_reconcile_result_tx, mut screen_reconcile_result_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(
                     &'static str,
                     bool,
                     bool,
+                    u64,
                     Option<String>,
                 )>();
             let mut screen_reconcile_fetch_in_flight = false;
@@ -6828,6 +6831,16 @@ fn TerminalCanvas(
                         // armed; the pass after completion re-judges the gates.
                     } else {
                         screen_reconcile_due_at_ms = 0;
+                        // The chain's age is read BEFORE the reset below: the
+                        // reset zeroes the stamp when the fetch is spawned, and
+                        // the apply branch (which owns the forced-reveal trace)
+                        // would otherwise see 0 and lose how long the wrong
+                        // frame stood.
+                        let defer_chain_ms = if screen_reconcile_defer_chain_began_ms == 0 {
+                            0
+                        } else {
+                            reconcile_now_ms.saturating_sub(screen_reconcile_defer_chain_began_ms)
+                        };
                         // The chain ends when the reconcile actually runs — not when
                         // a single rearm elapses. Reset here so the next chain's
                         // depth/age measure that chain alone.
@@ -6849,6 +6862,7 @@ fn TerminalCanvas(
                             reconcile_reason,
                             reveal_incomplete,
                             defer_deadline_expired,
+                            defer_chain_ms,
                             screen_reconcile_result_tx.clone(),
                         );
                     }
@@ -10228,7 +10242,13 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    Some((reconcile_reason, reveal_incomplete, defer_deadline_expired, fetched)) = screen_reconcile_result_rx.recv() => {
+                    Some((
+                        reconcile_reason,
+                        reveal_incomplete,
+                        defer_deadline_expired,
+                        defer_chain_ms,
+                        fetched,
+                    )) = screen_reconcile_result_rx.recv() => {
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "screen_reconcile_apply",
                             &session_path,
@@ -10294,6 +10314,24 @@ fn TerminalCanvas(
                                         ScreenReconcileDecision::Write
                                     }
                                     ScreenReconcileDecision::Write if reveal_incomplete => {
+                                        // ⛔ THE TWO COUNTS ARE THE VERDICT. The
+                                        // forced write fires whenever the CLIENT
+                                        // surface is near-blank (<3 nonblank rows),
+                                        // and until 2026-09-27 the event carried no
+                                        // daemon-side count — so a legitimately
+                                        // short screen (idle/scratch row = prompt
+                                        // only) and a genuinely lost client frame
+                                        // (the blank-flash class) were
+                                        // indistinguishable. The daemon's
+                                        // authoritative screen is in hand here; its
+                                        // nonblank count makes the quiet gate's
+                                        // founding assumption ("client near-empty =>
+                                        // daemon near-empty") measurable: analysis
+                                        // reads client_frame_lost as daemon >= 3
+                                        // while client < 3. defer_chain_ms is how
+                                        // long the wrong frame stood (chain age read
+                                        // at fetch spawn — the stamp resets before
+                                        // the apply branch runs).
                                         append_trace_event(
                                             &trace_home,
                                             "ui",
@@ -10302,7 +10340,13 @@ fn TerminalCanvas(
                                             json!({
                                                 "session_path": session_path.clone(),
                                                 "visible_nonblank_rows": last_host_health_visible_nonblank_rows,
+                                                "daemon_visible_nonblank_rows": screen_text
+                                                    .lines()
+                                                    .filter(|line| !line.trim().is_empty())
+                                                    .count(),
                                                 "bytes": screen_text.len(),
+                                                "defer_chain_ms": defer_chain_ms,
+                                                "defer_deadline_expired": defer_deadline_expired,
                                             }),
                                         );
                                         ScreenReconcileDecision::Write
@@ -18923,10 +18967,12 @@ fn spawn_screen_reconcile_fetch(
     reconcile_reason: &'static str,
     reveal_incomplete: bool,
     defer_deadline_expired: bool,
+    defer_chain_ms: u64,
     result_tx: tokio::sync::mpsc::UnboundedSender<(
         &'static str,
         bool,
         bool,
+        u64,
         Option<String>,
     )>,
 ) {
@@ -18941,6 +18987,7 @@ fn spawn_screen_reconcile_fetch(
             reconcile_reason,
             reveal_incomplete,
             defer_deadline_expired,
+            defer_chain_ms,
             fetched,
         ));
     });

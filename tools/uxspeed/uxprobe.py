@@ -1452,8 +1452,28 @@ dioxus.send(out);
                                    sp.get("rows_content_unpainted"))
                 if forced is not None and first_frame is None:
                     it["forced_incomplete_ms"] = forced.get("ts_ms", 0) - t_release
-                    acc.append("switch ended forced-incomplete (reveal never "
-                               "became meaningful within the deadline)")
+                    # The forced event's two counts are the verdict: client
+                    # rows <3 fired the forced write; the daemon count (new
+                    # 2026-09-27, absent on older builds) says whether the
+                    # screen was LEGITIMATELY short (benign) or the client
+                    # LOST its frame while the daemon held content — the
+                    # blank-flash class.
+                    fp = (forced.get("payload") or {}).get("payload",
+                         forced.get("payload") or {})
+                    it["forced_client_rows"] = fp.get("visible_nonblank_rows")
+                    it["forced_daemon_rows"] = fp.get("daemon_visible_nonblank_rows")
+                    it["forced_defer_chain_ms"] = fp.get("defer_chain_ms")
+                    dr = it["forced_daemon_rows"]
+                    if dr is not None and dr >= 3:
+                        acc.append("forced-incomplete is a LOST CLIENT FRAME "
+                                   "(daemon holds %s nonblank rows, client "
+                                   "showed %s, wrong frame stood %sms) — the "
+                                   "blank-flash class, not a short screen"
+                                   % (dr, it["forced_client_rows"],
+                                      it["forced_defer_chain_ms"]))
+                    else:
+                        acc.append("switch ended forced-incomplete (reveal never "
+                                   "became meaningful within the deadline)")
                 if reveal is not None:
                     it["reveal_name"] = reveal.get("name")
                     it["reveal_ms"] = reveal.get("ts_ms", 0) - t_release
