@@ -24902,8 +24902,52 @@ pub fn run_remote_resume_agent(
         sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
-    let saved_session_exists =
+    let mut saved_session_exists =
         remote_saved_agent_session_exists(kind, session_id, &RemoteCodexStoreEnv::from_process())?;
+    // ⛔ THE [11.183] AGY VOUCH LADDER — the WRAPPER half. The peer-side
+    // ensure carries the same ladder, but the wrapper's own [11.165]
+    // definitive-miss gate fires FIRST (measured live 2026-09-27 21:27: the
+    // re-birth row's resume refused at the wrapper with the owner's exact
+    // string, zero daemon-side events, the ensure ladder never reached): on a
+    // DEFINITIVE store miss for an addressed row, the store's newest
+    // conversation for the row's own cwd is what the resume means. The
+    // rebind is traced (`agy_store_candidate_vouch`, the same name the
+    // probe greps for) and the re-pointed id flows through both gates and
+    // into the ensure, whose own ladder then finds the id vouched and stamps
+    // the Conversation binding. `None` (unreadable store) never vouches.
+    let mut session_id = session_id.to_string();
+    if kind == SessionKind::Antigravity
+        && require_existing
+        && !saved_session_exists
+        && local_agent_store_vouches_for_session(kind, &session_id) == Some(false)
+        && let Some(dir) = cwd
+        && let Some(user_home) = dirs::home_dir()
+        && let Some((candidate_id, candidate_title)) =
+            yggterm_core::agent_cli::store_candidate_session_for_directory(
+                &user_home, kind, dir,
+            )
+        && candidate_id != session_id
+    {
+        append_trace_event(
+            &home,
+            "remote",
+            "resume_agent",
+            "agy_store_candidate_vouch",
+            json!({
+                "requested_id": session_id,
+                "vouched_id": candidate_id,
+                "vouched_title": candidate_title,
+                "cwd": dir,
+                "side": "wrapper",
+                "policy": "definitive_store_miss_binds_the_cwd_newest_conversation",
+            }),
+        );
+        session_id = candidate_id;
+        // The store vouches the candidate BY CONSTRUCTION (the candidate
+        // reader read it there), so the gates below answer on truth.
+        saved_session_exists = true;
+    }
+    let session_id: &str = &session_id;
     // ⛔ A SELF-MINTING CLI never stores yggterm's birth id, so an absent
     // probe is not evidence of absence — measured 2026-08-29 on opencode2's
     // v2 preview, where the scanner cannot read the store schema at all and
@@ -60410,6 +60454,29 @@ mod agy_connection_tests {
         assert!(
             ladder.contains("!self.sessions.contains_key(&key)"),
             "a runtime this daemon holds is never re-pointed"
+        );
+
+        // THE WRAPPER HALF: the wrapper's own [11.165] gate must see the
+        // vouched id too — the ladder sits BEFORE the gate there, or the
+        // refusal fires before the ensure is ever asked (measured live
+        // 2026-09-27 21:27: wrapper refused with the owner's exact string,
+        // zero daemon-side events).
+        let wrapper = source
+            .split("pub fn run_remote_resume_agent(\n    kind: SessionKind,")
+            .nth(1)
+            .expect("wrapper body")
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        let wladder_at = wrapper
+            .find("agy_store_candidate_vouch")
+            .expect("the wrapper-side ladder");
+        let wgate_at = wrapper
+            .find("remote_require_existing_needs_definitive_vouch(kind)")
+            .expect("the wrapper gate");
+        assert!(
+            wladder_at < wgate_at,
+            "the wrapper ladder must re-point before its own definitive-miss gate"
         );
 
         // The binding stamps: at birth (start path) and on a store-vouched

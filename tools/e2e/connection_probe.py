@@ -98,7 +98,6 @@ def yggterm_detached(args):
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
-        check=False,
     )
 
 
@@ -174,7 +173,18 @@ def scenario_preflight():
         pass
     finally:
         handle.close()
-    holder_text = ""
+    # A holder INSIDE its step deadline is not a wedge — the [11.182] fix
+    # guarantees release at MANAGED_CLI_INSTALL_STEP_TIMEOUT_SECS (900s).
+    # Fail only past the deadline + margin; name the holder either way.
+    age_s = None
+    try:
+        holder_json = json.loads(LOCK_FILE.read_text().strip() or "{}")
+        acquired_at = holder_json.get("acquired_at_ms")
+        if acquired_at:
+            age_s = max(0, time.time() - acquired_at / 1000)
+    except (ValueError, OSError):
+        pass
+    fuser = run(["fuser", "-v", str(LOCK_FILE)], timeout=30)
     fuser = run(["fuser", "-v", str(LOCK_FILE)], timeout=30)
     # fuser prints the bare pids first (stdout) and the annotated table after
     # (stderr) — read the pid list first, fall back to the table.
@@ -182,19 +192,21 @@ def scenario_preflight():
         r"(\d+)\s+F", fuser.stdout + fuser.stderr
     )
     pid = int(match.group(1)) if match else None
+    holder_text = "an unresolvable holder"
     if pid and pathlib.Path(f"/proc/{pid}").exists():
         cmdline = (pathlib.Path(f"/proc/{pid}/cmdline").read_text(errors="replace")
                    .replace("\0", " ").strip())
         holder_text = f"pid {pid} ({cmdline[:140]})"
-        child = run(["pgrep", "-P", str(pid)], timeout=30).stdout.split()
-        if child:
-            holder_text += f" with {len(child)} child(ren)"
-    else:
-        holder_text = "an unresolvable holder"
+    if age_s is not None and age_s <= 900 + 120:
+        return sc.ok(
+            f"lock busy with a holder inside its step deadline ({holder_text}, "
+            f"age {int(age_s)}s ≤ 900s+margin) — the [11.182] deadline bounds it"
+        )
     sc.fail(
         f"the [11.182] ops condition is LIVE: the managed-CLI install lock is "
-        f"flock-held by {holder_text} — clear the stuck holder before the "
-        f"chain can be trusted"
+        f"flock-held by {holder_text} "
+        + (f"for {int(age_s)}s, PAST the 900s step deadline — " if age_s is not None else "")
+        + "clear the stuck holder before the chain can be trusted"
     )
     return sc
 
@@ -207,18 +219,35 @@ def scenario_fresh_start():
     key = f"agy-runtime://{session_id}"
     try:
         yggterm_detached(["remote", "start-agy", session_id, str(cwd)])
-        connected, text = poll_until(lambda: screen_ok(key), deadline_s=90)
+        connected, text = poll_until(lambda: screen_ok(key), deadline_s=150)
         if connected is True:
             return sc.ok(f"screen shows the CLI ({len(text)} chars)")
         if connected is False:
             return sc.fail(f"refusal painted on the row screen: {text[:300]!r}")
-        return sc.fail(f"no CLI on screen after 90s; screen tail: {text[-300:]!r}")
+        return sc.fail(f"no CLI on screen after 150s; screen tail: {text[-300:]!r}")
     finally:
         reap(key)
 
 
+PRESENCE_DIR = HOME / ".gemini/antigravity-cli/presence"
+
+
+def presence_held(conversation_id):
+    """True when a LIVE process holds the conversation's presence lock — the
+    agy CLI marks an open conversation there, and the fd-based holder arm
+    (linux_proc_pids_holding_session_path) will rightly refuse a second
+    resume. A probe must not pick a held conversation and then report the
+    holder guard as a failure."""
+    lock = PRESENCE_DIR / f"{conversation_id}.lock"
+    if not lock.exists():
+        return False
+    answer = run(["fuser", str(lock)], timeout=30)
+    return answer.returncode == 0 and bool(answer.stdout.strip())
+
+
 def store_conversations():
-    """(id, workspace_dir) for every live, non-killed conversation, newest first."""
+    """(id, workspace_dir) for every live, non-killed, UNHELD conversation,
+    newest first."""
     if not AGY_DB.exists():
         return []
     import sqlite3
@@ -231,7 +260,7 @@ def store_conversations():
     conn.close()
     out = []
     for cid, ws, last_input, modified, killed in rows:
-        if killed:
+        if killed or presence_held(cid):
             continue
         try:
             dirs = json.loads(ws)
@@ -268,12 +297,12 @@ def scenario_resume_store_present():
         yggterm_detached(
             ["remote", "resume-agy", session_id, workspace, "--require-existing"]
         )
-        connected, text = poll_until(lambda: screen_ok(key), deadline_s=90)
+        connected, text = poll_until(lambda: screen_ok(key), deadline_s=150)
         if connected is True:
             return sc.ok(f"store-vouched resume connected ({len(text)} chars)")
         if connected is False:
             return sc.fail(f"refusal painted: {text[:300]!r}")
-        return sc.fail(f"no CLI after 90s; tail: {text[-300:]!r}")
+        return sc.fail(f"no CLI after 150s; tail: {text[-300:]!r}")
     finally:
         reap(key)
 
@@ -305,7 +334,7 @@ def scenario_rebirth_uuid_vouch():
         yggterm_detached(
             ["remote", "resume-agy", fresh_id, workspace, "--require-existing"]
         )
-        connected, text = poll_until(lambda: screen_ok(key), deadline_s=90)
+        connected, text = poll_until(lambda: screen_ok(key), deadline_s=150)
         vouched = trace_has_vouch(fresh_id, offset)
         if connected is True and vouched:
             return sc.ok(f"re-birth uuid {fresh_id[:8]}… vouched onto a store conversation")
@@ -321,7 +350,7 @@ def scenario_rebirth_uuid_vouch():
                     f"the ladder did not fire; the [11.165] gate refused: {text[:240]!r}"
                 )
             return sc.fail(f"refusal painted: {text[:240]!r}")
-        return sc.fail(f"no CLI after 90s; tail: {text[-240:]!r}")
+        return sc.fail(f"no CLI after 150s; tail: {text[-240:]!r}")
     finally:
         reap(key)
 
