@@ -20,8 +20,9 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.173] THE MOUNT-BODY WARM-EVAL GATE IS DEAD ON THE LIVE BUILD — THE VERSION PROBE'S SHAPE CANNOT CROSS THE EVAL BRIDGE, SO EVERY MOUNT STILL COLD-PARSES THE ~500 KB BODY (live-proven 2026-09-27 ~04:40 IST, jojo build 3bc0801024c3)
 
-**FIXED IN CODE — LIVE PROOF OWED** (lane/uxspeed/activation-stall). The
-observation that closes it: after this deploys and jojo rotates, ytrace shows
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+(lane/uxspeed/activation-stall.) The observation that closes it: after this deploys and jojo rotates, ytrace shows
 `terminal_mount/mount_eval_warm` for every mount that still evals the mount
 script, and uxprobe `spawn`'s mount_begin→first_frame leg drops from the
 885-1148 ms rows (3 runs, 09-27) toward what the ~513 ms parse-death promises;
