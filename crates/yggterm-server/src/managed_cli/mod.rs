@@ -2881,6 +2881,10 @@ mod tests {
     /// answering `None` for kimi and muse used to be the gate that skipped them.
     /// It still answers `None` — that is correct, they are not npm packages —
     /// so the gate had to move to a different question, and this proves it did.
+    /// ⛔ [11.175] kimi JOINED muse as a vendor script (the vendor killed
+    /// kimi-cli; the uv binary is a deprecation shim that installs kimi-code).
+    /// No registered CLI is `Uv` anymore — the Uv arm survives as machinery,
+    /// and this comment is where that fact stays visible.
     #[test]
     fn a_uv_or_vendor_cli_is_provisioned_rather_than_refused() {
         assert_eq!(ManagedCliTool::Kimi.npm_package(), None);
@@ -2888,7 +2892,9 @@ mod tests {
         for present in [false, true] {
             assert_eq!(
                 provision_step_for(ManagedCliTool::Kimi.descriptor(), present),
-                Some(ProvisionStep::Uv("kimi-cli"))
+                Some(ProvisionStep::VendorScript(
+                    "https://code.kimi.com/kimi-code/install.sh"
+                ))
             );
             assert_eq!(
                 provision_step_for(ManagedCliTool::Muse.descriptor(), present),
@@ -3181,13 +3187,21 @@ mod tests {
     #[test]
     fn the_install_detail_names_the_method_that_ran() {
         let paths = provision_test_paths("detail");
-        // uv: the package and the uv verb, never the npm prefix.
+        // vendor (kimi-code [11.175]): the URL that was executed. kimi was the
+        // uv example when it was kimi-cli; the vendor line took over the day
+        // the vendor killed kimi-cli.
         let kimi = provision_detail(&paths, ManagedCliTool::Kimi);
-        assert!(kimi.contains("kimi-cli"), "{kimi}");
-        assert!(kimi.contains("uv tool install --upgrade"), "{kimi}");
+        assert!(
+            kimi.contains("https://code.kimi.com/kimi-code/install.sh"),
+            "{kimi}"
+        );
+        assert!(
+            !kimi.contains("uv tool install"),
+            "a vendor install must not name the uv verb: {kimi}"
+        );
         assert!(
             !kimi.contains("npm"),
-            "a uv install must not name the npm prefix: {kimi}"
+            "a vendor install must not name the npm prefix: {kimi}"
         );
 
         // vendor: the URL that was executed.
@@ -3222,7 +3236,13 @@ mod tests {
     /// would not have fixed it.
     #[test]
     fn a_missing_provisioner_is_named_per_method() {
-        assert_eq!(ManagedCliTool::Kimi.package_name(), "kimi-cli");
+        // [11.175] kimi's provisioning source is the vendor URL now — the
+        // status line names where the binary comes from, and that is
+        // code.kimi.com's installer, not a package name.
+        assert_eq!(
+            ManagedCliTool::Kimi.package_name(),
+            "https://code.kimi.com/kimi-code/install.sh"
+        );
         assert_eq!(
             ManagedCliTool::Muse.package_name(),
             "https://dev.meta.ai/install.sh"

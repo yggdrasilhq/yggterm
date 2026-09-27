@@ -119,13 +119,13 @@
     },
     "kimi": {
       "store_globs": [
-        ".kimi/sessions/*/*/wire.jsonl"
+        ".kimi-code/sessions/*/*/state.json"
       ],
       "icon_kind": "kimi",
-      "transcript": ".kimi/sessions/*/{id}/wire.jsonl",
+      "transcript": ".kimi-code/sessions/*/{id}/agents/main/wire.jsonl",
       "format": "jsonl",
       "verified_on_disk": true,
-      "note": "kimi 1.50.0 moved the store BACK to ~/.kimi (md5-of-cwd buckets, bare-uuid session dirs, NO state.json) — the 0.27-era .kimi-code/state.json glob here was dead and the gate test failed until this row caught up ([11.104]; registry owner: session_store_globs = .kimi/sessions/*/*/wire.jsonl per the 11.6.6-a c-tail landing, context.jsonl deliberately unmatched). The session id is the bare-uuid directory; verified 2026-09-14 against a live store by substituting the real id 373af60b-0dc8-42e6-848a-23c5ee8a31c1 into this template and matching its wire.jsonl exactly."
+      "note": "[11.175] 2026-09-27: the vendor killed kimi-cli (the uv 1.52.0 binary is a deprecation SHIM that runs the code.kimi.com installer); the CLI is Kimi Code now, store under ~/.kimi-code/sessions/wd_<basename>_<sha256(cwd)[0..12]>/session_<uuid>/ — state.json (title/workDir/updatedAt) anchors the glob; agents/main/wire.jsonl is the typed event feed. Layout measured on the 0.27.0 store (the 2026-07-18 muse-lab session); the 2.1.1 layout is unmeasured (no authed session exists anywhere yet). Store history: ~/.kimi hashed buckets -> ~/.kimi-code state.json -> ~/.kimi md5 buckets -> back here."
     },
     "zcode-tui": {
       "store_globs": [

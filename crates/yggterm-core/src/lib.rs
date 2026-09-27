@@ -1754,7 +1754,17 @@ fn composer_row_holds_text_impl(
                 .trim_start_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
             if text.starts_with(marker) {
                 anchored = true;
-                let head = text[marker.len_utf8()..].trim();
+                // ⛔ [11.175] THE HEAD ENDS WHERE THE BOX ENDS. kimi-code 2.1.1
+                // rules its composer as `│ > <text> │`: after the gutter strip
+                // the row is `> <text> │`, and the closing RULE is chrome on
+                // the row, not text in the composer — without this end-strip
+                // the EMPTY box's head reads `│` and every idle row holds a
+                // phantom one-char draft. Only rows ending in a light box rule
+                // change shape; every measured open-row composer (codex `›`,
+                // agy `>`, opencode `┃ …`) ends in text or a quote.
+                let head = text[marker.len_utf8()..]
+                    .trim()
+                    .trim_end_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
                 let lowered = head.to_ascii_lowercase();
                 let is_placeholder = descriptor
                     .composer_placeholder_needles
@@ -1801,7 +1811,11 @@ fn composer_row_holds_text_impl(
             .trim()
             .trim_start_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
         if text.starts_with(marker) {
-            let head = text[marker.len_utf8()..].trim();
+            // Same [11.175] end-strip as the box arm above: the closing rule
+            // of a boxed composer row is chrome, not draft text.
+            let head = text[marker.len_utf8()..]
+                .trim()
+                .trim_end_matches(|ch: char| matches!(ch, '\u{2502}' | ' '));
             let verdict = !head.is_empty() || !content.trim().is_empty();
             return (
                 Some(verdict),
@@ -1893,7 +1907,18 @@ fn composer_row_is_chrome(row: &str) -> bool {
     // state must stay readable (trimming it here would blind agy's own
     // classifier), and a `>` with anything after it is transcript (codex
     // error lines start `> text` — [11.66]).
-    if text == ">" && row.starts_with(|ch: char| ch == ' ' || ch == '\t') {
+    // ⛔ [11.175] …UNLESS THE ROW CARRIES THE BOX GUTTER. kimi-code 2.1.1's
+    // EMPTY composer row is `│ >        │` — box-trim it and the residue is
+    // exactly opencode's bare right-aligned `>`; classifying it chrome made
+    // the guard strip the composer row itself and answer cannot-say on every
+    // clean kimi-code screen. The raw light rule (U+2502) in the row is the
+    // discriminator: opencode's corner glyph carries no gutter. With the row
+    // kept, the marker arm anchors `>` and the [11.175] end-strip reads the
+    // empty box Some(false) — the confident-empty answer the wake law needs.
+    if text == ">"
+        && row.starts_with(|ch: char| ch == ' ' || ch == '\t')
+        && !row.contains('\u{2502}')
+    {
         return true;
     }
     // A bare version stamp is vendor chrome, not composer content (opencode
@@ -4129,71 +4154,71 @@ mod tests {
         );
     }
 
-    /// ⛔ [11.6.6-b follow-up] THE DRAFT GUARD GETS THE REGION ARM. kimi 1.50.0
-    /// draws no composer glyph, so the marker scan found no anchor and every
-    /// kimi row answered `None` — the daemon could never see typed-but-unsent
-    /// input in a kimi composer. Measured live 2026-09-14 (muse lab host, kimi
-    /// 1.50.0, type-without-send via `tools/probe-battery suites/kimi.js`,
-    /// probe `composer-draft-shape`, snap `kimi-draft-typed`): the typed text
-    /// renders on the rows directly BELOW the `── input ──` label, above the
-    /// box's bottom rule; the measured footer (`ctrl-j: newline …`,
-    /// `context: 0.0%`) stays. Both fixtures are the real screens, blank vt
-    /// rows included — the guard consumes the raw grid, not a normalized
-    /// extract.
+    /// ⛔ [11.175] THE BOX COMPOSER, TWO CONSUMERS, ONE FIXTURE SET. kimi-code
+    /// 2.1.1 replaced the 1.50 `── input ──` region with a rounded box whose
+    /// input row is `│ > <draft> │` (measured live 2026-09-27, muse lab host,
+    /// type-without-send via the probe-lab kimi-code-intake drive, snaps
+    /// `draft` / `turn-settled`; the marker is the `>` head after box trim).
+    /// The empty box is the regression this pins: its head after the marker is
+    /// the closing RULE, which without the [11.175] end-strip read as a
+    /// phantom one-char draft on every idle row.
     #[test]
-    fn kimi_region_composer_holds_the_typed_draft() {
+    fn kimi_box_composer_holds_the_typed_draft() {
         let rows = |lines: &[&str]| {
             lines
                 .iter()
                 .map(|line| (*line).to_string())
                 .collect::<Vec<_>>()
         };
-        let rule = "\u{2500}".repeat(24);
+        let top = format!("  \u{256d}{}\u{256e}", "\u{2500}".repeat(118));
+        let bottom = format!("  \u{2570}{}\u{256f}", "\u{2500}".repeat(118));
+        let footer = [
+            "  \u{2026}/probe-lab/kimi-code-intake/code-cwd-Z9D83Q                        /goal for multi-step work with a clear finish line",
+            "                                                                                                             context: 0",
+        ];
         let typed = rows(&[
-            "\u{2500}\u{2500} input \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            " PROBE-DRAFT-REGION",
-            "",
-            " ",
-            &rule,
-            "agent  /tmp/kimi-draft-probe  ctrl-j: newline | /feedback: send feedback",
-            "                                                                                           context: 0.0%",
+            &top,
+            "  \u{2502} > PROBE-KC-DRAFT                                                                                               \u{2502}",
+            &bottom,
+            footer[0],
+            footer[1],
         ]);
         assert_eq!(
             super::composer_row_holds_text(Some(SessionKind::Kimi), &typed),
             Some(true),
-            "typed-but-unsent text below the region label is a draft"
+            "typed-but-unsent text inside the box is a draft"
         );
-        // The same screen with the draft cleared (snap `kimi-draft-cleared`):
-        // the label anchors, the region is empty — `Some(false)`, the answer
-        // that lets a clean wake through. `None` (the pre-arm answer) is NOT
-        // acceptable here: it leaves the verdict to the keystroke arm alone,
-        // which is blind after every handover.
+        // The same screen with the draft cleared (snap `first-paint`): the box
+        // anchors, the head is empty once the closing rule is stripped —
+        // `Some(false)`, the answer that lets a clean wake through. This is
+        // the arm the end-strip bought: `Some(true)` here is the phantom.
         let cleared = rows(&[
-            "\u{2500}\u{2500} input \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            "",
-            " ",
-            &rule,
-            "agent  /tmp/kimi-draft-probe  ctrl-j: newline | /feedback: send feedback",
-            "                                                                                           context: 0.0%",
+            &top,
+            "  \u{2502} >                                                                                                                \u{2502}",
+            &bottom,
+            footer[0],
+            footer[1],
         ]);
         assert_eq!(
             super::composer_row_holds_text(Some(SessionKind::Kimi), &cleared),
             Some(false),
-            "the glyph-less region composer empty must read empty, not unknown"
+            "the empty box must read empty, not hold its own closing rule"
         );
-        // Delivered output sitting below a label line must not read as an
-        // empty region either — it is content, and the guard refuses: the
-        // asymmetric cost is a wrong "it is empty", never a needless refusal.
-        let stale = rows(&[
-            "\u{2500}\u{2500} input \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            "\u{2728} PROBE-KIMI-1104-OK",
-            "LLM not set, send \"/login\" to login",
-            "agent  /tmp/kimi-draft-probe  ctrl-j: newline | /feedback: send feedback",
-            "                                                                                           context: 0.0%",
+        // Delivered output sitting above a fresh empty box (the measured
+        // refusal screen, snap `turn-settled`): the box is EMPTY — the old
+        // error is transcript, never draft.
+        let refused = rows(&[
+            "    Error: LLM not set, send \"/login\" to login",
+            &top,
+            "  \u{2502} >                                                                                                                \u{2502}",
+            &bottom,
+            footer[0],
+            footer[1],
         ]);
         assert_eq!(
-            super::composer_row_holds_text(Some(SessionKind::Kimi), &stale),
-            Some(true)
+            super::composer_row_holds_text(Some(SessionKind::Kimi), &refused),
+            Some(false),
+            "the refusal line above the box is transcript, not unsent text"
         );
     }
 

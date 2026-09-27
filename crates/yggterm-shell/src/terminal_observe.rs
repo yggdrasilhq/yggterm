@@ -6161,66 +6161,69 @@ Best thing to improve in the meantime:
         );
     }
 
-    /// ⛔ [11.6.6-b] kimi 1.50.0 draws NO composer glyph — the composer is the
-    /// labeled rule region `── input ────`, and the readiness gate anchored on
-    /// the declared `❯` alone, so a kimi row was never-ready forever. Real
-    /// screen captured 2026-09-14 on the muse lab host (kimi 1.50.0,
-    /// node-pty + vendored xterm, `tools/probe-battery suites/kimi.js`,
-    /// probe session c6490bf8): the fixture keeps the non-empty lines verbatim
-    /// with the rule repeats and the probe cwd trimmed, which is what the
-    /// normalizer consumes.
+    /// ⛔ [11.175] kimi-code 2.1.1 replaced the 1.50 `── input ──` region with
+    /// a rounded box whose input row is `│ >  │` — the marker is the `>` head
+    /// after box trim (`normalized_composer_lines` reduces `│ > text │` to
+    /// `> text`). Measured live 2026-09-27 on the muse lab host (node-pty +
+    /// vendored xterm, the probe-lab kimi-code-intake drive, snap
+    /// `first-paint`): the fixture keeps the non-empty lines verbatim with
+    /// the rule repeats and the probe cwd trimmed, which is what the
+    /// normalizer consumes. Unauthenticated, so the welcome panel carries the
+    /// `/login` hint — a banner line, not a gate.
     #[test]
-    fn kimi_composer_region_label_anchors_the_readiness_gate() {
+    fn kimi_composer_box_anchors_the_readiness_gate() {
         let d = yggterm_core::agent_cli::agent_cli_descriptor(yggterm_core::SessionKind::Kimi)
             .expect("registered");
-        assert_eq!(d.composer_region_label, Some("input"));
-        let idle = "\
-Welcome to Kimi Code CLI!
-Send /help for help information.
-Directory: <probe-cwd>
-Session: c6490bf8-b0c4-44ec-9a9c-8f61041b448d
-Model: not set, send /login to login
-── input ──────────────────────────────────────────────────────────────────
-agent  <probe-cwd>  shift-tab: plan mode | ctrl-o: editor
-context: 0.0%";
-        // The defect, red on main until the region arm landed: a kimi row at
-        // its composer must read READY.
-        assert!(
-            terminal_chunk_has_agent_composer_row(idle),
-            "kimi's `── input ──` region composer did not ready the gate"
+        assert_eq!(d.composer_marker, '\u{3e}');
+        assert_eq!(d.composer_region_label, None);
+        let mut screen = String::from(
+            "  \u{2502}  \u{2596}\u{254b}\u{254b}\u{254b}\u{2597}  Welcome to Kimi Code!\n\
+             \x20 \u{2502}  Run /login or /provider to get started.\n\
+             \x20 \u{2502}  Directory: <probe-cwd>\n\
+             \x20 \u{2502}  Session:\n\
+             \x20 \u{2502}  Model:     not set, run /login or /provider\n\
+             \x20 \u{2502}  Version:   2.1.1\n\
+             \x20 \u{2502} >                                                                          \u{2502}\n",
         );
-        // The measured screens carry no U+276F anywhere — the declared glyph
-        // stays declared (the char lock), but nothing may silently start
-        // matching on it.
-        assert!(!idle.contains('\u{276f}'));
+        screen.push_str(&format!("  \u{2570}{}\u{256f}\n", "\u{2500}".repeat(74)));
+        screen.push_str("  \u{2026}/probe-lab/kimi-code-intake/code-cwd-Z9D83Q                        /goal for multi-step work with a clear finish line\n");
+        screen.push_str("                                                                                                             context: 0");
+        // The defect shape, red on the 1.50 descriptor: a kimi-code row at
+        // its box composer must read READY — the `>` head anchors and the
+        // footer chrome (cwd + /goal hint line, the context meter) clears
+        // everything below.
+        assert!(
+            terminal_chunk_has_agent_composer_row(&screen),
+            "kimi-code's box composer did not ready the gate"
+        );
+        // The measured screens carry no U+276F anywhere on the idle render —
+        // the picker's cursor is the only place the old glyph still exists.
+        assert!(!screen.contains('\u{276f}'));
     }
 
-    /// The region anchor is glyph-FIRST and takes the LAST label line, so a
-    /// stray `input` word in a transcript with real output beneath it must not
-    /// ready the gate — the below-chrome rule still guards the region shape.
+    /// The marker anchor is glyph-FIRST and takes the LAST marker line, so an
+    /// OLD `>` line with real output beneath it must not ready the gate —
+    /// the below-chrome rule still guards the shape.
     #[test]
-    fn kimi_region_is_not_ready_when_output_sits_below_the_label() {
+    fn kimi_box_is_not_ready_when_output_sits_below_the_marker() {
         let stale = "\
-── input ──────────────────────────────────────────────────────────────────
-agent  <probe-cwd>  shift-tab: plan mode | ctrl-o: editor
-context: 0.0%
-✨ PROBE-KIMI-1104-OK
-LLM not set, send \"/login\" to login
-input
-── output that follows a stray label word ──";
+  \u{2502} > PROBE-KIMI-CODE-OK                                                                        \u{2502}
+  \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+    Error: LLM not set, send \"/login\" to login
+No session yet \u{2014} one will be created on your first message.";
         assert!(!terminal_chunk_has_agent_composer_row(stale));
     }
 
-    /// The activity classifier shares the anchor: a kimi row at its region
-    /// composer reads Idle (its working hints are below-declared), not the
-    /// `Unknown` the glyph-blind walk answered forever.
+    /// The activity classifier shares the anchor: a kimi-code row at its box
+    /// composer reads Idle (its footer is below-declared), not the `Unknown`
+    /// the glyph-blind walk answered forever.
     #[test]
-    fn kimi_activity_reads_idle_at_the_region_composer() {
+    fn kimi_activity_reads_idle_at_the_box_composer() {
         let idle = "\
-Model: not set, send /login to login
-── input ──────────────────────────────────────────────────────────────────
-agent  <probe-cwd>  shift-tab: plan mode | ctrl-o: editor
-context: 0.0%";
+  \u{2502} >                                                                        \u{2502}
+  \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+  \u{2026}/probe-lab/kimi-code-intake/code-cwd-Z9D83Q                        /goal for multi-step work with a clear finish line
+                                                                                                             context: 0";
         assert_eq!(
             terminal_chunk_agent_activity(Some(yggterm_core::SessionKind::Kimi), idle),
             AgentRowActivity::Idle

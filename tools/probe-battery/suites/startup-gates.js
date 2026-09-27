@@ -30,10 +30,12 @@
 //                      "Waiting for approval..." / "ctrl+q  quit"): a gate
 //                      by the field's own doctrine — auth-scoped, not
 //                      directory-scoped. Declared ❯ NOT re-askable behind it.
-//   kimi 1.52.0      — UNMEASURABLE: the binary is now a deprecation SHIM
-//                      that auto-runs the code.kimi.com install script
-//                      ("kimi-cli is no longer maintained"); the drive
-//                      rendered the installer, not a TUI. ([11.175])
+//   kimi (Kimi Code 2.1.1) — GATE, directory-scoped: the "Trust this folder?"
+//                      picker is the first screen on a never-opened dir
+//                      ([11.175], re-measured after the 1.52.0 deprecation-
+//                      shim era made PATH-kimi unmeasurable). One-time
+//                      migration pickers precede it on an unmigrated host.
+//                      Declared marker now `>` after box trim (`│ > ` row).
 //   zcode-tui 0.6.14 — NO gate (composer direct; first-party source has no
 //                      directory-trust gate). Declared ▏ U+258F draws
 //                      NOWHERE — the live input head is ▌ U+258C (marker
@@ -56,7 +58,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // readiness rides the region label (kimi), nothing to re-ask.
 const DECLARED_MARKER = {
   opencode: '\u{2503}',
-  kimi: null, // composer_region_label Some("input"); declared ❯ is absent BY MEASUREMENT
+  kimi: '\u{3e}', // [11.175]: the `>` head of the `│ > ` box row, after box trim
   grok: '\u{276f}',
   'zcode-tui': '\u{258f}',
 };
@@ -88,7 +90,16 @@ module.exports = {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
-    const binOf = (cli) => ctx.args[`bin.${cli}`] || cli;
+    const binOf = (cli) => {
+      if (ctx.args[`bin.${cli}`]) return ctx.args[`bin.${cli}`];
+      if (cli === 'kimi') {
+        // PATH `kimi` may be the uv 1.52.0 deprecation SHIM (installer, not a
+        // TUI) — prefer the real CLI's install dir ([11.175]).
+        const real = path.join(os.homedir(), '.kimi-code', 'bin', 'kimi');
+        if (fs.existsSync(real)) return real;
+      }
+      return cli;
+    };
 
     const stageRoot = path.join(os.homedir(), 'probe-lab', 'startup-gates');
     fs.mkdirSync(stageRoot, { recursive: true });
@@ -123,7 +134,9 @@ module.exports = {
           facts.screen = lines.slice(0, 40);
           facts.trust_lines = lines.filter((l) => /trust/i.test(l));
           facts.picker_lines = lines.filter((l) => /^\s*\d[\.\)]\s*\S/.test(l) || /no,?\s*(quit|exit)/i.test(l));
-          facts.gate_detected = facts.trust_lines.length > 0;
+          // ⛔ [11.175] the shim's installer screen is not "no gate": name it.
+          facts.shim_installer = lines.some((l) => /no longer maintained|Running the Kimi Code install/i.test(l));
+          facts.gate_detected = facts.trust_lines.length > 0 || facts.shim_installer;
 
           if (facts.gate_detected) {
             // ⛔ STOP: a picker's wrong keypress quits or spends. The composer
@@ -139,7 +152,9 @@ module.exports = {
           try { drive.dispose(); } catch (_) {}
         }
         Object.assign(ctx.facts, { [cli]: facts });
-        return facts.gate_detected
+        return facts.shim_installer
+          ? `${cli}: SHIM INSTALLER on first screen — PATH binary is the deprecation shim, not a CLI`
+          : facts.gate_detected
           ? `${cli}: GATE on first screen (${facts.trust_lines.length} trust lines)`
           : `${cli}: no gate — composer reachable unasked`;
       });

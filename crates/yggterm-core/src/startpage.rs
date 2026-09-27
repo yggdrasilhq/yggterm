@@ -1689,7 +1689,7 @@ mod scan_truth_tests {
         assert!(kind_has_dedicated_scanner(crate::SessionKind::OpenCode));
         assert!(
             !kind_has_dedicated_scanner(crate::SessionKind::Kimi),
-            "kimi's store is glob-expressible on the 1.50 layout (~/.kimi md5 buckets) too"
+            "kimi's store is glob-expressible on the kimi-code layout (~/.kimi-code wd_ buckets, [11.175]) too"
         );
         assert!(!kind_has_dedicated_scanner(crate::SessionKind::Codex));
     }

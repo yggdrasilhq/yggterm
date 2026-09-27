@@ -46575,13 +46575,18 @@ mod tests {
         assert!(remote_resume_absent_opens_picker(SessionKind::CodexLiteLlm));
         assert!(remote_resume_absent_opens_picker(SessionKind::Muse));
         assert!(remote_resume_absent_opens_picker(SessionKind::Antigravity));
+        // ⛔ [11.175] kimi MOVED LISTS: kimi-code mints `session_<uuid>` at
+        // first turn (the welcome panel prints `Session:` EMPTY; `-S <unknown>`
+        // errors "Session not found" where kimi-cli created the session), so
+        // its store absence is about an id the CLI never stored — the
+        // self-minting posture, measured 2026-09-27 on the muse lab host.
+        assert!(remote_resume_absent_opens_picker(SessionKind::Kimi));
         // Birth-id kinds: their stores ARE keyed by the row id; absence is
         // real and the refusal stands.
         assert!(!remote_resume_absent_opens_picker(
             SessionKind::ClaudeCode
         ));
         assert!(!remote_resume_absent_opens_picker(SessionKind::Pi));
-        assert!(!remote_resume_absent_opens_picker(SessionKind::Kimi));
         assert!(!remote_resume_absent_opens_picker(SessionKind::QwenCode));
         assert!(!remote_resume_absent_opens_picker(
             SessionKind::GrokBuild
