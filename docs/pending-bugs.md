@@ -33,7 +33,7 @@ MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `sch
 ⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
 
 
-## ⛔ [11.181] THE WEB-SURFACE PROVENANCE GATE HARDCODES THE PILOT APP: `launch_command.contains("ychrome")` REFUSES EVERY OTHER REGISTERED APP'S SURFACES — yRDP'S WHOLE CHOOSER FLOW DIED AS `provenance_refused` AND THE ROW SAT ON "CONNECTING" OVER A LIVE, HEALTHY RDP SESSION (owner report + screenshot 2026-09-27 ~12:38 IST, live jojo desktop)
+## ⛔ [11.185] THE WEB-SURFACE PROVENANCE GATE HARDCODES THE PILOT APP: `launch_command.contains("ychrome")` REFUSES EVERY OTHER REGISTERED APP'S SURFACES — yRDP'S WHOLE CHOOSER FLOW DIED AS `provenance_refused` AND THE ROW SAT ON "CONNECTING" OVER A LIVE, HEALTHY RDP SESSION (owner report + screenshot 2026-09-27 ~12:38 IST, live jojo desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
