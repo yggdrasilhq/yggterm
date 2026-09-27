@@ -17720,19 +17720,10 @@ fn remote_saved_session_screen_is_attachable_in(
             .unwrap_or(false)
 }
 
-pub(crate) fn remote_resume_runtime_output_mismatches_saved_session(
-    session_id: &str,
-    snapshot: &[u8],
-) -> bool {
-    remote_resume_runtime_output_mismatches_saved_session_in(
-        session_id,
-        snapshot,
-        &RemoteCodexStoreEnv::from_process(),
-    )
-}
-
-/// [`remote_resume_runtime_output_mismatches_saved_session`] against explicit
-/// env — the test seam.
+/// [`remote_resume_runtime_output_mismatches_saved_session_in`] consults the
+/// store the CLI itself relocates by `CODEX_HOME` — via the explicit
+/// [`RemoteCodexStoreEnv`] parameter, never the process globals (2026-09-27,
+/// fifth pass: the from_process wrapper retired with its last caller).
 fn remote_resume_runtime_output_mismatches_saved_session_in(
     session_id: &str,
     snapshot: &[u8],
@@ -18368,29 +18359,18 @@ fn restored_remote_runtime_codex_session_id(
         .and_then(|value| parse_remote_runtime_agent_session_key(&value).map(str::to_string))
 }
 
-fn refresh_restored_remote_runtime_codex_launch_command(
-    key: &str,
-    session: &mut ManagedSessionView,
-) -> bool {
-    refresh_restored_remote_runtime_codex_launch_command_in(
-        key,
-        session,
-        dirs::home_dir().as_deref(),
-        &RemoteCodexStoreEnv::from_process(),
-    )
-}
-
-/// [`refresh_restored_remote_runtime_codex_launch_command`] against an explicit
-/// home and store env — the test seam. The [11.165] re-arm gate consults the
-/// machine's REAL CLI store through the vouch, so the unseamed fn is
-/// host-sensitive by construction: the restored-opencode fixture red on a host
-/// whose live `~/.local/share/opencode/opencode.db` lacks the fixture id and
-/// green where the store is absent (measured muse-lab host vs dev,
-/// 2026-09-26). A unit test that consults the user's own store passes or fails
-/// on THEIR data — the `_in` twins exist so it never does. The 2026-09-27
-/// fifth pass added the [`RemoteCodexStoreEnv`] param for the same reason on
-/// the codex arm: the deep codex flow tests inject a fixture store instead of
-/// mutating the process `CODEX_HOME`.
+/// The restored-runtime launch repair against an explicit home and store env —
+/// the test seam. The [11.165] re-arm gate consults the machine's REAL CLI
+/// store through the vouch, so an unseamed fn is host-sensitive by
+/// construction: the restored-opencode fixture red on a host whose live
+/// `~/.local/share/opencode/opencode.db` lacks the fixture id and green where
+/// the store is absent (measured muse-lab host vs dev, 2026-09-26). A unit
+/// test that consults the user's own store passes or fails on THEIR data —
+/// the `_in` twins exist so it never does. The 2026-09-27 fifth pass added
+/// the [`RemoteCodexStoreEnv`] param for the same reason on the codex arm:
+/// the deep codex flow tests inject a fixture store instead of mutating the
+/// process `CODEX_HOME`. (The from_process wrapper retired with its last
+/// production caller — every server site passes the birth-resolved field.)
 fn refresh_restored_remote_runtime_codex_launch_command_in(
     key: &str,
     session: &mut ManagedSessionView,
@@ -18678,7 +18658,12 @@ mod restored_runtime_repair_tests {
         let key = "remote-agy://buildbox/3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
         let ssh_launch = "exec ssh -tt buildbox 'agy --conversation 3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011'";
         let mut session = agy_session(key, ssh_launch);
-        let repaired = refresh_restored_remote_runtime_codex_launch_command(key, &mut session);
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            key,
+            &mut session,
+            None,
+            &RemoteCodexStoreEnv::default(),
+        );
         assert!(!repaired, "a remote row is not a restored daemon runtime");
         assert_eq!(session.session_path, key, "the row keeps its remote path");
         assert_eq!(session.launch_command, ssh_launch, "the ssh launch survives");
@@ -18711,7 +18696,12 @@ mod restored_runtime_repair_tests {
         let key = format!("codex-runtime://{id}");
         let mut session = codex_session_for_repair(&key, &format!("codex resume {id}"));
         session.source = SessionSource::LiveLocal;
-        let repaired = refresh_restored_remote_runtime_codex_launch_command(&key, &mut session);
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            &key,
+            &mut session,
+            None,
+            &RemoteCodexStoreEnv::default(),
+        );
         assert!(repaired, "the restored daemon-runtime case must keep working");
         assert_eq!(session.session_path, key);
         assert_eq!(session.source, SessionSource::LiveLocal);
@@ -41178,9 +41168,10 @@ mod tests {
                 message.as_bytes()
             ));
             assert!(
-                !super::remote_resume_runtime_output_mismatches_saved_session(
+                !super::remote_resume_runtime_output_mismatches_saved_session_in(
                     "abc123",
-                    message.as_bytes()
+                    message.as_bytes(),
+                    &super::RemoteCodexStoreEnv::default(),
                 )
             );
         }
