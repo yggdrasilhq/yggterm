@@ -591,6 +591,16 @@ const REMOTE_LIVE_PREWARM_ROWS: u16 = 50;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
+/// [11.178] The warm mount eval can be PHANTOM-COMPLETED by WebKitGTK:
+/// run_javascript answers Ok(null) without executing a single statement
+/// (rig 2026-09-27: dispatch ok -> eval_complete ok(null), no wrapper entry,
+/// no bridge event, while small evals before and a 1.5 MB cold after both
+/// execute; wry queue, script size (<=4 MB idle), syntax and dispatch thread
+/// all exonerated). A healthy warm mount's first bridge event (the bootstrap
+/// js_debug) lands well under 500 ms, so this much silence means the eval
+/// vanished and the cold installer must be dispatched without waiting for
+/// the recover ladder.
+const TERMINAL_WARM_EVAL_LIVENESS_MS: u64 = 1_000;
 // Cap on consecutive startup-restore recoveries without a Ready in between —
 // past this, further remounts are futile churn (see
 // startup_terminal_restore_should_recover).

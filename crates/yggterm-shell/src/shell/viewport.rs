@@ -6637,6 +6637,30 @@ fn TerminalCanvas(
             let mut reveal_cover = crate::reveal_cover::RevealCoverGate::new();
             let mut unfocused_tui_drop_active = false;
             let mut eval_result = Box::pin(eval.clone().join::<Value>());
+            // [11.178] Arm the warm-eval liveness gate only when the warm
+            // path was taken; the cold installer is built up front so the
+            // vanish arm below can re-dispatch it without touching the
+            // ensure/read channels it races.
+            let mut cold_fallback_script = if mount_fn_installed {
+                Some(terminal_eval_script_with_pinned_grid_seeded(
+                    &host_id,
+                    &theme,
+                    initial_input_focus,
+                    pinned_grid,
+                    initial_grid,
+                    yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
+                    yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
+                    initial_buffer_kind.as_deref(),
+                ))
+            } else {
+                None
+            };
+            let mut warm_liveness_deadline = if mount_fn_installed {
+                Some(tokio::time::Instant::now() + Duration::from_millis(TERMINAL_WARM_EVAL_LIVENESS_MS))
+            } else {
+                None
+            };
+            let mut saw_warm_bridge_event = false;
             loop {
                 // The PRE-SELECT body (focus bookkeeping, bridge flush, screen
                 // reconcile — including a daemon snapshot round trip when a
@@ -7124,6 +7148,8 @@ fn TerminalCanvas(
                         }
                     }
                     result = &mut eval_result => {
+                        saw_warm_bridge_event = true;
+                        warm_liveness_deadline = None;
                         let _ = safe_shell_mut(state, "terminal_attach_bridge_result", |shell| {
                             release_terminal_bootstrap_lease_if_current(
                                 shell,
@@ -7175,6 +7201,10 @@ fn TerminalCanvas(
                         break;
                     }
                     event = eval.recv::<TerminalJsEvent>() => {
+                        // [11.178] Any bridge event proves the mount eval
+                        // executed — the vanish gate is done for this mount.
+                        saw_warm_bridge_event = true;
+                        warm_liveness_deadline = None;
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "js_event",
                             &session_path,
@@ -11404,6 +11434,45 @@ fn TerminalCanvas(
                                     }
                                 }
                             }
+                        }
+                    }
+                    // [11.178] The warm mount eval PHANTOM-COMPLETED: WebKitGTK
+                    // answered Ok(null) without executing a single statement, so
+                    // neither the bridge nor eval_result will ever produce
+                    // evidence. One second of total bridge silence on the warm
+                    // path is that vanish; re-dispatch the cold installer in-task
+                    // instead of paying the ~8.3 s recover ladder per spawn. The
+                    // [11.176] streak ladder stays armed behind this as the outer
+                    // bound (a vanished REDO lands there).
+                    _ = tokio::time::sleep_until(
+                        warm_liveness_deadline
+                            .unwrap_or_else(tokio::time::Instant::now),
+                    ),
+                        if warm_liveness_deadline.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "warm_eval_liveness",
+                            &session_path,
+                        );
+                        warm_liveness_deadline = None;
+                        if !saw_warm_bridge_event {
+                            let Some(cold_script) = cold_fallback_script.take() else {
+                                continue;
+                            };
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "warm_eval_vanish_redo_cold",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                    "mount_epoch": mount_epoch,
+                                    "liveness_ms": TERMINAL_WARM_EVAL_LIVENESS_MS,
+                                }),
+                            );
+                            eval = terminal_document.eval(cold_script);
+                            eval_result = Box::pin(eval.clone().join::<Value>());
                         }
                     }
                     _ = tokio::time::sleep_until(next_read_deadline),

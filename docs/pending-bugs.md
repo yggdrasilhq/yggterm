@@ -73,7 +73,7 @@ merge-cache keys + SessionPreview drop chains) below ~2% of raise-window
 GUI samples (from ~19%), and uxprobe switch activation_ms p50 on scratch
 pairs drops accordingly; no regression in `reveal_served` counts.
 
-## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN; defused for spawns by the [11.176] fix — rig recipe included)
+## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN at the WebKitGTK layer — spawn cost FIXED IN CODE by the warm-eval liveness gate; rig recipe + dispatch-stamp recipe included)
 
 **Status:** OPEN
 
@@ -101,11 +101,20 @@ Force `mount_fn_installed = false` (cold installer): 3/3 painted ~1.6 s. The war
 path is the wedge; cold is clean; both daemons (7227be34aabc and current main)
 behave identically in the rig — the daemon is exonerated.
 
-NEXT: instrument the eval DISPATCH (wry/dioxus-desktop layer) for the warm script —
-stamp dispatch-accepted/rejected at the IPC boundary; suspect a document-state
-window where a script containing a top-level `await` of a long-lived promise is
-silently dropped while `return`-probes pass. The [11.176] fix (streak-aware cold
-fallback) bounds the felt damage; this entry owns the root cause.
+RESOLVED-NARROWED 2026-09-27 evening (lane/uxspeed/warm-mount-wedge, dispatch-stamp rig): the eval
+is PHANTOM-COMPLETED by WebKitGTK — `run_javascript` answers Ok(null) ~90 ms after dispatch and the
+script never executes one statement (no wrapper entry, no bridge event, the eval future never
+settles), while small evals ms earlier and a 1.5 MB cold eval seconds later execute normally.
+Exonerated by the same rig: the wry pending_scripts queue (0 queued dispatches), script size (<=4 MB
+executes on an idle page through the identical path), syntax/async shape (a construct/call failure
+posts an error and settles), and dispatch thread (same task as the resolving probe). The window is
+the spawn churn only; an idle page never drops. Still OPEN is WHY WebKitGTK no-ops — next step is a
+minimal standalone repro for an upstream WebKitGTK report. The dispatch stamps (wry eval
+branch/completion, dioxus query dispatch, wrapper-entry/ipc stamps, page-side eval ring) are
+diagnostic-only and NOT merged; each is a ~5-line eprintln at wry `webkitgtk/mod.rs` eval() + the
+run_javascript callback, dioxus-desktop `query.rs` new_query(), and a `launch.rs` IpcMethod::Other
+arm. Rebuild them in minutes when chasing the webkit why.
+
 
 LIVE-PROVEN 2026-09-27 ~11:20 IST on rotated jojo (d96c246121f5): uxprobe spawn
 4/4 painted (8.2-10.3 s, the warm-stall -> recover -> cold -> first_frame ladder),
@@ -113,6 +122,20 @@ LIVE-PROVEN 2026-09-27 ~11:20 IST on rotated jojo (d96c246121f5): uxprobe spawn
 FIRST mount still pays the warm-stall + ~5 s recover + cold-paint tail — the fast
 warm path returns only after the streak resets; landing this entry's root cause is
 what buys the sub-second warm spawn back.
+
+FIXED-IN-CODE 2026-09-27 ~18:10 IST (lane/uxspeed/warm-mount-wedge fdfdf0c0): the warm-eval
+liveness gate. A healthy warm mount's first bridge event lands well under 500 ms, so 1 s of TOTAL
+bridge silence after a warm dispatch (`TERMINAL_WARM_EVAL_LIVENESS_MS`, state.rs) is read as the
+vanish and the COLD installer is re-dispatched in-task — no recover wait, no re-render dependency.
+Rig proof (spawn x3, fresh home): vanish gates fire at +1.0 s on the warm spawns, the redo cold
+mounts in ~150 ms (mount_open +152 ms, first_frame +366 ms after the gate),
+`startup_terminal_restore_recover` never fires, uxprobe spawn_to_paint 9.1-9.9 s -> 6.6-6.8 s (the
+~6.6 s residual is the rig daemon-bootstrap+prompt floor, a different cost center). FALSIFIER for
+the gate: a spawn whose warm eval vanishes and still pays the recover ladder
+(`startup_terminal_restore_recover` present on a spawn path), or a permanent blank after a
+`warm_eval_vanish_redo_cold` trace event. LIVE PROOF OWED on a rotated desktop. Scope note: the
+gate arms on the WARM path only; a vanished COLD first mount (seen once in the rig) stays bounded
+by the [11.176] streak ladder.
 
 ## ⛔ [11.177] THE MANAGED GENERATION RE-POINTS UNDER A STALE LOGIN-RESOLVED BINARY, AND THE EFFECTIVE-VERSION DRIFT EVENT CANNOT FIRE — THE REFRESH GATES ITS OWN DRIFT CHECK ON "INSTALL NOT DEFERRED" (measured 2026-09-27, muse lab host)
 
