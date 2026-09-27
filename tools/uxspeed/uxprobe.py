@@ -341,6 +341,183 @@ refuse("delete_overlay_did_not_close");
 # and the row menu open through the chord path — the walls the chord
 # instrument exists to measure — and leaves every container closed again.
 # No menu item is ever fired here.
+SPLIT_OPEN_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const PATH_A = {session_a!r};
+const AXIS = {axis!r};  // "split-side-by-side" | "split-stacked"
+const refuse = (reason, extra) => dioxus.send(
+    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+if (document.querySelector('[data-split-group-row="1"]')) {{
+    refuse("split_group_already_on_screen");
+    return;
+}}
+const dismiss = async () => {{
+    try {{
+        const t = document.elementFromPoint(3, 3) || document.body;
+        const b = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, clientX: 3, clientY: 3, screenX: 3,
+                     screenY: 3, button: 0, buttons: 1 }};
+        t.dispatchEvent(new MouseEvent('mousedown', b));
+        t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
+        t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
+        await settle(80);
+    }} catch (_e) {{}}
+}};
+await dismiss();
+const row = await (async () => {{
+    // the sidebar virtualizes: the node may not exist until the row is
+    // selected and scrolled into view (the driver tree-selects first)
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {{
+        const n = document.querySelector(
+            '[data-sidebar-row-path="' + PATH_A + '"]');
+        if (n) return n;
+        await settle(50);
+    }}
+    return null;
+}})();
+if (!row) {{
+    refuse("sidebar_row_missing", {{ session_path: PATH_A }});
+    return;
+}}
+const rect = row.getBoundingClientRect();
+if (!(rect.width > 0 && rect.height > 0)) {{
+    refuse("sidebar_row_not_visible", {{ session_path: PATH_A }});
+    return;
+}}
+const cx = Number((rect.left + rect.width / 2).toFixed(2));
+const cy = Number((rect.top + rect.height / 2).toFixed(2));
+const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                button: 2, buttons: 2, detail: 1 }};
+const t_open = Date.now();
+row.dispatchEvent(new MouseEvent('mousedown', init));
+row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('contextmenu', init));
+let menu = null, splitItem = null;
+const openDeadline = Date.now() + 1500;
+while (Date.now() < openDeadline) {{
+    await settle(40);
+    menu = document.querySelector('[data-context-menu="1"]');
+    splitItem = menu?.querySelector(
+        '[data-context-menu-action="' + AXIS + '"]') || null;
+    if (menu && splitItem) break;
+}}
+if (!menu || !splitItem) {{
+    await dismiss();
+    refuse("context_menu_or_split_item_not_observed",
+           {{ session_path: PATH_A, axis: AXIS }});
+    return;
+}}
+const menu_open_ms = Date.now() - t_open;
+const item_label = String(splitItem.textContent || '').slice(0, 80);
+await settle(120);
+const clickInit = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 }};
+splitItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
+splitItem.dispatchEvent(new MouseEvent('mouseup',
+    {{ ...clickInit, buttons: 0 }}));
+splitItem.dispatchEvent(new MouseEvent('click', clickInit));
+const t_click = Date.now();
+// The split's paint truth lives in THIS document: the compound sidebar row
+// ([data-split-group-row]) and the pane rects ([data-split-session]) with
+// the split layer active. Both panes are webview rects laid out natively;
+// their xterm surfaces paint in their own webviews.
+let compound = null, panes = [];
+const domDeadline = t_click + 2500;
+while (Date.now() < domDeadline) {{
+    await settle(25);
+    compound = document.querySelector('[data-split-group-row="1"]');
+    panes = [...document.querySelectorAll('[data-split-session]')];
+    if (compound && panes.length >= 2) break;
+}}
+const t_dom = Date.now();
+if (!compound || panes.length < 2) {{
+    refuse("split_dom_truth_did_not_land",
+           {{ menu_open_ms, compound_found: !!compound,
+              pane_count: panes.length }});
+    return;
+}}
+const paneRect = (n) => {{
+    const r = n.getBoundingClientRect();
+    return {{ x: Math.round(r.left), y: Math.round(r.top),
+              w: Math.round(r.width), h: Math.round(r.height) }};
+}};
+dioxus.send({{
+    accepted: true,
+    menu_open_ms,
+    click_to_dom_ms: t_dom - t_click,
+    dispatch_to_dom_ms: t_dom - t_open,
+    item_label,
+    compound_label: String(compound.textContent || '').slice(0, 80),
+    pane_count: panes.length,
+    panes: panes.map((n) => ({{
+        session: n.getAttribute('data-split-session'),
+        pane_index: n.getAttribute('data-split-pane-index'),
+        rect: paneRect(n),
+    }})),
+}});
+"""
+
+SPLIT_UNGROUP_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const refuse = (reason, extra) => dioxus.send(
+    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+const compound = document.querySelector('[data-split-group-row="1"]');
+if (!compound) {{
+    refuse("compound_row_missing");
+    return;
+}}
+const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: 0, clientY: 0, button: 2, buttons: 2, detail: 1 }};
+const r = compound.getBoundingClientRect();
+init.clientX = init.screenX = Math.round(r.left + r.width / 2);
+init.clientY = init.screenY = Math.round(r.top + r.height / 2);
+const t0 = Date.now();
+compound.dispatchEvent(new MouseEvent('mousedown', init));
+compound.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
+compound.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+compound.dispatchEvent(new MouseEvent('contextmenu', init));
+let menu = null, item = null;
+const deadline = Date.now() + 1500;
+while (Date.now() < deadline) {{
+    await settle(40);
+    menu = document.querySelector('[data-context-menu="1"]');
+    item = menu?.querySelector(
+        '[data-context-menu-action="ungroup-split"]') || null;
+    if (menu && item) break;
+}}
+if (!menu || !item) {{
+    await dismiss();
+    refuse("context_menu_or_ungroup_item_not_observed");
+    return;
+}}
+await settle(120);
+const clickInit = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 }};
+item.dispatchEvent(new MouseEvent('mousedown', clickInit));
+item.dispatchEvent(new MouseEvent('mouseup',
+    {{ ...clickInit, buttons: 0 }}));
+item.dispatchEvent(new MouseEvent('click', clickInit));
+const tClick = Date.now();
+const deadline2 = tClick + 2000;
+while (Date.now() < deadline2) {{
+    await settle(25);
+    if (!document.querySelector('[data-split-group-row="1"]') &&
+        document.querySelectorAll('[data-split-session]').length === 0) break;
+}}
+const tGone = Date.now();
+const stillCompound = !!document.querySelector('[data-split-group-row="1"]');
+dioxus.send({{
+    accepted: !stillCompound,
+    ungroup_to_gone_ms: tGone - tClick,
+    menu_open_ms: 0,
+    still_compound: stillCompound,
+    pane_count_after: document.querySelectorAll(
+        '[data-split-session]').length,
+}});
+"""
 CHORD_LEG_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
@@ -1712,6 +1889,126 @@ dioxus.send(out);
         out["confirm_leg_result"] = confirm_result
         return summarize(out, key="dispatch_to_mount_ms")
 
+    def split_events_from_trace(self, since_ms: int) -> dict:
+        """The split pair: context_menu_activate{action:split-*} -> split/create
+        (joined by the window, both one-shot events; group_id in the payload is
+        the identity assert). Refusal events are surfaced, never swallowed."""
+        out = {"activate": None, "create": None, "create_refused": None,
+               "ungrouped": None, "ungroup_refused": None}
+        for ev in self.ytrace_events(since_ms):
+            name = ev.get("name")
+            payload = self._ui_payload(ev)
+            if name == "context_menu_activate" \
+                    and str(payload.get("action", "")).startswith("split-"):
+                out["activate"] = {"ts": ev.get("ts_ms"),
+                                   "action": payload.get("action")}
+            elif name == "split/create":
+                out["create"] = {"ts": ev.get("ts_ms"),
+                                 "group_id": payload.get("group_id"),
+                                 "axis": payload.get("axis"),
+                                 "origin": payload.get("origin"),
+                                 "members": payload.get("members")}
+            elif name == "split/create_refused":
+                out["create_refused"] = {"reason": payload.get("reason")}
+            elif name == "split/ungrouped":
+                out["ungrouped"] = {"ts": ev.get("ts_ms"),
+                                    "group_id": payload.get("group_id")}
+            elif name == "split/ungroup_refused":
+                out["ungroup_refused"] = {"reason": payload.get("reason")}
+        if out["activate"] and out["create"]:
+            out["pair_ms"] = out["create"]["ts"] - out["activate"]["ts"]
+        return out
+
+    def action_split(self, iters: int) -> dict:
+        """The split vertical: right-click a scratch row's REAL sidebar menu ->
+        Split side by side -> commit + DOM truth. Accuracy = the pane set is
+        EXACTLY the two scratch rows, both pane rects on screen, and ungroup
+        restores the rows without closing anyone (blast-radius law)."""
+        out = {"iterations": []}
+        scratch = self.ensure_two_scratch_rows()
+        if len(scratch) < 2:
+            return {"error": "need two scratch rows", "iterations": []}
+        a_path, b_path = scratch[0], scratch[1]
+        for i in range(iters):
+            acc = []
+            # both rows selected: the menu's split candidates are the
+            # right-clicked row + the selection (split_candidate_paths_for)
+            self.verb("tree", "select", a_path, b_path, "--anchor", a_path)
+            time.sleep(0.15)
+            t0 = now_ms()
+            js = SPLIT_OPEN_JS.replace("{session_a!r}", repr(a_path))
+            js = js.replace("{axis!r}", repr("split-side-by-side"))
+            r = self.verb("dom-eval", js, timeout=25)
+            open_wall_ms = now_ms() - t0
+            result = ((r.get("json") or {}).get("data") or {}).get("result") or {}
+            if not r["ok"]:
+                acc.append(f"dom-eval failed: {r.get('error')}")
+            if result.get("dom_eval_error"):
+                acc.append(f"script error: {result['dom_eval_error']}")
+            if not result.get("accepted"):
+                acc.append(f"split refused: {result.get('reason')}")
+            pair = self.split_events_from_trace(t0)
+            if result.get("accepted"):
+                if pair.get("pair_ms") is None:
+                    acc.append("no context_menu_activate -> split/create pair "
+                               "in ytrace within window (build not rotated "
+                               "onto the split instrument, or refusal)")
+                create = pair.get("create") or {}
+                if create.get("origin") not in ("menu", None):
+                    acc.append("split/create origin=%s (want menu)"
+                               % create.get("origin"))
+                if create.get("axis") not in ("side by side", None):
+                    acc.append("split/create axis=%s (want side by side)"
+                               % create.get("axis"))
+                members = [m.get("session") for m in
+                           (create.get("members") or [])]
+                if members and set(members) != {a_path, b_path}:
+                    acc.append("split/create members=%s (want exactly the "
+                               "two scratch rows)" % members)
+                panes = result.get("panes") or []
+                pane_sessions = {p.get("session") for p in panes}
+                if panes and not {a_path, b_path} <= pane_sessions:
+                    acc.append("pane rects missing a scratch session: %s"
+                               % pane_sessions)
+                rects = [p.get("rect") for p in panes]
+                if any(not r2 or r2["w"] <= 0 or r2["h"] <= 0 for r2 in rects):
+                    acc.append("a pane rect is empty (split not visible)")
+            # UNGROUP — the teardown must restore both rows alive
+            ungroup = {}
+            if result.get("accepted"):
+                time.sleep(0.3)
+                ru = self.verb("dom-eval", SPLIT_UNGROUP_JS, timeout=15)
+                ungroup = ((ru.get("json") or {}).get("data")
+                           or {}).get("result") or {}
+                if not ungroup.get("accepted"):
+                    acc.append(f"ungroup failed: {ungroup.get('reason')} "
+                               f"(still_compound={ungroup.get('still_compound')})")
+                else:
+                    pair2 = self.split_events_from_trace(t0)
+                    if not pair2.get("ungrouped"):
+                        acc.append("no split/ungrouped event in ytrace")
+                time.sleep(0.3)
+                live = set(self.live_session_paths())
+                lost = [p for p in (a_path, b_path) if p not in live]
+                if lost:
+                    acc.append("UNGROUP CLOSED SCRATCH ROWS: %s" % lost)
+            out["iterations"].append({
+                "open_wall_ms": open_wall_ms,
+                "menu_open_ms": result.get("menu_open_ms"),
+                "click_to_dom_ms": result.get("click_to_dom_ms"),
+                "dispatch_to_dom_ms": result.get("dispatch_to_dom_ms"),
+                "pair_ms": pair.get("pair_ms"),
+                "create_origin": (pair.get("create") or {}).get("origin"),
+                "create_axis": (pair.get("create") or {}).get("axis"),
+                "member_count": len((pair.get("create") or {})
+                                    .get("members") or []),
+                "pane_count": result.get("pane_count"),
+                "compound_label": result.get("compound_label"),
+                "ungroup_to_gone_ms": ungroup.get("ungroup_to_gone_ms"),
+                "accuracy_failures": acc,
+            })
+        return summarize(out, key="click_to_dom_ms")
+
     # ---- waiters --------------------------------------------------------
 
     def wait_order(self, a_path: str, b_path: str,
@@ -1776,7 +2073,7 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch")
+                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch,split")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -1824,6 +2121,8 @@ def main() -> int:
                 report["actions"]["close"] = probe.action_close()
             elif action == "closeall":
                 report["actions"]["closeall"] = probe.action_closeall(args.iters)
+            elif action == "split":
+                report["actions"]["split"] = probe.action_split(args.iters)
             else:
                 report["actions"][action] = {"error": f"unknown action {action}"}
             log(f"  {json.dumps(report['actions'][action], default=str)[:300]}")

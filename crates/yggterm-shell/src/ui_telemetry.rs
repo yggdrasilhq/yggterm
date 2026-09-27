@@ -33,6 +33,16 @@ pub(crate) fn ui_telemetry_should_record(
     {
         return false;
     }
+    // A continuous window drag fires Resized faster than the frame cadence;
+    // the resize begin marker wants the gesture's shape, not every native
+    // callback — at most one `window/resized` per 150 ms regardless of size.
+    if event == "window/resized" {
+        if let Some((_, last_ms)) = recent_ui_telemetry.get(event)
+            && now_ms.saturating_sub(*last_ms) < 150
+        {
+            return false;
+        }
+    }
     // Also rate-limit preview_debug even when payload differs — it was the sole
     // 1s stall source (ytrace ui/block 32 samples p95 1111ms, all preview_debug)
     if event == "preview_debug" {
@@ -98,6 +108,31 @@ mod tests {
             "terminal_open_attempt",
             r#"{"state":"ready"}"#,
             3_501
+        ));
+    }
+
+    #[test]
+    fn window_resized_is_rate_limited_regardless_of_payload() {
+        let mut recent = HashMap::new();
+        assert!(ui_telemetry_should_record(
+            &mut recent,
+            "window/resized",
+            r#"{"width":1460,"height":920}"#,
+            1_000
+        ));
+        // a drag fires Resized many times per second; sizes differ, the
+        // 150 ms any-payload floor still holds the plane down
+        assert!(!ui_telemetry_should_record(
+            &mut recent,
+            "window/resized",
+            r#"{"width":1461,"height":920}"#,
+            1_080
+        ));
+        assert!(ui_telemetry_should_record(
+            &mut recent,
+            "window/resized",
+            r#"{"width":1461,"height":920}"#,
+            1_151
         ));
     }
 

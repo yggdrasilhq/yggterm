@@ -1612,10 +1612,16 @@ fn app() -> Element {
                         window_epoch.with_mut(|epoch| *epoch += 1);
                     }
                 }
-                DesktopWindowEvent::Moved(_)
-                | DesktopWindowEvent::Resized(_)
-                | DesktopWindowEvent::ScaleFactorChanged { .. } => {
+                DesktopWindowEvent::Moved(_) | DesktopWindowEvent::ScaleFactorChanged { .. } => {
                     state.with_mut_counted(sync_window_frame_state);
+                    window_epoch.with_mut(|epoch| *epoch += 1);
+                }
+                DesktopWindowEvent::Resized(size) => {
+                    state.with_mut_counted(|shell| {
+                        sync_window_frame_state(shell);
+                        let (width, height) = (size.width, size.height);
+                        shell.record_window_resized(width, height);
+                    });
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::Focused(focused) => {

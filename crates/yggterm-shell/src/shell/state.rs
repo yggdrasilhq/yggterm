@@ -35768,6 +35768,21 @@ impl ShellState {
         }
         append_ui_telemetry_event(event, payload);
     }
+    /// The resize action's begin marker (ux-speed split-window-vocab lane):
+    /// the native window committed a new inner size. The REPAINT half rides
+    /// the existing families (daemon resize events with grid hashes; the
+    /// xterm surface's own paint markers), so this event only has to say
+    /// WHEN the window changed and to WHAT — throttle rules in
+    /// ui_telemetry keep a continuous drag from flooding the plane.
+    pub(crate) fn record_window_resized(&mut self, width: u32, height: u32) {
+        self.record_ui_telemetry(
+            "window/resized",
+            json!({
+                "width": width,
+                "height": height,
+            }),
+        );
+    }
     fn persist_settings(&self) {
         yggterm_core::set_perf_profiling_enabled(self.settings.perf_profiling_enabled);
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
@@ -40816,11 +40831,13 @@ fn create_split_group(
     state: Signal<ShellState>,
     members: Vec<String>,
     axis: SplitAxis,
+    origin: SplitOrigin,
 ) -> Option<String> {
     create_split_group_from_members(
         state,
         members.into_iter().map(SplitMember::terminal).collect(),
         axis,
+        origin,
     )
 }
 
@@ -40833,6 +40850,7 @@ fn create_split_group_from_members(
     mut state: Signal<ShellState>,
     members: Vec<SplitMember>,
     axis: SplitAxis,
+    origin: SplitOrigin,
 ) -> Option<String> {
     let outcome = state.with_mut_counted(|shell| {
         let mut seen = HashSet::new();
@@ -40841,12 +40859,29 @@ fn create_split_group_from_members(
             .filter(|member| seen.insert((member.session.clone(), member.view.clone())))
             .collect();
         if members.len() < 2 {
+            // The ux-speed pair's refusal half: a silent refusal reads the
+            // same as "build not rotated onto the instrument yet" to a probe.
+            shell.record_ui_telemetry(
+                "split/create_refused",
+                json!({
+                    "reason": "needs_two_distinct_members",
+                    "origin": origin,
+                }),
+            );
             return None;
         }
         if members
             .iter()
             .any(|member| shell.split_group_for_session(&member.session).is_some())
         {
+            shell.record_ui_telemetry(
+                "split/create_refused",
+                json!({
+                    "reason": "member_already_grouped",
+                    "origin": origin,
+                    "members": split_members_payload(&members),
+                }),
+            );
             return None;
         }
         let live = shell.server.live_sessions();
@@ -40870,6 +40905,8 @@ fn create_split_group_from_members(
         let seq = NEXT_SPLIT_GROUP_SEQ.fetch_add(1, Ordering::Relaxed);
         let group_id = format!("{}-{seq}", current_millis());
         let first_member = members[0].session.clone();
+        // serialized before the push moves `members` into the group
+        let members_payload = split_members_payload(&members);
         shell.split_groups.push(SplitGroup {
             group_id: group_id.clone(),
             axis,
@@ -40879,6 +40916,23 @@ fn create_split_group_from_members(
             prior_keep_alive,
         });
         shell.persist_split_groups();
+        // The split action's commit marker (ux-speed split-window-vocab lane):
+        // the felt path is context_menu_activate{action:split-*} (begin,
+        // already instrumented) -> split/create (THIS commit) -> pane surfaces
+        // revealing/fitting at their pane rects (the paint path). Without this
+        // event the create leg is dark and click->commit latency is
+        // unmeasurable. One choke point serves menu, app-control and web-tab
+        // creation, so every origin is paired.
+        shell.record_ui_telemetry(
+            "split/create",
+            json!({
+                "group_id": group_id,
+                "axis": axis_label(axis),
+                "origin": origin,
+                "members": members_payload,
+                "keep_alive_forced": keep_alive_calls.len(),
+            }),
+        );
         shell.close_context_menu();
         shell.last_action = format!("split group ({}) created", axis_label(axis));
         Some((group_id, keep_alive_calls, first_member))
@@ -40935,7 +40989,28 @@ fn split_web_tab_into_pane(
             },
         ],
         axis,
+        "web_tab",
     )
+}
+
+/// Where a split-group mutation came from. The trace payload carries it so a
+/// probe can assert it drove the SAME path a user's hand drives (the menu),
+/// not a backdoor.
+type SplitOrigin = &'static str;
+
+/// The members array shared by the split/create + split/create_refused
+/// payloads — session + view per pane, so a probe can assert the EXACT pane
+/// set (accuracy), not just a member count.
+fn split_members_payload(members: &[SplitMember]) -> Vec<Value> {
+    members
+        .iter()
+        .map(|member| {
+            json!({
+                "session": member.session,
+                "view": format!("{:?}", member.view),
+            })
+        })
+        .collect()
 }
 
 fn axis_label(axis: SplitAxis) -> &'static str {
@@ -41125,6 +41200,10 @@ fn ungroup_split_group(mut state: Signal<ShellState>, group_id: &str) {
             .iter()
             .position(|group| group.group_id == group_id)
         else {
+            shell.record_ui_telemetry(
+                "split/ungroup_refused",
+                json!({ "group_id": group_id, "reason": "group_not_found" }),
+            );
             return Vec::new();
         };
         let group = shell.split_groups.remove(pos);
@@ -41137,6 +41216,18 @@ fn ungroup_split_group(mut state: Signal<ShellState>, group_id: &str) {
             }
         }
         shell.persist_split_groups();
+        // The ungroup half of the split pair (ux-speed split-window-vocab
+        // lane): click->panes-gone latency and the keep-alive restore are
+        // unreadable without a commit marker, and the probe's teardown leg
+        // must be able to assert the ungroup actually committed.
+        shell.record_ui_telemetry(
+            "split/ungrouped",
+            json!({
+                "group_id": group_id,
+                "members": group.members.len(),
+                "keep_alive_restored": restore.len(),
+            }),
+        );
         shell.close_context_menu();
         shell.last_action = "ungrouped split".to_string();
         restore
@@ -89174,7 +89265,7 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::CreateSplitGroup { members, axis } => {
             let axis = parse_split_axis(axis.as_deref());
-            let group_id = create_split_group(state, members.clone(), axis);
+            let group_id = create_split_group(state, members.clone(), axis, "app_control");
             let split_groups = state.with(|shell| split_groups_debug_json(shell));
             AppControlResponse {
                 request_id: request.request_id.clone(),
