@@ -18,6 +18,60 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.176] A SPAWNED ROW'S SCREEN STAYS BLANK: THE DAEMON READS THE PROMPT BYTES (first_bytes CARRIES "pi@jojo:") BUT THE SCREEN BUFFER NEVER FILLS — INTERMITTENT, MOSTLY-ALWAYS ON CURRENT MAIN (measured 2026-09-27 ~06:30-08:00 IST, live jojo desktop)
+
+**Status:** OPEN
+
+Filed 2026-09-27 on `lane/uxspeed/spawn-ladder` (zcode
+sess_123bb054-e0c8-44e6-afbb-80694539daa0 on jojo, work FROM dev) while
+re-baselining the spawn ladder. Felt UX: `terminal new` gives a row with a
+lone cursor and NO prompt, indefinitely; every uxprobe `spawn` iteration
+reports "no screen content" (the lane's new content-truth assert,
+instrument same-commit).
+
+MECHANISM (narrowed live): the daemon's PTY reader WORKS —
+`terminal_runtime/first_bytes` on a blank row carries bytes=66 with
+`sample: 'pi@jojo:…'` (the prompt reached the reader), yet `server app
+terminal read-buffer --mode screen` answers `nonblank_line_count: 0`
+forever, `xterm_paint/*` markers never fire for the row, and
+`content_free_frame_no_stamp` does NOT fire either (the frame is never
+processed as content-free — it is never processed). The break is between
+the read and the screen-buffer apply inside the daemon. Spawned bash is
+HEALTHY (correct env, `Ss+` on its pts, wrote its prompt to the slave).
+
+EVIDENCE:
+- A/B by daemon build, same GUI, same desktop, same env: daemon
+  7227be34aabc (the 05:33 activation-stall deploy) → spawn paints
+  `pi@jojo:/tmp$` in seconds (nonblank 1, read-buffer + screenshot). Daemon
+  13d5bf59bd76 and CI-clean 4346f613b4ac (current main, deployed 07:11 by
+  ygg-ci build yggterm--20260927-071109) → 5/5 and 4/5 spawns blank within
+  a 12 s content poll; the one 4346 iteration that DID fill took 12.1 s and
+  fired the full marker ladder (mount_open 1359 / first_frame 1628 /
+  settle 2455) — INTERMITTENT, mostly-broken.
+- Regression window therefore 7227be34aabc..main, daemon-side. Read of the
+  window's daemon diffs (env-seam ee0b131d home threading; env-seam-codex-flow
+  2bfc5223/ae1beaaa CODEX_HOME retirement) shows mechanical env→field
+  threading — the offending change is NOT yet identified; `terminal.rs`
+  (the read/screen sites) is untouched in the window, so the break rides
+  how its inputs are WIRED by the ensure/launch funnel.
+- Provenance caveat: the 13d5 binaries were built by the WEDGED jojo-side
+  watcher (incident ACK-80eb91b620) from a stale/dirty checkout, but the
+  clean CI build of 4346 reproduces the class, so this is committed code on
+  main, not deploy junk.
+
+FIRST INSTRUMENT (this lane, same-commit): uxprobe `spawn` now polls
+read-buffer as the paint truth and asserts "no screen content … (blank
+first screen?)" — it flags this defect on iteration 1. The 2026-09-15
+§BASELINES spawn row (verb→settle p50 3.7 s) predates both the [11.173]
+warm-eval win and this defect; re-baseline owed on the fixed build.
+
+NEXT: bisect 7227be34aabc..main on the daemon with a headless repro (the
+content leg is assertable headlessly: spawn via the ensure funnel, then
+read-buffer) or read the screen-apply handoff in terminal.rs against the
+window's ensure-funnel diffs. ⚠ Owner-facing: while OPEN, every new
+terminal row on a rotated desktop is a coin flip for a permanent blank —
+worth LEGENDARY consideration.
+
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED

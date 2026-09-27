@@ -7,9 +7,10 @@ on self-created scratch rows only. Blast-radius law: rows not created by
 this run are never mutated; teardown removes exactly what the run spawned.
 
 Actions:
-  spawn  — server app terminal new → wait the paint ladder in ytrace
-         (first_frame | settle | mount_open — first_frame is write-scoped and
-         does not fire on a mount that never receives a byte)
+  spawn  — server app terminal new → the paint answer is SCREEN CONTENT
+         (read-buffer nonblank poll — honest verb→content); the ytrace
+         milestone ladder (open_attempt/mount, and first_frame | settle |
+         mount_open when the build fires them) rides along as diagnostics
   drag   — server app drag begin/hover/drop reorder of two scratch rows
   felt   — the REAL input-plane drag: pointer down on a scratch row, dwell
            under the 6px threshold, cross it, hover across rows, release on
@@ -729,7 +730,14 @@ class Probe:
             (r["json"].get("completed_at_ms") - t0)
             if r.get("json", {}).get("completed_at_ms") else None)
         row["queued"] = data.get("queued")
-        paint = self.wait_paint_milestones(path, since_ms=t0)
+        # Milestones are DIAGNOSTIC since the [11.171] marker rework: on a
+        # healthy spawn only open_attempt/mount fire, and waiting the full
+        # action timeout for markers that never fire burns 12 s per
+        # iteration. Cap the diagnostic window; the content poll owns the
+        # honest paint leg.
+        paint = self.wait_paint_milestones(path, since_ms=t0,
+                                           timeout_s=min(self.timeout_s, 6.0))
+        paint["content"] = self.wait_screen_content(path, since_ms=t0)
         row["paint"] = paint
         return row
 
@@ -807,6 +815,31 @@ class Probe:
                 "blank_frames_before_write":
                     ff.get("payload", {}).get("blank_frames_before_write")}
 
+    def wait_screen_content(self, path: str, since_ms: int,
+                            timeout_s: float | None = None) -> dict:
+        """THE spawn paint truth: poll the daemon screen until it holds
+        nonblank content. The xterm_paint marker family does not answer
+        idle-shell spawns — first_frame is write-scoped and settle has not
+        fired on a spawn since the [11.171] marker rework — so a spawned row
+        whose prompt VISIBLY painted answers the milestone ladder with
+        silence (measured 2026-09-27: open_attempt/mount fire at ~465 ms,
+        then no marker ever, while read-buffer shows the prompt).
+        read-buffer is content- AND session-addressed (it never touches the
+        viewport), so nonblank_line_count >= 1 is the honest verb→content
+        leg. A null here on a live row IS the blank-first-screen defect
+        class — this assert is what catches a broken-daemon build on
+        iteration 1 instead of after five silent timeouts."""
+        deadline = time.time() + (timeout_s or self.timeout_s)
+        while time.time() < deadline:
+            r = self.verb("terminal", "read-buffer", path, "--mode", "screen")
+            data = (r.get("json") or {}).get("data") or {}
+            n = data.get("nonblank_line_count")
+            if r["ok"] and isinstance(n, int) and n > 0:
+                return {"content_first_ms": now_ms() - since_ms,
+                        "nonblank_line_count": n}
+            time.sleep(0.12)
+        return {"content_first_ms": None, "nonblank_line_count": None}
+
     # ---- actions -------------------------------------------------------
 
     def action_spawn(self, iters: int) -> dict:
@@ -821,11 +854,18 @@ class Probe:
             acc = []
             if not present:
                 acc.append("row absent from server app rows after spawn")
-            if paint.get("paint_marker") is None:
-                acc.append("no paint milestone fired within timeout")
+            content = paint.get("content") or {}
+            content_ms = content.get("content_first_ms")
+            if content_ms is None and paint.get("paint_marker") is None:
+                acc.append("no screen content and no paint milestone "
+                           "within timeout (blank first screen?)")
             out["iterations"].append({
-                "spawn_to_paint_ms": paint.get("spawn_to_paint_ms"),
-                "paint_marker": paint.get("paint_marker"),
+                "spawn_to_paint_ms": content_ms
+                if content_ms is not None else paint.get("spawn_to_paint_ms"),
+                "paint_marker": "screen_content" if content_ms is not None
+                else paint.get("paint_marker"),
+                "content_first_ms": content_ms,
+                "nonblank_line_count": content.get("nonblank_line_count"),
                 "daemon_processed_ms": row.get("daemon_processed_ms"),
                 "queued": row.get("queued"),
                 "cli_new_ms": row["cli_ms"],
