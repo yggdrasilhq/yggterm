@@ -31494,9 +31494,11 @@ birth identity, the appearance-only `initial_server_sync`, the frontend
 `onColor` backstop and OSC 4 slots 16-255 stay open above.
 
 
-## ⛔ [11.178] THE SCHEDULED MANAGED-CLI REFRESH HELD THE INSTALL LOCK FOR ~18h — ONE STUCK CHILD (`mimo upgrade`, NO TTY, NO DEADLINE) FROZE EVERY TOOLCHAIN WRITE ON THE HOST, AND EVERY AGY ROW WENT AMBER AFTER THE RESTART (measured 2026-09-27 12:33-12:40 IST, jojo + dev, owner report "all agy clis not connecting after restart; new sessions still amber")
+## ⛔ [11.182] THE SCHEDULED MANAGED-CLI REFRESH HELD THE INSTALL LOCK FOR ~18h — ONE STUCK CHILD (`mimo upgrade`, NO TTY, NO DEADLINE) FROZE EVERY TOOLCHAIN WRITE ON THE HOST, AND EVERY AGY ROW WENT AMBER AFTER THE RESTART (measured 2026-09-27 12:33-12:40 IST, jojo + dev, owner report "all agy clis not connecting after restart; new sessions still amber")
 
-Status: OPEN (remediated live this sitting; the code is unfixed — this WILL recur on the next reboot+hang)
+**Status:** OPEN
+
+Remediated live this sitting; the code is unfixed — this WILL recur on the next reboot+hang.
 
 The chain, measured: dev rebooted ~17:35 Sep 26 → boot-spawned `yggterm server remote refresh-managed-cli scheduled` (pid 1532) walked the managed CLIs and hung on its child `node ~/.yggterm/ynpm/bin/mimo upgrade` (pid 2606) — 17h53m in `anon_pipe_read`, child in `do_epoll_wait`, no TTY, no deadline. The refresh held fd 8 = `/home/pi/.yggterm/managed-cli-install.lock` for the whole walk. Every `ensure-managed-cli agy` on dev refused: "another yggterm process has been installing managed CLIs for over 300000ms (lock …); refusing to write the toolchain concurrently" — jojo's daemon logged 22 such refusals; every agy spawn/restore → ensure fails → row sits amber forever ("launch queued", `launch_phase: RemoteBootstrap`). Ops remedy this sitting: TERM 2606 + 1532 (lock dies with the holder), ensure path verified recovered — a fresh remote agy birth spawned and attached end-to-end (probe row, `agy --dangerously-skip-permissions --conversation <uuid>` live on dev, then reaped).
 
@@ -31508,9 +31510,11 @@ Structural defects, all four needed:
 
 Fix direction: per-CLI lock span + per-child deadline (kill + continue) + holder-progress escalation (break-after-N-min with /proc evidence) + row stamp naming the ensure failure. Repro instrument: `server monitor --scenario managed-cli-refresh` exists; add a hung-child scenario.
 
-## ⛔ [11.179] THE AGY ROW→CONVERSATION BINDING IS PERSISTED NOWHERE ON THE ROW — RE-BIRTH ORPHANS THE ROW FROM ITS STORE CONVERSATION; PRE-[11.165] THIS ATE SESSIONS SILENTLY (FABRICATE), POST-[11.165] IT REFUSES AND THE ROW HANGS IN "Bootstrapping · idle" FOREVER (measured 2026-09-27, jojo + dev, the owner's five work rows)
+## ⛔ [11.183] THE AGY ROW→CONVERSATION BINDING IS PERSISTED NOWHERE ON THE ROW — RE-BIRTH ORPHANS THE ROW FROM ITS STORE CONVERSATION; PRE-[11.165] THIS ATE SESSIONS SILENTLY (FABRICATE), POST-[11.165] IT REFUSES AND THE ROW HANGS IN "Bootstrapping · idle" FOREVER (measured 2026-09-27, jojo + dev, the owner's five work rows)
 
-Status: OPEN (owner data verified INTACT in the store; the GUI cannot reach it)
+**Status:** OPEN
+
+Owner data verified INTACT in the store; the GUI cannot reach it.
 
 Facts measured this sitting:
 - jojo's persisted row records (`~/.yggterm/server-state.json`, all six `remote-agy://dev/<uuid>` rows) carry NO conversation binding — the row `id` doubles as the resume id (`resume-agy <row-uuid>` is what the stored launch command runs). Contrast the claude_code rows: they carry `storage_path` pointing at their transcript.
@@ -31520,9 +31524,9 @@ Facts measured this sitting:
 
 Fix direction: (a) persist the bound conversation id on the ROW record at stamp/rebind time (a `storage_path`-class field; carried through close/tombstone/restore like terminal_identity_exports); (b) compose resume from the persisted binding, falling back to the row uuid; (c) an agy vouch ladder mirroring opencode's (focus stamp → store candidate by cwd/recency → honest fresh-start affordance) so a binding-less row lands on ITS conversation or an explicit new one — never an eternal Bootstrapping, never a silent fabrication.
 
-## ⛔ [11.180] REMOTE AGY RESUME HITS `no terminal spec for session: agy-runtime://<uuid>` WHEN THE DEV-SIDE RUNTIME RECORD IS GONE — EVEN WHEN THE STORE HAS THE CONVERSATION; THE ENSURE'S OWN COMPOSE IS UNDONE BY THE TERMINAL-ENSURE KEY RESOLUTION (measured 2026-09-27, dev 3.2.113, row c70b6a9c whose conversation EXISTS in the db)
+## ⛔ [11.184] REMOTE AGY RESUME HITS `no terminal spec for session: agy-runtime://<uuid>` WHEN THE DEV-SIDE RUNTIME RECORD IS GONE — EVEN WHEN THE STORE HAS THE CONVERSATION; THE ENSURE'S OWN COMPOSE IS UNDONE BY THE TERMINAL-ENSURE KEY RESOLUTION (measured 2026-09-27, dev 3.2.113, row c70b6a9c whose conversation EXISTS in the db)
 
-Status: OPEN
+**Status:** OPEN
 
 Repro: dev store has conversation `c70b6a9c-…` (db row verified, Sep 23); dev's daemon has NO `agy-runtime://c70b6a9c` record (post-reboot). `yggterm server remote resume-agy c70b6a9c-… /home/pi --require-existing` on dev → passes both [11.165] gates (store answers exists) → the ensure arm inserts the runtime row + sets `launch_command` (lib.rs `ensure_remote_runtime_agent_session`, the `sessions.get_mut(&key)` block) → the handler's `ensure_terminal_for_path_with_initial_size` then bails at daemon.rs:10687 `no terminal spec for session: {path}` — `terminal_spec` → `resolve_terminal_session_key` fails to resolve the very key the ensure just inserted/returned. The [11.162] classifier knows these words (its test literally uses `agy-runtime://b8f0c09d…`) and stamps the row, but there is NO healing arm: the row paints the raw error forever; birth (`start-agy`) through the same terminal-ensure works, so the seam is ensure-vs-resolve specific.
 
