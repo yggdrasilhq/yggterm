@@ -18,6 +18,21 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
+
+**Status:** OPEN
+
+Filed 2026-09-27 by the [11.177] lane while unblinding the drift report (zcode sess_fc6e2076-4139-4752-b3c6-95e7c5eec07d on jojo, work FROM dev; claim ACK-036bbb9074). The [11.177] fix makes the drift report fire regardless — this entry is what it will keep firing INTO until the install plane is honest.
+
+MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `scheduled`, ttl 7200000):
+
+- Every sweep's `refresh_end` carries `install_attempted: true, install_deferred: false` and **ALL 13 tool statuses `action: "failed"`** — while the SAME window's ynpm trace shows **every `operation.complete` with `result: "ok"`** (8 packages, one ynpm transaction each, incl. `@opencode/cli` 2.0.18). The npm arm is innocent.
+- `install_latest` collects failures across ALL provision arms and joins them into one `install_error` for the WHOLE refresh (`anyhow::bail!("{}", failures.join("; "))`). One failing non-ynpm arm poisons everything: every tool's status becomes "failed" — **including tools whose own arm succeeded and demonstrably changed** (`changed: true` on kimi/muse/agy in the same statuses that name them "failed") — and `persist_managed_cli_refresh_state` is skipped (same success-only block), so `last_successful_refresh_ms` starves and the TTL "skipped recently" quiet period can never engage.
+- The failing arm is one of the five non-ynpm tools (kimi/muse/devin VendorScript `curl|sh`, agy/devin SelfCommand self-updaters on this host). It is DETERMINISTIC (3/3 sweeps) and FAST (sweep completes in ~90 s). Its identity and error string are INVISIBLE in the trace: `refresh_end` statuses carry `{action, available, changed, tool}` only, the `Managed refresh failed: {error}` detail surfaces nowhere in event-trace.jsonl or daemon.log, and the GUI panel is the only consumer that ever sees it.
+
+⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
+
+
 ## ⛔ [11.180] THE SERVING RAISE PAYS A FULL SIDEBAR REBUILD: SessionPreview DROP+REALLOC + FULL RE-HASH OF EVERY ROW'S PREVIEW LINES PER RAISE — sidebar/memo complex ≈17-19% + allocator ≈16% OF RAISE-WINDOW CPU, webproc clock-tax + page-in ≈8%, DAEMON ≈0% (measured 2026-09-27 ~12:20-12:35 IST, raise-perf-capture lane, live jojo desktop, GUI 5baa7991 / daemon aa555326)
 
 **Status:** OPEN
