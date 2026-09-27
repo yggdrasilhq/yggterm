@@ -154,60 +154,6 @@ paths, `startup_terminal_restore_recover` x0, 0 rows left behind. Scope note: th
 gate arms on the WARM path only; a vanished COLD first mount (seen once in the rig) stays bounded
 by the [11.176] streak ladder.
 
-## ⛔ [11.177] THE MANAGED GENERATION RE-POINTS UNDER A STALE LOGIN-RESOLVED BINARY, AND THE EFFECTIVE-VERSION DRIFT EVENT CANNOT FIRE — THE REFRESH GATES ITS OWN DRIFT CHECK ON "INSTALL NOT DEFERRED" (measured 2026-09-27, muse lab host)
-
-**Status:** OPEN
-
-Opencode resolves TWO ways on this host at once, and only one of them is the
-binary a yggterm row runs. The login shell (`bash -lc`, the SSOT
-`login_shell_resolved_cli` names for remote launches and probes) resolves
-`~/.local/bin/opencode2` → **2.0.3**. The wrapper PATH a daemon-spawned LOCAL
-row gets (`launch_path_prefix`: managed `ynpm/bin` first) hands the same row
-**2.0.18** — the ynpm current generation, re-pointed 2026-09-26 07:05 and
-re-installed as `@opencode/cli@latest` 2026-09-27 09:35 by the background
-refresh (event trace, component `ynpm`). Local rows and remote launches run
-DIFFERENT opencode versions on one machine, and version-specific descriptor
-facts are only true of whichever binary the measurer happened to resolve.
-suites/opencode.js 12/12 twice on each (oc203-reverify lane): the declared
-facts hold on both TODAY — the split is a latent hazard, not a live defect.
-
-The reason the machine stays silent about it: `report_managed_cli_effective_version_drift`
-runs ONLY under `provisioner_available && install_error.is_none() &&
-!skipped_recently && !install_deferred`, and this host's background refreshes
-answer `deferred_background_install` — so the drift check is skipped on every
-such tick, precisely while the managed generation moves under a stale
-login-resolved binary. `grep -c '"name":"effective_cli_version_drift"'
-~/.yggterm/event-trace.jsonl` = **0**. The event's own doc names the failure
-it exists to catch — "the binary yggterm MAINTAINS is not the binary a
-session RUNS" — and that failure is live here, unnamed. (On the deferred
-path the refresh also keeps `after = before.clone()`, so the check has no
-fresh probe to compare even if it ran.)
-
-⇒ Fix direction: fire the effective-drift report from the path where a
-deferred install actually COMPLETES (the ynpm install-begin/end events show
-that path exists and runs), or schedule the check off the deferred tick, so a
-completed generation re-point always ends in either a fresh probe+report or
-an explicit skip that names itself. Rider: the 4th instance of the bin-re-point
-class ([11.144]-era 2.0.8/2.0.9 readings, the [11.175] rider's 2.0.3 reading —
-each was true of a DIFFERENT resolution plane); version-specific facts must
-name WHICH plane they measured (wrapper `ynpm/bin` vs login `~/.local/bin`).
-RESOLVED-IN-CODE 2026-09-27 (~10:30 IST, spawn-screen-fix lane): the break is the
-[11.172/11.173] WARM MOUNT PATH, not the daemon — the warm eval wedges (created,
-never executes) on a fresh spawn, the recover loop re-wedged warm every ~5 s until
-its streak capped, and the row went permanently dark. The daemon-side observation
-above (first_bytes present, screen empty) was the warm wedge seen from the other
-side: the daemon screen had the content all along (verified: daemon-screen
-read-buffer answers the prompt on blank rows); the CLIENT never mounted. FIX: the
-warm gate now requires a zero recovery streak for the session — after one stall,
-re-mounts take the cold installer until Ready resets the streak. Isolation rig
-(Xvfb :77 + dbus-run-session + scratch YGGTERM_HOME, recipe in [11.178]): warm
-0/3 painted -> fixed 3/3 painted, trace shows warm-stall -> recover -> cold ->
-first_frame. Shell lib 2175 passed / 2 pre-existing reds (idle-mount/paint,
-byte-identical to clean main). LIVE PROOF OWED on the first rotated jojo build:
-`uxprobe --actions spawn` paints every iteration (warm-fast or recover+cold),
-no permanent blanks.
-
-
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
 **Status:** OPEN
