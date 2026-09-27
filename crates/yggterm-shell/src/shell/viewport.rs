@@ -6107,11 +6107,30 @@ fn TerminalCanvas(
             // `window.__yggtermMountFn`; this probe gates the ~1 KB warm
             // invoke on that exact version and any miss reinstalls cold (one
             // parse — exactly today's behavior).
-            let mount_fn_installed = document::eval(&terminal_mount_fn_probe_script())
-                .await
-                .ok()
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
+            // [11.176] The warm mount eval can WEDGE: the ~1 KB script never
+            // executes (no first js_debug, no Ready, the eval future never
+            // settles) while the same document still answers the version
+            // probe, and every recover re-mount re-took the warm path and
+            // re-wedged until the streak cap left the row permanently blank
+            // (felt as a lone cursor and no prompt, indefinitely). Isolation
+            // rig, 2026-09-27 (spawn x3): warm 0/3 painted, cold-forced 3/3
+            // painted (~1.6 s). So once a session's mount has stalled into
+            // recovery, re-mounts take the COLD installer until a Ready
+            // resets the streak; first attempts keep the warm fast path.
+            let warm_mount_path_allowed = state.with(|shell| {
+                shell
+                    .startup_restore_recover_streak
+                    .get(&session_path)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+            });
+            let mount_fn_installed = warm_mount_path_allowed
+                && document::eval(&terminal_mount_fn_probe_script())
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
             let mount_script = if mount_fn_installed {
                 append_trace_event(
                     &trace_home,
