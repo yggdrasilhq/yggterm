@@ -5502,6 +5502,14 @@ pub struct YggtermServer {
     /// answered.
     yggterm_home: Option<PathBuf>,
     user_home: Option<PathBuf>,
+    /// The same birth-resolved treatment for the remote codex store-read
+    /// chain: every read that used to call `RemoteCodexStoreEnv::from_process()`
+    /// per site reads this snapshot instead (2026-09-27, fifth pass). Same
+    /// honest boundary as the two home fields above — the env never changes
+    /// mid-process, so birth-time resolution answers every site the per-call
+    /// resolution answered, and the deep codex flow tests inject a fixture
+    /// store here instead of mutating the process.
+    remote_codex_store_env: RemoteCodexStoreEnv,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5558,6 +5566,7 @@ impl YggtermServer {
             working_last_informed: BTreeMap::new(),
             yggterm_home: resolve_yggterm_home().ok(),
             user_home: dirs::home_dir(),
+            remote_codex_store_env: RemoteCodexStoreEnv::from_process(),
         };
 
         this
@@ -5572,6 +5581,18 @@ impl YggtermServer {
     fn rooted_at(mut self, home: &Path) -> Self {
         self.yggterm_home = Some(home.to_path_buf());
         self.user_home = Some(home.to_path_buf());
+        self
+    }
+
+    /// THE TEST SEAM for the remote codex store: the deep codex flow tests
+    /// plant their fixture rollout store in a scratch directory and point the
+    /// server's birth-resolved [`RemoteCodexStoreEnv`] at it, instead of
+    /// mutating the process `CODEX_HOME` (the DECLARED gate's population).
+    /// Production never calls this — it resolves the process env once in
+    /// [`new`].
+    #[cfg(test)]
+    fn rooted_codex_store_at(mut self, codex_home: &Path) -> Self {
+        self.remote_codex_store_env.codex_home = Some(codex_home.to_path_buf().into_os_string());
         self
     }
 
@@ -6756,7 +6777,11 @@ impl YggtermServer {
         else {
             return false;
         };
-        let saved_session_exists = remote_saved_codex_session_exists(session_id).unwrap_or(false);
+        let saved_session_exists = remote_saved_codex_session_exists_in(
+            session_id,
+            &self.remote_codex_store_env,
+        )
+        .unwrap_or(false);
         if let Some(key) = self.resolve_session_storage_key(path)
             && let Some(session) = self.sessions.get(key)
         {
@@ -6779,7 +6804,11 @@ impl YggtermServer {
         if !saved_session_exists {
             return false;
         }
-        remote_resume_runtime_output_mismatches_saved_session(session_id, snapshot)
+        remote_resume_runtime_output_mismatches_saved_session_in(
+            session_id,
+            snapshot,
+            &self.remote_codex_store_env,
+        )
     }
 
     pub fn remote_direct_attach_launch_command_for_path(&self, path: &str) -> Option<String> {
@@ -6910,8 +6939,12 @@ impl YggtermServer {
         let remote_machines = self.remote_machines.clone();
         let mut refreshed = 0usize;
         for (key, session) in self.sessions.iter_mut() {
-            if refresh_restored_remote_runtime_codex_launch_command(key, session)
-                || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
+            if refresh_restored_remote_runtime_codex_launch_command_in(
+                key,
+                session,
+                self.user_home.as_deref(),
+                &self.remote_codex_store_env,
+            ) || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
             {
                 refreshed += 1;
             }
@@ -6925,8 +6958,12 @@ impl YggtermServer {
         };
         let remote_machines = self.remote_machines.clone();
         self.sessions.get_mut(&key).is_some_and(|session| {
-            refresh_restored_remote_runtime_codex_launch_command(&key, session)
-                || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
+            refresh_restored_remote_runtime_codex_launch_command_in(
+                &key,
+                session,
+                self.user_home.as_deref(),
+                &self.remote_codex_store_env,
+            ) || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
         })
     }
 
@@ -12618,7 +12655,8 @@ impl YggtermServer {
         // composition needs the truth, because it is what gets executed in a
         // fresh PTY: `resume <row id>` for an id the CLI never minted dies
         // there (see [`live_held_row_resumes_by_row_id`]).
-        let saved_session_in_store = remote_saved_agent_session_exists(kind, session_id)?;
+        let saved_session_in_store =
+            remote_saved_agent_session_exists(kind, session_id, &self.remote_codex_store_env)?;
         let saved_session_exists = live_runtime_held || saved_session_in_store;
         if !picker_fallback
             && remote_require_existing_refusal_allowed(
@@ -13708,7 +13746,12 @@ impl YggtermServer {
         }
         if let Some(session) = self.sessions.get_mut(&key) {
             session.kind = normalized_kind;
-            let _ = refresh_restored_remote_runtime_codex_launch_command(&key, session);
+            let _ = refresh_restored_remote_runtime_codex_launch_command_in(
+                &key,
+                session,
+                self.user_home.as_deref(),
+                &self.remote_codex_store_env,
+            );
             if let Some(storage_path) = storage_path.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
                 if yggterm_core::CODEX_FAMILY.contains(&session.kind) {
@@ -14496,7 +14539,12 @@ impl YggtermServer {
                 promote_active_stored_session = true;
             }
             SessionSource::LiveLocal | SessionSource::LiveSsh => {
-                let _ = refresh_restored_remote_runtime_codex_launch_command(&path, session);
+                let _ = refresh_restored_remote_runtime_codex_launch_command_in(
+                    &path,
+                    session,
+                    self.user_home.as_deref(),
+                    &self.remote_codex_store_env,
+                );
                 let uses_remote_runtime = live_session_uses_remote_runtime(session);
                 if uses_remote_runtime && let Some(ssh_target) = session.ssh_target.clone() {
                     let (cached_ssh_target, cached_ssh_prefix, cached_launch) =
@@ -15914,14 +15962,26 @@ fn local_agent_store_vouches_for_session_in(
 /// non-CC session up in `~/.codex`, so a pi/qwen/agy session — which is not in
 /// `~/.codex` and never will be — answered `false`, and a `--require-existing`
 /// resume then reported the live session as "no longer available".
-fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> anyhow::Result<bool> {
+///
+/// The env rides as a parameter (2026-09-27, fifth pass) because the codex arm
+/// consults `CODEX_HOME` and the deep codex flow tests inject a fixture store
+/// here instead of mutating the process. Production callers pass
+/// [`RemoteCodexStoreEnv::from_process()`]; the server sites pass their
+/// birth-resolved field. The body is pinned verbatim by the
+/// `the_definitive_miss_gate_sits_at_both_require_existing_consumers_only`
+/// source scan — the seam rides the signature, not a wrapper split.
+fn remote_saved_agent_session_exists(
+    kind: SessionKind,
+    session_id: &str,
+    env: &RemoteCodexStoreEnv,
+) -> anyhow::Result<bool> {
     match kind {
         SessionKind::ClaudeCode => return remote_saved_cc_session_exists(session_id),
         // Codex keeps the measured reader: its file NAME carries a timestamp
         // rather than the session id, so identity lives in a field INSIDE the
         // rollout, and its store may be relocated by `CODEX_HOME`.
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
-            return remote_saved_codex_session_exists(session_id);
+            return remote_saved_codex_session_exists_in(session_id, env);
         }
         SessionKind::Antigravity => {
             if antigravity_local_db_holds_conversation(session_id) == Some(true) {
@@ -17660,19 +17720,10 @@ fn remote_saved_session_screen_is_attachable_in(
             .unwrap_or(false)
 }
 
-pub(crate) fn remote_resume_runtime_output_mismatches_saved_session(
-    session_id: &str,
-    snapshot: &[u8],
-) -> bool {
-    remote_resume_runtime_output_mismatches_saved_session_in(
-        session_id,
-        snapshot,
-        &RemoteCodexStoreEnv::from_process(),
-    )
-}
-
-/// [`remote_resume_runtime_output_mismatches_saved_session`] against explicit
-/// env — the test seam.
+/// [`remote_resume_runtime_output_mismatches_saved_session_in`] consults the
+/// store the CLI itself relocates by `CODEX_HOME` — via the explicit
+/// [`RemoteCodexStoreEnv`] parameter, never the process globals (2026-09-27,
+/// fifth pass: the from_process wrapper retired with its last caller).
 fn remote_resume_runtime_output_mismatches_saved_session_in(
     session_id: &str,
     snapshot: &[u8],
@@ -18308,29 +18359,23 @@ fn restored_remote_runtime_codex_session_id(
         .and_then(|value| parse_remote_runtime_agent_session_key(&value).map(str::to_string))
 }
 
-fn refresh_restored_remote_runtime_codex_launch_command(
-    key: &str,
-    session: &mut ManagedSessionView,
-) -> bool {
-    refresh_restored_remote_runtime_codex_launch_command_in(
-        key,
-        session,
-        dirs::home_dir().as_deref(),
-    )
-}
-
-/// [`refresh_restored_remote_runtime_codex_launch_command`] against an explicit
-/// home — the test seam. The [11.165] re-arm gate consults the machine's REAL
-/// CLI store through the vouch, so the unseamed fn is host-sensitive by
+/// The restored-runtime launch repair against an explicit home and store env —
+/// the test seam. The [11.165] re-arm gate consults the machine's REAL CLI
+/// store through the vouch, so an unseamed fn is host-sensitive by
 /// construction: the restored-opencode fixture red on a host whose live
 /// `~/.local/share/opencode/opencode.db` lacks the fixture id and green where
 /// the store is absent (measured muse-lab host vs dev, 2026-09-26). A unit
 /// test that consults the user's own store passes or fails on THEIR data —
-/// the `_in` twins exist so it never does.
+/// the `_in` twins exist so it never does. The 2026-09-27 fifth pass added
+/// the [`RemoteCodexStoreEnv`] param for the same reason on the codex arm:
+/// the deep codex flow tests inject a fixture store instead of mutating the
+/// process `CODEX_HOME`. (The from_process wrapper retired with its last
+/// production caller — every server site passes the birth-resolved field.)
 fn refresh_restored_remote_runtime_codex_launch_command_in(
     key: &str,
     session: &mut ManagedSessionView,
     home: Option<&std::path::Path>,
+    env: &RemoteCodexStoreEnv,
 ) -> bool {
     // ⛔ A REMOTE agent row is NOT a restored daemon runtime, and the
     // eligibility sniff below cannot tell them apart on its own: a healthy
@@ -18374,7 +18419,7 @@ fn refresh_restored_remote_runtime_codex_launch_command_in(
     let already_resume = session.launch_command.contains(resume_needle)
         && session.launch_command.contains(session_id.as_str());
     if !already_resume {
-        match remote_saved_agent_session_exists(session.kind, &session_id) {
+        match remote_saved_agent_session_exists(session.kind, &session_id, env) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {
@@ -18613,7 +18658,12 @@ mod restored_runtime_repair_tests {
         let key = "remote-agy://buildbox/3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
         let ssh_launch = "exec ssh -tt buildbox 'agy --conversation 3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011'";
         let mut session = agy_session(key, ssh_launch);
-        let repaired = refresh_restored_remote_runtime_codex_launch_command(key, &mut session);
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            key,
+            &mut session,
+            None,
+            &RemoteCodexStoreEnv::default(),
+        );
         assert!(!repaired, "a remote row is not a restored daemon runtime");
         assert_eq!(session.session_path, key, "the row keeps its remote path");
         assert_eq!(session.launch_command, ssh_launch, "the ssh launch survives");
@@ -18646,7 +18696,12 @@ mod restored_runtime_repair_tests {
         let key = format!("codex-runtime://{id}");
         let mut session = codex_session_for_repair(&key, &format!("codex resume {id}"));
         session.source = SessionSource::LiveLocal;
-        let repaired = refresh_restored_remote_runtime_codex_launch_command(&key, &mut session);
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            &key,
+            &mut session,
+            None,
+            &RemoteCodexStoreEnv::default(),
+        );
         assert!(repaired, "the restored daemon-runtime case must keep working");
         assert_eq!(session.session_path, key);
         assert_eq!(session.source, SessionSource::LiveLocal);
@@ -19116,6 +19171,7 @@ mod restored_runtime_repair_tests {
             &key,
             &mut session,
             Some(&home),
+            &RemoteCodexStoreEnv::default(),
         );
         assert!(repaired, "a restored opencode runtime row is repaired");
         let restore = session
@@ -19146,6 +19202,7 @@ mod restored_runtime_repair_tests {
             &absent_key,
             &mut absent_session,
             Some(&home),
+            &RemoteCodexStoreEnv::default(),
         );
         assert!(
             !refused,
@@ -24646,7 +24703,8 @@ pub fn run_remote_resume_agent(
         sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
-    let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
+    let saved_session_exists =
+        remote_saved_agent_session_exists(kind, session_id, &RemoteCodexStoreEnv::from_process())?;
     // ⛔ A SELF-MINTING CLI never stores yggterm's birth id, so an absent
     // probe is not evidence of absence — measured 2026-08-29 on opencode2's
     // v2 preview, where the scanner cannot read the store schema at all and
@@ -24839,7 +24897,7 @@ pub fn run_remote_saved_agent_session_exists(
 ) -> anyhow::Result<()> {
     let response = RemoteSavedCodexSessionExistsResponse {
         session_id: session_id.to_string(),
-        exists: remote_saved_agent_session_exists(kind, session_id)?,
+        exists: remote_saved_agent_session_exists(kind, session_id, &RemoteCodexStoreEnv::from_process())?,
     };
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -40313,19 +40371,32 @@ mod tests {
     /// (codex_cli::env_test_guard) — deliberate today (its scan test names it
     /// the one identity guard); the day a reader-victim spans the two
     /// populations, unifying the guards is the fix.
+    ///
+    /// 2026-09-27 (fifth pass): CODEX_HOME left the list — the server carries
+    /// a birth-resolved `remote_codex_store_env` field (the third birth-field
+    /// beside `yggterm_home` + `user_home`), the codex store-read consumers
+    /// read the field or take the env as a parameter, and the three flow
+    /// tests inject a fixture store via `rooted_codex_store_at`. What
+    /// remains is exactly what the entries below name: the managed_cli
+    /// identity sync, the child-env composition contract, the production
+    /// app-control export, the CC extra-args export writer, and the
+    /// appearance-restore fixture cluster.
     #[test]
     fn the_process_globals_this_binarys_tests_mutate_are_all_declared() {
         // Sanctioned because they already exist, NOT because they are safe.
         // Removing one from this list by threading its seam is the direction of
         // travel; adding one is a decision to make the flake population larger.
         const DECLARED: &[&str] = &[
-            // 2026-09-27: the store-read chain (resolve_remote_codex_home →
-            // exists / cwd / match_fragments / attachable / output-mismatches)
-            // takes the `RemoteCodexStoreEnv` seam, and its unit tests pass
-            // the env as a value. What remains here are the three flow tests
-            // whose read sits behind a server method or a full
-            // restore/start flow — too deep to thread as an argument.
-            "CODEX_HOME",
+            // 2026-09-27 (fifth pass): CODEX_HOME LEFT this list — the server
+            // now carries a birth-resolved `remote_codex_store_env` field
+            // (`RemoteCodexStoreEnv::from_process()` in new), the ensure resume
+            // arm, the launch-repair `_in` twin, the identity-refresh pair and
+            // `request_terminal_launch_for_resolved_path` read the field,
+            // `remote_saved_agent_session_exists` takes the env as a parameter
+            // (its body is pinned verbatim by the [11.165] source scan, so the
+            // seam rides the signature rather than a wrapper split), and the
+            // last three mutator tests inject a fixture store via
+            // `rooted_codex_store_at` instead of touching the process.
             // 2026-09-27: PATH and YGGTERM_GOVERNOR LEFT this list — their
             // readers take env-as-value twins (resolve_player_in /
             // run_audio_command_in; is_governor_enabled_in +
@@ -41097,9 +41168,10 @@ mod tests {
                 message.as_bytes()
             ));
             assert!(
-                !super::remote_resume_runtime_output_mismatches_saved_session(
+                !super::remote_resume_runtime_output_mismatches_saved_session_in(
                     "abc123",
-                    message.as_bytes()
+                    message.as_bytes(),
+                    &super::RemoteCodexStoreEnv::default(),
                 )
             );
         }
@@ -47011,7 +47083,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
 
     #[test]
     fn runtime_output_mismatch_detects_wrong_codex_runtime_buffer() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-runtime-codex-key-mismatch-{}-{}",
             std::process::id(),
@@ -47027,15 +47098,12 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                 "{\"timestamp\":\"2026-05-15T03:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I found the restored runtime was launching plain codex instead of resuming the saved session.\"}]}}\n"
             ),
         )?;
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
         let server = YggtermServer::new(
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
-        );
+        )
+        .rooted_codex_store_at(&home);
         let fresh_codex_surface = b">_ OpenAI Codex (v0.130.0)\nmodel: gpt-5.5 xhigh /model to change\ndirectory: ~/gh/yggterm\n\nTip: You can resume a previous session by running codex resume <ID>.\n\n> Write tests for @filename\n";
 
         let mismatches = server.remote_resume_runtime_output_mismatches_path(
@@ -47047,7 +47115,6 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
             fresh_codex_surface,
         );
 
-        restore_env_var("CODEX_HOME", previous_codex_home);
         let _ = fs::remove_dir_all(home);
 
         assert!(mismatches);
@@ -57001,7 +57068,6 @@ terminal_window_id: None,
 
     #[test]
     fn restored_daemon_owned_codex_runtime_resumes_saved_session_identity() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-restored-runtime-resume-{}-{}",
             std::process::id(),
@@ -57013,16 +57079,13 @@ terminal_window_id: None,
             sessions_dir.join("rollout-test.jsonl"),
             "{\"id\":\"abc123\",\"cwd\":\"/srv/app\"}\n",
         )?;
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
 
         let mut server = YggtermServer::new(
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
-        );
+        )
+        .rooted_codex_store_at(&home);
         let runtime_key = remote_runtime_codex_session_key("abc123");
 
         server.restore_live_session(PersistedLiveSession {
@@ -57083,30 +57146,25 @@ terminal_window_id: None,
         );
         assert!(!launch_command.ends_with("&& codex"), "{launch_command}");
 
-        restore_env_var("CODEX_HOME", previous_codex_home);
         let _ = fs::remove_dir_all(home);
         Ok(())
     }
 
     #[test]
     fn fresh_daemon_owned_codex_runtime_without_saved_session_keeps_fresh_launch() -> Result<()> {
-        let _env = declared_env_test_lock();
         let home = std::env::temp_dir().join(format!(
             "yggterm-fresh-runtime-launch-{}-{}",
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(home.join("sessions"))?;
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
-        unsafe {
-            std::env::set_var("CODEX_HOME", &home);
-        }
 
         let mut server = YggtermServer::new(
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
-        );
+        )
+        .rooted_codex_store_at(&home);
         let runtime_key = remote_runtime_codex_session_key("fresh123");
 
         server.restore_live_session(PersistedLiveSession {
@@ -57150,7 +57208,6 @@ terminal_window_id: None,
             "{launch_command}"
         );
 
-        restore_env_var("CODEX_HOME", previous_codex_home);
         let _ = fs::remove_dir_all(home);
         Ok(())
     }
