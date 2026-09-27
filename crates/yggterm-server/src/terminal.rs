@@ -13,13 +13,14 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vt100::Parser as Vt100Parser;
-use yggterm_core::{append_bounded_jsonl_record, append_trace_event, resolve_yggterm_home};
+use yggterm_core::{AppManifest, append_bounded_jsonl_record, append_trace_event, resolve_yggterm_home};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
@@ -5068,8 +5069,51 @@ fn find_uuid_in_text(text: &str) -> Option<String> {
 /// surface app may declare surfaces; arbitrary row content may not. (A forger
 /// who execs the real app has crossed from "output" to "running the binary" —
 /// a different, accepted threat.)
+///
+/// [11.181], measured 2026-09-27 on jojo: "surface app" used to mean ONE
+/// hardcoded name — `contains("ychrome")` — so every other libyggterm app's
+/// web-surface OSC was refused as forged at the ingest plane. yRDP's whole
+/// chooser flow died as `provenance_refused`: the operator clicked connect,
+/// the RDP session came up, the picker emitted the open — and the retained
+/// declare (the plane that survives a GUI restart) never accepted a record,
+/// so the row sat on "Connecting" for ever. The app REGISTRY is the
+/// platform's answer to "who is an app": ynpm writes
+/// `~/.yggterm/apps/<name>.json` at install and the daemon already scans it
+/// for the launcher family, so a row launched as a registered app's binary
+/// passes the same bar ychrome's rows always did. The substring stays for
+/// the pre-registry pilot installs; it carries the same accepted exposure it
+/// always had (a launch line merely NAMING an app passes — accepted for
+/// ychrome since [11.60], now uniformly for every registered app).
 fn launch_command_declares_web_surfaces(launch_command: &str) -> bool {
-    launch_command.contains("ychrome")
+    if launch_command.contains("ychrome") {
+        return true;
+    }
+    launch_command_invokes_registered_app(launch_command, &crate::cached_app_registry())
+}
+
+/// Whether the launch command invokes one of `apps`' binaries — full path or
+/// basename, compared on token boundaries so `…/bin/yrdp pick`, `yrdp pick`
+/// and `sh -c 'yrdp pick'` all pass while `echo yrdpick` does not. Shell
+/// punctuation riding a token (`yrdp pick;`) is stripped before the compare.
+/// Registry in a parameter, not read here: the scan is a process-global
+/// cache, and a pure matcher is testable without pointing YGGTERM_HOME at a
+/// fixture tree.
+fn launch_command_invokes_registered_app(launch_command: &str, apps: &[AppManifest]) -> bool {
+    let tokens: Vec<&str> = launch_command
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| ";|&'\"<>".contains(c)))
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    apps.iter().any(|app| {
+        let name = Path::new(&app.binary)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        tokens.iter().any(|token| *token == app.binary || *token == name)
+    })
 }
 
 /// Refusals are traced at most once per (path, verb, action) per window: a
@@ -6092,6 +6136,53 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    fn app(name: &str, binary: &str) -> AppManifest {
+        AppManifest {
+            name: name.to_string(),
+            binary: binary.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// [11.181] The provenance gate answers "was this row launched as a
+    /// surface app" from the app REGISTRY, not from one hardcoded pilot name.
+    /// The measured failure it ends: yRDP's row ran `yrdp pick` and every
+    /// web-surface OSC it ever emitted was refused as forged — the operator
+    /// watched "Connecting" over a live, healthy RDP session.
+    #[test]
+    fn a_registered_apps_row_mints_web_surfaces_and_a_shell_row_does_not() {
+        let apps = vec![
+            app("yrdp", "/home/pi/.local/bin/yrdp"),
+            app("ychrome", "/home/pi/.local/bin/ychrome"),
+        ];
+        // The exact launch command from the live incident (claim 11.181).
+        let yrdp_row = "/home/pi/.local/bin/yrdp pick; exec \"${SHELL:-/bin/bash}\" -i";
+        assert!(launch_command_invokes_registered_app(yrdp_row, &apps));
+        // Bare and quoted basenames launch the app just as well.
+        assert!(launch_command_invokes_registered_app("yrdp pick", &apps));
+        assert!(launch_command_invokes_registered_app("sh -c 'yrdp pick'", &apps));
+        // The [11.60] forgery class stays refused: a plain shell row's launch
+        // command names no registered binary.
+        assert!(!launch_command_invokes_registered_app("bash", &apps));
+        assert!(!launch_command_invokes_registered_app(
+            "bash -c 'printf ...forged osc...'",
+            &apps
+        ));
+        // Token boundaries hold: a word containing the name is not the app.
+        assert!(!launch_command_invokes_registered_app("echo yrdpick", &apps));
+        // An app whose manifest names an unresolvable binary was already
+        // omitted by the scan; a stale full-path token matches nothing here.
+        assert!(!launch_command_invokes_registered_app(
+            "/opt/gone/yrdp pick",
+            &apps
+        ));
+        // The pilot clause is unchanged, registry or no registry.
+        assert!(launch_command_declares_web_surfaces("ychrome --profile temp"));
+        assert!(launch_command_declares_web_surfaces(yrdp_row));
+        assert!(!launch_command_declares_web_surfaces("bash"));
+        assert!(!launch_command_invokes_registered_app("", &apps));
+    }
 
     /// [11.150] Ctrl+U plus one backspace per held character is the per-CLI
     /// draft remedy; the SIZING is the safety. The pure predicate's arms:

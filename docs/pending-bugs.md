@@ -33,6 +33,41 @@ MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `sch
 ⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
 
 
+## ⛔ [11.185] THE WEB-SURFACE PROVENANCE GATE HARDCODES THE PILOT APP: `launch_command.contains("ychrome")` REFUSES EVERY OTHER REGISTERED APP'S SURFACES — yRDP'S WHOLE CHOOSER FLOW DIED AS `provenance_refused` AND THE ROW SAT ON "CONNECTING" OVER A LIVE, HEALTHY RDP SESSION (owner report + screenshot 2026-09-27 ~12:38 IST, live jojo desktop)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Filed 2026-09-27 (zcode sess_8f109ffd on jojo, row claim 11.181,
+board plan ACK-a64d441169). The [11.60] anti-forgery gate answers "was this
+row launched as a surface app" from ONE hardcoded name, so yRDP's row
+(`/home/pi/.local/bin/yrdp pick; exec …`) could never pass: ytrace carries
+`provenance_refused {"action": "open", "verb": "web-surface",
+"launch_command": "…/yrdp pick; exec …"}` for the open AND every heartbeat,
+12:37:48→12:48:36. The yRDP chain itself was UP the whole time (daemon
+:34297 alive, Xvfb :90 + xfreerdp3 → win0, two noVNC bridges, /api/active
+= pl9 epoch 2 — TWO clicks both connected); the picker drained the daemon's
+web-surface event and emitted the OSC (proc io counters: writes every 4s,
+zero reads). The GUI never saw the surface, and the daemon-declare rebuild
+plane — the one that survives a GUI restart, and the GUI DID restart at
+12:48 — can never rehydrate what ingest refused.
+
+FIX (this lane): the gate asks the APP REGISTRY — the same
+`cached_app_registry()` scan the launcher family reads — via a pure
+token-boundary matcher (full path or basename, shell punctuation
+stripped; `echo yrdpick` still refuses). `contains("ychrome")` stays as the
+grandfathered pilot clause with its [11.60]-era exposure unchanged. Plain
+shell rows stay refused: the forgery hole stays shut (naming an app in a
+launch line was already accepted for ychrome; it is now uniform for every
+registered app).
+
+FALSIFIER (live bar before this entry retires): on the rotated build, a
+fresh `yrdp pick` row + connect shows the desktop IN THE ROW (PTY proof),
+ytrace carries ZERO new `provenance_refused` for verb web-surface, and the
+retained declare plane accepts the record (`app_declare_ingested` with
+verb web-surface). Any OTHER registered app (ymacs/yedit/yfiles/ytop) that
+emits the OSC now passes the same gate — that generality is the point.
+
+
 ## ⛔ [11.180] THE SERVING RAISE PAYS A FULL SIDEBAR REBUILD: SessionPreview DROP+REALLOC + FULL RE-HASH OF EVERY ROW'S PREVIEW LINES PER RAISE — sidebar/memo complex ≈17-19% + allocator ≈16% OF RAISE-WINDOW CPU, webproc clock-tax + page-in ≈8%, DAEMON ≈0% (measured 2026-09-27 ~12:20-12:35 IST, raise-perf-capture lane, live jojo desktop, GUI 5baa7991 / daemon aa555326)
 
 **Status:** OPEN

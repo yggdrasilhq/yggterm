@@ -4693,7 +4693,11 @@ const APP_REGISTRY_RESCAN_AFTER_MS: u64 = 5_000;
 /// A missing executable is omitted from the live snapshot, but ownership and
 /// removal belong to ynpm. The daemon must not turn a read-only scan into an
 /// uninstall side effect; an explicit `ynpm remove` deletes the registration.
-fn cached_app_registry() -> Vec<AppManifest> {
+///
+/// `pub(crate)` for the web-surface provenance gate ([11.181]): "may this row
+/// mint surfaces" is answered from the same registry the launcher family
+/// reads, never from a second hand-rolled app list.
+pub(crate) fn cached_app_registry() -> Vec<AppManifest> {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     static CACHE: OnceLock<Mutex<(u64, Vec<AppManifest>)>> = OnceLock::new();
