@@ -18,9 +18,45 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.176] A SPAWNED ROW'S SCREEN STAYS BLANK: THE DAEMON READS THE PROMPT BYTES (first_bytes CARRIES "pi@jojo:") BUT THE SCREEN BUFFER NEVER FILLS — INTERMITTENT, MOSTLY-ALWAYS ON CURRENT MAIN (measured 2026-09-27 ~06:30-08:00 IST, live jojo desktop)
+## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN; defused for spawns by the [11.176] fix — rig recipe included)
 
 **Status:** OPEN
+
+Root cause open; the FELT SYMPTOM is defused on `lane/uxspeed/spawn-screen-fix`.
+
+Filed 2026-09-27 on `lane/uxspeed/spawn-screen-fix` (zcode sess_04fb9058 on jojo,
+work FROM dev) while fixing [11.176]. The [11.172/11.173] warm mount path dispatches
+`terminal_document.eval(warm_script)` after a version probe that RESOLVED true in the
+same document milliseconds earlier — and the warm script then never executes at all:
+no first `js_debug` ("bootstrap host=... present=..."), no `mount_open`, no
+`js_ready`, no bridge return AND no bridge error, the eval future never settles.
+Retries dispatch NEW warm evals that also never execute, while unrelated probe evals
+keep resolving — so the document eval pipeline is alive; the mount script
+specifically never starts. Syntactic shape is NOT the cause (an async-IIFE-wrapped
+warm script wedges identically — tested). MECHANISM OPEN: why does a ~1 KB script
+fail to start in a webview whose eval channel demonstrably works?
+
+RIG RECIPE (deterministic repro, no owner desktop needed): scratch `YGGTERM_HOME`,
+`Xvfb :77` + `dbus-run-session` (the GUI refuses a second yggterm on the owner's
+session bus — adopt-or-refuse — and hands off to the running window without
+`YGGTERM_ALLOW_MULTI_WINDOW=1`), GUI at any current main build, daemon any build;
+`uxprobe --actions spawn --iters 3` -> 0/3 painted, event-trace shows
+`js_eval_created` -> silence -> `startup_terminal_restore_recover` x3 -> cap -> dark.
+Force `mount_fn_installed = false` (cold installer): 3/3 painted ~1.6 s. The warm
+path is the wedge; cold is clean; both daemons (7227be34aabc and current main)
+behave identically in the rig — the daemon is exonerated.
+
+NEXT: instrument the eval DISPATCH (wry/dioxus-desktop layer) for the warm script —
+stamp dispatch-accepted/rejected at the IPC boundary; suspect a document-state
+window where a script containing a top-level `await` of a long-lived promise is
+silently dropped while `return`-probes pass. The [11.176] fix (streak-aware cold
+fallback) bounds the felt damage; this entry owns the root cause.
+
+## ⛔ [11.176] A SPAWNED ROW'S SCREEN STAYS BLANK: THE DAEMON READS THE PROMPT BYTES (first_bytes CARRIES "pi@jojo:") BUT THE SCREEN BUFFER NEVER FILLS — INTERMITTENT, MOSTLY-ALWAYS ON CURRENT MAIN (measured 2026-09-27 ~06:30-08:00 IST, live jojo desktop)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Lane `lane/uxspeed/spawn-screen-fix`; the root cause of the wedge is split off as [11.178].
 
 Filed 2026-09-27 on `lane/uxspeed/spawn-ladder` (zcode
 sess_123bb054-e0c8-44e6-afbb-80694539daa0 on jojo, work FROM dev) while
@@ -109,6 +145,21 @@ an explicit skip that names itself. Rider: the 4th instance of the bin-re-point
 class ([11.144]-era 2.0.8/2.0.9 readings, the [11.175] rider's 2.0.3 reading —
 each was true of a DIFFERENT resolution plane); version-specific facts must
 name WHICH plane they measured (wrapper `ynpm/bin` vs login `~/.local/bin`).
+RESOLVED-IN-CODE 2026-09-27 (~10:30 IST, spawn-screen-fix lane): the break is the
+[11.172/11.173] WARM MOUNT PATH, not the daemon — the warm eval wedges (created,
+never executes) on a fresh spawn, the recover loop re-wedged warm every ~5 s until
+its streak capped, and the row went permanently dark. The daemon-side observation
+above (first_bytes present, screen empty) was the warm wedge seen from the other
+side: the daemon screen had the content all along (verified: daemon-screen
+read-buffer answers the prompt on blank rows); the CLIENT never mounted. FIX: the
+warm gate now requires a zero recovery streak for the session — after one stall,
+re-mounts take the cold installer until Ready resets the streak. Isolation rig
+(Xvfb :77 + dbus-run-session + scratch YGGTERM_HOME, recipe in [11.178]): warm
+0/3 painted -> fixed 3/3 painted, trace shows warm-stall -> recover -> cold ->
+first_frame. Shell lib 2175 passed / 2 pre-existing reds (idle-mount/paint,
+byte-identical to clean main). LIVE PROOF OWED on the first rotated jojo build:
+`uxprobe --actions spawn` paints every iteration (warm-fast or recover+cold),
+no permanent blanks.
 
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
