@@ -2140,11 +2140,26 @@ means UNMEASURED and warns that a picker *"EATS TYPED INPUT … a sentence typed
 produces nothing visible anywhere"*. The mechanism was built; eight of the values were
 never filled.
 
-⇒ Remaining unmeasured: `codex-litellm`, `pi`, `opencode`, `qwen-code`, `kimi`, `muse`,
-`antigravity`, `grok-build`. ⛔ **Do not copy codex's phrases across** — codex-litellm
-plausibly shares them and "plausibly" is what this doctrine exists to refuse. Each is
-now cheap to measure: spawn a row of that CLI into a directory it has never opened, in
-a sandbox (recipe in the field guide), and read the rendered grid.
+⇒ MEASURED 2026-09-27 (muse lab host, `tools/probe-battery/suites/startup-gates.js`,
+one never-opened directory per CLI, rendered grid): **grok-build** — the gate is the
+unauth device-code SIGN-IN screen ("Approve in your browser to finish signing in." /
+"Waiting for approval..." / "ctrl+q  quit"); it eats typed input exactly like codex's
+picker and is AUTH-scoped, not directory-scoped (a signed-in host renders the composer
+directly). FILLED, with the capture locked in
+`a_startup_gate_is_recognised_for_every_cli_that_declares_one`. **opencode** and
+**zcode-tui** — gate MEASURED ABSENT: a never-opened directory renders the composer
+directly (opencode with AND without `--auto`; zcode-tui confirmed from first-party
+source — no directory-trust gate exists). Their empty lists are now MEASURED-NONE, not
+UNMEASURED. **muse** and **antigravity** were found ALREADY FILLED by their own seats —
+the remaining-list below was stale on this entry. **kimi** is BLOCKED, not unmeasured:
+the binary migrated under the descriptor ([11.175]).
+
+⇒ Still unmeasured: `codex-litellm`, `pi`, `qwen-code` — availability-gated (no
+usable binary on any fleet host), plus kimi's NEW CLI after [11.175] is provisioned.
+⛔ **Do not copy codex's phrases across** — codex-litellm plausibly shares them and
+"plausibly" is what this doctrine exists to refuse. Each is cheap to measure the
+moment a binary exists: spawn a row into a directory it has never opened, in a
+sandbox, and read the rendered grid.
 
 ## ⛔ [99.1] SEVEN CLIs DECLARE THE SAME COMPOSER MARKER, AND AT LEAST ONE WAS A GUESS
 
@@ -2162,8 +2177,51 @@ first: a hardcoded `›` did exactly this to Claude Code on 2026-08-06, and the 
 to make the value per-CLI. The mechanism became per-CLI; the values stayed guesses, and
 a default shared by seven entries is where a guess hides among measurements.
 
-⇒ Recommended: measure the remaining seven the same cheap way, and treat a marker
+⇒ PROGRESS 2026-09-27 (muse lab host, suites/startup-gates.js): **THIRD
+OCCURRENCE of the same defect, different glyph** — zcode-tui declared U+258F `▏` (the
+0.5.9-era draft-caret reading), and the deployed 0.6.x parity line draws U+258C `▌`
+as the input head; `▏` drew NOWHERE on the live idle render. Corrected to `▌`
+(byte-checked 0x258c), locked in `a_composer_marker_is_the_glyph_that_cli_actually_draws`.
+opencode's `┃` U+2503 RE-VERIFIED live on the 2.0.3 render. Still unverified against
+a live render: grok (auth gate blocks the composer on this host right now), and the
+availability-gated tail.
+
+⇒ Recommended: measure the remaining markers the same cheap way, and treat a marker
 shared by most of the table as unproven until something has rendered it.
+
+## ⛔ [11.175] KIMI MIGRATED UNDER THE DESCRIPTOR — THE HOST BINARY IS NOW A DEPRECATION SHIM THAT AUTO-INSTALLS A DIFFERENT CLI (measured 2026-09-27, muse lab host)
+
+**Status:** OPEN
+
+The descriptor's kimi block describes **kimi-cli 1.50.0** (the 09-11 c-tail fill:
+md5(cwd) store buckets, `── input ──` region composer, no titles). On 2026-09-27 the
+muse lab host's `kimi` (re-pointed to the uv tool at ~04:52 local, provenance
+unrecorded) resolves to **1.52.0**, whose first output is:
+
+    kimi-cli is no longer maintained. Please use the new Kimi Code CLI.
+    Install: curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+    Running the Kimi Code install script...
+
+— and it RUNS the installer (measured live by the startup-gates audit drive:
+the rendered screen was the installer, not a TUI; `~/.kimi-code/` now holds the new
+CLI's bin/config/credentials). Consequences already true on this host:
+
+- `suites/kimi.js` can no longer drive the 1.50.0 TUI — every kimi drive now lands in
+  the installer screen (the suite's region-label + U+276F-absence asserts will read it
+  as failures; they are measuring a DIFFERENT binary).
+- The whole kimi block (store globs, composer region label, resume contract,
+  working phrases) describes the dying line; the new **Kimi Code CLI** needs its own
+  measured block — schema v2 intake, not a patch of the old values.
+- ⛔ Side-effect class worth naming: a PROBE drive triggered a remote install script.
+  Availability probes must not side-effect the host; the shim converted a measurement
+  into an installation with no ask.
+
+⇒ Next seat: provision Kimi Code CLI deliberately, re-run the 11.6.6 intake recipe
+against it, and re-derive the block; decide whether old-kimi keeps a descriptor at
+all. Rider: the host's `opencode2` ynpm generation has re-pointed to **2.0.3** (the
+[11.144]-era "production = 2.0.8/2.0.9" readings are stale AGAIN — third instance of
+the bin-re-point class); the startup-gates + opencode suites describe whatever binary
+PATH resolves, so re-verify before trusting version-specific facts.
 
 ## ⛔ [99.1] "NO TRANSCRIPT" IS NOT "NEVER BRIEFED" FOR A CLI THAT MINTS ITS OWN ID
 
