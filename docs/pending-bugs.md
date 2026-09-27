@@ -18,32 +18,6 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.173] THE MOUNT-BODY WARM-EVAL GATE IS DEAD ON THE LIVE BUILD — THE VERSION PROBE'S SHAPE CANNOT CROSS THE EVAL BRIDGE, SO EVERY MOUNT STILL COLD-PARSES THE ~500 KB BODY (live-proven 2026-09-27 ~04:40 IST, jojo build 3bc0801024c3)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-(lane/uxspeed/activation-stall.) The observation that closes it: after this deploys and jojo rotates, ytrace shows
-`terminal_mount/mount_eval_warm` for every mount that still evals the mount
-script, and uxprobe `spawn`'s mount_begin→first_frame leg drops from the
-885-1148 ms rows (3 runs, 09-27) toward what the ~513 ms parse-death promises;
-raise-path reveals (`xterm_paint/reveal`) are unaffected — they never eval.
-
-The [11.172] leg-1 warm path shipped with its gate mis-shaped. `document::eval`
-wraps every script in a function body, and a value crosses ONLY via a TOP-LEVEL
-`return`. The gate probe was a bare expression (value dropped → always false →
-always cold), and the first fix wrapped it in an IIFE — an IIFE's return is an
-expression statement's completion value INSIDE the wrapper, equally dropped.
-Live proof of the contract (2026-09-27, app-control dom-eval against the live
-GUI): `return 1+1` → 2; `1+1` → null; `(function(){return 42;})()` → null.
-Trace truth on the live build: `mount_eval_warm` count 0 over 12k trace lines
-while `terminal_mount/js_eval_created` fires once per mount — every first
-spawn / fault recovery / epoch-bump mount still pays the ~513 ms re-parse leg
-the warm path exists to kill. The same shape bug silently emptied the preview
-find-pill match label (`preview_find_script` was an IIFE consumed through the
-same awaited-eval path). Both scripts now cross via a top-level `return`;
-behavioral locks pin the shape (the probe starts with `return `, never with
-`(`), so the bridge contract cannot regress to silence again.
-
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
