@@ -148,7 +148,9 @@ mounts in ~150 ms (mount_open +152 ms, first_frame +366 ms after the gate),
 ~6.6 s residual is the rig daemon-bootstrap+prompt floor, a different cost center). FALSIFIER for
 the gate: a spawn whose warm eval vanishes and still pays the recover ladder
 (`startup_terminal_restore_recover` present on a spawn path), or a permanent blank after a
-`warm_eval_vanish_redo_cold` trace event. LIVE PROOF OWED on a rotated desktop. Scope note: the
+`warm_eval_vanish_redo_cold` trace event. LIVE-PROVEN 2026-09-27 ~13:05 IST on rotated jojo
+(91bfe727e697): uxprobe spawn 3/3 painted 2.0-2.3 s, `warm_eval_vanish_redo_cold` x3 on the spawn
+paths, `startup_terminal_restore_recover` x0, 0 rows left behind. Scope note: the
 gate arms on the WARM path only; a vanished COLD first mount (seen once in the rig) stays bounded
 by the [11.176] streak ladder.
 
