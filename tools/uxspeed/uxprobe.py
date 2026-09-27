@@ -345,6 +345,10 @@ SPLIT_OPEN_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const PATH_A = {session_a!r};
 const AXIS = {axis!r};  // "split-side-by-side" | "split-stacked"
+// ⛔ dom-eval budget is ~3 s on the app side: this script only opens the REAL
+// row menu, clicks the split item, and reports — the post-click DOM truth is
+// polled by the probe with SHORT separate evals (split-window-vocab lane,
+// live run 1: in-page polling burned the budget -> dom_eval_timeout).
 const refuse = (reason, extra) => dioxus.send(
     Object.assign({{ accepted: false, reason }}, extra || {{}}));
 if (document.querySelector('[data-split-group-row="1"]')) {{
@@ -360,19 +364,17 @@ const dismiss = async () => {{
         t.dispatchEvent(new MouseEvent('mousedown', b));
         t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
         t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
-        await settle(80);
+        await settle(50);
     }} catch (_e) {{}}
 }};
 await dismiss();
 const row = await (async () => {{
-    // the sidebar virtualizes: the node may not exist until the row is
-    // selected and scrolled into view (the driver tree-selects first)
-    const deadline = Date.now() + 1500;
+    const deadline = Date.now() + 700;
     while (Date.now() < deadline) {{
         const n = document.querySelector(
             '[data-sidebar-row-path="' + PATH_A + '"]');
         if (n) return n;
-        await settle(50);
+        await settle(40);
     }}
     return null;
 }})();
@@ -398,7 +400,7 @@ row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, splitItem = null;
 const openDeadline = Date.now() + 1500;
 while (Date.now() < openDeadline) {{
-    await settle(40);
+    await settle(30);
     menu = document.querySelector('[data-context-menu="1"]');
     splitItem = menu?.querySelector(
         '[data-context-menu-action="' + AXIS + '"]') || null;
@@ -412,58 +414,37 @@ if (!menu || !splitItem) {{
 }}
 const menu_open_ms = Date.now() - t_open;
 const item_label = String(splitItem.textContent || '').slice(0, 80);
-await settle(120);
+await settle(100);
 const clickInit = {{ bubbles: true, cancelable: true, composed: true,
                      view: window, button: 0, buttons: 1 }};
+const t_click = Date.now();
 splitItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
 splitItem.dispatchEvent(new MouseEvent('mouseup',
     {{ ...clickInit, buttons: 0 }}));
 splitItem.dispatchEvent(new MouseEvent('click', clickInit));
-const t_click = Date.now();
-// The split's paint truth lives in THIS document: the compound sidebar row
-// ([data-split-group-row]) and the pane rects ([data-split-session]) with
-// the split layer active. Both panes are webview rects laid out natively;
-// their xterm surfaces paint in their own webviews.
-let compound = null, panes = [];
-const domDeadline = t_click + 2500;
-while (Date.now() < domDeadline) {{
-    await settle(25);
-    compound = document.querySelector('[data-split-group-row="1"]');
-    panes = [...document.querySelectorAll('[data-split-session]')];
-    if (compound && panes.length >= 2) break;
-}}
-const t_dom = Date.now();
-if (!compound || panes.length < 2) {{
-    refuse("split_dom_truth_did_not_land",
-           {{ menu_open_ms, compound_found: !!compound,
-              pane_count: panes.length }});
-    return;
-}}
-const paneRect = (n) => {{
-    const r = n.getBoundingClientRect();
-    return {{ x: Math.round(r.left), y: Math.round(r.top),
-              w: Math.round(r.width), h: Math.round(r.height) }};
-}};
 dioxus.send({{
     accepted: true,
     menu_open_ms,
-    click_to_dom_ms: t_dom - t_click,
-    dispatch_to_dom_ms: t_dom - t_open,
+    clicked_at: t_click,
     item_label,
-    compound_label: String(compound.textContent || '').slice(0, 80),
-    pane_count: panes.length,
-    panes: panes.map((n) => ({{
-        session: n.getAttribute('data-split-session'),
-        pane_index: n.getAttribute('data-split-pane-index'),
-        rect: paneRect(n),
-    }})),
 }});
 """
 
 SPLIT_UNGROUP_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
-const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+const refuse = (reason) => dioxus.send({{ accepted: false, reason }});
+const dismiss = async () => {{
+    try {{
+        const t = document.elementFromPoint(3, 3) || document.body;
+        const b = {{ bubbles: true, cancelable: true, composed: true,
+                     view: window, clientX: 3, clientY: 3, screenX: 3,
+                     screenY: 3, button: 0, buttons: 1 }};
+        t.dispatchEvent(new MouseEvent('mousedown', b));
+        t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
+        t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
+        await settle(50);
+    }} catch (_e) {{}}
+}};
 const compound = document.querySelector('[data-split-group-row="1"]');
 if (!compound) {{
     refuse("compound_row_missing");
@@ -480,9 +461,9 @@ compound.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
 compound.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
 compound.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, item = null;
-const deadline = Date.now() + 1500;
+const deadline = Date.now() + 900;
 while (Date.now() < deadline) {{
-    await settle(40);
+    await settle(30);
     menu = document.querySelector('[data-context-menu="1"]');
     item = menu?.querySelector(
         '[data-context-menu-action="ungroup-split"]') || null;
@@ -493,30 +474,47 @@ if (!menu || !item) {{
     refuse("context_menu_or_ungroup_item_not_observed");
     return;
 }}
-await settle(120);
+await settle(100);
 const clickInit = {{ bubbles: true, cancelable: true, composed: true,
                      view: window, button: 0, buttons: 1 }};
 item.dispatchEvent(new MouseEvent('mousedown', clickInit));
 item.dispatchEvent(new MouseEvent('mouseup',
     {{ ...clickInit, buttons: 0 }}));
 item.dispatchEvent(new MouseEvent('click', clickInit));
-const tClick = Date.now();
-const deadline2 = tClick + 2000;
-while (Date.now() < deadline2) {{
-    await settle(25);
-    if (!document.querySelector('[data-split-group-row="1"]') &&
-        document.querySelectorAll('[data-split-session]').length === 0) break;
-}}
-const tGone = Date.now();
-const stillCompound = !!document.querySelector('[data-split-group-row="1"]');
+dioxus.send({{ accepted: true, menu_open_ms: Date.now() - t0 }});
+"""
+# The post-click DOM truth read: ONE cheap eval, retried by the probe.
+SPLIT_DOM_JS = """
+const compound = document.querySelector('[data-split-group-row="1"]');
+const panes = [...document.querySelectorAll('[data-split-session]')];
+const paneRect = (n) => {{
+    const r = n.getBoundingClientRect();
+    return {{ x: Math.round(r.left), y: Math.round(r.top),
+              w: Math.round(r.width), h: Math.round(r.height) }};
+}};
 dioxus.send({{
-    accepted: !stillCompound,
-    ungroup_to_gone_ms: tGone - tClick,
-    menu_open_ms: 0,
-    still_compound: stillCompound,
-    pane_count_after: document.querySelectorAll(
-        '[data-split-session]').length,
+    compound_present: !!compound,
+    compound_label: String(compound?.textContent || '').slice(0, 80),
+    pane_count: panes.length,
+    panes: panes.map((n) => ({{
+        session: n.getAttribute('data-split-session'),
+        pane_index: n.getAttribute('data-split-pane-index'),
+        rect: paneRect(n),
+    }})),
 }});
+"""
+# The dismissal helper: a split refusal can leave the real menu open.
+SPLIT_DISMISS_JS = """
+try {{
+    const t = document.elementFromPoint(3, 3) || document.body;
+    const b = {{ bubbles: true, cancelable: true, composed: true,
+                 view: window, clientX: 3, clientY: 3, screenX: 3,
+                 screenY: 3, button: 0, buttons: 1 }};
+    t.dispatchEvent(new MouseEvent('mousedown', b));
+    t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
+    t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
+}} catch (_e) {{}}
+dioxus.send({{ dismissed: true }});
 """
 CHORD_LEG_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1901,15 +1899,68 @@ dioxus.send(out);
             out["pair_ms"] = out["create"]["ts"] - out["activate"]["ts"]
         return out
 
+    def eval_retry(self, js: str, timeout: int, tries: int = 3) -> dict:
+        """dom-eval with the probe's own retry on the app's TRANSIENT eval
+        errors: 'EvalError::Finished - eval has already ran' is documented
+        retryable (app_control_eval_error_should_retry) and the in-server
+        single retry still loses races on a loaded desktop (live run 3).
+        dom_eval_timeout rides the same loop — a starved surface answers a
+        retry, not a verdict."""
+        last = {}
+        for attempt in range(tries):
+            r = self.verb("dom-eval", js, timeout=timeout)
+            last = r
+            reply = (r.get("json") or {}).get("data") or {}
+            err = reply.get("error") or ""
+            transient = isinstance(err, str) and (
+                "already ran" in err
+                or "EvalError::Finished" in err
+                or err == "dom_eval_timeout")
+            if r["ok"] and not transient:
+                return r
+            time.sleep(0.3 * (attempt + 1))
+        return last
+
+    def _split_dom_truth(self) -> dict:
+        """ONE cheap eval; the probe retries on a cadence it owns."""
+        r = self.eval_retry(SPLIT_DOM_JS.format(), timeout=10)
+        return ((r.get("json") or {}).get("data") or {}).get("result") or {}
+
     def action_split(self, iters: int) -> dict:
         """The split vertical: right-click a scratch row's REAL sidebar menu ->
-        Split side by side -> commit + DOM truth. Accuracy = the pane set is
-        EXACTLY the two scratch rows, both pane rects on screen, and ungroup
-        restores the rows without closing anyone (blast-radius law)."""
+        Split side by side -> commit. The click eval RETURNS right after the
+        item click (the app's dom-eval budget is ~3 s — in-page result polling
+        burned it on live run 1, dom_eval_timeout 3/3); the commit pair joins
+        from ytrace and the DOM truth is polled with short separate evals.
+        Accuracy = the pane set is EXACTLY the two scratch rows, both pane
+        rects non-empty on screen, and ungroup restores the rows alive."""
         out = {"iterations": []}
-        scratch = self.ensure_two_scratch_rows()
+        # ACTIVATED scratch rows, deliberately: a --no-activate spawn's
+        # reply carries the DESKTOP's active session as active_session_path,
+        # and when the rows listing lags the extractor answers with THAT —
+        # every spawn "extracts" the same unrelated row (live runs 4-5).
+        # An activated spawn's active session IS the new row, so the path is
+        # true. A user splits a row they are looking at; so does the probe.
+        scratch = self.ensure_scratch_rows(2, activate=True)
+        # live run 4: the rows-diff extractor answered the SAME fresh row for
+        # two spawns under daemon rows lag — a duplicated pair reads as ONE
+        # selected row, the menu legitimately drops the split items
+        # (split_candidate_count < 2), and the run dies on a refusal that is
+        # the DRIVER's fault. Dedupe, then top up with explicit spawns until
+        # two DISTINCT live rows exist.
+        scratch = list(dict.fromkeys(scratch))
+        tries = 0
+        while len(scratch) < 2 and tries < 4:
+            row = self.spawn_scratch_row(len(scratch), activate=False)
+            tries += 1
+            if "error" in row:
+                break
+            path = row.get("path")
+            if path and path not in scratch:
+                scratch.append(path)
         if len(scratch) < 2:
-            return {"error": "need two scratch rows", "iterations": []}
+            return {"error": "need two DISTINCT scratch rows",
+                    "got": scratch, "iterations": []}
         a_path, b_path = scratch[0], scratch[1]
         for i in range(iters):
             acc = []
@@ -1918,23 +1969,42 @@ dioxus.send(out);
             self.verb("tree", "select", a_path, b_path, "--anchor", a_path)
             time.sleep(0.15)
             t0 = now_ms()
-            js = SPLIT_OPEN_JS.replace("{session_a!r}", repr(a_path))
-            js = js.replace("{axis!r}", repr("split-side-by-side"))
-            r = self.verb("dom-eval", js, timeout=25)
+            # .format DE-DOUBLES the template's {{ }} — replace() would
+            # ship literal doubled braces (a JS SyntaxError; the send never
+            # fires; live runs 1-3 died exactly there)
+            js = SPLIT_OPEN_JS.format(session_a=a_path,
+                                      axis="split-side-by-side")
+            r = self.eval_retry(js, timeout=15)
             open_wall_ms = now_ms() - t0
-            result = ((r.get("json") or {}).get("data") or {}).get("result") or {}
+            reply = (r.get("json") or {}).get("data") or {}
+            result = reply.get("result") or {}
+            if reply.get("error") == "dom_eval_timeout":
+                acc.append("open eval hit the dom-eval budget (surface "
+                           "starved or JS too heavy — honest instrument "
+                           "refusal, not a product verdict)")
             if not r["ok"]:
                 acc.append(f"dom-eval failed: {r.get('error')}")
             if result.get("dom_eval_error"):
                 acc.append(f"script error: {result['dom_eval_error']}")
-            if not result.get("accepted"):
-                acc.append(f"split refused: {result.get('reason')}")
-            pair = self.split_events_from_trace(t0)
+            if not result.get("accepted") and not acc:
+                acc.append(f"split open refused: {result.get('reason')}")
+            # commit pair from the trace plane (server side, no eval budget)
+            pair = {}
+            dom = {}
             if result.get("accepted"):
-                if pair.get("pair_ms") is None:
-                    acc.append("no context_menu_activate -> split/create pair "
-                               "in ytrace within window (build not rotated "
-                               "onto the split instrument, or refusal)")
+                deadline = now_ms() + 4000
+                while now_ms() < deadline:
+                    pair = self.split_events_from_trace(t0)
+                    if pair.get("create") or pair.get("create_refused"):
+                        break
+                    time.sleep(0.15)
+                if pair.get("create_refused"):
+                    acc.append("split/create_refused: %s"
+                               % pair["create_refused"].get("reason"))
+                if not pair.get("create") and not pair.get("create_refused"):
+                    acc.append("no context_menu_activate -> split/create "
+                               "pair in ytrace within 4 s (build not rotated "
+                               "onto the split instrument?)")
                 create = pair.get("create") or {}
                 if create.get("origin") not in ("menu", None):
                     acc.append("split/create origin=%s (want menu)"
@@ -1947,49 +2017,71 @@ dioxus.send(out);
                 if members and set(members) != {a_path, b_path}:
                     acc.append("split/create members=%s (want exactly the "
                                "two scratch rows)" % members)
-                panes = result.get("panes") or []
+                # DOM truth: short evals on the probe's cadence
+                dom_deadline = now_ms() + 3000
+                while now_ms() < dom_deadline:
+                    dom = self._split_dom_truth()
+                    if dom.get("compound_present") \
+                            and dom.get("pane_count", 0) >= 2:
+                        break
+                    time.sleep(0.3)
+                if not dom.get("compound_present"):
+                    acc.append("compound split row never appeared in the "
+                               "sidebar DOM")
+                panes = dom.get("panes") or []
                 pane_sessions = {p.get("session") for p in panes}
                 if panes and not {a_path, b_path} <= pane_sessions:
                     acc.append("pane rects missing a scratch session: %s"
                                % pane_sessions)
                 rects = [p.get("rect") for p in panes]
-                if any(not r2 or r2["w"] <= 0 or r2["h"] <= 0 for r2 in rects):
+                if rects and any(not r2 or r2["w"] <= 0 or r2["h"] <= 0
+                                 for r2 in rects):
                     acc.append("a pane rect is empty (split not visible)")
             # UNGROUP — the teardown must restore both rows alive
             ungroup = {}
-            if result.get("accepted"):
+            if dom.get("compound_present"):
                 time.sleep(0.3)
-                ru = self.verb("dom-eval", SPLIT_UNGROUP_JS, timeout=15)
-                ungroup = ((ru.get("json") or {}).get("data")
-                           or {}).get("result") or {}
-                if not ungroup.get("accepted"):
-                    acc.append(f"ungroup failed: {ungroup.get('reason')} "
-                               f"(still_compound={ungroup.get('still_compound')})")
+                ru = self.eval_retry(SPLIT_UNGROUP_JS.format(), timeout=15)
+                ureply = (ru.get("json") or {}).get("data") or {}
+                ungroup = ureply.get("result") or {}
+                if ureply.get("error") == "dom_eval_timeout":
+                    acc.append("ungroup eval hit the dom-eval budget")
+                elif not ungroup.get("accepted"):
+                    acc.append(f"ungroup refused: {ungroup.get('reason')}")
                 else:
-                    pair2 = self.split_events_from_trace(t0)
+                    deadline = now_ms() + 4000
+                    while now_ms() < deadline:
+                        pair2 = self.split_events_from_trace(t0)
+                        if pair2.get("ungrouped"):
+                            break
+                        time.sleep(0.15)
                     if not pair2.get("ungrouped"):
                         acc.append("no split/ungrouped event in ytrace")
-                time.sleep(0.3)
+                time.sleep(0.4)
                 live = set(self.live_session_paths())
                 lost = [p for p in (a_path, b_path) if p not in live]
                 if lost:
                     acc.append("UNGROUP CLOSED SCRATCH ROWS: %s" % lost)
+                gone = self._split_dom_truth()
+                if gone.get("compound_present"):
+                    acc.append("compound row survived ungroup")
+            else:
+                self.eval_retry(SPLIT_DISMISS_JS.format(), timeout=10)
             out["iterations"].append({
                 "open_wall_ms": open_wall_ms,
                 "menu_open_ms": result.get("menu_open_ms"),
-                "click_to_dom_ms": result.get("click_to_dom_ms"),
-                "dispatch_to_dom_ms": result.get("dispatch_to_dom_ms"),
+                "item_label": result.get("item_label"),
                 "pair_ms": pair.get("pair_ms"),
                 "create_origin": (pair.get("create") or {}).get("origin"),
                 "create_axis": (pair.get("create") or {}).get("axis"),
                 "member_count": len((pair.get("create") or {})
                                     .get("members") or []),
-                "pane_count": result.get("pane_count"),
-                "compound_label": result.get("compound_label"),
-                "ungroup_to_gone_ms": ungroup.get("ungroup_to_gone_ms"),
+                "pane_count": dom.get("pane_count"),
+                "compound_label": dom.get("compound_label"),
+                "ungroup_menu_ms": ungroup.get("menu_open_ms"),
                 "accuracy_failures": acc,
             })
-        return summarize(out, key="click_to_dom_ms")
+        return summarize(out, key="pair_ms")
 
     # ---- waiters --------------------------------------------------------
 
