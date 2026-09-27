@@ -2717,6 +2717,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        // ⭐ MEASURED ABSENT 2026-09-27 (2.0.3, muse lab host,
+        // probe-battery suites/startup-gates.js): a NEVER-OPENED directory
+        // renders the composer directly — no trust/onboarding picker between
+        // spawn and idle, with AND without `--auto` (only the mode row
+        // changes, `Build` vs `Build auto`). Empty here is MEASURED-NONE,
+        // not UNMEASURED.
         startup_gate_screen_phrases: &[],
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
@@ -3062,6 +3068,14 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         limit_wait_screen_phrases: &[],
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
+        // ⛔ STILL UNMEASURED — and the ground moved: 2026-09-27 the muse lab
+        // host's `kimi` resolves to the uv kimi-cli 1.52.0 DEPRECATION SHIM
+        // ("kimi-cli is no longer maintained. Please use the new Kimi Code
+        // CLI"), which AUTO-RUNS the code.kimi.com install script — the
+        // startup-gates drive rendered the installer, not a TUI, and
+        // ~/.kimi-code now holds the new CLI. The 1.50.0 facts in this block
+        // describe the dying line; the new Kimi Code CLI needs its own
+        // measured block before any value here is touched. ([11.175])
         startup_gate_screen_phrases: &[],
         plan_limit_choice_screen_phrases: &[],
         // ⭐ CONFIRMED 2026-08-08 against a real `kimi --help` on guihost (yggterm
@@ -3733,7 +3747,25 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // honest table: the arm answers false, and nothing may claim a
         // background agent from chrome alone.
         background_agent_hint_screen_phrases: &[],
-        startup_gate_screen_phrases: &[],
+        // ⭐ MEASURED 2026-09-27 (1.0.30, muse lab host,
+        // suites/startup-gates.js): with the host's grok auth expired, the
+        // first screen IS a gate — the device-code sign-in ("Approve in your
+        // browser to finish signing in." / code / "Waiting for approval..." /
+        // "ctrl+q  quit"). It eats typed input exactly like codex's trust
+        // picker and never clears without the browser approval. AUTH-scoped,
+        // not directory-scoped: a signed-in host renders the composer
+        // directly (the 09-11 suite drives real turns on the same binary).
+        // Two own-line witnesses, no also_any.
+        startup_gate_screen_phrases: &[
+            ScreenWorkingPhrase {
+                needle: "approve in your browser to finish signing in",
+                also_any: &[],
+            },
+            ScreenWorkingPhrase {
+                needle: "waiting for approval",
+                also_any: &[],
+            },
+        ],
         plan_limit_choice_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`. 1.0.30's help
         // (2026-09-15) also spells `--continue` as an alias of the same
@@ -3973,6 +4005,12 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             },
         ],
         background_agent_hint_screen_phrases: &[],
+        // ⭐ MEASURED ABSENT 2026-09-27 (0.6.14 deployed, muse lab host,
+        // suites/startup-gates.js): a NEVER-OPENED directory renders the
+        // composer directly. Confirmed from source: first-party has no
+        // directory-trust gate (the only trust wiring is the
+        // workspaceHookTrustGrant protocol message, server-side). Empty
+        // here is MEASURED-NONE, not UNMEASURED.
         startup_gate_screen_phrases: &[],
         plan_limit_choice_screen_phrases: &[],
         // MEASURED: `--resume <sessionId>` boots straight into a resumed
@@ -3982,9 +4020,15 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // is inherited from that store, so re-rooting would be a no-op.
         resume_re_roots_with_cwd: false,
         model_flag: Some("--model"),
-        // The composer renders the draft with a U+258F left-bar caret while
-        // typing; nothing else marks the input head.
-        composer_marker: '\u{258f}',
+        // ⭐ RE-MEASURED 2026-09-27 (0.6.14 deployed, byte-checked idle
+        // render, suites/startup-gates.js): the composer input head is the
+        // U+258C `▌` box rule — the declared U+258F `▏` draws NOWHERE on the
+        // 0.6.x idle screen. History: `▏` was the 0.5.9-era draft-caret
+        // reading (the [11.111] fill, suite-green against true-main); the
+        // opencode-v2 parity line redraws the composer as a ▌-ruled box. The
+        // descriptor follows the DEPLOYED line — the readiness probe must
+        // find the composer real rows draw.
+        composer_marker: '\u{258c}',
         composer_region_label: None,
         composer_placeholder_needles: &[],
         // MEASURED 0.5.9 ([11.111]): `○ idle` never draws (idle status is
@@ -11045,10 +11089,27 @@ Antigravity CLI requires permission to read, edit, and execute files here.
         const AGY_IDLE: &str = ">
 ? for shortcuts                                                                   Gemini 3.7 Flash - high";
 
+        // grok 1.0.30, measured 2026-09-27 on the muse lab host
+        // (suites/startup-gates.js): with the host's auth expired the first
+        // screen is the device-code SIGN-IN — an AUTH-scoped gate (a signed-in
+        // host renders the composer directly). The device code is invented.
+        const GROK_GATE: &str = "\
+Approve in your browser to finish signing in.
+0000-0000
+Make sure your browser shows this code.
+If it doesn't open, click here to copy.
+Copying not working? Click here to show full URL.
+Waiting for approval...
+ctrl+q  quit";
+        const GROK_IDLE: &str = "\
+\u{276f}
+Shift+Tab:mode \u{2502} Ctrl+x:shortcuts";
+
         for (kind, gate, idle) in [
             (SessionKind::Codex, CODEX_GATE, CODEX_IDLE),
             (SessionKind::ClaudeCode, CLAUDE_GATE, CLAUDE_IDLE),
             (SessionKind::Antigravity, AGY_GATE, AGY_IDLE),
+            (SessionKind::GrokBuild, GROK_GATE, GROK_IDLE),
         ] {
             let d = agent_cli_descriptor(kind).expect("registered");
             assert!(
@@ -11098,6 +11159,14 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             (
                 SessionKind::OpenCode,
                 "\u{2503}  Ask anything\u{2026} \"Fix broken tests\"",
+            ),
+            // [99.1] re-measured 2026-09-27, 0.6.14 deployed (muse lab host):
+            // the opencode-v2 parity line redraws the composer as a ▌-ruled
+            // box — the declared ▏ U+258F drew NOWHERE on the idle render
+            // (byte-checked 0x258c on the input head).
+            (
+                SessionKind::ZcodeTui,
+                "\u{258c}   Ask anything\u{2026} \"How do I run the test suite?\"",
             ),
         ] {
             let d = agent_cli_descriptor(kind).expect("registered");
