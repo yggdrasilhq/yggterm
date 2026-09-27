@@ -33,39 +33,46 @@ MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `sch
 ⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
 
 
-## ⛔ [11.185] THE WEB-SURFACE PROVENANCE GATE HARDCODES THE PILOT APP: `launch_command.contains("ychrome")` REFUSES EVERY OTHER REGISTERED APP'S SURFACES — yRDP'S WHOLE CHOOSER FLOW DIED AS `provenance_refused` AND THE ROW SAT ON "CONNECTING" OVER A LIVE, HEALTHY RDP SESSION (owner report + screenshot 2026-09-27 ~12:38 IST, live jojo desktop)
+## ⛔ [11.186] THE RETIRED CHOOSER PANE KEEPS PAINTING OVER THE MOUNTED DESKTOP: A yRDP sidebar `close` NEVER FIRES THE GUI'S `sidebar_contribution/close` ARM, SO `clear_document_panes_for_session` NEVER RUNS AND THE VIEWPORT SHOWS THE MACHINE LIST OVER THE LIVE noVNC CANVAS (measured 2026-09-27 14:50-15:25 IST, live jojo desktop, the [11.185] proof leg)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
-Filed 2026-09-27 (zcode sess_8f109ffd on jojo, row claim 11.181,
-board plan ACK-a64d441169). The [11.60] anti-forgery gate answers "was this
-row launched as a surface app" from ONE hardcoded name, so yRDP's row
-(`/home/pi/.local/bin/yrdp pick; exec …`) could never pass: ytrace carries
-`provenance_refused {"action": "open", "verb": "web-surface",
-"launch_command": "…/yrdp pick; exec …"}` for the open AND every heartbeat,
-12:37:48→12:48:36. The yRDP chain itself was UP the whole time (daemon
-:34297 alive, Xvfb :90 + xfreerdp3 → win0, two noVNC bridges, /api/active
-= pl9 epoch 2 — TWO clicks both connected); the picker drained the daemon's
-web-surface event and emitted the OSC (proc io counters: writes every 4s,
-zero reads). The GUI never saw the surface, and the daemon-declare rebuild
-plane — the one that survives a GUI restart, and the GUI DID restart at
-12:48 — can never rehydrate what ingest refused.
+Filed 2026-09-27 (zcode sess_8f109ffd on jojo, row claim 11.185). yRDP is the
+FIRST libyggterm app that ends a viewport DOCUMENT pane and swaps in a web
+surface (pick.py: `_osc("sidebar","close")` then `_osc("web-surface","open")`);
+ychrome's picker is the NATIVE picker, never a document pane, so this handoff
+was never exercised before [11.185] let yRDP surfaces through the gate.
 
-FIX (this lane): the gate asks the APP REGISTRY — the same
-`cached_app_registry()` scan the launcher family reads — via a pure
-token-boundary matcher (full path or basename, shell punctuation
-stripped; `echo yrdpick` still refuses). `contains("ychrome")` stays as the
-grandfathered pilot clause with its [11.60]-era exposure unchanged. Plain
-shell rows stay refused: the forgery hole stays shut (naming an app in a
-launch line was already accepted for ychrome; it is now uniform for every
-registered app).
+MEASURED, with the gate fix live (build 0c8e47b95cc3):
+- The server ingests the close and the open; the retained declare plane holds
+  web-surface (`app_declare_ingested` verb web-surface, retained_verbs
+  ["web-surface"]) and the restore poll's `daemon_declare_rebuild` MOUNTS the
+  surface — `native_open` at
+  `http://127.0.0.1:6102/index.html?...#/m/pl9`, engines_present 1,
+  engine_widgets_visible 1, frame url verified via `app web read`.
+- FOUR connects with the row OPEN and ACTIVE on the GUI (pid 993818), each
+  driving a fresh picker close+open through the PTY: ZERO client-side
+  `sidebar_contribution/close` traces. The declare reached the same JS (the
+  pane rendered), so 7717 reaches the client; the close specifically never
+  fires the arm at viewport.rs's `"close" =>` handler.
+- `shell.document_surfaces` keeps `{"pane_id": "targets", "visible": true,
+  "stale": false}` and the pane paints the machine list OVER the mounted
+  follower canvas. A row close/reopen (clean replay, no live fetch racing)
+  leaves the pane mounted too.
 
-FALSIFIER (live bar before this entry retires): on the rotated build, a
-fresh `yrdp pick` row + connect shows the desktop IN THE ROW (PTY proof),
-ytrace carries ZERO new `provenance_refused` for verb web-surface, and the
-retained declare plane accepts the record (`app_declare_ingested` with
-verb web-surface). Any OTHER registered app (ymacs/yedit/yfiles/ytop) that
-emits the OSC now passes the same gate — that generality is the point.
+The close arm itself looks right (`clear_document_panes_for_session` +
+`close_app_pane`); the break is in delivery or ordering — leading suspects:
+(a) the close chunk is dropped/suppressed on the relay to clients
+(`terminal_protocol_only_duplicate_should_skip` compares whole batches), or
+(b) the declare-triggered `app_pane_fetch_schema` completes AFTER the close
+cleared the pane and re-mounts it (fetch-vs-close race). Falsifier: with this
+row's repro, a client-side `sidebar_contribution/close` trace fires and
+`document_surfaces` for the session goes empty; the desktop canvas becomes the
+top-most content of the row.
+
+⇒ Fix direction: trace the close chunk at the server relay boundary and at the
+JS forward, find where it dies, then make the pane drop deterministic against
+an in-flight schema fetch (generation-stamp the fetch; a close wins).
 
 
 ## ⛔ [11.180] THE SERVING RAISE PAYS A FULL SIDEBAR REBUILD: SessionPreview DROP+REALLOC + FULL RE-HASH OF EVERY ROW'S PREVIEW LINES PER RAISE — sidebar/memo complex ≈17-19% + allocator ≈16% OF RAISE-WINDOW CPU, webproc clock-tax + page-in ≈8%, DAEMON ≈0% (measured 2026-09-27 ~12:20-12:35 IST, raise-perf-capture lane, live jojo desktop, GUI 5baa7991 / daemon aa555326)
