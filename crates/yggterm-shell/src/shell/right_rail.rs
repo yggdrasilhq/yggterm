@@ -8929,7 +8929,7 @@ fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: 
             } else {
                 SplitAxis::Stacked
             };
-            create_split_group(state, candidates, axis);
+            create_split_group(state, candidates, axis, "menu");
         }
         "rename-session" => {
             state.with_mut_counted(|shell| shell.begin_tree_rename(&row));

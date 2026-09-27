@@ -23062,6 +23062,50 @@ console.log('ok');
     // exact shape the context-menu probe and the ALT row-menu walk produce)
     // rode it silently. Every opener that mounts the delete dialog must emit
     // `modal_open_requested`, and the payload must name its opener.
+    // ux-speed split-window-vocab lane (2026-09-27): the split action's
+    // begin half existed (`context_menu_activate{action:split-*}`) but the
+    // commit, refusal and teardown halves were DARK — click→commit latency
+    // was unmeasurable and a probe could not distinguish "build not rotated"
+    // from "silent refusal". Every creation origin (menu, app-control,
+    // web-tab) funnels through `create_split_group_from_members`, so the
+    // family must fire THERE with the origin carried, and ungroup must have
+    // its own commit + refusal halves.
+    #[test]
+    fn split_event_family_commits_and_refuses_at_the_one_choke_point() {
+        let source = SHELL_SOURCE;
+        assert!(source.contains(
+            "axis: SplitAxis,\n    origin: SplitOrigin,"
+        ));
+        assert!(source.contains("\"split/create\","));
+        assert!(source.contains("\"split/create_refused\","));
+        assert!(source.contains("\"reason\": \"needs_two_distinct_members\""));
+        assert!(source.contains("\"reason\": \"member_already_grouped\""));
+        assert!(source.contains("\"split/ungrouped\","));
+        assert!(source.contains("\"split/ungroup_refused\","));
+        // the user's hand is the menu path; a probe asserts it drove THAT
+        assert!(source
+            .contains("create_split_group(state, candidates, axis, \"menu\")"));
+        assert!(source.contains(
+            "create_split_group(state, members.clone(), axis, \"app_control\")"
+        ));
+        assert!(source.contains("axis,\n        \"web_tab\","));
+    }
+
+    // ux-speed split-window-vocab lane (2026-09-27): the resize action had NO
+    // native begin marker — the window committed a new size and only the
+    // daemon's PTY-side events (hash-paired) and the hot-throttled xterm_fit
+    // noticed. `window/resized` is the resize pair's begin truth; the throttle
+    // (150 ms, any payload) lives in ui_telemetry's own tests.
+    #[test]
+    fn window_resized_begin_marker_rides_the_native_resized_arm() {
+        let source = SHELL_SOURCE;
+        assert!(source.contains(
+            "pub(crate) fn record_window_resized(&mut self, width: u32, height: u32)"
+        ));
+        assert!(source.contains("shell.record_window_resized(width, height);"));
+        assert!(source.contains("DesktopWindowEvent::Resized(size) =>"));
+    }
+
     #[test]
     fn modal_request_edge_fires_from_every_delete_dialog_opener() {
         let source = SHELL_SOURCE;
