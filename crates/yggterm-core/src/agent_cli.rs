@@ -5742,26 +5742,82 @@ pub fn store_candidate_session_for_directory(
             let title: Option<String> = row.get(1).ok();
             Some((id, title_without_fallbacks(title)))
         }
-        // agy's summaries db: workspace_uris is a JSON list of roots — a
-        // substring match on the cwd is the honest bound here (the list is
-        // short and the cwd is absolute), last_modified_time the recency.
+        // agy's summaries db: workspace_uris is a JSON list of `file://` roots.
+        // ⛔ THE [11.183] TIGHTENING (measured on dev 2026-09-27): the old
+        // substring `LIKE %cwd%` let a `/home/pi` row vouch a
+        // `/home/pi/sol-correction/...` conversation — a subdirectory
+        // conversation is NOT this row's, and the store's newest-modified row
+        // was exactly such an interloper. The JSON array is probed for the
+        // EXACT quoted `"file://<cwd>"` element, killed conversations are
+        // excluded, and recency is the user's own last input (the modified
+        // time can outlive the human by hours of background agent churn).
+        // Type-agnostic column reads throughout — a storage-class surprise is
+        // the silent-empty-answer killer (the opencode lesson below).
         SessionKind::Antigravity => {
             let conn = open_cli_index_readonly(
                 &home.join(".gemini/antigravity-cli/conversation_summaries.db"),
             )?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT conversation_id, title FROM conversation_summaries \
-                     WHERE workspace_uris LIKE ?1 ESCAPE '\\' \
-                     ORDER BY last_modified_time DESC LIMIT 1",
-                )
-                .ok()?;
-            let pattern = format!("%{}%", cwd.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-            let mut rows = stmt.query(rusqlite::params![pattern]).ok()?;
-            let row = rows.next().ok()??;
-            let id: String = row.get(0).ok()?;
-            let title: Option<String> = row.get(1).ok();
-            Some((id, title_without_fallbacks(title)))
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT conversation_id, title, workspace_uris, \
+                 last_modified_time, last_user_input_time, killed \
+                 FROM conversation_summaries",
+            ) else {
+                return None;
+            };
+            let needle = format!("\"file://{cwd}\"");
+            let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, rusqlite::types::Value>(5)?,
+                ))
+            }) else {
+                return None;
+            };
+            let mut best: Option<(String, Option<String>)> = None;
+            let mut best_recency = String::new();
+            let mut best_typed = false;
+            for row in rows {
+                let Ok((id, title, workspaces, modified, last_input, killed)) = row else {
+                    continue;
+                };
+                let killed_is_set = match killed {
+                    rusqlite::types::Value::Integer(n) => n != 0,
+                    rusqlite::types::Value::Real(f) => f != 0.0,
+                    rusqlite::types::Value::Text(t) => !(t.is_empty() || t == "0"),
+                    _ => false,
+                };
+                if killed_is_set || !workspaces.contains(&needle) {
+                    continue;
+                }
+                // One writer lays every timestamp down in the same shape and
+                // offset, so the ISO-ish strings order lexicographically. A
+                // conversation the human TYPED into always outranks a
+                // never-typed one whose background agents churned its modified
+                // time afterwards; among same-typedness rows the newer
+                // timestamp wins (the human's last input for typed rows, the
+                // modified time for never-typed ones).
+                let typed = !last_input.starts_with("0001-01-01");
+                let recency = if typed { last_input } else { modified };
+                let better = if best.is_none() {
+                    true
+                } else {
+                    match (typed, best_typed) {
+                        (true, false) => true,
+                        (false, true) => false,
+                        _ => recency > best_recency,
+                    }
+                };
+                if better {
+                    best = Some((id, title_without_fallbacks(Some(title))));
+                    best_typed = typed;
+                    best_recency = recency;
+                }
+            }
+            best
         }
         _ => None,
     }
@@ -12585,6 +12641,182 @@ mod newest_session_tests {
             ),
             None,
             "no db: this host cannot answer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agy_store_candidate_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("yggterm-agycand-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("temp home");
+        home
+    }
+
+    fn seed(home: &Path, rows: &[(&str, &str, &str, &str, &str, &str)]) {
+        let dir = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&dir).expect("store dir");
+        let conn = Connection::open(dir.join("conversation_summaries.db")).expect("fixture db");
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT, title TEXT, workspace_uris TEXT,
+                last_modified_time TEXT, last_user_input_time TEXT, killed TEXT);",
+        )
+        .expect("schema");
+        for (id, title, ws, modified, last_input, killed) in rows {
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![id, title, ws, modified, last_input, killed],
+            )
+            .expect("row");
+        }
+    }
+
+    const PELVIC: &str = "79189666-62c6-4837-ac04-f823775ae528";
+    const REPAIR: &str = "e7693814-4f1d-41b8-90d9-3459d394acbe";
+
+    #[test]
+    fn an_exact_workspace_match_beats_a_newer_subdirectory_interloper() {
+        // THE [11.183] MEASURED SHAPE (dev 2026-09-27): the /home/pi row must
+        // land on the /home/pi conversation even though the subdirectory
+        // conversation was modified LATER — the old substring LIKE arm picked
+        // the interloper.
+        let home = temp_home("exact");
+        seed(
+            &home,
+            &[
+                (
+                    REPAIR,
+                    "Repair JSON Math Formatting",
+                    "[\"file:///home/pi/sol-correction/work-wave2-fixed-income\"]",
+                    "2026-09-27 01:52:15.245484935+00:00",
+                    "0001-01-01 00:00:00+00:00",
+                    "0",
+                ),
+                (
+                    PELVIC,
+                    "Pelvic Pain And Bridge Exercise",
+                    "[\"file:///home/pi\"]",
+                    "2026-09-26 11:39:00.000000000+00:00",
+                    "2026-09-26 11:32:00.000000000+00:00",
+                    "0",
+                ),
+            ],
+        );
+        let (id, title) =
+            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/home/pi")
+                .expect("candidate");
+        assert_eq!(id, PELVIC);
+        assert_eq!(title.as_deref(), Some("Pelvic Pain And Bridge Exercise"));
+    }
+
+    #[test]
+    fn the_users_own_last_input_outranks_background_modification() {
+        // A conversation the human typed into LAST is the one the row means,
+        // even when a background agent churned another one's modified time
+        // afterwards.
+        let home = temp_home("recency");
+        seed(
+            &home,
+            &[
+                (
+                    "aaaa-2",
+                    "Background Churn",
+                    "[\"file:///w\"]",
+                    "2026-09-27 10:00:00.000000000+00:00",
+                    "0001-01-01 00:00:00+00:00",
+                    "0",
+                ),
+                (
+                    "bbbb-1",
+                    "The Human's",
+                    "[\"file:///w\"]",
+                    "2026-09-27 08:00:00.000000000+00:00",
+                    "2026-09-27 09:30:00.000000000+00:00",
+                    "0",
+                ),
+            ],
+        );
+        let (id, _) =
+            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/w")
+                .expect("candidate");
+        assert_eq!(id, "bbbb-1");
+    }
+
+    #[test]
+    fn killed_conversations_never_vouch_and_killed_reads_any_storage_class() {
+        let home = temp_home("killed");
+        seed(
+            &home,
+            &[
+                (
+                    "dead-int",
+                    "Killed Integer",
+                    "[\"file:///w\"]",
+                    "2026-09-27 10:00:00.000000000+00:00",
+                    "2026-09-27 10:00:00.000000000+00:00",
+                    "1",
+                ),
+                (
+                    "dead-text",
+                    "Killed Text",
+                    "[\"file:///w\"]",
+                    "2026-09-27 11:00:00.000000000+00:00",
+                    "2026-09-27 11:00:00.000000000+00:00",
+                    "1",
+                ),
+                (
+                    "alive",
+                    "Alive",
+                    "[\"file:///w\"]",
+                    "2026-09-27 01:00:00.000000000+00:00",
+                    "2026-09-27 01:00:00.000000000+00:00",
+                    "0",
+                ),
+            ],
+        );
+        // The live store lays `killed` down as INTEGER; the fixture above
+        // forces the TEXT shape through the same column, so this one query
+        // proves the reads are type-agnostic.
+        let conn =
+            Connection::open(home.join(".gemini/antigravity-cli/conversation_summaries.db"))
+                .expect("reopen");
+        conn.execute_batch("UPDATE conversation_summaries SET killed = 1 WHERE conversation_id = 'dead-int';")
+            .expect("int shape");
+        let (id, _) =
+            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/w")
+                .expect("candidate");
+        assert_eq!(id, "alive");
+    }
+
+    #[test]
+    fn no_store_or_no_match_answers_none_not_a_guess() {
+        let home = temp_home("none");
+        assert_eq!(
+            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/w"),
+            None,
+            "no db: this host cannot answer"
+        );
+        seed(
+            &home,
+            &[(
+                "somewhere-else",
+                "Elsewhere",
+                "[\"file:///other\"]",
+                "2026-09-27 10:00:00.000000000+00:00",
+                "2026-09-27 10:00:00.000000000+00:00",
+                "0",
+            )],
+        );
+        assert_eq!(
+            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/w"),
+            None,
+            "a cwd the store cannot vouch for proposes nothing"
         );
     }
 }

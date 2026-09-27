@@ -12324,6 +12324,7 @@ impl YggtermServer {
             true,
             activate,
             launch,
+            false,
         );
         key
     }
@@ -12636,6 +12637,89 @@ impl YggtermServer {
                 session_id = vouched_id;
             }
         }
+        // ⛔ THE [11.183] AGY VOUCH LADDER — the store-candidate tier. A
+        // re-birthed Antigravity row ([11.156]) carries a uuid the store has
+        // never held: the clone lost the conversation binding that lived only
+        // in the daemon-lifetime runtime twin, so every `--require-existing`
+        // resume probed ABSENT and the [11.165] gate refused forever — the
+        // row's eternal Bootstrapping / raw "no longer available" paint
+        // (owner screenshots 2026-09-27 19:41) while the real conversation
+        // sat intact in the peer store (measured: row 845ddc17 ↔ db
+        // 79189666 "Pelvic Pain And Bridge Exercise", exact workspace
+        // `file:///home/pi`, last user input minutes before the report).
+        // The store is the last witness left, and the conversation with the
+        // most recent USER INPUT for the row's own cwd is what "the human's
+        // conversation" means at this tier. Runs ONLY on a definitive miss
+        // (never over `None` — an unreadable store vouches nothing), never
+        // for a runtime this daemon already holds, and the rebind is NAMED
+        // here and on the row's Conversation metadata so nobody mistakes it
+        // for the birth id.
+        if kind == SessionKind::Antigravity
+            && require_existing
+            && !self.sessions.contains_key(&key)
+        {
+            let definitive_miss = self
+                .user_home
+                .as_deref()
+                .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, &session_id))
+                == Some(false);
+            if definitive_miss
+                && let Some(home) = self.user_home.as_deref()
+                && let Some(dir) = cwd
+                && let Some((candidate_id, candidate_title)) =
+                    yggterm_core::agent_cli::store_candidate_session_for_directory(
+                        home, kind, dir,
+                    )
+                && candidate_id != session_id
+            {
+                if let Some(ygg_home) = self.yggterm_home.clone() {
+                    append_trace_event(
+                        &ygg_home,
+                        "daemon",
+                        "remote_runtime",
+                        "agy_store_candidate_vouch",
+                        json!({
+                            "requested_id": session_id,
+                            "vouched_id": candidate_id,
+                            "vouched_title": candidate_title,
+                            "cwd": dir,
+                            "policy": "definitive_store_miss_binds_the_cwd_newest_conversation",
+                        }),
+                    );
+                }
+                // BUS LAW (1cb614bcf): the restore tests exercise this arm for
+                // the composed launch; the fleet bus must not receive fixture
+                // vouches.
+                #[cfg(not(test))]
+                {
+                    use crate::codex_cli::{composed_cli_extra_args_with, split_extra_args};
+                    let descriptor_extra = composed_cli_extra_args_with(
+                        kind,
+                        &AgentLaunchOptions::default(),
+                        configured_extra_args,
+                    )
+                    .unwrap_or_default();
+                    let selector = agent_cli_descriptor(kind)
+                        .map(|descriptor| descriptor.resume_selector_token())
+                        .unwrap_or_default();
+                    yggterm_core::cli_plane::emit_launch_contract(
+                        "daemon",
+                        kind,
+                        selector,
+                        yggterm_core::cli_plane::CliInvocationShape {
+                            action: "resume",
+                            selector,
+                            carries_id: true,
+                            re_roots_with_cwd: false,
+                            extra_arg_tokens: split_extra_args(&descriptor_extra).len(),
+                            persistent: true,
+                        },
+                        yggterm_core::cli_plane::CliLaunchContractBreach::StoreCandidateResume,
+                    );
+                }
+                session_id = candidate_id;
+            }
+        }
         let session_id: &str = &session_id;
         // ⛔ LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE — the same rule the
         // `resume-<slug>` wrappers enforce before their own store probe (see
@@ -12662,6 +12746,15 @@ impl YggtermServer {
         let saved_session_in_store =
             remote_saved_agent_session_exists(kind, session_id, &self.remote_codex_store_env)?;
         let saved_session_exists = live_runtime_held || saved_session_in_store;
+        // THE [11.154] DELIBERATE RE-ENTRY SIGNAL ([11.184], reproduced live
+        // on dev 2026-09-27 20:11): an addressed `--require-existing` open of
+        // a session the store vouches for (or a runtime this daemon holds) is
+        // the permissive open verb's peer — NOT the passive re-birth the
+        // birth veto exists to stop. Without this, the owner's bulk-closed
+        // rows could never be re-opened: the veto silently ate the ensure's
+        // insert, the ensure still answered Ok, and the handler's
+        // terminal-ensure died later on the generic `no terminal spec` paint.
+        let deliberate_reentry = require_existing && saved_session_exists;
         if !picker_fallback
             && remote_require_existing_refusal_allowed(
                 live_runtime_held,
@@ -12856,7 +12949,7 @@ impl YggtermServer {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| local_live_session_default_title(kind));
         if !self.sessions.contains_key(&key) {
-            self.insert_live_session_with_launch(
+            self.insert_live_session_with_launch_deliberate(
                 &key,
                 session_id,
                 kind,
@@ -12864,6 +12957,7 @@ impl YggtermServer {
                 Some(title.clone()),
                 false,
                 false,
+                deliberate_reentry,
             );
         }
         // A held live row must re-attach through the RESUME command — its
@@ -12978,6 +13072,17 @@ impl YggtermServer {
                     })
                 ),
             );
+            // THE [11.183] BINDING, PERSISTED ON THE ROW: the id this resume
+            // is composed from, stamped only when the store vouches for it —
+            // the metadata names a CONVERSATION, so a live-held row without
+            // store presence keeps its hands off.
+            if saved_session_in_store {
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Conversation",
+                    session_id.to_string(),
+                );
+            }
             if let Some(cwd) = target.cwd.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
             }
@@ -12997,6 +13102,31 @@ impl YggtermServer {
                 "Runtime owner: yggterm daemon".to_string(),
                 "Transport bridge: stdio attach to daemon PTY".to_string(),
             ];
+        }
+        // ⛔ NEVER ANSWER OK FOR A RUNTIME ROW THAT DOES NOT EXIST. A vetoed
+        // birth used to fall through: the ensure returned the key, the
+        // handler's terminal-ensure then bailed with the generic
+        // `no terminal spec for session:` and the row painted THAT raw
+        // forever ([11.184]). The refusal surfaces HERE, with its named
+        // cause, so the row stamps the truth instead of a resolution failure.
+        if !self.sessions.contains_key(&key) {
+            if let Some(home) = self.yggterm_home.clone() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "remote_runtime",
+                    "ensure_runtime_row_absent_after_birth",
+                    json!({
+                        "key": key,
+                        "kind": format!("{kind:?}"),
+                        "detail": "the birth did not land (close still remembered); refusing by name instead of answering Ok",
+                    }),
+                );
+            }
+            anyhow::bail!(
+                "yggterm: {display} runtime row {key} could not be created on this machine — \
+                 its close is still remembered here, so only an addressed re-open can resume it"
+            );
         }
         self.set_active_session_path(
             Some(key.clone()),
@@ -13179,6 +13309,15 @@ impl YggtermServer {
                         format!("start-<{} has no remote arm>", session_kind_label(kind))
                     })
                 ),
+            );
+            // THE [11.183] BINDING AT BIRTH: a fresh start runs
+            // `--conversation <id>` with the row's own id, so the store will
+            // hold the conversation under exactly this id; stamping it here
+            // is what lets a later re-birth find its way back.
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Conversation",
+                session_id.to_string(),
             );
             if let Some(cwd) = target.cwd.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -13602,6 +13741,7 @@ impl YggtermServer {
                 false,
                 false,
                 &agent_launch_options,
+                false,
             );
             self.append_restored_live_session_order(normalized_live_key);
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
@@ -13706,6 +13846,7 @@ impl YggtermServer {
             false,
             false,
             &agent_launch_options,
+            false,
         );
         self.append_restored_live_session_order(&key);
         // The row's title provenance travels with the row. Without this a
@@ -14814,6 +14955,37 @@ impl YggtermServer {
             launch_now,
             activate,
             &AgentLaunchOptions::default(),
+            false,
+        );
+    }
+
+    /// THE [11.154]/[11.184] DELIBERATE BIRTH: an addressed re-entry
+    /// (`--require-existing` open of a session the store vouches for) inserts
+    /// THROUGH a remembered close instead of being silently vetoed by it —
+    /// `persist()`'s reconcile then lifts the stale grave, the same way it
+    /// already lifts for a user-driven start.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_live_session_with_launch_deliberate(
+        &mut self,
+        key: &str,
+        session_id: &str,
+        kind: SessionKind,
+        target: &SshConnectTarget,
+        title_override: Option<String>,
+        launch_now: bool,
+        activate: bool,
+        deliberate_birth: bool,
+    ) {
+        self.insert_live_session_with_launch_options(
+            key,
+            session_id,
+            kind,
+            target,
+            title_override,
+            launch_now,
+            activate,
+            &AgentLaunchOptions::default(),
+            deliberate_birth,
         );
     }
 
@@ -14828,6 +15000,7 @@ impl YggtermServer {
         launch_now: bool,
         activate: bool,
         launch: &AgentLaunchOptions,
+        deliberate_birth: bool,
     ) {
         // ⛔ THE [11.154] BIRTH VETO. A PASSIVE birth (`launch_now == false` —
         // a rotation restore, a client-handshake re-birth, a scanned-session
@@ -14839,9 +15012,31 @@ impl YggtermServer {
         // back in against a dead peer. A user-driven start
         // (`launch_now == true`) is a DELIBERATE re-entry: it inserts, and
         // the persist reconcile lifts the stale veto on the row now living.
-        if !launch_now
+        let birth_is_tombstoned = !launch_now
+            && self
+                .yggterm_home
+                .as_ref()
+                .is_some_and(|home| !crate::live_row_closes_remembered_among(home, [key]).is_empty());
+        if birth_is_tombstoned && deliberate_birth {
+            // THE [11.184] DELIBERATE RE-ENTRY ARM: an addressed
+            // `--require-existing` open is the permissive open verb's peer,
+            // not a sweep's resurrection — the insert proceeds and
+            // persist()'s reconcile lifts the grave.
+            if let Some(home) = self.yggterm_home.clone() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "live_session_birth_deliberate_reentry",
+                    serde_json::json!({
+                        "key": key,
+                        "kind": format!("{kind:?}"),
+                        "detail": "an addressed require-existing open lifts the remembered close; persist() reconciles the grave",
+                    }),
+                );
+            }
+        } else if birth_is_tombstoned
             && let Some(home) = self.yggterm_home.clone()
-            && !crate::live_row_closes_remembered_among(home.as_path(), [key]).is_empty()
         {
             append_trace_event(
                 &home,
@@ -60100,5 +60295,143 @@ mod remote_scan_lock_wait_tests {
         );
         releaser.join().expect("releaser thread");
         let _ = fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod agy_connection_tests {
+    use super::*;
+
+    /// THE [11.184] REPRO AS A LAW (dev 2026-09-27 20:11): a re-birthed row
+    /// the store vouches for, whose birth the [11.154] veto used to eat —
+    /// the ensure answered Ok for a row it never created, and the handler's
+    /// terminal-ensure died later on the generic `no terminal spec` paint.
+    /// Three source-shape locks: the deliberate signal is computed, the
+    /// ensure's insert carries it, and the veto arm branches BEFORE the veto
+    /// return.
+    #[test]
+    fn a_deliberate_reentry_lifts_a_remembered_close_and_a_vetoed_birth_never_answers_ok() {
+        let source = include_str!("lib.rs");
+
+        // 1. The signal exists and is exactly require-existing AND
+        // saved-session (an addressed open, never a sweep).
+        let signal_at = source
+            .find("let deliberate_reentry = require_existing && saved_session_exists;")
+            .expect("the deliberate-reentry signal");
+        assert!(
+            signal_at
+                < source
+                    .find("fn insert_live_session_with_launch_deliberate(")
+                    .expect("the deliberate insert exists"),
+            "the signal is computed before the insert that consumes it"
+        );
+
+        // 2. The ENSURE's insert is the deliberate variant.
+        let ensure = source
+            .split("fn ensure_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            ensure.contains("insert_live_session_with_launch_deliberate("),
+            "the ensure's birth goes through the deliberate arm"
+        );
+        assert!(
+            !ensure.contains("self.insert_live_session_with_launch(\n"),
+            "the ensure never takes the passive-birth path"
+        );
+
+        // 3. The veto branches on deliberate BEFORE returning.
+        let veto = source
+            .split("let birth_is_tombstoned = !launch_now")
+            .nth(1)
+            .expect("veto block")
+            .split("\n        let mut session")
+            .next()
+            .unwrap();
+        let deliberate_arm = veto.find("if birth_is_tombstoned && deliberate_birth {").expect("deliberate arm");
+        let veto_return = veto.find("return;").expect("veto return");
+        assert!(
+            deliberate_arm < veto_return,
+            "a deliberate birth must be decided before the veto returns"
+        );
+
+        // 4. The ensure NEVER answers Ok for a runtime row that does not
+        // exist — the named bail sits before the activation.
+        let bail_at = ensure
+            .find("ensure_runtime_row_absent_after_birth")
+            .expect("the loud-failure trace");
+        let ok_at = ensure.find("Ok(key)").expect("the Ok return");
+        assert!(
+            bail_at < ok_at,
+            "the absent-row refusal must precede the Ok the handler would trust"
+        );
+    }
+
+    /// THE [11.183] LAWS, locked in source shape: the agy ladder runs before
+    /// the definitive-miss gate (a vouched id must pass it), only on a
+    /// definitive miss, and stamps its binding on the row; the start path
+    /// stamps the birth id as the binding.
+    #[test]
+    fn the_agy_ladder_precedes_the_gate_and_the_binding_is_stamped_on_the_row() {
+        let source = include_str!("lib.rs");
+
+        let ensure = source
+            .split("fn ensure_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        let ladder_at = ensure
+            .find("THE [11.183] AGY VOUCH LADDER")
+            .expect("the agy ladder");
+        let gate_at = ensure
+            .find("remote_require_existing_needs_definitive_vouch(kind)")
+            .expect("the [11.165] gate");
+        assert!(
+            ladder_at < gate_at,
+            "a vouched rebind must run BEFORE the gate that would refuse the birth id"
+        );
+        // The ladder vouches only over a DEFINITIVE miss and only for an
+        // addressed, unheld row. The window runs to the gate (which sits
+        // after the ladder by the first assertion).
+        let ladder = &ensure[ladder_at..gate_at];
+        assert!(
+            ladder.contains("== Some(false)"),
+            "an unreadable store (None) never vouches"
+        );
+        assert!(
+            ladder.contains("require_existing"),
+            "the ladder is an addressed-open arm, never a sweep arm"
+        );
+        assert!(
+            ladder.contains("!self.sessions.contains_key(&key)"),
+            "a runtime this daemon holds is never re-pointed"
+        );
+
+        // The binding stamps: at birth (start path) and on a store-vouched
+        // resume (ensure path), and the ensure's stamp is guarded.
+        let start = source
+            .split("fn start_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("start body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            start.contains("upsert_session_metadata(\n                &mut session.metadata,\n                \"Conversation\","),
+            "a fresh start stamps the birth id as the conversation binding"
+        );
+        let guard_at = ensure
+            .find("if saved_session_in_store {")
+            .expect("the stamp guard");
+        let stamp_at = ensure.find("\"Conversation\",").expect("the ensure stamp");
+        assert!(
+            guard_at < stamp_at,
+            "the ensure stamps a conversation only when the store vouches for the id"
+        );
     }
 }
