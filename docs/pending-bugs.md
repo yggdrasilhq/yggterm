@@ -31484,7 +31484,9 @@ birth identity, the appearance-only `initial_server_sync`, the frontend
 
 ## ⛔ [11.187] A REMOTE ROW'S OUTPUT STREAM DIES SECONDS AFTER BIRTH AND NOTHING EVER RECONCILES — THE ROW STAYS ACTIVE, THE DAEMON'S OWN SCREEN MOVES ON, AND THE VIEWPORT FREEZES ON THE BIRTH PAINT FOREVER (measured 2026-09-27 19:35-19:41 IST live on the owner's GUI, the [11.187] sitting; owner screenshot: "New dev Antigravity" frozen at "Signing in…")
 
-**Status:** OPEN — filed with the full measured chain; the E2E probe must learn to DETECT this class before any "fixed"
+**Status:** OPEN
+
+Filed with the full measured chain (zcode sess_745c8f5c on jojo, work FROM dev, lane/integration/11187-agy-connection-e2e); the E2E probe must learn to DETECT this class before any "fixed" declaration. Landed same-sitting companions: [11.182]/[11.183]/[11.184] all FIXED IN CODE and E2E-proven by `tools/e2e/connection_probe.py` (5/5 on the live fixed stack, 2026-09-27 ~22:2x IST).
 
 The chain, from jojo's ytrace for `remote-agy://dev/ce241f2e…` (all timestamps IST):
 - 19:35:10 birth is HEALTHY: fresh `start-agy` on dev, spawn 170x63, mount m1, first paint, stream samples + frame-hash probes flowing (spinner frames of the agy sign-in TUI arriving).
