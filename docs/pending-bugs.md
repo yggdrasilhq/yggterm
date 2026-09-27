@@ -161,6 +161,58 @@ byte-identical to clean main). LIVE PROOF OWED on the first rotated jojo build:
 `uxprobe --actions spawn` paints every iteration (warm-fast or recover+cold),
 no permanent blanks.
 
+
+## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
+
+**Status:** OPEN
+
+Filed 2026-09-27 by the ux-speed webproc-raise-capture lane (zcode
+sess_75faf0ad on jojo, work FROM dev, board claim ACK-aa18fa4a43) while
+preparing the WebProcess perf capture during raise-path switches: the
+raises to capture DO NOT EXIST on current main.
+
+MEASURED (active ytrace generation, full window; uxprobe `switch` ×10 real
+pointer clicks on scratch rows + natural traffic):
+
+- `terminal_mount/reveal_raise_refused` ×173: 110 local + 63 remote rows,
+  `daemon_owns_runtime: false` + `has_host_epoch: true` in EVERY payload.
+  `terminal_mount/reveal_served` ×0 in the same generation — the [11.172]
+  retained-raise path has not served ONCE on this build.
+- LOCAL rows (probe scratch): refusal is the [11.176]/[11.177] WEDGE
+  SYMPTOM — the wedged warm mount never completes, ownership never
+  establishes, every re-activation refuses the raise and remounts (probe:
+  10/10 remounts, 0/10 paint ends on a quiet desktop, floor 70 ms;
+  `reveal/reveal_cancelled` ×9 "stopped being the active terminal before
+  its host completed"; `terminal_mount/attach_supersede_watchdog` fired
+  owned_elsewhere after 15 s). Expected to clear when the a4e25bff fix
+  (lane/uxspeed/spawn-screen-fix) lands and is re-probed.
+- REMOTE rows (remote-agy://dev/…): refusal is the OWNERSHIP GATE DESIGN —
+  ce64fc1d ("daemon ownership gates remote rows only") gates the raise on
+  daemon_owns_runtime, which is PERSISTENTLY FALSE for remote rows whose
+  runtime the local daemon does not own. 63/63 remote refusals, zero
+  serves. Until the gate grows a remote-ownership story (trust the remote
+  daemon's retained snapshot, or establish local ownership of the remote
+  surface), every switch to a remote row pays the FULL REMOUNT — and for
+  this owner remote rows are the majority plane. [11.172]'s ≤150 ms
+  felt-switch bar is STRUCTURALLY UNREACHABLE for remote rows on main.
+- Side evidence for [11.119]: the same probe window re-measured the clock
+  tax on build d1a568cf — ~40% of WebKitWebProcess cycles in the
+  clock_gettime pipeline (22.65% `_copy_to_user` + 7.11%
+  `entry_SYSRETQ_unsafe_stack` + 3.13% `read_hpet` + syscall/vDSO/SRSO
+  machinery) during a concurrent remote-agy warm-mount storm
+  (`mount_eval_warm` ×20) — consistent with this entry's ~25% webproc
+  reading, and the boot log shows `check_tsc_sync_source failed` AGAIN on
+  the 2026-09-26 17:26 boot: the TSC instability REPRODUCES across boots.
+
+Falsifier: on a rotated build carrying the raise fixes, `uxprobe switch`
+reports reveal_served + xterm_paint/reveal ends again (the 2026-09-27
+~04:45 raise falsifier met 8/8 on 3bc0801024c3 pre-7227be34aabc), and the
+refusal counter reads 0 for both row kinds across a probe batch.
+Instrument: the `reveal_raise_refused` payload (kind split local/remote)
+is the counter — no probe changes needed.
+
+ID RESOLUTION: [11.177] is the cli-integration lane's merged entry (managed-generation re-point, b7762588); the spawn-screen-fix lane filed the wedge root cause as [11.178] (senior - their [11.176] status line + rig recipe + memory reference it); THIS entry is the renumber to [11.179] (2026-09-27 ~10:45, same-morning id race, resolved by senior-references).
+
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -30001,6 +30053,19 @@ build 3.2.113-era, GUI process at ~00:05 on b787d688, WebKitWebProcess at
 - Main-thread census: the storm's center of mass IS the GUI main thread
   (comm `yggterm` non-tokio ~80% of process samples) — the metronome's
   337 ms lockstep burn is this flood's main-thread face.
+
+CONFIRMED ON CURRENT MAIN (2026-09-27 ~10:20 IST, the ux-speed
+webproc-raise-capture lane, build d1a568cf, quiet floor 70 ms): a fresh
+WebKitWebProcess capture during a uxprobe switch window re-reads the same
+pipeline at ~40% of webproc cycles (22.65% `_copy_to_user` + 7.11%
+`entry_SYSRETQ_unsafe_stack` + 3.13% `read_hpet` + vDSO/syscall/SRSO
+machinery), consistent with the ~25% reading above at a busier mix; data
+`~/.cache/uxspeed-stage/perf-webproc.data` (jojo, fp — user frames stub in
+libwebkit, the LBR capture here remains the caller evidence). The boot log
+adds one fact: the CURRENT boot (2026-09-26 17:26) failed the TSC sync
+check AGAIN ("Marking TSC unstable due to check_tsc_sync_source failed") —
+the instability reproduces across boots (2026-09-11 and 2026-09-26), so the
+owner-level TSC decision (lever (i)) is not a one-off boot judgment.
 
 Falsifier (unchanged): with the burning site fixed,
 `ui_wait_ms` p50 of `background_live_session_snapshot` returns to ~30ms
