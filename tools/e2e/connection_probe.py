@@ -307,6 +307,29 @@ def scenario_resume_store_present():
         reap(key)
 
 
+def trace_vouched_id(requested_id, since_bytes):
+    """The id the wrapper ladder vouched for `requested_id`, if it fired —
+    the ROW lives under the VOUCHED id (the ensure keys the runtime by the
+    id it is handed), so a probe that polls only the requested key watches
+    an empty terminal while the real row connects next to it."""
+    if not YTRACE.exists():
+        return None
+    found = None
+    with open(YTRACE, "rb") as handle:
+        handle.seek(since_bytes)
+        for line in handle:
+            if b"agy_store_candidate_vouch" not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            payload = event.get("payload", {})
+            if payload.get("requested_id") == requested_id:
+                found = payload.get("vouched_id")
+    return found
+
+
 def trace_has_vouch(requested_id, since_bytes):
     if not YTRACE.exists():
         return False
@@ -334,7 +357,16 @@ def scenario_rebirth_uuid_vouch():
         yggterm_detached(
             ["remote", "resume-agy", fresh_id, workspace, "--require-existing"]
         )
-        connected, text = poll_until(lambda: screen_ok(key), deadline_s=150)
+        def both_keys():
+            ok, text = screen_ok(key)
+            if ok is not None:
+                return ok, text
+            vouched_id = trace_vouched_id(fresh_id, offset)
+            if vouched_id:
+                return screen_ok(f"agy-runtime://{vouched_id}")
+            return None, text
+
+        connected, text = poll_until(both_keys, deadline_s=150)
         vouched = trace_has_vouch(fresh_id, offset)
         if connected is True and vouched:
             return sc.ok(f"re-birth uuid {fresh_id[:8]}… vouched onto a store conversation")
@@ -352,7 +384,10 @@ def scenario_rebirth_uuid_vouch():
             return sc.fail(f"refusal painted: {text[:240]!r}")
         return sc.fail(f"no CLI after 150s; tail: {text[-240:]!r}")
     finally:
+        vouched_id = trace_vouched_id(fresh_id, offset)
         reap(key)
+        if vouched_id:
+            reap(f"agy-runtime://{vouched_id}")
 
 
 def scenario_store_absent_refuses():
