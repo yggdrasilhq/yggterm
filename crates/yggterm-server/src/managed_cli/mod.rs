@@ -930,51 +930,84 @@ fn extract_semver_like_version(line: &str) -> Option<&str> {
 /// the SSOT for "what will actually run"; this is that clause enforced, and the
 /// owner's ask (2026-08-06) that a machine which cannot keep its CLIs current
 /// SAY SO in telemetry rather than go quietly stale.
-fn report_managed_cli_effective_version_drift(home: &Path, probes: &[(ManagedCliTool, ToolProbe)]) {
+fn report_managed_cli_effective_version_drift(
+    home: &Path,
+    managed_bin_dir: &Path,
+    probes: &[(ManagedCliTool, ToolProbe)],
+    probe_basis: &str,
+) {
     for (tool, probe) in probes {
         let binary_name = tool.binary_name();
         let managed_version = match (&probe.version, probe.source) {
             (Some(version), Some(ManagedCliBinarySource::Managed)) => version.clone(),
             _ => continue,
         };
-        let Some((resolved_path, resolved_version)) = login_shell_resolved_cli(binary_name) else {
-            append_trace_event(
-                home,
-                "server",
-                "managed_cli",
-                "effective_cli_unresolvable",
-                serde_json::json!({
-                    "tool": binary_name,
-                    "managed_version": managed_version,
-                    "detail": "the login shell resolves no such binary, so a session \
-                               cannot launch this CLI on this machine",
-                }),
-            );
+        let managed_path = managed_bin_dir.join(binary_name);
+        let resolution = login_shell_resolved_cli(binary_name);
+        let Some((event, payload)) = effective_version_drift_event(
+            binary_name,
+            &managed_version,
+            &managed_path,
+            resolution,
+            probe_basis,
+        ) else {
             continue;
         };
-        let drifted = resolved_version
-            .as_deref()
-            .map(|resolved| resolved != managed_version)
-            .unwrap_or(true);
-        if !drifted {
-            continue;
-        }
-        append_trace_event(
-            home,
-            "server",
-            "managed_cli",
-            "effective_cli_version_drift",
+        append_trace_event(home, "server", "managed_cli", event, payload);
+    }
+}
+
+/// The RULE with the machine taken out of it: given what the login shell
+/// resolved (or that it resolved nothing), which trace event — if any — does
+/// the drift plane owe, carrying its full payload. Split from
+/// [`report_managed_cli_effective_version_drift`] because the resolution is
+/// filesystem truth a test cannot fake; the decision and the payload are pure.
+///
+/// ⛔ [11.177] rider: the payload names BOTH resolution planes — `managed_path`
+/// (the binary yggterm maintains) and `effective_path` (the binary a session
+/// runs) — so no reader ever has to ask which side a measured version
+/// belonged to.
+fn effective_version_drift_event(
+    binary_name: &str,
+    managed_version: &str,
+    managed_path: &Path,
+    resolved: Option<(String, Option<String>)>,
+    probe_basis: &str,
+) -> Option<(&'static str, serde_json::Value)> {
+    let Some((resolved_path, resolved_version)) = resolved else {
+        return Some((
+            "effective_cli_unresolvable",
             serde_json::json!({
                 "tool": binary_name,
                 "managed_version": managed_version,
-                "effective_version": resolved_version,
-                "effective_path": resolved_path,
-                "detail": "the refresh updated the managed copy, but the login shell \
-                           resolves a DIFFERENT install — sessions on this machine run \
-                           the version reported as effective_version, not managed_version",
+                "managed_path": managed_path.display().to_string(),
+                "probe_basis": probe_basis,
+                "detail": "the login shell resolves no such binary, so a session \
+                           cannot launch this CLI on this machine",
             }),
-        );
+        ));
+    };
+    let drifted = resolved_version
+        .as_deref()
+        .map(|resolved| resolved != managed_version)
+        .unwrap_or(true);
+    if !drifted {
+        return None;
     }
+    Some((
+        "effective_cli_version_drift",
+        serde_json::json!({
+            "tool": binary_name,
+            "managed_version": managed_version,
+            "managed_path": managed_path.display().to_string(),
+            "effective_version": resolved_version,
+            "effective_path": resolved_path,
+            "probe_basis": probe_basis,
+            "detail": "the refresh updated the managed copy, but the login shell \
+                       resolves a DIFFERENT install — sessions on this machine run \
+                       the version reported as effective_version, not managed_version",
+        }),
+    ))
 }
 
 fn record_managed_cli_probe_span(
@@ -2050,6 +2083,90 @@ mod tests {
     }
 
     // The focus/attach path's cheap probe must recognize a present managed binary
+    /// ⛔ [11.177] The rule with the machine taken out of it: the login-shell
+    /// resolution is filesystem truth a test cannot fake, so the DECISION and
+    /// the payload are pure ([`effective_version_drift_event`]) and the IO
+    /// shell stays thin. The payload must name BOTH resolution planes —
+    /// `managed_path` (what yggterm maintains) and `effective_path` (what a
+    /// session actually runs) — plus `probe_basis` (which refresh arm produced
+    /// the probe), or a reader is back to asking which binary a version
+    /// belonged to.
+    #[test]
+    fn effective_drift_names_both_resolution_planes_when_versions_diverge() {
+        let (event, payload) = effective_version_drift_event(
+            "opencode2",
+            "2.0.18",
+            Path::new("/home/pi/.yggterm/ynpm/bin/opencode2"),
+            Some((
+                "/home/pi/.local/bin/opencode2".to_string(),
+                Some("2.0.3".to_string()),
+            )),
+            "after_install",
+        )
+        .expect("a version divergence is drift and must say so");
+
+        assert_eq!(event, "effective_cli_version_drift");
+        assert_eq!(payload["tool"], "opencode2");
+        assert_eq!(payload["managed_version"], "2.0.18");
+        assert_eq!(payload["managed_path"], "/home/pi/.yggterm/ynpm/bin/opencode2");
+        assert_eq!(payload["effective_version"], "2.0.3");
+        assert_eq!(payload["effective_path"], "/home/pi/.local/bin/opencode2");
+        assert_eq!(payload["probe_basis"], "after_install");
+    }
+
+    #[test]
+    fn effective_drift_is_silent_when_both_planes_agree() {
+        assert!(
+            effective_version_drift_event(
+                "codex",
+                "0.157.1",
+                Path::new("/home/pi/.yggterm/ynpm/bin/codex"),
+                Some((
+                    "/home/pi/.yggterm/ynpm/bin/codex".to_string(),
+                    Some("0.157.1".to_string())
+                )),
+                "after_install",
+            )
+            .is_none(),
+            "agreement is not drift; the plane must not cry wolf"
+        );
+    }
+
+    #[test]
+    fn effective_drift_fires_when_the_effective_version_cannot_be_read() {
+        // A login-resolved binary whose --version carries no readable version
+        // is drift by the worst honest reading, with a null effective_version.
+        let (event, payload) = effective_version_drift_event(
+            "muse",
+            "1.2.1",
+            Path::new("/home/pi/.yggterm/ynpm/bin/muse"),
+            Some(("/usr/local/bin/muse".to_string(), None)),
+            "deferred_no_install",
+        )
+        .expect("an unreadable version is drift until proven agreement");
+
+        assert_eq!(event, "effective_cli_version_drift");
+        assert!(payload["effective_version"].is_null());
+        assert_eq!(payload["probe_basis"], "deferred_no_install");
+    }
+
+    #[test]
+    fn effective_drift_names_the_unresolvable_login_plane() {
+        let (event, payload) = effective_version_drift_event(
+            "kimi",
+            "2.1.1",
+            Path::new("/home/pi/.yggterm/ynpm/bin/kimi"),
+            None,
+            "ttl_skipped_no_install",
+        )
+        .expect("a managed CLI the login shell cannot resolve must say so");
+
+        assert_eq!(event, "effective_cli_unresolvable");
+        assert_eq!(payload["managed_version"], "2.1.1");
+        assert_eq!(payload["managed_path"], "/home/pi/.yggterm/ynpm/bin/kimi");
+        assert_eq!(payload["probe_basis"], "ttl_skipped_no_install");
+    }
+
     /// The drift check compares a bare managed version against a decorated
     /// `--version` line, so the extractor is the whole correctness of it: too
     /// greedy and every machine reports permanent false drift, too strict and
@@ -7041,11 +7158,26 @@ pub(crate) fn refresh_local_managed_cli(
                 serde_json::json!({ "error": error.to_string() }),
             );
         }
-        // A refresh is only as true as the binary a session will actually run.
-        // Checked HERE, after a refresh we believe succeeded, because that is
-        // precisely when the silent form of this failure looks like success.
-        report_managed_cli_effective_version_drift(&paths.home, &after);
     }
+    // ⛔ [11.177] THE DRIFT REPORT IS A READING, NOT A WRITE — it must not be
+    // gated on install success, on the defer choice, or on the TTL skip.
+    // Measured live on the muse lab host 2026-09-27: the managed generation
+    // re-pointed under a stale login-resolved binary (opencode 2.0.18 managed
+    // vs 2.0.3 effective) while `effective_cli_version_drift` had NEVER fired —
+    // the sweeps that re-point the generation all carried an unrelated
+    // install_error, and the background ticks deferred. `before` probes run
+    // unconditionally at every tick start, and a deferred tick installs nothing
+    // in-process, so `after` is current truth on every path that reaches here:
+    // the report costs zero extra probes and has no honest reason to stay
+    // silent. `probe_basis` names which arm produced the probe.
+    let probe_basis = if install_deferred {
+        "deferred_no_install"
+    } else if skipped_recently {
+        "ttl_skipped_no_install"
+    } else {
+        "after_install"
+    };
+    report_managed_cli_effective_version_drift(&paths.home, &paths.bin_dir, &after, probe_basis);
 
     let statuses = before
         .into_iter()
