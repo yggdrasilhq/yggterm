@@ -57798,6 +57798,45 @@ Shared connection to 192.0.2.14 closed.\r\n";
         );
     }
 
+    /// ⛔ A REMOTE-FOLDER PATH RESOLVES AS THE GROUP IT IS, NOT A FABRICATED
+    /// SESSION/DOCUMENT — [11.201]. `resolve_app_control_row` used to hand a
+    /// `__remote_folder__/…` path to the session synthesizer, whose catch-all
+    /// minted a Document row the `SetRowExpanded` kind guard then refused
+    /// ("row is not expandable") for the exact disclosures a hand can click:
+    /// 7/7 nested remote-folder paths under a collapsed machine root,
+    /// deterministic. The folder group row is answerable exactly — the fold
+    /// store keys on `full_path` — so the resolver synthesizes it before the
+    /// session synthesizer can shadow it, and `expanded` reads TRUE (the
+    /// app-control convention: the row is drawn with every set open so the
+    /// setter's short-circuit never swallows a re-open; the real state lives
+    /// in the collapse store the setter toggles).
+    #[test]
+    fn a_remote_folder_path_resolves_to_its_group_row_with_the_app_control_expanded_convention() {
+        for path in [
+            "__remote_folder__/dev/etc/apt",
+            "__remote_folder__/oc/home/pi/.codex",
+            "__remote_folder__/dev/home/pi/greet",
+        ] {
+            let row = synthesize_remote_folder_group_row(path)
+                .unwrap_or_else(|| panic!("the folder row must synthesize: {path}"));
+            assert_eq!(row.kind, BrowserRowKind::Group, "[{path}] the kind the                 SetRowExpanded guard requires — a Session/Document synthesis is                 the [11.201] refusal");
+            assert!(row.expanded, "[{path}] drawn OPEN, so                 set_app_control_row_expanded's short-circuit cannot swallow a                 re-open of a folder a human collapsed");
+            assert!(
+                row.session_cwd.as_deref().is_some_and(|cwd| cwd.starts_with('/')),
+                "[{path}] session_cwd carries the real folder path"
+            );
+            let rest = path.strip_prefix("__remote_folder__/").unwrap();
+            let (machine_key, _) = rest.split_once('/').unwrap();
+            assert_eq!(row.host_label, machine_key, "[{path}] host label is the                 machine key, as append_remote_folder_rows draws it");
+        }
+        // Not folder rows: a machine-root prefix and a bare machine key (no
+        // folder segment) stay None — the session synthesizer keeps its old
+        // contract for every non-`__remote_folder__` path.
+        assert!(synthesize_remote_folder_group_row("__remote_machine__/dev").is_none());
+        assert!(synthesize_remote_folder_group_row("__remote_folder__/dev").is_none());
+        assert!(synthesize_remote_folder_group_row("local://seed").is_none());
+    }
+
     /// A live agent row shows its TERMINAL on a restart, whatever its transcript
     /// happens to hold.
     ///
