@@ -20,7 +20,27 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
-**Status:** OPEN
+**Status:** LANDED IN CODE — LIVE FALSIFIER OWED (2026-09-29, row 11.201,
+lane/integration/11181-install-honesty, work FROM dev). The entry's three
+fix directions resolved: (c) the refresh-state persist ALREADY survived
+per-tool failures — the [11.182] follow-up made it unconditional with the
+per-tool failed_at_ms backoff (the "gating the write on install_error"
+comment + the_launch_ensure_skips_a_contended_lock_before_any_install lock);
+this entry's (c) text was stale against that landing. (a)+(b) LANDED HERE:
+install_latest split into the Result-shaped wrapper (the single-tool ensure
+call sites keep the bail contract) over install_latest_collecting, which
+returns the per-arm failures structured; each failed arm emits
+install_step_failed {tool, error} at failure time, the walk emits
+refresh_install_error {failed_tools, error} when any arm failed, and the
+statuses branch keys "failed" on the tool's OWN arm (arm_failure_for) —
+a tool whose arm succeeded falls through to its honest updated/checked
+arm. Suite 1626/0 (1624 baseline + 2 new locks: the_walk_reads_per_arm_
+failures_and_telemetry_carries_them, an_arm_failure_marks_only_its_own_
+tool). FALSIFIER OWED post-deploy: a real sweep on a host with the
+deterministic failing arm must show honest per-tool statuses +
+refresh_install_error naming the failing arm in event-trace.jsonl +
+last_successful_refresh_ms advancing; then DELETE this entry per the
+verified-fix law.
 
 Filed 2026-09-27 by the [11.177] lane while unblinding the drift report (zcode sess_fc6e2076-4139-4752-b3c6-95e7c5eec07d on jojo, work FROM dev; claim ACK-036bbb9074). The [11.177] fix makes the drift report fire regardless — this entry is what it will keep firing INTO until the install plane is honest.
 
