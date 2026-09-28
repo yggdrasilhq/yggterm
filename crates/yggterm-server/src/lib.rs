@@ -12596,12 +12596,27 @@ impl YggtermServer {
                     )
                 });
             if vouched.is_none() {
-                vouched = self.opencode_store_candidate_vouch(cwd).map(|candidate| {
-                    (
-                        candidate,
-                        yggterm_core::cli_plane::CliLaunchContractBreach::StoreCandidateResume,
-                    )
-                });
+                // THE [11.192] CONTENTION GUARD, opencode's twin (the shared
+                // lattice): the store candidate is a heuristic — it must not
+                // bind THIS row to a conversation another live row already
+                // carries (duplicate rows share a cwd; the second one waited
+                // into an eternal Bootstrapping when both bound the same
+                // session). The focus-stamp tier above is service truth and
+                // stays unguarded.
+                let candidate_held_elsewhere = |candidate: &str| {
+                    self.sessions.iter().any(|(row_key, session)| {
+                        session.id == candidate && row_key != &key
+                    })
+                };
+                vouched = self
+                    .opencode_store_candidate_vouch(cwd)
+                    .filter(|candidate| !candidate_held_elsewhere(candidate))
+                    .map(|candidate| {
+                        (
+                            candidate,
+                            yggterm_core::cli_plane::CliLaunchContractBreach::StoreCandidateResume,
+                        )
+                    });
             }
             if let Some((vouched_id, breach)) = vouched {
                 // BUS LAW (1cb614bcf): the restore tests run this arm for the
@@ -12654,6 +12669,41 @@ impl YggtermServer {
         // for a runtime this daemon already holds, and the rebind is NAMED
         // here and on the row's Conversation metadata so nobody mistakes it
         // for the birth id.
+        // ⛔ THE [11.193] BINDING COMPOSE, FIRST IN THE LADDER ORDER: a row
+        // that carries a persisted "Conversation" binding (stamped at its own
+        // fresh start) resumes THAT conversation — before the cwd heuristic
+        // can send it anywhere else, and before the definitive-miss compose
+        // can mint another. The binding is trusted only on the store's
+        // positive word (Some(true)); a missing/absent binding changes
+        // nothing.
+        if kind == SessionKind::Antigravity
+            && let Some(bound) = self
+                .sessions
+                .get(&key)
+                .and_then(|session| session.metadata.iter().find(|m| m.label == "Conversation"))
+                .map(|m| m.value.clone())
+            && bound != session_id
+            && self
+                .user_home
+                .as_deref()
+                .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, &bound))
+                == Some(true)
+        {
+            if let Some(ygg_home) = self.yggterm_home.clone() {
+                append_trace_event(
+                    &ygg_home,
+                    "daemon",
+                    "remote_runtime",
+                    "agy_binding_compose_resume",
+                    json!({
+                        "row_id": session_id,
+                        "bound_conversation": bound,
+                        "policy": "the_rows_own_binding_outranks_the_cwd_heuristic",
+                    }),
+                );
+            }
+            session_id = bound;
+        }
         if kind == SessionKind::Antigravity
             && require_existing
             && !self.sessions.contains_key(&key)
@@ -13002,6 +13052,9 @@ impl YggtermServer {
                 == Some(false);
         let resumable = (saved_session_in_store && !agy_definitive_store_miss)
             || (live_runtime_held && live_held_row_resumes_by_row_id(kind, saved_session_in_store));
+        // THE [11.193] BINDING: the minted conversation id the fresh-start
+        // arm composes, carried to the row update below.
+        let mut bound_fresh_conversation_id: Option<String> = None;
         // ⛔ [11.168] THE FUNNEL RECOMPOSE MUST NOT RE-IDENTIFY THE ROW. This
         // arm rewrites the stored launch command on every ensure (rotation
         // respawn, keep-alive, focus) — composing it from the host global
@@ -13026,22 +13079,30 @@ impl YggtermServer {
                 Some(&carried_identity_exports),
             )
         } else if agy_definitive_store_miss {
-            // THE HONEST FRESH START ([11.190]): Launch semantics — no
-            // resume selector, no doomed `--conversation <absent id>`, no
-            // picker that agy does not have. The CLI starts a NEW
-            // conversation under the row id because that is what the row IS
-            // now; the prior conversation, if the store ever held one, is
-            // untouched and recoverable through the ladder on a later open.
-            codex_cli::managed_cli_shell_command_configured_with_identity(
+            // THE HONEST FRESH START WITH A MINTED, BOUND ID ([11.190] as
+            // sharpened by [11.193], owner report: every agy row stayed
+            // "New dev Antigravity" because the store titled a conversation
+            // id the row never knew). The Launch arm this replaces let agy
+            // MINT its own conversation id — the store then held the real
+            // title under an id the row never learns, and every title probe
+            // by the row's id answered silent FOREVER. The compose now binds
+            // the row to a conversation id YGGTERM mints: `--conversation
+            // <fresh uuid>` starts a new conversation under an id the row
+            // carries (`session.id` is re-pointed below), so the store's
+            // authored title lands on an id every probe asks for. The
+            // one-line agy "conversation not found" warning is the honest
+            // cost of a fresh start; the prior conversation, if the store
+            // ever held one, is untouched and recoverable through the ladder.
+            let fresh_conversation_id = uuid::Uuid::new_v4().to_string();
+            bound_fresh_conversation_id = Some(fresh_conversation_id.clone());
+            remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(
                 kind,
+                &fresh_conversation_id,
                 cwd,
-                ManagedCliAction::Launch,
                 terminal_appearance,
-                &AgentLaunchOptions::default(),
                 configured_extra_args,
                 Some(&carried_identity_exports),
             )
-            .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
         } else {
             remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity(
                 kind,
@@ -13134,6 +13195,19 @@ impl YggtermServer {
             // conversation, if the store ever held one, stays recoverable
             // through the ladder.
             if agy_definitive_store_miss && !resumable {
+                // THE [11.193] BINDING AT FRESH START: the row's runtime id
+                // BECOMES the minted conversation id — the id the store will
+                // title — so every downstream probe (title follow, identity,
+                // ladder) asks for an id that answers. The row KEY is
+                // untouched (sidebar identity stable).
+                if let Some(fresh_id) = bound_fresh_conversation_id.clone() {
+                    session.id = fresh_id.clone();
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Conversation",
+                        fresh_id,
+                    );
+                }
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Fresh Start",
@@ -60736,6 +60810,94 @@ mod agy_connection_tests {
         assert!(
             trace_at < fresh_at,
             "the fallback is NAMED before it starts anything"
+        );
+    }
+
+    /// THE [11.193] TITLE-BINDING LAW: a fresh start composes a MINTED,
+    /// ROW-BOUND conversation id (`--conversation <fresh uuid>`), re-points
+    /// the row's runtime id to it, stamps the binding, and the ensure's
+    /// FIRST ladder tier is the row's own persisted binding — so the store's
+    /// authored title lands on an id every probe asks for, and the respawn
+    /// cycle resumes the bound conversation instead of minting another.
+    #[test]
+    fn fresh_starts_bind_a_minted_conversation_id_and_the_binding_outranks_the_heuristic() {
+        let source = include_str!("lib.rs");
+        let ensure = source
+            .split("fn ensure_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+
+        // 1. The binding compose is FIRST in the ladder order — before the
+        // agy vouch ladder and before the definitive-miss compose.
+        let binding_at = ensure
+            .find("[11.193] BINDING COMPOSE, FIRST IN THE LADDER ORDER")
+            .expect("the binding compose");
+        // The ladder's CODE position (its comment block precedes the if).
+        let ladder_if_at = ensure
+            .find("if kind == SessionKind::Antigravity\n            && require_existing")
+            .expect("the agy ladder if");
+        let fresh_at = ensure
+            .find("} else if agy_definitive_store_miss {")
+            .expect("the fresh arm");
+        assert!(
+            binding_at < ladder_if_at && binding_at < fresh_at,
+            "the row's own binding outranks the heuristic and the mint"
+        );
+        assert!(
+            ensure.contains("session_id = bound;"),
+            "the binding re-points the resume id"
+        );
+
+        // 2. The fresh arm mints AND binds.
+        assert!(
+            ensure.contains("let fresh_conversation_id = uuid::Uuid::new_v4().to_string();"),
+            "the fresh arm mints the conversation id"
+        );
+        assert!(
+            ensure.contains("bound_fresh_conversation_id = Some(fresh_conversation_id.clone());"),
+            "the minted id is carried to the row update"
+        );
+        assert!(
+            ensure.contains("remote_persistent_resume_shell_command_with_terminal_appearance_configured_with_identity(\n                kind,\n                &fresh_conversation_id,"),
+            "the compose carries the MINTED id (the store titles an id the row knows)"
+        );
+        let rebind = ensure
+            .split("if let Some(fresh_id) = bound_fresh_conversation_id.clone() {")
+            .nth(1)
+            .expect("the id re-point")
+            .split("\n            }")
+            .next()
+            .unwrap();
+        assert!(
+            rebind.contains("session.id = fresh_id.clone();"),
+            "the row's runtime id becomes the minted conversation id"
+        );
+        assert!(
+            rebind.contains("\"Conversation\","),
+            "the binding is stamped"
+        );
+
+        // 3. The binding is trusted only on the store's POSITIVE word.
+        let binding = &ensure[binding_at..ladder_if_at];
+        assert!(
+            binding.contains("== Some(true)"),
+            "the binding composes only on a positive store vouch"
+        );
+
+        // 4. The opencode heuristic tier carries the same contention guard.
+        let oc = source
+            .split("opencode_store_candidate_vouch(cwd)")
+            .nth(1)
+            .expect("the opencode candidate tier")
+            .split("if let Some((vouched_id, breach)) = vouched {")
+            .next()
+            .unwrap();
+        assert!(
+            oc.contains("candidate_held_elsewhere"),
+            "the opencode heuristic tier never double-binds"
         );
     }
 }

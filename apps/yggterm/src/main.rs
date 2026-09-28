@@ -1016,6 +1016,43 @@ fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Re
 }
 
 fn main() -> Result<()> {
+    // ⭐ THE [11.187] PANIC WITNESS: the GUI's stderr lands in /dev/null on
+    // fleet hosts, so a panicked task — the per-session terminal loop among
+    // them — died INVISIBLE: the row froze mid-paint with the input policy
+    // still answering allow, and every report said "no error anywhere"
+    // (three live occurrences 2026-09-27/28). The hook makes every panic
+    // NAME ITSELF in the trace plane — location plus message — while keeping
+    // the default stderr behavior for local runs. The hook body must not
+    // panic: unwrap-free, and the trace write is best-effort.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                yggterm_core::append_trace_event(
+                    &home,
+                    "ui",
+                    "panic",
+                    "panic_caught",
+                    serde_json::json!({
+                        "location": location,
+                        "message": message,
+                    }),
+                );
+            }
+            default_hook(info);
+        }));
+    }
+
     // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
     // D-Bus session bus, because GLib autolaunches a PRIVATE one the moment
     // anything in this process touches GTK without an address to inherit, and
