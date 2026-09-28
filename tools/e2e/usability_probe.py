@@ -20,8 +20,10 @@ INVARIANTS (each maps to a lived owner pain):
                  floor and no mojibake signatures (the corruption paint)
   geometry       the row's recorded grid equals its remote truth — the
                  36x120 birth-fallback divergence class ([11.191])
-  ghost_pids     live CLI processes attached to NO runtime row, older than
-                 the grace — the detached-restart leak ([11.163] family)
+  ghost_pids     live CLI processes attached to NO runtime row on any plane
+                 (--peer), older than the grace — the detached-restart leak
+                 ([11.163] family) — plus yggterm-born CLIs whose row marker
+                 carries a remembered close ([11.197] regeneration)
 
 Run it UNATTENDED (cron / the ygg-ci watcher / any seat): exit 0 = clean,
 1 = at least one violation. `--json` renders the report for machines.
@@ -47,6 +49,63 @@ YGGTERM_BIN = None
 BIRTH_TITLE_DEFAULTS = ("New dev ", "New jojo ", "New oc ", "New local ")
 BOOTSTRAP_GRACE_S = 600        # a row may bootstrap for ten minutes
 GHOST_GRACE_S = 15 * 60        # an unattached CLI older than this is a ghost
+# [11.197] the tombstone plane, mirrored: TOMBSTONE_TTL_SECS in
+# crates/yggterm-server/src/live_row_tombstones.rs — keep in step.
+TOMBSTONE_FILE = HOME / ".yggterm/removed-rows.json"
+TOMBSTONE_TTL_S = 3 * 24 * 60 * 60
+
+UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def uuids_in(text):
+    return set(re.findall(UUID_RE, text or ""))
+
+
+def proc_row_marker(pid):
+    """The YGGTERM_SESSION_ID environ marker — the row yggterm launched this
+    CLI for. Argv conversation ids drift after a vouch rebind; the marker is
+    the launch-time truth."""
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return ""
+    for entry in raw.split(b"\x00"):
+        if entry.startswith(b"YGGTERM_SESSION_ID="):
+            return entry.decode("utf-8", "replace").split("=", 1)[1]
+    return ""
+
+
+def peer_row_truth(peers):
+    """Live rows of peer planes, as one text — a CLI on this host may be the
+    bridge of a peer's row, and the local state file cannot see that."""
+    text = ""
+    for peer in peers:
+        try:
+            proc = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", peer,
+                 "/home/pi/.yggterm/bin/yggterm server app rows"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode == 0:
+                text += proc.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return text
+
+
+def remembered_row_closes():
+    """Unexpired tombstones: {row identity: closed_at epoch}. A CLI whose row
+    marker names one of these is a bridge parked on a closed conversation."""
+    try:
+        data = json.loads(TOMBSTONE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {
+        key: stamp
+        for key, stamp in (data.get("entries") or {}).items()
+        if isinstance(stamp, (int, float)) and 0 <= now - stamp < TOMBSTONE_TTL_S
+    }
 PRINTABLE_FLOOR = 0.72         # readable screens are mostly printable
 MOJIBAKE_SIGNS = ("Ã", "Â", "\ufffd", "â€")
 # [11.187] A client word carrying a mismatch counts as STANDING only within
@@ -269,40 +328,50 @@ def live_runtime_keys():
     return list(keys)
 
 
-def invariant_ghost_pids(report):
-    """Live CLI processes carrying no runtime row and older than the grace —
-    the detached-restart leak ([11.163] family)."""
-    import datetime
-
+def invariant_ghost_pids(report, peers=()):
+    """Live CLI processes carrying no runtime row on ANY plane and older than
+    the grace — the detached-restart leak ([11.163] family) — plus the
+    [11.197] regeneration signature: a yggterm-born CLI whose row marker
+    carries a remembered close (a bridge parked on a closed conversation; the
+    keeper cycle re-spawns it every pass)."""
     procs = run(["pgrep", "-af", "^agy |^codex |^claude |^muse |^opencode "], timeout=30)
-    runtime_text = json.dumps(live_runtime_keys())
+    runtime_text = json.dumps(live_runtime_keys()) + peer_row_truth(peers)
+    truth_uuids = uuids_in(runtime_text)
+    tombstones = remembered_row_closes()
     now = time.time()
-    ghosts = []
+    ghosts, tombstone_held = [], []
     for line in procs.stdout.splitlines():
         match = re.match(r"\s*(\d+)\s+(.*)", line)
         if not match:
             continue
         pid, cmd = int(match.group(1)), match.group(2)
-        if not runtime_text or any(
-            token and token in runtime_text
-            for token in re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cmd)
-        ):
-            continue
-        started = pathlib.Path(f"/proc/{pid}/stat")
-        if not started.exists():
-            continue
         try:
             age_s = now - os.stat(f"/proc/{pid}").st_ctime
         except OSError:
             continue
+        marker = proc_row_marker(pid)
+        # THE [11.197] TOMBSTONE-HELD CLASS: the CLI's own launch marker names
+        # a row the user closed — attachment to a husk row does not excuse it.
+        if marker and marker in tombstones:
+            if age_s > GHOST_GRACE_S:
+                tombstone_held.append(
+                    f"pid {pid} holds closed row {marker[:44]} ({int(age_s)//60}m)"
+                )
+            continue
+        identity_uuids = uuids_in(marker) | uuids_in(cmd)
+        if truth_uuids and identity_uuids & truth_uuids:
+            continue
         if age_s > GHOST_GRACE_S:
             ghosts.append(f"pid {pid} ({cmd[:60]}, {int(age_s)//60}m)")
-    if ghosts:
+    if ghosts or tombstone_held:
         report.fail(
             "ghost_pids",
             "CLI process(es) attached to no runtime row, older than the "
             f"{GHOST_GRACE_S//60}m grace (the detached-restart leak): "
-            + "; ".join(ghosts[:3]),
+            + "; ".join(ghosts[:3],)
+            + ("; TOMBSTONE-HELD (the [11.197] regeneration signature — yggterm-born "
+               "CLIs holding remembered-closed rows): " if tombstone_held else "")
+            + "; ".join(tombstone_held[:3]),
         )
     else:
         report.ok("ghost_pids")
@@ -427,6 +496,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
+        "--peer", action="append", default=[],
+        help="a peer plane whose live rows count as attachment truth (e.g. "
+             "--peer jojo when judging dev): a CLI attached to a row "
+             "anywhere is not a ghost (the cross-host blindness, [11.197])",
+    )
+    parser.add_argument(
         "--freeze-window-secs", type=int, default=0,
         help="RED-BASELINE mode (the [11.187] falsifier): with the GUI process "
              "SIGSTOPped (or a dead loop), every client word must be older than "
@@ -449,7 +524,7 @@ def main():
     invariant_glyph(report, screens)
     invariant_untitled(report, rows)
     invariant_geometry(report, rows)
-    invariant_ghost_pids(report)
+    invariant_ghost_pids(report, args.peer)
     if args.freeze_window_secs > 0:
         invariant_freeze_window(report, args.freeze_window_secs)
     else:
