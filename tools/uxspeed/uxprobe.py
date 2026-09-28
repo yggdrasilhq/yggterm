@@ -344,13 +344,15 @@ refuse("delete_overlay_did_not_close");
 # instrument exists to measure — and leaves every container closed again.
 # No menu item is ever fired here.
 SPLIT_OPEN_JS = """
+// PHASE 1 (menu open + split-item click) — must fit the GUI's 3s
+// app-control eval budget ([11.200]: the monolithic script's 2.5s DOM tail
+// pushed every send past the budget and dom_eval_timeout discarded the
+// whole iteration, menu included). The DOM truth read lives in SPLIT_DOM_JS.
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const PATH_A = {session_a!r};
 const AXIS = {axis!r};  // "split-side-by-side" | "split-stacked"
-const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
 if (document.querySelector('[data-split-group-row="1"]')) {{
-    refuse("split_group_already_on_screen");
+    dioxus.send({{ accepted: false, reason: "split_group_already_on_screen" }});
     return;
 }}
 const dismiss = async () => {{
@@ -366,25 +368,25 @@ const dismiss = async () => {{
     }} catch (_e) {{}}
 }};
 await dismiss();
-const row = await (async () => {{
-    // the sidebar virtualizes: the node may not exist until the row is
-    // selected and scrolled into view (the driver tree-selects first)
-    const deadline = Date.now() + 1500;
-    while (Date.now() < deadline) {{
-        const n = document.querySelector(
-            '[data-sidebar-row-path="' + PATH_A + '"]');
-        if (n) return n;
-        await settle(50);
-    }}
-    return null;
-}})();
+// the driver tree-selects + verifies the rect before this eval, so a short
+// node wait is enough — the 1500ms crawl is gone
+let row = document.querySelector(
+    '[data-sidebar-row-path="' + PATH_A + '"]');
+const rowDeadline = Date.now() + 800;
+while (!row && Date.now() < rowDeadline) {{
+    await settle(50);
+    row = document.querySelector(
+        '[data-sidebar-row-path="' + PATH_A + '"]');
+}}
 if (!row) {{
-    refuse("sidebar_row_missing", {{ session_path: PATH_A }});
+    dioxus.send({{ accepted: false, reason: "sidebar_row_missing",
+                  session_path: PATH_A }});
     return;
 }}
 const rect = row.getBoundingClientRect();
 if (!(rect.width > 0 && rect.height > 0)) {{
-    refuse("sidebar_row_not_visible", {{ session_path: PATH_A }});
+    dioxus.send({{ accepted: false, reason: "sidebar_row_not_visible",
+                  session_path: PATH_A }});
     return;
 }}
 const cx = Number((rect.left + rect.width / 2).toFixed(2));
@@ -398,7 +400,7 @@ row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
 row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
 row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, splitItem = null;
-const openDeadline = Date.now() + 1500;
+const openDeadline = Date.now() + 1400;
 while (Date.now() < openDeadline) {{
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
@@ -408,38 +410,37 @@ while (Date.now() < openDeadline) {{
 }}
 if (!menu || !splitItem) {{
     await dismiss();
-    refuse("context_menu_or_split_item_not_observed",
-           {{ session_path: PATH_A, axis: AXIS }});
+    dioxus.send({{ accepted: false,
+                  reason: "context_menu_or_split_item_not_observed",
+                  session_path: PATH_A, axis: AXIS }});
     return;
 }}
 const menu_open_ms = Date.now() - t_open;
 const item_label = String(splitItem.textContent || '').slice(0, 80);
-await settle(120);
+await settle(100);
 const clickInit = {{ bubbles: true, cancelable: true, composed: true,
                      view: window, button: 0, buttons: 1 }};
 splitItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
 splitItem.dispatchEvent(new MouseEvent('mouseup',
     {{ ...clickInit, buttons: 0 }}));
 splitItem.dispatchEvent(new MouseEvent('click', clickInit));
-const t_click = Date.now();
-// The split's paint truth lives in THIS document: the compound sidebar row
-// ([data-split-group-row]) and the pane rects ([data-split-session]) with
-// the split layer active. Both panes are webview rects laid out natively;
-// their xterm surfaces paint in their own webviews.
-let compound = null, panes = [];
-const domDeadline = t_click + 2500;
-while (Date.now() < domDeadline) {{
+dioxus.send({{ accepted: true, menu_open_ms, item_label,
+              t_open, t_click: Date.now() }});
+"""
+
+SPLIT_DOM_JS = """
+// PHASE 2 (split DOM truth: compound row + pane rects) — its own eval so
+// the 2.5s wait can never eat phase 1's reply ([11.200]). The page clock is
+// shared with phase 1, so found_at - t_click is honest click_to_dom.
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const t0 = Date.now();
+const deadline = t0 + 2200;
+let compound = null, panes = [], found_at = null;
+while (Date.now() < deadline) {{
     await settle(25);
     compound = document.querySelector('[data-split-group-row="1"]');
     panes = [...document.querySelectorAll('[data-split-session]')];
-    if (compound && panes.length >= 2) break;
-}}
-const t_dom = Date.now();
-if (!compound || panes.length < 2) {{
-    refuse("split_dom_truth_did_not_land",
-           {{ menu_open_ms, compound_found: !!compound,
-              pane_count: panes.length }});
-    return;
+    if (compound && panes.length >= 2) {{ found_at = Date.now(); break; }}
 }}
 const paneRect = (n) => {{
     const r = n.getBoundingClientRect();
@@ -447,12 +448,10 @@ const paneRect = (n) => {{
               w: Math.round(r.width), h: Math.round(r.height) }};
 }};
 dioxus.send({{
-    accepted: true,
-    menu_open_ms,
-    click_to_dom_ms: t_dom - t_click,
-    dispatch_to_dom_ms: t_dom - t_open,
-    item_label,
-    compound_label: String(compound.textContent || '').slice(0, 80),
+    compound_found: !!compound,
+    found_at,
+    waited_ms: Date.now() - t0,
+    compound_label: compound ? String(compound.textContent || '').slice(0, 80) : null,
     pane_count: panes.length,
     panes: panes.map((n) => ({{
         session: n.getAttribute('data-split-session'),
@@ -503,7 +502,7 @@ item.dispatchEvent(new MouseEvent('mouseup',
     {{ ...clickInit, buttons: 0 }}));
 item.dispatchEvent(new MouseEvent('click', clickInit));
 const tClick = Date.now();
-const deadline2 = tClick + 2000;
+const deadline2 = tClick + 1200;
 while (Date.now() < deadline2) {{
     await settle(25);
     if (!document.querySelector('[data-split-group-row="1"]') &&
@@ -2192,8 +2191,31 @@ dioxus.send(out);
                 acc.append(f"script error: {result['dom_eval_error']}")
             if result and not result.get("accepted"):
                 acc.append(f"split refused: {result.get('reason')}")
+            # PHASE 2 — the DOM truth read rides its own eval so the 2.5s
+            # wait can never eat phase 1's reply under the GUI's 3s eval
+            # budget ([11.200]). committed = the menu actually opened and
+            # the split item was clicked.
+            committed = bool(result.get("accepted"))
+            dom = {}
+            if committed:
+                t_dom0 = now_ms()
+                ddata = self.dom_eval(SPLIT_DOM_JS, timeout=15)
+                dom = ddata.get("result") or {}
+                if not dom and ddata.get("error") is not None:
+                    acc.append(f"dom-truth eval error: {ddata['error']}")
+                elif dom.get("compound_found"):
+                    result["pane_count"] = dom.get("pane_count")
+                    result["panes"] = dom.get("panes") or []
+                    result["compound_label"] = dom.get("compound_label")
+                    t_click = result.get("t_click")
+                    found_at = dom.get("found_at")
+                    if t_click and found_at:
+                        result["click_to_dom_ms"] = found_at - t_click
+                else:
+                    acc.append("split_dom_truth_did_not_land "
+                               f"(waited {dom.get('waited_ms')} ms)")
             pair = self.split_events_from_trace(t0)
-            if result.get("accepted"):
+            if committed:
                 if pair.get("pair_ms") is None:
                     acc.append("no context_menu_activate -> split/create pair "
                                "in ytrace within window (build not rotated "
@@ -2220,7 +2242,7 @@ dioxus.send(out);
                     acc.append("a pane rect is empty (split not visible)")
             # UNGROUP — the teardown must restore both rows alive
             ungroup = {}
-            if result.get("accepted"):
+            if committed and dom.get("compound_found"):
                 time.sleep(0.3)
                 udata = self.dom_eval(SPLIT_UNGROUP_JS, timeout=15)
                 ungroup = udata.get("result") or {}
