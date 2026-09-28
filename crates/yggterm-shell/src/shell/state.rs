@@ -46334,6 +46334,17 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
     // synthesized row is the same answer that path ended on, so answer with
     // it first; the rebuild stays as the fallback for rows synthesis cannot
     // produce (groups, documents, stored-but-not-live rows).
+    // ⛔ A REMOTE-FOLDER PATH IS A GROUP, NOT A SESSION — the synthesizer
+    // below has no arm for the prefix, so its catch-all used to mint a
+    // Document/Session row and the SetRowExpanded kind guard refused it:
+    // a disclosure a hand can click and a verb cannot reach ([11.201],
+    // 7/7 nested remote-folder paths, deterministic). The group row is
+    // cheap to synthesize exactly — the fold store keys on full_path — so
+    // answer with it here rather than paying the full merge rebuild the
+    // [11.114] cold-drag arm measured at seconds on the UI thread.
+    if let Some(row) = synthesize_remote_folder_group_row(session_path) {
+        return Some(row);
+    }
     if let Some(row) = synthesize_app_control_row(shell, session_path) {
         return Some(row);
     }
@@ -46373,6 +46384,47 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         .into_iter()
         .find(|row| row.full_path == session_path)
         .or_else(|| synthesize_app_control_row(shell, session_path))
+}
+/// The remote-folder row an app-control verb needs, without the merge rebuild:
+/// `__remote_folder__/<machine_key><abs path>` as the Group row
+/// `append_remote_folder_rows` draws (kind Group, folder-basename label,
+/// host label = machine key, session_cwd = the real folder path).
+///
+/// ⭐ `expanded` reads TRUE unconditionally — the app-control convention, not
+/// a guess: rows resolved for app control are drawn with every set open, so
+/// `set_app_control_row_expanded`'s `row.expanded == expanded` short-circuit
+/// never swallows a request, and the real fold state lives in the collapse
+/// store the setter toggles (`toggle_virtual_group` — the row is synthetic
+/// by `is_synthetic_sidebar_row_path`).
+fn synthesize_remote_folder_group_row(session_path: &str) -> Option<BrowserRow> {
+    let rest = session_path.strip_prefix("__remote_folder__/")?;
+    let (machine_key, folder) = rest.split_once('/')?;
+    // The wire format is `__remote_folder__/{machine_key}{abs_path}` — the
+    // machine key and the folder share the one `/` (`…/dev/etc/apt` = machine
+    // `dev`, folder `/etc/apt`), so the folder's leading slash is implicit.
+    let folder_path = format!("/{folder}");
+    let label = Path::new(folder_path.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(folder_path.as_str())
+        .to_string();
+    Some(BrowserRow {
+        kind: BrowserRowKind::Group,
+        full_path: session_path.to_string(),
+        label,
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: None,
+        depth: folder_path.split('/').filter(|s| !s.is_empty()).count(),
+        host_label: machine_key.to_string(),
+        descendant_sessions: 0,
+        expanded: true,
+        session_id: None,
+        session_cwd: Some(folder_path.to_string()),
+        session_kind: None,
+    })
 }
 fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
     if let Some(session) = shell
