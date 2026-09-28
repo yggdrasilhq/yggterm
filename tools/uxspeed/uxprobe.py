@@ -1031,6 +1031,46 @@ class Probe:
         return summarize(out, key="spawn_to_paint_ms",
                          rate_key="blank_frames_before_write")
 
+    def _drag_verb_cycle(self, a_path: str, b_path: str) -> dict:
+        """One timed begin/hover(before)/drop cycle + order assert + the
+        un-timed drag-back that keeps iterations independent. Shared by
+        action_drag and action_mergescale — the merge-scale A/B must measure
+        the SAME cycle the §BASELINES drag rows did."""
+        t0 = now_ms()
+        rb = self.verb("drag", "begin", a_path)
+        rh = self.verb("drag", "hover", b_path, "--placement", "before")
+        rd = self.verb("drag", "drop")
+        commit_ms = now_ms() - t0
+        settled, settle_ms = self.wait_order(a_path, b_path)
+        events = {e.get("name") for e in self.ytrace_events(t0)
+                  if e.get("name")}
+        acc = []
+        if not (rb["ok"] and rh["ok"] and rd["ok"]):
+            acc.append("verb failure begin=%s hover=%s drop=%s errors=%s" % (
+                rb["ok"], rh["ok"], rd["ok"],
+                [v.get("error") for v in (rb, rh, rd) if not v["ok"]]))
+        if not settled:
+            acc.append("order did not reflect [A before B] within timeout")
+        it = {
+            "commit_ms": commit_ms,
+            "settle_ms": settle_ms,
+            "begin_ms": rb["wall_ms"], "hover_ms": rh["wall_ms"],
+            "drop_ms": rd["wall_ms"],
+            "accuracy_failures": acc,
+            "trace_events_in_window": sorted(e for e in events
+                                             if e and "drag" in e.lower())
+                                            or None,
+            "merged_scale": self._merged_sizes_in_window(t0, now_ms()),
+        }
+        # drag back so iterations stay independent
+        tb = now_ms()
+        self.verb("drag", "begin", a_path)
+        self.verb("drag", "hover", b_path, "--placement", "after")
+        self.verb("drag", "drop")
+        self.wait_order(b_path, a_path)
+        it["dragback_ms"] = now_ms() - tb
+        return it
+
     def action_drag(self, iters: int) -> dict:
         rows_ready = self.ensure_two_scratch_rows()
         if len(rows_ready) < 2:
@@ -1038,38 +1078,180 @@ class Probe:
         a_path, b_path = rows_ready[0], rows_ready[1]
         out = {"iterations": []}
         for i in range(iters):
-            t0 = now_ms()
-            rb = self.verb("drag", "begin", a_path)
-            rh = self.verb("drag", "hover", b_path, "--placement", "before")
-            rd = self.verb("drag", "drop")
-            commit_ms = now_ms() - t0
-            settled, settle_ms = self.wait_order(a_path, b_path)
-            events = {e.get("name") for e in self.ytrace_events(t0)
-                      if e.get("name")}
-            acc = []
-            if not (rb["ok"] and rh["ok"] and rd["ok"]):
-                acc.append("verb failure begin=%s hover=%s drop=%s errors=%s" % (
-                    rb["ok"], rh["ok"], rd["ok"],
-                    [v.get("error") for v in (rb, rh, rd) if not v["ok"]]))
-            if not settled:
-                acc.append("order did not reflect [A before B] within timeout")
-            out["iterations"].append({
-                "commit_ms": commit_ms,
-                "settle_ms": settle_ms,
-                "begin_ms": rb["wall_ms"], "hover_ms": rh["wall_ms"],
-                "drop_ms": rd["wall_ms"],
-                "accuracy_failures": acc,
-                "trace_events_in_window": sorted(e for e in events
-                                                 if e and "drag" in e.lower())
-                                                or None,
-            })
-            # drag back so iterations stay independent
-            t0 = now_ms()
-            self.verb("drag", "begin", a_path)
-            self.verb("drag", "hover", b_path, "--placement", "after")
-            self.verb("drag", "drop")
-            self.wait_order(b_path, a_path)
+            out["iterations"].append(self._drag_verb_cycle(a_path, b_path))
         return summarize(out, key="commit_ms")
+
+    # ---- drag-merge-scale lane (2026-09-29, ACK-5b36ae4c33) ------------
+
+    def _sidebar_expand_state(self) -> dict | None:
+        """Per-group expander state + rendered row count from the sidebar
+        DOM. rendered_rows is VIRTUALIZED context only — the authoritative
+        merged size is the restore_debug/merge_rows telemetry (the sidebar
+        renders a window; the merge walks the whole surface)."""
+        js = """const ex = Array.from(document.querySelectorAll("[data-sidebar-group-expander]"));
+const st = ex.map(b => {
+  const row = b.closest("[data-sidebar-row-path]");
+  return { p: row ? row.getAttribute("data-sidebar-row-path") : null,
+           e: b.getAttribute("data-sidebar-group-expanded") };
+});
+dioxus.send({ groups: st, rendered_rows:
+  document.querySelectorAll("[data-sidebar-row-path]").length });
+"""
+        r = self.dom_eval(js, timeout=10)
+        if r.get("error") is not None:
+            self.last_dom_error = str(r["error"])
+            return None
+        self.last_dom_error = None
+        return r.get("result") or None
+
+    def _set_group_expansion(self, want_expanded: bool,
+                             only: list[str] | None = None,
+                             max_rounds: int = 8) -> dict:
+        """Click group expander buttons until every group (or every group in
+        `only`) reaches want_expanded. Buttons are re-queried every round —
+        each click's merge + re-render replaces them. Only groups whose
+        state differs are clicked, so restoring never disturbs groups that
+        were already in the wanted state."""
+        t0 = time.perf_counter()
+        clicked = 0
+        state = None
+        for _ in range(max_rounds):
+            state = self._sidebar_expand_state()
+            if state is None:
+                break
+            targets = [g["p"] for g in state["groups"]
+                       if (g["e"] == "true") != want_expanded
+                       and (only is None or g["p"] in only)]
+            if not targets:
+                break
+            js = """const wanted = __WANT__;
+const want_state = __STATE__;
+let n = 0;
+for (const b of document.querySelectorAll("[data-sidebar-group-expander]")) {
+  const row = b.closest("[data-sidebar-row-path]");
+  const p = row ? row.getAttribute("data-sidebar-row-path") : null;
+  if (wanted.includes(p) &&
+      b.getAttribute("data-sidebar-group-expanded") !== want_state) {
+    b.click(); n += 1;
+  }
+}
+dioxus.send(n);
+""".replace("__WANT__", json.dumps(targets)).replace(
+                "__STATE__", "true" if want_expanded else "false")
+            r = self.dom_eval(js, timeout=10)
+            if r.get("error") is not None:
+                self.last_dom_error = str(r["error"])
+                break
+            clicked += r.get("result") or 0
+            time.sleep(0.35)  # let the per-click merges + re-render settle
+        return {"clicked": clicked,
+                "wall_ms": int((time.perf_counter() - t0) * 1000),
+                "final_state": state,
+                "dom_error": self.last_dom_error}
+
+    def _merged_sizes_in_window(self, t0: int, t1: int) -> dict:
+        """merged_row_count + expanded_path_count seen in [t0, t1], from the
+        two telemetry families that carry them: restore_debug (ui_telemetry
+        on begin_drag/set_drag_hover_target/select_tree_row — payload is
+        NESTED) and merge_rows/merge_rows_breakdown (sidebar perf, meta
+        sub-payload). Both read levels defensively."""
+        sizes: list[int] = []
+        exps: list[int] = []
+        for e in self._events_between(t0, t1):
+            name = e.get("name")
+            if name not in ("restore_debug", "merge_rows",
+                            "merge_rows_breakdown"):
+                continue
+            p = e.get("payload", {})
+            levels = [p]
+            if isinstance(p, dict) and isinstance(p.get("payload"), dict):
+                levels.append(p["payload"])
+            for lv in levels:
+                meta = lv.get("meta", lv) if isinstance(lv, dict) else {}
+                if isinstance(meta, dict):
+                    if isinstance(meta.get("merged_row_count"), int):
+                        sizes.append(meta["merged_row_count"])
+                    if isinstance(meta.get("expanded_path_count"), int):
+                        exps.append(meta["expanded_path_count"])
+                    eff = meta.get("effective_expanded_paths")
+                    if isinstance(eff, list):
+                        exps.append(len(eff))
+        return {"merged_row_count": sizes, "expanded_path_count": exps}
+
+    def action_mergescale(self, iters: int) -> dict:
+        """THE drag-merge-scale A/B (lane/uxspeed/drag-merge-scale): the
+        drag verb cycle at the AS-FOUND sidebar expansion vs ALL-EXPANDED,
+        with merged_row_count read per cycle from the cycle's own trace
+        window. The as-found per-group expansion map is RESTORED at the end
+        and the restore VERIFIED — the owner's sidebar view-state is the
+        restore contract. Not in the default battery (it mutates sidebar
+        view-state mid-battery); run via --actions mergescale."""
+        out: dict = {"iterations_collapsed": [], "iterations_expanded": []}
+        rows_ready = self.ensure_two_scratch_rows()
+        if len(rows_ready) < 2:
+            return {"error": "could not establish two scratch rows"}
+        a_path, b_path = rows_ready[0], rows_ready[1]
+        time.sleep(0.4)
+
+        snapshot = self._sidebar_expand_state()
+        if not snapshot or not snapshot.get("groups"):
+            return {"error": f"sidebar expand state unreadable: "
+                             f"{self.last_dom_error}"}
+        out["as_found"] = {
+            "expanded_groups": [g["p"] for g in snapshot["groups"]
+                                if g["e"] == "true"],
+            "collapsed_groups": [g["p"] for g in snapshot["groups"]
+                                 if g["e"] == "false"],
+            "rendered_rows_dom": snapshot.get("rendered_rows"),
+        }
+
+        # arm A — as-found expansion (boot state: folders collapsed)
+        for _ in range(iters):
+            out["iterations_collapsed"].append(
+                self._drag_verb_cycle(a_path, b_path))
+
+        # arm B — everything expanded
+        out["expand_all"] = self._set_group_expansion(True)
+        time.sleep(0.6)  # let the last merge + re-render settle
+        expanded_state = self._sidebar_expand_state()
+        out["expanded_dom"] = {
+            "rendered_rows_dom": (expanded_state or {}).get("rendered_rows"),
+            "groups": len((expanded_state or {}).get("groups") or []),
+            "state_error": self.last_dom_error,
+        }
+        for _ in range(iters):
+            out["iterations_expanded"].append(
+                self._drag_verb_cycle(a_path, b_path))
+
+        # restore the as-found map EXACTLY and verify
+        out["restore"] = self._set_group_expansion(
+            False, only=out["as_found"]["collapsed_groups"])
+        time.sleep(0.4)
+        final = self._sidebar_expand_state()
+        now_map = {g["p"]: g["e"] for g in ((final or {}).get("groups") or [])}
+        was_map = {g["p"]: g["e"] for g in snapshot["groups"]}
+        out["restore_verified"] = (now_map == was_map) if final else None
+        if out["restore_verified"] is False:
+            out["accuracy_failures"] = [
+                {"expansion_state_drifted": {"was": was_map, "now": now_map}}]
+
+        for arm, key in (("iterations_collapsed", "collapsed"),
+                         ("iterations_expanded", "expanded")):
+            its = out[arm]
+            for f in ("commit_ms", "begin_ms", "hover_ms", "drop_ms",
+                      "settle_ms", "dragback_ms"):
+                vals = [it[f] for it in its if isinstance(it.get(f), int)]
+                if vals:
+                    out[f"{key}_{f}"] = {"p50": statistics.median(vals),
+                                         "min": min(vals), "max": max(vals),
+                                         "n": len(vals)}
+            mvals = sorted(m for it in its
+                           for m in it["merged_scale"]["merged_row_count"])
+            out[f"{key}_merged_row_count"] = (
+                {"min": mvals[0], "max": mvals[-1],
+                 "median": statistics.median(mvals), "n": len(mvals)}
+                if mvals else None)
+        return out
 
     def _row_rects(self, paths: list[str]) -> dict:
         """Sidebar DOM rects for row paths, via one dom-eval. The sidebar
@@ -2395,6 +2577,8 @@ def main() -> int:
                 report["actions"]["spawn"] = probe.action_spawn(args.iters)
             elif action == "drag":
                 report["actions"]["drag"] = probe.action_drag(args.iters)
+            elif action == "mergescale":
+                report["actions"]["mergescale"] = probe.action_mergescale(args.iters)
             elif action == "felt":
                 report["actions"]["felt"] = probe.action_felt(args.iters)
             elif action == "shiftdrag":

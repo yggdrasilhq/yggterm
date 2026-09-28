@@ -18,6 +18,20 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.201] THE `row-expanded` VERB CANNOT REACH NESTED REMOTE-FOLDER ROWS: "row is not expandable" FOR THE EXACT DISCLOSURES THE VERB WAS WRITTEN TO REACH (measured 2026-09-29 ~05:10 IST, live jojo desktop, drag-merge-scale lane)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by the drag-merge-scale lane (zcode sess_87a28b0a on jojo, work FROM dev; claim ACK-5b36ae4c33) while honoring its sidebar-restore contract.
+
+MEASURED (live verbs + source read, 7/7 distinct paths, deterministic):
+
+- `yggterm server app row-expanded __remote_folder__/dev/etc/apt false` → `{"accepted": false, "error": "row is not expandable: …"}` — same refusal for all 7 nested remote-folder paths under a collapsed machine root (etc/apt, .cache + greet workdirs, .codex + codex-rs chain).
+- The rows RESOLVE — the refusal is the dispatch kind guard (`Some(row) if row.kind == BrowserRowKind::Group || row_heads_a_row_set(&row)` in the `AppControlCommand::SetRowExpanded` arm; every other Some(row) falls to "row is not expandable"), not "no row found". Remote-folder rows render expander buttons in the sidebar (the `BrowserRowKind::Group` branch that emits `data-sidebar-group-expander`), and a HAND can click them — but the row the verb resolves fails both predicate halves. That is exactly the "a disclosure a hand can click and a verb cannot reach is half a feature" class the verb`s own doc comment bans.
+- The DOM workaround (expand the machine root → click the folder expander → re-collapse the root) works, so a headless agent CAN honor a fold contract — but only by driving the GUI.
+
+⇒ Fix direction: one-predicate widening — carry the expandable kind through `resolve_app_control_row` for synthetic `__remote_folder__` rows (or accept them in the dispatch arm). Found by the lane, NOT fixed by it (lane scope: probe/docs only).
+
 ## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
 **Status:** OPEN
