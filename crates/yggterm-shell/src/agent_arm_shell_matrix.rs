@@ -59,6 +59,7 @@
 //! m1/m2 generation labels — which is where a cross-pathway double-construct
 //! becomes visible.
 
+use std::sync::Arc;
 use yggterm_core::SessionKind;
 use yggterm_core::agent_cli::AGENT_CLIS;
 use yggterm_core::{BrowserRow, BrowserRowKind};
@@ -604,11 +605,11 @@ impl ShellArm {
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: launch_action
                 .map(|action| {
                     vec![SessionMetadataEntry {

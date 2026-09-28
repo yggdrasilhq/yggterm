@@ -252,6 +252,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -843,6 +844,44 @@ pub enum SessionSource {
 }
 
 pub use yggterm_core::SessionKind;
+
+/// Cheap content-version stamp for one session's preview — the ux-speed
+/// [11.180] memo-key primitive.
+///
+/// `ManagedSessionView::preview` is `Arc`-shared and never mutated in place
+/// (every preview write builds a NEW `Arc`), so holding the last-seen `Arc`
+/// per session path makes pointer equality a SOUND content check: the held
+/// clone keeps the allocation alive, so a freed-and-reallocated lookalike
+/// address can never alias. Equal pointers = equal content; the stamp
+/// advances exactly when the content changes.
+///
+/// Consumers hash this stamp instead of re-hashing every preview line on
+/// every shell snapshot — the raise-path memo check measured at ~19% of
+/// raise-window GUI CPU ([11.180], raise-perf-capture lane 2026-09-27:
+/// sip-hash of every block line + memcmp + the drop/realloc shadow).
+pub fn session_preview_stamp(session_path: &str, preview: &Arc<SessionPreview>) -> u64 {
+    static LAST_SEEN: OnceLock<Mutex<HashMap<String, (Arc<SessionPreview>, u64)>>> =
+        OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    // Bound: entries for removed sessions linger; clearing at the cap only
+    // over-invalidates (a re-stamp is one monotonic bump), never misses.
+    const PREVIEW_STAMP_SESSION_CAP: usize = 4096;
+    let mut seen = LAST_SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((arc, stamp)) = seen.get(session_path)
+        && Arc::ptr_eq(arc, preview)
+    {
+        return *stamp;
+    }
+    let stamp = SEQ.fetch_add(1, Ordering::Relaxed);
+    if seen.len() >= PREVIEW_STAMP_SESSION_CAP {
+        seen.clear();
+    }
+    seen.insert(session_path.to_string(), (Arc::clone(preview), stamp));
+    stamp
+}
 
 /// A row's title at birth, before the CLI or the LLM chore names it —
 /// `New {machine} {what it is}`, for every kind alike.
@@ -5032,7 +5071,7 @@ pub struct ManagedSessionView {
     pub status_line: String,
     pub terminal_lines: Vec<String>,
     pub rendered_sections: Vec<SessionRenderedSection>,
-    pub preview: SessionPreview,
+    pub preview: Arc<SessionPreview>,
     pub metadata: Vec<SessionMetadataEntry>,
     pub terminal_process_id: Option<u32>,
     pub terminal_foreground_active: Option<bool>,
@@ -5209,11 +5248,11 @@ mod live_session_recoverable_tests {
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: vec![],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -7848,14 +7887,14 @@ impl YggtermServer {
             match summary {
                 Some(summary) => {
                     upsert_session_metadata(
-                        &mut session.preview.summary,
+                        &mut Arc::make_mut(&mut session.preview).summary,
                         "Summary",
                         summary.to_string(),
                     );
                     upsert_session_metadata(&mut session.metadata, "Summary", summary.to_string());
                 }
                 None => {
-                    session.preview.summary.retain(|entry| entry.label != "Summary");
+                    Arc::make_mut(&mut session.preview).summary.retain(|entry| entry.label != "Summary");
                     session.metadata.retain(|entry| entry.label != "Summary");
                 }
             }
@@ -7884,7 +7923,7 @@ impl YggtermServer {
     pub fn restore_session_preview_if_empty(
         &mut self,
         session_path: &str,
-        preview: SessionPreview,
+        preview: Arc<SessionPreview>,
         rendered_sections: Vec<SessionRenderedSection>,
     ) -> bool {
         let Some(session) = self.sessions.get_mut(session_path) else {
@@ -14258,7 +14297,7 @@ impl YggtermServer {
         let Some(session) = self.sessions.get_mut(&path) else {
             return;
         };
-        let Some(block) = session.preview.blocks.get_mut(block_ix) else {
+        let Some(block) = Arc::make_mut(&mut session.preview).blocks.get_mut(block_ix) else {
             return;
         };
         block.folded = !block.folded;
@@ -14277,7 +14316,7 @@ impl YggtermServer {
         let Some(session) = self.sessions.get_mut(&path) else {
             return;
         };
-        for block in &mut session.preview.blocks {
+        for block in &mut Arc::make_mut(&mut session.preview).blocks {
             block.folded = folded;
         }
     }
@@ -15498,8 +15537,9 @@ impl YggtermServer {
             return Ok(());
         }
         if let Some(session) = self.sessions.get_mut(path) {
-            session.preview.blocks = blocks;
-            session.preview.older_available = older_available;
+            let preview = Arc::make_mut(&mut session.preview);
+            preview.blocks = blocks;
+            preview.older_available = older_available;
             // Hydration PARSED the transcript, so its count is the true one and
             // must replace the scan's estimate everywhere it is displayed.
             upsert_session_message_count(session, user_messages, assistant_messages);
@@ -18955,11 +18995,11 @@ mod restored_runtime_repair_tests {
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: vec![],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Antigravity Session",
                 value: "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011".to_string(),
@@ -19450,11 +19490,11 @@ mod restored_runtime_repair_tests {
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: vec![],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/widgets".to_string(),
@@ -20105,7 +20145,7 @@ fn apply_remote_scanned_session_preview(
     let (primary_goals, preview_blocks, rendered_sections) =
         parse_recent_context_sections(&scanned.recent_context);
     if !preserve_hydrated_preview {
-        session.preview.blocks = preview_blocks;
+        Arc::make_mut(&mut session.preview).blocks = preview_blocks;
         session.rendered_sections = rendered_sections;
         if !session.preview.blocks.is_empty() || !session.rendered_sections.is_empty() {
             upsert_session_metadata(
@@ -20120,32 +20160,32 @@ fn apply_remote_scanned_session_preview(
         scanned.user_message_count, scanned.assistant_message_count
     );
     upsert_session_metadata(
-        &mut session.preview.summary,
+        &mut Arc::make_mut(&mut session.preview).summary,
         "Session",
         scanned.session_id.clone(),
     );
     upsert_session_metadata(
-        &mut session.preview.summary,
+        &mut Arc::make_mut(&mut session.preview).summary,
         "Host",
         machine_label.to_string(),
     );
-    upsert_session_metadata(&mut session.preview.summary, "Cwd", scanned.cwd.clone());
+    upsert_session_metadata(&mut Arc::make_mut(&mut session.preview).summary, "Cwd", scanned.cwd.clone());
     upsert_session_metadata(
-        &mut session.preview.summary,
+        &mut Arc::make_mut(&mut session.preview).summary,
         "Started",
         scanned.started_at.clone(),
     );
-    upsert_session_metadata(&mut session.preview.summary, "Messages", messages.clone());
+    upsert_session_metadata(&mut Arc::make_mut(&mut session.preview).summary, "Messages", messages.clone());
     upsert_session_metadata(
-        &mut session.preview.summary,
+        &mut Arc::make_mut(&mut session.preview).summary,
         "Updated",
         modified_epoch_display(scanned.modified_epoch),
     );
     if let Some(goal) = primary_goals.first() {
-        upsert_session_metadata(&mut session.preview.summary, "Goal", goal.clone());
+        upsert_session_metadata(&mut Arc::make_mut(&mut session.preview).summary, "Goal", goal.clone());
     }
     if let Some(summary) = &scanned.cached_summary {
-        upsert_session_metadata(&mut session.preview.summary, "Summary", summary.clone());
+        upsert_session_metadata(&mut Arc::make_mut(&mut session.preview).summary, "Summary", summary.clone());
     }
 
     upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
@@ -20175,7 +20215,7 @@ fn mark_session_preview_loading(session: &mut ManagedSessionView) {
 }
 
 fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
-    session.preview.blocks.clear();
+    Arc::make_mut(&mut session.preview).blocks.clear();
     session.rendered_sections.clear();
     mark_session_preview_loading(session);
 }
@@ -20498,7 +20538,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
     {
         session.title = title_hint;
     }
-    session.preview = SessionPreview {
+    session.preview = Arc::new(SessionPreview {
         summary: payload
             .preview
             .summary
@@ -20523,7 +20563,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
                 activity: block.activity,
             })
             .collect(),
-    };
+    });
     session.rendered_sections = sanitize_snapshot_rendered_sections(payload.rendered_sections)
         .into_iter()
         .map(|section| SessionRenderedSection {
@@ -20882,12 +20922,7 @@ fn remote_preview_payload_for_path(
             .filter(|value| !value.trim().is_empty()),
         preview: SnapshotPreview {
             summary: snapshot_metadata_entries(&session.preview.summary),
-            blocks: session
-                .preview
-                .blocks
-                .into_iter()
-                .map(snapshot_preview_block)
-                .collect(),
+            blocks: session.preview.blocks.iter().cloned().map(snapshot_preview_block).collect(),
             older_available: session.preview.older_available,
         },
         rendered_sections: sanitize_snapshot_rendered_sections(
@@ -36018,7 +36053,7 @@ fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
 }
 
 fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
-    let preview_blocks = sanitize_session_preview_blocks(session.preview.blocks);
+    let preview_blocks = sanitize_session_preview_blocks(session.preview.blocks.clone());
     SnapshotSessionView {
         id: session.id,
         session_path: session.session_path,
@@ -36242,7 +36277,13 @@ fn merge_live_row_with_active_record(
     if preview_block_line_total(&active.preview.blocks)
         > preview_block_line_total(&merged.preview.blocks)
     {
-        merged.preview.blocks = active.preview.blocks;
+        // The snapshot conversion built this Arc fresh, so try_unwrap steals
+        // the blocks without a deep copy in the common unshared case.
+        let blocks = match Arc::try_unwrap(active.preview) {
+            Ok(preview) => preview.blocks,
+            Err(arc) => arc.blocks.clone(),
+        };
+        Arc::make_mut(&mut merged.preview).blocks = blocks;
     }
     merged
 }
@@ -36348,7 +36389,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
                 lines: section.lines,
             })
             .collect(),
-        preview: SessionPreview {
+        preview: Arc::new(SessionPreview {
             older_available: session.preview.older_available,
             summary: session
                 .preview
@@ -36371,7 +36412,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
                     activity: block.activity,
                 })
                 .collect(),
-        },
+        }),
         metadata,
         terminal_process_id: session.terminal_process_id,
         terminal_foreground_active: session.terminal_foreground_active,
@@ -36747,7 +36788,7 @@ fn build_session(
                 ],
             },
         ],
-        preview,
+        preview: Arc::new(preview),
         metadata,
         terminal_process_id: None,
         terminal_foreground_active: None,
@@ -37001,7 +37042,7 @@ fn build_live_session_with_launch_options(
             "Daemon PTY: request main viewport terminal stream".to_string(),
         ],
         rendered_sections: vec![],
-        preview: SessionPreview {
+        preview: Arc::new(SessionPreview {
             // A session being queued has no transcript yet.
             older_available: false,
             summary: vec![
@@ -37058,7 +37099,7 @@ fn build_live_session_with_launch_options(
                     ],
                 ),
             ],
-        },
+        }),
         metadata: vec![
             SessionMetadataEntry {
                 label: "Source",
@@ -37302,7 +37343,7 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
             document.replay_commands.clone(),
         ));
     }
-    session.preview = SessionPreview {
+    session.preview = Arc::new(SessionPreview {
         // A document IS its body — there is no bounded tail to page past.
         older_available: false,
         summary: vec![
@@ -37332,7 +37373,7 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
             },
         ],
         blocks: preview_blocks,
-    };
+    });
     session.rendered_sections = vec![SessionRenderedSection {
         title: "Document",
         lines: document.body.lines().map(ToOwned::to_owned).collect(),
@@ -38647,7 +38688,7 @@ fn upsert_session_message_count(
     assistant_messages: usize,
 ) {
     upsert_session_metadata(
-        &mut session.preview.summary,
+        &mut Arc::make_mut(&mut session.preview).summary,
         "Messages",
         format!("{user_messages} user · {assistant_messages} assistant"),
     );
@@ -38879,11 +38920,11 @@ mod recipe_tests {
             status_line: "web view only".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: vec![],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -39022,6 +39063,53 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn session_preview_stamp_tracks_arc_identity() {
+        // [11.180] lock: the stamp is an IDENTITY stamp. The preview is
+        // immutable behind its Arc, so equal pointers prove equal content;
+        // any NEW Arc (equal content or not) must move the stamp so the
+        // consumer's memo over-invalidates, never misses.
+        let path = "local://stamp-lock";
+        let first = Arc::new(SessionPreview {
+            summary: Vec::new(),
+            blocks: Vec::new(),
+            older_available: false,
+        });
+        let s1 = session_preview_stamp(path, &first);
+        assert_eq!(
+            s1,
+            session_preview_stamp(path, &first),
+            "the same Arc must stamp stable"
+        );
+        let second = Arc::new(first.as_ref().clone());
+        let s2 = session_preview_stamp(path, &second);
+        assert_ne!(
+            s2, s1,
+            "a new Arc must move the stamp, even with identical content"
+        );
+        assert_eq!(
+            s2,
+            session_preview_stamp(path, &second),
+            "the replacement must stamp stable too"
+        );
+        let changed = Arc::new(SessionPreview {
+            summary: Vec::new(),
+            blocks: vec![SessionPreviewBlock::message(
+                "ASSISTANT",
+                "t".to_string(),
+                PreviewTone::Assistant,
+                vec!["changed".to_string()],
+            )],
+            older_available: false,
+        });
+        assert_ne!(
+            session_preview_stamp(path, &changed),
+            s2,
+            "a new Arc with new content must move the stamp"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -46526,7 +46614,7 @@ mod tests {
                     title: "Primary User Goals",
                     lines: vec!["goal line".to_string()],
                 }],
-                preview: SessionPreview {
+                preview: Arc::new(SessionPreview {
                     older_available: false,
                     summary: vec![SessionMetadataEntry {
                         label: "Summary",
@@ -46541,7 +46629,7 @@ mod tests {
                         kind: PreviewBlockKind::Message,
                         activity: None,
                     }],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Kind",
                     value: "Codex".to_string(),
@@ -46626,7 +46714,7 @@ mod tests {
                 title: "Rendered",
                 lines: heavy_rendered_lines.clone(),
             }],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
@@ -46641,7 +46729,7 @@ mod tests {
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -46687,7 +46775,7 @@ mod tests {
                 title: "Rendered",
                 lines: heavy_rendered_lines,
             }],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
@@ -46702,7 +46790,7 @@ mod tests {
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -47632,7 +47720,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                         .to_string(),
                 ],
             }],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
@@ -47650,7 +47738,7 @@ from npm (@openai/codex) — an install may be in flight, so retry in a moment.\
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -48466,7 +48554,7 @@ terminal_window_id: None,
             StoredPreviewHydrationMode::Deferred,
         );
         session.source = SessionSource::LiveSsh;
-        session.preview.blocks = (0..5)
+        Arc::make_mut(&mut session.preview).blocks = (0..5)
             .map(|index| SessionPreviewBlock {
                 role: if index % 2 == 0 { "USER" } else { "ASSISTANT" },
                 timestamp: format!("2026-05-22T10:0{index}:00Z"),
@@ -50630,7 +50718,7 @@ terminal_window_id: None,
             false,
             StoredPreviewHydrationMode::Eager,
         );
-        session.preview.blocks = vec![SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks = vec![SessionPreviewBlock {
             role: "ASSISTANT",
             timestamp: "Mar 31, 2026 10:00 PM UTC+0530".to_string(),
             tone: PreviewTone::Assistant,
@@ -50686,7 +50774,7 @@ terminal_window_id: None,
             false,
             StoredPreviewHydrationMode::Deferred,
         );
-        session.preview.blocks = vec![SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks = vec![SessionPreviewBlock {
             role: "ASSISTANT",
             timestamp: "May 22, 2026 02:10 PM UTC+0530".to_string(),
             tone: PreviewTone::Assistant,
@@ -51288,11 +51376,11 @@ terminal_window_id: None,
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: vec![],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -51615,7 +51703,7 @@ terminal_window_id: None,
             false,
             StoredPreviewHydrationMode::Eager,
         );
-        session.preview.blocks = vec![SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks = vec![SessionPreviewBlock {
             role: "USER",
             timestamp: "Mar 31, 2026 10:00 PM UTC+0530".to_string(),
             tone: PreviewTone::User,
@@ -56135,11 +56223,11 @@ terminal_window_id: None,
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: SessionPreview {
+                preview: Arc::new(SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Cwd",
                     value: "/home/user/gh/yggterm".to_string(),
@@ -56221,7 +56309,7 @@ terminal_window_id: None,
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: (0..48)
@@ -56234,7 +56322,7 @@ terminal_window_id: None,
                         )
                     })
                     .collect(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Preview Hydration",
                 value: "tail".to_string(),
@@ -56305,7 +56393,7 @@ terminal_window_id: None,
         stored_placeholder.source = SessionSource::Stored;
         stored_placeholder.title = "Stored Placeholder".to_string();
         stored_placeholder.launch_phase = TerminalLaunchPhase::Queued;
-        stored_placeholder.preview.blocks.clear();
+        Arc::make_mut(&mut stored_placeholder.preview).blocks.clear();
         let mut live_row = hydrated.clone();
         live_row.title = "Live Remote".to_string();
 
@@ -56354,11 +56442,11 @@ terminal_window_id: None,
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             // What the scan left behind: the rail's source, already wrong.
             metadata: vec![SessionMetadataEntry {
                 label: "Messages",

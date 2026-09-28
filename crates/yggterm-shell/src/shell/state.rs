@@ -19956,7 +19956,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
             SNAPSHOT_LIVE_RENDERED_SECTION_LIMIT,
             SNAPSHOT_RENDERED_SECTION_LINE_LIMIT,
         ),
-        preview: yggterm_server::SessionPreview {
+        preview: Arc::new(yggterm_server::SessionPreview {
             summary: session.preview.summary.clone(),
             blocks: snapshot_preview_block_head(
                 &session.preview.blocks,
@@ -19968,7 +19968,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
             // version that added this copy's own clipping put a "Load earlier
             // turns" control on a conversation with nothing behind it.
             older_available: session.preview.older_available,
-        },
+        }),
         metadata: session.metadata.clone(),
         terminal_process_id: session.terminal_process_id,
         terminal_foreground_active: session.terminal_foreground_active,
@@ -52205,9 +52205,12 @@ fn set_sidebar_search_context(
     // PERF memo gate: hash exactly the input fields that feed the blobs below,
     // WITHOUT allocating (borrow + hash only). If identical to the last build,
     // the store and SIDEBAR_SEARCH_CONTEXT_HASH are already correct — skip the
-    // expensive rebuild. The fingerprint hashes raw preview lines (a superset of
-    // the filtered preview_context), so it can only over-invalidate, never miss a
-    // change. See LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.
+    // expensive rebuild. Preview CONTENT rides its Arc-identity version stamp
+    // (session_preview_stamp) rather than raw line hashes: a stamp only moves
+    // when the preview is replaced, so the fingerprint still over-invalidates,
+    // never misses — without re-hashing every row's lines per call
+    // ([11.180], ~19% of raise-window GUI CPU). See
+    // LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.
     let input_fingerprint = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for machine in remote_machines {
@@ -52234,12 +52237,12 @@ fn set_sidebar_search_context(
                 entry.label.hash(&mut hasher);
                 entry.value.hash(&mut hasher);
             }
-            for block in &session.preview.blocks {
-                block.role.hash(&mut hasher);
-                for line in &block.lines {
-                    line.hash(&mut hasher);
-                }
-            }
+            // PERF [11.180]: the preview is Arc-shared and immutable, so its
+            // content version is one pointer-checked stamp — NOT a re-hash of
+            // every block line (the raise-path memo check measured at ~19% of
+            // raise-window GUI CPU; see session_preview_stamp).
+            yggterm_server::session_preview_stamp(&session.session_path, &session.preview)
+                .hash(&mut hasher);
             generated_summaries
                 .get(&session.session_path)
                 .map(String::as_str)
