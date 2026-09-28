@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -222,77 +223,77 @@ refuse("delete_overlay_did_not_close");
 CLOSEALL_OPEN_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
-if (document.querySelector('[data-delete-confirm-overlay]')) {{
+    Object.assign({ accepted: false, reason }, extra || {}));
+if (document.querySelector('[data-delete-confirm-overlay]')) {
     refuse("delete_overlay_already_open");
     return;
-}}
+}
 const PATH = '__live_sessions__';
-const row = await (async () => {{
+const row = await (async () => {
     const deadline = Date.now() + 1500;
-    while (Date.now() < deadline) {{
+    while (Date.now() < deadline) {
         const n = document.querySelector(
             '[data-sidebar-row-path="' + PATH + '"]');
         if (n) return n;
         await settle(50);
-    }}
+    }
     return null;
-}})();
-if (!row) {{
+})();
+if (!row) {
     refuse("live_sessions_group_row_missing");
     return;
-}}
+}
 const rect = row.getBoundingClientRect();
-if (!(rect.width > 0 && rect.height > 0)) {{
+if (!(rect.width > 0 && rect.height > 0)) {
     refuse("live_sessions_group_row_not_visible");
     return;
-}}
+}
 const cx = Number((rect.left + rect.width / 2).toFixed(2));
 const cy = Number((rect.top + rect.height / 2).toFixed(2));
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
                 clientX: cx, clientY: cy, screenX: cx, screenY: cy,
-                button: 2, buttons: 2, detail: 1 }};
+                button: 2, buttons: 2, detail: 1 };
 const t_open = Date.now();
 row.dispatchEvent(new MouseEvent('mousedown', init));
-row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+row.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, closeAll = null;
 const openDeadline = Date.now() + 1500;
-while (Date.now() < openDeadline) {{
+while (Date.now() < openDeadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     closeAll = menu?.querySelector(
         '[data-context-menu-action="close-all-live-sessions"]') || null;
     if (menu && closeAll) break;
-}}
-if (!menu || !closeAll) {{
-    refuse("menu_or_close_all_item_not_observed", {{ session_path: PATH }});
+}
+if (!menu || !closeAll) {
+    refuse("menu_or_close_all_item_not_observed", { session_path: PATH });
     return;
-}}
+}
 const menu_open_ms = Date.now() - t_open;
 await settle(120);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 closeAll.dispatchEvent(new MouseEvent('mousedown', clickInit));
 closeAll.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 closeAll.dispatchEvent(new MouseEvent('click', clickInit));
 const t_click = Date.now();
 const mountDeadline = t_click + 1500;
 let overlay = null;
-while (Date.now() < mountDeadline) {{
+while (Date.now() < mountDeadline) {
     await settle(20);
     overlay = document.querySelector('[data-delete-confirm-overlay]');
     if (overlay) break;
-}}
-if (!overlay) {{
-    refuse("delete_overlay_did_not_mount", {{ menu_open_ms }});
+}
+if (!overlay) {
+    refuse("delete_overlay_did_not_mount", { menu_open_ms });
     return;
-}}
+}
 const t_mounted = Date.now();
 const dialog = overlay.querySelector('[data-delete-confirm-dialog]');
-dioxus.send({{
+dioxus.send({
     accepted: true,
     menu_open_ms,
     click_to_mount_ms: t_mounted - t_click,
@@ -306,7 +307,7 @@ dioxus.send({{
     unkept_button_present: !!overlay.querySelector(
         '[data-delete-confirm-unkept-action]'),
     dialog_text: String(dialog?.textContent || '').slice(0, 400),
-}});
+});
 """
 
 # The CONFIRM leg of close-all — gated by the caller (only when every live
@@ -343,235 +344,234 @@ refuse("delete_overlay_did_not_close");
 # instrument exists to measure — and leaves every container closed again.
 # No menu item is ever fired here.
 SPLIT_OPEN_JS = """
+// PHASE 1 (menu open + split-item click) — must fit the GUI's 3s
+// app-control eval budget ([11.200]: the monolithic script's 2.5s DOM tail
+// pushed every send past the budget and dom_eval_timeout discarded the
+// whole iteration, menu included). The DOM truth read lives in SPLIT_DOM_JS.
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const PATH_A = {session_a!r};
 const AXIS = {axis!r};  // "split-side-by-side" | "split-stacked"
-const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
-if (document.querySelector('[data-split-group-row="1"]')) {{
-    refuse("split_group_already_on_screen");
+if (document.querySelector('[data-split-group-row="1"]')) {
+    dioxus.send({ accepted: false, reason: "split_group_already_on_screen" });
     return;
-}}
-const dismiss = async () => {{
-    try {{
+}
+const dismiss = async () => {
+    try {
         const t = document.elementFromPoint(3, 3) || document.body;
-        const b = {{ bubbles: true, cancelable: true, composed: true,
+        const b = { bubbles: true, cancelable: true, composed: true,
                      view: window, clientX: 3, clientY: 3, screenX: 3,
-                     screenY: 3, button: 0, buttons: 1 }};
+                     screenY: 3, button: 0, buttons: 1 };
         t.dispatchEvent(new MouseEvent('mousedown', b));
-        t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
-        t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
+        t.dispatchEvent(new MouseEvent('mouseup', { ...b, buttons: 0 }));
+        t.dispatchEvent(new MouseEvent('click', { ...b, buttons: 0 }));
         await settle(80);
-    }} catch (_e) {{}}
-}};
+    } catch (_e) {}
+};
 await dismiss();
-const row = await (async () => {{
-    // the sidebar virtualizes: the node may not exist until the row is
-    // selected and scrolled into view (the driver tree-selects first)
-    const deadline = Date.now() + 1500;
-    while (Date.now() < deadline) {{
-        const n = document.querySelector(
-            '[data-sidebar-row-path="' + PATH_A + '"]');
-        if (n) return n;
-        await settle(50);
-    }}
-    return null;
-}})();
-if (!row) {{
-    refuse("sidebar_row_missing", {{ session_path: PATH_A }});
+// the driver tree-selects + verifies the rect before this eval, so a short
+// node wait is enough — the 1500ms crawl is gone
+let row = document.querySelector(
+    '[data-sidebar-row-path="' + PATH_A + '"]');
+const rowDeadline = Date.now() + 800;
+while (!row && Date.now() < rowDeadline) {
+    await settle(50);
+    row = document.querySelector(
+        '[data-sidebar-row-path="' + PATH_A + '"]');
+}
+if (!row) {
+    dioxus.send({ accepted: false, reason: "sidebar_row_missing",
+                  session_path: PATH_A });
     return;
-}}
+}
 const rect = row.getBoundingClientRect();
-if (!(rect.width > 0 && rect.height > 0)) {{
-    refuse("sidebar_row_not_visible", {{ session_path: PATH_A }});
+if (!(rect.width > 0 && rect.height > 0)) {
+    dioxus.send({ accepted: false, reason: "sidebar_row_not_visible",
+                  session_path: PATH_A });
     return;
-}}
+}
 const cx = Number((rect.left + rect.width / 2).toFixed(2));
 const cy = Number((rect.top + rect.height / 2).toFixed(2));
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
                 clientX: cx, clientY: cy, screenX: cx, screenY: cy,
-                button: 2, buttons: 2, detail: 1 }};
+                button: 2, buttons: 2, detail: 1 };
 const t_open = Date.now();
 row.dispatchEvent(new MouseEvent('mousedown', init));
-row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+row.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, splitItem = null;
-const openDeadline = Date.now() + 1500;
-while (Date.now() < openDeadline) {{
+const openDeadline = Date.now() + 1400;
+while (Date.now() < openDeadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     splitItem = menu?.querySelector(
         '[data-context-menu-action="' + AXIS + '"]') || null;
     if (menu && splitItem) break;
-}}
-if (!menu || !splitItem) {{
+}
+if (!menu || !splitItem) {
     await dismiss();
-    refuse("context_menu_or_split_item_not_observed",
-           {{ session_path: PATH_A, axis: AXIS }});
+    dioxus.send({ accepted: false,
+                  reason: "context_menu_or_split_item_not_observed",
+                  session_path: PATH_A, axis: AXIS });
     return;
-}}
+}
 const menu_open_ms = Date.now() - t_open;
 const item_label = String(splitItem.textContent || '').slice(0, 80);
-await settle(120);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+await settle(100);
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 splitItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
 splitItem.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 splitItem.dispatchEvent(new MouseEvent('click', clickInit));
-const t_click = Date.now();
-// The split's paint truth lives in THIS document: the compound sidebar row
-// ([data-split-group-row]) and the pane rects ([data-split-session]) with
-// the split layer active. Both panes are webview rects laid out natively;
-// their xterm surfaces paint in their own webviews.
-let compound = null, panes = [];
-const domDeadline = t_click + 2500;
-while (Date.now() < domDeadline) {{
+dioxus.send({ accepted: true, menu_open_ms, item_label,
+              t_open, t_click: Date.now() });
+"""
+
+SPLIT_DOM_JS = """
+// PHASE 2 (split DOM truth: compound row + pane rects) — its own eval so
+// the 2.5s wait can never eat phase 1's reply ([11.200]). The page clock is
+// shared with phase 1, so found_at - t_click is honest click_to_dom.
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const t0 = Date.now();
+const deadline = t0 + 2200;
+let compound = null, panes = [], found_at = null;
+while (Date.now() < deadline) {
     await settle(25);
     compound = document.querySelector('[data-split-group-row="1"]');
     panes = [...document.querySelectorAll('[data-split-session]')];
-    if (compound && panes.length >= 2) break;
-}}
-const t_dom = Date.now();
-if (!compound || panes.length < 2) {{
-    refuse("split_dom_truth_did_not_land",
-           {{ menu_open_ms, compound_found: !!compound,
-              pane_count: panes.length }});
-    return;
-}}
-const paneRect = (n) => {{
+    if (compound && panes.length >= 2) { found_at = Date.now(); break; }
+}
+const paneRect = (n) => {
     const r = n.getBoundingClientRect();
-    return {{ x: Math.round(r.left), y: Math.round(r.top),
-              w: Math.round(r.width), h: Math.round(r.height) }};
-}};
-dioxus.send({{
-    accepted: true,
-    menu_open_ms,
-    click_to_dom_ms: t_dom - t_click,
-    dispatch_to_dom_ms: t_dom - t_open,
-    item_label,
-    compound_label: String(compound.textContent || '').slice(0, 80),
+    return { x: Math.round(r.left), y: Math.round(r.top),
+              w: Math.round(r.width), h: Math.round(r.height) };
+};
+dioxus.send({
+    compound_found: !!compound,
+    found_at,
+    waited_ms: Date.now() - t0,
+    compound_label: compound ? String(compound.textContent || '').slice(0, 80) : null,
     pane_count: panes.length,
-    panes: panes.map((n) => ({{
+    panes: panes.map((n) => ({
         session: n.getAttribute('data-split-session'),
         pane_index: n.getAttribute('data-split-pane-index'),
         rect: paneRect(n),
-    }})),
-}});
+    })),
+});
 """
 
 SPLIT_UNGROUP_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+    Object.assign({ accepted: false, reason }, extra || {}));
 const compound = document.querySelector('[data-split-group-row="1"]');
-if (!compound) {{
+if (!compound) {
     refuse("compound_row_missing");
     return;
-}}
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
-                clientX: 0, clientY: 0, button: 2, buttons: 2, detail: 1 }};
+}
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: 0, clientY: 0, button: 2, buttons: 2, detail: 1 };
 const r = compound.getBoundingClientRect();
 init.clientX = init.screenX = Math.round(r.left + r.width / 2);
 init.clientY = init.screenY = Math.round(r.top + r.height / 2);
 const t0 = Date.now();
 compound.dispatchEvent(new MouseEvent('mousedown', init));
-compound.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-compound.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+compound.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+compound.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 compound.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, item = null;
 const deadline = Date.now() + 1500;
-while (Date.now() < deadline) {{
+while (Date.now() < deadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     item = menu?.querySelector(
         '[data-context-menu-action="ungroup-split"]') || null;
     if (menu && item) break;
-}}
-if (!menu || !item) {{
+}
+if (!menu || !item) {
     await dismiss();
     refuse("context_menu_or_ungroup_item_not_observed");
     return;
-}}
+}
 await settle(120);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 item.dispatchEvent(new MouseEvent('mousedown', clickInit));
 item.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 item.dispatchEvent(new MouseEvent('click', clickInit));
 const tClick = Date.now();
-const deadline2 = tClick + 2000;
-while (Date.now() < deadline2) {{
+const deadline2 = tClick + 1200;
+while (Date.now() < deadline2) {
     await settle(25);
     if (!document.querySelector('[data-split-group-row="1"]') &&
         document.querySelectorAll('[data-split-session]').length === 0) break;
-}}
+}
 const tGone = Date.now();
 const stillCompound = !!document.querySelector('[data-split-group-row="1"]');
-dioxus.send({{
+dioxus.send({
     accepted: !stillCompound,
     ungroup_to_gone_ms: tGone - tClick,
     menu_open_ms: 0,
     still_compound: stillCompound,
     pane_count_after: document.querySelectorAll(
         '[data-split-session]').length,
-}});
+});
 """
 CHORD_LEG_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+    Object.assign({ accepted: false, reason }, extra || {}));
 const q = (sel) => !!document.querySelector(sel);
-if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {{
+if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {
     refuse("menu_or_overlay_already_open");
     return;
-}}
+}
 const kd = (key, code) => window.dispatchEvent(new KeyboardEvent('keydown',
-    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+    { key, code, bubbles: true, cancelable: true, composed: true }));
 const ku = (key, code) => window.dispatchEvent(new KeyboardEvent('keyup',
-    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+    { key, code, bubbles: true, cancelable: true, composed: true }));
 const t_tap = Date.now();
 kd('Alt', 'AltLeft');
 ku('Alt', 'AltLeft');
 let overlaySeen = false;
 const ovDeadline = Date.now() + 1500;
-while (Date.now() < ovDeadline) {{
+while (Date.now() < ovDeadline) {
     await settle(40);
-    if (q('[data-yggterm-keytip-breadcrumb]')) {{ overlaySeen = true; break; }}
-}}
-if (!overlaySeen) {{
-    refuse("alt_overlay_did_not_open", {{ tap_to_overlay_ms: null }});
+    if (q('[data-yggterm-keytip-breadcrumb]')) { overlaySeen = true; break; }
+}
+if (!overlaySeen) {
+    refuse("alt_overlay_did_not_open", { tap_to_overlay_ms: null });
     return;
-}}
+}
 const tap_to_overlay_ms = Date.now() - t_tap;
 const t_e = Date.now();
 kd('e', 'KeyE');
 let menuSeen = false;
 const mDeadline = Date.now() + 1500;
-while (Date.now() < mDeadline) {{
+while (Date.now() < mDeadline) {
     await settle(40);
-    if (q('[data-yggterm-menu-open]')) {{ menuSeen = true; break; }}
-}}
+    if (q('[data-yggterm-menu-open]')) { menuSeen = true; break; }
+}
 const walk_to_menu_ms = menuSeen ? Date.now() - t_e : null;
 kd('Escape', 'Escape');
 let menuClosed = false;
 const gDeadline = Date.now() + 1500;
-while (Date.now() < gDeadline) {{
+while (Date.now() < gDeadline) {
     await settle(40);
-    if (!q('[data-yggterm-menu-open]')) {{ menuClosed = true; break; }}
-}}
+    if (!q('[data-yggterm-menu-open]')) { menuClosed = true; break; }
+}
 let overlayClosed = !q('[data-yggterm-keytip-breadcrumb]');
-if (!overlayClosed) {{
+if (!overlayClosed) {
     kd('Escape', 'Escape');
     const d2 = Date.now() + 1000;
-    while (Date.now() < d2) {{
+    while (Date.now() < d2) {
         await settle(40);
-        if (!q('[data-yggterm-keytip-breadcrumb]')) {{ overlayClosed = true; break; }}
-    }}
-}}
-dioxus.send({{
+        if (!q('[data-yggterm-keytip-breadcrumb]')) { overlayClosed = true; break; }
+    }
+}
+dioxus.send({
     accepted: true,
     overlay_seen: true,
     menu_seen: menuSeen,
@@ -579,7 +579,7 @@ dioxus.send({{
     walk_to_menu_ms,
     escape_closed_menu: menuClosed,
     overlay_closed: overlayClosed,
-}});
+});
 """
 
 
@@ -597,32 +597,88 @@ class Probe:
         self.spawned_paths: list[str] = []
         self.scratch_titles: list[dict] = []
         self.trace_events_seen: dict[str, set] = {}
+        self.last_dom_error: str | None = None
 
     # ---- instruments -------------------------------------------------
 
     def verb(self, *argv: str, timeout: float | None = None) -> dict:
-        """Run one `yggterm server app …` verb; return parsed reply + wall ms."""
+        """Run one `yggterm server app …` verb; return parsed reply + wall ms.
+        The CLI runs in its own process group; a budget expiry killpg's the
+        GROUP and drains bounded — one wedged app-control call costs its
+        budget, never minutes ([11.200]: one iteration held 972895 ms)."""
         cmd = [YGGTERM, "server", "app", *argv]
+        budget = timeout or self.timeout_s
         t0 = time.perf_counter()
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=timeout or self.timeout_s,
-            )
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "verb timeout", "wall_ms": None,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True)
+        except OSError as exc:
+            return {"ok": False, "error": f"spawn failed: {exc}",
+                    "wall_ms": int((time.perf_counter() - t0) * 1000),
                     "raw": ""}
-        wall_ms = int((time.perf_counter() - t0) * 1000)
-        reply: dict = {"ok": proc.returncode == 0, "wall_ms": wall_ms}
+        timed_out = False
         try:
-            reply["json"] = json.loads(proc.stdout)
+            out, err = proc.communicate(timeout=budget)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            try:
+                out, err = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+        wall_ms = int((time.perf_counter() - t0) * 1000)
+        if timed_out:
+            reply: dict = {"ok": False,
+                           "error": f"verb timeout (group killed at {budget:g}s)",
+                           "wall_ms": wall_ms, "raw": (out or "")[-2000:]}
+            self.dump_artifact(f"verb-{'-'.join(argv[:3])}-{now_ms()}.json", reply)
+            return reply
+        reply = {"ok": proc.returncode == 0, "wall_ms": wall_ms}
+        try:
+            reply["json"] = json.loads(out)
         except (json.JSONDecodeError, ValueError):
             reply["json"] = None
-            reply["raw"] = (proc.stdout + proc.stderr)[-2000:]
+            reply["raw"] = ((out or "") + (err or ""))[-2000:]
         if proc.returncode != 0:
-            reply["error"] = (proc.stderr or proc.stdout)[-500:]
+            reply["error"] = (err or out or "")[-500:]
         self.dump_artifact(f"verb-{'-'.join(argv[:3])}-{now_ms()}.json", reply)
         return reply
+
+    # dom_eval_for_app_control answers {"error": …} in data when the eval
+    # never produced a value; this class is the GUI's own retryable set
+    # (app_control_eval_error_should_retry) — a FRESH eval is the medicine.
+    EVAL_RETRYABLE_MARKERS = ("eval has already ran", "EvalError::Finished")
+
+    def dom_eval(self, js: str, timeout: float = 15,
+                 retries: int = 2) -> dict:
+        """One app-control dom-eval, honest + retry-bounded. Returns the
+        data dict: {"result": …} on success, {"error": …} on failure —
+        NEVER silently empty ([11.200]: the battery read only data.result
+        and reported every real failure as "split refused: None")."""
+        last: dict = {}
+        for attempt in range(retries + 1):
+            r = self.verb("dom-eval", js, timeout=timeout)
+            data = (r.get("json") or {}).get("data")
+            if isinstance(data, dict):
+                last = data
+            elif r.get("ok"):
+                last = {"error": "dom-eval returned no data payload"}
+            else:
+                last = {"error": f"dom-eval verb failed: "
+                                 f"{r.get('error') or 'unknown'}"}
+            if last.get("error") is None and "result" in last:
+                return last
+            reason = str(last.get("error"))
+            if attempt < retries and any(m in reason
+                                         for m in self.EVAL_RETRYABLE_MARKERS):
+                time.sleep(0.3)
+                continue
+            break
+        return last
 
     def ping_overhead_ms(self, samples: int = 5) -> float | None:
         """CLI round-trip floor: every verb measurement includes this."""
@@ -999,7 +1055,10 @@ class Probe:
 
     def _row_rects(self, paths: list[str]) -> dict:
         """Sidebar DOM rects for row paths, via one dom-eval. The sidebar
-        virtualizes — the caller must `tree select` first so nodes exist."""
+        virtualizes — the caller must `tree select` first so nodes exist.
+        An eval failure returns {} and names itself in last_dom_error, so a
+        latched eval plane can never masquerade as "virtualized out"
+        ([11.200] misattribution)."""
         js = """const out = {};
 for (const p of __PATHS__) {
   let el = null;
@@ -1012,9 +1071,12 @@ for (const p of __PATHS__) {
 }
 dioxus.send(out);
 """.replace("__PATHS__", json.dumps(paths))
-        r = self.verb("dom-eval", js, timeout=15)
-        reply = r.get("json") or {}
-        return (reply.get("data") or {}).get("result") or {}
+        r = self.dom_eval(js, timeout=15)
+        if r.get("error") is not None:
+            self.last_dom_error = str(r["error"])
+            return {}
+        self.last_dom_error = None
+        return r.get("result") or {}
 
     def _events_between(self, t0: int, t1: int) -> list[dict]:
         return [e for e in self.ytrace_events(t0) if e.get("ts_ms", 0) <= t1]
@@ -1410,9 +1472,23 @@ dioxus.send(out);
         self.verb("tree", "select", a_path)
         self.verb("tree", "select", b_path)
         time.sleep(0.2)
-        rects = self._row_rects([a_path, b_path])
+        # the select's scroll-into-view is async: verify the rects with a
+        # bounded poll, and name an eval-plane failure AS an eval-plane
+        # failure — "virtualized out" is only honest when the eval answered
+        # and the nodes truly are not in the DOM ([11.200])
+        rects: dict = {}
+        for attempt in range(3):
+            rects = self._row_rects([a_path, b_path])
+            if rects.get(a_path) and rects.get(b_path):
+                break
+            time.sleep(0.5)
         if not rects.get(a_path) or not rects.get(b_path):
-            return {"error": "row nodes not rendered (virtualized out?)",
+            if self.last_dom_error:
+                return {"error": "row rects unavailable — dom-eval plane "
+                                 f"failed: {self.last_dom_error}",
+                        "iterations": []}
+            return {"error": "row nodes not rendered (virtualized out? — "
+                             "eval answered, nodes absent from the DOM)",
                     "iterations": []}
         out = {"iterations": []}
         confirmed_active: str | None = None
@@ -2106,17 +2182,40 @@ dioxus.send(out);
             t0 = now_ms()
             js = SPLIT_OPEN_JS.replace("{session_a!r}", repr(a_path))
             js = js.replace("{axis!r}", repr("split-side-by-side"))
-            r = self.verb("dom-eval", js, timeout=25)
+            data = self.dom_eval(js, timeout=25)
             open_wall_ms = now_ms() - t0
-            result = ((r.get("json") or {}).get("data") or {}).get("result") or {}
-            if not r["ok"]:
-                acc.append(f"dom-eval failed: {r.get('error')}")
+            result = data.get("result") or {}
+            if not result and data.get("error") is not None:
+                acc.append(f"dom-eval error: {data['error']}")
             if result.get("dom_eval_error"):
                 acc.append(f"script error: {result['dom_eval_error']}")
-            if not result.get("accepted"):
+            if result and not result.get("accepted"):
                 acc.append(f"split refused: {result.get('reason')}")
+            # PHASE 2 — the DOM truth read rides its own eval so the 2.5s
+            # wait can never eat phase 1's reply under the GUI's 3s eval
+            # budget ([11.200]). committed = the menu actually opened and
+            # the split item was clicked.
+            committed = bool(result.get("accepted"))
+            dom = {}
+            if committed:
+                t_dom0 = now_ms()
+                ddata = self.dom_eval(SPLIT_DOM_JS, timeout=15)
+                dom = ddata.get("result") or {}
+                if not dom and ddata.get("error") is not None:
+                    acc.append(f"dom-truth eval error: {ddata['error']}")
+                elif dom.get("compound_found"):
+                    result["pane_count"] = dom.get("pane_count")
+                    result["panes"] = dom.get("panes") or []
+                    result["compound_label"] = dom.get("compound_label")
+                    t_click = result.get("t_click")
+                    found_at = dom.get("found_at")
+                    if t_click and found_at:
+                        result["click_to_dom_ms"] = found_at - t_click
+                else:
+                    acc.append("split_dom_truth_did_not_land "
+                               f"(waited {dom.get('waited_ms')} ms)")
             pair = self.split_events_from_trace(t0)
-            if result.get("accepted"):
+            if committed:
                 if pair.get("pair_ms") is None:
                     acc.append("no context_menu_activate -> split/create pair "
                                "in ytrace within window (build not rotated "
@@ -2143,14 +2242,16 @@ dioxus.send(out);
                     acc.append("a pane rect is empty (split not visible)")
             # UNGROUP — the teardown must restore both rows alive
             ungroup = {}
-            if result.get("accepted"):
+            if committed and dom.get("compound_found"):
                 time.sleep(0.3)
-                ru = self.verb("dom-eval", SPLIT_UNGROUP_JS, timeout=15)
-                ungroup = ((ru.get("json") or {}).get("data")
-                           or {}).get("result") or {}
+                udata = self.dom_eval(SPLIT_UNGROUP_JS, timeout=15)
+                ungroup = udata.get("result") or {}
                 if not ungroup.get("accepted"):
-                    acc.append(f"ungroup failed: {ungroup.get('reason')} "
-                               f"(still_compound={ungroup.get('still_compound')})")
+                    why = (f"ungroup dom-eval error: {udata['error']}"
+                           if udata.get("error") is not None and not ungroup
+                           else f"ungroup failed: {ungroup.get('reason')} "
+                                f"(still_compound={ungroup.get('still_compound')})")
+                    acc.append(why)
                 else:
                     pair2 = self.split_events_from_trace(t0)
                     if not pair2.get("ungrouped"):
