@@ -223,77 +223,77 @@ refuse("delete_overlay_did_not_close");
 CLOSEALL_OPEN_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
-if (document.querySelector('[data-delete-confirm-overlay]')) {{
+    Object.assign({ accepted: false, reason }, extra || {}));
+if (document.querySelector('[data-delete-confirm-overlay]')) {
     refuse("delete_overlay_already_open");
     return;
-}}
+}
 const PATH = '__live_sessions__';
-const row = await (async () => {{
+const row = await (async () => {
     const deadline = Date.now() + 1500;
-    while (Date.now() < deadline) {{
+    while (Date.now() < deadline) {
         const n = document.querySelector(
             '[data-sidebar-row-path="' + PATH + '"]');
         if (n) return n;
         await settle(50);
-    }}
+    }
     return null;
-}})();
-if (!row) {{
+})();
+if (!row) {
     refuse("live_sessions_group_row_missing");
     return;
-}}
+}
 const rect = row.getBoundingClientRect();
-if (!(rect.width > 0 && rect.height > 0)) {{
+if (!(rect.width > 0 && rect.height > 0)) {
     refuse("live_sessions_group_row_not_visible");
     return;
-}}
+}
 const cx = Number((rect.left + rect.width / 2).toFixed(2));
 const cy = Number((rect.top + rect.height / 2).toFixed(2));
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
                 clientX: cx, clientY: cy, screenX: cx, screenY: cy,
-                button: 2, buttons: 2, detail: 1 }};
+                button: 2, buttons: 2, detail: 1 };
 const t_open = Date.now();
 row.dispatchEvent(new MouseEvent('mousedown', init));
-row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+row.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, closeAll = null;
 const openDeadline = Date.now() + 1500;
-while (Date.now() < openDeadline) {{
+while (Date.now() < openDeadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     closeAll = menu?.querySelector(
         '[data-context-menu-action="close-all-live-sessions"]') || null;
     if (menu && closeAll) break;
-}}
-if (!menu || !closeAll) {{
-    refuse("menu_or_close_all_item_not_observed", {{ session_path: PATH }});
+}
+if (!menu || !closeAll) {
+    refuse("menu_or_close_all_item_not_observed", { session_path: PATH });
     return;
-}}
+}
 const menu_open_ms = Date.now() - t_open;
 await settle(120);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 closeAll.dispatchEvent(new MouseEvent('mousedown', clickInit));
 closeAll.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 closeAll.dispatchEvent(new MouseEvent('click', clickInit));
 const t_click = Date.now();
 const mountDeadline = t_click + 1500;
 let overlay = null;
-while (Date.now() < mountDeadline) {{
+while (Date.now() < mountDeadline) {
     await settle(20);
     overlay = document.querySelector('[data-delete-confirm-overlay]');
     if (overlay) break;
-}}
-if (!overlay) {{
-    refuse("delete_overlay_did_not_mount", {{ menu_open_ms }});
+}
+if (!overlay) {
+    refuse("delete_overlay_did_not_mount", { menu_open_ms });
     return;
-}}
+}
 const t_mounted = Date.now();
 const dialog = overlay.querySelector('[data-delete-confirm-dialog]');
-dioxus.send({{
+dioxus.send({
     accepted: true,
     menu_open_ms,
     click_to_mount_ms: t_mounted - t_click,
@@ -307,7 +307,7 @@ dioxus.send({{
     unkept_button_present: !!overlay.querySelector(
         '[data-delete-confirm-unkept-action]'),
     dialog_text: String(dialog?.textContent || '').slice(0, 400),
-}});
+});
 """
 
 # The CONFIRM leg of close-all — gated by the caller (only when every live
@@ -351,81 +351,81 @@ SPLIT_OPEN_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const PATH_A = {session_a!r};
 const AXIS = {axis!r};  // "split-side-by-side" | "split-stacked"
-if (document.querySelector('[data-split-group-row="1"]')) {{
-    dioxus.send({{ accepted: false, reason: "split_group_already_on_screen" }});
+if (document.querySelector('[data-split-group-row="1"]')) {
+    dioxus.send({ accepted: false, reason: "split_group_already_on_screen" });
     return;
-}}
-const dismiss = async () => {{
-    try {{
+}
+const dismiss = async () => {
+    try {
         const t = document.elementFromPoint(3, 3) || document.body;
-        const b = {{ bubbles: true, cancelable: true, composed: true,
+        const b = { bubbles: true, cancelable: true, composed: true,
                      view: window, clientX: 3, clientY: 3, screenX: 3,
-                     screenY: 3, button: 0, buttons: 1 }};
+                     screenY: 3, button: 0, buttons: 1 };
         t.dispatchEvent(new MouseEvent('mousedown', b));
-        t.dispatchEvent(new MouseEvent('mouseup', {{ ...b, buttons: 0 }}));
-        t.dispatchEvent(new MouseEvent('click', {{ ...b, buttons: 0 }}));
+        t.dispatchEvent(new MouseEvent('mouseup', { ...b, buttons: 0 }));
+        t.dispatchEvent(new MouseEvent('click', { ...b, buttons: 0 }));
         await settle(80);
-    }} catch (_e) {{}}
-}};
+    } catch (_e) {}
+};
 await dismiss();
 // the driver tree-selects + verifies the rect before this eval, so a short
 // node wait is enough — the 1500ms crawl is gone
 let row = document.querySelector(
     '[data-sidebar-row-path="' + PATH_A + '"]');
 const rowDeadline = Date.now() + 800;
-while (!row && Date.now() < rowDeadline) {{
+while (!row && Date.now() < rowDeadline) {
     await settle(50);
     row = document.querySelector(
         '[data-sidebar-row-path="' + PATH_A + '"]');
-}}
-if (!row) {{
-    dioxus.send({{ accepted: false, reason: "sidebar_row_missing",
-                  session_path: PATH_A }});
+}
+if (!row) {
+    dioxus.send({ accepted: false, reason: "sidebar_row_missing",
+                  session_path: PATH_A });
     return;
-}}
+}
 const rect = row.getBoundingClientRect();
-if (!(rect.width > 0 && rect.height > 0)) {{
-    dioxus.send({{ accepted: false, reason: "sidebar_row_not_visible",
-                  session_path: PATH_A }});
+if (!(rect.width > 0 && rect.height > 0)) {
+    dioxus.send({ accepted: false, reason: "sidebar_row_not_visible",
+                  session_path: PATH_A });
     return;
-}}
+}
 const cx = Number((rect.left + rect.width / 2).toFixed(2));
 const cy = Number((rect.top + rect.height / 2).toFixed(2));
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
                 clientX: cx, clientY: cy, screenX: cx, screenY: cy,
-                button: 2, buttons: 2, detail: 1 }};
+                button: 2, buttons: 2, detail: 1 };
 const t_open = Date.now();
 row.dispatchEvent(new MouseEvent('mousedown', init));
-row.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-row.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+row.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+row.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 row.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, splitItem = null;
 const openDeadline = Date.now() + 1400;
-while (Date.now() < openDeadline) {{
+while (Date.now() < openDeadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     splitItem = menu?.querySelector(
         '[data-context-menu-action="' + AXIS + '"]') || null;
     if (menu && splitItem) break;
-}}
-if (!menu || !splitItem) {{
+}
+if (!menu || !splitItem) {
     await dismiss();
-    dioxus.send({{ accepted: false,
+    dioxus.send({ accepted: false,
                   reason: "context_menu_or_split_item_not_observed",
-                  session_path: PATH_A, axis: AXIS }});
+                  session_path: PATH_A, axis: AXIS });
     return;
-}}
+}
 const menu_open_ms = Date.now() - t_open;
 const item_label = String(splitItem.textContent || '').slice(0, 80);
 await settle(100);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 splitItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
 splitItem.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 splitItem.dispatchEvent(new MouseEvent('click', clickInit));
-dioxus.send({{ accepted: true, menu_open_ms, item_label,
-              t_open, t_click: Date.now() }});
+dioxus.send({ accepted: true, menu_open_ms, item_label,
+              t_open, t_click: Date.now() });
 """
 
 SPLIT_DOM_JS = """
@@ -436,142 +436,142 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const t0 = Date.now();
 const deadline = t0 + 2200;
 let compound = null, panes = [], found_at = null;
-while (Date.now() < deadline) {{
+while (Date.now() < deadline) {
     await settle(25);
     compound = document.querySelector('[data-split-group-row="1"]');
     panes = [...document.querySelectorAll('[data-split-session]')];
-    if (compound && panes.length >= 2) {{ found_at = Date.now(); break; }}
-}}
-const paneRect = (n) => {{
+    if (compound && panes.length >= 2) { found_at = Date.now(); break; }
+}
+const paneRect = (n) => {
     const r = n.getBoundingClientRect();
-    return {{ x: Math.round(r.left), y: Math.round(r.top),
-              w: Math.round(r.width), h: Math.round(r.height) }};
-}};
-dioxus.send({{
+    return { x: Math.round(r.left), y: Math.round(r.top),
+              w: Math.round(r.width), h: Math.round(r.height) };
+};
+dioxus.send({
     compound_found: !!compound,
     found_at,
     waited_ms: Date.now() - t0,
     compound_label: compound ? String(compound.textContent || '').slice(0, 80) : null,
     pane_count: panes.length,
-    panes: panes.map((n) => ({{
+    panes: panes.map((n) => ({
         session: n.getAttribute('data-split-session'),
         pane_index: n.getAttribute('data-split-pane-index'),
         rect: paneRect(n),
-    }})),
-}});
+    })),
+});
 """
 
 SPLIT_UNGROUP_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+    Object.assign({ accepted: false, reason }, extra || {}));
 const compound = document.querySelector('[data-split-group-row="1"]');
-if (!compound) {{
+if (!compound) {
     refuse("compound_row_missing");
     return;
-}}
-const init = {{ bubbles: true, cancelable: true, composed: true, view: window,
-                clientX: 0, clientY: 0, button: 2, buttons: 2, detail: 1 }};
+}
+const init = { bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: 0, clientY: 0, button: 2, buttons: 2, detail: 1 };
 const r = compound.getBoundingClientRect();
 init.clientX = init.screenX = Math.round(r.left + r.width / 2);
 init.clientY = init.screenY = Math.round(r.top + r.height / 2);
 const t0 = Date.now();
 compound.dispatchEvent(new MouseEvent('mousedown', init));
-compound.dispatchEvent(new MouseEvent('mouseup', {{ ...init, buttons: 0 }}));
-compound.dispatchEvent(new MouseEvent('auxclick', {{ ...init, buttons: 0 }}));
+compound.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 }));
+compound.dispatchEvent(new MouseEvent('auxclick', { ...init, buttons: 0 }));
 compound.dispatchEvent(new MouseEvent('contextmenu', init));
 let menu = null, item = null;
 const deadline = Date.now() + 1500;
-while (Date.now() < deadline) {{
+while (Date.now() < deadline) {
     await settle(40);
     menu = document.querySelector('[data-context-menu="1"]');
     item = menu?.querySelector(
         '[data-context-menu-action="ungroup-split"]') || null;
     if (menu && item) break;
-}}
-if (!menu || !item) {{
+}
+if (!menu || !item) {
     await dismiss();
     refuse("context_menu_or_ungroup_item_not_observed");
     return;
-}}
+}
 await settle(120);
-const clickInit = {{ bubbles: true, cancelable: true, composed: true,
-                     view: window, button: 0, buttons: 1 }};
+const clickInit = { bubbles: true, cancelable: true, composed: true,
+                     view: window, button: 0, buttons: 1 };
 item.dispatchEvent(new MouseEvent('mousedown', clickInit));
 item.dispatchEvent(new MouseEvent('mouseup',
-    {{ ...clickInit, buttons: 0 }}));
+    { ...clickInit, buttons: 0 }));
 item.dispatchEvent(new MouseEvent('click', clickInit));
 const tClick = Date.now();
 const deadline2 = tClick + 1200;
-while (Date.now() < deadline2) {{
+while (Date.now() < deadline2) {
     await settle(25);
     if (!document.querySelector('[data-split-group-row="1"]') &&
         document.querySelectorAll('[data-split-session]').length === 0) break;
-}}
+}
 const tGone = Date.now();
 const stillCompound = !!document.querySelector('[data-split-group-row="1"]');
-dioxus.send({{
+dioxus.send({
     accepted: !stillCompound,
     ungroup_to_gone_ms: tGone - tClick,
     menu_open_ms: 0,
     still_compound: stillCompound,
     pane_count_after: document.querySelectorAll(
         '[data-split-session]').length,
-}});
+});
 """
 CHORD_LEG_JS = """
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const refuse = (reason, extra) => dioxus.send(
-    Object.assign({{ accepted: false, reason }}, extra || {{}}));
+    Object.assign({ accepted: false, reason }, extra || {}));
 const q = (sel) => !!document.querySelector(sel);
-if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {{
+if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {
     refuse("menu_or_overlay_already_open");
     return;
-}}
+}
 const kd = (key, code) => window.dispatchEvent(new KeyboardEvent('keydown',
-    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+    { key, code, bubbles: true, cancelable: true, composed: true }));
 const ku = (key, code) => window.dispatchEvent(new KeyboardEvent('keyup',
-    {{ key, code, bubbles: true, cancelable: true, composed: true }}));
+    { key, code, bubbles: true, cancelable: true, composed: true }));
 const t_tap = Date.now();
 kd('Alt', 'AltLeft');
 ku('Alt', 'AltLeft');
 let overlaySeen = false;
 const ovDeadline = Date.now() + 1500;
-while (Date.now() < ovDeadline) {{
+while (Date.now() < ovDeadline) {
     await settle(40);
-    if (q('[data-yggterm-keytip-breadcrumb]')) {{ overlaySeen = true; break; }}
-}}
-if (!overlaySeen) {{
-    refuse("alt_overlay_did_not_open", {{ tap_to_overlay_ms: null }});
+    if (q('[data-yggterm-keytip-breadcrumb]')) { overlaySeen = true; break; }
+}
+if (!overlaySeen) {
+    refuse("alt_overlay_did_not_open", { tap_to_overlay_ms: null });
     return;
-}}
+}
 const tap_to_overlay_ms = Date.now() - t_tap;
 const t_e = Date.now();
 kd('e', 'KeyE');
 let menuSeen = false;
 const mDeadline = Date.now() + 1500;
-while (Date.now() < mDeadline) {{
+while (Date.now() < mDeadline) {
     await settle(40);
-    if (q('[data-yggterm-menu-open]')) {{ menuSeen = true; break; }}
-}}
+    if (q('[data-yggterm-menu-open]')) { menuSeen = true; break; }
+}
 const walk_to_menu_ms = menuSeen ? Date.now() - t_e : null;
 kd('Escape', 'Escape');
 let menuClosed = false;
 const gDeadline = Date.now() + 1500;
-while (Date.now() < gDeadline) {{
+while (Date.now() < gDeadline) {
     await settle(40);
-    if (!q('[data-yggterm-menu-open]')) {{ menuClosed = true; break; }}
-}}
+    if (!q('[data-yggterm-menu-open]')) { menuClosed = true; break; }
+}
 let overlayClosed = !q('[data-yggterm-keytip-breadcrumb]');
-if (!overlayClosed) {{
+if (!overlayClosed) {
     kd('Escape', 'Escape');
     const d2 = Date.now() + 1000;
-    while (Date.now() < d2) {{
+    while (Date.now() < d2) {
         await settle(40);
-        if (!q('[data-yggterm-keytip-breadcrumb]')) {{ overlayClosed = true; break; }}
-    }}
-}}
-dioxus.send({{
+        if (!q('[data-yggterm-keytip-breadcrumb]')) { overlayClosed = true; break; }
+    }
+}
+dioxus.send({
     accepted: true,
     overlay_seen: true,
     menu_seen: menuSeen,
@@ -579,7 +579,7 @@ dioxus.send({{
     walk_to_menu_ms,
     escape_closed_menu: menuClosed,
     overlay_closed: overlayClosed,
-}});
+});
 """
 
 
