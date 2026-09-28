@@ -634,7 +634,7 @@ class Probe:
             time.sleep(0.05)
         return statistics.median(walls) if walls else None
 
-    def ytrace_events(self, since_ms: int, lines: int = 400) -> list[dict]:
+    def ytrace_events(self, since_ms: int, lines: int = 1200) -> list[dict]:
         try:
             proc = subprocess.run(
                 [YTRACE, "tail", "--lines", str(lines), "--json"],
@@ -735,9 +735,8 @@ class Probe:
         # action timeout for markers that never fire burns 12 s per
         # iteration. Cap the diagnostic window; the content poll owns the
         # honest paint leg.
-        paint = self.wait_paint_milestones(path, since_ms=t0,
-                                           timeout_s=min(self.timeout_s, 6.0))
-        paint["content"] = self.wait_screen_content(path, since_ms=t0)
+        paint = self.wait_spawn_truth(path, since_ms=t0,
+                                      milestone_timeout_s=min(self.timeout_s, 6.0))
         row["paint"] = paint
         return row
 
@@ -840,6 +839,81 @@ class Probe:
             time.sleep(0.12)
         return {"content_first_ms": None, "nonblank_line_count": None}
 
+    def wait_spawn_truth(self, path: str, since_ms: int,
+                         milestone_timeout_s: float = 6.0) -> dict:
+        """ONE interleaved watcher for both spawn observation legs.
+
+        The sequential form (milestone wait to its cap, THEN the content
+        poll) overstated verb\u2192content by the whole milestone cap while
+        content_first_ms kept counting from t0 \u2014 on e9cc152c the trace
+        showed first_frame +3.0 s / settle +3.9 s while the probe reported
+        content_first +8.3-9.2 s, 5/5 (2026-09-29). This loop polls
+        read-buffer and scans the trace in the SAME pass, records every
+        read-buffer wall (the poll-cost half of the content leg), and
+        returns when both legs answered or their deadlines passed."""
+        uuid = path.split("://")[-1]
+        markers = {
+            "open_attempt_begin": ("terminal_open_attempt", "begin"),
+            "mount_begin": ("terminal_mount", "begin"),
+            "mount_open": ("xterm_paint", "mount_open"),
+            "paint_settle": ("xterm_paint", "settle"),
+            "first_frame": ("xterm_paint", "first_frame"),
+        }
+        found: dict[str, dict] = {}
+        content = {"content_first_ms": None, "nonblank_line_count": None,
+                   "content_poll_walls_ms": [], "content_polls": 0}
+        start = time.time()
+        ct_deadline = start + self.timeout_s
+        # The content poll runs with NO trace scanning in the loop: a
+        # `ytrace tail` inside a hot generation costs seconds (measured
+        # 5.6 s/call on jojo 2026-09-29) and that cost was landing inside
+        # content_first_ms. Milestone offsets are ts_ms-based, so ONE scan
+        # after the content leg answers recovers them exactly.
+        while content["content_first_ms"] is None and time.time() < ct_deadline:
+            t = time.time()
+            r = self.verb("terminal", "read-buffer", path,
+                          "--mode", "screen")
+            content["content_poll_walls_ms"].append(
+                round((time.time() - t) * 1000))
+            content["content_polls"] += 1
+            data = (r.get("json") or {}).get("data") or {}
+            n = data.get("nonblank_line_count")
+            if r["ok"] and isinstance(n, int) and n > 0:
+                content["content_first_ms"] = now_ms() - since_ms
+                content["nonblank_line_count"] = n
+            else:
+                time.sleep(0.15)
+        for e in self.ytrace_events(since_ms, lines=2400):
+            for key, (cat, name) in markers.items():
+                if key in found:
+                    continue
+                if e.get("category") != cat or e.get("name") != name:
+                    continue
+                if uuid not in json.dumps(e):
+                    continue
+                found[key] = {"ts_ms": e["ts_ms"],
+                              "offset_ms": e["ts_ms"] - since_ms,
+                              "payload": e.get("payload")}
+        ff = found.get("first_frame", {})
+        paint_marker = ("first_frame" if "first_frame" in found
+                        else "paint_settle" if "paint_settle" in found
+                        else "mount_open" if "mount_open" in found
+                        else None)
+        walls = sorted(content["content_poll_walls_ms"])
+        p50 = walls[len(walls) // 2] if walls else None
+        return {"milestones": found,
+                "paint_marker": paint_marker,
+                "spawn_to_paint_ms": found[paint_marker]["offset_ms"]
+                if paint_marker else None,
+                "open_to_write_ms": ff.get("payload", {}).get("open_to_write_ms"),
+                "write_to_frame_ms": ff.get("payload", {}).get("write_to_frame_ms"),
+                "blank_frames_before_write":
+                    ff.get("payload", {}).get("blank_frames_before_write"),
+                "content": {"content_first_ms": content["content_first_ms"],
+                            "nonblank_line_count": content["nonblank_line_count"]},
+                "content_poll_walls_p50_ms": p50,
+                "content_polls": content["content_polls"]}
+
     # ---- actions -------------------------------------------------------
 
     def action_spawn(self, iters: int) -> dict:
@@ -874,6 +948,10 @@ class Probe:
                 "open_to_write_ms": paint.get("open_to_write_ms"),
                 "write_to_frame_ms": paint.get("write_to_frame_ms"),
                 "blank_frames_before_write": paint.get("blank_frames_before_write"),
+                "trace_paint_marker": paint.get("paint_marker"),
+                "trace_paint_ms": paint.get("spawn_to_paint_ms"),
+                "content_poll_walls_p50_ms": paint.get("content_poll_walls_p50_ms"),
+                "content_polls": paint.get("content_polls"),
                 "accuracy_failures": acc,
             })
         return summarize(out, key="spawn_to_paint_ms",
