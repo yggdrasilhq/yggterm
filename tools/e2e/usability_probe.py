@@ -49,6 +49,9 @@ BOOTSTRAP_GRACE_S = 600        # a row may bootstrap for ten minutes
 GHOST_GRACE_S = 15 * 60        # an unattached CLI older than this is a ghost
 PRINTABLE_FLOOR = 0.72         # readable screens are mostly printable
 MOJIBAKE_SIGNS = ("Ã", "Â", "\ufffd", "â€")
+# [11.187] A client word carrying a mismatch counts as STANDING only within
+# this window; older words are history (the row may have healed or closed).
+STANDING_MISMATCH_GRACE_MS = 30 * 60 * 1000
 
 
 def yggterm_binary():
@@ -305,10 +308,124 @@ def invariant_ghost_pids(report):
         report.ok("ghost_pids")
 
 
+def latest_frame_hash_words(max_events=400):
+    """The client half's own words, from the GUI host's ytrace plane: the
+    newest `frame_hash_probe` event per session_path, plus any recent
+    loop-liveness watchdog events. Returns ({session_path: event}, [watchdog
+    event strings]). Empty when this host carries no ytrace (headless — the
+    stream_liveness invariant self-skips rather than lie)."""
+    traces = sorted(HOME.glob(".yggterm/ytrace.g*.jsonl"), key=lambda p: p.stat().st_mtime,
+                    reverse=True)
+    if not traces:
+        return {}, []
+    latest = {}
+    watchdog = []
+    scanned = 0
+    now_ms = time.time() * 1000
+    for trace in traces:
+        try:
+            lines = trace.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if "frame_hash_probe" not in line and "terminal_mount_loop" not in line \
+                    and "terminal_mount_task_dropped" not in line \
+                    and "terminal_mount_watchdog_remount" not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            name = str(event.get("name", ""))
+            payload = event.get("payload") or {}
+            session = str(payload.get("session_path", ""))
+            if name == "frame_hash_probe" and session:
+                if session not in latest:
+                    latest[session] = payload
+                    latest[session]["_age_ms"] = now_ms - float(event.get("ts_ms", 0))
+            elif name.startswith("terminal_mount_loop") or name in (
+                "terminal_mount_task_dropped", "terminal_mount_watchdog_remount_armed",
+            ):
+                age_h = (now_ms - float(event.get("ts_ms", 0))) / 3_600_000
+                if age_h <= 1.0:
+                    watchdog.append(f"{name} {session} ({age_h:.1f}h ago)")
+        scanned += 1
+        if len(latest) >= max_events or scanned >= 3:
+            break
+    return latest, watchdog
+
+
+def invariant_stream_liveness(report, rows):
+    """THE TWO-SIDED RECONCILIATION INVARIANT ([11.187]). The daemon-side
+    screen can be perfect while the GUI's client buffer is frozen — every
+    daemon-side read asserts nothing about what the user sees. The client half
+    of the frame-hash probe emits its own pairing word (a quiet tick since
+    [11.187]: every healthy mounted row speaks at least every 5 minutes). A
+    row whose latest client word is a STANDING mismatch, or a row the watchdog
+    named dead, is a stream-liveness violation. Skips silently on hosts with
+    no ytrace (headless daemons have no client half to judge)."""
+    words, watchdog = latest_frame_hash_words()
+    if not words and not watchdog:
+        report.ok("stream_liveness", "(no client words on this host — headless, skipped)")
+        return
+    for session, word in sorted(words.items()):
+        if word.get("mismatch") and float(word.get("_age_ms", 9e12)) < STANDING_MISMATCH_GRACE_MS:
+            report.fail(
+                "stream_liveness",
+                f"{session}: the CLIENT frame diverges from the daemon's "
+                f"authoritative screen (client {word.get('client_hash')} vs daemon "
+                f"{word.get('daemon_hash')}, at_bottom={word.get('at_bottom')}, "
+                f"consecutive={word.get('consecutive_mismatch')}, "
+                f"{float(word.get('_age_ms', 0))/1000:.0f}s ago) — the frozen-viewport "
+                "class the daemon-side reads cannot see",
+            )
+            return
+    if watchdog:
+        report.fail(
+            "stream_liveness",
+            "loop-liveness watchdog events within the last hour (a mount loop "
+            "died or was remounted): " + "; ".join(sorted(set(watchdog))[:3]),
+        )
+        return
+    report.ok("stream_liveness", f"{len(words)} client word(s) clean")
+
+
+def invariant_freeze_window(report, window_secs):
+    """RED-BASELINE falsifier (the [11.187] probe law: a probe that never saw
+    RED cannot be trusted GREEN). Run with the GUI process SIGSTOPped: the
+    daemon side stays live and answerable, the client half cannot speak, so
+    every client word must be OLDER than the window. A fresh word means the
+    client half is still alive — the forced freeze did not take, and this
+    mode says so instead of pretending to have seen red."""
+    words, _watchdog = latest_frame_hash_words()
+    if not words:
+        report.fail("freeze_window", "no client words at all — the probe cannot "
+                    "see the client half on this host; the freeze would be invisible")
+        return
+    fresh = [s for s, w in sorted(words.items())
+             if float(w.get("_age_ms", 0)) < window_secs * 1000]
+    if fresh:
+        report.fail("freeze_window",
+                    f"client word(s) FRESHER than the {window_secs}s window "
+                    f"({', '.join(fresh)}) — the client half is still alive; "
+                    "the forced freeze did not take")
+    else:
+        report.ok("freeze_window",
+                  f"all {len(words)} client word(s) older than {window_secs}s "
+                  "while the daemon stays answerable — the freeze IS visible")
+
+
 def main():
     global YGGTERM_BIN
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--freeze-window-secs", type=int, default=0,
+        help="RED-BASELINE mode (the [11.187] falsifier): with the GUI process "
+             "SIGSTOPped (or a dead loop), every client word must be older than "
+             "this window while the daemon stays live — exit 1 proves the probe "
+             "SEES the freeze. 0 = disabled (the normal pass).",
+    )
     args = parser.parse_args()
 
     YGGTERM_BIN = yggterm_binary()
@@ -326,6 +443,10 @@ def main():
     invariant_untitled(report, rows)
     invariant_geometry(report, rows)
     invariant_ghost_pids(report)
+    if args.freeze_window_secs > 0:
+        invariant_freeze_window(report, args.freeze_window_secs)
+    else:
+        invariant_stream_liveness(report, rows)
 
     failed = len(report.violations)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %z")

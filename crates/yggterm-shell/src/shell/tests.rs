@@ -17422,9 +17422,11 @@ console.log('ok');
         );
         assert_eq!(
             script.matches("maybePairFrameHash(").count(),
-            2,
-            "the pairing hook must be CALLED exactly twice: on the frame_hash \
-             arrival (caught-up instant) and at the flush settle"
+            3,
+            "the pairing hook must be CALLED exactly three times: on the \
+             frame_hash arrival (caught-up instant), at the flush settle, and \
+             from the [11.187] quiet tick — the write-independent pairing that \
+             lets a frozen stream trigger its own repair"
         );
         assert!(
             script.contains("if (hasPendingWrites) {"),
@@ -17451,6 +17453,153 @@ console.log('ok');
             script.contains("nowMs - frameHashLastEmitMs < 30000"),
             "a mismatch standing across three emits with an unchanged daemon \
              hash must back off from 1 Hz to 30 s"
+        );
+    }
+
+    // [11.187] The write-INDEPENDENT half of the frame-hash plane. The flush-
+    // settle pairing is write-coupled — a frozen stream starves the settles,
+    // so a divergent viewport could never trigger its own repair (the birth
+    // freeze measured 3 mismatches then silence). The quiet tick re-runs the
+    // pairing without writes, requests a fresh authoritative hash when the
+    // pair disagrees (backing the request off under standing divergence), and
+    // speaks a 5-minute agree heartbeat the two-sided probe reads.
+    #[test]
+    fn the_frame_hash_tick_pairs_on_a_quiet_surface_without_writes() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("setInterval(frameHashTick, 2500)"),
+            "the quiet tick must be scheduled — a pairing that only runs at \
+             write flushes cannot see a frozen stream"
+        );
+        assert!(
+            script.contains("frameHashConsecutiveMismatchEmits > 3 ? 30000 : 2500"),
+            "the tick's hash request must back off under a standing mismatch — \
+             a 2.5 s request cadence against a persistent divergence is an RPC \
+             treadmill (consult correction, gemini-3.8 HIGH 2026-09-28)"
+        );
+        assert!(
+            script.contains("__now - frameHashLastAgreeHeartbeatMs >= 300000"),
+            "an agreeing surface must speak one heartbeat per 5 minutes — the \
+             client-side word the two-sided probe reads; steady agreement stays \
+             silent between heartbeats (the probe's share of the plane is the test)"
+        );
+        assert!(
+            script.contains("frameHashQuietAndStable() && !frameHashRequestInFlight"),
+            "the tick's request must stay quiet-gated and single-flight"
+        );
+    }
+
+    // [11.187] Behavior: the remount budget bounds and the heartbeat ages.
+    // The statics are module-private, so the law is testable directly: exactly
+    // TERMINAL_LOOP_REMOUNT_BUDGET spends per window, then refusal; a bumped
+    // heartbeat answers an age; a never-mounted session answers None (nothing
+    // to judge — the watchdog must not alarm on pre-heartbeat builds).
+    #[test]
+    fn the_remount_budget_bounds_and_the_heartbeat_ages() {
+        let session = "test-11187-budget-session";
+        for _ in 0..TERMINAL_LOOP_REMOUNT_BUDGET {
+            assert!(
+                terminal_loop_remount_budget_allows(session),
+                "the budget must allow exactly its const worth of remounts"
+            );
+        }
+        assert!(
+            !terminal_loop_remount_budget_allows(session),
+            "an exhausted budget must refuse — the crash-loop guard"
+        );
+        bump_terminal_loop_heartbeat(session);
+        assert!(
+            terminal_loop_heartbeat_age_ms(session).is_some_and(|age| age < 5_000),
+            "a bumped heartbeat must answer a fresh age"
+        );
+        assert!(
+            terminal_loop_heartbeat_age_ms("never-mounted-11187").is_none(),
+            "a session never mounted under a heartbeat-carrying build must not              be judged — None is skip, not stale"
+        );
+    }
+
+    // [11.187] LEG B source law: the FrameHash arm no longer only RECORDS a
+    // mismatch — a standing at-bottom divergence from a quiet surface arms the
+    // EXISTING screen reconcile (the scrollback-preserving repaint) with the
+    // defer chain begun at 0, so the arm's reconcile defers while output flows
+    // and the forced deadline (which needs a chain age) can never write over
+    // live streaming output (consult correction Q1).
+    #[test]
+    fn a_standing_quiet_mismatch_arms_the_reconcile_and_never_forces_over_live_output() {
+        let viewport = include_str!("viewport.rs");
+        let arm_at = viewport
+            .find("Ok(TerminalJsEvent::FrameHash {")
+            .expect("the FrameHash arm exists");
+        let arm_body = &viewport[arm_at..arm_at + 6_000];
+        assert!(
+            arm_body.contains("frame_hash_mismatch_reconcile_armed"),
+            "the arm must arm the existing reconcile by name, not only record"
+        );
+        assert!(
+            arm_body.contains("next_read_deadline = tokio::time::Instant::now()"),
+            "the read pump must be nudged so a stuck backlog drains through the \
+             normal path before any repaint"
+        );
+        assert!(
+            arm_body.contains("screen_reconcile_defer_chain_began_ms = 0"),
+            "the mismatch chain must begin at 0 — a zero chain never ages, so \
+             SCREEN_RECONCILE_DEFER_DEADLINE_MS can never force this reconcile \
+             over live streaming output"
+        );
+        assert!(
+            arm_body.contains("consecutive_mismatch >= 2"),
+            "a single-frame artifact must not arm a repaint — the standing-\
+             divergence threshold keeps transient pairings out"
+        );
+    }
+
+    // [11.187] LEG C source law: a dead loop must be re-armable from OUTSIDE
+    // the component. The remount epoch rides IN the bootstrap identity (the
+    // task latch is a component-local RefCell no outside task can clear), the
+    // reveal-raise must refuse a heartbeat-stale host (its Ready truth is
+    // stale paint), and the watchdog is budget-bounded.
+    #[test]
+    fn the_watchdog_remount_rides_the_bootstrap_identity_and_the_raise_refuses_stale() {
+        let viewport = include_str!("viewport.rs");
+        assert!(
+            viewport
+                .find("let watchdog_remount_epoch = state.with(")
+                .is_some(),
+            "the component must read the remount epoch on every render (the \
+             reactive read is what turns a watchdog bump into a re-render)"
+        );
+        assert!(
+            viewport
+                .find(":{bootstrap_activation_epoch}:wr{watchdog_remount_epoch}")
+                .is_some(),
+            "the remount epoch must be part of the bootstrap identity — \
+             epoch-in-identity is the mechanism; clearing the RefCell latch \
+             from outside is impossible"
+        );
+        assert!(
+            viewport.find("bump_terminal_loop_heartbeat(&session_path)").is_some(),
+            "the mount loop must bump its heartbeat every iteration"
+        );
+        let armed = viewport.matches("mount_task_guard.arm_remount.set(true)").count();
+        assert!(
+            armed >= 2 && armed <= 3,
+            "exactly the bridge-death breaks arm the remount — supersede and \
+             ensure-error exits must NOT (a successor exists / the host is \
+             genuinely unreachable)"
+        );
+        assert!(
+            viewport.find("terminal_mount_loop_stale_degraded").is_some(),
+            "an exhausted budget must stamp the surface degraded BY NAME, not \
+             crash-loop forever"
+        );
+        let state = include_str!("state.rs");
+        assert!(
+            state
+                .find("terminal_loop_heartbeat_age_ms(session_path).is_some_and(|age| age >= TERMINAL_LOOP_STALE_MS)")
+                .is_some(),
+            "the reveal-raise must refuse a heartbeat-stale host — raising on \
+             stale Ready truth is the freeze itself"
         );
     }
 

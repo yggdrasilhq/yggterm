@@ -787,6 +787,123 @@ fn screen_reconcile_defer_deadline_expired(now_ms: u64, chain_began_ms: u64) -> 
         >= SCREEN_RECONCILE_DEFER_DEADLINE_MS
 }
 
+// ── [11.187] the mount-loop liveness plane ────────────────────────────────
+// The per-session terminal mount loop can DIE (a panic that used to fall into
+// /dev/null, a resolved eval bridge) while its session stays mounted: the
+// viewport keeps the retained pixels, the daemon's screen stays current, and
+// NOTHING ever notices — "the user's switch away and back to fix it" was the
+// only recovery. Two instruments close that:
+//
+// 1. THE HEARTBEAT (non-reactive by law): the mount loop bumps a plain global
+//    map once per iteration. ⛔ NEVER move this into `ShellState` — a state
+//    write per loop iteration re-renders the component every iteration.
+// 2. THE WATCHDOG (viewport side) turns a stale heartbeat into a remount by
+//    bumping `terminal_watchdog_remount_epoch_by_session`, which is part of
+//    the bootstrap identity — the epoch-in-identity mechanism. The budget map
+//    bounds it so a crash-looping remount degrades into a NAMED stamp instead
+//    of burning the GUI host.
+
+/// A heartbeat older than this names a dead loop. The slowest legitimate loop
+/// cadence is the 16 s paused poll; a remote read's overdue belt fires at 30 s;
+/// consult correction (gemini-3.8 HIGH, 2026-09-28): threshold must clear BOTH
+/// — 60 s sits far above every legitimate quiet and catches the minutes-long
+/// freezes this campaign measured.
+pub(crate) const TERMINAL_LOOP_STALE_MS: u64 = 60_000;
+
+/// Remount budget per session per window: a loop that dies again inside the
+/// window is a crash loop, and the watchdog's job is to NAME it, not to feed
+/// it. Exhausted budget stamps the surface degraded with the reason, which is
+/// the honest end state.
+pub(crate) const TERMINAL_LOOP_REMOUNT_BUDGET: u32 = 3;
+pub(crate) const TERMINAL_LOOP_REMOUNT_WINDOW_MS: u64 = 10 * 60_000;
+
+/// [11.187] Settle window between arming the mismatch reconcile and running
+/// it: the read nudge fires first, so a merely-backlogged pump drains through
+/// the normal path and the reconcile finds nothing to correct.
+pub(crate) const FRAME_HASH_MISMATCH_RECONCILE_SETTLE_MS: u64 = 1_200;
+
+fn wall_now_ms() -> u64 {
+    yggterm_core::clock::amortized_unix_ms()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+pub(crate) static TERMINAL_LOOP_HEARTBEATS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+static TERMINAL_LOOP_REMOUNT_SPEND: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u32, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub(crate) fn bump_terminal_loop_heartbeat(session_path: &str) {
+    if let Ok(mut beats) = TERMINAL_LOOP_HEARTBEATS.lock() {
+        beats.insert(session_path.to_string(), wall_now_ms());
+    }
+}
+
+/// Age of the session's mount-loop heartbeat, in ms. `None` = never mounted
+/// under a build that carries the heartbeat (nothing to judge).
+pub(crate) fn terminal_loop_heartbeat_age_ms(session_path: &str) -> Option<u64> {
+    let beats = TERMINAL_LOOP_HEARTBEATS.lock().ok()?;
+    let at = beats.get(session_path)?;
+    Some(wall_now_ms().saturating_sub(*at))
+}
+
+/// Does the session still have remount budget, and record the spend when yes.
+pub(crate) fn terminal_loop_remount_budget_allows(session_path: &str) -> bool {
+    let Ok(mut spend) = TERMINAL_LOOP_REMOUNT_SPEND.lock() else {
+        return false;
+    };
+    let now = wall_now_ms();
+    let entry = spend.entry(session_path.to_string()).or_insert((0, now));
+    if now.saturating_sub(entry.1) >= TERMINAL_LOOP_REMOUNT_WINDOW_MS {
+        *entry = (0, now);
+    }
+    if entry.0 >= TERMINAL_LOOP_REMOUNT_BUDGET {
+        return false;
+    }
+    entry.0 += 1;
+    entry.1 = now;
+    true
+}
+
+impl ShellState {
+    /// Sessions whose mount loop LOOKS dead: an owner-map entry (a loop that
+    /// acquired the bootstrap and never released it — the wedge shape) whose
+    /// heartbeat is stale. A heartbeat of `None` is skipped: a session never
+    /// mounted under a heartbeat-carrying build is not judged.
+    pub(crate) fn terminal_loop_stale_watch_sessions(&self) -> Vec<String> {
+        self.terminal_bootstrap_owner_by_session
+            .keys()
+            .filter(|session| {
+                terminal_loop_heartbeat_age_ms(session)
+                    .is_some_and(|age| age >= TERMINAL_LOOP_STALE_MS)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The epoch-in-identity bump: changes the session's bootstrap identity so
+    /// the next render schedules a fresh mount (and any zombie loop loses its
+    /// owner check at its next pre_select).
+    pub(crate) fn bump_terminal_watchdog_remount_epoch(&mut self, session_path: &str) -> u64 {
+        let epoch = self
+            .terminal_watchdog_remount_epoch_by_session
+            .entry(session_path.to_string())
+            .or_insert(0);
+        *epoch += 1;
+        *epoch
+    }
+
+    pub(crate) fn terminal_watchdog_remount_epoch(&self, session_path: &str) -> u64 {
+        self.terminal_watchdog_remount_epoch_by_session
+            .get(session_path)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// FORWARD-RATE PROBE (latency campaign 2026-06-19): the GUI main thread runs at
 /// ~30% CPU while `app()` renders only ~0.4/s, so the cost is NOT Dioxus render —
 /// the prime suspect is this per-chunk terminal-forward eval bridge. Mirror the
@@ -18412,6 +18529,13 @@ struct ShellState {
     terminal_attach_in_flight: HashSet<String>,
     terminal_bootstrap_owner_by_session: HashMap<String, String>,
     terminal_bootstrap_lease_by_session: HashMap<String, String>,
+    /// ⭐ [11.187] The watchdog's remount epoch per session. Bumped ONLY by the
+    /// loop-liveness watchdog (or a task death that arms it) when a mount loop's
+    /// heartbeat went stale; TerminalCanvas reads it into the bootstrap identity,
+    /// so the bump is what turns the NEXT render into a fresh schedule candidate
+    /// (the epoch-in-identity mechanism — the task latch itself is a
+    /// component-local RefCell no outside task can clear).
+    terminal_watchdog_remount_epoch_by_session: HashMap<String, u64>,
     /// ⭐ [startpage-hijack-D sibling] The LAST OBSERVED terminal buffer kind
     /// per session (`"alternate"` | `"normal"`), captured from the mount's
     /// own HostHealth tick. A fullscreen TUI arms its buffer + mouse DECSETs
@@ -21007,6 +21131,7 @@ impl ShellState {
             terminal_attach_in_flight: HashSet::new(),
             terminal_bootstrap_owner_by_session: HashMap::new(),
             terminal_bootstrap_lease_by_session: HashMap::new(),
+            terminal_watchdog_remount_epoch_by_session: HashMap::new(),
             terminal_last_buffer_kinds: HashMap::new(),
             terminal_resume_ready_paths: HashSet::new(),
             terminal_ensure_failed: HashMap::new(),
@@ -30986,6 +31111,17 @@ impl ShellState {
     fn terminal_host_ready_for_reveal_raise(&self, session_path: &str) -> bool {
         if !self.terminal_session_host_id(session_path).is_some()
             || !self.terminal_session_was_ever_ready(session_path)
+        {
+            return false;
+        }
+        // ⭐ [11.187] RETAIN-HOST LIVENESS AT RE-BOOTSTRAP: the Ready paint
+        // truth above can outlive the loop that earned it. A host whose mount
+        // loop is heartbeat-stale must NOT be raised on its stale frame — the
+        // reveal-raise would swallow the schedule candidate and the freeze
+        // (retained pixels, no output, no input) would stand forever. Refuse
+        // the raise so the bootstrap path re-runs and re-arms the pump; a
+        // LIVE loop's heartbeat is fresh and never enters this arm.
+        if terminal_loop_heartbeat_age_ms(session_path).is_some_and(|age| age >= TERMINAL_LOOP_STALE_MS)
         {
             return false;
         }
