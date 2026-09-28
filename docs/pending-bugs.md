@@ -77,7 +77,9 @@ an in-flight schema fetch (generation-stamp the fetch; a close wins).
 
 ## ⛔ [11.180] THE SERVING RAISE PAYS A FULL SIDEBAR REBUILD: SessionPreview DROP+REALLOC + FULL RE-HASH OF EVERY ROW'S PREVIEW LINES PER RAISE — sidebar/memo complex ≈17-19% + allocator ≈16% OF RAISE-WINDOW CPU, webproc clock-tax + page-in ≈8%, DAEMON ≈0% (measured 2026-09-27 ~12:20-12:35 IST, raise-perf-capture lane, live jojo desktop, GUI 5baa7991 / daemon aa555326)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Fixed in code 2026-09-28 (the ux-speed raise-memo-fix lane): `ManagedSessionView::preview` is `Arc<SessionPreview>` — immutable, pointer identity IS the content version — and the search-context memo keys on `yggterm_server::session_preview_stamp` (pointer-checked per path) instead of raw line hashes; view clones share the pointer. The falsifier below runs on the next rotated jojo build; the entry retires with that proof per the verified-fix law.
 
 Filed 2026-09-27 by the ux-speed raise-perf-capture lane (zcode
 sess_5ad2631f on jojo, work FROM dev, board claim ACK-9680788fb1) — the

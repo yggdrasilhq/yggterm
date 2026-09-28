@@ -25,6 +25,7 @@ pub(crate) fn seam_contains(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn picker_profiles_json_parse_keeps_string_names_and_skips_the_rest() {
@@ -8949,6 +8950,60 @@ JSON.stringify({{
             1,
             "a differing stored fingerprint must trigger exactly one rebuild"
         );
+
+        // [11.180] lock: preview CONTENT rides the Arc-identity stamp
+        // (session_preview_stamp), not raw line hashes — handing back the SAME
+        // Arc (what live_sessions() does on a steady raise) must skip the
+        // rebuild; replacing the preview (the transcript reader builds a new
+        // Arc) must rebuild exactly once and then skip again.
+        let mut stamp_session = test_managed_conversation_session(SessionKind::Codex);
+        stamp_session.session_path = "local://memo-stamp".to_string();
+        stamp_session.preview = Arc::new(yggterm_server::SessionPreview {
+            summary: Vec::new(),
+            blocks: vec![SessionPreviewBlock::message(
+                "ASSISTANT",
+                "stamp".to_string(),
+                PreviewTone::Assistant,
+                vec!["memo stamp line".to_string()],
+            )],
+            older_available: false,
+        });
+        LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.store(0, Ordering::Relaxed);
+        let stamp_before = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
+        let stamped_live = vec![stamp_session.clone()];
+        set_sidebar_search_context(&machines, &stamped_live, &summaries);
+        let stamp_first = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
+        assert_eq!(stamp_first - stamp_before, 1, "first call must rebuild once");
+        set_sidebar_search_context(&machines, &stamped_live, &summaries);
+        assert_eq!(
+            SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed),
+            stamp_first,
+            "an unchanged preview Arc must NOT rebuild (the steady-raise skip)"
+        );
+        let mut replaced = stamp_session.clone();
+        replaced.preview = Arc::new(yggterm_server::SessionPreview {
+            summary: Vec::new(),
+            blocks: vec![SessionPreviewBlock::message(
+                "ASSISTANT",
+                "stamp".to_string(),
+                PreviewTone::Assistant,
+                vec!["a fresh transcript line".to_string()],
+            )],
+            older_available: false,
+        });
+        let replaced_live = vec![replaced];
+        set_sidebar_search_context(&machines, &replaced_live, &summaries);
+        assert_eq!(
+            SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed),
+            stamp_first + 1,
+            "a replaced preview Arc must rebuild exactly once"
+        );
+        set_sidebar_search_context(&machines, &replaced_live, &summaries);
+        assert_eq!(
+            SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed),
+            stamp_first + 1,
+            "steady state after the rebuild must skip again"
+        );
     }
 
     // Minimal BrowserRow for icon-resolution tests. Fields the icon does NOT
@@ -14455,12 +14510,12 @@ console.log('ok');
                 vec![format!("turn {ix}")],
             )
         };
-        session.preview.blocks = (0..40).map(turn).collect();
+        Arc::make_mut(&mut session.preview).blocks = (0..40).map(turn).collect();
         let (_, before) = preview_latest_pin_request(&session);
 
         // The agent writes more. Same session, same hydration state.
-        session.preview.blocks.push(turn(40));
-        session.preview.blocks.push(turn(41));
+        Arc::make_mut(&mut session.preview).blocks.push(turn(40));
+        Arc::make_mut(&mut session.preview).blocks.push(turn(41));
         let (_, after) = preview_latest_pin_request(&session);
         assert_eq!(
             before, after,
@@ -14505,7 +14560,7 @@ console.log('ok');
             let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
             session.session_path = "remote-cc://dev/a033a728".to_string();
             session.rendered_sections = Vec::new();
-            session.preview.blocks = (0..count).map(block).collect();
+            Arc::make_mut(&mut session.preview).blocks = (0..count).map(block).collect();
             session.metadata.push(SessionMetadataEntry {
                 label: "Preview Hydration",
                 value: "tail".to_string(),
@@ -14756,7 +14811,7 @@ console.log('ok');
         let row = |blocks: Vec<SessionPreviewBlock>, hydration: &str| {
             let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
             session.session_path = "remote-cc://dev/91527c7b".to_string();
-            session.preview.blocks = blocks;
+            Arc::make_mut(&mut session.preview).blocks = blocks;
             session
                 .metadata
                 .retain(|entry| entry.label != "Preview Hydration");
@@ -15056,8 +15111,8 @@ console.log('ok');
         };
         let session_with = |count: usize, older: bool| {
             let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
-            session.preview.blocks = (0..count).map(block).collect();
-            session.preview.older_available = older;
+            Arc::make_mut(&mut session.preview).blocks = (0..count).map(block).collect();
+            Arc::make_mut(&mut session.preview).older_available = older;
             snapshot_retained_terminal_session_view(&session)
         };
 
@@ -15167,7 +15222,7 @@ console.log('ok');
         let scaffolded = |path: &str| {
             let mut session = test_managed_conversation_session(SessionKind::ClaudeCode);
             session.session_path = path.to_string();
-            session.preview.blocks = vec![SessionPreviewBlock::message(
+            Arc::make_mut(&mut session.preview).blocks = vec![SessionPreviewBlock::message(
                 "ASSISTANT",
                 "server:launch".to_string(),
                 PreviewTone::Assistant,
@@ -15199,7 +15254,7 @@ console.log('ok');
                 label: "Preview Hydration",
                 value: "tail".to_string(),
             });
-            hydrated.preview.blocks = vec![SessionPreviewBlock::message(
+            Arc::make_mut(&mut hydrated.preview).blocks = vec![SessionPreviewBlock::message(
                 "USER",
                 "Aug 03, 2026 11:00 AM UTC+0530".to_string(),
                 PreviewTone::User,
@@ -15397,7 +15452,7 @@ console.log('ok');
     #[test]
     fn a_visible_rows_index_is_the_daemons_not_its_position_after_filtering() {
         let mut session = preview_probe_session();
-        session.preview.blocks = vec![
+        Arc::make_mut(&mut session.preview).blocks = vec![
             SessionPreviewBlock::message(
                 "USER",
                 "now".to_string(),
@@ -15484,7 +15539,7 @@ console.log('ok');
     #[test]
     fn a_tool_call_with_no_output_survives_the_visible_block_filter() {
         let mut session = preview_probe_session();
-        session.preview.blocks = vec![
+        Arc::make_mut(&mut session.preview).blocks = vec![
             SessionPreviewBlock::message(
                 "USER",
                 "now".to_string(),
@@ -15534,7 +15589,7 @@ console.log('ok');
             }),
         };
         let mut session = preview_probe_session();
-        session.preview.blocks = vec![tool("cargo build"), tool("cargo test")];
+        Arc::make_mut(&mut session.preview).blocks = vec![tool("cargo build"), tool("cargo test")];
         let visible = visible_preview_blocks(&session);
         assert_eq!(visible.len(), 2, "{visible:?}");
     }
@@ -25092,7 +25147,7 @@ console.log('ok');
     fn remote_preview_tail_hydration_is_readable_without_immediate_resync() {
         let mut session = test_live_shell_session("remote-session://dev/preview");
         session.source = SessionSource::LiveSsh;
-        session.preview.blocks.push(SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks.push(SessionPreviewBlock {
             role: "ASSISTANT",
             timestamp: "2026-05-22".to_string(),
             tone: PreviewTone::Assistant,
@@ -25118,7 +25173,7 @@ console.log('ok');
         // trusting it froze a 670-block transcript at 2 blocks forever on the
         // live host. A delivered tail is one that carries more than the cap.
         for ix in 0..=yggterm_server::LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT {
-            session.preview.blocks.push(SessionPreviewBlock {
+            Arc::make_mut(&mut session.preview).blocks.push(SessionPreviewBlock {
                 role: "ASSISTANT",
                 timestamp: format!("2026-05-22 delivered {ix}"),
                 tone: PreviewTone::Assistant,
@@ -25135,7 +25190,7 @@ console.log('ok');
     fn remote_preview_tail_hydration_pins_chat_reader_to_latest_on_open() {
         let mut session = test_live_shell_session("remote-session://dev/preview");
         session.source = SessionSource::LiveSsh;
-        session.preview.blocks.push(SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks.push(SessionPreviewBlock {
             role: "USER",
             timestamp: "2026-05-21".to_string(),
             tone: PreviewTone::User,
@@ -25144,7 +25199,7 @@ console.log('ok');
             kind: PreviewBlockKind::Message,
             activity: None,
         });
-        session.preview.blocks.push(SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks.push(SessionPreviewBlock {
             role: "ASSISTANT",
             timestamp: "2026-05-22".to_string(),
             tone: PreviewTone::Assistant,
@@ -25178,7 +25233,7 @@ console.log('ok');
         );
         assert!(preview_latest_initial_scroll_top(&session) >= 0.0);
         for ix in 0..(PREVIEW_BLOCK_WINDOW + 3) {
-            session.preview.blocks.push(SessionPreviewBlock {
+            Arc::make_mut(&mut session.preview).blocks.push(SessionPreviewBlock {
                 role: "ASSISTANT",
                 timestamp: format!("2026-05-22 tail {ix}"),
                 tone: PreviewTone::Assistant,
@@ -25219,7 +25274,7 @@ console.log('ok');
     fn preview_latest_pin_respects_non_chat_search_and_unhydrated_modes() {
         let mut session = test_live_shell_session("remote-session://dev/preview");
         session.source = SessionSource::LiveSsh;
-        session.preview.blocks.push(SessionPreviewBlock {
+        Arc::make_mut(&mut session.preview).blocks.push(SessionPreviewBlock {
             role: "ASSISTANT",
             timestamp: "2026-05-22".to_string(),
             tone: PreviewTone::Assistant,
@@ -28213,11 +28268,11 @@ console.log('ok');
                 status_line: "attached".to_string(),
                 terminal_lines: Vec::new(),
                 rendered_sections: Vec::new(),
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: Vec::new(),
                     blocks: Vec::new(),
-                },
+                }),
                 metadata: Vec::new(),
                 terminal_process_id: None,
                 terminal_foreground_active: None,
@@ -28289,11 +28344,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -28488,11 +28543,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![
                     SessionMetadataEntry {
                         label: "Cwd",
@@ -28611,11 +28666,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Cwd",
                     value: "/home/user/gh/yggterm".to_string(),
@@ -28702,11 +28757,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec!["› Example".to_string()],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Storage",
                     value: stored_path.clone(),
@@ -28833,11 +28888,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Cwd",
                     value: "/home/user/gh/yggterm".to_string(),
@@ -28930,11 +28985,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Cwd",
                     value: "/home/user/gh/yggterm".to_string(),
@@ -29046,11 +29101,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Cwd",
                     value: "/home/user".to_string(),
@@ -29554,7 +29609,7 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![SessionPreviewBlock {
@@ -29566,7 +29621,7 @@ console.log('ok');
                         kind: PreviewBlockKind::Message,
                         activity: None,
                     }],
-                },
+                }),
                 metadata: vec![
                     SessionMetadataEntry {
                         label: "Cwd",
@@ -29675,11 +29730,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh".to_string(),
@@ -30086,11 +30141,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -30147,11 +30202,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -30197,11 +30252,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -30247,11 +30302,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Source",
                 value: "app:ychrome:new".to_string(),
@@ -30301,11 +30356,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -30392,11 +30447,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -30471,11 +30526,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -30550,14 +30605,14 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Local shell rooted at /home/user.".to_string(),
                 }],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![
                 SessionMetadataEntry {
                     label: "Cwd",
@@ -30637,14 +30692,14 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Fix the live terminal mismatch.".to_string(),
                 }],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -30690,14 +30745,14 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
                     value: "Fix the live terminal mismatch.".to_string(),
                 }],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -31074,11 +31129,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -31148,11 +31203,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -31226,11 +31281,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/git/samplenotes".to_string(),
@@ -31301,11 +31356,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -31382,11 +31437,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![
                     SessionMetadataEntry {
                         label: "Cwd",
@@ -31434,11 +31489,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![SessionMetadataEntry {
                     label: "Cwd",
                     value: "/home/user/proj".to_string(),
@@ -31542,11 +31597,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![],
                 terminal_process_id: None,
                 terminal_foreground_active: None,
@@ -31628,11 +31683,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![],
                 terminal_process_id: None,
                 terminal_foreground_active: None,
@@ -31697,11 +31752,11 @@ console.log('ok');
                 status_line: String::new(),
                 terminal_lines: vec![],
                 rendered_sections: vec![],
-                preview: yggterm_server::SessionPreview {
+                preview: Arc::new(yggterm_server::SessionPreview {
                     older_available: false,
                     summary: vec![],
                     blocks: vec![],
-                },
+                }),
                 metadata: vec![],
                 terminal_process_id: None,
                 terminal_foreground_active: None,
@@ -34615,11 +34670,11 @@ console.log('ok');
                 "pi@dev:~/gh/yggterm$".to_string(),
             ],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: Some(123),
             terminal_foreground_active: None,
@@ -34662,11 +34717,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: vec!["sudo apt install wezterm".to_string()],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![],
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -34756,11 +34811,11 @@ console.log('ok');
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -34818,7 +34873,7 @@ console.log('ok');
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
@@ -34826,7 +34881,7 @@ console.log('ok');
                         .to_string(),
                 }],
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![
                 SessionMetadataEntry {
                     label: "Summary",
@@ -34882,7 +34937,7 @@ console.log('ok');
             status_line: "ready".to_string(),
             terminal_lines: vec!["timezone migration".to_string()],
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
@@ -34894,7 +34949,7 @@ console.log('ok');
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -35242,7 +35297,7 @@ console.log('ok');
             status_line: "xterm.js · waiting for terminal host".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
@@ -35260,7 +35315,7 @@ console.log('ok');
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -35304,7 +35359,7 @@ console.log('ok');
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
@@ -35316,7 +35371,7 @@ console.log('ok');
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Preview Hydration",
                 value: "loading".to_string(),
@@ -35363,7 +35418,7 @@ console.log('ok');
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
@@ -35389,7 +35444,7 @@ console.log('ok');
                         activity: None,
                     },
                 ],
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -35436,7 +35491,7 @@ console.log('ok');
                 title: "Primary User Goals",
                 lines: vec!["Document the Traccar workflow.".to_string()],
             }],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
@@ -35459,7 +35514,7 @@ console.log('ok');
                         activity: None,
                     },
                 ],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Preview Hydration",
                 value: "scan".to_string(),
@@ -35507,7 +35562,7 @@ console.log('ok');
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![
@@ -35530,7 +35585,7 @@ console.log('ok');
                         activity: None,
                     },
                 ],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Storage",
                 value: "/home/user/.codex/sessions/demo.jsonl".to_string(),
@@ -35586,7 +35641,7 @@ console.log('ok');
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
@@ -35598,7 +35653,7 @@ console.log('ok');
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -35653,11 +35708,11 @@ console.log('ok');
                 title: "Server Notes",
                 lines: vec!["Launch command prepared".to_string()],
             }],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -44269,11 +44324,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "› active".to_string(),
             terminal_lines: vec!["› active".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -44315,11 +44370,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "pi@dev:~$".to_string(),
             terminal_lines: vec!["pi@dev:~$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -45239,11 +45294,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -45757,11 +45812,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -46721,11 +46776,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -46795,11 +46850,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -46850,11 +46905,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 8".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -47092,11 +47147,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -47728,11 +47783,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["› Continue".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -47818,11 +47873,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "working...".to_string(),
             ],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(123),
             terminal_foreground_active: None,
@@ -49080,11 +49135,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 10".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(123),
             terminal_foreground_active: Some(false),
@@ -49123,11 +49178,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: Some(false),
@@ -49336,11 +49391,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: None,
@@ -49549,11 +49604,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "xterm.js · waiting for terminal host".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: None,
@@ -49765,11 +49820,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 title: "Recent",
                 lines: vec!["Launch command prepared: exec '/bin/bash' -i".to_string()],
             }],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: None,
@@ -49985,11 +50040,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "Daemon PTY: request main viewport terminal stream".to_string(),
             ],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -50197,11 +50252,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 10".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: Some(true),
@@ -50409,11 +50464,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["sleep 10".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: Some(false),
@@ -50621,11 +50676,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@guihost:~$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(123),
             terminal_foreground_active: None,
@@ -50664,11 +50719,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: Some(false),
@@ -50879,11 +50934,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "pi@dev:~/gh/yggterm$".to_string(),
             ],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: Some(true),
@@ -51092,11 +51147,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: None,
@@ -51135,11 +51190,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: Some(456),
             terminal_foreground_active: Some(false),
@@ -52012,11 +52067,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -54094,11 +54149,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -54324,11 +54379,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -54820,11 +54875,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "pi@dev:~/gh/yggterm$".to_string(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -54866,11 +54921,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "› Find and fix a bug in @filename".to_string(),
             terminal_lines: vec!["• wezterm is installed and available".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -55079,11 +55134,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -55146,11 +55201,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "pi@dev:~$".to_string(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -55281,11 +55336,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             status_line: "pi@dev:~$".to_string(),
             terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
             rendered_sections: Vec::new(),
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/gh/yggterm".to_string(),
@@ -55370,7 +55425,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 title: "Recent",
                 lines: heavy_rendered_lines.clone(),
             }],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
@@ -55385,7 +55440,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -55430,7 +55485,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 title: "Rendered",
                 lines: heavy_rendered_lines.clone(),
             }],
-            preview: SessionPreview {
+            preview: Arc::new(SessionPreview {
                 older_available: false,
                 summary: vec![SessionMetadataEntry {
                     label: "Summary",
@@ -55445,7 +55500,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -57176,11 +57231,11 @@ Shared connection to 192.0.2.14 closed.\r\n";
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -57225,7 +57280,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: vec![yggterm_server::SessionPreviewBlock {
@@ -57239,7 +57294,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
                     kind: PreviewBlockKind::Message,
                     activity: None,
                 }],
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -57285,14 +57340,14 @@ Shared connection to 192.0.2.14 closed.\r\n";
             status_line: "ready".to_string(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![yggterm_server::SessionMetadataEntry {
                     label: "Summary",
                     value: "Local Codex terminal rooted at /home/user.".to_string(),
                 }],
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -57357,11 +57412,11 @@ Shared connection to 192.0.2.14 closed.\r\n";
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![yggterm_server::SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user".to_string(),
@@ -57424,11 +57479,11 @@ Shared connection to 192.0.2.14 closed.\r\n";
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: vec![yggterm_server::SessionMetadataEntry {
                 label: "Cwd",
                 value: cwd.to_string(),
@@ -57827,11 +57882,11 @@ Shared connection to 192.0.2.14 closed.\r\n";
                 "• wezterm is installed and available".to_string(),
             ],
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -57931,11 +57986,11 @@ Shared connection to 192.0.2.14 closed.\r\n";
                 "Terminal surface: embedded xterm.js".to_string(),
             ],
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -70561,11 +70616,11 @@ mod web_surface_immersion_locks {
             status_line: String::new(),
             terminal_lines: Vec::new(),
             rendered_sections: Vec::new(),
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: Vec::new(),
                 blocks: Vec::new(),
-            },
+            }),
             metadata: Vec::new(),
             terminal_process_id: None,
             terminal_foreground_active: None,
@@ -70710,11 +70765,11 @@ mod web_surface_immersion_locks {
             status_line: String::new(),
             terminal_lines: vec![],
             rendered_sections: vec![],
-            preview: yggterm_server::SessionPreview {
+            preview: Arc::new(yggterm_server::SessionPreview {
                 older_available: false,
                 summary: vec![],
                 blocks: vec![],
-            },
+            }),
             metadata: vec![SessionMetadataEntry {
                 label: "Cwd",
                 value: "/home/user/proj/yggterm".to_string(),
