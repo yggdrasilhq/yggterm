@@ -31582,7 +31582,7 @@ Second half, same seam: when the dev-side twin record DOES exist, its `.id` (the
 
 Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the key the ensure just wrote (the alias seam — `local_runtime_id_from_key` → `local_live_runtime_key` vs `remote_runtime_agent_session_key` spellings), add the missing-record healing arm for agent runtimes (recompose spec from the descriptor + STORE-conversation id when the twin carries one), and add a repro test: ensure-then-terminal-ensure for a remote agent row with no pre-existing record.
 
-## ⛔ [11.197] THE GHOST REGENERATION LOOP — the keeper cycle for a store-absent row vouches it onto a REMEMBERED-CLOSED conversation and re-spawns a headless bridge CLI on every pass (guard alarm ACK-3d6015dc64, chased to ground 2026-09-28 23:00-23:59 IST, zcode sess_f343788a on jojo, work FROM dev)
+## ⛔ [11.197] THE GHOST REGENERATION LOOP — the keeper cycle for a store-absent row vouches it onto a conversation the user already closed (unexpired tombstone) and re-spawns a headless bridge CLI on every pass (guard alarm ACK-3d6015dc64, measured 2026-09-28 23:00-23:59 IST, zcode sess_f343788a on jojo, work FROM dev)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
