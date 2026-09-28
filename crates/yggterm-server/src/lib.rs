@@ -12730,6 +12730,17 @@ impl YggtermServer {
                 && !self.sessions.iter().any(|(row_key, held)| {
                     held.id == candidate_id && row_key != &key
                 })
+                // THE [11.195] LIVE-HOLDER GUARD: a candidate an ORPHANED CLI
+                // still has open is not a candidate either — a CLI that
+                // survived its daemon (no runtime twin left to see) holds the
+                // conversation all the same, and the resume would wait out
+                // the holder deadline and dissolve the row (measured
+                // 2026-09-28 22:2x: the respawn vouched 79189666 while an
+                // orphaned agy held it — the owner's working session
+                // dissolved into the wait banner). The fd-based scan is the
+                // same witness the holder-wait would use later — asked HERE,
+                // before the bind, so the row fresh-starts instead.
+                && linux_proc_pids_holding_session_path(&candidate_id).is_empty()
             {
                 if let Some(ygg_home) = self.yggterm_home.clone() {
                     append_trace_event(
@@ -25070,6 +25081,12 @@ pub fn run_remote_resume_agent(
                 &user_home, kind, dir,
             )
         && candidate_id != session_id
+        // THE [11.195] LIVE-HOLDER GUARD (the wrapper's twin): vouching onto
+        // a conversation an orphaned CLI still has open waits the row into
+        // the holder deadline and dissolves it (measured 2026-09-28 22:2x).
+        // The fd-based scan is the same witness the holder wait uses — asked
+        // HERE, before the bind, so the row fresh-starts instead.
+        && linux_proc_pids_holding_session_path(&candidate_id).is_empty()
     {
         append_trace_event(
             &home,
@@ -60898,6 +60915,37 @@ mod agy_connection_tests {
         assert!(
             oc.contains("candidate_held_elsewhere"),
             "the opencode heuristic tier never double-binds"
+        );
+    }
+
+    /// THE [11.195] LIVE-HOLDER LAW: the ladders ask the fd-based witness
+    /// BEFORE binding — a conversation an orphaned CLI still has open is
+    /// never a candidate (the row fresh-starts instead of dissolving into
+    /// the holder wait). Both ladders carry it.
+    #[test]
+    fn the_ladders_ask_the_holder_witness_before_binding_a_candidate() {
+        let source = include_str!("lib.rs");
+        let ensure = source
+            .split("fn ensure_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            ensure.contains("linux_proc_pids_holding_session_path(&candidate_id).is_empty()"),
+            "the ensure ladder asks the fd witness before the bind"
+        );
+        let wrapper = source
+            .split("pub fn run_remote_resume_agent(\n    kind: SessionKind,")
+            .nth(1)
+            .expect("wrapper body")
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        assert!(
+            wrapper.contains("linux_proc_pids_holding_session_path(&candidate_id).is_empty()"),
+            "the wrapper ladder asks the fd witness before the bind"
         );
     }
 }
