@@ -44710,8 +44710,14 @@ mod tests {
         // Option: an older owner's absence deserializes as `None` = "nobody
         // could answer", and the seed falls through byte-identically; an
         // older client ignores the unknown field.
-        const STAMPED_AT_VERSION: &str = "3.2.78";
-        const STAMPED_SHAPE_HASH: u64 = 0x74843ba79da0f1fa;
+        // Re-stamped at 3.2.114 ([11.198] lane, 2026-09-29): the enum source
+        // had drifted off the 3.2.78 stamp somewhere in the 3.2.79..3.2.113
+        // range and the law had been failing on main unnoticed — ygg-ci's
+        // `cargo check --tests` compiles the law, it never RUNS it. This
+        // commit re-arms the stamp at the shipped truth; the NEXT shape
+        // change must bump the version and this hash in its own commit.
+        const STAMPED_AT_VERSION: &str = "3.2.114";
+        const STAMPED_SHAPE_HASH: u64 = 0x2363fb2b0c9e7582;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
