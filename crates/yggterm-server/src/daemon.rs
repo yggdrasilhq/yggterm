@@ -13737,9 +13737,20 @@ impl DaemonRuntime {
                     terminal_appearance.as_deref(),
                     configured_extra_args.as_deref(),
                 )?;
+                // ⛔ THE [11.191] PERSISTED-GRID FALLBACK: a HEADLESS ensure
+                // (the recovery/keep-alive recompose — no tty to measure) used
+                // to arrive with no size, and the PTY spawned at the compose
+                // fallback (36x120) while the user's pane lived at its real
+                // grid — the remote painted ~70% width into the local grid:
+                // the squished viewport, from birth, on every recovery respawn
+                // (measured: two agy rows' PTYs stuck at 36x120 under a
+                // 170x63 pane, 2026-09-28). The row's OWN last-known grid is
+                // the truth the pane already shows — spawn into it.
+                let agent_initial_size = valid_initial_terminal_size(initial_cols, initial_rows)
+                    .or_else(|| self.server.session_pty_grid(&key));
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
-                    valid_initial_terminal_size(initial_cols, initial_rows),
+                    agent_initial_size,
                 )?;
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
@@ -13763,9 +13774,14 @@ impl DaemonRuntime {
                     &launch_options.unwrap_or_default(),
                     configured_extra_args.as_deref(),
                 )?;
+                // THE [11.191] PERSISTED-GRID FALLBACK (the ensure arm's twin):
+                // a headless start with no measured size spawns into the
+                // row's own last-known grid, never the 36x120 compose default.
+                let agent_start_size = valid_initial_terminal_size(initial_cols, initial_rows)
+                    .or_else(|| self.server.session_pty_grid(&key));
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
-                    valid_initial_terminal_size(initial_cols, initial_rows),
+                    agent_start_size,
                 )?;
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
@@ -45190,4 +45206,48 @@ terminal session not found: codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c
         }
     }
 
+}
+
+#[cfg(test)]
+mod persisted_grid_fallback_tests {
+    /// THE [11.191] LAW (source shape): BOTH agent arms (ensure + start) fall
+    /// back to the row's own last-known PTY grid when the request carries no
+    /// measured size — a headless recovery recompose must never spawn the
+    /// 36x120 compose fallback under the user's real pane.
+    #[test]
+    fn agent_arms_fall_back_to_the_persisted_grid_when_the_request_has_no_size() {
+        let source = include_str!("daemon.rs");
+        // Anchor on the unique public-ensure CALL (the variant name alone
+        // matches the wire-enum definition first).
+        let ensure = source
+            .split("self.server.ensure_remote_runtime_agent_session_public(")
+            .nth(1)
+            .expect("ensure arm")
+            .split("ServerRequest::StartRemoteRuntimeAgentSession {")
+            .next()
+            .unwrap();
+        assert!(
+            ensure.contains("agent_initial_size = valid_initial_terminal_size(initial_cols, initial_rows)"),
+            "the ensure arm measures the request size first"
+        );
+        assert!(
+            ensure.contains(".or_else(|| self.server.session_pty_grid(&key))"),
+            "the ensure arm falls back to the persisted grid"
+        );
+        let start = source
+            .split("self.server.start_remote_runtime_agent_session_public(")
+            .nth(1)
+            .expect("start arm")
+            .split("ServerRequest::EnsureShellSession {")
+            .next()
+            .unwrap();
+        assert!(
+            start.contains("agent_start_size = valid_initial_terminal_size(initial_cols, initial_rows)"),
+            "the start arm measures the request size first"
+        );
+        assert!(
+            start.contains(".or_else(|| self.server.session_pty_grid(&key))"),
+            "the start arm falls back to the persisted grid"
+        );
+    }
 }
