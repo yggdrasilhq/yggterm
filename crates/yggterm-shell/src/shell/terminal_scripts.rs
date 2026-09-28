@@ -2149,6 +2149,15 @@ fn terminal_eval_script_with_canvas_renderer(
         let frameHashLastStateKey = '';
         let frameHashLastEmitMs = 0;
         let frameHashRequestInFlight = false;
+        // [11.187] The write-INDEPENDENT half. `frameHashDaemonHashAtMs` dates
+        // the stored daemon hash so the tick can tell "fresh" from "stale";
+        // the tick's own request backoff keeps a standing divergence from
+        // turning into a 2.5 s RPC treadmill (consult correction: the tick
+        // backs off to 30 s under a persistent mismatch, same discipline as
+        // the emit backoff).
+        let frameHashDaemonHashAtMs = 0;
+        let frameHashLastTickRequestMs = 0;
+        let frameHashLastAgreeHeartbeatMs = 0;
         // Persistent-mismatch backoff state: how many consecutive mismatch
         // emits have carried the SAME daemon hash, and what that hash was.
         // A mismatch that survives three emits with the daemon grid unchanged
@@ -2295,6 +2304,101 @@ fn terminal_eval_script_with_canvas_renderer(
                 // A probe failure must never disturb the flush path.
             }}
         }};
+        // ── [11.187] THE QUIET TICK — pairing that does not depend on writes
+        // ───────────────────────────────────────────────────────────────────
+        // The flush-settle pairing is write-coupled: a frozen stream starves
+        // the settles, so a divergent viewport could never trigger its own
+        // repair (the [11.187] birth freeze measured 3 mismatches then
+        // silence). This interval re-runs the SAME pairing on a quiet surface
+        // every 2.5 s. Zero PTY writes; at most one daemon-hash request per
+        // window, and that request backs off to 30 s while a mismatch
+        // persists — the same discipline as the emit backoff (consult
+        // correction, gemini-3.8 HIGH 2026-09-28: a static 2.5 s request
+        // cadence under standing divergence is an RPC treadmill). One AGREE
+        // heartbeat per 5 minutes gives the unattended probe a client word
+        // for "alive and caught up"; steady agreement stays silent between
+        // heartbeats (the probe's share of the plane is the test).
+        const frameHashTickBackoffMs = () => (frameHashConsecutiveMismatchEmits > 3 ? 30000 : 2500);
+        const frameHashTick = () => {{
+            try {{
+                if (!window.__yggtermFrameHash || !term) return;
+                if (frameHashDaemonHash === null) {{
+                    // No daemon hash yet (older daemon or first read pending):
+                    // one request per window when quiet, then leave it alone.
+                    if (frameHashQuietAndStable() && !frameHashRequestInFlight) {{
+                        const __now = Date.now();
+                        if (__now - frameHashLastTickRequestMs >= frameHashTickBackoffMs()) {{
+                            frameHashLastTickRequestMs = __now;
+                            frameHashRequestInFlight = true;
+                            sendTerminalEvent({{ kind: "frame_hash_request" }});
+                        }}
+                    }}
+                    return;
+                }}
+                const __entry = window.__yggtermXtermHosts
+                    && window.__yggtermXtermHosts[hostId];
+                const __pending = __entry
+                    ? String(__entry.writeBridgePendingData || '').length
+                    : 0;
+                if (__pending > 0 || !frameHashQuietAndStable()) return;
+                const __reading = window.__yggtermFrameHash.frameHashOf(term);
+                if (!__reading) return;
+                const __mismatch = __reading.atBottom && __reading.hash !== frameHashDaemonHash;
+                if (__mismatch) {{
+                    // A fresh authoritative hash settles "stale hash" from
+                    // "real divergence" — the Rust side fetches it off-loop
+                    // and the repair (read nudge + quiet reconcile) owns the
+                    // rest. Backoff-gated so a standing divergence cannot
+                    // turn the tick into a request treadmill.
+                    if (!frameHashRequestInFlight) {{
+                        const __now = Date.now();
+                        if (__now - frameHashLastTickRequestMs >= frameHashTickBackoffMs()) {{
+                            frameHashLastTickRequestMs = __now;
+                            frameHashRequestInFlight = true;
+                            sendTerminalEvent({{ kind: "frame_hash_request" }});
+                        }}
+                    }}
+                    // Pair through the SAME path as a settle so the verdict,
+                    // the backoff and the ghost context stay in one place.
+                    maybePairFrameHash(false, true);
+                    return;
+                }}
+                // Agreement: emit the heartbeat at most once per 5 minutes —
+                // the client-side word the two-sided probe reads. Full field
+                // set (the wire twin requires client_hash/cols/rows; the rest
+                // default) so this event is byte-indistinguishable in shape
+                // from a settle pairing.
+                const __now = Date.now();
+                if (
+                    __now - frameHashLastAgreeHeartbeatMs >= 300000
+                    && __now - frameHashLastEmitMs >= 300000
+                ) {{
+                    frameHashLastAgreeHeartbeatMs = __now;
+                    frameHashLastEmitMs = __now;
+                    sendTerminalEvent({{
+                        kind: "frame_hash",
+                        daemon_hash: frameHashDaemonHash,
+                        client_hash: __reading.hash,
+                        cols: term.cols,
+                        rows: term.rows,
+                        at_bottom: __reading.atBottom,
+                        mismatch: false,
+                        tick: true,
+                        buffer_kind: currentBufferKind(),
+                        buffer_transitions: Number((__entry && __entry.bufferTransitionCount) || 0),
+                        visual_reason: String((__entry && __entry.lastVisualTransitionReason) || ''),
+                        host_age_ms: Number((__entry && __entry.mountedAtMs) ? (Date.now() - __entry.mountedAtMs) : 0),
+                        wheel_events: Number((__entry && __entry.wheelEventCount) || 0),
+                        consecutive_mismatch: 0,
+                        backed_off: false,
+                        protocol_only_settle_skips: Number((__entry && __entry.frameHashProtocolOnlySettleSkips) || 0)
+                    }});
+                }}
+            }} catch (_tickError) {{
+                // A probe failure must never disturb anything.
+            }}
+        }};
+        setInterval(frameHashTick, 2500);
         // libyggterm web-surface control (ychrome pilot): OSC 7717 with payload
         // `web-surface;<action>;<base64 json>`. The PTY byte relay is the
         // transport (works identically for local and remote sessions); the OSC
@@ -13164,6 +13268,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 // was all control-only forwarded output) defers/skips the
                 // pairing inside, same as a flush settle.
                 frameHashDaemonHash = typeof message.hash === 'string' ? message.hash : null;
+                frameHashDaemonHashAtMs = Date.now();
                 frameHashRequestInFlight = false;
                 setTimeout(() => {{
                     const __ygEntry = window.__yggtermXtermHosts

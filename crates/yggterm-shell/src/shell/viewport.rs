@@ -3474,6 +3474,11 @@ fn TerminalCanvas(
     // `dioxus_render/component_window`, which is exactly the blind spot an
     // instrument must not have on the surface the user types into.
     let _render_span = crate::render_attribution::ComponentRenderSpan::start("TerminalCanvas");
+    // [11.187] Arm the loop-liveness watchdog once per process. It needs a
+    // Signal handle, which only a render owns — so the first TerminalCanvas
+    // render to run after boot is the one that spawns it (the spawn-once
+    // latch makes every later render a no-op).
+    ensure_terminal_loop_watchdog(state);
     let endpoint = BOOTSTRAP
         .get()
         .expect("shell bootstrap initialized")
@@ -3776,8 +3781,14 @@ fn TerminalCanvas(
         pinned_bootstrap_activation_epoch.set(epoch);
         epoch
     };
+    // [11.187] The watchdog's remount epoch rides IN the bootstrap identity:
+    // a bump changes the identity, which turns the next render into a fresh
+    // schedule candidate (the task latch is keyed on the identity, so it
+    // cannot be cleared from outside the component — the epoch-in-identity
+    // mechanism is what lets an external watchdog re-arm a dead loop).
+    let watchdog_remount_epoch = state.with(|shell| shell.terminal_watchdog_remount_epoch(&session_path));
     let bootstrap_identity =
-        format!("{mount_identity}:{current_bootstrap_generation}:{bootstrap_activation_epoch}");
+        format!("{mount_identity}:{current_bootstrap_generation}:{bootstrap_activation_epoch}:wr{watchdog_remount_epoch}");
     if *last_bootstrap_identity.borrow() != mount_identity {
         append_trace_event(
             &trace_home,
@@ -6661,7 +6672,19 @@ fn TerminalCanvas(
                 None
             };
             let mut saw_warm_bridge_event = false;
+            // [11.187] The drop witness + the liveness heartbeat. The guard
+            // lives for the loop's whole life; its Drop fires at task end
+            // (normal or panic) and leaves a NAMED trace. The heartbeat is
+            // what tells the watchdog this loop is alive — non-reactive on
+            // purpose, a state write here would re-render every iteration.
+            let mount_task_guard = TerminalMountTaskDropGuard {
+                session_path: session_path.clone(),
+                trace_home: trace_home.clone(),
+                state,
+                arm_remount: std::cell::Cell::new(false),
+            };
             loop {
+                bump_terminal_loop_heartbeat(&session_path);
                 // The PRE-SELECT body (focus bookkeeping, bridge flush, screen
                 // reconcile — including a daemon snapshot round trip when a
                 // reconcile is due) runs before any branch can be polled, so a
@@ -7198,6 +7221,10 @@ fn TerminalCanvas(
                                 warn!(session=%session_path, host=%host_id, js_ready=js_ready, error=%error, "terminal eval bridge returned an error");
                             }
                         }
+                        // [11.187] The eval bridge ENDED — the death class
+                        // that used to leave retained pixels and no recovery.
+                        // The drop witness arms the remount on its way out.
+                        mount_task_guard.arm_remount.set(true);
                         break;
                     }
                     event = eval.recv::<TerminalJsEvent>() => {
@@ -9636,6 +9663,55 @@ fn TerminalCanvas(
                                         "protocol_only_settle_skips": protocol_only_settle_skips,
                                     }),
                                 );
+                                // ⭐ [11.187] THE WRITE-INDEPENDENT REPAIR. The
+                                // pairing used to be a witness only — a frozen
+                                // stream starves the write flushes that drive
+                                // it, so a divergent viewport could never
+                                // trigger its own fix. The client half now
+                                // pairs on a quiet tick (terminal_scripts.rs),
+                                // and THIS arm acts on what it hears: a
+                                // standing at-bottom divergence from a QUIET
+                                // surface means the client buffer is missing
+                                // content the daemon's screen holds. Nudge the
+                                // read pump (the normal path drains any stuck
+                                // backlog) and arm the EXISTING screen
+                                // reconcile — the scrollback-preserving
+                                // repaint from the daemon's authoritative
+                                // vt100 state. `consecutive_mismatch >= 2`
+                                // keeps single-frame artifacts out; the
+                                // chain-began reset below means the arm's
+                                // reconcile defers while output flows and can
+                                // NEVER force a write over live streaming
+                                // output (the forced deadline needs a chain
+                                // age; a zero chain never ages).
+                                if mismatch && at_bottom && consecutive_mismatch >= 2 {
+                                    next_read_deadline = tokio::time::Instant::now();
+                                    if !backed_off
+                                        && !screen_reconcile_fetch_in_flight
+                                        && screen_reconcile_due_at_ms == 0
+                                    {
+                                        screen_reconcile_due_at_ms = current_millis()
+                                            .saturating_add(
+                                                FRAME_HASH_MISMATCH_RECONCILE_SETTLE_MS,
+                                            );
+                                        screen_reconcile_reason =
+                                            "frame_hash_mismatch_reconcile";
+                                        screen_reconcile_defer_chain_began_ms = 0;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "frame_hash_mismatch_reconcile_armed",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "client_hash": client_hash,
+                                                "daemon_hash": daemon_hash,
+                                                "consecutive_mismatch": consecutive_mismatch,
+                                                "settle_ms": FRAME_HASH_MISMATCH_RECONCILE_SETTLE_MS,
+                                            }),
+                                        );
+                                    }
+                                }
                             }
                             Ok(TerminalJsEvent::FrameHashRequest) => {
                                 // The client half went quiet and wants a FRESH
@@ -10287,6 +10363,9 @@ fn TerminalCanvas(
                                         }),
                                     );
                                 warn!(session=%session_path, error=%error, "terminal eval bridge closed");
+                                // [11.187] Bridge closed — same death class,
+                                // same remount arm (see the eval-bridge break).
+                                mount_task_guard.arm_remount.set(true);
                                 break;
                             }
                         }
@@ -17824,6 +17903,124 @@ fn record_loop_branch_share(branch: &'static str, held_ms: u64) {
     }
     if held_ms > 120 {
         agg.over_120_ms += 1;
+    }
+}
+
+// ── [11.187] the loop-liveness watchdog + the mount-task drop witness ────
+// A mount loop that DIES (panic into the void, resolved eval bridge) used to
+// be unrecoverable: retained pixels, no output, no input, and the only remedy
+// was the user switching away and back. The heartbeat (state.rs) says when a
+// loop stopped iterating; this watchdog turns that into the code's own
+// prescribed remedy — the next render re-schedules, because the remount epoch
+// bump is part of the bootstrap identity and a live successor's acquire
+// no-ops the re-schedule. The budget bounds a crash loop into a NAMED
+// degraded stamp instead of feeding it.
+const TERMINAL_LOOP_WATCHDOG_TICK_MS: u64 = 5_000;
+
+fn ensure_terminal_loop_watchdog(mut state: Signal<ShellState>) {
+    static TERMINAL_LOOP_WATCHDOG_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if TERMINAL_LOOP_WATCHDOG_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                TERMINAL_LOOP_WATCHDOG_TICK_MS,
+            ))
+            .await;
+            let stale = state.with(|shell| shell.terminal_loop_stale_watch_sessions());
+            for session_path in stale {
+                let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "terminal_mount_loop_stale_detected",
+                    json!({
+                        "session_path": session_path,
+                        "stale_threshold_ms": TERMINAL_LOOP_STALE_MS,
+                    }),
+                );
+                if terminal_loop_remount_budget_allows(&session_path) {
+                    let epoch = state.with_mut_counted(|shell| {
+                        shell.bump_terminal_watchdog_remount_epoch(&session_path)
+                    });
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "terminal_mount_watchdog_remount_armed",
+                        json!({
+                            "session_path": session_path,
+                            "remount_epoch": epoch,
+                        }),
+                    );
+                } else {
+                    update_terminal_surface_status(
+                        state,
+                        &session_path,
+                        true,
+                        true,
+                        0,
+                        "loop_stale_watchdog_exhausted",
+                    );
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "terminal_mount_loop_stale_degraded",
+                        json!({
+                            "session_path": session_path,
+                            "budget": TERMINAL_LOOP_REMOUNT_BUDGET,
+                            "window_ms": TERMINAL_LOOP_REMOUNT_WINDOW_MS,
+                        }),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Drop witness for the mount task: fires whether the task ends normally or
+/// is unwound by a panic (Drop runs during unwind), so a dead loop leaves a
+/// NAMED trace instead of silence. When the exit was one of the abnormal
+/// bridge-death breaks (`arm_remount`), it arms the same remount the watchdog
+/// would — instant recovery on the deaths we can name, no 60 s wait.
+struct TerminalMountTaskDropGuard {
+    session_path: String,
+    trace_home: std::path::PathBuf,
+    state: Signal<ShellState>,
+    arm_remount: std::cell::Cell<bool>,
+}
+
+impl Drop for TerminalMountTaskDropGuard {
+    fn drop(&mut self) {
+        append_trace_event(
+            &self.trace_home,
+            "ui",
+            "terminal_mount",
+            "terminal_mount_task_dropped",
+            json!({
+                "session_path": self.session_path,
+                "remount_armed": self.arm_remount.get(),
+            }),
+        );
+        if self.arm_remount.get() && terminal_loop_remount_budget_allows(&self.session_path) {
+            let epoch = self
+                .state
+                .with_mut_counted(|shell| shell.bump_terminal_watchdog_remount_epoch(&self.session_path));
+            append_trace_event(
+                &self.trace_home,
+                "ui",
+                "terminal_mount",
+                "terminal_mount_task_remount_armed",
+                json!({
+                    "session_path": self.session_path,
+                    "remount_epoch": epoch,
+                }),
+            );
+        }
     }
 }
 
