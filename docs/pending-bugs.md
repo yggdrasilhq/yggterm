@@ -18,6 +18,37 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.202] THE OPENCODE HALF OF THE STORE-CANDIDATE CURE ABSORBS EVERY OPENCODE-KIND ROW ON THE HOST INTO ONE SESSION — SIX ROWS WEAR ONE ID AND THE CANDIDATE'S TITLE, AND THE identity_dedupe INVARIANT CANNOT SEE IT (measured 2026-09-29 ~05:15 IST, live dev, the [11.181]+[11.197] close recon)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by the [11.181]+[11.197] close seat (zcode sess_4fe6051e on
+jojo, work FROM dev, row 11.201). The [11.200] close note scoped the
+non-Antigravity cure planes OUT ("add only if a muse/opencode cure livelock is
+ever measured") — this is that measurement.
+
+MEASURED: dev's daemon rolled onto the [11.200] build (pid 1806044, born
+05:06:32 IST on the live 5c01dbe7-era binary); the roll-time restore pass ran
+the store-candidate cure on the OPENCODE plane, which has no session-named-key
+guard (the [11.200] queue-side skip is Antigravity-only by construction):
+identity_store_candidate_rebind x3 at one timestamp — ses_fb820a4a...,
+ses_fb294aa5..., ses_f9dce8ab... all re-pointed to
+ses_f7e98830affeROSlZADurz7IOX — and dev's live snapshot NOW holds SIX
+open_code rows wearing id ses_f7e98830... titled "Greeting message", including
+probe-corpses whose own names say they never held that session ("resize probe
+row" local://04788ea6..., "mirror diagnosis row" local://5e753e69...). The
+usability probe stays GREEN by construction: opencode keys are row-named
+([11.73]), so identity_dedupe (session-named keys only) has nothing to
+contradict — the class is invisible to the very invariant [11.200] added.
+
+Fix direction: (a) the cure must not re-point a row whose own session is
+store-ANSWERED — a live, store-visible session is an identity, not a silent
+read (the agy cure's quiet phase already distinguishes these); (b) the probe
+grows an opencode-plane convergence invariant (no two live rows may wear one
+store session id) so the class can never regress silently again; (c) the six
+dev rows need a heal onto their own pre-rebind ids (the rebind trace names
+every from_id/to_id pair, and the persisted records carry them).
+
 ## ⛔ [11.201] THE `row-expanded` VERB CANNOT REACH NESTED REMOTE-FOLDER ROWS: "row is not expandable" FOR THE EXACT DISCLOSURES THE VERB WAS WRITTEN TO REACH (measured 2026-09-29 ~05:10 IST, live jojo desktop, drag-merge-scale lane)
 
 **Status:** OPEN
@@ -31,42 +62,6 @@ MEASURED (live verbs + source read, 7/7 distinct paths, deterministic):
 - The DOM workaround (expand the machine root → click the folder expander → re-collapse the root) works, so a headless agent CAN honor a fold contract — but only by driving the GUI.
 
 ⇒ Fix direction: one-predicate widening — carry the expandable kind through `resolve_app_control_row` for synthetic `__remote_folder__` rows (or accept them in the dispatch arm). Found by the lane, NOT fixed by it (lane scope: probe/docs only).
-
-## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-2026-09-29, row 11.201, lane/integration/11181-install-honesty, work FROM
-dev. The entry's three fix directions resolved: (c) the refresh-state persist ALREADY survived
-per-tool failures — the [11.182] follow-up made it unconditional with the
-per-tool failed_at_ms backoff (the "gating the write on install_error"
-comment + the_launch_ensure_skips_a_contended_lock_before_any_install lock);
-this entry's (c) text was stale against that landing. (a)+(b) LANDED HERE:
-install_latest split into the Result-shaped wrapper (the single-tool ensure
-call sites keep the bail contract) over install_latest_collecting, which
-returns the per-arm failures structured; each failed arm emits
-install_step_failed {tool, error} at failure time, the walk emits
-refresh_install_error {failed_tools, error} when any arm failed, and the
-statuses branch keys "failed" on the tool's OWN arm (arm_failure_for) —
-a tool whose arm succeeded falls through to its honest updated/checked
-arm. Suite 1626/0 (1624 baseline + 2 new locks: the_walk_reads_per_arm_
-failures_and_telemetry_carries_them, an_arm_failure_marks_only_its_own_
-tool). FALSIFIER OWED post-deploy: a real sweep on a host with the
-deterministic failing arm must show honest per-tool statuses +
-refresh_install_error naming the failing arm in event-trace.jsonl +
-last_successful_refresh_ms advancing; then DELETE this entry per the
-verified-fix law.
-
-Filed 2026-09-27 by the [11.177] lane while unblinding the drift report (zcode sess_fc6e2076-4139-4752-b3c6-95e7c5eec07d on jojo, work FROM dev; claim ACK-036bbb9074). The [11.177] fix makes the drift report fire regardless — this entry is what it will keep firing INTO until the install plane is honest.
-
-MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `scheduled`, ttl 7200000):
-
-- Every sweep's `refresh_end` carries `install_attempted: true, install_deferred: false` and **ALL 13 tool statuses `action: "failed"`** — while the SAME window's ynpm trace shows **every `operation.complete` with `result: "ok"`** (8 packages, one ynpm transaction each, incl. `@opencode/cli` 2.0.18). The npm arm is innocent.
-- `install_latest` collects failures across ALL provision arms and joins them into one `install_error` for the WHOLE refresh (`anyhow::bail!("{}", failures.join("; "))`). One failing non-ynpm arm poisons everything: every tool's status becomes "failed" — **including tools whose own arm succeeded and demonstrably changed** (`changed: true` on kimi/muse/agy in the same statuses that name them "failed") — and `persist_managed_cli_refresh_state` is skipped (same success-only block), so `last_successful_refresh_ms` starves and the TTL "skipped recently" quiet period can never engage.
-- The failing arm is one of the five non-ynpm tools (kimi/muse/devin VendorScript `curl|sh`, agy/devin SelfCommand self-updaters on this host). It is DETERMINISTIC (3/3 sweeps) and FAST (sweep completes in ~90 s). Its identity and error string are INVISIBLE in the trace: `refresh_end` statuses carry `{action, available, changed, tool}` only, the `Managed refresh failed: {error}` detail surfaces nowhere in event-trace.jsonl or daemon.log, and the GUI panel is the only consumer that ever sees it.
-
-⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
-
 
 ## ⛔ [11.186] THE RETIRED CHOOSER PANE KEEPS PAINTING OVER THE MOUNTED DESKTOP: A yRDP sidebar `close` NEVER FIRES THE GUI'S `sidebar_contribution/close` ARM, SO `clear_document_panes_for_session` NEVER RUNS AND THE VIEWPORT SHOWS THE MACHINE LIST OVER THE LIVE noVNC CANVAS (measured 2026-09-27 14:50-15:25 IST, live jojo desktop, the [11.185] proof leg)
 
@@ -31559,25 +31554,3 @@ Repro (original filing, kept): dev store has conversation `c70b6a9c-…` (db row
 Second half, same seam: when the dev-side twin record DOES exist, its `.id` (the real conversation) is IGNORED at recompose — the compose uses the request's session_id (the row uuid), so a held twin resumes by row id and agy fabricates a fresh conversation under it (peer-side [11.165] gate is skipped by `live_runtime_held` by design).
 
 Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the key the ensure just wrote (the alias seam — `local_runtime_id_from_key` → `local_live_runtime_key` vs `remote_runtime_agent_session_key` spellings), add the missing-record healing arm for agent runtimes (recompose spec from the descriptor + STORE-conversation id when the twin carries one), and add a repro test: ensure-then-terminal-ensure for a remote agent row with no pre-existing record.
-
-## ⛔ [11.197] THE GHOST REGENERATION LOOP — the keeper cycle for a store-absent row vouches it onto a conversation the user already closed (unexpired tombstone) and re-spawns a headless bridge CLI on every pass (guard alarm ACK-3d6015dc64, measured 2026-09-28 23:00-23:59 IST, zcode sess_f343788a on jojo, work FROM dev)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-SYMPTOM — the usability guard's ghost_pids alarms regenerate after every reap: "agy CLI processes attached to no runtime row" come back within the hour, each new generation holding conversations the owner closed (79189666, 12198ca1, 656843b5).
-
-ROOT — measured live, complete chain in dev's trace plane (18:02 UTC window): (1) the jojo GUI daemon holds live `remote-agy://dev/7c2a3aec` rows (the owner's sidebar; the keep-alive spec makes keeping them CORRECT) and ssh-resumes them every cycle; (2) the row id is store-absent fabricated lineage, so the [11.183] store-candidate vouch ladder (wrapper half, `agy_store_candidate_vouch` … `definitive_store_miss_binds_the_cwd_newest_conversation`) binds the resume onto the cwd-newest REAL conversation — which was 79189666, a row the user CLOSED (unexpired tombstone in removed-rows.json); (3) the daemon spawns a fresh agy (YGGTERM_SESSION_ID=agy-runtime://79189666…) as a headless bridge; (4) the probe's ghost detection matches ARGV conversation ids against row keys, so the rebound CLI looks like a ghost even when its own row is alive — the alarm was the only witness, and the [11.194] reap of such a "ghost" risks killing a LIVE bridge. Two defects, one loop: the ladder never asks the tombstone plane, and the probe never asks the launch marker.
-
-FIXED IN CODE (lane/integration/11197-ghost-respawn): (A) THE [11.197] TOMBSTONE GUARD on BOTH vouch twins (wrapper `run_remote_resume_agent` + the ensure `ensure_remote_runtime_agent_session`): a candidate whose row key carries a remembered (unexpired) close is NOT a candidate — the row honest-fresh-starts instead, the refusal is traced (`agy_store_candidate_vouch_refused_tombstoned`, both sides), and the close RE-ARMS so an eternal keeper cannot wait out the TTL (the restore door's own law, applied to the resume door). A live conversation the owner still works in has no tombstone and vouches exactly as before. (B) THE PROBE TRUTH FIX (tools/e2e/usability_probe.py): the ghost invariant reads the CLI's YGGTERM_SESSION_ID environ marker (launch-time row truth — argv ids drift after a rebind), folds peer planes into the attachment truth (`--peer jojo` when judging dev; the bridge of a peer row is not a ghost), and adds the TOMBSTONE-HELD class — a yggterm-born CLI whose own marker names a remembered-closed row is flagged even when a husk row exists (the regeneration signature, encoded as the invariant the directive requires).
-
-RESIDUAL (OPEN, next seat): the fabricated rows themselves (41e5733d, c70b6a9c, 7c2a3aec on jojo) stay open and now fresh-start every keep-alive cycle instead of hijacking — the keeper churn is starved but not silent; the deeper fix is cross-host contention truth (a peer's live row holding the candidate must be visible to THIS host's ladder — the [11.192] guard reads only the local sessions map). CORRECTION (2026-09-29, the [11.198] sitting): this premise was WRONG — jojo's trace holds 11 × `explicit_remote_session_close_requested, error: None, kind: Antigravity` across 09-27..09-28: every agy close DID cross the hop. What never happened was an effective kill — the dev-side sweep matched wrapper argv only and the daemon-owned bridges were invisible to it; see [11.198].
-
-RESIDUALS MEASURED 2026-09-29 ([11.198] sitting, its fix LANDED+LIVE-PROVEN and deleted from this queue per the git law): (a) the REBIND class keeps regenerating — the live daemon snapshot holds row id `12198ca1` on path `agy-runtime://41e5733d`, and ONE id (`0a1f852d`) claiming FOUR different runtime paths; `live_row_close` tombstone counters ran 38→43 in one day — the restore dedupe key, still open. (b) the RemoteRuntimeRegistry holds ghost conversations stuck at `attaching_pty` forever (re-registered by every keeper resume, never advanced to `interactive`); a terminate deletes registry rows, but nothing ages out a stuck attach — ANSWERED: the attach aging (lane/integration/11199-attach-aging, main 5e7b67e2e08a, deployed 02:10 IST; LIVE-PROVEN on jojo's first post-roll ensure — the five-month codex corpse and the 09-24 agy corpse aged to failed with named events).
-
-STATUS 2026-09-29 (the [11.199] seat, work FROM dev, lane/integration/11199-attach-aging): the [11.197] tombstone guard's own live proof IS MET — dev's trace carries 3 × `agy_store_candidate_vouch_refused_tombstoned` that day (requested `41e5733d`, refused candidate `12198ca1` — the rebind class refused by name, wrapper side), so the falsifier this entry's guard rode is satisfied and the remaining open work narrows to the restore dedupe key above. The cross-host half of the first residual is ANSWERED by the 11199 lane's witness upgrade (main 5e7b67e2e08a): the CLI store is host-resident, so every bridge of a peer's row runs on THIS host and the full holder scan sees it — no ssh ask is needed in the ladder.
-
-STATUS 2026-09-29 (the [11.200] seat, zcode sess_4868e4f3 on jojo, work FROM dev, lane/integration/11200-restore-dedupe-key): THE RESTORE DEDUPE KEY IS ROOT-CAUSED AND FIXED IN CODE — LIVE PROOF OWED. Root cause, measured live on dev: THE STORE-CANDIDATE CURE in `run_row_title_follow_chore` (the owner's 2026-09-10 cwd-recency rebind: a loopback row whose store title read is SILENT is re-pointed onto "the session this cwd last viewed") has NO session-named-key guard. Every `agy-runtime://<id>` row IS its key's conversation, so the cwd candidate is never its identity — yet the cure dragged FOUR live dev rows onto the dead birth id `0a1f852d` (all four wearing the candidate's title "Medgraph Health Data Logging", none with a live bridge), and the tick livelocked against restore's own key-wins law (`restored_local_runtime_id` re-derives the id from the key): 242 × `identity_store_candidate_rebind {from_id: 83374b43, to_id: 0a1f852d}` in one trace, each flip re-poisoning the persisted record, the resume decision, and the registry registration — the keeper pump behind this entry's whole ghost family. Fix: (a) THE KEY-ID GUARD in `rebind_live_session_store_identity` (the door every cure passes) — a session-named key row refuses a foreign id by name (`identity_store_candidate_rebind_refused_key_id`); re-binding ONTO the key's id is the heal and passes; (b) THE QUEUE-SIDE SKIP — the chore never queues a cwd candidate for a session-named key (named, tested); (c) THE HEAL — the chore re-points a divergent id TO its key id before the tick's store reads, and the remote-scanned restore branch composes the row ON the key-carried id ([11.79]'s law, restored); (d) THE PROBE — `usability_probe.py` grows the `identity_dedupe` invariant (no live row id may contradict its session-named key; when red, it also names whether a foreign rebind fired inside the trace window). RED BASELINE BANKED against the unfixed live daemon: the invariant fails naming `83374b43`/`b4c69330`/`eacf599e` wearing `0a1f852d`. Suite 1624/0 full server-lib (4 new: helper, door guard, restore heal, chore source-law lock). The falsifier this fix rides: after a daemon roll onto the lane, the invariant goes green (the four rows heal onto their key ids) and no foreign `identity_store_candidate_rebind` fires again; opencode's row-named rebind plane ([11.73]) is untouched by construction (the parser answers Antigravity only).
-
-STATUS 2026-09-29 (the proof seat, zcode sess_8a7b0f9e on jojo, work FROM dev, claim ACK-c8f2069608): THE GUARD LEG IS LIVE ON PRODUCTION DATA AND THE INVARIANT IS GREEN ON THE ROLLED HOST — the falsifier's remainder is DEV'S OWN ROLL, deferred by measured owner-plane gates, so the entry stays open narrowed to exactly that leg. MEASURED: (1) the 03:09 IST deploy of bf237ec9 fired dev's hot-restart door: the fixed successor (pid 1378613, direct/builds/bf237ec9004c) restored production state at 03:08:32 and wrote `identity_store_candidate_rebind_refused_key_id {from_id: eacf599e-6d85…, to_id: 0a1f852d-7d1a…}` — the drift REFUSED BY NAME on the real rows — and its restore pass produced ZERO foreign agy rebinds, while the stale predecessor had re-poisoned all four rows at 02:39:00, half an hour earlier. (2) jojo's daemon rolled onto bf237ec9004c at 03:35 IST; `usability_probe.py` on the rolled host answers `identity_dedupe: ok` (attachment/geometry/ghost_pids ok; the one red is `stream_liveness` on a jojo local row frozen ~1001 s — the [11.187] class, GUI-restart-gated, owned there); jojo's trace carries ZERO `identity_store_candidate_rebind` lines. (3) DEV'S ROLL DID NOT LAND — the full chain in dev's trace: `progressive_migration_candidates_blocked {blocking_gate: pending_draft}` on `codex-runtime://01a0bf3b` (the owner's ~2 h-idle draft; owner plane, veto-first, never forced), then `hot_restart_swap_queue_skipped "the replacement binary is not ahead of this daemon"` (the equal-label class: 3.2.114 both sides), then `disk_binary_handoff_cooldown_deferred` (30 min) — the successor exited, pid 843737 (the [11.198] image) still serves `server-3-2-114.sock`, and dev's snapshot STILL holds the red baseline (3 id-vs-key mismatches: `0a1f852d` worn on keys `83374b43`/`b4c69330`/`eacf599e` plus the dead row itself, all titled "Medgraph Health Data Logging"). THIS ENTRY'S WHOLE REMAINING OPEN WORK: dev's serving lane landing on the lane — unblocked when the owner's draft row releases (the next deploy's door fire then adopts the staged build) or by any version-bump deploy — after which the invariant must go GREEN ON DEV with the four rows healed onto their key ids and zero foreign rebinds; that leg met closes this entry.
-
-Source law: `the_ladder_never_binds_onto_a_remembered_close_and_the_probe_reads_the_marker`.
