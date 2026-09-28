@@ -20,9 +20,10 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
-**Status:** LANDED IN CODE — LIVE FALSIFIER OWED (2026-09-29, row 11.201,
-lane/integration/11181-install-honesty, work FROM dev). The entry's three
-fix directions resolved: (c) the refresh-state persist ALREADY survived
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+2026-09-29, row 11.201, lane/integration/11181-install-honesty, work FROM
+dev. The entry's three fix directions resolved: (c) the refresh-state persist ALREADY survived
 per-tool failures — the [11.182] follow-up made it unconditional with the
 per-tool failed_at_ms backoff (the "gating the write on install_error"
 comment + the_launch_ensure_skips_a_contended_lock_before_any_install lock);
