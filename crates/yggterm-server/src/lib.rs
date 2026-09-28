@@ -12715,6 +12715,35 @@ impl YggtermServer {
         // can mint another. The binding is trusted only on the store's
         // positive word (Some(true)); a missing/absent binding changes
         // nothing.
+        // THE [11.197] BINDING-TOMBSTONE WITNESS: a persisted binding onto a
+        // remembered-closed conversation is named and re-armed when the tier
+        // below declines it — the 79189666 regeneration's second door (an
+        // earlier [11.183] rebind stamped the closed conversation onto the
+        // row; honoring it resumes the dead one cycle at a time).
+        if kind == SessionKind::Antigravity
+            && let Some(bound) = self
+                .sessions
+                .get(&key)
+                .and_then(|session| session.metadata.iter().find(|m| m.label == "Conversation"))
+                .map(|m| m.value.clone())
+            && bound != session_id
+            && let Some(ygg_home) = self.yggterm_home.clone()
+            && let Some(bound_key) = remote_runtime_agent_session_key(kind, &bound)
+            && live_row_close_is_remembered(&ygg_home, &bound_key)
+        {
+            append_trace_event(
+                &ygg_home,
+                "daemon",
+                "remote_runtime",
+                "agy_binding_refused_tombstoned",
+                json!({
+                    "row_id": session_id,
+                    "bound_conversation": bound,
+                    "policy": "a_remembered_close_is_not_a_candidate",
+                }),
+            );
+            crate::rearm_live_row_closes_among(&ygg_home, [bound_key.as_str()]);
+        }
         if kind == SessionKind::Antigravity
             && let Some(bound) = self
                 .sessions
@@ -12727,6 +12756,18 @@ impl YggtermServer {
                 .as_deref()
                 .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, &bound))
                 == Some(true)
+            // THE [11.197] TOMBSTONE GUARD (the binding tier): the row's own
+            // binding is only a first tier when the conversation is not one
+            // the user CLOSED — see the witness above.
+            && !self
+                .yggterm_home
+                .as_deref()
+                .and_then(|ygg_home| {
+                    remote_runtime_agent_session_key(kind, &bound).map(|bound_key| {
+                        live_row_close_is_remembered(ygg_home, &bound_key)
+                    })
+                })
+                .unwrap_or(false)
         {
             if let Some(ygg_home) = self.yggterm_home.clone() {
                 append_trace_event(
@@ -60882,6 +60923,10 @@ mod agy_connection_tests {
         assert!(
             ensure.contains("live_row_close_is_remembered"),
             "the ensure ladder must refuse a tombstoned candidate"
+        );
+        assert!(
+            ensure.contains("agy_binding_refused_tombstoned"),
+            "the binding tier must refuse a tombstoned binding by name - the              rebind stamped it there and the tier runs FIRST"
         );
 
         // The binding stamps: at birth (start path) and on a store-vouched
