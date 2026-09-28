@@ -12971,7 +12971,27 @@ impl YggtermServer {
         // [`live_held_row_resumes_by_row_id`]), so a held codex row without a
         // saved session gets the picker arm — the user picks their
         // conversation, instead of a row that can never reach one.
-        let resumable = saved_session_in_store
+        // ⛔ THE [11.190] DEFINITIVE COMPOSE — THE FABRICATION TREADMILL KILL.
+        // `saved_session_in_store` is FAIL-OPEN for Antigravity BY DESIGN
+        // ([11.165]: the predicate answers Ok(true) even on a definitive
+        // miss), so the keep-alive/recovery recompose of a store-absent agy
+        // row composed `--conversation <row uuid>` on EVERY respawn and the
+        // CLI fabricated a fresh conversation in place — the owner's "agy
+        // sessions disconnecting and spawning a new fresh one in its place"
+        // (row 41e5733d: doomed spawns 11:24, 13:05, 13:12, 15:24, the id
+        // provably ABSENT from the store). The compose asks the THREE-VALUED
+        // vouch: a DEFINITIVE miss for an unheld row is NOT resumable — the
+        // ladder already had its chance to land the real conversation, and
+        // with no candidate the compose below is an HONEST FRESH START
+        // (Launch semantics, no doomed resume selector), stamped on the row.
+        let agy_definitive_store_miss = !live_runtime_held
+            && remote_require_existing_needs_definitive_vouch(kind)
+            && self
+                .user_home
+                .as_deref()
+                .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, &session_id))
+                == Some(false);
+        let resumable = (saved_session_in_store && !agy_definitive_store_miss)
             || (live_runtime_held && live_held_row_resumes_by_row_id(kind, saved_session_in_store));
         // ⛔ [11.168] THE FUNNEL RECOMPOSE MUST NOT RE-IDENTIFY THE ROW. This
         // arm rewrites the stored launch command on every ensure (rotation
@@ -12996,6 +13016,23 @@ impl YggtermServer {
                 configured_extra_args,
                 Some(&carried_identity_exports),
             )
+        } else if agy_definitive_store_miss {
+            // THE HONEST FRESH START ([11.190]): Launch semantics — no
+            // resume selector, no doomed `--conversation <absent id>`, no
+            // picker that agy does not have. The CLI starts a NEW
+            // conversation under the row id because that is what the row IS
+            // now; the prior conversation, if the store ever held one, is
+            // untouched and recoverable through the ladder on a later open.
+            codex_cli::managed_cli_shell_command_configured_with_identity(
+                kind,
+                cwd,
+                ManagedCliAction::Launch,
+                terminal_appearance,
+                &AgentLaunchOptions::default(),
+                configured_extra_args,
+                Some(&carried_identity_exports),
+            )
+            .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
         } else {
             remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity(
                 kind,
@@ -13081,6 +13118,19 @@ impl YggtermServer {
                     &mut session.metadata,
                     "Conversation",
                     session_id.to_string(),
+                );
+            }
+            // THE [11.190] HONEST-FRESH-START STAMP: the anti-fabrication law
+            // is that a fresh conversation is NAMED, never silent. The prior
+            // conversation, if the store ever held one, stays recoverable
+            // through the ladder.
+            if agy_definitive_store_miss && !resumable {
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Fresh Start",
+                    format!(
+                        "the store definitively lacks {session_id}; started a new conversation (the prior one is recoverable from the store if it exists)"
+                    ),
                 );
             }
             if let Some(cwd) = target.cwd.as_deref() {
@@ -60503,6 +60553,68 @@ mod agy_connection_tests {
         assert!(
             guard_at < stamp_at,
             "the ensure stamps a conversation only when the store vouches for the id"
+        );
+    }
+
+    /// THE [11.190] FABRICATION-TREADMILL LAW: a definitive store miss for an
+    /// unheld agy row makes the recompose HONEST — the fresh-start arm (Launch
+    /// semantics) is chosen BEFORE the picker arm, the row is STAMPED with the
+    /// reason, and a live-held row is never touched by the miss gate.
+    #[test]
+    fn a_store_absent_agy_row_composes_fresh_and_named_never_a_doomed_resume() {
+        let source = include_str!("lib.rs");
+        let ensure = source
+            .split("fn ensure_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+
+        // 1. The miss gate carries the live-held exclusion — a held row is
+        // never re-pointed or fresh-composed by the store's word.
+        let gate = ensure
+            .split("let agy_definitive_store_miss = !live_runtime_held")
+            .nth(1)
+            .expect("the miss gate")
+            .split("let resumable")
+            .next()
+            .unwrap();
+        assert!(
+            gate.contains("remote_require_existing_needs_definitive_vouch(kind)"),
+            "only a measured fabricator kind takes the definitive compose"
+        );
+
+        // 2. The resumable decision consumes the miss.
+        assert!(
+            ensure.contains(
+                "let resumable = (saved_session_in_store && !agy_definitive_store_miss)"
+            ),
+            "a definitive miss is not resumable"
+        );
+
+        // 3. The fresh-start arm precedes the picker arm, and the stamp rides
+        // the same condition.
+        let fresh_at = ensure
+            .find("} else if agy_definitive_store_miss {")
+            .expect("the fresh-start arm");
+        let picker_at = ensure
+            .find("remote_resume_picker_shell_command_with_terminal_appearance_configured_with_identity(")
+            .expect("the picker arm");
+        assert!(
+            fresh_at < picker_at,
+            "the honest fresh start is composed instead of the doomed picker"
+        );
+        let stamp = ensure
+            .split("if agy_definitive_store_miss && !resumable {")
+            .nth(1)
+            .expect("the fresh-start stamp")
+            .split("\n            }")
+            .next()
+            .unwrap();
+        assert!(
+            stamp.contains("Fresh Start"),
+            "the fresh conversation is NAMED on the row"
         );
     }
 }
