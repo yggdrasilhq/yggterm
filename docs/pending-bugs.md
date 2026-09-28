@@ -75,63 +75,6 @@ JS forward, find where it dies, then make the pane drop deterministic against
 an in-flight schema fetch (generation-stamp the fetch; a close wins).
 
 
-## ⛔ [11.180] THE SERVING RAISE PAYS A FULL SIDEBAR REBUILD: SessionPreview DROP+REALLOC + FULL RE-HASH OF EVERY ROW'S PREVIEW LINES PER RAISE — sidebar/memo complex ≈17-19% + allocator ≈16% OF RAISE-WINDOW CPU, webproc clock-tax + page-in ≈8%, DAEMON ≈0% (measured 2026-09-27 ~12:20-12:35 IST, raise-perf-capture lane, live jojo desktop, GUI 5baa7991 / daemon aa555326)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Fixed in code 2026-09-28 (the ux-speed raise-memo-fix lane): `ManagedSessionView::preview` is `Arc<SessionPreview>` — immutable, pointer identity IS the content version — and the search-context memo keys on `yggterm_server::session_preview_stamp` (pointer-checked per path) instead of raw line hashes; view clones share the pointer. The falsifier below runs on the next rotated jojo build; the entry retires with that proof per the verified-fix law.
-
-Filed 2026-09-27 by the ux-speed raise-perf-capture lane (zcode
-sess_5ad2631f on jojo, work FROM dev, board claim ACK-9680788fb1) — the
-perf-during-raises capture that [11.179]/webproc-raise-capture left OWED,
-discharged the same morning [11.176] landed and local raises began
-serving 3/3 (switch-falsifier-sweep close ACK-4fe83b887b).
-
-MEASURED: `perf record -F 99 -g -p <gui>,<webproc>,<daemon>` during
-uxprobe `switch` ×10 real pointer clicks on a fresh scratch A/B pair;
-iterations 5-10 were pure retained raises (`reveal_served` ×6, alternating
-A/B, `mount None` per iteration); 546 samples inside the six ±0.4 s raise
-windows; ytrace bounds every window (activation → reveal_served → ui/reveal).
-
-- SERVE LATENCY on this build: user_gesture activation → reveal_served
-  111-151 ms (n=6: 139/151/135/123/111/128); reveal_served → ui/reveal
-  paint stamp +150-250 ms. activation_ms p50 224 ms across all 10 clicks
-  (probe walls, cli floor 71 ms).
-- ROLE SPLIT of raise-window on-CPU samples: **GUI 52.4% / WebKitWebProcess
-  45.7% / daemon ≈0.03%** — the serve is GUI-local work; the daemon pays
-  WAIT, not burn (corroborates the activation-stall close ACK-3850141580).
-- GUI burn NAMED: the sidebar rebuild complex ≈17-19% of raise-window CPU —
-  `set_sidebar_search_context` ~2.0-2.2% + `sidebar_merge_cache_key_parts`
-  1.54% + sip `Hasher::write` ~4.6% + `__memcmp_evex_movbe` 5.0% +
-  `String::clone` 2.6% + hashbrown `rustc_entry`/`hash_one` ~1.3% +
-  `drop_in_place<yggterm_server::SessionPreview>` 1.43% +
-  `reserve_rehash` 1.41% — **every raise drops and recreates the row
-  previews and re-hashes every row's full preview lines just to CHECK the
-  memo** (`sidebar_search_context_memo_skips_rebuild_on_unchanged_inputs`
-  exists; the memo key IS the full content hash, so checking costs the
-  rebuild it guards). Allocator churn ≈16% (`_int_malloc` 7.6% + free
-  paths ~5% + `RawVec::reserve`/`rdl_alloc`) is the same rebuild's
-  allocation shadow. Clock tax ~4-5% + `unlink_chunk` 0.89% + fmt ~1.1%.
-- WEBPROC burn NAMED: clock tax ~7-8% in raise windows (`_copy_to_user`
-  5.6% + `entry_SYSRETQ` 1.5% + `read_hpet` 0.6% + vDSO/SRSO) — the
-  [11.119] storm reading (25-40%) is mount-storm specific, the raise
-  window is quieter — plus PAGE-IN (`kernel_init_pages` 1.2% +
-  `vmf_insert_pfn_prot` 0.5% + anonymous-page fault chains) and bmalloc +
-  JIT'd xterm render (unresolved JIT-map offsets).
-- FIX SHAPE (ours, yggterm_shell): key the search-context memo on a CHEAP
-  version stamp (row-set identity + last-mutation seq + search string),
-  not on content hashes of every preview line; reuse SessionPreview
-  objects across raises when the row identity is unchanged. Both are
-  GUI-shell-plane edits — deliberately NOT taken by this lane (claim
-  pledged read-only sampling; the owner's cli-integration wave owns
-  adjacent planes).
-
-Falsifier: after the memo-key fix, `perf record` during uxprobe switch
-raise windows shows the sidebar complex (set_sidebar_search_context +
-merge-cache keys + SessionPreview drop chains) below ~2% of raise-window
-GUI samples (from ~19%), and uxprobe switch activation_ms p50 on scratch
-pairs drops accordingly; no regression in `reveal_served` counts.
-
 ## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN at the WebKitGTK layer — spawn cost FIXED IN CODE by the warm-eval liveness gate; rig recipe + dispatch-stamp recipe included)
 
 **Status:** OPEN
