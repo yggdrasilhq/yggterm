@@ -31626,3 +31626,13 @@ it — an instrument gap in itself).
 Falsifier: uxprobe switch reports >=7/8 paint ends and split reports a
 non-null create pair on a fresh scratch pair, on a rotated build, with
 no iteration wall exceeding its own verb budget.
+
+> AMENDMENT (2026-09-29 ~01:55, same lane): the raise-memo-falsifier
+> seat's switch runs DID serve on 4aa6d5bd's GUI 2285010 the same hour
+> (7 serving raises measured, door close ~01:50) — the blind class is
+> therefore INTERMITTENT or ff5630c299-specific, not build-universal.
+> The falsifier for this entry must reproduce the class first (spawn a
+> fresh bottom-anchored scratch pair on a 423+-row sidebar, try the
+> click, and only then score the action) and the 16-minute verb block
+> is unconditional-to-file regardless: one app-control call must never
+> hold minutes-class while the CLI floor answers pings.
