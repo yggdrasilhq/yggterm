@@ -314,10 +314,17 @@ def latest_frame_hash_words(max_events=400):
     loop-liveness watchdog events. Returns ({session_path: event}, [watchdog
     event strings]). Empty when this host carries no ytrace (headless — the
     stream_liveness invariant self-skips rather than lie)."""
-    traces = sorted(HOME.glob(".yggterm/ytrace.g*.jsonl"), key=lambda p: p.stat().st_mtime,
+    # The trace layout changed under us once already (2026-09-28 22:34: the
+    # direct-build plane writes a LIVE `ytrace.jsonl`; older builds rotated
+    # generation files). Sort by mtime so the live file wins; a stale
+    # generation measured as if it were live made the first falsifier run
+    # vacuously pass — the witness must be the CURRENT writer's words.
+    traces = sorted(HOME.glob(".yggterm/ytrace*.jsonl"), key=lambda p: p.stat().st_mtime,
                     reverse=True)
     if not traces:
         return {}, []
+    now_s = time.time()
+    traces = [t for t in traces if now_s - t.stat().st_mtime < 3600] or traces[:1]
     latest = {}
     watchdog = []
     scanned = 0
