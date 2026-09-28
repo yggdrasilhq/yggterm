@@ -4724,11 +4724,56 @@ fn acquire_managed_cli_install_lock_waiting(
     }
 }
 
+/// ONE provision arm's failure, carried structured ([11.181]): the walk must
+/// mark "failed" only the tools whose own arm failed, and telemetry must
+/// carry the per-arm strings — one joined batch string painted every tool
+/// with one wedge and surfaced nowhere a machine could read.
+struct ManagedCliArmFailure {
+    binary_name: String,
+    display: String,
+    error: String,
+}
+
+/// The joined batch string in the shape install_error has always carried
+/// (`Display: error`, "; "-joined) — single source so the wrapper's bail and
+/// the walk's trace event cannot drift.
+fn arm_failures_joined(failures: &[ManagedCliArmFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.display, failure.error))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The walk's per-tool lookup: ONLY a tool whose own arm failed reads
+/// "failed"; every other tool falls through to its honest status arms.
+fn arm_failure_for<'a>(
+    arm_failures: &'a [ManagedCliArmFailure],
+    binary_name: &str,
+) -> Option<&'a ManagedCliArmFailure> {
+    arm_failures
+        .iter()
+        .find(|failure| failure.binary_name == binary_name)
+}
+
 fn install_latest(
     paths: &ManagedCliPaths,
     tools: &[ManagedCliTool],
     background: bool,
 ) -> Result<()> {
+    let failures = install_latest_collecting(paths, tools, background);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", arm_failures_joined(&failures))
+    }
+}
+
+fn install_latest_collecting(
+    paths: &ManagedCliPaths,
+    tools: &[ManagedCliTool],
+    background: bool,
+) -> Vec<ManagedCliArmFailure> {
     // ⛔ ONE WRITER PER MACHINE, across processes — now ONE TOOL AT A TIME,
     // not one WALK AT A TIME. The lock used to span the whole multi-CLI walk,
     // so one hung step pinned the machine's toolchain for as long as it hung
@@ -4756,7 +4801,7 @@ fn install_latest(
     // ⛔ Collected, never short-circuited: one CLI's vendor installer failing
     // must not stop the next CLI's update. The old single-method installer had
     // no such case, so `?` was safe there and is not safe here.
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: Vec<ManagedCliArmFailure> = Vec::new();
     let mut failed_tools: Vec<ManagedCliTool> = Vec::new();
     let now_ms = current_time_ms();
     let backoff_state = load_managed_cli_refresh_state(&paths.home);
@@ -4782,8 +4827,22 @@ fn install_latest(
         }
         let outcome = install_one_step_under_lock(paths, tool, step);
         if let Err(error) = outcome {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "install_step_failed",
+                serde_json::json!({
+                    "tool": tool.binary_name(),
+                    "error": error.to_string(),
+                }),
+            );
             failed_tools.push(tool);
-            failures.push(format!("{}: {error}", tool.display_name()));
+            failures.push(ManagedCliArmFailure {
+                binary_name: tool.binary_name().to_string(),
+                display: tool.display_name().to_string(),
+                error: error.to_string(),
+            });
         }
     }
 
@@ -4806,17 +4865,27 @@ fn install_latest(
         let outcome = install_one_step_under_lock(paths, tool, ProvisionStep::Npm)
             .and_then(|_| install_via_ynpm_publish(paths, tool, background));
         if let Err(error) = outcome {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "install_step_failed",
+                serde_json::json!({
+                    "tool": tool.binary_name(),
+                    "error": error.to_string(),
+                }),
+            );
             failed_tools.push(tool);
-            failures.push(format!("{}: {error}", tool.display_name()));
+            failures.push(ManagedCliArmFailure {
+                binary_name: tool.binary_name().to_string(),
+                display: tool.display_name().to_string(),
+                error: error.to_string(),
+            });
         }
     }
     record_install_tool_outcomes(paths, &failed_tools, failures.is_empty(), now_ms);
 
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("{}", failures.join("; "))
-    }
+    failures
 }
 
 /// Persist the per-tool failure backoff after a walk: failed tools stamp
@@ -7318,6 +7387,10 @@ pub(crate) fn refresh_local_managed_cli(
         .any(|tool| provision_step_is_runnable(&paths, tool));
     let background_install_enabled = managed_cli_background_install_enabled();
     let mut install_error = None::<String>;
+    // THE [11.181] PER-ARM FAILURES: structured, so the walk can mark
+    // "failed" only the tools whose own arm failed and telemetry can carry
+    // the per-arm strings.
+    let mut arm_failures = Vec::new();
     let mut install_attempted = false;
     let mut install_deferred = false;
     let mut background_install_deferred = false;
@@ -7407,8 +7480,24 @@ pub(crate) fn refresh_local_managed_cli(
                 "tool": tool.binary_name(),
             }));
         }
-        if let Err(error) = install_latest(&paths, &installable, background) {
-            install_error = Some(error.to_string());
+        arm_failures = install_latest_collecting(&paths, &installable, background);
+        if !arm_failures.is_empty() {
+            let joined = arm_failures_joined(&arm_failures);
+            install_error = Some(joined.clone());
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "refresh_install_error",
+                serde_json::json!({
+                    "background": background,
+                    "failed_tools": arm_failures
+                        .iter()
+                        .map(|failure| failure.binary_name.clone())
+                        .collect::<Vec<_>>(),
+                    "error": joined,
+                }),
+            );
         }
         let install_payload = serde_json::json!({
             "background": background,
@@ -7493,13 +7582,13 @@ pub(crate) fn refresh_local_managed_cli(
                     let detail = managed_cli_deferred_install_detail(tool, &after_probe);
                     tool_status(tool, before_probe, after_probe, "deferred_install", detail)
                 }
-            } else if let Some(error) = install_error.as_ref() {
+            } else if let Some(arm) = arm_failure_for(&arm_failures, tool.binary_name()) {
                 tool_status(
                     tool,
                     before_probe,
                     after_probe,
                     "failed",
-                    format!("Managed refresh failed: {error}"),
+                    format!("Managed refresh failed: {}", arm.error),
                 )
             } else if !provision_step_is_runnable(&paths, tool) {
                 let source = tool.package_name();
@@ -7839,5 +7928,67 @@ mod amber_treadmill_tests {
             carry.contains("failed_at_ms"),
             "the backoff map is carried over, never reset by a state write"
         );
+    }
+
+    /// THE [11.181] PER-ARM HONESTY LAW: the walk marks "failed" only the
+    /// tools whose own arm failed (the batch error never paints a succeeding
+    /// tool), the batch error surfaces as a refresh_install_error trace
+    /// event, and the walk reads the collecting variant while the single-tool
+    /// ensure call sites keep the bail wrapper's Result contract.
+    #[test]
+    fn the_walk_reads_per_arm_failures_and_telemetry_carries_them() {
+        let source = include_str!("mod.rs");
+        let walk = source
+            .split("fn refresh_local_managed_cli(")
+            .nth(1)
+            .expect("walk body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            walk.contains("arm_failure_for(&arm_failures, tool.binary_name())"),
+            "the failed branch keys on the arm failure set, not the batch error"
+        );
+        assert!(
+            !walk.contains("install_error.as_ref()"),
+            "the batch error string must never decide a per-tool status again"
+        );
+        assert!(
+            walk.contains("\"refresh_install_error\""),
+            "the batch error must surface in telemetry, not only in a GUI panel"
+        );
+        assert!(
+            walk.contains("install_latest_collecting(&paths, &installable"),
+            "the walk reads the structured per-arm failures"
+        );
+        let wrapper = source
+            .split("fn install_latest(")
+            .nth(1)
+            .expect("wrapper body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            wrapper.contains("install_latest_collecting("),
+            "the single-tool wrapper stays the Result-shaped contract"
+        );
+    }
+
+    /// The per-arm lookup and the joined batch string: only the failed arm's
+    /// tool answers, and the join keeps the historical `Display: error` shape.
+    #[test]
+    fn an_arm_failure_marks_only_its_own_tool() {
+        let failures = vec![ManagedCliArmFailure {
+            binary_name: "mimo".to_string(),
+            display: "Mimo".to_string(),
+            error: "upgrade wedged".to_string(),
+        }];
+        assert!(arm_failure_for(&failures, "mimo").is_some());
+        assert!(
+            arm_failure_for(&failures, "codex").is_none(),
+            "a tool whose own arm succeeded is not failed"
+        );
+        assert!(arm_failure_for(&[], "codex").is_none());
+        assert_eq!(arm_failures_joined(&failures), "Mimo: upgrade wedged");
     }
 }
