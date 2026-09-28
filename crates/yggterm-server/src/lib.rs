@@ -12743,6 +12743,44 @@ impl YggtermServer {
             }
             session_id = bound;
         }
+        // THE [11.197] TOMBSTONE REFUSAL WITNESS (the ensure's twin of the
+        // wrapper's): the candidate refusal below is named and the close
+        // re-arms — see the wrapper block for the measured regeneration.
+        if kind == SessionKind::Antigravity
+            && require_existing
+            && !self.sessions.contains_key(&key)
+            && self
+                .user_home
+                .as_deref()
+                .is_some_and(|home| {
+                    local_agent_store_vouches_for_session_in(home, kind, &session_id)
+                        == Some(false)
+                })
+            && let Some(dir) = cwd
+            && let Some(user_home) = self.user_home.as_deref()
+            && let Some((candidate_id, _)) =
+                yggterm_core::agent_cli::store_candidate_session_for_directory(
+                    user_home, kind, dir,
+                )
+            && candidate_id != session_id
+            && let Some(ygg_home) = self.yggterm_home.clone()
+            && let Some(candidate_key) = remote_runtime_agent_session_key(kind, &candidate_id)
+            && live_row_close_is_remembered(&ygg_home, &candidate_key)
+        {
+            append_trace_event(
+                &ygg_home,
+                "daemon",
+                "remote_runtime",
+                "agy_store_candidate_vouch_refused_tombstoned",
+                json!({
+                    "requested_id": session_id,
+                    "refused_candidate": candidate_id,
+                    "cwd": dir,
+                    "policy": "a_remembered_close_is_not_a_candidate",
+                }),
+            );
+            crate::rearm_live_row_closes_among(&ygg_home, [candidate_key.as_str()]);
+        }
         if kind == SessionKind::Antigravity
             && require_existing
             && !self.sessions.contains_key(&key)
@@ -12779,6 +12817,20 @@ impl YggtermServer {
                 // dissolved into the wait banner). The fd-based scan is the
                 // same witness the holder-wait would use later — asked HERE,
                 // before the bind, so the row fresh-starts instead.
+                // THE [11.197] TOMBSTONE GUARD: a candidate the user CLOSED
+                // is not a candidate — the vouch would bind this row onto a
+                // remembered-closed conversation (the store still holds it;
+                // the tombstone plane remembers the close). The witness block
+                // above names the refusal and re-arms the grave.
+                && !self
+                    .yggterm_home
+                    .as_deref()
+                    .and_then(|ygg_home| {
+                        remote_runtime_agent_session_key(kind, &candidate_id).map(
+                            |candidate_key| live_row_close_is_remembered(ygg_home, &candidate_key),
+                        )
+                    })
+                    .unwrap_or(false)
                 && linux_proc_pids_holding_session_path(&candidate_id).is_empty()
             {
                 if let Some(ygg_home) = self.yggterm_home.clone() {
@@ -25101,6 +25153,39 @@ pub fn run_remote_resume_agent(
     // dying in the holder wait (duplicate rows share a cwd; measured
     // 2026-09-28 19:4x).
     let mut ladder_vouched = false;
+    // THE [11.197] TOMBSTONE REFUSAL WITNESS: a candidate the user CLOSED is
+    // named when the ladder below refuses it, and the close re-arms — an
+    // eternal offerer must not wait out the TTL (the restore door's own law).
+    // Measured 2026-09-28 23:32 IST: the keeper cycle for store-absent
+    // 7c2a3aec bound the cwd-newest conversation 79189666, tombstoned on this
+    // host, and every keep-alive cycle re-spawned the hijack; the guard's
+    // ghost alarm was the only witness.
+    if kind == SessionKind::Antigravity
+        && require_existing
+        && local_agent_store_vouches_for_session(kind, &session_id) == Some(false)
+        && let Some(dir) = cwd
+        && let Some(user_home) = dirs::home_dir()
+        && let Some((candidate_id, _)) =
+            yggterm_core::agent_cli::store_candidate_session_for_directory(&user_home, kind, dir)
+        && candidate_id != session_id
+        && let Some(candidate_key) = remote_runtime_agent_session_key(kind, &candidate_id)
+        && live_row_close_is_remembered(&home, &candidate_key)
+    {
+        append_trace_event(
+            &home,
+            "remote",
+            "resume_agent",
+            "agy_store_candidate_vouch_refused_tombstoned",
+            json!({
+                "requested_id": session_id,
+                "refused_candidate": candidate_id,
+                "cwd": dir,
+                "side": "wrapper",
+                "policy": "a_remembered_close_is_not_a_candidate",
+            }),
+        );
+        crate::rearm_live_row_closes_among(&home, [candidate_key.as_str()]);
+    }
     // ⛔ `saved_session_exists` is FAIL-OPEN for Antigravity BY DESIGN (the
     // [11.165] predicate answers Ok(true) on a definitive miss; the gates
     // live at the consumers) — so it can never gate this ladder. The
@@ -25121,6 +25206,11 @@ pub fn run_remote_resume_agent(
         // the holder deadline and dissolves it (measured 2026-09-28 22:2x).
         // The fd-based scan is the same witness the holder wait uses — asked
         // HERE, before the bind, so the row fresh-starts instead.
+        // THE [11.197] TOMBSTONE GUARD (the wrapper's twin): a candidate the
+        // user CLOSED is not a candidate — see the witness block above.
+        && !remote_runtime_agent_session_key(kind, &candidate_id)
+            .map(|candidate_key| live_row_close_is_remembered(&home, &candidate_key))
+            .unwrap_or(false)
         && linux_proc_pids_holding_session_path(&candidate_id).is_empty()
     {
         append_trace_event(
@@ -60767,6 +60857,31 @@ mod agy_connection_tests {
         assert!(
             wladder_at < wgate_at,
             "the wrapper ladder must re-point before its own definitive-miss gate"
+        );
+
+        // THE [11.197] TOMBSTONE GUARD: both ladder twins refuse a candidate
+        // the user closed, name the refusal, and re-arm the grave — an
+        // eternal keeper must never park a fresh bridge on a remembered
+        // close (the 2026-09-28 79189666 regeneration).
+        assert!(
+            wrapper.contains("live_row_close_is_remembered"),
+            "the wrapper ladder must refuse a tombstoned candidate"
+        );
+        assert!(
+            wrapper.contains("agy_store_candidate_vouch_refused_tombstoned"),
+            "the wrapper refusal must be traced by name"
+        );
+        assert!(
+            wrapper.contains("rearm_live_row_closes_among"),
+            "the wrapper refusal must re-arm the close"
+        );
+        assert!(
+            ensure.contains("agy_store_candidate_vouch_refused_tombstoned"),
+            "the ensure refusal must be traced by name"
+        );
+        assert!(
+            ensure.contains("live_row_close_is_remembered"),
+            "the ensure ladder must refuse a tombstoned candidate"
         );
 
         // The binding stamps: at birth (start path) and on a store-vouched
