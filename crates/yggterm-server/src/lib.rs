@@ -7710,6 +7710,26 @@ impl YggtermServer {
         }
         let from = session.id.clone();
         let path = session.session_path.clone();
+        // ⛔ [11.200] THE KEY-ID GUARD: a row whose session_path is a
+        // session-named runtime key IS the conversation the key names. A
+        // caller re-binding it onto any other id (the cwd-recency cure's
+        // measured failure: four live rows dragged onto the dead birth id
+        // 0a1f852d) would strand the row's live writer and feed the keeper a
+        // conversation that is not the row's — the exact corruption the
+        // [11.79] repoint arm exists to undo. The key wins; the door refuses.
+        // Re-binding ONTO the key's own id is the [11.200] heal and passes.
+        if let Some(key_id) =
+            session_named_runtime_key_id_for_kind(session.kind, &path)
+            && key_id != new_session_id
+        {
+            emit_identity_trace(
+                "identity_store_candidate_rebind_refused_key_id",
+                &path,
+                Some(&from),
+                new_session_id,
+            );
+            return false;
+        }
         session.id = new_session_id.to_string();
         emit_identity_trace(
             "identity_store_candidate_rebind",
@@ -13918,8 +13938,32 @@ impl YggtermServer {
                 && storage_path
                     .as_deref()
                     .is_some_and(|path| !path.trim().is_empty());
+            // ⛔ [11.200] THE RESTORE DEDUPE KEY: a persisted record may carry
+            // an id its own session-named runtime key contradicts (the cure
+            // livelock poisoned the persisted plane too). For a remote
+            // session-named row the KEY-carried id is `session_id` — the
+            // [11.79] law's live truth — so restore composes the row ON it,
+            // the same heal `restored_local_runtime_id` performs for the
+            // local codex family, and the store-record lookup dedupes on the
+            // healed id (the row meets ITS OWN conversation's record, never
+            // the cwd candidate's).
+            let saved_agent_session_id = if has_saved_agent_identity {
+                if *agent_kind == SessionKind::Antigravity && session_id != id.as_str() {
+                    emit_identity_trace(
+                        "identity_restore_repoint",
+                        normalized_live_key,
+                        Some(id.as_str()),
+                        session_id,
+                    );
+                    session_id.clone()
+                } else {
+                    id.clone()
+                }
+            } else {
+                String::new()
+            };
             let restored_agent_session_id = if has_saved_agent_identity {
-                id.clone()
+                saved_agent_session_id
             } else {
                 session_id.clone()
             };
@@ -16447,6 +16491,38 @@ pub(crate) fn remote_runtime_agent_session_key(
     agent_cli_descriptor(kind)
         .and_then(|descriptor| descriptor.runtime_key_scheme)
         .map(|scheme| format!("{scheme}{session_id}"))
+}
+
+/// The session id a row's OWN session-named runtime key carries — the local
+/// twin of daemon's `session_named_runtime_key_id` (which parses the
+/// remote-agy:// scheme for the identity poll).
+///
+/// ⛔ [11.200] THE KEY IS THE CONVERSATION. For Antigravity the runtime key is
+/// named by the CLI conversation itself (`agy-runtime://<conversation-id>`),
+/// so the path-carried id is the live truth — the same law the [11.79]
+/// repoint arm enforces on remote rows ("the path-carried id of a
+/// session-named runtime key is the live truth"). A cwd-recency store
+/// candidate (or a persisted birth id) that disagrees with it is the STALE
+/// side of the drift, and no write door may drag the row onto it: the cure
+/// livelock of 2026-09-29 dragged FOUR live dev rows onto the dead birth id
+/// 0a1f852d through exactly such a door (242 rebinds in one trace).
+///
+/// Kinds whose runtime key names the ROW rather than the conversation
+/// (opencode-runtime://<row-uuid> — the [11.73] rebind plane) must never
+/// answer here; they are excluded by construction because only Antigravity
+/// is session-named today. Add a kind only with measured evidence that its
+/// runtime key embeds the CLI conversation id.
+pub(crate) fn session_named_runtime_key_id_for_kind(
+    kind: SessionKind,
+    path: &str,
+) -> Option<String> {
+    if kind != SessionKind::Antigravity {
+        return None;
+    }
+    let scheme = agent_cli_descriptor(kind)?.runtime_key_scheme?;
+    let rest = path.strip_prefix(scheme)?;
+    let id = rest.split(['/', '?']).next()?;
+    (!id.trim().is_empty()).then(|| id.to_string())
 }
 
 /// Does THIS host's Antigravity conversation DB hold `session_id`?
@@ -53830,6 +53906,167 @@ terminal_window_id: None,
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// [11.200] The session-named key parser: agy-runtime:// carries the
+    /// conversation id; row-named and remote schemes never answer here.
+    #[test]
+    fn a_session_named_key_carries_its_conversation_id() {
+        assert_eq!(
+            crate::session_named_runtime_key_id_for_kind(
+                SessionKind::Antigravity,
+                "agy-runtime://0a1f852d-7d1a-49e7-ac17-ca3b465a733d",
+            )
+            .as_deref(),
+            Some("0a1f852d-7d1a-49e7-ac17-ca3b465a733d"),
+        );
+        // Suffixed spellings still parse to the id segment.
+        assert_eq!(
+            crate::session_named_runtime_key_id_for_kind(
+                SessionKind::Antigravity,
+                "agy-runtime://abc/machine",
+            )
+            .as_deref(),
+            Some("abc"),
+        );
+        // Row-named scheme: the [11.73] rebind plane must stay untouched.
+        assert_eq!(
+            crate::session_named_runtime_key_id_for_kind(
+                SessionKind::OpenCode,
+                "opencode-runtime://row-uuid",
+            ),
+            None,
+        );
+        // The remote scheme is the identity poll\'s parser\'s job.
+        assert_eq!(
+            crate::session_named_runtime_key_id_for_kind(
+                SessionKind::Antigravity,
+                "remote-agy://dev/abc",
+            ),
+            None,
+        );
+    }
+
+    /// [11.200] THE KEY-ID GUARD at the rebind door: a session-named key row
+    /// refuses a foreign id (the cure livelock\'s write), accepts its own key
+    /// id (the heal), and the opencode row-named plane keeps rebinding.
+    #[test]
+    fn the_rebind_door_refuses_a_foreign_id_for_a_session_named_key() {
+        let mut server = test_server();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let foreign = "22222222-2222-4222-8222-222222222222";
+        let key = format!("agy-runtime://{id}");
+        server.insert_live_session_with_launch(
+            &key,
+            id,
+            SessionKind::Antigravity,
+            &crate::local_session_target(SessionKind::Antigravity, Some("/home/user/proj")),
+            Some("New dev Antigravity".to_string()),
+            false,
+            false,
+        );
+        assert_eq!(
+            server.sessions.get(&key).expect("row").id, id,
+            "an agy row is born on its key\'s conversation id"
+        );
+        assert!(
+            !server.rebind_live_session_store_identity(&key, foreign),
+            "a cwd-recency candidate must not drag the row off its own conversation"
+        );
+        assert_eq!(server.sessions.get(&key).expect("row").id, id);
+
+        // THE HEAL passes the same door: a divergent id re-points onto the
+        // key\'s id, which is the one rebind the law allows.
+        server
+            .sessions
+            .get_mut(&key)
+            .expect("row")
+            .id = foreign.to_string();
+        assert!(server.rebind_live_session_store_identity(&key, id));
+        assert_eq!(server.sessions.get(&key).expect("row").id, id);
+
+        // Row-named schemes keep the [11.73] rebind plane: no key-id guard.
+        let oc_key = format!("opencode-runtime://{foreign}");
+        server.insert_live_session_with_launch(
+            &oc_key,
+            foreign,
+            SessionKind::OpenCode,
+            &crate::local_session_target(SessionKind::OpenCode, Some("/home/user/proj")),
+            Some("New dev OpenCode".to_string()),
+            false,
+            false,
+        );
+        assert!(
+            server.rebind_live_session_store_identity(&oc_key, id),
+            "opencode-runtime rows are row-named; their rebind arms keep working"
+        );
+    }
+
+    /// [11.200] THE RESTORE DEDUPE KEY: a persisted remote-agent record whose
+    /// saved identity contradicts its session-named runtime key restores ON
+    /// the key\'s id, and the trace names the repoint.
+    #[test]
+    fn a_persisted_id_contradicting_its_session_named_key_restores_on_the_key_id() {
+        let key_id = "33333333-3333-4333-8333-333333333333";
+        let saved_id = "44444444-4444-4444-8444-444444444444";
+        let key = format!("remote-agy://dev/{key_id}");
+        let row = PersistedLiveSession {
+            app_launch: None,
+            terminal_identity_exports: Vec::new(),
+            key: key.clone(),
+            id: saved_id.to_string(),
+            title: "New dev Antigravity".to_string(),
+            kind: SessionKind::Antigravity,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/user".to_string()),
+            remote_launch_action: None,
+            storage_path: Some("/home/user/.gemini/antigravity-cli/x.db".to_string()),
+            restore_reason: None,
+            created_by: None,
+            ephemeral: None,
+            agent_launch_options: Default::default(),
+            title_is_explicit: false,
+            outline_prefix: None,
+        };
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-restore-dedupe-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        // Rooted at an EMPTY home: the restore branch consults stores; a unit
+        // test that reads the machine's real CLI store is not a test.
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        )
+        .rooted_at(&home);
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                last_known_app_declares: Default::default(),
+                active_session_path: None,
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: Vec::new(),
+                stored_sessions: Vec::new(),
+                live_sessions: vec![row],
+                session_pty_grids: Vec::new(),
+            },
+            None,
+        );
+        let _ = fs::remove_dir_all(&home);
+        let landed = server
+            .sessions
+            .values()
+            .find(|session| session.kind == SessionKind::Antigravity)
+            .expect("the agy row restores");
+        assert_eq!(
+            landed.id, key_id,
+            "the key\'s conversation id is the restore identity; the saved id was the cure livelock\'s poison"
+        );
     }
 
     /// LOCK: the restore door keeps asking the tombstone plane. A working veto

@@ -17501,9 +17501,27 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
     // while the audit flagged the very mismatch the follower believed it had
     // satisfied. One id authority: both wires read the persisted record.
     let (candidates, user_home) = {
-        let runtime = runtime
+        // mut: the [11.200] heal below re-points divergent row ids.
+        let mut runtime = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
+        // ⛔ [11.200] THE HEAL, FIRST: a row whose id contradicts its own
+        // session-named runtime key is carrying a stale identity (the cure
+        // livelock poisoned rows and their persisted records). The key is
+        // the live conversation; re-point the id TO the key before this
+        // tick reads any store, so the read and the row it serves agree.
+        // The door traces the rebind; the next persist writes the healed
+        // record, which also ends the restore-side flip.
+        for row in runtime.server.persisted_live_sessions() {
+            if let Some(key_id) =
+                crate::session_named_runtime_key_id_for_kind(row.kind, &row.key)
+                && key_id != row.id
+            {
+                runtime
+                    .server
+                    .rebind_live_session_store_identity(&row.key, &key_id);
+            }
+        }
         let rows: Vec<(String, SessionKind, String, String, Option<String>)> = runtime
             .server
             .persisted_live_sessions()
@@ -17564,6 +17582,15 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                     local_answers.insert(path.clone(), title);
                     continue;
                 }
+            }
+            // ⛔ [11.200] A session-named key never takes a cwd candidate:
+            // the row's conversation is IN its key, so "the session this cwd
+            // last viewed" cannot be its identity — queueing the cure for
+            // such a row is the livelock's queue side (the door now refuses
+            // the rebind; refusing the QUEUE is what keeps the tick's
+            // outcome honest instead of a silent cure_no_change).
+            if crate::session_named_runtime_key_id_for_kind(*kind, path).is_some() {
+                continue;
             }
             // THE STORE-CANDIDATE CURE (owner directive 2026-09-10): a live
             // loopback row whose store read is SILENT may be carrying a birth
@@ -39658,6 +39685,53 @@ mod tests {
         let nothing_mid_turn = std::collections::HashSet::new();
         let faults = super::collect_stuck_launch_faults(&sessions, &nothing_mid_turn, |_| false);
         assert!(faults.is_empty(), "{faults:?}");
+    }
+
+    /// [11.200] LOCK: the title-follow chore heals a divergent session-named
+    /// id BEFORE it snapshots candidates, and never queues a cwd candidate for
+    /// a session-named key — the cure livelock (four dev rows dragged onto the
+    /// dead birth id 0a1f852d, 242 rebinds) ran through exactly this queue.
+    #[test]
+    fn the_title_follow_chore_heals_before_reading_and_never_cures_a_session_named_key() {
+        let source = include_str!("daemon.rs");
+        let chore = source
+            .split("fn run_row_title_follow_chore(")
+            .nth(1)
+            .expect("chore body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+
+        let heal_at = chore
+            .find("THE HEAL, FIRST")
+            .expect("the heal must exist");
+        let snapshot_at = chore
+            .find("let rows: Vec<(String, SessionKind, String, String, Option<String>)>")
+            .expect("the candidate snapshot");
+        assert!(
+            heal_at < snapshot_at,
+            "the heal must run before the snapshot so the tick reads the healed id"
+        );
+        assert!(
+            chore[heal_at..snapshot_at]
+                .contains("rebind_live_session_store_identity"),
+            "the heal re-points through the guarded door, never a raw field write"
+        );
+
+        let skip_at = chore
+            .find("A session-named key never takes a cwd candidate")
+            .expect("the queue-side skip must exist");
+        let cure_at = chore
+            .find("THE STORE-CANDIDATE CURE (owner directive 2026-09-10)")
+            .expect("the cure must still exist for row-named kinds");
+        assert!(
+            skip_at < cure_at,
+            "a session-named key must be skipped before the cure queue is consulted"
+        );
+        assert!(
+            chore[skip_at..cure_at].contains("continue"),
+            "the skip is a continue, not a fallthrough into the queue"
+        );
     }
 
     #[test]

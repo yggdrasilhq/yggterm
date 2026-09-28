@@ -24,6 +24,11 @@ INVARIANTS (each maps to a lived owner pain):
                  (--peer), older than the grace — the detached-restart leak
                  ([11.163] family) — plus yggterm-born CLIs whose row marker
                  carries a remembered close ([11.197] regeneration)
+  identity_dedupe  a live row whose id contradicts its own session-named
+                 runtime key (the [11.200] restore-dedupe class: the
+                 store-candidate cure dragged four live dev rows onto the
+                 dead birth id 0a1f852d), or a foreign store-candidate
+                 rebind in the recent trace (the livelock's churn witness)
 
 Run it UNATTENDED (cron / the ygg-ci watcher / any seat): exit 0 = clean,
 1 = at least one violation. `--json` renders the report for machines.
@@ -317,6 +322,107 @@ def invariant_geometry(report, rows):
         report.ok("geometry")
 
 
+def live_snapshot_rows():
+    """The daemon's IN-MEMORY agent rows, from `server snapshot` (the ghost
+    rows of [11.200] are daemon-memory rows; the persisted copy can be clean
+    while the live map is poisoned). (path, kind, id)."""
+    try:
+        out = subprocess.run(
+            [str(YGGTERM_BIN), "server", "snapshot"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    try:
+        snap = json.loads(out.stdout)
+    except ValueError:
+        return []
+    rows = []
+    for entry in snap.get("live_sessions") or []:
+        if not isinstance(entry, dict):
+            continue
+        rows.append({
+            "path": str(entry.get("session_path", "")),
+            "kind": str(entry.get("kind", "")),
+            "id": str(entry.get("id", "")),
+        })
+    return rows
+
+
+def invariant_identity_dedupe(report, rows, window_secs=900):
+    """[11.200] THE KEY IS THE CONVERSATION: for a session-named runtime key
+    (agy-runtime://<id>), the path-carried id is the live truth — the same
+    law the [11.79] repoint arm enforces on remote rows. A row wearing a
+    foreign id is the cure livelock's poison, and it drives the keeper to
+    resume a conversation that is not the row's."""
+    diverged = []
+    for row in rows:
+        # The live snapshot spells kinds lowercase ("antigravity"); the
+        # persisted copy uses "Antigravity" — compare case-insensitively.
+        if row["kind"].lower() != "antigravity":
+            continue
+        path = row["path"]
+        if not path.startswith("agy-runtime://"):
+            continue
+        key_id = path[len("agy-runtime://"):].split("/")[0]
+        if key_id and row["id"] and key_id != row["id"]:
+            diverged.append(f"{path[:56]}: id {row['id'][:13]}… ≠ key id {key_id[:13]}…")
+    if diverged:
+        report.fail(
+            "identity_dedupe",
+            "row id contradicts its session-named key (the [11.200] "
+            "restore-dedupe class): " + "; ".join(diverged[:3]),
+        )
+    else:
+        report.ok("identity_dedupe")
+        return
+
+    # When the row invariant is RED, also say whether the churn is LIVE:
+    # a foreign store-candidate rebind inside the trace window means the
+    # poison is still being written, not merely inherited from old state.
+    try:
+        traces = sorted(
+            (HOME / ".yggterm").glob("ytrace.g*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        newest = traces[-1] if traces else None
+        cutoff = time.time() - window_secs
+        foreign = 0
+        if newest and newest.stat().st_mtime >= cutoff:
+            with newest.open(errors="replace") as handle:
+                for line in handle:
+                    if "identity_store_candidate_rebind" not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if event.get("name") != "identity_store_candidate_rebind":
+                        continue
+                    payload = event.get("payload") or {}
+                    path = str(payload.get("session_path", ""))
+                    to_id = str(payload.get("to_id", ""))
+                    key_id = path[len("agy-runtime://"):].split("/")[0] \
+                        if path.startswith("agy-runtime://") else ""
+                    if key_id and to_id and key_id != to_id:
+                        foreign += 1
+        if foreign:
+            report.fail(
+                "identity_dedupe",
+                f"the livelock is LIVE: {foreign} foreign store-candidate "
+                f"rebind(s) in the last {window_secs // 60} min of "
+                f"{newest.name}",
+            )
+        else:
+            report.ok(
+                "identity_dedupe",
+                "row divergence present but no live foreign rebind in the "
+                f"last {window_secs // 60} min — inherited poison only",
+            )
+    except OSError:
+        pass
+
+
 def live_runtime_keys():
     keys = set()
     try:
@@ -525,6 +631,7 @@ def main():
     invariant_untitled(report, rows)
     invariant_geometry(report, rows)
     invariant_ghost_pids(report, args.peer)
+    invariant_identity_dedupe(report, live_snapshot_rows())
     if args.freeze_window_secs > 0:
         invariant_freeze_window(report, args.freeze_window_secs)
     else:
