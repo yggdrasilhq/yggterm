@@ -690,6 +690,24 @@ class Probe:
             time.sleep(0.05)
         return statistics.median(walls) if walls else None
 
+    def gui_overhead_ms(self, samples: int = 3) -> float | None:
+        """GUI-plane round-trip floor: one minimal dom-eval through the same
+        app-control surface every action verb pays on. The CLI floor is
+        daemon-side and stays QUIET while the GUI's UI thread is contended —
+        the 2026-09-29 drag-warm-slowdown attribution measured drag verbs
+        inflating ~1.2-2x under a concurrent sibling probe + perf capture
+        while the CLI floor sat flat at 68 ms. Report both planes; a quiet
+        cli_overhead_ms with an inflated gui_overhead_ms names GUI-side
+        contention instead of laundering it into the action's numbers."""
+        walls = []
+        for _ in range(samples):
+            t0 = time.perf_counter()
+            r = self.dom_eval("dioxus.send(1);", timeout=5, retries=0)
+            if r.get("error") is None:
+                walls.append(int((time.perf_counter() - t0) * 1000))
+            time.sleep(0.05)
+        return statistics.median(walls) if walls else None
+
     def ytrace_events(self, since_ms: int, lines: int = 1200) -> list[dict]:
         try:
             proc = subprocess.run(
@@ -2366,6 +2384,9 @@ def main() -> int:
     report["cli_overhead_ms"] = probe.ping_overhead_ms()
     report["cli_overhead_end_ms"] = None
     log(f"cli overhead floor: {report['cli_overhead_ms']} ms")
+    report["gui_overhead_ms"] = probe.gui_overhead_ms()
+    report["gui_overhead_end_ms"] = None
+    log(f"gui overhead floor: {report['gui_overhead_ms']} ms")
 
     try:
         for action in actions:
@@ -2405,10 +2426,16 @@ def main() -> int:
         report["rows_left_behind"] = len(probe.spawned_paths)
         end_floor = probe.ping_overhead_ms(samples=3)
         report["cli_overhead_end_ms"] = end_floor
+        end_gui = probe.gui_overhead_ms()
+        report["gui_overhead_end_ms"] = end_gui
         if end_floor and report["cli_overhead_ms"]:
             drift = end_floor - report["cli_overhead_ms"]
             report["harness_load_drift_ms"] = drift
             log(f"overhead drift {drift:+d} ms (the probe's own pollution proxy)")
+        if end_gui and report["gui_overhead_ms"]:
+            gdrift = end_gui - report["gui_overhead_ms"]
+            report["gui_load_drift_ms"] = gdrift
+            log(f"gui overhead drift {gdrift:+d} ms (GUI-plane pollution proxy)")
         with open(args.out, "w") as fh:
             json.dump(report, fh, indent=1, default=str)
         log(f"report → {args.out}")
