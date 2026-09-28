@@ -31584,6 +31584,8 @@ Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the k
 
 ## ⛔ [11.197] THE GHOST REGENERATION LOOP — the keeper cycle for a store-absent row vouches it onto a REMEMBERED-CLOSED conversation and re-spawns a headless bridge CLI on every pass (guard alarm ACK-3d6015dc64, chased to ground 2026-09-28 23:00-23:59 IST, zcode sess_f343788a on jojo, work FROM dev)
 
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
 SYMPTOM — the usability guard's ghost_pids alarms regenerate after every reap: "agy CLI processes attached to no runtime row" come back within the hour, each new generation holding conversations the owner closed (79189666, 12198ca1, 656843b5).
 
 ROOT — measured live, complete chain in dev's trace plane (18:02 UTC window): (1) the jojo GUI daemon holds live `remote-agy://dev/7c2a3aec` rows (the owner's sidebar; the keep-alive spec makes keeping them CORRECT) and ssh-resumes them every cycle; (2) the row id is store-absent fabricated lineage, so the [11.183] store-candidate vouch ladder (wrapper half, `agy_store_candidate_vouch` … `definitive_store_miss_binds_the_cwd_newest_conversation`) binds the resume onto the cwd-newest REAL conversation — which was 79189666, a row the user CLOSED (unexpired tombstone in removed-rows.json); (3) the daemon spawns a fresh agy (YGGTERM_SESSION_ID=agy-runtime://79189666…) as a headless bridge; (4) the probe's ghost detection matches ARGV conversation ids against row keys, so the rebound CLI looks like a ghost even when its own row is alive — the alarm was the only witness, and the [11.194] reap of such a "ghost" risks killing a LIVE bridge. Two defects, one loop: the ladder never asks the tombstone plane, and the probe never asks the launch marker.
