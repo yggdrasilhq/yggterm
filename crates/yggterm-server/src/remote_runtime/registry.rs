@@ -13,6 +13,11 @@ const REMOTE_RUNTIME_DB_FILENAME: &str = "remote-runtime.db";
 const REMOTE_RUNTIME_SESSIONS_DIR: &str = "sessions";
 const TRANSCRIPT_LOG_FILENAME: &str = "transcript.log";
 const PTY_LOG_FILENAME: &str = "pty.log";
+/// THE [11.199] window after which a pre-interactive runtime row is a stuck
+/// attach, not an arriving one. The bridge serve loop marks `Interactive` on
+/// the FIRST observed output — seconds, never an hour. Measured corpses sat
+/// for months.
+const AGED_ATTACH_AFTER: TimeDuration = TimeDuration::hours(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -464,6 +469,56 @@ impl RemoteRuntimeRegistry {
         )?;
         self.get_session(session_id)?
             .with_context(|| format!("reloading runtime session {session_id} after transition"))
+    }
+
+    /// THE [11.199] ATTACH AGING: a runtime row that never left its
+    /// pre-interactive states is a stuck attach, and nothing aged it out —
+    /// measured 2026-09-29: dev held 14 antigravity rows at `attaching_pty`
+    /// (their `last_transition_at` frozen at the register+15ms mark), and
+    /// jojo held a codex row there SINCE 2026-04-15. The keeper's re-register
+    /// and re-transition refresh `updated_at`/`last_transition_at` on every
+    /// pass, so age reads `created_at` — the one timestamp no churn rewrites.
+    /// Aged rows transition to `Failed` (the same verdict the bridge serve
+    /// loop gives "runtime exited before producing output") with a named
+    /// detail and a full event-log row, so the snapshot stops reading a
+    /// five-month corpse as "attaching" and the evidence survives. Live and
+    /// terminal states are never touched, and an attach younger than the
+    /// window ([`AGED_ATTACH_AFTER`]) is by definition still arriving.
+    pub fn age_stale_attaches(&self) -> Result<Vec<String>> {
+        let now = OffsetDateTime::now_utc();
+        let mut aged = Vec::new();
+        for session in self.list_sessions()? {
+            if !matches!(
+                session.state,
+                RemoteRuntimeSessionState::Created
+                    | RemoteRuntimeSessionState::Starting
+                    | RemoteRuntimeSessionState::RestoringContext
+                    | RemoteRuntimeSessionState::AttachingPty
+            ) {
+                continue;
+            }
+            let born = match OffsetDateTime::parse(&session.created_at, &Rfc3339) {
+                Ok(born) => born,
+                // An unparseable birth stamp vouches nothing — the honest
+                // skip, never a guess about a row's age.
+                Err(_) => continue,
+            };
+            if now - born <= AGED_ATTACH_AFTER {
+                continue;
+            }
+            self.transition_session(
+                &session.session_id,
+                RemoteRuntimeSessionState::Failed,
+                Some("attach never advanced to interactive (aged out)"),
+                &json!({
+                    "policy": "a_stuck_attach_ages_out",
+                    "created_at": session.created_at,
+                    "aged_after_seconds": AGED_ATTACH_AFTER.whole_seconds(),
+                }),
+            )?;
+            aged.push(session.session_id);
+        }
+        Ok(aged)
     }
 
     pub fn list_events(&self, session_id: &str, limit: usize) -> Result<Vec<RemoteRuntimeEvent>> {
@@ -922,5 +977,125 @@ mod tests {
                 .is_empty()
         );
         assert!(!runtime_dir.exists());
+    }
+
+    fn register_attach(registry: &RemoteRuntimeRegistry, session_id: &str) {
+        registry
+            .register_session(RemoteRuntimeSessionInput {
+                session_id: Some(session_id.to_string()),
+                machine_key: "guihost".to_string(),
+                runtime_kind: RemoteRuntimeKind::Antigravity,
+                title: "New dev Antigravity".to_string(),
+                cwd: Some("/home/user/git/probe-workspace".to_string()),
+                summary: None,
+                requires_terminal: true,
+            })
+            .expect("register session");
+        registry
+            .transition_session(
+                session_id,
+                RemoteRuntimeSessionState::AttachingPty,
+                Some("ensuring daemon-owned agent runtime"),
+                &json!({}),
+            )
+            .expect("transition to attaching_pty");
+    }
+
+    fn backdate_created_at(registry: &RemoteRuntimeRegistry, session_id: &str, rfc3339: &str) {
+        registry
+            .conn
+            .execute(
+                "UPDATE runtime_sessions SET created_at = ?1 WHERE session_id = ?2",
+                params![rfc3339, session_id],
+            )
+            .expect("backdate created_at");
+    }
+
+    /// THE [11.199] AGING LAW, stuck half: a row parked in a pre-interactive
+    /// state past the window ages out to Failed, by name, with its event log
+    /// intact. `created_at` is the age key — the keeper's re-register and
+    /// re-transition refresh the other timestamps every pass (measured:
+    /// dev's churned corpses carried fresh `last_transition_at` for days).
+    #[test]
+    fn a_stuck_attach_ages_out_to_failed_by_name() {
+        let registry = test_registry();
+        register_attach(&registry, "corpse-old");
+        backdate_created_at(
+            &registry,
+            "corpse-old",
+            "2026-09-28T07:42:56.176209433Z",
+        );
+
+        let aged = registry.age_stale_attaches().expect("age stale attaches");
+        assert_eq!(aged, vec!["corpse-old".to_string()]);
+
+        let corpse = registry
+            .get_session("corpse-old")
+            .expect("reload aged corpse")
+            .expect("corpse still present");
+        assert_eq!(corpse.state, RemoteRuntimeSessionState::Failed);
+        assert_eq!(corpse.health, RemoteRuntimeHealth::Failed);
+        let events = registry
+            .list_events("corpse-old", 10)
+            .expect("list corpse events");
+        let aged_event = events
+            .iter()
+            .find(|event| event.detail.as_deref() == Some("attach never advanced to interactive (aged out)"))
+            .expect("the aging is on the event log");
+        assert_eq!(
+            aged_event.to_state,
+            Some(RemoteRuntimeSessionState::Failed)
+        );
+    }
+
+    /// THE [11.199] AGING LAW, untouched halves: an attach inside the window
+    /// is still arriving, and a row that made it to `Interactive` never ages
+    /// no matter how old its birth — the owner's weeks-old live rows must
+    /// read exactly as before.
+    #[test]
+    fn a_fresh_attach_and_a_live_row_are_never_aged() {
+        let registry = test_registry();
+        register_attach(&registry, "attach-fresh");
+        let live = {
+            registry
+                .register_session(RemoteRuntimeSessionInput {
+                    session_id: Some("live-old".to_string()),
+                    machine_key: "guihost".to_string(),
+                    runtime_kind: RemoteRuntimeKind::Codex,
+                    title: "New dev Codex".to_string(),
+                    cwd: None,
+                    summary: None,
+                    requires_terminal: true,
+                })
+                .expect("register live row");
+            registry
+                .transition_session(
+                    "live-old",
+                    RemoteRuntimeSessionState::Interactive,
+                    Some("bridge output observed"),
+                    &json!({}),
+                )
+                .expect("transition live row");
+            backdate_created_at(&registry, "live-old", "2026-04-15T21:28:26.974643497Z");
+            registry
+                .get_session("live-old")
+                .expect("reload live row")
+                .expect("live row present")
+        };
+
+        let aged = registry.age_stale_attaches().expect("age stale attaches");
+        assert!(aged.is_empty(), "nothing inside the law's reach aged");
+
+        let fresh = registry
+            .get_session("attach-fresh")
+            .expect("reload fresh attach")
+            .expect("fresh attach present");
+        assert_eq!(fresh.state, RemoteRuntimeSessionState::AttachingPty);
+        let live = registry
+            .get_session("live-old")
+            .expect("reload live row")
+            .expect("live row present");
+        assert_eq!(live.state, RemoteRuntimeSessionState::Interactive);
+        assert_eq!(live.health, RemoteRuntimeHealth::Healthy);
     }
 }

@@ -12915,9 +12915,14 @@ impl YggtermServer {
                 // the holder deadline and dissolve the row (measured
                 // 2026-09-28 22:2x: the respawn vouched 79189666 while an
                 // orphaned agy held it — the owner's working session
-                // dissolved into the wait banner). The fd-based scan is the
-                // same witness the holder-wait would use later — asked HERE,
-                // before the bind, so the row fresh-starts instead.
+                // dissolved into the wait banner). THE [11.199] WITNESS
+                // UPGRADE: the ask is the FULL holder witness the wait loop
+                // itself consults — argv (`--conversation <id>` never leaves
+                // a live bridge's cmdline) plus the fd arm (whose open paths
+                // close between flushes). A daemon-owned bridge of ANY
+                // host's peer row runs on THIS host — the CLI store is
+                // host-resident — so this one local walk is the cross-host
+                // contention truth the [11.197] residual asked for.
                 // THE [11.197] TOMBSTONE GUARD: a candidate the user CLOSED
                 // is not a candidate — the vouch would bind this row onto a
                 // remembered-closed conversation (the store still holds it;
@@ -12932,7 +12937,7 @@ impl YggtermServer {
                         )
                     })
                     .unwrap_or(false)
-                && linux_proc_pids_holding_session_path(&candidate_id).is_empty()
+                && external_agent_resume_processes_for_session(kind, &candidate_id).is_empty()
             {
                 if let Some(ygg_home) = self.yggterm_home.clone() {
                     append_trace_event(
@@ -13323,6 +13328,13 @@ impl YggtermServer {
             .clone()
             .context("the yggterm home is unresolved on this host")?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
+        // THE [11.199] ATTACH AGING: the ensure runs at least once per
+        // keeper pass, so the churn itself drives the sweep — stuck
+        // pre-interactive rows (measured: a codex corpse at attaching_pty
+        // for five months) age out by name instead of polling the snapshot
+        // forever. Best-effort: an aging failure must never block the
+        // register below.
+        let _ = registry.age_stale_attaches();
         let _ = registry.register_session(RemoteRuntimeSessionInput {
             session_id: Some(session_id.to_string()),
             machine_key: "local".to_string(),
@@ -13597,6 +13609,9 @@ impl YggtermServer {
             .clone()
             .context("the yggterm home is unresolved on this host")?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
+        // THE [11.199] ATTACH AGING (the picker arm's twin of the ensure
+        // site above): best-effort, never blocking the register.
+        let _ = registry.age_stale_attaches();
         let _ = registry.register_session(RemoteRuntimeSessionInput {
             session_id: Some(session_id.to_string()),
             machine_key: "local".to_string(),
@@ -25305,14 +25320,15 @@ pub fn run_remote_resume_agent(
         // THE [11.195] LIVE-HOLDER GUARD (the wrapper's twin): vouching onto
         // a conversation an orphaned CLI still has open waits the row into
         // the holder deadline and dissolves it (measured 2026-09-28 22:2x).
-        // The fd-based scan is the same witness the holder wait uses — asked
-        // HERE, before the bind, so the row fresh-starts instead.
+        // THE [11.199] WITNESS UPGRADE: the full holder witness the holder
+        // wait itself consults — argv plus the fd arm — asked HERE, before
+        // the bind, so the row fresh-starts instead.
         // THE [11.197] TOMBSTONE GUARD (the wrapper's twin): a candidate the
         // user CLOSED is not a candidate — see the witness block above.
         && !remote_runtime_agent_session_key(kind, &candidate_id)
             .map(|candidate_key| live_row_close_is_remembered(&home, &candidate_key))
             .unwrap_or(false)
-        && linux_proc_pids_holding_session_path(&candidate_id).is_empty()
+        && external_agent_resume_processes_for_session(kind, &candidate_id).is_empty()
     {
         append_trace_event(
             &home,
@@ -61337,10 +61353,13 @@ mod agy_connection_tests {
         );
     }
 
-    /// THE [11.195] LIVE-HOLDER LAW: the ladders ask the fd-based witness
+    /// THE [11.195] LIVE-HOLDER LAW: the ladders ask the holder witness
     /// BEFORE binding — a conversation an orphaned CLI still has open is
     /// never a candidate (the row fresh-starts instead of dissolving into
-    /// the holder wait). Both ladders carry it.
+    /// the holder wait). Both ladders carry it. THE [11.199] UPGRADE: the
+    /// witness is the FULL scanner the holder wait itself uses (argv + fd),
+    /// not the fd arm alone — a live bridge's `--conversation <id>` never
+    /// leaves its cmdline, while its log fds close between flushes.
     #[test]
     fn the_ladders_ask_the_holder_witness_before_binding_a_candidate() {
         let source = include_str!("lib.rs");
@@ -61352,8 +61371,10 @@ mod agy_connection_tests {
             .next()
             .unwrap();
         assert!(
-            ensure.contains("linux_proc_pids_holding_session_path(&candidate_id).is_empty()"),
-            "the ensure ladder asks the fd witness before the bind"
+            ensure.contains(
+                "external_agent_resume_processes_for_session(kind, &candidate_id).is_empty()"
+            ),
+            "the ensure ladder asks the full holder witness before the bind"
         );
         let wrapper = source
             .split("pub fn run_remote_resume_agent(\n    kind: SessionKind,")
@@ -61363,8 +61384,10 @@ mod agy_connection_tests {
             .next()
             .unwrap();
         assert!(
-            wrapper.contains("linux_proc_pids_holding_session_path(&candidate_id).is_empty()"),
-            "the wrapper ladder asks the fd witness before the bind"
+            wrapper.contains(
+                "external_agent_resume_processes_for_session(kind, &candidate_id).is_empty()"
+            ),
+            "the wrapper ladder asks the full holder witness before the bind"
         );
     }
 }
