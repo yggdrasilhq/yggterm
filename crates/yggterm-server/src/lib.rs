@@ -3125,6 +3125,63 @@ fn remote_codex_bridge_args_match(args: &[String], session_id: &str) -> bool {
     remote_agent_bridge_args_match(args, session_id, SessionKind::Codex)
 }
 
+/// Whether one process is a bridge of `session_id`, judged on BOTH name
+/// shapes a bridge can carry.
+///
+/// - The ARGV rule is the spawner: a `yggterm server remote <verb> <id>`
+///   wrapper. It is the only shape the kill sweep could see before [11.198].
+/// - The MARKER rule is the spawned: a daemon-owned bridge (`agy
+///   --conversation …`, parent the daemon) carries `YGGTERM_SESSION_ID`
+///   naming its runtime key or its row-scheme twin, stamped by OUR daemon at
+///   launch. Its argv is the agent's and never contains `server remote`, so
+///   the argv rule can never see it — measured 2026-09-29 on dev: two
+///   daemon-child agy bridges (markers `agy-runtime://…`) alive while a
+///   terminate for their own session matched nothing, killed nothing, and
+///   reported clean success ([11.198]).
+///
+/// `args`/`marker` are Options, not bare values: an unreadable /proc entry is
+/// evidence of neither shape, and `None` must answer false, not panic. A
+/// foreign marker names nothing — the match is the provenance, not the
+/// variable's existence.
+fn process_is_remote_agent_bridge(
+    args: Option<&[String]>,
+    session_marker: Option<&str>,
+    session_id: &str,
+    kind: SessionKind,
+) -> bool {
+    if args.is_some_and(|args| remote_agent_bridge_args_match(args, session_id, kind)) {
+        return true;
+    }
+    let Some(marker) = session_marker else {
+        return false;
+    };
+    if remote_runtime_agent_session_key(kind, session_id).as_deref() == Some(marker) {
+        return true;
+    }
+    // The row-scheme form carries a machine segment (`remote-agy://dev/<id>`)
+    // when a wrapper is mid-resume; the session id is still the LAST segment
+    // and the scheme prefix is ours.
+    agent_cli_descriptor(kind)
+        .and_then(|descriptor| descriptor.remote_row_scheme)
+        .is_some_and(|scheme| {
+            marker.starts_with(scheme) && marker.ends_with(&format!("/{session_id}"))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_session_marker(pid: u32) -> Option<String> {
+    let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    bytes
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| core::str::from_utf8(entry).ok())
+        .find_map(|entry| {
+            entry
+                .strip_prefix("YGGTERM_SESSION_ID=")
+                .or_else(|| entry.strip_prefix("LC_YGGTERM_SESSION_ID="))
+                .map(str::to_string)
+        })
+}
+
 #[cfg(target_os = "linux")]
 fn linux_remote_agent_bridge_pids_for_session(session_id: &str, kind: SessionKind) -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -3136,9 +3193,12 @@ fn linux_remote_agent_bridge_pids_for_session(session_id: &str, kind: SessionKin
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| *pid != current_pid)
         .filter(|pid| {
-            linux_proc_cmdline_args(*pid)
-                .as_deref()
-                .is_some_and(|args| remote_agent_bridge_args_match(args, session_id, kind))
+            process_is_remote_agent_bridge(
+                linux_proc_cmdline_args(*pid).as_deref(),
+                linux_proc_session_marker(*pid).as_deref(),
+                session_id,
+                kind,
+            )
         })
         .collect::<Vec<_>>();
     pids.sort_unstable();
@@ -28427,6 +28487,7 @@ pub fn run_remote_terminate_cc(session_id: &str) -> anyhow::Result<()> {
 pub fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow::Result<()> {
     let runtime_key = remote_runtime_agent_session_key(kind, session_id)
         .with_context(|| format!("no daemon runtime lane for session kind {kind:?}"))?;
+    let mut matched_rows = 0usize;
     if let Ok(home) = resolve_yggterm_home() {
         let current_endpoint = default_endpoint(&home);
         let mut endpoints = daemon::reachable_versioned_daemon_statuses(&home)
@@ -28442,16 +28503,27 @@ pub fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow
         }
         endpoints.sort_by_key(|endpoint| format!("{endpoint:?}"));
         endpoints.dedup();
+        // The honest match count: what THIS sweep could SEE before it asked
+        // for the removals. `remove_session` answers "delivered", never
+        // "removed", so the snapshot taken first is the only witness that the
+        // ask had a subject — without it a terminate that matched NOTHING
+        // (row absent everywhere, no bridge by name) was indistinguishable
+        // from one that killed, and the close that paid for the ask recorded
+        // clean success ([11.198]).
         for endpoint in endpoints {
+            let matching = snapshot(&endpoint)
+                .map(|(daemon_snapshot, _)| {
+                    daemon_snapshot
+                        .live_sessions
+                        .into_iter()
+                        .filter(|live| live.session_path == runtime_key || live.id == session_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            matched_rows += matching.len();
             let _ = remove_session(&endpoint, &runtime_key, false);
-            if let Ok((daemon_snapshot, _)) = snapshot(&endpoint) {
-                for live in daemon_snapshot
-                    .live_sessions
-                    .into_iter()
-                    .filter(|live| live.id == session_id)
-                {
-                    let _ = remove_session(&endpoint, &live.session_path, false);
-                }
+            for live in &matching {
+                let _ = remove_session(&endpoint, &live.session_path, false);
             }
         }
         if let Ok(registry) = RemoteRuntimeRegistry::open(&home) {
@@ -28478,6 +28550,30 @@ pub fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow
                 "kind": format!("{kind:?}"),
                 "runtime_key": runtime_key,
                 "count": terminated_bridge_count,
+            }),
+        );
+    }
+    // THE MATCHED-NOTHING HONESTY TWIN of the killed-bridges trace above: a
+    // terminate that saw no live row on any coexisting daemon and found no
+    // bridge process to kill must SAY SO. Before [11.198] this shape answered
+    // clean Ok — the close that paid for the ask recorded
+    // `explicit_remote_session_close_requested, error: None` while the bridge
+    // it named lived on for hours. Best-effort stays best-effort: the verb
+    // still succeeds, but the nothing is now a named, greppable fact.
+    if matched_rows == 0
+        && terminated_bridge_count == 0
+        && let Ok(home) = resolve_yggterm_home()
+    {
+        append_trace_event(
+            &home,
+            "remote",
+            "terminate_agent",
+            "remote_agent_terminate_matched_nothing",
+            json!({
+                "session_id": session_id,
+                "kind": format!("{kind:?}"),
+                "runtime_key": runtime_key,
+                "note": "no live row on any coexisting daemon and no bridge process answered to this session - the close that paid for this ask removed nothing ([11.198])",
             }),
         );
     }
@@ -39194,6 +39290,81 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // [11.198] THE BRIDGE KILL READS LAUNCH TRUTH, NOT JUST WRAPPER ARGV — a
+    // daemon-owned bridge's argv is the agent's (`agy --conversation …`); only
+    // its YGGTERM_SESSION_ID marker names the session. The argv-only sweep
+    // could never see it, so a terminate matched nothing, killed nothing, and
+    // reported clean success while the bridge lived on for hours.
+    #[test]
+    fn the_bridge_kill_names_the_daemon_child_by_its_marker() {
+        let id = "7c2a3aec-af69-4559-baf6-8894658fbae3";
+        let kind = SessionKind::Antigravity;
+        // The daemon child: agent argv, marker names the runtime key.
+        let agent_argv = vec![
+            "agy".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            format!("--conversation {id}"),
+        ];
+        let marker = remote_runtime_agent_session_key(kind, id).unwrap();
+        assert!(process_is_remote_agent_bridge(
+            Some(&agent_argv),
+            Some(&marker),
+            id,
+            kind
+        ));
+        // The pre-[11.198] blind spot, stated exactly: that argv alone named
+        // nothing.
+        assert!(!remote_agent_bridge_args_match(&agent_argv, id, kind));
+        assert!(!process_is_remote_agent_bridge(
+            Some(&agent_argv),
+            None,
+            id,
+            kind
+        ));
+        // The row-scheme twin (a wrapper mid-resume carries the machine
+        // segment) also names the session.
+        assert!(process_is_remote_agent_bridge(
+            None,
+            Some(&format!("remote-agy://dev/{id}")),
+            id,
+            kind
+        ));
+        // A foreign marker names nothing.
+        assert!(!process_is_remote_agent_bridge(
+            None,
+            Some("agy-runtime://11111111-2222-3333-4444-555555555555"),
+            id,
+            kind
+        ));
+        // A foreign scheme carrying the SAME id is not this kind's bridge.
+        assert!(!process_is_remote_agent_bridge(
+            None,
+            Some(&format!("muse-runtime://{id}")),
+            id,
+            kind
+        ));
+        // No evidence at all is no match.
+        assert!(!process_is_remote_agent_bridge(None, None, id, kind));
+    }
+
+    // The rule is registry-derived — no per-CLI literals for a fifth CLI to
+    // fall behind. One assertion per registered remote whose lane the sweep
+    // must keep seeing.
+    #[test]
+    fn the_marker_rule_is_registry_derived_for_the_registered_remotes() {
+        let id = "019d1518-ac2e-7663-aba5-49c98fae2603";
+        for (kind, scheme) in [
+            (SessionKind::Antigravity, "agy-runtime://"),
+            (SessionKind::Codex, "codex-runtime://"),
+            (SessionKind::ClaudeCode, "cc-runtime://"),
+        ] {
+            let marker = remote_runtime_agent_session_key(kind, id)
+                .unwrap_or_else(|| panic!("{kind:?} has no daemon runtime lane"));
+            assert_eq!(marker, format!("{scheme}{id}"), "kind {kind:?}");
+            assert!(process_is_remote_agent_bridge(None, Some(&marker), id, kind));
+        }
+    }
 
     #[test]
     fn session_preview_stamp_tracks_arc_identity() {
