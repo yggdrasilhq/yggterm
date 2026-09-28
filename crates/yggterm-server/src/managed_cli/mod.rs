@@ -199,6 +199,35 @@ struct ManagedCliRefreshState {
     last_successful_refresh_ms: Option<u64>,
     #[serde(default)]
     managed_versions: BTreeMap<String, String>,
+    /// Per-tool last INSTALL-STEP failure ([11.182] follow-up, the amber
+    /// treadmill of 2026-09-28): one tool whose upgrade hangs (measured:
+    /// `mimo upgrade` wedges deterministically on dev, 14h+ in an epoll wait)
+    /// used to fail every walk, the walk never persisted success, the TTL
+    /// stayed expired forever, and EVERY row launch re-ran the install under
+    /// the machine-wide lock — ambering new sessions on a schedule. A tool
+    /// that failed recently is backed off (skipped), so the walk completes,
+    /// the success state persists, and the lock frees.
+    #[serde(default)]
+    failed_at_ms: BTreeMap<String, u64>,
+}
+
+/// How long a tool whose install step failed is skipped by walks and by the
+/// launch-path ensure. Long enough to starve a permanently-wedged upgrader
+/// out of every walk; short enough that a transient npm hiccup retries this
+/// hour.
+const MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS: u64 = 30 * 60_000;
+
+/// The tool's remaining failure backoff, if it is currently backed off.
+fn managed_cli_tool_backoff_remaining_ms(
+    state: &ManagedCliRefreshState,
+    tool: ManagedCliTool,
+    now_ms: u64,
+) -> Option<u64> {
+    let failed_at = *state.failed_at_ms.get(tool.binary_name())?;
+    let remaining = failed_at
+        .saturating_add(MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS)
+        .saturating_sub(now_ms);
+    (remaining > 0).then_some(remaining)
 }
 
 #[derive(Debug, Clone)]
@@ -1090,6 +1119,7 @@ fn managed_cli_refresh_state_from_probes(
     ManagedCliRefreshState {
         last_successful_refresh_ms: Some(refreshed_at_ms),
         managed_versions,
+        failed_at_ms: BTreeMap::new(),
     }
 }
 
@@ -1202,7 +1232,11 @@ fn persist_managed_cli_refresh_state(
     probes: &[(ManagedCliTool, ToolProbe)],
     refreshed_at_ms: u64,
 ) -> Result<()> {
-    let state = managed_cli_refresh_state_from_probes(probes, refreshed_at_ms);
+    // The backoff map is CARRIED OVER, never reset by a refresh-state write:
+    // a walk that succeeded for six tools and failed for mimo must not erase
+    // mimo's backoff (it would be retried — and re-wedge — on the next walk).
+    let mut state = managed_cli_refresh_state_from_probes(probes, refreshed_at_ms);
+    state.failed_at_ms = load_managed_cli_refresh_state(home).failed_at_ms;
     if state.managed_versions.is_empty() {
         return Ok(());
     }
@@ -1823,6 +1857,7 @@ mod tests {
                 ("codex".to_string(), "1.2.3".to_string()),
                 ("codex-litellm".to_string(), "4.5.6".to_string()),
             ]),
+            failed_at_ms: BTreeMap::new(),
         };
         let remaining_ms = managed_cli_refresh_skip_remaining_ms(&before, &state, now_ms, ttl_ms);
         assert_eq!(remaining_ms, Some(ttl_ms.saturating_sub(1_000)));
@@ -1838,6 +1873,7 @@ mod tests {
                 ("codex".to_string(), "1.2.2".to_string()),
                 ("codex-litellm".to_string(), "4.5.6".to_string()),
             ]),
+            failed_at_ms: BTreeMap::new(),
         };
         let system_before = vec![
             (
@@ -2011,6 +2047,7 @@ mod tests {
         let state = ManagedCliRefreshState {
             last_successful_refresh_ms: Some(now_ms.saturating_sub(1_000)),
             managed_versions: BTreeMap::from([("codex".to_string(), "1.2.3".to_string())]),
+            failed_at_ms: BTreeMap::new(),
         };
         let system_probe = ToolProbe {
             version: Some("1.2.3".to_string()),
@@ -4554,6 +4591,38 @@ fn acquire_managed_cli_install_lock(home: &Path) -> Result<ManagedCliInstallLock
     acquire_managed_cli_install_lock_waiting(home, MANAGED_CLI_INSTALL_LOCK_WAIT_MS)
 }
 
+/// Is the machine-wide install lock FREE right now? A non-blocking probe for
+/// the launch path: an available CLI must never queue behind a scheduled walk
+/// just to be refreshed (the launch-path skip keys on this).
+fn managed_cli_install_lock_is_free(home: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let path = home.join("managed-cli-install.lock");
+        let Ok(file) = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        else {
+            return false;
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            unsafe {
+                let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+            true
+        } else {
+            false
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// The body of [`acquire_managed_cli_install_lock`], with the deadline passed in
 /// so a test can prove the contention behaviour without waiting out the real
 /// five-minute budget.
@@ -4688,25 +4757,99 @@ fn install_latest(
     // must not stop the next CLI's update. The old single-method installer had
     // no such case, so `?` was safe there and is not safe here.
     let mut failures: Vec<String> = Vec::new();
+    let mut failed_tools: Vec<ManagedCliTool> = Vec::new();
+    let now_ms = current_time_ms();
+    let backoff_state = load_managed_cli_refresh_state(&paths.home);
     for (tool, step) in per_tool {
+        // THE [11.182] FOLLOW-UP BACKOFF: a tool whose last install step
+        // failed recently is skipped, so one permanently-wedged upgrader
+        // cannot fail every walk (the treadmill that held the toolchain lock
+        // 15 of every 20 minutes and ambered every row launch behind it).
+        if let Some(remaining_ms) =
+            managed_cli_tool_backoff_remaining_ms(&backoff_state, tool, now_ms)
+        {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "managed_cli_tool_backoff_skip",
+                serde_json::json!({
+                    "tool": tool.binary_name(),
+                    "remaining_ms": remaining_ms,
+                }),
+            );
+            continue;
+        }
         let outcome = install_one_step_under_lock(paths, tool, step);
         if let Err(error) = outcome {
+            failed_tools.push(tool);
             failures.push(format!("{}: {error}", tool.display_name()));
         }
     }
 
     for tool in npm_tools {
+        if let Some(remaining_ms) =
+            managed_cli_tool_backoff_remaining_ms(&backoff_state, tool, now_ms)
+        {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "managed_cli_tool_backoff_skip",
+                serde_json::json!({
+                    "tool": tool.binary_name(),
+                    "remaining_ms": remaining_ms,
+                }),
+            );
+            continue;
+        }
         let outcome = install_one_step_under_lock(paths, tool, ProvisionStep::Npm)
             .and_then(|_| install_via_ynpm_publish(paths, tool, background));
         if let Err(error) = outcome {
+            failed_tools.push(tool);
             failures.push(format!("{}: {error}", tool.display_name()));
         }
     }
+    record_install_tool_outcomes(paths, &failed_tools, failures.is_empty(), now_ms);
 
     if failures.is_empty() {
         Ok(())
     } else {
         anyhow::bail!("{}", failures.join("; "))
+    }
+}
+
+/// Persist the per-tool failure backoff after a walk: failed tools stamp
+/// `failed_at_ms`, and a fully-successful walk clears the map (a tool that
+/// installs cleanly today may hang tomorrow; a tool that hung may be fixed —
+/// the backoff expires and it retries).
+fn record_install_tool_outcomes(
+    paths: &ManagedCliPaths,
+    failed_tools: &[ManagedCliTool],
+    all_succeeded: bool,
+    now_ms: u64,
+) {
+    let mut state = load_managed_cli_refresh_state(&paths.home);
+    if all_succeeded {
+        if state.failed_at_ms.is_empty() {
+            return;
+        }
+        state.failed_at_ms.clear();
+    } else {
+        for tool in failed_tools {
+            state
+                .failed_at_ms
+                .insert(tool.binary_name().to_string(), now_ms);
+        }
+    }
+    if let Err(error) = save_managed_cli_refresh_state(&paths.home, &state) {
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "install_backoff_state_write_error",
+            serde_json::json!({ "error": error.to_string() }),
+        );
     }
 }
 
@@ -6624,9 +6767,31 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
     // silently exempted three of the nine registered CLIs from the refresh the
     // owner ruled must cover all of them (2026-08-08).
     let provisioner_available = provision_step_is_runnable(&paths, tool);
-    if provisioner_available
+    // ⛔ THE LAUNCH PATH NEVER QUEUES ON THE TOOLCHAIN ([11.182] follow-up,
+    // the amber treadmill of 2026-09-28): a row launch whose CLI is ALREADY
+    // available must not sit out the install lock behind a scheduled walk —
+    // measured live: the lock held 15 of every 20 minutes by a wedged walk,
+    // the launch ensure waiting its 300s and refusing, the row ambered on
+    // spawn. When the lock is contended, or this tool is inside its failure
+    // backoff, the refresh is SKIPPED and the launch proceeds on the binary
+    // that exists; freshness is the background walk's job.
+    let refresh_would_run = provisioner_available
         && managed_cli_explicit_refresh_needed(tool, &before, &refresh_state, now_ms, ttl_ms)
-    {
+        && managed_cli_tool_backoff_remaining_ms(&refresh_state, tool, now_ms).is_none();
+    let refresh_skipped_lock_busy = refresh_would_run
+        && !managed_cli_install_lock_is_free(&paths.home);
+    if refresh_skipped_lock_busy {
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "ensure_refresh_skipped_lock_busy",
+            serde_json::json!({
+                "tool": tool.binary_name(),
+                "policy": "launch_never_queues_on_the_toolchain",
+            }),
+        );
+    } else if refresh_would_run {
         install_latest(&paths, &[tool], false)?;
         let after = probe_tool(&paths, tool);
         if !after.available {
@@ -7265,7 +7430,13 @@ pub(crate) fn refresh_local_managed_cli(
         "after",
     );
 
-    if provisioner_available && install_error.is_none() && !skipped_recently && !install_deferred {
+    // ⛔ THE STATE PERSISTS DESPITE PER-TOOL FAILURES ([11.182] follow-up):
+    // gating the write on install_error meant one wedged tool (mimo) kept the
+    // walk from EVER recording success, the TTL stayed expired forever, and
+    // every walk — and every row launch — re-ran the full install set. The
+    // tools that SUCCEEDED are recorded, so their TTL skip works; the failed
+    // tool's backoff lives in failed_at_ms.
+    if provisioner_available && !skipped_recently && !install_deferred {
         if let Err(error) = persist_managed_cli_refresh_state(&paths.home, &after, now_ms) {
             append_trace_event(
                 &paths.home,
@@ -7582,6 +7753,91 @@ mod provision_deadline_tests {
         assert!(
             publish.contains("acquire_managed_cli_install_lock"),
             "the ynpm publish takes the lock"
+        );
+    }
+}
+
+#[cfg(test)]
+mod amber_treadmill_tests {
+    use super::*;
+
+    /// THE [11.182] FOLLOW-UP BACKOFF LAW: a tool that failed recently is
+    /// backed off (skipped), and the backoff EXPIRES — a tool that hung
+    /// yesterday retries this hour, and a tool that installed cleanly is
+    /// never backed off at all.
+    #[test]
+    fn the_failure_backoff_bounds_and_expires() {
+        let now = 1_000_000_000_u64;
+        let mut state = ManagedCliRefreshState {
+            last_successful_refresh_ms: None,
+            managed_versions: BTreeMap::new(),
+            failed_at_ms: BTreeMap::new(),
+        };
+        let mimo = ManagedCliTool::Mimo;
+        assert!(managed_cli_tool_backoff_remaining_ms(&state, mimo, now).is_none());
+        state.failed_at_ms.insert("mimo".to_string(), now - 1000);
+        let remaining = managed_cli_tool_backoff_remaining_ms(&state, mimo, now)
+            .expect("a just-failed tool is backed off");
+        assert!(remaining > 0 && remaining <= MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS);
+        state.failed_at_ms.insert(
+            "mimo".to_string(),
+            now - MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS - 1,
+        );
+        assert!(
+            managed_cli_tool_backoff_remaining_ms(&state, mimo, now).is_none(),
+            "the backoff expires: the tool retries"
+        );
+    }
+
+    /// THE LAUNCH PATH NEVER QUEUES ON THE TOOLCHAIN (source law): the
+    /// lock-busy skip and the backoff skip both sit BEFORE the ensure's
+    /// install call, and the walk's success-state persist no longer gates on
+    /// install_error — one wedged tool must not keep the TTL expired forever.
+    #[test]
+    fn the_launch_ensure_skips_a_contended_lock_before_any_install() {
+        let source = include_str!("mod.rs");
+        let ensure = source
+            .split("fn ensure_local_managed_cli(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\npub(crate) fn ")
+            .next()
+            .unwrap();
+        let skip_at = ensure
+            .find("ensure_refresh_skipped_lock_busy")
+            .expect("the lock-busy skip");
+        let install_at = ensure
+            .find("install_latest(&paths, &[tool], false)?")
+            .expect("the install call");
+        assert!(
+            skip_at < install_at,
+            "the skip must be decided before the install the row would queue on"
+        );
+        let walk = source
+            .split("fn refresh_local_managed_cli(")
+            .nth(1)
+            .expect("walk body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        let persist_at = walk
+            .find("persist_managed_cli_refresh_state")
+            .expect("the state persist");
+        let gate = &walk[persist_at.saturating_sub(300)..persist_at];
+        assert!(
+            !gate.contains("install_error.is_none()"),
+            "the success state must persist despite per-tool failures"
+        );
+        let carry = source
+            .split("fn persist_managed_cli_refresh_state(")
+            .nth(1)
+            .expect("persist body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            carry.contains("failed_at_ms"),
+            "the backoff map is carried over, never reset by a state write"
         );
     }
 }
