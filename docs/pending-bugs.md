@@ -31554,3 +31554,58 @@ Repro (original filing, kept): dev store has conversation `c70b6a9c-…` (db row
 Second half, same seam: when the dev-side twin record DOES exist, its `.id` (the real conversation) is IGNORED at recompose — the compose uses the request's session_id (the row uuid), so a held twin resumes by row id and agy fabricates a fresh conversation under it (peer-side [11.165] gate is skipped by `live_runtime_held` by design).
 
 Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the key the ensure just wrote (the alias seam — `local_runtime_id_from_key` → `local_live_runtime_key` vs `remote_runtime_agent_session_key` spellings), add the missing-record healing arm for agent runtimes (recompose spec from the descriptor + STORE-conversation id when the twin carries one), and add a repro test: ensure-then-terminal-ensure for a remote agent row with no pre-existing record.
+
+## ⛔ [11.199] UXPROBE SWITCH+SPLIT ACTIONS BLIND ON CURRENT BUILDS: SCRATCH-ROW NODES VIRTUALIZED OUT OF THE SIDEBAR — CLICKS MISS, MENUS NEVER OPEN, SPLIT REFUSES None ×3, AND ONE POINTER/EVAL VERB BLOCKED 972895 ms WHILE THE CLI FLOOR STAYED 58-74 ms (measured 2026-09-29 ~01:18-01:40 IST, post-wedge-ladder lane, live jojo desktop, GUI ff5630c299, claim ACK-e14828a759)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by the ux-speed post-wedge-ladder lane (zcode
+sess_8add2320 on jojo, work FROM dev). The re-baseline battery ran
+spawn/menu/modal/drag CLEAN (see the campaign door's refreshed
+§BASELINES — spawn p50 2.2 s verb→content, modal pair 23-42 ms, all
+accuracy 0) but TWO driver actions that were LIVE-PROVEN on 2026-09-27
+(split pair p50 1 ms on 13d5bf59bd76; switch 8/8 paint ends on
+58999b0b) now cannot complete:
+
+- `switch`: 0 iterations, error "row nodes not rendered (virtualized
+  out?)" — ensure_two_scratch_rows' rows are not reachable in the
+  sidebar DOM on a 423-row virtualized sidebar. The raise-memo-fix
+  seat's independent switch attempts the same night also produced no
+  report (switch-report3.json never written), corroborating.
+- `split`: 3/3 "split refused: None" with menu_open_ms null — the
+  right-click never produced an observable menu, consistent with the
+  click landing on nothing (virtualized-out row) — and iteration 1's
+  menu-open verb BLOCKED for 972895 ms (16.2 minutes) while the probe's
+  own CLI floor stayed 58-74 ms: a single app-control call held
+  seconds-class while the plane it rides answered pings normally
+  throughout. Same block class as the known `rows --json` wedge under
+  probe+perf load (drag-begin-cold side finding 2026-09-27,
+  corroborated twice this night at >45 s).
+
+Not a probe-staging artifact: the staged driver is origin/main's own
+(77b3c2a2 lineage). The suspects are the sidebar virtualization window
+(row count grew; fresh bottom-anchored scratch rows land outside the
+rendered window and the driver never scrolls them into view) plus the
+app-control verb that can hold a lock minutes-class independent of the
+CLI round-trip floor.
+
+FIX SHAPE: the driver needs scroll-into-view (or row-path-anchored
+scroll) before every node-touching step, and a wall-clock bound +
+honest-null on every verb so one blocked call cannot cost a 16-minute
+iteration. The app-control 16-minute hold wants its own attribution
+(trace the blocked verb; ytrace has no app_control request span for
+it — an instrument gap in itself).
+
+Falsifier: uxprobe switch reports >=7/8 paint ends and split reports a
+non-null create pair on a fresh scratch pair, on a rotated build, with
+no iteration wall exceeding its own verb budget.
+
+> AMENDMENT (2026-09-29 ~01:55, same lane): the raise-memo-falsifier
+> seat's switch runs DID serve on 4aa6d5bd's GUI 2285010 the same hour
+> (7 serving raises measured, door close ~01:50) — the blind class is
+> therefore INTERMITTENT or ff5630c299-specific, not build-universal.
+> The falsifier for this entry must reproduce the class first (spawn a
+> fresh bottom-anchored scratch pair on a 423+-row sidebar, try the
+> click, and only then score the action) and the 16-minute verb block
+> is unconditional-to-file regardless: one app-control call must never
+> hold minutes-class while the CLI floor answers pings.
