@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -597,32 +598,88 @@ class Probe:
         self.spawned_paths: list[str] = []
         self.scratch_titles: list[dict] = []
         self.trace_events_seen: dict[str, set] = {}
+        self.last_dom_error: str | None = None
 
     # ---- instruments -------------------------------------------------
 
     def verb(self, *argv: str, timeout: float | None = None) -> dict:
-        """Run one `yggterm server app …` verb; return parsed reply + wall ms."""
+        """Run one `yggterm server app …` verb; return parsed reply + wall ms.
+        The CLI runs in its own process group; a budget expiry killpg's the
+        GROUP and drains bounded — one wedged app-control call costs its
+        budget, never minutes ([11.200]: one iteration held 972895 ms)."""
         cmd = [YGGTERM, "server", "app", *argv]
+        budget = timeout or self.timeout_s
         t0 = time.perf_counter()
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=timeout or self.timeout_s,
-            )
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "verb timeout", "wall_ms": None,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True)
+        except OSError as exc:
+            return {"ok": False, "error": f"spawn failed: {exc}",
+                    "wall_ms": int((time.perf_counter() - t0) * 1000),
                     "raw": ""}
-        wall_ms = int((time.perf_counter() - t0) * 1000)
-        reply: dict = {"ok": proc.returncode == 0, "wall_ms": wall_ms}
+        timed_out = False
         try:
-            reply["json"] = json.loads(proc.stdout)
+            out, err = proc.communicate(timeout=budget)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            try:
+                out, err = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+        wall_ms = int((time.perf_counter() - t0) * 1000)
+        if timed_out:
+            reply: dict = {"ok": False,
+                           "error": f"verb timeout (group killed at {budget:g}s)",
+                           "wall_ms": wall_ms, "raw": (out or "")[-2000:]}
+            self.dump_artifact(f"verb-{'-'.join(argv[:3])}-{now_ms()}.json", reply)
+            return reply
+        reply = {"ok": proc.returncode == 0, "wall_ms": wall_ms}
+        try:
+            reply["json"] = json.loads(out)
         except (json.JSONDecodeError, ValueError):
             reply["json"] = None
-            reply["raw"] = (proc.stdout + proc.stderr)[-2000:]
+            reply["raw"] = ((out or "") + (err or ""))[-2000:]
         if proc.returncode != 0:
-            reply["error"] = (proc.stderr or proc.stdout)[-500:]
+            reply["error"] = (err or out or "")[-500:]
         self.dump_artifact(f"verb-{'-'.join(argv[:3])}-{now_ms()}.json", reply)
         return reply
+
+    # dom_eval_for_app_control answers {"error": …} in data when the eval
+    # never produced a value; this class is the GUI's own retryable set
+    # (app_control_eval_error_should_retry) — a FRESH eval is the medicine.
+    EVAL_RETRYABLE_MARKERS = ("eval has already ran", "EvalError::Finished")
+
+    def dom_eval(self, js: str, timeout: float = 15,
+                 retries: int = 2) -> dict:
+        """One app-control dom-eval, honest + retry-bounded. Returns the
+        data dict: {"result": …} on success, {"error": …} on failure —
+        NEVER silently empty ([11.200]: the battery read only data.result
+        and reported every real failure as "split refused: None")."""
+        last: dict = {}
+        for attempt in range(retries + 1):
+            r = self.verb("dom-eval", js, timeout=timeout)
+            data = (r.get("json") or {}).get("data")
+            if isinstance(data, dict):
+                last = data
+            elif r.get("ok"):
+                last = {"error": "dom-eval returned no data payload"}
+            else:
+                last = {"error": f"dom-eval verb failed: "
+                                 f"{r.get('error') or 'unknown'}"}
+            if last.get("error") is None and "result" in last:
+                return last
+            reason = str(last.get("error"))
+            if attempt < retries and any(m in reason
+                                         for m in self.EVAL_RETRYABLE_MARKERS):
+                time.sleep(0.3)
+                continue
+            break
+        return last
 
     def ping_overhead_ms(self, samples: int = 5) -> float | None:
         """CLI round-trip floor: every verb measurement includes this."""
@@ -999,7 +1056,10 @@ class Probe:
 
     def _row_rects(self, paths: list[str]) -> dict:
         """Sidebar DOM rects for row paths, via one dom-eval. The sidebar
-        virtualizes — the caller must `tree select` first so nodes exist."""
+        virtualizes — the caller must `tree select` first so nodes exist.
+        An eval failure returns {} and names itself in last_dom_error, so a
+        latched eval plane can never masquerade as "virtualized out"
+        ([11.200] misattribution)."""
         js = """const out = {};
 for (const p of __PATHS__) {
   let el = null;
@@ -1012,9 +1072,12 @@ for (const p of __PATHS__) {
 }
 dioxus.send(out);
 """.replace("__PATHS__", json.dumps(paths))
-        r = self.verb("dom-eval", js, timeout=15)
-        reply = r.get("json") or {}
-        return (reply.get("data") or {}).get("result") or {}
+        r = self.dom_eval(js, timeout=15)
+        if r.get("error") is not None:
+            self.last_dom_error = str(r["error"])
+            return {}
+        self.last_dom_error = None
+        return r.get("result") or {}
 
     def _events_between(self, t0: int, t1: int) -> list[dict]:
         return [e for e in self.ytrace_events(t0) if e.get("ts_ms", 0) <= t1]
@@ -1410,9 +1473,23 @@ dioxus.send(out);
         self.verb("tree", "select", a_path)
         self.verb("tree", "select", b_path)
         time.sleep(0.2)
-        rects = self._row_rects([a_path, b_path])
+        # the select's scroll-into-view is async: verify the rects with a
+        # bounded poll, and name an eval-plane failure AS an eval-plane
+        # failure — "virtualized out" is only honest when the eval answered
+        # and the nodes truly are not in the DOM ([11.200])
+        rects: dict = {}
+        for attempt in range(3):
+            rects = self._row_rects([a_path, b_path])
+            if rects.get(a_path) and rects.get(b_path):
+                break
+            time.sleep(0.5)
         if not rects.get(a_path) or not rects.get(b_path):
-            return {"error": "row nodes not rendered (virtualized out?)",
+            if self.last_dom_error:
+                return {"error": "row rects unavailable — dom-eval plane "
+                                 f"failed: {self.last_dom_error}",
+                        "iterations": []}
+            return {"error": "row nodes not rendered (virtualized out? — "
+                             "eval answered, nodes absent from the DOM)",
                     "iterations": []}
         out = {"iterations": []}
         confirmed_active: str | None = None
@@ -2106,14 +2183,14 @@ dioxus.send(out);
             t0 = now_ms()
             js = SPLIT_OPEN_JS.replace("{session_a!r}", repr(a_path))
             js = js.replace("{axis!r}", repr("split-side-by-side"))
-            r = self.verb("dom-eval", js, timeout=25)
+            data = self.dom_eval(js, timeout=25)
             open_wall_ms = now_ms() - t0
-            result = ((r.get("json") or {}).get("data") or {}).get("result") or {}
-            if not r["ok"]:
-                acc.append(f"dom-eval failed: {r.get('error')}")
+            result = data.get("result") or {}
+            if not result and data.get("error") is not None:
+                acc.append(f"dom-eval error: {data['error']}")
             if result.get("dom_eval_error"):
                 acc.append(f"script error: {result['dom_eval_error']}")
-            if not result.get("accepted"):
+            if result and not result.get("accepted"):
                 acc.append(f"split refused: {result.get('reason')}")
             pair = self.split_events_from_trace(t0)
             if result.get("accepted"):
@@ -2145,12 +2222,14 @@ dioxus.send(out);
             ungroup = {}
             if result.get("accepted"):
                 time.sleep(0.3)
-                ru = self.verb("dom-eval", SPLIT_UNGROUP_JS, timeout=15)
-                ungroup = ((ru.get("json") or {}).get("data")
-                           or {}).get("result") or {}
+                udata = self.dom_eval(SPLIT_UNGROUP_JS, timeout=15)
+                ungroup = udata.get("result") or {}
                 if not ungroup.get("accepted"):
-                    acc.append(f"ungroup failed: {ungroup.get('reason')} "
-                               f"(still_compound={ungroup.get('still_compound')})")
+                    why = (f"ungroup dom-eval error: {udata['error']}"
+                           if udata.get("error") is not None and not ungroup
+                           else f"ungroup failed: {ungroup.get('reason')} "
+                                f"(still_compound={ungroup.get('still_compound')})")
+                    acc.append(why)
                 else:
                     pair2 = self.split_events_from_trace(t0)
                     if not pair2.get("ungrouped"):
