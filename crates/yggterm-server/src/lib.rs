@@ -12671,6 +12671,15 @@ impl YggtermServer {
                         home, kind, dir,
                     )
                 && candidate_id != session_id
+                // THE [11.192] CONTENTION GUARD: a candidate another LIVE row
+                // already carries is not a candidate — duplicate rows share a
+                // cwd, and binding two rows to one conversation waits the
+                // second out into an eternal Bootstrapping (measured
+                // 2026-09-28 19:4x: 24ff7d70 held by one "New dev Antigravity"
+                // row, its duplicate dead in Bootstrapping against it).
+                && !self.sessions.iter().any(|(row_key, held)| {
+                    held.id == candidate_id && row_key != &key
+                })
             {
                 if let Some(ygg_home) = self.yggterm_home.clone() {
                     append_trace_event(
@@ -24966,6 +24975,12 @@ pub fn run_remote_resume_agent(
     // into the ensure, whose own ladder then finds the id vouched and stamps
     // the Conversation binding. `None` (unreadable store) never vouches.
     let mut session_id = session_id.to_string();
+    // THE [11.192] VOUCH-BUSY FALLBACK FLAG: set when the ladder re-pointed
+    // this row onto another conversation — if that conversation turns out to
+    // be HELD by another live yggterm row, this row fresh-starts instead of
+    // dying in the holder wait (duplicate rows share a cwd; measured
+    // 2026-09-28 19:4x).
+    let mut ladder_vouched = false;
     // ⛔ `saved_session_exists` is FAIL-OPEN for Antigravity BY DESIGN (the
     // [11.165] predicate answers Ok(true) on a definitive miss; the gates
     // live at the consumers) — so it can never gate this ladder. The
@@ -24997,6 +25012,7 @@ pub fn run_remote_resume_agent(
             }),
         );
         session_id = candidate_id;
+        ladder_vouched = true;
         // The store vouches the candidate BY CONSTRUCTION (the candidate
         // reader read it there), so the gates below answer on truth.
         saved_session_exists = true;
@@ -25045,10 +25061,51 @@ pub fn run_remote_resume_agent(
             // transcript the holder still has open. The deadline is a refusal, not
             // a licence — see EXTERNAL_ACTIVE_WAIT_DEADLINE.
             if wait == ExternalResumeWait::DeadlineExpired {
+                // THE [11.192] VOUCH-BUSY FRESH START: when THIS row is only
+                // here because the ladder re-pointed it onto a conversation
+                // that another LIVE yggterm row is already serving (duplicate
+                // rows share a cwd — measured: one row working in 24ff7d70,
+                // its duplicate dead in Bootstrapping against it), waiting
+                // can never end and refusing abandons the user mid-work. The
+                // honest outcome is what agy itself suggests on this warning
+                // ("/fork to continue here separately"): a FRESH conversation
+                // for THIS row, named in the trace.
+                let holders = external_agent_resume_processes_for_session(kind, session_id);
+                let held_by_our_own_rows = !holders.is_empty()
+                    && holders
+                        .iter()
+                        .all(|process| process.holder == AgentResumeHolderKind::StrandedYggtermOwned);
+                if ladder_vouched && held_by_our_own_rows {
+                    append_trace_event(
+                        &home,
+                        "remote",
+                        "resume_agent",
+                        "agy_vouch_busy_fresh_start_fallback",
+                        json!({
+                            "ladder_vouched_id": session_id,
+                            "holder_pids": holders.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                            "policy": "duplicate_row_fresh_starts_instead_of_eternal_bootstrap",
+                        }),
+                    );
+                    let endpoint = default_endpoint(&home);
+                    ensure_local_daemon_running(&endpoint)?;
+                    let fresh_id = uuid::Uuid::new_v4().to_string();
+                    let key = daemon::start_remote_runtime_agent_session(
+                        &endpoint,
+                        kind,
+                        &fresh_id,
+                        cwd,
+                        initial_size,
+                        Some(&terminal_appearance),
+                        &AgentLaunchOptions::default(),
+                        forwarded_configured_extra_args().as_deref(),
+                    )?;
+                    return bridge_remote_runtime_session_stdio(&endpoint, &key);
+                }
                 anyhow::bail!(remote_resume_external_active_message(
                     kind,
                     session_id,
-                    &external_agent_resume_processes_for_session(kind, session_id),
+                    &holders,
                 ));
             }
             if let ExternalResumeWait::ServedByLiveDaemon { daemon_pid, holder_pids } = wait {
@@ -60615,6 +60672,70 @@ mod agy_connection_tests {
         assert!(
             stamp.contains("Fresh Start"),
             "the fresh conversation is NAMED on the row"
+        );
+    }
+
+    /// THE [11.192] VOUCH-CONTENTION LAW: the ladder never binds this row to
+    /// a conversation another live row already carries (ensure guard), and
+    /// when the wrapper's wait expires on a ladder-vouched conversation held
+    /// by yggterm's OWN rows, the row FRESH-STARTS (agy's own /fork remedy)
+    /// instead of dying in an eternal Bootstrapping.
+    #[test]
+    fn the_ladder_never_binds_two_rows_to_one_conversation_and_the_busy_row_fresh_starts() {
+        let source = include_str!("lib.rs");
+
+        // 1. The ensure-side guard.
+        let ensure = source
+            .split("fn ensure_remote_runtime_agent_session(")
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            ensure.contains("[11.192] CONTENTION GUARD"),
+            "the ensure ladder carries the contention guard"
+        );
+        assert!(
+            ensure.contains("held.id == candidate_id && row_key != &key"),
+            "a candidate another live row carries is refused"
+        );
+
+        // 2. The wrapper fallback: vouch-tracked, busy-detected, fresh-started.
+        // ⛔ Anchor on the real signature — the bare name also appears in an
+        // earlier test's source-scan string literal.
+        let wrapper = source
+            .split("pub fn run_remote_resume_agent(\n    kind: SessionKind,")
+            .nth(1)
+            .expect("wrapper body")
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        assert!(
+            wrapper.contains("let mut ladder_vouched = false;"),
+            "the vouch is tracked"
+        );
+        let fallback_head = wrapper
+            .find("if ladder_vouched && held_by_our_own_rows {")
+            .expect("the busy fallback condition");
+        // The yggterm-owned holder compute sits ABOVE the condition (it feeds
+        // it), so assert it in the wrapper window as a whole.
+        assert!(
+            wrapper.contains("let held_by_our_own_rows = !holders.is_empty()")
+                && wrapper
+                    .contains("process.holder == AgentResumeHolderKind::StrandedYggtermOwned"),
+            "the fallback fires only when OUR OWN rows hold the conversation"
+        );
+        let fallback_body = &wrapper[fallback_head..];
+        let fresh_at = fallback_body
+            .find("start_remote_runtime_agent_session(")
+            .expect("the fresh start");
+        let trace_at = fallback_body
+            .find("agy_vouch_busy_fresh_start_fallback")
+            .expect("the named trace");
+        assert!(
+            trace_at < fresh_at,
+            "the fallback is NAMED before it starts anything"
         );
     }
 }
