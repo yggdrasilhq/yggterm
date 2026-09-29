@@ -2,8 +2,8 @@
 # Enforce the docs SSOT law (docs/docs-ssot.md).
 #
 # The bug queue must list ONLY open items, every entry must declare exactly one
-# status from the vocabulary, and no second file may advertise itself as a list
-# of open bugs. Exits non-zero with the offending lines; no output means clean.
+# status from the vocabulary, no deleted entry may come back through a merge,
+# and no second file may advertise itself as a list of open bugs. Exits non-zero with the offending lines; no output means clean.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 2
@@ -102,6 +102,83 @@ if [ -n "$dupes" ]; then
   echo "$dupes" | head -10 >&2
 fi
 
+# 2c. No deleted entry comes back through a merge.
+#
+# ⛔ A GREEN INTEGRATION TICK CAN RESURRECT A DEAD ENTRY. Measured 2026-09-29
+# ([11.207], the [11.203] merge ghost): a24d5d9a deleted [11.203] on main with
+# its live proof; a lane based on PRE-deletion main still carried the entry
+# text; delete-on-main vs carried-text-on-lane merged TEXTUALLY CLEAN (different
+# hunks), so a green tick would have published the dead entry. Nothing else in
+# this gate can see it: the resurrected text carries one valid status line, no
+# duplicate paragraphs, no closed-marker heading.
+#
+# ⇒ The question is per id, at the plane the merge runs on: an id present in
+#   this tree but ABSENT from origin/main, whose `## ⛔ [id]` heading line
+#   origin/main's history ever carried (`git log -G` on the heading line), was
+#   DELETED on main — refuse, naming the id and the newest heading-touching
+#   commit. A stale origin/main weakens nothing at commit time (the id is still
+#   in the stale blob, so the question is merely skipped); the integration tick
+#   fetches first, and the tick is the plane that publishes. Non-numeric ids
+#   ([CLI], [PASS N]) are topic buckets reused by design and are scoped out.
+#   Re-filing under a fresh id is the doctrine; the same id coming back needs
+#   the deletion reversed on main, not a quiet merge.
+tombstones=$(python3 - "$QUEUE" <<'PY' || true
+import re, subprocess, sys
+
+HEAD = re.compile(r"^## ⛔ \[([0-9]+(?:\.[0-9]+)*)\]")
+
+def heading_ids(text):
+    found = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        m = HEAD.match(line)
+        if m:
+            found.setdefault(m.group(1), n)
+    return found
+
+def git(args):
+    return subprocess.run(["git"] + args, capture_output=True, text=True)
+
+now = heading_ids(open(sys.argv[1], encoding="utf-8").read())
+blob = git(["show", "origin/main:docs/pending-bugs.md"])
+if blob.returncode != 0:
+    sys.exit(0)  # no origin/main to ask — the tick's fresh fetch is the enforcement plane
+was = heading_ids(blob.stdout)
+
+for ident in sorted(set(now) - set(was)):
+    hist = git(["log", "-G", r"^## ⛔ \[%s\]" % re.escape(ident),
+                "--format=%h %s", "origin/main", "--", sys.argv[1]])
+    if hist.stdout.strip():
+        print(f"{ident}: re-added here, but origin/main DELETED this heading — "
+              f"newest heading-touching commit on main: {hist.stdout.strip().splitlines()[0]}; "
+              f"a merge carried a dead entry back. Refile under a fresh id.")
+PY
+)
+if [ -n "$tombstones" ]; then
+  note "these entry ids were deleted on origin/main and must not return through a merge:"
+  echo "$tombstones" | head -10 >&2
+fi
+
+# 2d. Reused ids are REPORTED, not gated.
+#
+# The id-uniqueness dream (ACK-aad3de4a80 — the double [11.214] shipped through
+# the gate) measured against the live queue 2026-09-29: id reuse is an
+# ESTABLISHED PRACTICE here — the 99.x class is a topic bucket ([99.1] x5,
+# [99.0] x2) and [11.0]/[11.49]/[11.97] each sit on two live entries. A hard
+# uniqueness gate would red the plane on ten entries and fight the numbering
+# scheme the owner has not ruled on. So: count, surface in the ok line, decide
+# later. The dream's real target — one id one defect — stays open for that
+# ruling; this line is the instrument that keeps it visible meanwhile.
+dup_ids=$(python3 - "$QUEUE" <<'PY' || true
+import re, sys
+from collections import Counter
+ids = Counter(re.findall(r"^## ⛔ \[([0-9]+(?:\.[0-9]+)*)\]",
+                         open(sys.argv[1], encoding="utf-8").read(), re.M))
+dups = {i: c for i, c in sorted(ids.items()) if c > 1}
+if dups:
+    print("; ".join(f"{i} x{c}" for i, c in dups.items()))
+PY
+)
+
 # 3. No second file claims the queue.
 # A file that POINTS at the queue is correct and expected (CLAUDE.md must). A
 # file that reproduces one is the failure. Pointing = it names the queue's path.
@@ -117,6 +194,10 @@ if [ -n "$rivals" ]; then
 fi
 
 if [ "$fail" -eq 0 ]; then
-  echo "docs-ssot: ok — $entries open entries, all statused, one owner"
+  if [ -n "$dup_ids" ]; then
+    echo "docs-ssot: ok — $entries open entries, all statused, one owner (reused ids: $dup_ids — informational, not gated)"
+  else
+    echo "docs-ssot: ok — $entries open entries, all statused, one owner"
+  fi
 fi
 exit $fail
