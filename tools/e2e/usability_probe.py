@@ -32,8 +32,10 @@ INVARIANTS (each maps to a lived owner pain):
   identity_convergence  one store session id worn by multiple live rows
                  (the [11.202] cure-convergence class: eight dev opencode
                  rows absorbed onto one cwd candidate), naming the theft
-                 shapes (held-key theft, unattributed wearer) apart from
-                 the tolerated dead-key adoption
+                 shapes (held-key theft, unverifiable-plane wearer) apart
+                 from the tolerated dead-key adoption; key-less wearers
+                 (local:// corpses) are named residue, not violations —
+                 the headless surface has no row-reap verb to cure them
 
 Run it UNATTENDED (cron / the ygg-ci watcher / any seat): exit 0 = clean,
 1 = at least one violation. `--json` renders the report for machines.
@@ -489,13 +491,18 @@ def invariant_identity_convergence(report, rows):
     row-named ([11.73]). Shape of the law: one wearer's key may name the id
     (the row that owns it); any OTHER wearer must have a key id the store
     says is DEAD (the cure's legitimate dead-key adoption). A wearer whose
-    key id is store-HELD, or that carries no key id at all (local://
-    corpses), is a theft."""
+    key id is store-HELD, or whose membership no local plane can verify,
+    is a theft. Key-less wearers (local:// corpses) are RESIDUE, not
+    violations: their pre-cure ids are unrecoverable and the headless
+    surface has no row-reap verb to remove them — they freeze in place
+    (the [11.202] membership belt refuses any further cure for a held id)
+    and the ok line names them so growth stays visible."""
     by_id = {}
     for row in rows:
         if row["id"]:
             by_id.setdefault(row["id"], []).append(row)
     violations = []
+    residue = []
     store_ids = None
     store_unanswerable = False
     for sid, wearers in by_id.items():
@@ -508,9 +515,7 @@ def invariant_identity_convergence(report, rows):
             if kid == sid:
                 continue  # the legitimate holder
             if kid is None:
-                violations.append(
-                    f"{sid[:20]}… worn by key-less row {w['path'][:44]}"
-                )
+                residue.append(f"{sid[:20]}… ← {w['path'][:44]}")
             elif not w["path"].startswith("opencode-runtime://"):
                 violations.append(
                     f"{sid[:20]}… worn by {w['path'][:44]} — membership "
@@ -538,6 +543,13 @@ def invariant_identity_convergence(report, rows):
             "identity_convergence",
             "one store session id worn by multiple live rows (the "
             "[11.202] cure-convergence class): " + "; ".join(violations[:3]),
+        )
+    elif residue:
+        report.ok(
+            "identity_convergence",
+            f"no theft, but {len(residue)} key-less wearer(s) of another "
+            "row's session id remain (no reap verb on the headless surface "
+            "yet): " + "; ".join(residue[:3]),
         )
     else:
         report.ok("identity_convergence")
