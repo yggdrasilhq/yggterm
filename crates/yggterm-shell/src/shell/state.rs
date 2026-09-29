@@ -89236,6 +89236,19 @@ async fn process_pending_app_control_requests(
                         shell.server.remote_machines().to_vec(),
                     )
                 });
+            let close_stage_t0 = std::time::Instant::now();
+            append_trace_event(
+                &home,
+                "ui",
+                "app_control",
+                "remove_session_stage",
+                json!({
+                    "stage": "preflight_done",
+                    "session_path": session_path,
+                    "ms": close_stage_t0.elapsed().as_millis() as u64,
+                    "redirect": close_redirect_target.is_some(),
+                }),
+            );
             let teardown_census = session_teardown_census(runtime_pid_before);
             let session_path_for_task = session_path.clone();
             let close_redirect_target_for_task = close_redirect_target.clone();
@@ -89288,6 +89301,17 @@ async fn process_pending_app_control_requests(
                 .await;
             match outcome {
                 Ok((snapshot, message, redirect_error)) => {
+                    append_trace_event(
+                        &home,
+                        "ui",
+                        "app_control",
+                        "remove_session_stage",
+                        json!({
+                            "stage": "round_trip_done",
+                            "session_path": session_path,
+                            "ms": close_stage_t0.elapsed().as_millis() as u64,
+                        }),
+                    );
                     // A successful ROUND TRIP is not a successful REMOVAL. The
                     // daemon answers Ok while saying "no live session for this
                     // path", and its teardown signals only the PTY child — so
@@ -89302,13 +89326,28 @@ async fn process_pending_app_control_requests(
                         .iter()
                         .any(|session| session.session_path == session_path);
                     let mut still_running = surviving_teardown_processes(&teardown_census);
+                    let mut settle_attempts: u32 = 0;
                     for _ in 0..SESSION_TEARDOWN_SETTLE_ATTEMPTS {
                         if still_running.is_empty() {
                             break;
                         }
+                        settle_attempts += 1;
                         sleep(Duration::from_millis(SESSION_TEARDOWN_SETTLE_INTERVAL_MS)).await;
                         still_running = surviving_teardown_processes(&teardown_census);
                     }
+                    append_trace_event(
+                        &home,
+                        "ui",
+                        "app_control",
+                        "remove_session_stage",
+                        json!({
+                            "stage": "settle_done",
+                            "session_path": session_path,
+                            "ms": close_stage_t0.elapsed().as_millis() as u64,
+                            "attempts": settle_attempts,
+                            "survivors": still_running.len(),
+                        }),
+                    );
                     // The far side of the hop. A `remote-cc://` / `remote-session://`
                     // row's agent runs under the OTHER machine's daemon and is
                     // built to outlive ssh drops, so reaping the local ssh
@@ -89335,6 +89374,17 @@ async fn process_pending_app_control_requests(
                     // A probe we could not even dispatch is unverifiable, which
                     // is a refusal — never a pass.
                     .unwrap_or(RemoteRuntimeAfterRemoval::Unverifiable);
+                    append_trace_event(
+                        &home,
+                        "ui",
+                        "app_control",
+                        "remove_session_stage",
+                        json!({
+                            "stage": "liveness_done",
+                            "session_path": session_path,
+                            "ms": close_stage_t0.elapsed().as_millis() as u64,
+                        }),
+                    );
                     let verdict = verify_session_removal(&SessionRemovalEvidence {
                         row_was_live: pending.live_session_close,
                         runtime_pid_before,
@@ -89360,6 +89410,18 @@ async fn process_pending_app_control_requests(
                         }
                         shell.server.active_session_path().map(ToOwned::to_owned)
                     });
+                    append_trace_event(
+                        &home,
+                        "ui",
+                        "app_control",
+                        "remove_session_stage",
+                        json!({
+                            "stage": "apply_done",
+                            "session_path": session_path,
+                            "ms": close_stage_t0.elapsed().as_millis() as u64,
+                            "active_session_path": active_session_path,
+                        }),
+                    );
                     AppControlResponse {
                         request_id: request.request_id.clone(),
                         handled_by_pid: std::process::id(),

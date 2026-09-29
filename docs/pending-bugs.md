@@ -18,6 +18,101 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.204] CLOSING THE ACTIVE ROW COSTS ~3 s WHILE AN INACTIVE ROW CLOSES IN ~0.5 s — THE REMOVE-SESSION HANDLER TAIL PARKS ~1.3 s PER AWAIT BOUNDARY (WAKE ARRIVES LATE ONLY WHEN THE DYING ROW IS THE MOUNTED SURFACE), PLUS A 0-500 ms SETTLE LOOP (measured 2026-09-29 ~07:05-07:55 IST, live jojo desktop, build 5079e95b, the uxspeed close-latency lane)
+
+**Status:** OPEN — ATTRIBUTED, FIX NOT TAKEN (instrument shipped, this lane)
+
+Filed 2026-09-29 by the ux-speed close-latency lane
+(lane/uxspeed/close-latency, claim ACK-a55fc29305). The re-baseline
+(post-wedge-ladder, 01:18 IST) read close at 544-741 ms; the lane found the
+distribution is BIMODAL and the mode is the bug.
+
+THE MEASUREMENT (4 independent probe/verb runs, quiet desktop, CLI floor
+63-74 ms, GUI floor 162-185 ms, accuracy verified:true every time):
+
+- INACTIVE row close: 469-612 ms probe wall, **~230 ms felt**
+  (request_begin→request_end + render). Still 2.3× over the ≤100 ms bar —
+  the floor leg, not this entry.
+- ACTIVE row close (the row the user is looking at — the common case):
+  **3111/3448/3594 ms probe wall across three probe runs, 2674/3135 ms verb
+  wall on manual closes — deterministic 5/5.** Felt ≈2.9 s.
+
+THE LADDER (ytrace + strace -f on the GUI, one close each):
+
+- Daemon : **93-132 ms both modes** (tombstone + row
+  departed + persist inside one lock hold). NOT the daemon.
+- The PTY dies fast: a 25 ms kill -0 poller on the session bash read
+  **DEAD at ~T0+250 ms** — inside the round trip. NOT process teardown.
+- Zero futex CONTENTION (strace: no long lock waits); perf -F 99 on the GUI
+  during closes: nothing on-CPU in the gaps (the [11.119] hpet tax +
+  malloc noise dominate). NOT CPU burn, NOT a lock.
+- THE BURN: the handler tail (yggterm-shell state.rs, the
+  AppControlCommand::RemoveSession arm) after the daemon answer:
+  **two ~1.3 s parks on the executor futex** (strace FUTEX_WAIT_BITSET:
+  643 ms parked before the settle loop even starts, another park after it;
+  ytrace interactive_request ui_wait_ms 1492 + 1267 vs **0-1 ms on the
+  same boundaries for an inactive close**). The IO thread finishes at
+  +0.2 s (worker_finish traced); the awaiting continuation is not polled
+  until +1.5 s. The wake chain runs late ONLY when the dying row is the
+  active surface — whose teardown/redirect work (terminal_mount_task_dropped
+  at +860 ms) is in flight on the same plane.
+- The settle loop (SESSION_TEARDOWN_SETTLE_ATTEMPTS 5 × 100 ms) adds 0-500 ms
+  on top (strace-proven running its full budget under ptrace slowdown;
+  survivors re-checked against /proc with honest zombie/recycled-pid rules).
+
+FIX DIRECTION (next seat, GUI-shell plane): (1) the stage instrument shipped
+with this entry (remove_session_stage events: preflight_done / round_trip_done
+/ settle_done{attempts,survivors} / liveness_done / apply_done, each with
+cumulative ms) — one close now names every park from one ytrace read;
+(2) then the wake-chain fix — the completion should wake the awaiting task
+directly, not queue behind the active-surface teardown on the main-thread
+pump; (3) settle granularity 100→25 ms is a cheap residual (~375 ms worst
+case) but is NOT the dominant leg.
+
+Probe artifacts: /tmp/close-lat/ on jojo (report1-3.json, rm_active/rmC/rmD
+replies, strace.txt, death.txt). Trace slices quoted in the lane door and the
+outcome post (infra/meta ACK-a55fc29305 thread).
+
+## ⛔ [11.203] OPENCODE TITLE READ GOES SILENT FOR session_v2-ONLY IDS (THE HEALED [11.202] ROWS KEEP THE CURE'S STALE TITLE), AND THE HEADLESS SURFACE HAS NO ROW-REAP VERB FOR THE ABSORBED CORPSES (measured 2026-09-29 ~06:10 IST, live dev, the [11.202] close)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by the [11.202] close seat. [11.202] itself is CLOSED
+(membership belt + unconditional holder refusal + opencode key heal,
+bad9ac74, probe identity_convergence RED→GREEN on the rolled daemon). Two
+residues of the heal, both measured on dev:
+
+1. THE TITLE SILENCE: the three healed rows (ses_fb820a4aaffen…,
+   ses_fb294aa59ffeo…, ses_f9dce8ab… — ids restored onto their keys) keep
+   the cure's stale title "Greeting message" because the tick's title read
+   answers None for them: they are session_v2-ONLY rows (the v1 `session`
+   table has no row — verified), the tick counts them in store_silent
+   (63/tick), and the [11.202] membership reader answers Some(true) for the
+   same ids from the same db. The two readers differ in exactly one
+   structural respect: read_opencode_live_store_title opens
+   SQLITE_OPEN_READ_ONLY with NO busy_timeout while the membership reader
+   goes through open_cli_index_readonly (busy-tolerant) — and the opencode
+   server on dev writes its db continuously. The working hypothesis (named,
+   not yet proven): the title read loses the busy race and the filters/
+   error arms turn it into silence. Fix: give the title reader the same
+   busy tolerance (or route it through open_cli_index_readonly). Until
+   then the belt makes this identity-safe (a silent title read for a held
+   id is refused as a cure), so the drift is cosmetic — wrong strings on
+   three dead-ish rows — but it also blinds the title-follow plane for
+   every future v2-only id.
+
+2. THE REAP GAP: four local:// rows wear ses_f7e98830 ("resize probe row",
+   "mirror diagnosis row", two nameless "Greeting message" husks). Their
+   pre-cure ids are unrecoverable (absorbed before every retained trace
+   rotation) and the headless server surface has NO row-close verb —
+   `rows` carries live/show/drafts/departed only, and the tombstone
+   primitives are crate-internal by law (a caller outside
+   live_row_tombstones must not publish a private snapshot over the shared
+   file). The identity_convergence invariant carries them as named RESIDUE
+   on its ok line, so growth stays visible. A `server row close <key>`
+   verb (tombstone + live-map removal through the plane's own doors)
+   closes this; then reap the four and the ok line goes clean.
+
 ## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
