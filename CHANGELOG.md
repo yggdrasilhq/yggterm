@@ -19,6 +19,8 @@ the daemon knows is retired.
 
 ## Unreleased
 
+- **The spawn probe now measures screen content, not marker silence — and catches a blank first screen by assertion.** A spawned row's honest paint end is the daemon screen holding nonblank content; the `xterm_paint` marker family does not answer idle-shell spawns (first_frame is write-scoped, settle has not fired on a spawn since the [11.171] marker rework), so `uxprobe --actions spawn` waited its full timeout for markers that never fire and recorded a null paint leg on healthy spawns — and would have called the blank-first-screen defect class ([11.176]: the daemon reads the prompt bytes but the screen buffer never fills, intermittent on current main) an unmeasured null instead of a failure. The spawn action now polls `terminal read-buffer` (content- and session-addressed) as the paint truth — `spawn_to_paint_ms` is the verb→content leg, `content_first_ms`/`nonblank_line_count` carry the readout — keeps the ytrace milestone ladder as a capped diagnostic, and asserts "no screen content … (blank first screen?)" when a live row shows neither. First numbers on the working daemon (7227be34aabc): verb→daemon ~350 ms, mount ~500-650 ms, prompt on screen in ~1-6 s warm. ([11.176] instrument, the ux-speed spawn-ladder lane)
+
 ## [11.174]-uxspeed the felt shift-drag stops resolving its drop on a stale mirror and stops lying about a satisfied drop
 
 A multi-row set drag resolved its landing against the server mirror instead

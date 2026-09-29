@@ -39177,7 +39177,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             Some(active_session_path)
         );
         assert!(shell.startup_terminal_restore_should_open(active_session_path));
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         assert!(!shell.startup_terminal_restore_should_open(active_session_path));
     }
     #[test]
@@ -39247,7 +39247,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_bootstrap_owner_by_session
             .insert(active_session_path.to_string(), "owner:test".to_string());
@@ -39268,7 +39268,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.window_focused = true;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         // Ready once in this host's life, then superseded by a fresh attempt
         // that will never observe anything.
         shell
@@ -39686,7 +39686,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_bootstrap_owner_by_session
             .insert(active_session_path.to_string(), "owner:test".to_string());
@@ -39805,7 +39805,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // A mounted host that is NOT retained-live (active remote + bootstrap lease,
         // no ready signal == is_retained_live false), like a never-Ready attempt.
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_bootstrap_owner_by_session
             .insert(active_session_path.to_string(), "owner:test".to_string());
@@ -39910,7 +39910,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "request:hot", 1, "test");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
@@ -39954,7 +39954,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "request:rg", 1, "test");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
@@ -40272,7 +40272,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_bootstrap_owner_by_session
             .insert(active_session_path.to_string(), "owner:test".to_string());
@@ -40327,7 +40327,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell.begin_terminal_open_attempt(active_session_path, "req-ready", 1, "open_row");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
         shell
@@ -40380,7 +40380,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_bootstrap_owner_by_session
             .insert(active_session_path.to_string(), "owner:test".to_string());
@@ -40443,7 +40443,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
@@ -40479,7 +40479,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell.begin_terminal_open_attempt(active_session_path, "req-ready", 1, "open_row");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
 
@@ -40497,7 +40497,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
@@ -40636,7 +40636,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -40870,7 +40870,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = true;
         shell.latest_open_request_id = 7;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -40935,7 +40935,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id = shell.begin_terminal_open_attempt(
             active_session_path,
             "req-test",
@@ -41953,7 +41953,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         // The host record exists: the mount epoch was assigned (the mount_open
         // had succeeded by the time the cancel fired in the measured trace).
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         let attempt_id =
             shell.begin_terminal_open_attempt(session_path, "req-live-host", 4, "startup_restore");
         // Real session content arrived through the daemon's forward, but the
@@ -42029,7 +42029,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(session_path.to_string());
@@ -42096,7 +42096,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(session_path.to_string());
@@ -42801,7 +42801,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -42892,7 +42892,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -43867,7 +43867,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let epoch_before = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let epoch_before = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id = shell.begin_terminal_open_attempt(
             active_session_path,
             "req-retained-empty",
@@ -43924,7 +43924,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let epoch_before = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let epoch_before = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id = shell.begin_terminal_open_attempt(
             active_session_path,
             "req-retained-empty",
@@ -44129,7 +44129,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -44154,7 +44154,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -44197,7 +44197,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -44603,7 +44603,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(inactive_session_path);
+        shell.bump_terminal_mount_epoch_for_session(inactive_session_path, "test");
         let inactive_host = shell
             .terminal_session_host_id(inactive_session_path)
             .expect("inactive retained session should have a host id");
@@ -44651,7 +44651,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(inactive_session_path);
+        shell.bump_terminal_mount_epoch_for_session(inactive_session_path, "test");
         shell
             .terminal_session_host_id(inactive_session_path)
             .expect("inactive retained session should have a host id");
@@ -44752,7 +44752,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         // The client is PAINTING this session (it has a mounted host).
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
 
         // Baseline: the daemon owns everything, nothing is preserved.
@@ -44844,7 +44844,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
 
         shell.set_latest_runtime_status(None);
@@ -44868,7 +44868,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
 
         shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
@@ -44918,7 +44918,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         let runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
         shell.set_latest_runtime_status(Some(runtime_status_with_preserved_keys(
             "2.12.16",
@@ -45118,7 +45118,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         shell.retain_terminal_session_path(session_path);
         shell
             .terminal_resume_ready_paths
@@ -54074,6 +54074,72 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             assert!(shell.terminal_input_override_active);
             assert!(shell.retained_terminal_session_paths.contains(session_path));
         });
+    }
+
+
+    #[test]
+    fn the_focus_tail_arm_preserves_sibling_hosts_epochs() {
+        // [11.215]: the focus tail used to re-run the FULL retention policy —
+        // its eviction sweep stripped sibling hosts' mount epochs mid-create,
+        // re-keying their elements and superseding the mount loop the same
+        // interaction had just started (one bootstrap_owner_superseded_
+        // during_loop + terminal_mount_task_dropped per split-create). The
+        // tail's arm must guarantee only THIS path: retained + epoch present.
+        let session_path = "local://focus-tail-a";
+        let sibling_path = "local://focus-tail-b";
+        let dom = dioxus_core::VirtualDom::new(|| rsx! {});
+        dom.in_runtime(|| {
+            let mut state = Signal::new_in_scope(
+                ShellState::new(test_shell_bootstrap_with_active_session(session_path)),
+                ScopeId::ROOT,
+            );
+            {
+                let mut shell = state.write();
+                shell.retained_terminal_session_paths
+                    .insert(sibling_path.to_string());
+                shell.terminal_mount_epochs
+                    .insert(sibling_path.to_string(), 7);
+            }
+            assert!(try_arm_terminal_activation_for_focus(
+                state,
+                session_path,
+                "test_focus_tail_preserves_siblings",
+            ));
+            let shell = state.read();
+            assert!(shell.terminal_input_override_active);
+            assert!(shell
+                .retained_terminal_session_paths
+                .contains(session_path));
+            assert_eq!(
+                shell.terminal_mount_epochs.get(sibling_path).copied(),
+                Some(7),
+                "the tail's arm must not strip a sibling host's epoch"
+            );
+        });
+    }
+
+    #[test]
+    fn the_focus_reclaim_deferred_passes_stay_out_of_the_appear_window() {
+        // [11.215]: the split/switch appear window is ~0-190 ms (felt DOM p50
+        // 164 ms was 1.6x over the 100 ms bar; the first animation frame paid
+        // +77-79 ms of congestion from reclaim passes firing inside it). The
+        // immediate call + the rAF pass are the only in-window invocations;
+        // every DEFERRED pass must land past the window, and the late-VDOM-
+        // settle defense must keep at least two passes.
+        const APPEAR_WINDOW_MS: u64 = 190;
+        let in_window: Vec<u64> = FOCUS_RECLAIM_DEFERRED_PASSES_MS
+            .iter()
+            .copied()
+            .filter(|ms| *ms < APPEAR_WINDOW_MS)
+            .collect();
+        assert!(
+            in_window.is_empty(),
+            "deferred reclaim passes inside the appear window: {in_window:?}"
+        );
+        assert!(
+            FOCUS_RECLAIM_DEFERRED_PASSES_MS.len() >= 2,
+            "the late focus-steal defense must keep at least two passes"
+        );
     }
 
     #[test]
@@ -71146,7 +71212,7 @@ mod web_surface_immersion_locks {
         shell.window_focused = true;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
-        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         shell.terminal_sessions_reached_ready
             .insert(session_path.to_string());
         shell
