@@ -18,6 +18,52 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.212] THE [11.190]/[11.193] MINTED-BOUND FRESH START NEVER REACHES THE ROW ON THE [11.206] CLICK PATH — THE FALLTHROUGH SERVES THE CLICK (trace + deliberate re-entry + live row, GREEN) BUT THE SPAWNED COMMAND RESUMES THE ABSENT REQUESTED ID AND THE FRESH-START STAMP + [11.193] RE-POINT NEVER LAND (measured 2026-09-29 ~12:3x-14:1x IST, live jojo daemon bfe5ed19, the 11.211 mint-arm falsifier lane)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by seat 11.211 (zcode sess_7c1d3a84 on jojo, work FROM dev;
+plan ACK-3d14c74cb5) running the [11.206] falsifier the 11.209 door queued:
+a live store-absent-without-candidate agy row opening a MINTED fresh start.
+
+MEASURED (tools/e2e/connection_probe.py scenario defmiss_fresh_start_mint_11206,
+3 live runs): the construction works — birth agy row in a probe cwd, rows
+despawn (records the remembered close), the cwd's conversations deleted from
+conversation_summaries.db, `resume-agy <uuid> <cwd> --require-existing`. Every
+run: `ensure_definitive_miss_fresh_start` traced, `live_session_birth_
+deliberate_reentry` (the birth veto did NOT eat the insert), row born, CLI
+live on the PTY — the [11.206] dead frame is GONE, that half is proven. But
+`rows show` answers id == the store-absent REQUESTED uuid every time, and the
+resolved launch command (trace `resolved`, the run window in ytrace) carries
+`--conversation '<the absent id>'` — the [11.190] minted compose and the
+[11.193] re-point of session.id did NOT reach the row. A row born this way
+resumes an id the store provably lacks: agy's own "conversation not found"
+warning paints in the PTY (measured: `agent_session_error` /
+`resume_refusal` pattern session_not_found in the same window), and the store
+will never title the row — the exact disease [11.193] was cut for.
+
+MECHANISM POINTER (static read, unconfirmed): the ensure's compose is correct
+on its face (worktree bfe5ed19 lib.rs 13329-13362: resumable false,
+agy_definitive_store_miss true → fresh_conversation_id minted and bound), but
+`restored_codex_runtime_launch_repaired` fires INSIDE the same window (trace,
+between `launch` and `request_terminal_launch`) and UNCONDITIONALLY rewrites
+`session.launch_command` (lib.rs 19185-19188) — and the repair's command is
+composed by the restore/keep-alive path from `remote_saved_agent_session_
+exists`, which answers fail-open TRUE for Antigravity BY [11.165] DESIGN
+(lib.rs 16674-16705) → a resume of the ORIGINAL id stomps the minted compose.
+The Fresh Start stamp block (lib.rs 13461) then names a compose the row no
+longer carries — the naming/binding half dies between compose and repair.
+
+⇒ Fix direction: the repair must not stomp a minted fresh-start compose — the
+repair path needs the same three-valued vouch the ensure compose now has (or
+the compose must survive the repair), and the [11.193] re-point + "Fresh
+Start" stamp must land on the row that actually launches.
+
+PROBE: scenario defmiss_fresh_start_mint_11206 is the falsifier — GREEN when
+rows show re-points the id (bound != requested) with the trace still fired
+and the row live. RED baseline (this lane, build bfe5ed19): "SERVING half
+green, BINDING half red ... rows show answers id=<requested>".
+
 ## ⛔ [11.206] THE CONNECTION WEDGE (OWNER TOP PRIORITY): AFTER A HOST-DAEMON ROLL THE CLICKED REMOTE ROW REFUSES EVERY PLANE — resize/input ANSWER "terminal session not found", THE INPUT GATE STICKS unrestorable, AND STORE-ABSENT ROWS DEAD-END IN ERROR FRAMES BECAUSE THE ENSURE'S DEFINITIVE-MISS GATE REFUSES BEFORE THE [11.190] FRESH-START COMPOSE CAN SERVE THE CLICK (measured 2026-09-29 ~07:00-08:40 IST, live jojo GUI + dev, the 11.205 sitting; REATTRIBUTED same day by row 11.208)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -79,10 +125,16 @@ and keeps drawing resize-unownable forwards (~44/min): a row that can
 never own a runtime should stop being resize-forwarded (auto-despawn
 after N refusals) — candidate follow-up, cli-integration queue.
 
-FALSIFIER STILL OWED: a live store-absent-without-candidate agy row
-opening a MINTED fresh start (trace `ensure_definitive_miss_fresh_start`,
-"Fresh Start" metadata) — until one occurs or the owner accepts this
-sweep as the class proof, the entry stays.
+FALSIFIER (narrowed 2026-09-29 ~14:1x IST by row 11.211, probe lane
+11211-defmiss-mintarm): the SERVING half is now LIVE-PROVEN — the new
+connection_probe scenario `defmiss_fresh_start_mint_11206` drove a live
+store-absent-without-candidate remembered-closed agy row through the
+require-existing click: trace `ensure_definitive_miss_fresh_start` +
+`live_session_birth_deliberate_reentry` + live CLI on the PTY, zero dead
+frames (3/3 runs on daemon bfe5ed19). The BINDING half measured RED (the
+minted-bound [11.190]/[11.193] compose never reached the row — the spawned
+command resumed the absent requested id) and is filed as [11.212]; this
+entry stays until [11.212] lands and the scenario goes green end to end.
 
 ## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
