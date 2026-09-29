@@ -20,12 +20,17 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.204] CLOSING THE ACTIVE ROW COSTS ~3 s WHILE AN INACTIVE ROW CLOSES IN ~0.5 s — THE REMOVE-SESSION HANDLER TAIL PARKS ~1.3 s PER AWAIT BOUNDARY (WAKE ARRIVES LATE ONLY WHEN THE DYING ROW IS THE MOUNTED SURFACE), PLUS A 0-500 ms SETTLE LOOP (measured 2026-09-29 ~07:05-07:55 IST, live jojo desktop, build 5079e95b, the uxspeed close-latency lane)
 
-**Status:** OPEN — ATTRIBUTED, FIX NOT TAKEN (instrument shipped, this lane)
+**Status:** OPEN
 
 Filed 2026-09-29 by the ux-speed close-latency lane
 (lane/uxspeed/close-latency, claim ACK-a55fc29305). The re-baseline
 (post-wedge-ladder, 01:18 IST) read close at 544-741 ms; the lane found the
 distribution is BIMODAL and the mode is the bug.
+(The original status line carried attribution prose outside the docs-ssot
+vocabulary and jammed every integration tick ~08:36-09:1x IST; the prose lives
+here: the close-latency lane shipped the remove_session_stage instrument
+(bf576134), fix ATTRIBUTED NOT TAKEN there; the wake-chain fix leg landed as
+b688caab. Status-line prose belongs in the body, per docs-ssot.)
 
 THE MEASUREMENT (4 independent probe/verb runs, quiet desktop, CLI floor
 63-74 ms, GUI floor 162-185 ms, accuracy verified:true every time):
@@ -73,81 +78,37 @@ Probe artifacts: /tmp/close-lat/ on jojo (report1-3.json, rm_active/rmC/rmD
 replies, strace.txt, death.txt). Trace slices quoted in the lane door and the
 outcome post (infra/meta ACK-a55fc29305 thread).
 
-## ⛔ [11.203] OPENCODE TITLE READ GOES SILENT FOR session_v2-ONLY IDS (THE HEALED [11.202] ROWS KEEP THE CURE'S STALE TITLE), AND THE HEADLESS SURFACE HAS NO ROW-REAP VERB FOR THE ABSORBED CORPSES (measured 2026-09-29 ~06:10 IST, live dev, the [11.202] close)
+## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
 **Status:** OPEN
 
-Filed 2026-09-29 by the [11.202] close seat. [11.202] itself is CLOSED
-(membership belt + unconditional holder refusal + opencode key heal,
-bad9ac74, probe identity_convergence RED→GREEN on the rolled daemon). Two
-residues of the heal, both measured on dev:
+Filed 2026-09-29 (zcode row 11.206, work FROM dev; plan ACK-8cc045fa8a).
+Two mechanical defects, one jam:
 
-1. THE TITLE SILENCE: the three healed rows (ses_fb820a4aaffen…,
-   ses_fb294aa59ffeo…, ses_f9dce8ab… — ids restored onto their keys) keep
-   the cure's stale title "Greeting message" because the tick's title read
-   answers None for them: they are session_v2-ONLY rows (the v1 `session`
-   table has no row — verified), the tick counts them in store_silent
-   (63/tick), and the [11.202] membership reader answers Some(true) for the
-   same ids from the same db. The two readers differ in exactly one
-   structural respect: read_opencode_live_store_title opens
-   SQLITE_OPEN_READ_ONLY with NO busy_timeout while the membership reader
-   goes through open_cli_index_readonly (busy-tolerant) — and the opencode
-   server on dev writes its db continuously. The working hypothesis (named,
-   not yet proven): the title read loses the busy race and the filters/
-   error arms turn it into silence. Fix: give the title reader the same
-   busy tolerance (or route it through open_cli_index_readonly). Until
-   then the belt makes this identity-safe (a silent title read for a held
-   id is refused as a cure), so the drift is cosmetic — wrong strings on
-   three dead-ish rows — but it also blinds the title-follow plane for
-   every future v2-only id.
+1. RESURRECTION: a24d5d9a deleted [11.203] with the live proof; the
+uxspeed close-latency docs commit bf576134 was based on PRE-deletion
+main, still carried the entry text, and `git log -S "OPENCODE TITLE READ
+GOES SILENT"` names bf576134 as the re-add. The delete-on-main vs
+carried-text-on-lane merge is TEXTUALLY CLEAN (different hunks), so a
+green tick would publish the dead entry. Re-deleted in this lane.
 
-2. THE REAP GAP: four local:// rows wear ses_f7e98830 ("resize probe row",
-   "mirror diagnosis row", two nameless "Greeting message" husks). Their
-   pre-cure ids are unrecoverable (absorbed before every retained trace
-   rotation) and the headless server surface has NO row-close verb —
-   `rows` carries live/show/drafts/departed only, and the tombstone
-   primitives are crate-internal by law (a caller outside
-   live_row_tombstones must not publish a private snapshot over the shared
-   file). The identity_convergence invariant carries them as named RESIDUE
-   on its ok line, so growth stays visible. A `server row close <key>`
-   verb (tombstone + live-map removal through the plane's own doors)
-   closes this; then reap the four and the ok line goes clean.
+2. RED-GATE DECODE KILL: the gate's own error printer truncates the
+offending heading at a BYTE boundary — the [11.204] print ended
+`~0.5 s \xe2` (a bare em-dash lead byte) — and ygg-ci.py's step runner
+(`Popen(text=True)` with no encoding) decodes the gate's stderr with the
+locale codec and dies: `'utf-8' codec can't decode byte 0xe2 in position
+188`, three ticks in a row (08:49, 08:54 build, 08:59), no deploy since
+07:50. The 09-14 [11.112] class, second occurrence. Fix direction: the
+gate truncates by CHARACTERS (decode before slicing), the step runner
+pins `encoding="utf-8", errors="replace"` so no gate output bytes can
+ever kill a tick. The [11.204] status-line jam that tripped the red gate
+is fixed in this lane too.
 
-## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-2026-09-29, row 11.201, lane/integration/11181-install-honesty, work FROM
-dev. The entry's three fix directions resolved: (c) the refresh-state persist ALREADY survived
-per-tool failures — the [11.182] follow-up made it unconditional with the
-per-tool failed_at_ms backoff (the "gating the write on install_error"
-comment + the_launch_ensure_skips_a_contended_lock_before_any_install lock);
-this entry's (c) text was stale against that landing. (a)+(b) LANDED HERE:
-install_latest split into the Result-shaped wrapper (the single-tool ensure
-call sites keep the bail contract) over install_latest_collecting, which
-returns the per-arm failures structured; each failed arm emits
-install_step_failed {tool, error} at failure time, the walk emits
-refresh_install_error {failed_tools, error} when any arm failed, and the
-statuses branch keys "failed" on the tool's OWN arm (arm_failure_for) —
-a tool whose arm succeeded falls through to its honest updated/checked
-arm. Suite 1626/0 (1624 baseline + 2 new locks: the_walk_reads_per_arm_
-failures_and_telemetry_carries_them, an_arm_failure_marks_only_its_own_
-tool). FALSIFIER OWED post-deploy: a real sweep on a host with the
-deterministic failing arm must show honest per-tool statuses +
-refresh_install_error naming the failing arm in event-trace.jsonl +
-last_successful_refresh_ms advancing; then DELETE this entry per the
-verified-fix law.
-
-Filed 2026-09-27 by the [11.177] lane while unblinding the drift report (zcode sess_fc6e2076-4139-4752-b3c6-95e7c5eec07d on jojo, work FROM dev; claim ACK-036bbb9074). The [11.177] fix makes the drift report fire regardless — this entry is what it will keep firing INTO until the install plane is honest.
-
-MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `scheduled`, ttl 7200000):
-
-- Every sweep's `refresh_end` carries `install_attempted: true, install_deferred: false` and **ALL 13 tool statuses `action: "failed"`** — while the SAME window's ynpm trace shows **every `operation.complete` with `result: "ok"`** (8 packages, one ynpm transaction each, incl. `@opencode/cli` 2.0.18). The npm arm is innocent.
-- `install_latest` collects failures across ALL provision arms and joins them into one `install_error` for the WHOLE refresh (`anyhow::bail!("{}", failures.join("; "))`). One failing non-ynpm arm poisons everything: every tool's status becomes "failed" — **including tools whose own arm succeeded and demonstrably changed** (`changed: true` on kimi/muse/agy in the same statuses that name them "failed") — and `persist_managed_cli_refresh_state` is skipped (same success-only block), so `last_successful_refresh_ms` starves and the TTL "skipped recently" quiet period can never engage.
-- The failing arm is one of the five non-ynpm tools (kimi/muse/devin VendorScript `curl|sh`, agy/devin SelfCommand self-updaters on this host). It is DETERMINISTIC (3/3 sweeps) and FAST (sweep completes in ~90 s). Its identity and error string are INVISIBLE in the trace: `refresh_end` statuses carry `{action, available, changed, tool}` only, the `Managed refresh failed: {error}` detail surfaces nowhere in event-trace.jsonl or daemon.log, and the GUI panel is the only consumer that ever sees it.
-
-⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
-
+⇒ Fix direction (ygg-ci): a tombstone check in the docs gate (refuse a
+tick whose merge re-adds a `## ⛔ [id]` heading the origin/main parent
+had deleted); the two decode hardenings above. Lane-side hygiene until
+then: rebase on origin/main BEFORE editing pending-bugs; keep status
+lines inside the closed vocabulary.
 
 ## ⛔ [11.186] THE RETIRED CHOOSER PANE KEEPS PAINTING OVER THE MOUNTED DESKTOP: A yRDP sidebar `close` NEVER FIRES THE GUI'S `sidebar_contribution/close` ARM, SO `clear_document_panes_for_session` NEVER RUNS AND THE VIEWPORT SHOWS THE MACHINE LIST OVER THE LIVE noVNC CANVAS (measured 2026-09-27 14:50-15:25 IST, live jojo desktop, the [11.185] proof leg)
 
