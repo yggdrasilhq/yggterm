@@ -5726,6 +5726,25 @@ pub(crate) struct DaemonRuntime {
     /// store-absence is not evidence), so peer death confirms across SPACED
     /// asks — real ensure ticks apart, the loop never parks on them.
     startborn_alive_no_at: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// THE [11.213] re-mount liveness planes, per path. The corpse class is
+    /// a handover-adopted remote row whose ring holds pre-handover bytes:
+    /// the LOCAL ssh child alive, the PEER runtime gone — both reuse-arm
+    /// witnesses lie, so before blessing a reuse from output this daemon
+    /// process never received, the peer is heard ONCE per session per daemon
+    /// birth. ASK is a background worker (the Q2 consult rebuttal: a
+    /// synchronous ssh ask under the daemon lock freezes the startup prewarm
+    /// sweep and blows the sub-100ms switch law), so the planes split:
+    /// `remount_peer_liveness_vouched` — heard alive, ask never again this
+    /// birth; `remount_peer_gone_verdicts` — a confident NO the next ensure
+    /// SPENDS (close or refuse); `remount_peer_ask_backoff` — a transport
+    /// error's short fail-open cooldown, so a degraded host is re-probed on
+    /// a later tick instead of on every switch (the Q4 third shape); the
+    /// pending set keeps one worker per path. The daemon restart that
+    /// re-poses the question also clears every plane.
+    remount_peer_liveness_vouched: Arc<Mutex<HashSet<String>>>,
+    remount_peer_gone_verdicts: Arc<Mutex<HashMap<String, RemountPeerGoneEvidence>>>,
+    remount_peer_ask_backoff: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    remount_peer_ask_pending: Arc<Mutex<HashSet<String>>>,
     /// Content gate for the routine persist paths — see
     /// [`write_persisted_state_if_changed`]. `None` until this daemon has
     /// written the file once, so the first persist of a process always writes.
@@ -5910,6 +5929,10 @@ impl DaemonRuntime {
             remote_pty_resize_in_flight: Arc::new(Mutex::new(HashSet::new())),
             peer_runtime_missing: Arc::new(Mutex::new(HashMap::new())),
             startborn_alive_no_at: Arc::new(Mutex::new(HashMap::new())),
+            remount_peer_liveness_vouched: Arc::new(Mutex::new(HashSet::new())),
+            remount_peer_gone_verdicts: Arc::new(Mutex::new(HashMap::new())),
+            remount_peer_ask_backoff: Arc::new(Mutex::new(HashMap::new())),
+            remount_peer_ask_pending: Arc::new(Mutex::new(HashSet::new())),
             last_persisted_state: None,
         };
         // Baseline, not an observation: rows restored at boot have not "come
@@ -10634,7 +10657,15 @@ impl DaemonRuntime {
         // placeholder banner. Spend the memo instead: refuse, name the state
         // in the row itself, and let the window expire so a peer-side
         // restore can heal the row.
-        if path.starts_with("remote-session://") {
+        // THE [11.153] GATE, EVERY REMOTE-AGENT KIND ([11.213]). The gate
+        // spent the peer-missing memo for remote-session:// rows only, so a
+        // handover-dead remote-agy:// (or any other kind) row re-mounted
+        // forever: the resize forward armed the same memo against the same
+        // peer, and the ensure never read it — the reuse arm kept blessing
+        // the corpse from its stale retained ring. The spend now keys off
+        // the SSOT remote-agent predicate (a superset of the old prefix,
+        // registry derived), so every kind with a peer spends the verdict.
+        if crate::session_path_is_remote_agent(path) {
             let peer_missing_error = {
                 let mut memo = self
                     .peer_runtime_missing
@@ -11093,6 +11124,18 @@ impl DaemonRuntime {
                 );
             }
             if !needs_restart {
+                // THE [11.213] RE-MOUNT LIVENESS GATE. `still_running` is the
+                // LOCAL ssh child and `has_runtime_output` is the ring — a
+                // handover-dead remote row answers true to both while the
+                // peer runtime is gone, and this return is what painted the
+                // corpse and re-armed the [11.57] burn. Remote-agent rows pay
+                // the gate: it spends a landed peer-dead verdict (close or
+                // healable refusal) and otherwise dispatches the BACKGROUND
+                // ask — never a synchronous ssh under the daemon lock (the
+                // Q2 consult law).
+                if crate::session_path_is_remote_agent(path) && has_runtime_output {
+                    self.remount_peer_liveness_gate(path)?;
+                }
                 let remote_reuse_missing_retained_scrollback = path
                     .starts_with("remote-session://")
                     && has_runtime_output
@@ -11696,6 +11739,229 @@ impl DaemonRuntime {
     /// an alive peer — disarms and keeps today's flow. The alive verb only
     /// ever goes out under a fresh memo: a healthy start-born row pays no
     /// ssh ask on this path at all.
+    /// THE [11.213] re-mount liveness gate, reuse-arm side. Never blocks:
+    /// spends an already-landed verdict, otherwise dispatches the background
+    /// ask and preserves today's flow (the one corpse paint the async shape
+    /// accepts; the Q2 consult law — no ssh under the daemon lock). The
+    /// next ensure spends the verdict: a store-gone CLOSES the row outright
+    /// (the [11.155] confident-NO shape, tombstone + departure, so the
+    /// recovery door has nothing to re-mount and passive births are vetoed);
+    /// an alive-ask-gone REFUSES with the healable [11.160] stamp and tears
+    /// the refused runtime down (the Q5 consult correction: a refusal that
+    /// leaves the corpse session in the map leaks the bridge and keeps
+    /// live_runtime_held true, wedging the [11.214] restore flow).
+    fn remount_peer_liveness_gate(&mut self, path: &str) -> anyhow::Result<()> {
+        if self
+            .remount_peer_liveness_vouched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(path)
+        {
+            return Ok(());
+        }
+        let landed_verdict = self
+            .remount_peer_gone_verdicts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(path);
+        if let Some(evidence) = landed_verdict {
+            // Spend: the worker heard the peer dead. Clear every plane so a
+            // future REAL birth at this path poses the question anew.
+            self.clear_remount_peer_liveness_planes(path);
+            match evidence {
+                RemountPeerGoneEvidence::PeerStoreGone => {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_reuse_closed_peer_dead_remount",
+                            serde_json::json!({
+                                "path": path,
+                                "instrument": evidence.instrument(),
+                            }),
+                        );
+                    }
+                    let _ = self.close_live_session_row(
+                        path,
+                        crate::live_row_tombstones::RowDeparture::PeerSessionGone,
+                    );
+                    bail!(
+                        "peer session gone — the owning machine no longer \
+                         holds this session, so the row was closed here to \
+                         match. Re-open the row to start a fresh session."
+                    );
+                }
+                RemountPeerGoneEvidence::AliveAskGone => {
+                    let refusal = format!(
+                        "peer session gone — the owning host reports this \
+                         runtime missing (runtime alive ask answered gone); \
+                         closed there? Re-open the row to start a fresh \
+                         session."
+                    );
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_reuse_refused_peer_dead_remount",
+                            serde_json::json!({
+                                "path": path,
+                                "instrument": evidence.instrument(),
+                            }),
+                        );
+                    }
+                    self.server
+                        .record_launch_refusal_for_path(path, &refusal, "peer session gone");
+                    self.teardown_refused_remote_runtime(path);
+                    let _ = self.persist_state_only();
+                    bail!("{refusal}");
+                }
+            }
+        }
+        if self
+            .remount_peer_ask_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(path)
+            .is_some_and(|at| at.elapsed() <= REMOUNT_PEER_ASK_BACKOFF)
+        {
+            // A recent transport error: fail open without re-asking (the Q4
+            // third shape — the treadmill is worse than one stale paint),
+            // and let the resize memo own the confident verdict meanwhile.
+            return Ok(());
+        }
+        self.spawn_remount_peer_liveness_ask(path);
+        Ok(())
+    }
+
+    fn clear_remount_peer_liveness_planes(&self, path: &str) {
+        self.remount_peer_liveness_vouched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(path);
+        self.remount_peer_ask_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(path);
+        self.remount_peer_ask_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(path);
+    }
+
+    /// THE [11.213] background ask worker, one per path at a time (the
+    /// resize forward's in-flight pattern). Peer CLI-store ask first —
+    /// DEFINITIVE when it answers; the start-born class (whose absence the
+    /// store must refuse) falls to the strict alive verb. Alive answers
+    /// vouch for the session's life here; transport errors only set the
+    /// short backoff, never a verdict.
+    fn spawn_remount_peer_liveness_ask(&self, path: &str) {
+        {
+            let mut pending = self
+                .remount_peer_ask_pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !pending.insert(path.to_string()) {
+                return;
+            }
+        }
+        let vouched_arc = Arc::clone(&self.remount_peer_liveness_vouched);
+        let verdicts = Arc::clone(&self.remount_peer_gone_verdicts);
+        let backoff = Arc::clone(&self.remount_peer_ask_backoff);
+        let pending = Arc::clone(&self.remount_peer_ask_pending);
+        let target = self.server.remote_agent_pty_target_for_path(path);
+        let start_born = self.remote_saved_session_row_is_start_born(path);
+        let worker_path = path.to_string();
+        let spawn_result = std::thread::Builder::new()
+            .name("yggterm-remount-peer-liveness".to_string())
+            .spawn(move || {
+                let finish = |vouched: bool, verdict: Option<RemountPeerGoneEvidence>| {
+                    if let Some(evidence) = verdict {
+                        verdicts
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(worker_path.clone(), evidence);
+                    } else if vouched {
+                        vouched_arc
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(worker_path.clone());
+                    } else {
+                        backoff
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(worker_path.clone(), std::time::Instant::now());
+                    }
+                    pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&worker_path);
+                    if let Ok(h) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &h,
+                            "daemon",
+                            "terminal_ensure",
+                            "remount_peer_liveness_verdict",
+                            serde_json::json!({
+                                "path": worker_path,
+                                "instrument": verdict.map(|e| e.instrument()),
+                                "vouched": vouched,
+                                "backoff_secs": (!vouched && verdict.is_none())
+                                    .then_some(REMOUNT_PEER_ASK_BACKOFF.as_secs()),
+                            }),
+                        );
+                    }
+                };
+                let (machine, session_id, kind) = match target {
+                    Some(target) => target,
+                    None => {
+                        finish(false, None);
+                        return;
+                    }
+                };
+                let store_answer =
+                    crate::fetch_remote_saved_agent_session_exists(
+                        kind,
+                        &machine.ssh_target,
+                        machine.prefix.as_deref(),
+                        &session_id,
+                    )
+                    .map(|exists| !exists)
+                    .map_err(|error| {
+                        anyhow::anyhow!("peer existence ask failed: {error:#}")
+                    });
+                match store_answer {
+                    Ok(true) => finish(false, Some(RemountPeerGoneEvidence::PeerStoreGone)),
+                    Ok(false) => finish(true, None),
+                    Err(_store_error) => {
+                        if !start_born {
+                            // Transport trouble is not evidence; back off and
+                            // keep today's flow.
+                            finish(false, None);
+                            return;
+                        }
+                        let alive_answer = crate::remote_agent_session_runtime_alive(
+                            &machine, &session_id, kind,
+                        );
+                        match alive_answer {
+                            Ok(false) => {
+                                finish(false, Some(RemountPeerGoneEvidence::AliveAskGone))
+                            }
+                            Ok(true) => finish(true, None),
+                            Err(_alive_error) => finish(false, None),
+                        }
+                    }
+                }
+            });
+        if spawn_result.is_err() {
+            self.remount_peer_ask_pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(path);
+        }
+    }
+
     fn startborn_peer_gone_ask(&self, path: &str) -> StartbornPeerAsk {
         let memo_fresh = {
             let memo = self
@@ -31067,6 +31333,12 @@ struct PeerRuntimeMissingVerdict {
 /// again (a peer-side restore CAN re-create the runtime key under the same
 /// id), and a still-missing peer re-arms the memo within seconds through the
 /// resize forward's own retries.
+/// THE [11.213] transport-error cooldown for the re-mount liveness ask:
+/// long enough that a degraded host is not probed on every switch (the
+/// treadmill), short enough that a transient ssh failure cannot outlive the
+/// user reaching the row again.
+const REMOUNT_PEER_ASK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 const REMOTE_PEER_MISSING_REFUSE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(600);
 
@@ -31088,6 +31360,35 @@ enum StartbornPeerAsk {
     KeepArmed,
     /// No fresh memo, a transport error, or an alive peer: disarm and preserve.
     Disarm,
+}
+
+/// THE [11.213] instruments that can name a re-mounted remote row's peer
+/// dead, ordered by strength. The peer CLI-store ask is DEFINITIVE — the
+/// store survives the peer daemon's rolls, so a confident absence there is
+/// not a roll window artifact, and the [11.155] close is the honest answer
+/// (Q3 consult bifurcation: definitive loss closes, runtime-only absence
+/// refuses healable). The alive verb speaks for the class the store must
+/// refuse (start-born rows, whose id the store never heard of); its NO is
+/// refused with the healable [11.160] shape and never closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemountPeerGoneEvidence {
+    /// The peer's own CLI store says the conversation id does not exist.
+    PeerStoreGone,
+    /// The strict-parse `agent-runtime-alive` verb answered gone (the
+    /// start-born class, whose absence the store cannot speak about).
+    AliveAskGone,
+}
+
+impl RemountPeerGoneEvidence {
+    /// The trace/JSON name of the instrument — the verdict trace and the
+    /// spend-site trace carry the same token so an operator grep sees one
+    /// vocabulary.
+    pub(crate) fn instrument(self) -> &'static str {
+        match self {
+            RemountPeerGoneEvidence::PeerStoreGone => "peer_store_gone",
+            RemountPeerGoneEvidence::AliveAskGone => "alive_ask_gone",
+        }
+    }
 }
 
 /// THE [11.158] decision core, pure so the table is testable: a start-born
@@ -32264,6 +32565,128 @@ mod tests {
             startborn_peer_action(true, Some(spacing), &ok(false)),
             StartbornPeerAsk::ConfirmClose,
             "two spaced nos on a fresh memo is the compound verdict"
+        );
+    }
+
+    #[test]
+    fn the_remount_liveness_ask_never_blocks_the_reuse_arm() {
+        // [11.213], the Q2 consult law: a synchronous ssh ask under the
+        // daemon lock freezes the startup prewarm sweep and blows the
+        // sub-100ms switch law. The reuse arm may only SPEND a landed
+        // verdict and DISPATCH the background ask; both peer instruments
+        // live inside the spawned worker, never on the ensure path.
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let gate = daemon_fn_body(
+            source,
+            "    fn remount_peer_liveness_gate(",
+        );
+        assert!(
+            !gate.contains("remote_agent_session_runtime_alive")
+                && !gate.contains("fetch_remote_saved_agent_session_exists"),
+            "the ensure-side gate must not ask the peer synchronously"
+        );
+        let worker = daemon_fn_body(
+            source,
+            "    fn spawn_remount_peer_liveness_ask(",
+        );
+        assert!(
+            worker.contains("std::thread::Builder::new()")
+                && worker.contains("fetch_remote_saved_agent_session_exists"),
+            "the ask lives in the spawned worker"
+        );
+        let start_born_arm = worker
+            .split("if !start_born")
+            .nth(1)
+            .expect("the start-born fallthrough to the alive verb");
+        assert!(
+            start_born_arm.contains("remote_agent_session_runtime_alive"),
+            "the class the store must refuse asks the strict alive verb"
+        );
+    }
+
+    #[test]
+    fn a_peer_store_gone_closes_and_an_alive_gone_refuses_healable() {
+        // [11.213], the Q3 consult bifurcation: the peer store survives the
+        // peer daemon's rolls, so a confident absence there is DEFINITIVE —
+        // the [11.155] close (tombstone + departure) is the honest answer.
+        // The alive verb's NO is refused with the healable [11.160] shape
+        // and tears the refused runtime down (the Q5 correction: a refusal
+        // that leaves the corpse in the map leaks the bridge and keeps
+        // live_runtime_held true).
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let gate = daemon_fn_body(
+            source,
+            "    fn remount_peer_liveness_gate(",
+        );
+        let spend = gate
+            .split("if let Some(evidence) = landed_verdict")
+            .nth(1)
+            .expect("the spend arm");
+        let close = spend
+            .split("RemountPeerGoneEvidence::AliveAskGone")
+            .next()
+            .expect("the store-gone half of the spend");
+        assert!(
+            close.contains("RowDeparture::PeerSessionGone")
+                && close.contains("close_live_session_row("),
+            "a definitive store absence closes the row outright"
+        );
+        let refuse = spend
+            .split("RemountPeerGoneEvidence::AliveAskGone")
+            .nth(1)
+            .expect("the alive-gone half of the spend");
+        assert!(
+            refuse.contains("record_launch_refusal_for_path(")
+                && refuse.contains("teardown_refused_remote_runtime("),
+            "a runtime-only absence refuses healable and tears the corpse down"
+        );
+        let reuse_arm = source
+            .split("THE [11.213] RE-MOUNT LIVENESS GATE.")
+            .nth(1)
+            .expect("the reuse-arm gate comment");
+        assert!(
+            reuse_arm.contains("self.remount_peer_liveness_gate(path)?;"),
+            "the reuse arm propagates the spend's refusal to the mount"
+        );
+    }
+
+    #[test]
+    fn the_1153_memo_spend_covers_every_remote_agent_kind() {
+        // [11.213] Gate A: the memo the resize forward arms against the peer
+        // is spent by the ensure for EVERY remote-agent kind, not just the
+        // remote-session:// prefix — a handover-dead remote-agy:// row used
+        // to re-mount forever with the verdict armed and unread.
+        let source = daemon_product_source();
+        let source = source.as_str();
+        let spend = source
+            .split("THE [11.153] GATE, EVERY REMOTE-AGENT KIND ([11.213]).")
+            .nth(1)
+            .expect("the widened spend gate comment")
+            .split("remote_saved_session_preflight_elided_runtime_launch")
+            .next()
+            .expect("the gate block ends before the elision trace");
+        assert!(
+            spend.contains("if crate::session_path_is_remote_agent(path) {"),
+            "the spend keys off the SSOT remote-agent predicate"
+        );
+        assert!(
+            spend.contains("peer_missing_error"),
+            "the spend still reads the peer-missing memo"
+        );
+    }
+
+    #[test]
+    fn the_remount_liveness_instruments_carry_one_vocabulary() {
+        use super::RemountPeerGoneEvidence;
+        assert_eq!(
+            RemountPeerGoneEvidence::PeerStoreGone.instrument(),
+            "peer_store_gone"
+        );
+        assert_eq!(
+            RemountPeerGoneEvidence::AliveAskGone.instrument(),
+            "alive_ask_gone"
         );
     }
 
