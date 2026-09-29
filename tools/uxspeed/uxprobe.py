@@ -747,6 +747,27 @@ class Probe:
                 return row
         return None
 
+    def live_region_order(self) -> list[str]:
+        """The drawn LIVE-REGION order — the sequence a live drop resolves
+        against (live_sidebar_session_row_indices: rows after the
+        __live_sessions__ head until the next depth-0 row, kind==Session).
+        rows()'s first-occurrence order is NOT this: a session row legitimately
+        appears twice (live rail + cwd tree), and the tree copy can shadow the
+        rail copy in a naive index read."""
+        rows = self.rows()
+        order: list[str] = []
+        in_live = False
+        for row in rows:
+            fp = row.get("full_path")
+            if fp == "__live_sessions__":
+                in_live = True
+                continue
+            if in_live and row.get("depth") == 0:
+                break
+            if in_live and row.get("kind") == "Session" and fp:
+                order.append(fp)
+        return order
+
     def rows_order_indices(self, paths: tuple[str, ...]) -> dict[str, int | None]:
         """One listing fetch serves every lookup. wait_order used to make one
         full `rows --json` call PER PATH per poll — two ~1-4 s calls on a
@@ -1513,6 +1534,32 @@ dioxus.send(out);
             time.sleep(0.3)
         return False, None
 
+    def wait_block_landing(self, expected: list[str], band: str,
+                           target: str, timeout_s: float | None = None):
+        """Wait for the BLOCK INVARIANT a live set drop promises: the set
+        contiguous, in its pre-gesture internal order, at the dropped band
+        relative to the target. An exact full-order match is over-strict on a
+        live desktop — rows born between the pre-read and the drop shift
+        absolute positions without touching the gesture's semantics (measured
+        2026-09-29: the daemon's applied list satisfied block+band 3/3 while
+        an exact-order poll timed out). Returns (ok, wait_ms)."""
+        set_expected = [q for q in expected if q != target]
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < (timeout_s or self.timeout_s):
+            live = self.live_region_order()
+            pos = {q: live.index(q) for q in expected if q in live}
+            if len(pos) == len(expected):
+                idxs = sorted(pos[q] for q in set_expected)
+                contiguous = idxs == list(range(min(idxs), max(idxs) + 1))
+                internal = [q for q in live if q in set_expected] == set_expected
+                t_i = pos[target]
+                band_ok = (all(i < t_i for i in idxs) if band == "before"
+                           else all(i > t_i for i in idxs))
+                if contiguous and internal and band_ok:
+                    return True, int((time.perf_counter() - t0) * 1000)
+            time.sleep(0.3)
+        return False, None
+
     def _stable_rects(self, paths: list[str], tries: int = 4) -> dict | None:
         """Sidebar rects, fetched twice and required equal — the sidebar
         smooth-scrolls after a tree select, and a rect fetched mid-scroll
@@ -1578,10 +1625,21 @@ dioxus.send(out);
             # already satisfied by front-seating — a satisfied drop no-ops by
             # design, so the driver would measure its own assumption, not the
             # product).
-            pre_idx = self.rows_order_indices(tuple(paths))
-            if any(v is None for v in pre_idx.values()):
-                acc.append("pre-gesture rows() missing paths: %s" % pre_idx)
-            pre_list = sorted(paths, key=lambda q: pre_idx[q] or 0)
+            live_idx: dict[str, int] = {}
+            _t1 = time.perf_counter()
+            while time.perf_counter() - _t1 < self.timeout_s:
+                live_order = self.live_region_order()
+                live_idx = {q: live_order.index(q) for q in paths
+                            if q in live_order}
+                if len(live_idx) == len(paths):
+                    break
+                time.sleep(0.3)
+            if len(live_idx) != len(paths):
+                acc.append("pre-gesture live region missing paths: %s"
+                           % [q for q in paths if q not in live_idx])
+                out["iterations"].append({"accuracy_failures": acc})
+                continue
+            pre_list = sorted(paths, key=lambda q: live_idx[q])
             set_drawn = [q for q in pre_list if q in (a_path, b_path, c_path)]
             rest = [q for q in pre_list if q not in (a_path, b_path, c_path)]
             d_i = rest.index(d_path)
@@ -1632,7 +1690,8 @@ dioxus.send(out);
                     it["hover_steps"] += 1
                 self.verb("pointer", "release")
                 t_release = now_ms()
-                landed, settle_ms = self.wait_relative_order(it_expected)
+                landed, settle_ms = self.wait_block_landing(
+                    it_expected, band, d_path)
                 it["felt_ms"] = now_ms() - t_down
                 it["reorder_settle_ms"] = settle_ms
                 evs = self._events_between(t_down, now_ms())
@@ -1691,12 +1750,21 @@ dioxus.send(out);
                 if n in ("live_session_reorder_persisted", "row_set_arranged"))
             if tree_drop_ignored:
                 acc.append("drop refused (tree_drop_ignored in window)")
+            # The daemon's honest skip account: a seat-gate refusal on the
+            # TARGET row breaks the landing relative to it even though the
+            # set itself lands as a block ([11.174] residual, daemon plane).
+            skipped_rows = [self._ui_payload(e) for e in evs
+                            if e.get("name") == "live_session_reorder_skipped_rows"]
+            if skipped_rows:
+                it["skipped_rows"] = skipped_rows[-1].get("skipped")
+                acc.append("reorder skipped rows: %s" % (it["skipped_rows"],))
             if not it["commit_persist_events"] and not tree_drop_ignored:
                 acc.append("drop committed nothing "
                            "(no reorder_persisted/row_set_arranged in window)")
             if not landed:
-                acc.append("drop did not land the set after D in set order "
-                           "within timeout")
+                acc.append("drop did not land the block at the dropped band "
+                           "(set contiguous + internal order + %s target) "
+                           "within timeout" % band)
             it["render_attribution"] = self.render_attribution(
                 t_down, t_release, it["hover_steps"])
             acc.extend(self.assert_render_attribution(
