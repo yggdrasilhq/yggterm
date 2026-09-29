@@ -2774,10 +2774,18 @@ dioxus.send(out);
                                f"{str(sr.get('error'))[:120]}")
             time.sleep(0.5)
             for m_path, mk in markers.items():
-                rb = self.verb("terminal", "read-buffer", m_path,
-                               "--mode", "screen")
-                blob = json.dumps(rb.get("json") or {}) + (rb.get("raw") or "")
-                if mk not in blob:
+                # The echo can take >0.5s to reach the daemon screen on a
+                # FRESH row (iter-0 red run) — bounded retry before calling
+                # it missing, so the assert convicts the app, not the clock.
+                for _attempt in range(4):
+                    rb = self.verb("terminal", "read-buffer", m_path,
+                                   "--mode", "screen")
+                    blob = (json.dumps(rb.get("json") or {})
+                            + (rb.get("raw") or ""))
+                    if mk in blob:
+                        break
+                    time.sleep(0.5)
+                else:
                     acc.append(f"pre-split marker missing in daemon buffer "
                                f"({m_path})")
             # both rows selected: the menu's split candidates are the
