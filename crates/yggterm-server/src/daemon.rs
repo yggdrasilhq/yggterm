@@ -11920,7 +11920,29 @@ impl DaemonRuntime {
                         return;
                     }
                 };
-                let store_answer =
+                let store_answer = if start_born {
+                    // ⛔ THE START-BORN CLASS DOES NOT ASK THE STORE. The
+                    // peer wrapper's session-exists arm is FAIL-OPEN for
+                    // exactly the kinds that mint fresh births ([11.165]:
+                    // Antigravity answers exists=true for any id not
+                    // positively present; declared-unscannable stores do the
+                    // same), so the store ask can prove neither life nor
+                    // death here — measured live 2026-09-29 on a
+                    // handover-dead remote-agy corpse (store db absent,
+                    // wrapper childless, agent-runtime-alive answering
+                    // alive:false): the worker vouched true from the
+                    // fail-open, and the vouched set is never re-asked, so
+                    // one fail-open silenced the gate for the row's
+                    // lifetime while the retained-rehydrate + resize-burn
+                    // loop ran free. The strict `agent-runtime-alive` verb
+                    // — it asks the peer's daemons who OWNS the runtime PTY
+                    // — is the instrument for this class, exactly as the
+                    // entry's design names it.
+                    Err(anyhow::anyhow!(
+                        "start-born class: the store ask is fail-open for \
+                         minting kinds; the strict alive verb decides"
+                    ))
+                } else {
                     crate::fetch_remote_saved_agent_session_exists(
                         kind,
                         &machine.ssh_target,
@@ -11930,7 +11952,8 @@ impl DaemonRuntime {
                     .map(|exists| !exists)
                     .map_err(|error| {
                         anyhow::anyhow!("peer existence ask failed: {error:#}")
-                    });
+                    })
+                };
                 match store_answer {
                     Ok(true) => finish(false, Some(RemountPeerGoneEvidence::PeerStoreGone)),
                     Ok(false) => finish(true, None),
@@ -32602,6 +32625,34 @@ mod tests {
         assert!(
             start_born_arm.contains("remote_agent_session_runtime_alive"),
             "the class the store must refuse asks the strict alive verb"
+        );
+        // [11.213] THE FAIL-OPEN FALSIFIER (measured live 2026-09-29 on a
+        // handover-dead remote-agy corpse: store db absent,
+        // agent-runtime-alive alive:false, yet the worker answered
+        // vouched:true — the peer session-exists arm is fail-open for
+        // minting kinds ([11.165]), so a start-born corpse vouched itself
+        // alive and the vouched set never asked again). The start-born
+        // class must SKIP the store ask entirely: its Err lands in the
+        // existing fallthrough above and only the strict alive verb
+        // decides.
+        let store_ask = worker
+            .split("let store_answer = if start_born")
+            .nth(1)
+            .expect("the start-born store-skip branch precedes the ask");
+        let (skip_arm, resume_arm) = store_ask
+            .split_once("} else {")
+            .expect("the skip/ask split");
+        assert!(
+            skip_arm.contains("THE START-BORN CLASS DOES NOT ASK THE STORE"),
+            "the skip names the fail-open law it exists for"
+        );
+        assert!(
+            !skip_arm.contains("fetch_remote_saved_agent_session_exists"),
+            "the start-born arm never consults the fail-open store ask"
+        );
+        assert!(
+            resume_arm.contains("fetch_remote_saved_agent_session_exists"),
+            "the resume class keeps the cheap store-first ask"
         );
     }
 
