@@ -731,6 +731,27 @@ class Probe:
                 return row
         return None
 
+    def live_region_order(self) -> list[str]:
+        """The drawn LIVE-REGION order — the sequence a live drop resolves
+        against (live_sidebar_session_row_indices: rows after the
+        __live_sessions__ head until the next depth-0 row, kind==Session).
+        rows()'s first-occurrence order is NOT this: a session row legitimately
+        appears twice (live rail + cwd tree), and the tree copy can shadow the
+        rail copy in a naive index read."""
+        rows = self.rows()
+        order: list[str] = []
+        in_live = False
+        for row in rows:
+            fp = row.get("full_path")
+            if fp == "__live_sessions__":
+                in_live = True
+                continue
+            if in_live and row.get("depth") == 0:
+                break
+            if in_live and row.get("kind") == "Session" and fp:
+                order.append(fp)
+        return order
+
     def rows_order_indices(self, paths: tuple[str, ...]) -> dict[str, int | None]:
         """One listing fetch serves every lookup. wait_order used to make one
         full `rows --json` call PER PATH per poll — two ~1-4 s calls on a
@@ -1562,10 +1583,12 @@ dioxus.send(out);
             # already satisfied by front-seating — a satisfied drop no-ops by
             # design, so the driver would measure its own assumption, not the
             # product).
-            pre_idx = self.rows_order_indices(tuple(paths))
-            if any(v is None for v in pre_idx.values()):
-                acc.append("pre-gesture rows() missing paths: %s" % pre_idx)
-            pre_list = sorted(paths, key=lambda q: pre_idx[q] or 0)
+            live_order = self.live_region_order()
+            pre_idx = {q: live_order.index(q) for q in paths if q in live_order}
+            if len(pre_idx) != len(paths):
+                acc.append("pre-gesture live region missing paths: %s"
+                           % [q for q in paths if q not in pre_idx])
+            pre_list = sorted(paths, key=lambda q: pre_idx[q])
             set_drawn = [q for q in pre_list if q in (a_path, b_path, c_path)]
             rest = [q for q in pre_list if q not in (a_path, b_path, c_path)]
             d_i = rest.index(d_path)
@@ -1675,12 +1698,21 @@ dioxus.send(out);
                 if n in ("live_session_reorder_persisted", "row_set_arranged"))
             if tree_drop_ignored:
                 acc.append("drop refused (tree_drop_ignored in window)")
+            # The daemon's honest skip account: a seat-gate refusal on the
+            # TARGET row breaks the landing relative to it even though the
+            # set itself lands as a block ([11.174] residual, daemon plane).
+            skipped_rows = [self._ui_payload(e) for e in evs
+                            if e.get("name") == "live_session_reorder_skipped_rows"]
+            if skipped_rows:
+                it["skipped_rows"] = skipped_rows[-1].get("skipped")
+                acc.append("reorder skipped rows: %s" % (it["skipped_rows"],))
             if not it["commit_persist_events"] and not tree_drop_ignored:
                 acc.append("drop committed nothing "
                            "(no reorder_persisted/row_set_arranged in window)")
             if not landed:
-                acc.append("drop did not land the set after D in set order "
-                           "within timeout")
+                acc.append("drop did not land the set at the dropped band "
+                           "in drawn order within timeout (expected %s)"
+                           % it_expected)
             it["render_attribution"] = self.render_attribution(
                 t_down, t_release, it["hover_steps"])
             acc.extend(self.assert_render_attribution(
