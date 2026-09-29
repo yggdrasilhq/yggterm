@@ -287,12 +287,38 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
                 .map(|session| (session.session_path.clone(), session.session_id.clone()))
                 .collect::<Vec<_>>(),
         );
+        // ⛔ ONE batched title load per machine per build, not one query per
+        // session: the per-row `remote_scanned_session_label` open storm is
+        // gone (shared store), but a prepare+query PER CANDIDATE still cost
+        // ~640 round-trips per StartPage build on the fleet desktop — the
+        // same shape the merge's [11.117] leg fixed. Batched through
+        // get_title_map; the per-row call below reads the map.
+        let saved_titles = yggterm_core::resolve_yggterm_home()
+            .ok()
+            .and_then(|home| {
+                yggterm_core::with_shared_title_store(&home, |store| {
+                    let ids = machine
+                        .sessions
+                        .iter()
+                        .map(|session| session.session_id.clone())
+                        .collect::<Vec<_>>();
+                    store.get_title_map(&ids).ok()
+                })
+            })
+            .flatten()
+            .unwrap_or_default();
         for session in &machine.sessions {
             if !remote_scanned_session_is_start_page_durable(session) {
                 continue;
             }
+            let saved_title = saved_titles.get(&session.session_id);
             push_candidate(
-                browser_row_for_remote_scanned_session(machine, session, &remote_short_ids),
+                browser_row_for_remote_scanned_session(
+                    machine,
+                    session,
+                    &remote_short_ids,
+                    saved_title.map(String::as_str),
+                ),
                 session.modified_epoch,
                 session.started_at.clone(),
                 start_page_recent_scope_allows_remote_session(&scope, machine, session),
@@ -789,8 +815,9 @@ fn browser_row_for_remote_scanned_session(
     machine: &RemoteMachineSnapshot,
     session: &RemoteScannedSession,
     short_ids: &HashMap<String, String>,
+    saved_title: Option<&str>,
 ) -> BrowserRow {
-    let label = remote_scanned_session_label(session, short_ids);
+    let label = remote_scanned_session_label_with_saved_title(session, short_ids, saved_title);
     // ⛔ NO DEFAULT CLI. This used to be `lookup.or(Some(SessionKind::Codex))`,
     // so a row whose scheme the registry had not met was PRESENTED as Codex —
     // the wrong button, the wrong brand colour, and the wrong resume path on

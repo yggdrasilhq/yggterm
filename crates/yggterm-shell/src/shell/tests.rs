@@ -70684,6 +70684,7 @@ mod web_surface_immersion_locks {
             &machine,
             scanned,
             &HashMap::new(),
+            None,
         );
         assert_eq!(
             row.session_kind,
@@ -70897,13 +70898,13 @@ mod web_surface_immersion_locks {
             "remote-opencode://probehost/ses_probe0000000000000000000",
             Some(SessionKind::OpenCode),
         );
-        let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new());
+        let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new(), None);
         assert_eq!(row.session_kind, Some(SessionKind::OpenCode));
 
         scanned.session_path =
             "remote-mystery://probehost/ses_probe0000000000000000000".to_string();
         scanned.kind = None;
-        let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new());
+        let row = browser_row_for_remote_scanned_session(&machine, &scanned, &HashMap::new(), None);
         assert_ne!(
             row.session_kind,
             Some(SessionKind::Codex),
