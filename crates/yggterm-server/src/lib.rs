@@ -1746,6 +1746,8 @@ fn persisted_live_session_from_managed(
         terminal_identity_exports: funnel_carried_identity_exports(Some(
             &session.launch_command,
         )),
+        note: session_metadata_value(session, "Note")
+            .filter(|note| !note.trim().is_empty()),
         title_is_explicit: session.title_is_explicit,
         outline_prefix: session.outline_prefix.clone(),
         // ONE encoding: the `Source` stamp an app launch writes IS the
@@ -5061,6 +5063,15 @@ pub struct PersistedLiveSession {
     /// which is the pre-existing behaviour rather than a new guess.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub title_is_explicit: bool,
+    /// The row's free-text NOTE ([11.210] `rows note set`) — the agent/human
+    /// write half of the Session Metadata panel. Persisted because a note
+    /// that dies with the daemon is not a note (a row outlives many daemons
+    /// in this fleet); restored back INTO the metadata vec under the static
+    /// label "Note" — the one store the panel and `rows show` read. The
+    /// machine-composed entries around it stay runtime-derived on purpose:
+    /// persisting the whole vec would resurrect stale scars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// The row's sidebar outline position. Persisted for the same reason the
     /// title's provenance is: a row outlives many daemons, and an outline that
     /// cannot survive a restart is not an outline.
@@ -6680,7 +6691,8 @@ impl YggtermServer {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let row_key = self.live_session_row_key(runtime_key)?;
         let session = self.sessions.get_mut(&row_key)?;
         session.id = session_id.to_string();
@@ -7842,6 +7854,93 @@ impl YggtermServer {
                 }
             }
         }
+    }
+
+    /// Clear a row's EXPLICIT-title pin: the title returns to the dynamic
+    /// plane — the title-follow chore and the CLI store readers own it again
+    /// on their next tick. Its own writer rather than an empty explicit
+    /// title, because the explicit-but-blank arm is a measured weird state,
+    /// not a spelling of "back to generated". The scanned mirror's flag
+    /// clears with the live row's (the explicit writer sets both — one
+    /// fact, one clear). Answers `None` for a path no row resolves,
+    /// `Some(false)` for an already-dynamic row, `Some(true)` when the pin
+    /// came off.
+    pub fn clear_session_title_explicit(&mut self, session_path: &str) -> Option<bool> {
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        let resolved_path = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .map(|session| session.session_path.clone());
+        let mut row_resolved = false;
+        let mut cleared = false;
+        if let Some(session) = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get_mut(key))
+        {
+            row_resolved = true;
+            if session.title_is_explicit {
+                session.title_is_explicit = false;
+                cleared = true;
+            }
+        }
+        for machine in &mut self.remote_machines {
+            for scanned in &mut machine.sessions {
+                if scanned.session_path == session_path
+                    || resolved_path
+                        .as_deref()
+                        .is_some_and(|path| scanned.session_path == path)
+                {
+                    row_resolved = true;
+                    if scanned.title_is_explicit {
+                        scanned.title_is_explicit = false;
+                        cleared = true;
+                    }
+                    return Some(cleared);
+                }
+            }
+        }
+        if row_resolved {
+            return Some(cleared);
+        }
+        None
+    }
+
+    /// Set (or remove, with `None`) a row's free-text NOTE — the write half
+    /// of the Session Metadata panel's agent plane. The note is an ordinary
+    /// metadata entry under the static label "Note", so it rides the
+    /// snapshot wire, the panel renderer and the persisted view unchanged;
+    /// no new wire type, no second store. A whitespace-only note is a clear.
+    /// Answers `None` for a path no row resolves, `Some(false)` when the
+    /// note already said that, `Some(true)` when the metadata changed.
+    pub fn set_session_note(&mut self, session_path: &str, note: Option<&str>) -> Option<bool> {
+        let row_key = self
+            .resolve_session_storage_key(session_path)
+            .map(str::to_string);
+        let note = note.map(str::trim);
+        let note = note.filter(|text| !text.is_empty());
+        if let Some(session) = row_key
+            .as_ref()
+            .and_then(|key| self.sessions.get_mut(key))
+        {
+            return Some(match note {
+                Some(text) => {
+                    if metadata_value(session, "Note") == text {
+                        false
+                    } else {
+                        upsert_session_metadata(&mut session.metadata, "Note", text.to_string());
+                        true
+                    }
+                }
+                None => {
+                    let before = session.metadata.len();
+                    session.metadata.retain(|entry| entry.label != "Note");
+                    session.metadata.len() != before
+                }
+            });
+        }
+        None
     }
 
     pub fn remote_copy_target_for_session_path(
@@ -13862,6 +13961,7 @@ impl YggtermServer {
             agent_launch_options,
             terminal_identity_exports,
             title_is_explicit,
+            note,
             outline_prefix,
             app_launch,
         } = live;
@@ -14062,6 +14162,13 @@ impl YggtermServer {
                 // binding.
                 session.outline_prefix = outline_prefix.clone();
                 if has_saved_agent_identity {
+
+                // The note rehydrates into the metadata vec UNCONDITIONALLY —
+                // the same law as the outline prefix one line over: it was
+                // persisted, dropping it at the handover is the failure.
+                if let Some(note) = note.as_deref() {
+                    upsert_session_metadata(&mut session.metadata, "Note", note.to_string());
+                }
                     session.id = restored_agent_session_id.clone();
                     session.session_path = normalized_live_key.clone();
                     let meta_label = agent_cli_descriptor(*agent_kind)
@@ -14178,6 +14285,12 @@ impl YggtermServer {
                 session.title_is_explicit = title_is_explicit;
                 session.outline_prefix = outline_prefix.clone();
                 session.source = SessionSource::LiveSsh;
+
+                // The note rehydrates into the metadata vec UNCONDITIONALLY —
+                // the same law as the outline prefix one line over.
+                if let Some(note) = note.as_deref() {
+                    upsert_session_metadata(&mut session.metadata, "Note", note.to_string());
+                }
                 session.kind = *agent_kind;
                 session.id = restored_agent_session_id.clone();
                 session.ssh_target = Some(target.ssh_target.clone());
@@ -14289,6 +14402,11 @@ impl YggtermServer {
             // where the row SITS, and it has to survive the handover or the
             // numbering is re-typed by hand every time.
             session.outline_prefix = outline_prefix.clone();
+            // The note is the same class of fact: it was persisted, so
+            // dropping it at the handover is the failure.
+            if let Some(note) = note.as_deref() {
+                upsert_session_metadata(&mut session.metadata, "Note", note.to_string());
+            }
         }
         // remote-cc:// twin of the remote_scanned arm above (the scanned-key
         // parse only matches remote-session://): build_live_session's
@@ -30755,10 +30873,12 @@ pub fn run_row_show(selector: &str) -> anyhow::Result<()> {
                     "ssot".to_string(),
                     serde_json::json!({
                         "row_title": row_title,
+                        "title_source": if row.title_is_explicit { "user" } else { "dynamic" },
                         "cli_store_title": cli_store_title,
                         "title_sources": title_sources,
                         "mismatch": matches!(&cli_store_title, Some(t) if t != &row_title)
                             && !row.title_is_explicit,
+                        "note": row.note,
                     }),
                 );
             }
@@ -30792,6 +30912,131 @@ pub fn run_row_show(selector: &str) -> anyhow::Result<()> {
 ///
 /// ⚠ PRESENCE ONLY. Neither this verb nor the field it reads ever carries what
 /// was typed.
+/// ONE RESOLVER for the rows-write verbs: the selector matches a row's key,
+/// then its id, then a title substring — the `rows show` order — across
+/// every reachable daemon, and the answer carries the OWNING endpoint (the
+/// write must land where the row's record lives), the row's session path
+/// (`PersistedLiveSession.key` IS the session path), its current title and
+/// its explicit flag, so the verb answers what it is about to change.
+fn resolve_row_for_write(
+    home: &std::path::Path,
+    selector: &str,
+) -> Option<(crate::daemon::ServerEndpoint, String, String, bool)> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return None;
+    }
+    for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(home) {
+        for row in &runtime.live_terminal_sessions {
+            let matched = row.key == selector
+                || row.id == selector
+                || row.title.contains(selector);
+            if matched {
+                return Some((
+                    endpoint,
+                    row.key.clone(),
+                    row.title.clone(),
+                    row.title_is_explicit,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `server rows title set <selector> <text...>` — the verb half of the
+/// GUI's `session rename`, for agents and for every host the GUI is not
+/// on. The title lands through the OWNING daemon with `title_is_explicit`:
+/// the title-follow chore answers `refused_owner_set` for the row, the
+/// hint writers keep out, and the explicit writer's store write-through
+/// keeps the CLI's own picker in agreement (loopback rows). An empty title
+/// is refused BY NAME — the explicit-but-blank arm is a measured weird
+/// state; `rows title clear` is the way back to the dynamic title.
+pub fn run_row_title_set(selector: &str, title: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!(
+            "an empty title is refused — the explicit-but-blank state is a measured \
+             weird state; use `server rows title clear <selector>` to return the \
+             row to the dynamic title"
+        );
+    }
+    let Some((endpoint, key, previous_title, was_explicit)) =
+        resolve_row_for_write(&home, selector)
+    else {
+        anyhow::bail!("no live row matches {selector:?} on any reachable daemon");
+    };
+    daemon::update_session_copy_title(&endpoint, &key, title)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "key": key,
+        "title": title,
+        "title_source": "user",
+        "previous_title": previous_title,
+        "previous_title_source": if was_explicit { "user" } else { "dynamic" },
+        "note": "the title-follow chore refuses this row until `rows title clear`",
+    }))?)?;
+    Ok(())
+}
+
+/// `server rows title clear <selector>` — take a row's title pin off: the
+/// next title-follow tick re-applies what the CLI's own store says.
+pub fn run_row_title_clear(selector: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let Some((endpoint, key, previous_title, was_explicit)) =
+        resolve_row_for_write(&home, selector)
+    else {
+        anyhow::bail!("no live row matches {selector:?} on any reachable daemon");
+    };
+    let answer = daemon::clear_session_explicit_title(&endpoint, &key)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "key": key,
+        "previous_title": previous_title,
+        "was_explicit": was_explicit,
+        "answer": answer,
+    }))?)?;
+    Ok(())
+}
+
+/// `server rows note set <selector> <text...>` — attach a free-text note to
+/// a row: the agent/human write half of the Session Metadata panel. The
+/// note rides the snapshot to the panel and `rows show` alike; no second
+/// store, no new wire type.
+pub fn run_row_note_set(selector: &str, note: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let note = note.trim();
+    if note.is_empty() {
+        anyhow::bail!(
+            "an empty note is refused — use `server rows note clear <selector>` \
+             to remove a note"
+        );
+    }
+    let Some((endpoint, key, _, _)) = resolve_row_for_write(&home, selector) else {
+        anyhow::bail!("no live row matches {selector:?} on any reachable daemon");
+    };
+    let answer = daemon::set_session_note(&endpoint, &key, Some(note))?;
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "key": key,
+        "note": note,
+        "answer": answer,
+    }))?)?;
+    Ok(())
+}
+
+/// `server rows note clear <selector>` — remove a row's note.
+pub fn run_row_note_clear(selector: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let Some((endpoint, key, _, _)) = resolve_row_for_write(&home, selector) else {
+        anyhow::bail!("no live row matches {selector:?} on any reachable daemon");
+    };
+    let answer = daemon::set_session_note(&endpoint, &key, None)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&serde_json::json!({
+        "key": key,
+        "answer": answer,
+    }))?)?;
+    Ok(())
+}
+
 pub fn run_row_drafts() -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let mut daemons = Vec::new();
@@ -41062,7 +41307,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
 
         // ⚠ THE CONTROL, and it is the whole point: the scan says nothing is
         // live, exactly as a real persist leaves it.
@@ -41124,7 +41370,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
         assert!(
             super::persisted_live_session_is_recoverable(&cc),
             "remote CC keep-alive must survive a daemon restart exactly like remote codex"
@@ -41650,7 +41897,8 @@ mod tests {
             agent_launch_options: options.clone(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
 
         let round_tripped: crate::PersistedLiveSession =
             serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
@@ -44854,7 +45102,8 @@ mod tests {
             outline_prefix: None,
             app_launch: Some("app:ychrome:new".to_string()),
             terminal_identity_exports: Vec::new(),
-        };
+        
+            note: None,};
 
         for restart in 1..=2 {
             server.restore_live_session(record.clone());
@@ -50648,6 +50897,135 @@ terminal_window_id: None,
         );
     }
 
+    /// THE CLEAR IS THE WAY BACK: a cleared pin hands the title to the
+    /// dynamic plane — the hint writers (the title-follow chore's write
+    /// arm) are refused while the pin is on and own the title again the
+    /// moment it comes off. The named outcomes (no row / already dynamic /
+    /// cleared) keep a wrong selector from answering as success.
+    #[test]
+    fn a_cleared_title_pin_returns_the_row_to_the_dynamic_plane() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("Local Claude Code"),
+        );
+        server.set_session_title_explicit(&path, "6. yggterm: campaign");
+        assert!(server.session_title_is_explicit(&path));
+        assert!(
+            !server.set_session_title_hint(&path, "generated title"),
+            "a hint write must be refused while the pin is on"
+        );
+        assert_eq!(server.clear_session_title_explicit(&path), Some(true));
+        assert!(!server.session_title_is_explicit(&path));
+        assert!(
+            server.set_session_title_hint(&path, "generated title"),
+            "the hint plane owns the title again after the clear"
+        );
+        assert_eq!(
+            server.sessions.get(&path).expect("row").title,
+            "generated title"
+        );
+        assert_eq!(
+            server.clear_session_title_explicit(&path),
+            Some(false),
+            "already-dynamic is its own named outcome"
+        );
+        assert_eq!(server.clear_session_title_explicit("/no/such/row"), None);
+    }
+
+    /// THE NOTE IS ONE FACT WITH ONE STORE: written under the static label
+    /// "Note" in the metadata vec, persisted as the record's own field, and
+    /// rehydrated into the vec at restore — the panel and `rows show` read
+    /// the vec either way, and a daemon handover cannot eat it.
+    #[test]
+    fn a_note_rides_one_static_label_and_survives_a_daemon_restart() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(
+            SessionKind::ClaudeCode,
+            Some("/home/user/gh/yggterm"),
+            Some("Local Claude Code"),
+        );
+        assert_eq!(
+            server.set_session_note(&path, Some("cli-integration 11.210")),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_value(server.sessions.get(&path).expect("row"), "Note"),
+            "cli-integration 11.210"
+        );
+        assert_eq!(
+            server.set_session_note(&path, Some("cli-integration 11.210")),
+            Some(false),
+            "the same note again is a named no-op"
+        );
+        assert_eq!(server.set_session_note(&path, Some("moved on")), Some(true));
+        assert_eq!(server.set_session_note(&path, None), Some(true));
+        assert_eq!(server.set_session_note(&path, None), Some(false));
+        assert_eq!(server.set_session_note("/no/such/row", Some("x")), None);
+
+        // the survival leg: note -> persist -> new daemon -> still there
+        // (the writer trims, so the value wears no padding)
+        server.set_session_note(&path, Some(" survives the handover"));
+        let persisted = server.persisted_state();
+        let record = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == path)
+            .expect("row persists");
+        assert_eq!(record.note.as_deref(), Some("survives the handover"));
+        let mut next = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        next.restore_persisted_state(persisted, None);
+        assert_eq!(
+            metadata_value(next.sessions.get(&path).expect("restored row"), "Note"),
+            "survives the handover",
+            "the note must rehydrate into the metadata vec, not vanish at the handover"
+        );
+    }
+
+    /// THE CLEAR IS ITS OWN REQUEST, never an empty explicit title riding
+    /// `UpdateSessionCopy` — the explicit-but-blank arm is a measured weird
+    /// state, and overloading it would make "clear" mean "blank".
+    #[test]
+    fn the_title_clear_is_its_own_request_not_an_empty_explicit_title() {
+        let daemon = include_str!("daemon.rs");
+        assert!(
+            daemon.contains(concat!("ClearSessionExplicit", "Title {")),
+            "the clear must ride its own request variant"
+        );
+    }
+
+    /// THE VERB-SIDE TITLE SET RIDES THE EXPLICIT FLAG — the same wire the
+    /// GUI rename uses — so the follow chore's `refused_owner_set` and the
+    /// hint writers' refusal apply to agent renames with no new guard, and
+    /// the empty title is refused BY NAME at the verb (the explicit-but-blank
+    /// state stays unreachable from the verb plane).
+    #[test]
+    fn the_rows_title_set_rides_the_explicit_flag() {
+        let daemon = include_str!("daemon.rs");
+        let lib = include_str!("lib.rs");
+        assert!(
+            daemon.contains(concat!("title_is_explicit: ", "true,")),
+            "update_session_copy_title must set the explicit flag"
+        );
+        assert!(
+            lib.contains(concat!("an empty title is ", "refused")),
+            "the verb must refuse the empty title by name, pointing at rows title clear"
+        );
+    }
+
     /// The scanned mirror carries the PROVENANCE of a human-set title, not just
     /// its text.
     ///
@@ -52000,7 +52378,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let command = server
             .sessions
             .get("local://abd1")
@@ -52561,7 +52940,8 @@ terminal_window_id: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
                     outline_prefix: None,
-                }],
+                
+                    note: None,}],
                 session_pty_grids: Vec::new(),
             },
             None,
@@ -52615,7 +52995,8 @@ terminal_window_id: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
                     outline_prefix: None,
-                }],
+                
+                    note: None,}],
                 session_pty_grids: Vec::new(),
             },
             None,
@@ -52698,7 +53079,8 @@ terminal_window_id: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
                     outline_prefix: None,
-                }],
+                
+                    note: None,}],
                 session_pty_grids: Vec::new(),
             },
             None,
@@ -52787,7 +53169,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let local_shell = server.start_local_session(
             SessionKind::Shell,
             Some("/home/user/gh/yggterm"),
@@ -52934,7 +53317,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         assert!(server.represents_terminal_runtime_key(&kept_remote));
         assert!(
             !server.represents_terminal_runtime_key("remote-session://dev/non-kept-old"),
@@ -52981,7 +53365,8 @@ terminal_window_id: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            });
+            
+                note: None,});
             assert!(
                 server.represents_terminal_runtime_key(&runtime_key),
                 "{} row must represent its descriptor runtime alias {runtime_key}",
@@ -53017,7 +53402,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         assert!(server.live_session_order_keys().iter().any(|key| key == runtime_key));
         assert!(server.represents_terminal_runtime_key(runtime_key));
@@ -53215,7 +53601,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: true,
             outline_prefix: None,
-        });
+        
+            note: None,});
         assert!(
             server
                 .recover_owned_agent_runtime_row(
@@ -53292,7 +53679,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
 
         // Our own rows, in the user's arrangement.
         for id in ["a", "b", "c"] {
@@ -53353,7 +53741,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
         server.restore_live_session(row("mine"));
 
         let peer_rows: Vec<PersistedLiveSession> = ["top", "refused", "mine", "tail"]
@@ -53634,7 +54023,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let session = server
             .sessions
@@ -53740,7 +54130,8 @@ terminal_window_id: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
                     outline_prefix: None,
-                }],
+                
+                    note: None,}],
                 session_pty_grids: Vec::new(),
             },
             None,
@@ -53793,7 +54184,8 @@ terminal_window_id: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
                     outline_prefix: None,
-                }],
+                
+                    note: None,}],
                 session_pty_grids: Vec::new(),
             },
             None,
@@ -53881,7 +54273,8 @@ terminal_window_id: None,
                     agent_launch_options: Default::default(),
                     title_is_explicit: false,
                     outline_prefix: None,
-                }],
+                
+                    note: None,}],
                 session_pty_grids: Vec::new(),
             },
             None,
@@ -53952,7 +54345,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
         LiveRowTombstones::default()
             .record_close(&home, &closed, now_secs())
             .expect("record the close the way remove_session does");
@@ -54159,7 +54553,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
         let home = std::env::temp_dir().join(format!(
             "yggterm-restore-dedupe-{}-{}",
             std::process::id(),
@@ -54260,7 +54655,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
 
         assert!(
             !server.live_session_row_exists(&key),
@@ -54370,7 +54766,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.open_or_focus_session(
             SessionKind::ClaudeCode,
             &unkept,
@@ -54702,7 +55099,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                     PersistedLiveSession {
                         app_launch: None,
                         terminal_identity_exports: Vec::new(),
@@ -54722,7 +55120,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                 ],
                 session_pty_grids: Vec::new(),
             },
@@ -54776,7 +55175,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                     PersistedLiveSession {
                         app_launch: None,
                         terminal_identity_exports: Vec::new(),
@@ -54796,7 +55196,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                     PersistedLiveSession {
                         app_launch: None,
                         terminal_identity_exports: Vec::new(),
@@ -54816,7 +55217,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                 ],
                 session_pty_grids: Vec::new(),
             },
@@ -54882,7 +55284,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                     PersistedLiveSession {
                         app_launch: None,
                         terminal_identity_exports: Vec::new(),
@@ -54902,7 +55305,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                 ],
                 session_pty_grids: Vec::new(),
             },
@@ -55027,7 +55431,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                     PersistedLiveSession {
                         app_launch: None,
                         terminal_identity_exports: Vec::new(),
@@ -55047,7 +55452,8 @@ terminal_window_id: None,
                         agent_launch_options: Default::default(),
                         title_is_explicit: false,
                         outline_prefix: None,
-                    },
+                    
+                        note: None,},
                 ],
                 session_pty_grids: Vec::new(),
             },
@@ -55179,7 +55585,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         assert!(!server.sessions.contains_key(storage_path));
         let live = server
@@ -55225,7 +55632,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let live = server
             .live_sessions()
@@ -55286,7 +55694,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let session = server.sessions.get(key).expect("restored remote cc row");
         assert_eq!(session.kind, SessionKind::ClaudeCode);
@@ -55364,7 +55773,8 @@ terminal_window_id: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            };
+            
+                note: None,};
 
             assert_eq!(
                 super::restored_live_row_key(&persisted),
@@ -55417,7 +55827,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let session = server
             .sessions
             .get(key)
@@ -55460,7 +55871,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Terminal);
@@ -55554,7 +55966,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let live = server.sessions.get_mut(&runtime_key).expect("mounted");
         upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
         let (targets, _excluded) = server.live_remote_agent_identity_poll_view();
@@ -55626,7 +56039,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let live = server.sessions.get_mut(&runtime_key).expect("mounted");
         upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
         // Simulate the order-ledger divergence measured on the GUI host
@@ -55681,7 +56095,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let live = server.sessions.get_mut(&runtime_key).expect("mounted");
         upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
         // The re-birth on the live host happens AFTER restore (the ensure
@@ -55732,7 +56147,8 @@ terminal_window_id: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            });
+            
+                note: None,});
             let live = server.sessions.get_mut(&key).expect("mounted");
             upsert_session_metadata(&mut live.metadata, "Cwd", "/home/user/gh/yggterm".to_string());
         }
@@ -55867,7 +56283,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let live = server.sessions.get_mut(&runtime_key).expect("mounted");
         upsert_session_metadata(&mut live.metadata, "Codex Session", wrong.to_string());
 
@@ -55926,7 +56343,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.request_terminal_launch_for_path(&runtime_key, ActivationOrigin::internal("test"));
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -56041,7 +56459,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
@@ -56169,7 +56588,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         assert!(server.apply_codex_runtime_identity_to_live_session(
             &runtime_key,
             &super::CodexRuntimeProcessIdentity {
@@ -56242,7 +56662,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         assert!(
             server
@@ -56329,7 +56750,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert!(
@@ -56415,7 +56837,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         // The rebound row: real conversation id + resume-shaped command.
         {
             let session = server.sessions.get_mut(runtime_key).unwrap();
@@ -56480,7 +56903,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert!(
@@ -56597,7 +57021,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         // The daemon's start path stamps the row's workspace before a turn can
@@ -56713,7 +57138,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        };
+        
+            note: None,};
         let mut server = YggtermServer::new(
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
@@ -56795,7 +57221,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.request_terminal_launch_for_path(runtime_key, ActivationOrigin::internal("test"));
 
         assert!(server.apply_codex_runtime_identity_to_live_session(
@@ -57478,7 +57905,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let session = server
             .sessions
@@ -57544,7 +57972,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let session = server
             .sessions
@@ -58196,7 +58625,8 @@ terminal_window_id: None,
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            });
+            
+                note: None,});
 
             let session = server
                 .sessions
@@ -58330,7 +58760,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let session = server
             .sessions
@@ -58409,7 +58840,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let session = server
             .sessions
@@ -58517,7 +58949,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.active_session_path = Some("remote-session://dev/fresh-codex".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
         server.request_terminal_launch_for_active();
@@ -58581,7 +59014,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.active_session_path = Some("remote-session://dev/synthetic-runtime".to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
         server.request_terminal_launch_for_active();
@@ -58656,7 +59090,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         assert_eq!(
             server.terminal_stop_command("remote-session://dev/abc123"),
@@ -58739,7 +59174,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
             terminal_identity_exports: Vec::new(),
@@ -58759,7 +59195,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let targets = server.remote_shutdown_targets();
 
@@ -58829,7 +59266,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let (machine, session_id) = server
             .remote_shutdown_target_for_path("remote-session://guihost/live-2")
@@ -59364,7 +59802,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
         assert!(result.is_ok());
@@ -59397,7 +59836,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         server.active_session_path = Some(path.to_string());
         server.active_view_mode = WorkspaceViewMode::Terminal;
@@ -59434,7 +59874,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
             terminal_identity_exports: Vec::new(),
@@ -59454,7 +59895,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         // No session with an interactive prompt may be stopped by typing into
         // it: the text lands on the user's half-written input and submits it.
@@ -59489,7 +59931,8 @@ terminal_window_id: None,
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
 
         assert!(
             server

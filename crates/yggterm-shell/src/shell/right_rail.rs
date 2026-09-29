@@ -5980,6 +5980,16 @@ fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> El
             value: title,
         });
     }
+    // The agent/human note ([11.210] rows note set) — written through the
+    // daemon under the static label "Note", so it rides the snapshot; the
+    // panel only renders it when someone actually left one.
+    let note = metadata_value(session, "Note");
+    if !note.trim().is_empty() {
+        identity.push(SessionMetadataEntry {
+            label: "Note",
+            value: note.trim().to_string(),
+        });
+    }
 
     let connect = session_connect_command(session, &cwd);
 

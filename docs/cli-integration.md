@@ -2121,6 +2121,19 @@ owner's own breakdown:
    the verb half of the Session Metadata panel). Spawn/despawn wrappers are
    the open half: `server attach` / `terminal new` already spawn; a
    first-class per-row close verb is owed.
+   (The close verb LANDED since — `server rows despawn`.) The write half of
+   the metadata program LANDED 2026-09-29 (lane/integration/11210-titles-meta-set,
+   the owner's second priority law): `server rows title set|clear <selector>`
+   — the verb half of the GUI rename, riding `UpdateSessionCopy` with
+   `title_is_explicit` so the title-follow chore answers `refused_owner_set`
+   and the CLI store write-through keeps the picker in agreement; the clear
+   is its OWN request (`ClearSessionExplicitTitle`) because the
+   explicit-but-blank arm is a measured weird state, not a spelling of
+   "back to generated". Plus `server rows note set|clear <selector>` — one
+   static metadata label "Note", persisted on the record and rehydrated into
+   the metadata vec at restore, rendered by the Session Metadata panel, and
+   carried by `rows show` (which now also names `title_source`:
+   user|dynamic).
 2. **ytrace lifecycle probes with row positions.** LANDED this lane: the
    `rows_order` probe — one trace event per change in the live rows' set or
    order (spawn/close/drag-reorder/migration), carrying before-and-after
