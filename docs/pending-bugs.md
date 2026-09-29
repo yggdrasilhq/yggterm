@@ -216,7 +216,7 @@ RESIDUE (named, owner-gated through [11.165]): Gate B's store arm cannot CLOSE a
 
 ## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-09-29 (zcode row 11.206, work FROM dev; plan ACK-8cc045fa8a).
 Two mechanical defects, one jam:
@@ -245,6 +245,27 @@ tick whose merge re-adds a `## ⛔ [id]` heading the origin/main parent
 had deleted); the two decode hardenings above. Lane-side hygiene until
 then: rebase on origin/main BEFORE editing pending-bugs; keep status
 lines inside the closed vocabulary.
+
+LANDED — both halves FIXED IN CODE (2026-09-29 ~21:1x-22:0x IST, zcode
+sess_a1337d0a on jojo, work FROM dev; claim ACK-02f611e54f,
+lane/tools/11207-tombstone-gate). Decode half: 46bdef19 on main (the
+gate drops the awk byte-precision — the full heading prints, always
+valid UTF-8; ygg-ci.py pins encoding="utf-8", errors="replace" on the
+step runner). Tombstone half: c316f7a0, scripts/check-docs-ssot.sh
+section 2c — an id present in the tree but absent from origin/main,
+whose `## ⛔ [id]` heading line main's history ever carried
+(`git log -G` on the heading), is a resurrection: RED naming the id and
+the newest heading-touching commit; non-numeric bucket ids scoped out;
+a stale origin/main merely skips the question at commit time (the tick
+fetches fresh and is the plane that publishes). PROOF: RED on re-added
+[11.214] (names b3790486) and re-added [11.203] (names 23c571a7, the
+ghost re-deletion itself); GREEN on clean main; GREEN on a fresh id.
+Section 2d: the id-uniqueness dream (ACK-aad3de4a80) measured against
+the live queue and NOT gated — reuse is established practice (11.0 x8,
+6.7 x11, 99.1 x7, 18 groups); the ok line reports the count information-
+ally and the one-id-one-defect ruling stays with the owner. Live proof
+owed: the integrating tick runs the new gate green and deploys it; the
+entry then leaves under the verified-fix law.
 
 
 
