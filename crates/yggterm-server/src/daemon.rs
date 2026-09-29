@@ -22906,7 +22906,10 @@ pub fn update_session_copy_title(
     path: &str,
     title: &str,
 ) -> Result<String> {
-    expect_ack(send_request(
+    // The UpdateSessionCopy handler answers a BARE Ack (message: None) — that
+    // is its contract, not a transport fault; demanding a message here made a
+    // landed write read as an error (measured live, row 11.210's first proof).
+    Ok(expect_ack(send_request(
         endpoint,
         &ServerRequest::UpdateSessionCopy {
             path: path.to_string(),
@@ -22916,20 +22919,23 @@ pub fn update_session_copy_title(
             title_is_explicit: true,
         },
     )?)?
-    .with_context(|| format!("missing title-set answer for {path}"))
+    .unwrap_or_default())
 }
 
 /// Clear a row's explicit-title pin on the daemon that owns it. The answer
 /// names all three outcomes (cleared / already dynamic / no row) so a wrong
 /// path is never silent.
 pub fn clear_session_explicit_title(endpoint: &ServerEndpoint, path: &str) -> Result<String> {
-    expect_ack(send_request(
+    // The handler answers snapshot_response (a named message riding the
+    // Snapshot variant) — the outline client's transport, not expect_ack's.
+    Ok(expect_snapshot(send_request(
         endpoint,
         &ServerRequest::ClearSessionExplicitTitle {
             path: path.to_string(),
         },
     )?)?
-    .with_context(|| format!("missing title-clear answer for {path}"))
+    .1
+    .unwrap_or_default())
 }
 
 /// Set (or clear, with `None`) a row's note on the daemon that owns it.
@@ -22938,14 +22944,16 @@ pub fn set_session_note(
     path: &str,
     note: Option<&str>,
 ) -> Result<String> {
-    expect_ack(send_request(
+    // Same transport as the clear: the handler answers snapshot_response.
+    Ok(expect_snapshot(send_request(
         endpoint,
         &ServerRequest::SetSessionNote {
             path: path.to_string(),
             note: note.map(str::to_string),
         },
     )?)?
-    .with_context(|| format!("missing note answer for {path}"))
+    .1
+    .unwrap_or_default())
 }
 
 /// Fetch the row-order ledger report (JSON string) — all scopes or one.
