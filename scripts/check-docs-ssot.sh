@@ -85,7 +85,7 @@ rm -f /tmp/ygg-docs-ssot-badstatus.$$
 dupes=$(python3 - "$QUEUE" <<'PY' || true
 import sys, hashlib
 from collections import Counter
-paras = [p.strip() for p in open(sys.argv[1]).read().split("\n\n")]
+paras = [p.strip() for p in open(sys.argv[1], encoding="utf-8").read().split("\n\n")]
 long  = [p for p in paras if len(p) > 80]
 key   = lambda p: hashlib.sha1(" ".join(p.split()).encode()).hexdigest()
 counts = Counter(key(p) for p in long)
