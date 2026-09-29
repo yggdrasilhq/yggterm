@@ -31951,3 +31951,88 @@ shell teardown_honesty_locks::the_session_remove_call_site…,
 shell terminal_mount_warm_eval_is_tiny_and_version_locked, core
 install::promote_direct…, core session_bus::every_entry_point_refuses…
 (board ACK-5d7a0bf3db).
+
+UPDATE 3 — 2026-09-29 ~10:1x UTC (close-render-burst-2 lane, claim
+ACK-3174ece348; zcode sess_63c94b4b-aa38-4e26-8117-1c21d485d878 on jojo,
+work FROM dev): THE BURST IS DEAD ON THE CURRENT TIP — the fix is
+CONFIRMED by quiet re-measure, the A/B question is settled, and the
+residual is NAMED to a leg.
+
+- QUIET RE-MEASURE on rotated main 2359e40f (carries this entry's fixes +
+  d30498c0 + 7f1af593; cli floor 57-62 ms, gui floor 160-176 ms):
+  uxprobe spawn,close n=5 pairs — inactive close_to_gone 540-557 (p50
+  547), ACTIVE 756-909 (p50 855), verified 10/10, 0 rows left behind.
+  ZERO selection_crawl events and ZERO close-plane ui_block incidents in
+  all five run windows (the one 214 ms block in the windows is the SPAWN
+  plane, terminal_mount/ensure_end). The close-render-burst fix HOLDS.
+- THE 945bcd3 "REGRESSION" WAS LOAD: the close-render-burst close's
+  residual reading (1408-2828 ms, crawls "re-appearing") does NOT
+  reproduce on the integrated tip at quiet floors; the A/B exonerates
+  d30498c0 + 7f1af593 — that window was the concurrent publish/build
+  churn. No lane to blame, nothing to revert.
+- WHERE THE 855 GOES (trace-attributed, n=5 active closes):
+  daemon_request/remove_session lock 203-283 ms → redirect sync
+  (daemon_request/focus_live) 160 ms lock → settle loop breaks INSTANTLY
+  on a clean teardown (attempts 0, it was never the settle) → floating
+  apply +25-30 ms after settle. App-truth gone (apply_done): INACTIVE
+  234-291 ms, ACTIVE 448-542 ms. The probe's close_to_gone adds 1-2 poll
+  cycles (~170-340 ms: an 80 ms sleep plus a full CLI rows call per
+  iteration) — instrument quantization, not app latency. First post-verb
+  rows poll serves 22-32 ms (the ≤~200 ms falsifier leg MET).
+- THE NAMED RESIDUAL is the redirect sync leg: the active close pays a
+  SECOND lock-held daemon mutation (focus_live — activation + FULL
+  daemon persist ~81 ms + snapshot build ~75 ms under the lock) after
+  the removal call. The two calls serialize on the daemon lock
+  (request/lock_holder on both), so GUI-side parallelization buys
+  nothing; the lever is daemon-plane → FILED AS [11.214], not taken
+  (scope law). THE INSTRUMENT this entry asked for is LANDED (471b66ac):
+  remove_session_stage redirect_sync_done {ms, ran} fires between
+  round_trip_done and settle_done on every close with a redirect
+  target — ran:false marks the StartPage-fallback shape where the sync
+  declines.
+- FALSIFIER STATE: the ≤~700 ms probe-bar is NOT met on the metric (855
+  p50) with the residual named to the [11.214] daemon leg + poll
+  quantization; the app-truth arms are MET (first poll ≤~200 ms, 5/5
+  verified, 0 left behind, residual < 300 ms and named). Per the
+  filed-entry-with-attribution arm, this entry's close question closes
+  into [11.214].
+
+## [11.214] — EVERY ACTIVE CLOSE PAYS A SECOND SERIALIZED LOCK-HELD DAEMON MUTATION (the redirect focus): focus_live carries a FULL persist (~81 ms) + snapshot build (~75 ms) under the daemon lock — the felt active close is ~470 ms where ~300 ms is the floor (measured 2026-09-29, live jojo, the close-render-burst-2 lane)
+
+**Status:** OPEN — daemon plane (file-not-take from ux-speed seats)
+
+FILED 2026-09-29 ~10:1x UTC (uxspeed close-render-burst-2 lane, claim
+ACK-3174ece348; zcode sess_63c94b4b on jojo, work FROM dev). [11.208]'s
+successor: that burst is dead (UPDATE 3 there); this is the residual leg
+it was always going to name.
+
+SYMPTOM (build 2359e40f, jojo GUI, quiet floors 57-62 ms cli / 160-176
+gui, 426-row desktop): closing the ACTIVE row costs the close worker TWO
+serialized daemon mutations where an inactive close costs one —
+daemon_request/remove_session lock 203-283 ms, then
+close_redirect_target_daemon_sync's daemon_request/focus_live lock 160 ms
+(inside it: the launch-ensure chain ~1-2 ms, a FULL daemon persist ~81 ms
+— serialize + write + cc_identity_refresh — and snapshot_response ~75
+ms). App-truth gone (apply_done, n=5): ACTIVE 448-542 ms vs INACTIVE
+234-291 ms. The whole active-inactive delta is the focus leg.
+
+WHY THE GUI PLANE CANNOT FIX IT: the two calls serialize on the daemon
+lock (request/lock_holder on both), so overlapping them from the worker
+buys ~nothing and adds an ordering hazard; deferring the focus off the
+verb (two-phase apply) risks the double-transition flash class for
+~100 ms of verb. The lever is daemon-plane — filed, not taken.
+
+NEXT LEVER (daemon plane, owner's seat): a delta-focus — the GUI already
+holds the post-removal world (the removal snapshot) and needs only
+active+view set; FocusLive could skip the full persist (or coalesce it
+with the removal's persist — two persists ~40 ms apart per close today)
+and answer with a cheap ack instead of a full snapshot build. Expected:
+active close app-truth ~470 → ~300 ms; uxprobe close ACTIVE p50 under
+the ≤~700 ms bar with margin.
+
+FALSIFIER: on a rotated build, uxprobe close ACTIVE n=5 — apply_done ≤
+~300 ms, redirect_sync_done {ms} ≤ ~30 ms, verified 5/5, 0 rows left
+behind — and the daemon lock_holder for focus_live ≤ ~30 ms.
+
+INSTRUMENT ALREADY LANDED (471b66ac, GUI plane): remove_session_stage
+redirect_sync_done {ms, ran} names the leg on every close.
