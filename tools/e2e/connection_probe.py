@@ -37,12 +37,39 @@ probe row it creates. Scenario ↔ defect map:
                              [11.212] close-out run: trace fired, rows show
                              re-pointed off the requested id, row live) — the
                              minted-bound compose reaches the row.
+  startborn_remote_corpse    [11.213] live proof: a START-BORN remote-agy row
+                             (launch action `start-*` — minted ONLY by the GUI
+                             Fresh-Start flow, so this scenario speaks the
+                             GUI's own wire request `start_remote_agent_session`
+                             to the daemon socket) is built into a controlled
+                             handover-dead corpse (the peer stream pump frozen
+                             SIGSTOP, the peer CLI child killed: bridge alive,
+                             peer runtime gone — the exact shape a daemon
+                             handover leaves), then re-mounted twice: mount 1
+                             must dispatch the [11.213] liveness worker and —
+                             because the start-born class SKIPS the fail-open
+                             store ask (lane 11213-store-failopen) — answer
+                             `remount_peer_liveness_verdict {instrument:
+                             alive_ask_gone}` from the strict
+                             `agent-runtime-alive` verb; mount 2 must SPEND it:
+                             `remote_reuse_refused_peer_dead_remount`, the
+                             named refusal, teardown of the leaked bridge, and
+                             NO daemon_owned_fast_ready_on_first_meaningful_
+                             output after the kill. RED on record: the
+                             store-failopen falsifier run on d755bfd0 measured
+                             the pre-skip disease on this exact shape — the
+                             worker vouched the corpse ALIVE from the [11.165]
+                             fail-open store answer (`instrument: null`) and
+                             the gate stayed silent for the row's lifetime.
 
-A scenario that cannot run (no store, no CLI) is SKIP with the reason; a
-scenario that asserts and fails is FAIL. Exit code 0 only when nothing failed.
+A scenario that cannot run (no store, no CLI, no peer machine) is SKIP with
+the reason; a scenario that asserts and fails is FAIL. Exit code 0 only when
+nothing failed.
 """
 
 import argparse
+import collections
+import glob
 import json
 import shutil
 import os
@@ -779,6 +806,376 @@ def scenario_defmiss_fresh_start_mint():
         stderr_path.unlink(missing_ok=True)
 
 
+def daemon_socket():
+    """The live daemon's unix socket. The daemon's listening name carries the
+    version (server-<ver>.sock) and every older-name compatibility symlink is
+    re-pointed at it on each rotation — so the majority realpath of the
+    server-*.sock family IS the serving socket (measured on dev 2026-09-29:
+    dozens of legacy links, one target)."""
+    counts = collections.Counter()
+    for link in glob.glob(str(HOME / ".yggterm/server-*.sock")):
+        try:
+            counts[os.path.realpath(link)] += 1
+        except OSError:
+            continue
+    if not counts:
+        return None
+    return counts.most_common(1)[0][0]
+
+
+def wire_request(request, timeout=60):
+    """One newline-JSON request to the daemon socket — the SAME wire every CLI
+    verb and the GUI speak (ClientRequestEnvelope; an anonymous envelope
+    serializes as the bare request). The [11.213] scenario needs the one
+    request no CLI verb reaches: `start_remote_agent_session`, the GUI
+    Fresh-Start flow's own birth, and the only plane that mints a START-BORN
+    remote row (launch action `start-*`). Real daemon verb, real compose, no
+    fabricated state."""
+    import socket as pysocket
+
+    sock_path = daemon_socket()
+    if not sock_path:
+        raise RuntimeError("no daemon socket resolved under ~/.yggterm")
+    stream = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_STREAM)
+    stream.settimeout(timeout)
+    try:
+        stream.connect(sock_path)
+        stream.sendall((json.dumps(request) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = stream.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        stream.close()
+    line = buf.decode(errors="replace").strip().splitlines()
+    if not line:
+        raise RuntimeError("empty daemon answer")
+    return json.loads(line[0])
+
+
+def ssh_run(machine, script, timeout=30):
+    return run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            machine,
+            script,
+        ],
+        timeout=timeout,
+    )
+
+
+PEER_YGGTERM = "$HOME/.yggterm/bin/yggterm"
+
+
+def remote_holder_pids(machine, cwd):
+    """Live pids on `machine` whose cwd is `cwd` — the peer-side holder walk,
+    the [11.213] identity lesson applied over ssh (the CLI's argv never
+    carries the row uuid; the working directory cannot hide)."""
+    script = (
+        "for p in /proc/[0-9]*/cwd; do tgt=$(readlink \"$p\" 2>/dev/null); "
+        f'if [ "$tgt" = "{cwd}" ]; then echo $(basename $(dirname "$p")); fi; done'
+    )
+    answer = ssh_run(machine, script)
+    return [int(x) for x in answer.stdout.split() if x.isdigit()]
+
+
+def peer_runtime_alive(machine, session_uuid):
+    """The strict peer instrument, asked where it lives: `agent-runtime-alive`
+    on the PEER (the worker sshes there too). Strict-parse of the last JSON
+    line; None = unreadable (transport/old binary), never False."""
+    answer = ssh_run(
+        machine,
+        f"{PEER_YGGTERM} server remote agent-runtime-alive "
+        f"agy-runtime://{session_uuid}",
+        timeout=45,
+    )
+    for line in reversed(answer.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            alive = value.get("alive")
+            if isinstance(alive, bool):
+                return alive
+    return None
+
+
+def bridge_pids(session_uuid):
+    """Local pids of the row's ssh bridge (launch command carries the uuid in
+    `ssh <peer> ... start-agy <uuid> ...`). This is `still_running`'s source:
+    the daemon PTY's child."""
+    pids = []
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ")
+        except OSError:
+            continue
+        text = cmdline.decode(errors="replace")
+        if session_uuid in text and "start-agy" in text:
+            pids.append(int(proc.name))
+    return pids
+
+
+def trace_payloads(event_name, since_bytes):
+    """Every payload of `event_name` appended since `since_bytes`."""
+    if not YTRACE.exists():
+        return []
+    needle = event_name.encode()
+    out = []
+    with open(YTRACE, "rb") as handle:
+        handle.seek(since_bytes)
+        for line in handle:
+            if needle not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if (event.get("name") or "").endswith(event_name):
+                out.append(event.get("payload", {}))
+    return out
+
+
+def scenario_startborn_remote_corpse():
+    sc = Scenario("startborn_remote_corpse_refuses_11213")
+    this_host = os.uname().nodename
+    peer = None
+    for candidate in ("oc", "dev", "jojo", "practice"):
+        if candidate == this_host:
+            continue
+        capable = ssh_run(
+            candidate,
+            f"test -x {PEER_YGGTERM} && command -v agy >/dev/null",
+            timeout=20,
+        )
+        if capable.returncode == 0:
+            peer = candidate
+            break
+    if not peer:
+        sc.evidence = (
+            "no peer machine with yggterm + agy reachable — a cross-machine "
+            "corpse needs one; nothing was born"
+        )
+        return sc
+
+    session_cwd = PROBE_CWD_ROOT / f"sb-{uuid.uuid4().hex[:8]}"
+    key = None
+    session_uuid = None
+    oneshot_pid = None
+    kill_offset = None
+    daemon_at_birth = None
+    try:
+        ssh_run(peer, f"mkdir -p '{session_cwd}'", timeout=20)
+        # 1. THE BIRTH — the GUI Fresh-Start wire request, the only mint of a
+        # start-born remote row (launch action `start-*`).
+        answer = wire_request(
+            {
+                "kind": "start_remote_agent_session",
+                "session_kind": "antigravity",
+                "target": peer,
+                "prefix": None,
+                "cwd": str(session_cwd),
+                "title_hint": None,
+                "terminal_appearance": None,
+                "insert_after": None,
+                "outline_prefix": None,
+                "launch_options": None,
+            }
+        )
+        message = answer.get("message") or ""
+        key = next(
+            (token for token in message.split() if token.startswith("remote-agy://")),
+            None,
+        )
+        if not key:
+            return sc.fail(
+                f"the wire birth did not name a row key: {json.dumps(answer)[:300]}"
+            )
+        session_uuid = key.rsplit("/", 1)[1]
+        daemon_at_birth = daemon_identity()
+        # 2. The birth leg must mount the CLI (the ring now holds real output).
+        connected, text = poll_until(lambda: screen_ok(key), deadline_s=150)
+        if connected is not True:
+            return sc.fail(
+                f"birth leg never mounted a CLI on the row; screen: {text[-200:]!r}"
+            )
+        # 3. CORPSIFY — the handover-dead shape: bridge ALIVE, peer runtime
+        # GONE. Freeze the peer stream pump first (a handover orphans the pump
+        # mid-stream; the frozen pump never sees the EOF a child death sends),
+        # then kill the CLI child by cwd — the argv never carries the uuid.
+        kill_offset = YTRACE.stat().st_size if YTRACE.exists() else 0
+        oneshot_answer = ssh_run(
+            peer, f"pgrep -f 'start-agy {session_uuid}' | head -1", timeout=20
+        )
+        try:
+            oneshot_pid = int(oneshot_answer.stdout.strip().split()[0])
+        except (ValueError, IndexError):
+            oneshot_pid = None
+        if oneshot_pid:
+            ssh_run(peer, f"kill -STOP {oneshot_pid}", timeout=20)
+        for pid in remote_holder_pids(peer, str(session_cwd)):
+            ssh_run(peer, f"kill -9 {pid}", timeout=20)
+        alive = peer_runtime_alive(peer, session_uuid)
+        if alive is not False:
+            return sc.fail(
+                f"corpsify failed: the peer ({peer}) answers "
+                f"agent-runtime-alive = {alive!r} (want False) — the runtime "
+                "still lives, so the verdict could only vouch"
+            )
+        bridge_deadline = time.monotonic() + 10
+        while time.monotonic() < bridge_deadline and not bridge_pids(session_uuid):
+            time.sleep(0.5)
+        if not bridge_pids(session_uuid):
+            return sc.fail(
+                "the local bridge died with the peer child — still_running "
+                "false sends the ensure down the RESTART arm and the re-mount "
+                "liveness gate is unreachable by construction; the corpse "
+                "shape (childless-alive bridge) did not form"
+            )
+        # 4. RE-MOUNT 1 — the reuse arm pays the [11.213] gate: the worker
+        # dispatches, the START-BORN class skips the fail-open store ask, and
+        # the strict alive verb answers gone → verdict alive_ask_gone.
+        yggterm(["connect", key], timeout=60)
+
+        def verdict_for_row():
+            payloads = [
+                p
+                for p in trace_payloads("remount_peer_liveness_verdict", kill_offset)
+                if p.get("path") == key
+            ]
+            return (payloads[-1], "") if payloads else (None, "")
+
+        verdict = poll_until(verdict_for_row, deadline_s=90, interval_s=4.0)[0]
+        if verdict is None:
+            return sc.fail(
+                "re-mount 1 never dispatched the remount liveness worker (no "
+                "remount_peer_liveness_verdict in 90s) — the gate did not fire"
+            )
+        instrument = verdict.get("instrument")
+        if instrument != "alive_ask_gone":
+            return sc.fail(
+                f"THE PRE-SKIP DISEASE (the red shape, on record from the "
+                f"store-failopen falsifier run on d755bfd0): the worker "
+                f"answered instrument={instrument!r} vouched="
+                f"{verdict.get('vouched')!r} — the fail-open store ask vouched "
+                "the corpse alive; the start-born skip is NOT live on this "
+                "daemon"
+            )
+        # 5. RE-MOUNT 2 — the spend: refused healable + teardown.
+        answer = yggterm(["connect", key], timeout=60)
+        combined = (answer.stdout + answer.stderr).strip()
+        spent = any(
+            p.get("path") == key
+            for p in trace_payloads("remote_reuse_refused_peer_dead_remount", kill_offset)
+        )
+        refusal_named = "peer session gone" in combined
+        if not (spent or refusal_named):
+            return sc.fail(
+                "the landed verdict was never spent: re-mount 2 saw neither "
+                f"remote_reuse_refused_peer_dead_remount nor the named refusal "
+                f"(rc={answer.returncode} out={answer.stdout[:120]!r} "
+                f"err={answer.stderr[:160]!r})"
+            )
+        # 6. THE NEGATIVE — no daemon-owned fast-ready may bless the corpse
+        # after the kill (the disease's paint: retained bytes read as a live
+        # birth's first meaningful output).
+        fast_ready = [
+            p
+            for p in trace_payloads(
+                "daemon_owned_fast_ready_on_first_meaningful_output", kill_offset
+            )
+            if key in json.dumps(p)
+        ]
+        # 7. THE TEARDOWN — the Q5 wedge's actual harm is the corpse SESSION
+        # staying held (live_runtime_held blocks the [11.214] restore flow)
+        # with the bridge leaking behind it. The frozen pump holds the ssh
+        # open by construction, so measure in two honest steps: first the row
+        # must leave the daemon's live set, then — the pump unfrozen, the
+        # construction artifact gone — the bridge must die from the master
+        # drop (the [11.195] settle law).
+        row_gone_deadline = time.monotonic() + 15
+        while time.monotonic() < row_gone_deadline:
+            listing = yggterm(["connect", "--list"], timeout=60).stdout
+            if key not in listing:
+                break
+            time.sleep(1.0)
+        row_still_held = key in yggterm(["connect", "--list"], timeout=60).stdout
+        if oneshot_pid:
+            ssh_run(peer, f"kill -CONT {oneshot_pid} 2>/dev/null", timeout=20)
+        bridge_deadline = time.monotonic() + 15
+        while time.monotonic() < bridge_deadline and bridge_pids(session_uuid):
+            time.sleep(0.5)
+        leaked = bridge_pids(session_uuid)
+        rotated = daemon_identity() != daemon_at_birth
+        if rotated:
+            return sc.fail(
+                "INVALID RUN: the daemon rotated mid-scenario (the verdict and "
+                "the spend landed in different daemons) — rerun on a settled "
+                "daemon"
+            )
+        problems = []
+        if fast_ready:
+            problems.append(
+                f"daemon_owned_fast_ready_on_first_meaningful_output fired for "
+                f"the corpse {len(fast_ready)}x after the kill"
+            )
+        if row_still_held:
+            problems.append(
+                "the daemon still holds the refused row 15s after the spend "
+                "(the Q5 wedge: live_runtime_held blocks the restore flow)"
+            )
+        if leaked:
+            problems.append(
+                f"the refused runtime leaked the bridge {leaked} (alive 15s "
+                "after the pump unfroze — the Q5 bridge leak)"
+            )
+        if problems:
+            return sc.fail("; ".join(problems))
+        return sc.ok(
+            f"start-born corpse on {peer}: mount 1 verdict alive_ask_gone (the "
+            f"store-ask skip held), mount 2 spent it "
+            f"({'trace fired' if spent else 'refusal named'}"
+            f"{'; trace+refusal' if spent and refusal_named else ''}), bridge "
+            "torn down, no fast-ready"
+        )
+    finally:
+        # REAP — the row on this daemon, the corpse record, the peer's runtime
+        # row, the frozen pump (CONT so it can see the closed stream, then
+        # kill), any surviving holder, both cwd copies.
+        if key:
+            yggterm(["remove", key], timeout=60)
+            yggterm(["rows", "despawn", key], timeout=60)
+        if session_uuid:
+            ssh_run(
+                peer,
+                f"{PEER_YGGTERM} server remove agy-runtime://{session_uuid}; "
+                f"{PEER_YGGTERM} server rows despawn "
+                f"agy-runtime://{session_uuid}",
+                timeout=60,
+            )
+        if oneshot_pid:
+            ssh_run(
+                peer,
+                f"kill -CONT {oneshot_pid} 2>/dev/null; "
+                f"kill -9 {oneshot_pid} 2>/dev/null",
+                timeout=20,
+            )
+        for pid in remote_holder_pids(peer, str(session_cwd)):
+            ssh_run(peer, f"kill -9 {pid}", timeout=20)
+        ssh_run(peer, f"rm -rf '{session_cwd}'", timeout=20)
+        shutil.rmtree(session_cwd, ignore_errors=True)
+
+
 SCENARIOS = [
     scenario_preflight,
     scenario_fresh_start,
@@ -786,6 +1183,7 @@ SCENARIOS = [
     scenario_rebirth_uuid_vouch,
     scenario_store_absent_refuses,
     scenario_defmiss_fresh_start_mint,
+    scenario_startborn_remote_corpse,
 ]
 
 
