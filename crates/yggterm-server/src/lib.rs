@@ -30941,6 +30941,24 @@ pub fn run_row_re_point(key: &str, session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The CLI-side despawn pre-record: the grave that must win the restore race
+/// a daemon cannot see. ⛔ THE [11.213] IDENTITY FOLD — every ask on this
+/// plane (`live_row_closes_remembered_among`, the restore veto, the birth
+/// veto, the wrapper gates) folds its path through
+/// [`normalized_live_row_identity`] before it consults, so a grave recorded
+/// under the RAW runtime key is invisible to all of them at once. Measured
+/// 2026-09-29: an `agy-runtime://<uuid>` despawn pre-record sat in
+/// removed-rows.json while the app-plane restore_persisted_state re-held the
+/// closed row untouched (`tombstone_vetoed: 0` in its own perf span). The
+/// daemon close paths record the folded identity; this pre-record folds the
+/// same way or it records nothing.
+fn record_cli_despawn_grave(home: &std::path::Path, key: &str, now: u64) -> bool {
+    let mut tombstones = crate::live_row_tombstones::LiveRowTombstones::load(home, now);
+    tombstones
+        .record_close(home, &normalized_live_row_identity(key), now)
+        .unwrap_or(false)
+}
+
 fn despawn_local_row(key: &str) -> serde_json::Value {
     let home = match resolve_yggterm_home() {
         Ok(home) => home,
@@ -30949,8 +30967,7 @@ fn despawn_local_row(key: &str) -> serde_json::Value {
         }
     };
     let now = crate::live_row_tombstones::now_secs();
-    let mut tombstones = crate::live_row_tombstones::LiveRowTombstones::load(&home, now);
-    let veto_recorded = tombstones.record_close(&home, key, now).unwrap_or(false);
+    let veto_recorded = record_cli_despawn_grave(&home, key, now);
     let endpoint = server_cli::cli_server_endpoint(&home);
     // despawn=true: the daemon arm refuses while a live runtime holds the
     // row, then does the tombstone + removal + row_despawned trace itself

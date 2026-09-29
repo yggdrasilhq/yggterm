@@ -727,6 +727,46 @@ mod tests {
         );
     }
 
+    /// THE [11.213] FOLD CONTRACT (2026-09-29): the ask plane folds every path
+    /// through `normalized_live_row_identity` before it consults, so a grave
+    /// recorded under any other spelling is invisible to every consumer at
+    /// once — the measured miss was a CLI-side `agy-runtime://` despawn
+    /// pre-record that never vetoed the restore plane. A runtime-key row's
+    /// fold is `id::<uuid>`; this pins the scheme contract the fix relies on.
+    #[test]
+    fn a_runtime_key_row_folds_to_the_id_identity() {
+        assert_eq!(
+            crate::normalized_live_row_identity(
+                "agy-runtime://00000000-0000-4000-8000-000000000042"
+            ),
+            "id::00000000-0000-4000-8000-000000000042"
+        );
+    }
+
+    /// THE [11.213] regression, through the despawn's own write path: the
+    /// grave the CLI-side despawn records must answer REMEMBERED when the ask
+    /// plane is consulted under the row's raw key spelling. Before the fold
+    /// this test's shape answered false while the record sat in the file, and
+    /// restore_persisted_state re-held the closed row (tombstone_vetoed: 0,
+    /// measured 2026-09-29).
+    #[test]
+    fn a_cli_despawn_grave_recorded_the_despawn_way_is_askable() {
+        let dir =
+            std::env::temp_dir().join(format!("yggterm-tombstone-fold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key = "agy-runtime://00000000-0000-4000-8000-000000000042";
+        let now = crate::live_row_tombstones::now_secs();
+        assert!(
+            crate::record_cli_despawn_grave(&dir, key, now),
+            "the despawn pre-record must land (fresh file, fresh identity)"
+        );
+        assert!(
+            crate::live_row_close_is_remembered(&dir, key),
+            "a grave the despawn wrote must veto the row under its raw key spelling"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reopening_clears_the_tombstone() {
         let mut tombstones = LiveRowTombstones::default();
