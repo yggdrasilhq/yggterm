@@ -30689,43 +30689,41 @@ lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
 > spawn-and-reap primitive stays as a dream (dreams/features
 > ACK-02191b62c8): one abandoned Child on a bad day re-opens this.
 
-## ⛔ [11.174] THE FELT SHIFT-DRAG COMMITS NOTHING — A MULTI-ROW RANGE SELECTION DRAGS AS A SET (begin carries all 3 paths, the ghost promises Move item +2), AND THE DROP ENDS THE GESTURE WITHOUT ANY PERSIST, REORDER, OR ARRANGE — FIVE GESTURES, ZERO COMMITS (measured 2026-09-27 ~03:45-04:55 IST, uxprobe shiftdrag on rotated build d709917d8d9b, live jojo desktop, the ux-speed drag-proof-accuracy lane)
+## ⛔ [11.213] THE REORDER SEAT GATE REFUSED A HEALTHY FRESH LIVE BIRTH — a 21-second-old `local://` row, drawn in the live region with a `live_session_birth` trace, was skipped by BOTH the client's optimistic apply and the daemon's `ReorderLiveSessions` handler as `SKIPPED_NOT_A_LIVE_ROW`, so a set drop anchored on it landed the block but not relative to its target (measured 2026-09-29 ~14:3x UTC, the [11.174]-uxspeed shiftdrag falsifier run 1, iteration 2, live jojo desktop, build 9bf0346113c4)
 
-**Status:** OPEN
+**Status:** OPEN — daemon/server plane, FILE-NOT-TAKE from ux-speed seats (the
+fix lives in `replace_live_session_order`/`live_session_row_key`,
+crates/yggterm-server/src/lib.rs).
 
-The owner's sole goal names shift-drag. Yggterm semantics (the sidebar
-onmousedown guard refuses a drag under any modifier): shift+click extends a
-range selection and a plain drag carries the WHOLE set. The driver
-(tools/uxspeed/uxprobe.py shiftdrag — range selection via tree select
-paths+anchor, then a REAL pointer drag onto a non-member row's After band)
-measured, 3 iterations × 2 runs, every gesture identical:
+The gesture: a 3-row set dragged Before a freshly spawned scratch row
+(`local://c1996f28-7182-49f1-aadd-d8f2f59540e1`, born ~21 s earlier,
+`live_session_birth` {kind: Shell, launch_now: true} traced). The drawn
+sidebar resolved the hover onto it fine (the GUI drew it from
+`browser.rows`), the drawn-view plan included it, and the set itself landed
+contiguously in order — but the seat gate refused the TARGET on both planes:
+the client's `replace_live_session_order` skipped it
+(`live_session_reorder_skipped_rows` {reason: "not a Live Sessions row"}),
+and the daemon's handler skipped it too (its `applied` list lacks the row
+entirely), so the landing is only loosely relative to the intended target.
 
-- tree_drag_begin {anchor: pressed row, drag_paths: exactly the 3-row set} ✓
-- DragGhost leaf re-renders with the pointer stream (11 renders/gesture) ✓ —
-  the ghost paints Move item +2 (the promise)
-- tree_drag_hover fires with targets; tree_drag_ended fires {paths: 3} ✓
-- live_session_persist_dropped: **0**; row_set_arranged: none; the sidebar
-  order is UNCHANGED after every gesture (wait_relative_order timeout) ✗
+The puzzle a fixing seat should start from: the row was born on THIS daemon
+(seated by `seat_new_live_session` inside the create request per the seating
+law), the drawn live region carried it, and the gate still answered
+`resolve_live_session_key(path).filter(|key| live_session_order.contains(key))
+== None` — either the resolution failed for a fresh local key or the row was
+absent from `live_session_order` at reorder time. n=1 across 9 falsifier
+gestures (the other 8 anchored on rows the gate accepted), so it is rare —
+but a gate that refuses its own 21-second-old birth is wrong whatever the
+trigger, and the [11.174] lane's drawn-view fix makes it VISIBLE where the
+old mirror-resolution silently swallowed the whole gesture.
 
-So the set drag is ACCEPTED, VISUALLY PROMISED, and silently discarded at
-release. Single-row felt drags on the same build commit fine
-(live_session_persist_dropped fires; order flips in ~206 ms), so the defect
-is specific to the multi-row set drop path. Suspected sites (for the fixing
-seat): the end-drag arrangement/reorder split in state.rs (the
-apply_row_set_drop vs the reorder fall-through around the
-ONLY an INTO drop ends here comment) — the set drop resolves a target and
-an ended-with-paths event, then neither the arrangement branch nor the
-reorder branch claims it. Falsifier for the fix: with the fix live, uxprobe
-shiftdrag --iters 3 on a quiet window reports commit_persist_events ≥ 1 per
-gesture with the set landed after the target in set order (accuracy 3/3).
+Falsifier for the fix: uxprobe `shiftdrag --iters 3` twice on a rotated
+build reports zero `live_session_reorder_skipped_rows` with a fresh-batch
+target, and a targeted repro (spawn → drop anchored on the newborn within
+30 s, 10 iterations) never skips.
 
-Filed 2026-09-27 ~05:05 IST by zcode sess_f46e835c on jojo, lane
-lane/uxspeed/drag-proof-accuracy (claim ACK-bee6712954).
-> ⚠ ID RENUMBER (the defect-id law — the earlier filing keeps the id):
-> briefly filed as [11.173] at ~05:05; the activation-stall lane's
-> warm-mount-gate entry claimed [11.173] at 05:03 and is on main first,
-> so THIS entry renumbers to [11.174].
-
+Filed 2026-09-29 by zcode sess_a7becfa0 on jojo, lane
+lane/uxspeed/shiftdrag-set-drop (claim ACK-ea58099047).
 
 ## ⛔ [11.134] OPENCODE 2.0.3 SILENTLY FALLS BACK TO THE LATEST SESSION ON AN UNKNOWN `--session` ID — THE BETA-ERA OUTRIGHT REFUSAL IS GONE, SO A CALLER THAT MINTS IDS OUT-OF-BAND CAN BIND THE WRONG SESSION AND NEVER LEARN IT (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
 
