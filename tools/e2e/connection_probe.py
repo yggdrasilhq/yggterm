@@ -161,13 +161,49 @@ def screen_ok(key):
     return None, text
 
 
-def reap(key):
-    """Kill the row's runtime processes, then despawn the record."""
-    ident = key.split("://")[-1]
-    run(["pkill", "-f", ident], timeout=30)
-    time.sleep(1.0)
-    run(["pkill", "-9", "-f", ident], timeout=30)
+def live_holder_pids(cwd):
+    """Live CLI pids whose process cwd is the row's cwd — the holder set.
+
+    THE [11.213] IDENTITY LESSON (measured 2026-09-29): the birth compose is
+    `agy '--dangerously-skip-permissions'` — the CLI's argv NEVER carries the
+    row uuid, so `pkill -f <uuid>` matched nothing, the kill silently missed,
+    and `rows despawn` then lawfully refused the still-live runtime. The one
+    identity the holder cannot hide is its working directory."""
+    pids = []
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if os.path.realpath(proc / "cwd") == os.path.realpath(cwd):
+                pids.append(int(proc.name))
+        except OSError:
+            continue
+    return pids
+
+
+def reap(key, cwd=None):
+    """Close the row the way the click path does, then evict the corpse record.
+
+    THE [11.213] TEARDOWN LAW: `rows despawn` is a corpse-record eviction —
+    it has no teardown and lawfully REFUSES a live runtime ([11.74]). The
+    user-path close is `server remove` (RemoveSession despawn=None ->
+    close_live_session_row: tombstone + PTY teardown + row removal). The
+    despawn rides AFTER it, on the corpse.
+
+    Returns the live holders the CLOSE itself left behind (before any by-hand
+    escalation) — the [11.195] no-live-holder measurement."""
+    yggterm(["server", "remove", key], timeout=60)
+    post_close = live_holder_pids(cwd) if cwd is not None else []
+    if cwd is not None:
+        for _ in range(3):
+            holders = live_holder_pids(cwd)
+            if not holders:
+                break
+            for pid in holders:
+                run(["kill", "-9", str(pid)], timeout=30)
+            time.sleep(1.0)
     yggterm(["rows", "despawn", key], timeout=60)
+    return post_close
 
 
 def poll_until(fn, deadline_s, interval_s=3.0):
@@ -582,10 +618,19 @@ def scenario_defmiss_fresh_start_mint():
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not db_conversations_for_dir(str(cwd)):
             time.sleep(3)
-        # 3. Close the row through the daemon: rows despawn RECORDS the
-        # remembered close (the e2ddee1a reopen-pass) and kills the CLI, so
-        # no live holder survives into the resume ([11.195]).
-        reap(key)
+        # 3. Close the row the way the click path does: `server remove`
+        # (close_live_session_row: tombstone + PTY teardown + row removal),
+        # THEN rows despawn evicts the corpse record. THE [11.195] LAW,
+        # asserted: the close itself must leave no live CLI holder — a
+        # survivor orphans into the resume's holder wait.
+        post_close_holders = reap(key, cwd)
+        if post_close_holders:
+            return sc.fail(
+                f"the close left live CLI holders {post_close_holders} — the "
+                "[11.195] no-live-holder-survives-into-the-resume law is broken "
+                "(escalation-killed for the record; the mint leg stays red until "
+                "the close kills its own CLI)"
+            )
         # 4. The store surgery: the cwd's conversation leaves the store, so
         # the candidate search answers None — the vouch has nothing to serve
         # and the definitive miss falls through to the mint.
