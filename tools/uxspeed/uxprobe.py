@@ -2758,6 +2758,28 @@ dioxus.send(out);
         a_path, b_path = scratch[0], scratch[1]
         for i in range(iters):
             acc = []
+            # [11.217] content markers: one per member, written through the
+            # REAL daemon PTY path pre-split and verified in the daemon
+            # screen buffer, so the post-create pane read asserts the
+            # member's OWN content (not just a DOM rect).
+            markers = {
+                a_path: f"UXSPEED-MARK-{i}-A-{now_ms()}",
+                b_path: f"UXSPEED-MARK-{i}-B-{now_ms()}",
+            }
+            for m_path, mk in markers.items():
+                sr = self.verb("terminal", "send", m_path,
+                               "--data", f"echo {mk}\n")
+                if not sr.get("ok"):
+                    acc.append(f"terminal send failed for {m_path}: "
+                               f"{str(sr.get('error'))[:120]}")
+            time.sleep(0.5)
+            for m_path, mk in markers.items():
+                rb = self.verb("terminal", "read-buffer", m_path,
+                               "--mode", "screen")
+                blob = json.dumps(rb.get("json") or {}) + (rb.get("raw") or "")
+                if mk not in blob:
+                    acc.append(f"pre-split marker missing in daemon buffer "
+                               f"({m_path})")
             # both rows selected: the menu's split candidates are the
             # right-clicked row + the selection (split_candidate_paths_for)
             self.verb("tree", "select", a_path, b_path, "--anchor", a_path)
@@ -2823,6 +2845,43 @@ dioxus.send(out);
                 rects = [p.get("rect") for p in panes]
                 if any(not r2 or r2["w"] <= 0 or r2["h"] <= 0 for r2 in rects):
                     acc.append("a pane rect is empty (split not visible)")
+            # [11.217] THE CONTENT ASSERT: each pane's own pre-split
+            # marker must be visible in its pane's live xterm buffer.
+            # Pre-fix the co-visible member's host never mounted
+            # (host_missing) and the pane kept the stale full-width atlas.
+            panes_content: dict = {}
+            if committed:
+                deadline = time.time() + 4.0
+                while True:
+                    cdata = self.dom_eval(
+                        PANE_CONTENT_JS.replace(
+                            "{paths!r}", repr([a_path, b_path])), timeout=10)
+                    panes_content = ((cdata.get("result") or {})
+                                     .get("panes")) or {}
+                    if (panes_content.get(a_path, {}).get("present")
+                            and panes_content.get(b_path, {}).get("present")):
+                        break
+                    if time.time() >= deadline:
+                        break
+                    time.sleep(0.25)
+                for m_path, which in ((a_path, "focused"),
+                                      (b_path, "co-visible")):
+                    pane = panes_content.get(m_path) or {}
+                    if not pane.get("present"):
+                        acc.append(f"{which} pane host_missing ({m_path}) "
+                                   "— the member never mounted ([11.217])")
+                        continue
+                    tail = "\n".join(pane.get("tail") or [])
+                    mk = markers[m_path]
+                    if mk in tail:
+                        wrapped = "single_line"
+                    elif mk in tail.replace("\n", ""):
+                        wrapped = "split_across_lines"
+                    else:
+                        acc.append(f"{which} pane missing its pre-split "
+                                   f"marker ({m_path})")
+                        wrapped = "absent"
+                    pane["marker"] = wrapped
             # UNGROUP — the teardown must restore both rows alive
             ungroup = {}
             if committed and dom.get("compound_found"):
@@ -2858,6 +2917,15 @@ dioxus.send(out);
                 if not render_spans:
                     acc.append("no split/render_span in ytrace (build not "
                                "rotated onto the render-span instrument)")
+                else:
+                    # [11.217]: BOTH members must paint — one span each.
+                    for m_path, which in ((a_path, "focused"),
+                                          (b_path, "co-visible")):
+                        if not any(s.get("session_path") == m_path
+                                   for s in render_spans):
+                            acc.append(f"{which} member emitted no "
+                                       f"split/render_span — never painted "
+                                       f"([11.217]: {m_path})")
             out["iterations"].append({
                 "open_wall_ms": open_wall_ms,
                 "menu_open_ms": result.get("menu_open_ms"),
@@ -2878,6 +2946,15 @@ dioxus.send(out);
                         for s in render_spans)
                     if render_spans else None),
                 "render_spans": render_spans,
+                "pane_content": {
+                    p: {
+                        "present":
+                            (panes_content.get(p) or {}).get("present"),
+                        "cols": (panes_content.get(p) or {}).get("cols"),
+                        "marker": (panes_content.get(p) or {}).get("marker"),
+                    }
+                    for p in (a_path, b_path)
+                },
                 "accuracy_failures": acc,
             })
         return summarize(out, key="click_to_dom_felt_ms")
@@ -3136,6 +3213,40 @@ dioxus.send(out);
 
     def ensure_two_scratch_rows(self) -> list[str]:
         return self.ensure_scratch_rows(2)
+
+
+# [11.217] The content truth per split member: the member's live xterm host
+# (window.__yggtermXtermHosts, entry.sessionPath set by the terminal host
+# scripts) and its buffer tail. Pre-fix the co-visible member has NO host
+# (bootstrap_spawn_skipped_inactive_retained_host) and the read answers
+# host_missing — the defect signature, not an instrument failure.
+PANE_CONTENT_JS = """
+const PATHS = {paths!r};
+const panes = {};
+for (const p of PATHS) {
+    const entries = Object.values(window.__yggtermXtermHosts || {})
+        .filter((e) => e && e.term && e.sessionPath === p)
+        .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+    const entry = entries[0];
+    if (!entry) {
+        panes[p] = { present: false, reason: "host_missing" };
+        continue;
+    }
+    const term = entry.term;
+    const buf = term.buffer && term.buffer.active;
+    const tail = [];
+    if (buf) {
+        const n = Math.min(buf.length || 0, 4000);
+        for (let y = Math.max(0, n - 80); y < n; y++) {
+            const line = buf.getLine(y);
+            tail.push(line ? line.translateToString(true) : "");
+        }
+    }
+    panes[p] = { present: true, cols: term.cols || null,
+                 rows: term.rows || null, tail };
+}
+dioxus.send({ accepted: true, panes });
+"""
 
 
 def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
