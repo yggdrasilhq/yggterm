@@ -88,17 +88,30 @@ def yggterm(args, timeout=120):
     return run([YGGTERM_BIN, "server", *args], timeout=timeout)
 
 
-def yggterm_detached(args):
+def yggterm_detached(args, stderr_path=None):
     """The start/resume wrapper IS the row's living bridge — it never exits
     while the row is connected, so a probe must not wait on it. Spawn it
-    detached, own the process via the session-id kill in reap()."""
-    return subprocess.Popen(
-        [YGGTERM_BIN, "server", *args],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    detached, own the process via the session-id kill in reap().
+
+    stderr_path: capture the wrapper's stderr. The detached spawn owns no
+    PTY, so a PRE-ENSURE refusal (the [11.165] wrapper gate, the [11.197]
+    tombstone guard) paints nowhere else on the machine — without the
+    capture a refused rebirth reads as a silently blank row and the
+    scenario misfiles a designed refusal as a dead row (measured 2026-09-29
+    on jojo: rebirth FAILed "no CLI after 150s" on what was the [11.197]
+    guard's named refusal, written to /dev/null)."""
+    err = open(stderr_path, "wb") if stderr_path else subprocess.DEVNULL
+    try:
+        return subprocess.Popen(
+            [YGGTERM_BIN, "server", *args],
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        if stderr_path:
+            err.close()
 
 
 class Scenario:
@@ -343,6 +356,23 @@ def trace_has_vouch(requested_id, since_bytes):
     return False
 
 
+def trace_has_event(requested_id, since_bytes, event_name):
+    """Exact event-name match — `trace_has_vouch`'s needle is a prefix of
+    `agy_store_candidate_vouch_refused_tombstoned`, so it cannot tell a
+    vouch from a refusal."""
+    if not YTRACE.exists():
+        return False
+    needle = event_name.encode()
+    with open(YTRACE, "rb") as handle:
+        handle.seek(since_bytes)
+        for line in handle:
+            if needle not in line:
+                continue
+            if requested_id.encode() in line:
+                return True
+    return False
+
+
 def scenario_rebirth_uuid_vouch():
     sc = Scenario("rebirth_uuid_lands_on_store_candidate_11183")
     conversations = store_conversations()
@@ -352,10 +382,12 @@ def scenario_rebirth_uuid_vouch():
     fresh_id = str(uuid.uuid4())  # the store has never held this — by construction
     _, workspace = conversations[0]  # the store's newest conversation's cwd
     key = f"agy-runtime://{fresh_id}"
+    stderr_path = PROBE_CWD_ROOT / f"rebirth-{fresh_id[:8]}.stderr"
     try:
         offset = YTRACE.stat().st_size if YTRACE.exists() else 0
-        yggterm_detached(
-            ["remote", "resume-agy", fresh_id, workspace, "--require-existing"]
+        proc = yggterm_detached(
+            ["remote", "resume-agy", fresh_id, workspace, "--require-existing"],
+            stderr_path=str(stderr_path),
         )
         def both_keys():
             ok, text = screen_ok(key)
@@ -366,7 +398,30 @@ def scenario_rebirth_uuid_vouch():
                 return screen_ok(f"agy-runtime://{vouched_id}")
             return None, text
 
-        connected, text = poll_until(both_keys, deadline_s=150)
+        def wrapper_refused_early():
+            # A pre-ensure refusal exits the wrapper before any row is
+            # born — no screen will ever appear, so stop the poll and read
+            # the captured stderr instead.
+            if proc.poll() is None:
+                return None
+            try:
+                err = stderr_path.read_text(errors="replace")
+            except OSError:
+                return False
+            return "no longer available" in err
+
+        deadline = time.monotonic() + 150
+        connected, text = None, ""
+        while time.monotonic() < deadline:
+            connected, text = both_keys()
+            if connected is not None or wrapper_refused_early():
+                break
+            time.sleep(3)
+        refused_stderr = ""
+        try:
+            refused_stderr = stderr_path.read_text(errors="replace").strip()
+        except OSError:
+            pass
         vouched = trace_has_vouch(fresh_id, offset)
         if connected is True and vouched:
             return sc.ok(f"re-birth uuid {fresh_id[:8]}… vouched onto a store conversation")
@@ -382,12 +437,35 @@ def scenario_rebirth_uuid_vouch():
                     f"the ladder did not fire; the [11.165] gate refused: {text[:240]!r}"
                 )
             return sc.fail(f"refusal painted: {text[:240]!r}")
-        return sc.fail(f"no CLI after 150s; tail: {text[-240:]!r}")
+        # No row was born and the poll ended. Either the wrapper refused by
+        # name (captured stderr — the only place a detached refusal paints),
+        # or the row truly died in silence, which is the defect this arm
+        # exists to catch.
+        witness = trace_has_event(
+            fresh_id, offset, "agy_store_candidate_vouch_refused_tombstoned"
+        )
+        if "no longer available" in refused_stderr and witness:
+            return sc.ok(
+                "designed [11.197] tombstone guard: this cwd's newest candidate is a "
+                "remembered close, refused by name pre-ensure (captured stderr); the "
+                "ladder consulted the store and enforced the guard — its bind arm is "
+                "not exercised by this cwd"
+            )
+        if "no longer available" in refused_stderr:
+            return sc.fail(
+                "wrapper refused without the tombstone witness — the ladder never "
+                f"consulted the store: {refused_stderr[:240]!r}"
+            )
+        return sc.fail(
+            "no CLI after 150s and no named refusal in the wrapper's stderr — a "
+            f"silent death: stderr={refused_stderr[:240]!r} screen={text[-160:]!r}"
+        )
     finally:
         vouched_id = trace_vouched_id(fresh_id, offset)
         reap(key)
         if vouched_id:
             reap(f"agy-runtime://{vouched_id}")
+        stderr_path.unlink(missing_ok=True)
 
 
 def scenario_store_absent_refuses():
