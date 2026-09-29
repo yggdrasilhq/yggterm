@@ -240,7 +240,8 @@ def _run(cmd, cwd=None, timeout=120, shell=False, label=None, heartbeat_secs=0):
         # start_new_session: the child leads its own process group, so the
         # watchdog can killpg the whole tree in one signal.
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, cwd=cwd, shell=shell, start_new_session=True)
+                             text=True, encoding="utf-8", errors="replace",
+                             cwd=cwd, shell=shell, start_new_session=True)
     except Exception as e:
         return subprocess.CompletedProcess(cmd, 127, "", f"{type(e).__name__}: {e}")
     shown = label or (cmd if isinstance(cmd, str) else " ".join(map(str, cmd)))
@@ -310,7 +311,8 @@ def _sccache_stats(host=None):
     Keys are anchored with \\s{2,} so sub-lines ("Cache misses (Rust)") and the
     "Cache hits rate" line can never satisfy a plain-key grab."""
     try:
-        r = subprocess.run(_sccache_cmd(host), capture_output=True, text=True, timeout=45)
+        r = subprocess.run(_sccache_cmd(host), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=45)
     except Exception:
         return None
     out = r.stdout or ""
@@ -368,7 +370,8 @@ def _cache_wire_probe(host=None):
               '|| [ -x "$HOME/.local/bin/sccache" ]; } && echo B=1 || echo B=0')
     cmd = ["bash", "-c", script] if not host or host == this_host() else ["ssh", host, script]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=45)
     except Exception:
         return {"binary": None, "wrapper": None}
     o = r.stdout or ""

@@ -49,7 +49,7 @@ bad_entries=$(awk '
   /^\*\*Status:\*\* (OPEN|FIXED IN CODE — LIVE PROOF OWED|AWAITING A DECISION)$/ { if (seen) n++ ; next }
   END { if (seen) report(head_line, head_text, n) }
   function report(ln, text, count) {
-    if (count != 1) printf "%d: %d status line(s) — %.90s\n", ln, count, text
+    if (count != 1) printf "%d: %d status line(s) — %s\n", ln, count, text
   }
 ' "$QUEUE")
 if [ -n "$bad_entries" ]; then
