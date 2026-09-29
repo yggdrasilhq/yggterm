@@ -239,12 +239,78 @@ pub fn session_title_store_open_count() -> usize {
     TITLE_STORE_OPENS.with(Cell::get)
 }
 
+/// Homes whose title DB schema THIS PROCESS has already initialized.
+///
+/// ⛔ THE SCHEMA BATCH IS NOT FREE AND IT IS NOT PER-DB-STATE — IT IS PER-OPEN.
+/// Every `open` used to run the six-statement CREATE-TABLE batch: a write
+/// transaction, a file lock (`pager_wait_on_lock` → `fcntl` F_SETLK) and a
+/// full sqlite parse of the DDL, every single time. Measured live 2026-09-29
+/// ([11.208]-uxspeed close-render-burst): the active-row close burst's
+/// main-thread block sat INSIDE this batch — gdb mid-block backtrace:
+/// `StartPage → remote_scanned_session_label → SessionTitleStore::open →
+/// execute_batch → btreeBeginTrans → pager_wait_on_lock → unixLock/fcntl` —
+/// hundreds of opens deep, one per candidate row. The batch is idempotent
+/// and the file persists; running it once per process per home is
+/// behavior-identical. Tests use per-test temp homes, so they still get a
+/// fresh schema.
+static TITLE_SCHEMA_INITIALIZED_HOMES: std::sync::Mutex<
+    Option<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// ONE title store per thread per home, reused by the per-item callers
+    /// that used to open their own ([11.117] lesson, regrown at the label
+    /// builder — see [`TITLE_SCHEMA_INITIALIZED_HOMES`]). The store owns its
+    /// sqlite connection; per-thread keeps rusqlite's !Sync bounds intact.
+    static SHARED_TITLE_STORE: std::cell::RefCell<
+        Option<(std::path::PathBuf, SessionTitleStore)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the thread's shared title store for `home`, opening (and
+/// caching) it on first use. A caller that used to do
+/// `SessionTitleStore::open(&home).ok().and_then(|store| ...)` PER ITEM pays
+/// one open per thread per home instead.
+pub fn with_shared_title_store<T>(
+    home: &Path,
+    f: impl FnOnce(&SessionTitleStore) -> T,
+) -> Option<T> {
+    SHARED_TITLE_STORE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(cached_home, _)| cached_home != home) {
+            match SessionTitleStore::open(home) {
+                Ok(store) => *slot = Some((home.to_path_buf(), store)),
+                Err(_) => {
+                    *slot = None;
+                    return None;
+                }
+            }
+        }
+        slot.as_ref().map(|(_, store)| f(store))
+    })
+}
+
 impl SessionTitleStore {
     pub fn open(home: &Path) -> Result<Self> {
         TITLE_STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
         let db_path = home.join(TITLE_DB_FILENAME);
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open title db {}", db_path.display()))?;
+        // Schema DDL once per process per home, not once per open — see
+        // [`TITLE_SCHEMA_INITIALIZED_HOMES`] for the measured cost of the old
+        // shape (the close burst's main-thread block sat in this batch).
+        let schema_needed = {
+            let mut guard = TITLE_SCHEMA_INITIALIZED_HOMES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                Some(homes) if homes.contains(&db_path) => false,
+                _ => true,
+            }
+        };
+        if !schema_needed {
+            return Ok(Self { conn });
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_titles (
                 session_id TEXT PRIMARY KEY,
@@ -282,6 +348,14 @@ impl SessionTitleStore {
             );",
         )
         .context("failed to initialize title db schema")?;
+        {
+            let mut guard = TITLE_SCHEMA_INITIALIZED_HOMES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .get_or_insert_with(std::collections::HashSet::new)
+                .insert(db_path);
+        }
         Ok(Self { conn })
     }
 
