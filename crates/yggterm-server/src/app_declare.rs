@@ -110,7 +110,19 @@ fn retention_for(verb: &str, action: &str) -> Retention {
         // close still clears it, so a stale pick cannot outlive the app.
         ("web-surface", "pick") => Retention::Store,
         ("sidebar", "declare") => Retention::Store,
-        ("sidebar", "close") => Retention::Clear,
+        // [11.186] The close is RETAINED, not cleared. The GUI's only
+        // host-independent close channel is the daemon-declare rebuild poll,
+        // and it can only express what the daemon retains: with close-clears,
+        // a client whose live xterm host never saw the close bytes (unmounted
+        // at the emission instant, or a cursor-0 attach seed that windowed the
+        // protocol-only chunk out) can never learn the app retired its
+        // contribution — the pane mounts from a replayed declare and paints
+        // over the live surface forever. The retained close record IS the
+        // retirement; the sidebar rebuild reads action=close as "retire".
+        // Web-surface keeps close-clears: its surfaces rebuild from daemon
+        // state directly, nothing client-local needs to learn the close, and
+        // a cleared record is what keeps a closed surface un-rebuildable.
+        ("sidebar", "close") => Retention::Store,
         // A WebAuthn ceremony asks for the user's PRESENCE. A retained copy
         // could be replayed at a moment nobody is there to consent — never
         // store one.
@@ -295,6 +307,34 @@ fn parse_declare_body(body: &str) -> Option<AppDeclareMessage> {
 /// session was backgrounded).
 pub fn attach_replay_neutralizes_web_surface_open(record_action: Option<&str>) -> bool {
     record_action != Some("open")
+}
+
+/// The wire spelling of a sidebar `declare`, up to its payload.
+pub const SIDEBAR_DECLARE_SEQUENCE: &str = "\x1b]7717;sidebar;declare;";
+/// What a cursor-0 attach seed serves in place of a consumed sidebar
+/// `declare`: the SAME bytes with the action `defunct` — deliberately the same
+/// length as `declare` (seven chars), so the rewrite never moves a byte and
+/// retained chunk boundaries stay exactly where they were. The client forwards
+/// the verb and the client Rust match has no `defunct` arm, so a replayed
+/// declare whose daemon-side state is no longer "declared" (the app closed it)
+/// can never flash-mount a pane the seed is about to be told to retire.
+pub const SIDEBAR_DEFUNCT_SEQUENCE: &str = "\x1b]7717;sidebar;defunct;";
+
+/// Rewrite every consumed sidebar `declare` in a replayed stream to `defunct`.
+///
+/// Same contract as [`rewrite_consumed_web_surface_opens`]: returns `None`
+/// when the stream holds no such sequence; the swap is same-length by
+/// construction, so the caller may re-slice at the original chunk boundaries.
+pub fn rewrite_consumed_sidebar_declares(stream: &str) -> Option<(String, usize)> {
+    const _: () = assert!(SIDEBAR_DECLARE_SEQUENCE.len() == SIDEBAR_DEFUNCT_SEQUENCE.len());
+    if !stream.contains(SIDEBAR_DECLARE_SEQUENCE) {
+        return None;
+    }
+    let count = stream.matches(SIDEBAR_DECLARE_SEQUENCE).count();
+    Some((
+        stream.replace(SIDEBAR_DECLARE_SEQUENCE, SIDEBAR_DEFUNCT_SEQUENCE),
+        count,
+    ))
 }
 
 /// Rewrite every consumed web-surface `open` in a replayed stream to `seen`.
@@ -894,6 +934,75 @@ mod tests {
             witness.observe("opencode-runtime://s", "17;web-surface;open;e30=\x07"),
             vec!["app_declare"]
         );
+    }
+
+    // [11.186] A sidebar close is RETAINED as the verb's current state — it IS
+    // the retirement the GUI's rebuild poll must be able to deliver to a
+    // client whose live xterm host never saw the bytes. close-clears here made
+    // the retirement inexpressible, and a chooser pane painted over the
+    // mounted surface forever.
+    #[test]
+    fn a_sidebar_close_is_retained_not_cleared() {
+        let mut log = AppDeclareLog::new();
+        log.ingest(msg("sidebar", "declare", serde_json::json!({"session": "s"})), 1_000);
+        log.ingest(msg("sidebar", "close", serde_json::json!({"session": "s"})), 2_000);
+        let sidebar = log
+            .records()
+            .into_iter()
+            .find(|record| record.verb == "sidebar")
+            .expect("the sidebar record must survive the close");
+        assert_eq!(sidebar.action, "close");
+        // A fresh declare replaces the retirement — a new picker run re-opens.
+        log.ingest(msg("sidebar", "declare", serde_json::json!({"session": "s"})), 3_000);
+        let sidebar = log
+            .records()
+            .into_iter()
+            .find(|record| record.verb == "sidebar")
+            .expect("sidebar record after re-declare");
+        assert_eq!(sidebar.action, "declare");
+    }
+
+    // A web-surface close keeps close-clears: nothing client-local needs to
+    // learn it, and the cleared record is what keeps a closed surface
+    // un-rebuildable.
+    #[test]
+    fn a_web_surface_close_still_clears_its_record() {
+        let mut log = AppDeclareLog::new();
+        log.ingest(
+            msg("web-surface", "open", serde_json::json!({"session": "s", "url": "https://x.test/"})),
+            1_000,
+        );
+        log.ingest(msg("web-surface", "close", serde_json::json!({"session": "s"})), 2_000);
+        assert!(
+            log.records().iter().all(|record| record.verb != "web-surface"),
+            "a web-surface close must clear the record"
+        );
+    }
+
+    #[test]
+    fn consumed_sidebar_declares_rewrite_same_length_or_not_at_all() {
+        let stream = "before\x1b]7717;sidebar;declare;e30=\x07after";
+        let (rewritten, count) =
+            rewrite_consumed_sidebar_declares(stream).expect("the consumed declare rewrites");
+        assert_eq!(count, 1);
+        assert_eq!(rewritten.len(), stream.len(), "the swap must be same-length");
+        assert!(rewritten.contains("\x1b]7717;sidebar;defunct;e30=\x07"));
+        assert!(rewritten.contains("before") && rewritten.contains("after"));
+        // A stream with no sidebar declare is untouched.
+        assert!(
+            rewrite_consumed_sidebar_declares(
+                "plain\x1b]7717;web-surface;open;e30=\x07output",
+            )
+            .is_none()
+        );
+    }
+
+    fn msg(verb: &str, action: &str, payload: serde_json::Value) -> AppDeclareMessage {
+        AppDeclareMessage {
+            verb: verb.to_string(),
+            action: action.to_string(),
+            payload,
+        }
     }
 
     #[test]

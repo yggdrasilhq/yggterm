@@ -199,6 +199,26 @@ fn main() {
             hold(&args);
             return;
         }
+        // INTERACTIVE: a libyggterm app on the OSC 7717 SIDEBAR channel
+        // ([11.186]). Declares once at boot, then re-declares ON DEMAND: each
+        // stdin line triggers one more emission — a line starting with `c`
+        // emits the `close` (the chooser retired), anything else a fresh
+        // `declare` (the heartbeat cadence). Drives the daemon-side close
+        // RETENTION and the attach-replay rule: a consumed `declare` must
+        // serve as `defunct` on a cursor-0 attach once the record is on
+        // `close`, while the close bytes themselves stay a faithful
+        // transcript.
+        "sidebar-declare" => {
+            let payload = base64::engine::general_purpose::STANDARD
+                .encode(br#"{"session":"mock-app","control":"http://127.0.0.1:41234","app_name":"Mock Chooser","panes":[{"id":"targets","title":"Targets","placement":"viewport"}]}"#);
+            let _ = write!(w, "MOCK_SIDEBAR_READY\r\n");
+            let _ = write!(w, "\x1b]7717;sidebar;declare;{payload}\x07");
+            let _ = write!(w, "MOCK_SIDEBAR_DECLARE_0_declare\r\n");
+            let _ = w.flush();
+            run_sidebar_declares(&mut w, &payload);
+            hold(&args);
+            return;
+        }
         // INTERACTIVE: echo each stdin line back as `ECHO: <line>`. Exercises the
         // full agent-session-control drive loop (write -> PTY -> program -> read):
         // a test sends a prompt and asserts the program received + responded.
@@ -435,6 +455,40 @@ fn run_echo(w: &mut impl Write) {
 /// `o` re-declares `open`, anything else `heartbeat` — always the same full
 /// payload, exactly like a real app. A numbered marker line follows each
 /// declare so a test can wait for the bytes deterministically.
+fn run_sidebar_declares(w: &mut impl Write, payload: &str) {
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 1024];
+    let mut line: Vec<u8> = Vec::new();
+    let mut emitted = 0usize;
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            if byte == b'\r' || byte == b'\n' {
+                emitted += 1;
+                let action = if line.first() == Some(&b'c') {
+                    "close"
+                } else {
+                    "declare"
+                };
+                if action == "close" {
+                    let close_payload = base64::engine::general_purpose::STANDARD
+                        .encode(br#"{"session":"mock-app"}"#);
+                    let _ = write!(w, "\x1b]7717;sidebar;close;{close_payload}\x07");
+                } else {
+                    let _ = write!(w, "\x1b]7717;sidebar;declare;{payload}\x07");
+                }
+                let _ = write!(w, "MOCK_SIDEBAR_DECLARE_{emitted}_{action}\r\n");
+                let _ = w.flush();
+                line.clear();
+            } else {
+                line.push(byte);
+            }
+        }
+    }
+}
+
 fn run_web_declares(w: &mut impl Write, payload: &str) {
     let mut stdin = io::stdin();
     let mut buf = [0u8; 1024];
