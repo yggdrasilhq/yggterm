@@ -17505,6 +17505,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
         let mut runtime = runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon runtime lock poisoned"))?;
+        let user_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         // ⛔ [11.200] THE HEAL, FIRST: a row whose id contradicts its own
         // session-named runtime key is carrying a stale identity (the cure
         // livelock poisoned rows and their persisted records). The key is
@@ -17516,6 +17517,30 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
             if let Some(key_id) =
                 crate::session_named_runtime_key_id_for_kind(row.kind, &row.key)
                 && key_id != row.id
+            {
+                runtime
+                    .server
+                    .rebind_live_session_store_identity(&row.key, &key_id);
+            } else if row.kind == SessionKind::OpenCode
+                // ⛔ [11.202] THE OPENCODE KEY HEAL: an opencode-runtime key
+                // carries the row's own birth session id ([11.73]); when that
+                // id is store-HELD and the row wears a foreign id, the
+                // divergence is an old cure's theft — heal onto the key
+                // before this tick reads any store. The membership lookup is
+                // a bounded sqlite read under the lock: divergent opencode
+                // rows only (a handful at most), and only until the heal
+                // converges (a row on its key never re-enters this arm).
+                && let Some(key_id) = crate::opencode_key_heal_target(
+                    &row.key,
+                    &row.id,
+                    |key_id| {
+                        yggterm_core::agent_cli::cure_store_membership(
+                            &user_home,
+                            SessionKind::OpenCode,
+                            key_id,
+                        )
+                    },
+                )
             {
                 runtime
                     .server
@@ -17539,7 +17564,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                 )
             })
             .collect();
-        (rows, dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        (rows, user_home)
     };
     // [11.80 diagnosability] one line per tick — silence must be
     // distinguishable from absence.
@@ -17680,6 +17705,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
     let mut store_silent = 0usize;
     let mut equal_skips = 0usize;
     let mut cures = 0usize;
+    let mut cures_refused_store_answered = 0usize;
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     {
         let mut runtime = runtime
@@ -17703,6 +17729,27 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                 // because a silent read produced no tick evidence at all —
                 // [11.86]'s diagnosability half.
                 store_silent += 1;
+                // ⛔ [11.202] THE MEMBERSHIP BELT: a silent TITLE read is not
+                // an absent SESSION. If the store HOLDS the row's own id, the
+                // row is an identity and no cwd candidate may evict it —
+                // measured on dev 2026-09-29: three rows whose ids the store
+                // held (live sessions, real titles) wore the candidate's
+                // conversation because their title reads went silent at a
+                // roll tick. Membership, not title, is the identity answer;
+                // the queue's budget is spent, but the rebind never fires.
+                if yggterm_core::agent_cli::cure_store_membership(&user_home, *kind, id)
+                    == Some(true)
+                {
+                    cures_refused_store_answered += 1;
+                    if outcomes.len() < 12 {
+                        outcomes.push(serde_json::json!({
+                            "path": path,
+                            "outcome": "cure_refused_store_answered",
+                            "read_id": id,
+                        }));
+                    }
+                    continue;
+                }
                 // THE STORE-CANDIDATE CURE, applied: the row carries an id
                 // its CLI's store has never answered for, the store named the
                 // session this cwd last viewed, and no other row holds it —
@@ -17714,13 +17761,22 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                         .server
                         .live_agent_row_holding_session_id(candidate_id, path);
                     match holder {
-                        Some(other) if outcomes.len() < 12 => {
-                            outcomes.push(serde_json::json!({
-                                "path": path,
-                                "outcome": "cure_refused_holder",
-                                "candidate_id": candidate_id,
-                                "held_by": other,
-                            }));
+                        // ⛔ [11.202] THE REFUSAL IS UNCONDITIONAL: the old
+                        // arm conditioned the refusal on the outcome cap and
+                        // so let the cap silently DISABLE the law — after 12
+                        // outcomes in a tick a held candidate rebound anyway
+                        // (measured: three rows converged onto one session
+                        // in one tick). The cap bounds the TRACE, never the
+                        // refusal.
+                        Some(other) => {
+                            if outcomes.len() < 12 {
+                                outcomes.push(serde_json::json!({
+                                    "path": path,
+                                    "outcome": "cure_refused_holder",
+                                    "candidate_id": candidate_id,
+                                    "held_by": other,
+                                }));
+                            }
                         }
                         _ => {
                             let rebound = runtime
@@ -17831,6 +17887,7 @@ fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usi
                 "store_silent": store_silent,
                 "equal_skips": equal_skips,
                 "store_candidate_cures": cures,
+                "cure_refusals_store_answered": cures_refused_store_answered,
                 "local_answers": local_answers.len(),
                 "remote_hosts_answered": remote_answers.len(),
                 "remote_missing": remote_missing.len(),
@@ -39731,6 +39788,52 @@ mod tests {
         assert!(
             chore[skip_at..cure_at].contains("continue"),
             "the skip is a continue, not a fallthrough into the queue"
+        );
+    }
+
+    /// [11.202] LOCK: the cure's refusals are laws, not traces. The holder
+    /// refusal must be unconditional (the conditioned form disabled the law
+    /// once the outcome cap filled), the membership belt must stand between
+    /// a silent title read and any rebind, and the opencode key heal must
+    /// run before the tick reads any store.
+    #[test]
+    fn the_cure_refuses_unconditionally_and_the_belt_guards_silent_reads() {
+        let source = include_str!("daemon.rs");
+        let chore = source
+            .split("fn run_row_title_follow_chore(")
+            .nth(1)
+            .expect("chore body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+
+        assert!(
+            !chore.contains("Some(other) if outcomes.len()"),
+            "the holder refusal must not be conditioned on the outcome cap"
+        );
+        let belt_at = chore
+            .find("THE MEMBERSHIP BELT")
+            .expect("the membership belt must exist");
+        let cure_at = chore
+            .find("THE STORE-CANDIDATE CURE, applied")
+            .expect("the cure apply must still exist");
+        assert!(
+            belt_at < cure_at,
+            "the belt must stand before the cure apply, not after it"
+        );
+        assert!(
+            chore[belt_at..cure_at].contains("cure_refused_store_answered"),
+            "a belt refusal is a named outcome, never silence"
+        );
+        let heal_at = chore
+            .find("opencode_key_heal_target(")
+            .expect("the opencode key heal must exist");
+        let snapshot_at = chore
+            .find("let rows: Vec<(String, SessionKind, String, String, Option<String>)>")
+            .expect("the candidate snapshot");
+        assert!(
+            heal_at < snapshot_at,
+            "the heal must run before the snapshot so the tick reads the healed id"
         );
     }
 
