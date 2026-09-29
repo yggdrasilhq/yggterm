@@ -2107,6 +2107,17 @@ fn terminal_session_should_bootstrap_host(
     // retained anyway; a skipped spawn on the INCOMING one is a blank viewport.
     shell.server.active_session_path() == Some(session_path)
         || active_session_path == Some(session_path)
+        // [11.217] The split create promotes every group member to a
+        // CO-VISIBLE pane, and the design already tiers co-visible siblings
+        // as VISIBLE (session_is_visible_split_pane: full reads, foreground
+        // recovery). The host-bootstrap decision is the predicate that
+        // widening missed: without it the co-visible member's host never
+        // mounts (bootstrap_spawn_skipped_inactive_retained_host), nothing
+        // ever fits/refreshes/paints its pane, and the pane keeps the stale
+        // full-width atlas at half width — spawn_heal_split_panes redraws
+        // find no host entry (terminal_host_missing). Scoped to the ACTIVE
+        // group's members; a background row outside the group still skips.
+        || shell.session_is_visible_split_pane(session_path)
 }
 
 fn next_terminal_bootstrap_owner_id() -> u64 {

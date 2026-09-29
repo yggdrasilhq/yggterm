@@ -44597,6 +44597,49 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn co_visible_split_pane_member_bootstraps_its_host() {
+        // [11.217]: the split create promotes the hidden-retained member to
+        // a co-visible pane, but the host-bootstrap predicate answered
+        // active-session-only — the pane's host never mounted
+        // (bootstrap_spawn_skipped_inactive_retained_host), nothing ever
+        // fit/refreshed/painted it, and the pane kept the stale full-width
+        // atlas at half width. The co-visible sibling is VISIBLE tier
+        // (session_is_visible_split_pane) and must bootstrap like the
+        // focused pane; a row OUTSIDE the active group still must not.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.split_groups.push(SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        });
+        // The focused pane: unchanged.
+        assert!(terminal_session_should_bootstrap_host(
+            &shell,
+            Some("local://a"),
+            "local://a"
+        ));
+        // THE FIX: the co-visible sibling bootstraps its host too.
+        assert!(terminal_session_should_bootstrap_host(
+            &shell,
+            Some("local://a"),
+            "local://b"
+        ));
+        // A session outside the active group still must NOT bootstrap.
+        assert!(!terminal_session_should_bootstrap_host(
+            &shell,
+            Some("local://a"),
+            "local://z"
+        ));
+    }
+
+    #[test]
     fn inactive_retained_ready_session_keeps_bridge_mounted_but_pauses_reads() {
         let active_session_path = "codex://active";
         let inactive_session_path = "remote-session://dev/inactive";
