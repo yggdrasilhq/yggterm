@@ -20,7 +20,7 @@ Closed narratives from before 2026-08-02 are in
 
 ## ⛔ [11.213] THE GUI RECOVERY DOOR LAUNDERS A HANDOVER-DEAD REMOTE ROW — EVERY RE-MOUNT READS THE STALE RETAINED BUFFER, CALLS IT LIVE OUTPUT, AND RE-ARMS THE RESIZE BURN (measured 2026-09-29 ~14:13-14:35 IST, live jojo, the [11.57] tombstone lane)
 
-**Status:** OPEN — measured and named; the fix needs the owner's call on the reconciliation shape (real liveness ask vs amber-naming)
+**Status:** OPEN
 
 Filed 2026-09-29 by seat 11.1 (zcode sess_1981d799 on jojo, work FROM dev; claim ACK-b048fcabe8). Symptom carrier: `remote-agy://dev/6778336d` — the OWNER'S ACTIVE row, frozen mid-paint while every instrument swears it is healthy.
 
@@ -33,7 +33,7 @@ THE CHAIN (one full cycle, 14:28:50-14:29:07 IST, every step traced):
 
 THE THREE LIES, named so the next seat does not have to re-derive them: `has_runtime_output` counts retained/stale client bytes as runtime output; `daemon_owned_fast_ready_on_first_meaningful_output` cannot distinguish a live PTY's first frame from a retained-buffer replay (`terminal_transport_recovered {source: "read", ghost_frame: true}` rides the same event block); and nothing consults the [11.158] `agent-runtime-alive` verb on a RE-MOUNT — it is only asked under a fresh [11.153] memo for start-born rows.
 
-FIX DIRECTION (owner call wanted): on a re-mount of a remote row whose runtime key the fresh daemon map does NOT declare (the declare-absent trigger itself), gate `daemon_owned_fast_ready` behind ONE real liveness ask (the existing `remote_agent_session_runtime_alive` ssh verb, budgeted like the [11.158] ask) — a dead peer names the row honestly (amber/refusal banner, the [11.160] shape) instead of painting the corpse; a live peer pays one ssh round trip per re-mount, not per keystroke. The softer alternative — transport-death reconciliation marking the row amber at the daemon — leaves the GUI loop alone but needs the daemon to notice the dead ssh transport it currently reuses.
+FIX DIRECTION (owner call wanted — real liveness ask vs amber-naming; this is why the entry stays OPEN): on a re-mount of a remote row whose runtime key the fresh daemon map does NOT declare (the declare-absent trigger itself), gate `daemon_owned_fast_ready` behind ONE real liveness ask (the existing `remote_agent_session_runtime_alive` ssh verb, budgeted like the [11.158] ask) — a dead peer names the row honestly (amber/refusal banner, the [11.160] shape) instead of painting the corpse; a live peer pays one ssh round trip per re-mount, not per keystroke. The softer alternative — transport-death reconciliation marking the row amber at the daemon — leaves the GUI loop alone but needs the daemon to notice the dead ssh transport it currently reuses.
 
 Falsifier: a remote row whose peer runtime is gone (handover class) re-mounts and within one cycle emits a LIVENESS verdict naming the peer dead (new event, or the [11.158] alive-ask's false arm surfaced on the re-mount path) — and `daemon_owned_fast_ready_on_first_meaningful_output` stops firing for that row until a real birth or a real adopt. Today's baseline (the lie, live): reveal_ready + fast_ready fire on every re-mount while dev answers not-found — reproducible from the [11.57] entry's live specimen.
 
@@ -915,7 +915,7 @@ edit needed. The audit's remaining CLIs stand unaudited.
 
 ## ⛔ [11.57] A REMOTE RUNTIME LOST TO A DAEMON HANDOVER IS UNOWNABLE FOREVER — THE RESIZE RE-QUEUE BURNS ITS RETRIES AGAINST A CORPSE AND THE ROW COMPOSTS ITS SCREEN
 
-**Status:** FIXED IN CODE — LIVE PROOF PARTIAL (the verdict half + the forever-burn tombstone live-proven 2026-09-29 on jojo row 6778336d; the structural cure — respawn-on-unownable and handover re-adoption — is filed below and needs an owner ruling; until it lands this entry stays open.)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Measured 2026-09-05 ~01:20–02:15, the GUI host + the owning host (owner screenshot + live traces; the remote-agy row `remote-agy://dev/16e85426-4032-4491-8321-822b3b1cd67b`):
 
