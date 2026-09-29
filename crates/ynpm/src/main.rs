@@ -4391,6 +4391,295 @@ fn verb_sync(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// Which way an upgrade moves, named for the operator. `SemVer` unparseable
+/// on either side is a move whose direction honest tooling refuses to guess.
+fn upgrade_direction(current: &str, latest: &str) -> &'static str {
+    match (SemVer::parse(current), SemVer::parse(latest)) {
+        (Ok(current), Ok(latest)) => match SemVer::cmp_semver(&latest, &current) {
+            std::cmp::Ordering::Greater => "upgrade",
+            std::cmp::Ordering::Less => "downgrade; the registry answers older",
+            std::cmp::Ordering::Equal => "reinstall",
+        },
+        _ => "version change",
+    }
+}
+
+/// One bin's PATH-shadow verdict: what `tool_on_path` answers versus the
+/// managed destination link. A shadow that is a symlink into the ynpm root is
+/// ynpm's own publication from an older generation (a destination migration
+/// or past install leaves it behind) — ynpm repoints its own links. Anything
+/// else on PATH is somebody else's install and only ever gets named.
+enum ShadowVerdict {
+    Current,
+    Newer(String),
+    OwnedStale,
+    Foreign,
+}
+
+fn classify_path_shadow(
+    shadow: &Path,
+    managed: &Path,
+    ynpm_root: &Path,
+    shadow_version: Option<&str>,
+    managed_version: Option<&str>,
+) -> ShadowVerdict {
+    let (Ok(shadow_real), Ok(managed_real)) = (fs::canonicalize(shadow), fs::canonicalize(managed))
+    else {
+        // Unreadable on either side: never touch what cannot be verified.
+        return ShadowVerdict::Foreign;
+    };
+    if shadow_real == managed_real {
+        return ShadowVerdict::Current;
+    }
+    // A shadow answering strictly NEWER than the managed link is a live
+    // forward choice (the dev-convergence law: the cli link may serve a newer
+    // build on purpose). An explicit upgrade heals backwards drift only.
+    let answered_not_newer = match (shadow_version, managed_version) {
+        (Some(served), Some(managed)) => match (SemVer::parse(served), SemVer::parse(managed)) {
+            (Ok(served), Ok(managed)) => {
+                SemVer::cmp_semver(&served, &managed) != std::cmp::Ordering::Greater
+            }
+            _ => true,
+        },
+        // A shadow answering no version is not a newer build; owned ones get
+        // healed, foreign ones get named.
+        _ => true,
+    };
+    if !answered_not_newer {
+        return ShadowVerdict::Newer(shadow_version.unwrap_or_default().to_string());
+    }
+    let is_symlink = fs::symlink_metadata(shadow)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink && shadow_real.starts_with(ynpm_root) {
+        ShadowVerdict::OwnedStale
+    } else {
+        ShadowVerdict::Foreign
+    }
+}
+
+/// Converge one bin's PATH shadow onto the managed destination link. Returns
+/// the report line when there is something to say. `apply = false` (the
+/// --dry-run pass) classifies and reports without repointing anything.
+/// `shadow` overrides the PATH lookup (the tests inject a fixed link; the
+/// verb passes None and lets `tool_on_path` answer).
+fn converge_path_shadow(
+    paths: &Paths,
+    bin: &str,
+    destination: &Path,
+    apply: bool,
+    shadow: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
+    let managed = destination.join(bin);
+    let managed_version = run_version(&managed)
+        .ok()
+        .as_deref()
+        .and_then(version_from_answer);
+    let on_path = match shadow.map(|path| path.to_path_buf()) {
+        Some(path) => Some(path),
+        None => tool_on_path(bin),
+    };
+    let Some(on_path) = on_path else {
+        return Ok(None);
+    };
+    let shadow_version = run_version(&on_path)
+        .ok()
+        .as_deref()
+        .and_then(version_from_answer);
+    let ynpm_root = fs::canonicalize(paths.root()).unwrap_or_else(|_| paths.root().to_path_buf());
+    match classify_path_shadow(
+        &on_path,
+        &managed,
+        &ynpm_root,
+        shadow_version.as_deref(),
+        managed_version.as_deref(),
+    ) {
+        ShadowVerdict::Current => Ok(None),
+        ShadowVerdict::Newer(version) => Ok(Some(format!(
+            "{bin}: PATH serves {version} from {} — newer than the managed build, left alone",
+            on_path.display()
+        ))),
+        ShadowVerdict::OwnedStale => {
+            if apply {
+                publish_link(&managed, &on_path)?;
+            }
+            Ok(Some(format!(
+                "{bin}: repointed stale user-local link {} (answered {}) -> managed {}{}",
+                on_path.display(),
+                shadow_version.as_deref().unwrap_or("no version"),
+                managed_version.as_deref().unwrap_or("no version"),
+                if apply { "" } else { " (dry run)" }
+            )))
+        }
+        ShadowVerdict::Foreign => Ok(Some(format!(
+            "{bin}: ⛔ PATH answers {} from {} — a foreign install shadows the managed build ({}); remove or upgrade it outside ynpm",
+            shadow_version.as_deref().unwrap_or("no version"),
+            on_path.display(),
+            managed_version.as_deref().unwrap_or("no version"),
+        ))),
+    }
+}
+
+/// `upgrade` is the operator-explicit aggressive sibling of `sync`: the same
+/// freshness (the manager itself first, a manifest fetched now) plus the two
+/// moves the unattended cycles must never make. It converges DOWN when the
+/// registry answers older than the host — the operator asked, and the freshly
+/// fetched version rides as the concrete pin the discovery downgrade refusal
+/// is designed to yield to — and it repoints the stale user-local links an
+/// older destination layout left shadowing the managed ones on PATH
+/// (2026-09-29: opencode answered 2.0.3 for two weeks while 2.0.19 was
+/// managed). A watched dev build keeps the forward-only handback law: an
+/// upgrade reports it and never stomps it.
+fn verb_upgrade(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
+    let mut dry_run = false;
+    for arg in args {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            other => bail!("unknown upgrade option '{other}'; use --dry-run or no options"),
+        }
+    }
+    if !dry_run {
+        match run_yggterm_self_update(paths) {
+            Ok(report) => println!(
+                "ynpm: yggterm {}{}",
+                report.status,
+                report
+                    .version
+                    .as_deref()
+                    .map(|version| format!(" -> {version}"))
+                    .unwrap_or_default()
+            ),
+            Err(error) if is_network_failure(&error) => {
+                eprintln!("ynpm: yggterm update check skipped while offline: {error:#}")
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let state = paths.load_state()?;
+    if state.packages.is_empty() {
+        println!("ynpm: no packages are recorded yet");
+        return Ok(());
+    }
+    let keys = state.packages.keys().cloned().collect::<Vec<_>>();
+    let mut updated = 0usize;
+    let mut failed = Vec::new();
+    for key in keys {
+        let state = paths.load_state()?;
+        let package = state
+            .packages
+            .get(&key)
+            .context("package disappeared during upgrade")?;
+        let identity = package_identity(&key, package);
+        let destination = package_destination(paths, package);
+        if let Some(marker) = &package.dev {
+            let manifest = marker
+                .watch
+                .as_deref()
+                .and_then(|watch| fetch_package_manifest(watch, None).ok());
+            let handback = dev_handback(
+                manifest.as_ref().map(|manifest| manifest.version.as_str()),
+                marker.supersedes.as_deref(),
+                marker.supersedes_fingerprint.as_deref(),
+                manifest.as_ref().and_then(|manifest| {
+                    manifest.integrity.as_deref().or(manifest.shasum.as_deref())
+                }),
+            );
+            if handback == DevHandback::ReleaseAvailable && !dry_run {
+                println!("ynpm: {identity} dev -> production release");
+                match install_one_at(paths, &identity, true, Some(&destination)) {
+                    Ok(_) => updated += 1,
+                    Err(error) => failed.push(format!("{identity}: {error:#}")),
+                }
+            } else if handback == DevHandback::ReleaseAvailable {
+                println!("ynpm: {identity} dev -> production release (dry run)");
+            } else {
+                println!(
+                    "ynpm: {identity} DEV; keeping build (watch {})",
+                    marker.watch.as_deref().unwrap_or("none")
+                );
+            }
+            continue;
+        }
+        let latest = match fetch_package_manifest(&identity, None) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                failed.push(format!("{identity}: {error:#}"));
+                continue;
+            }
+        };
+        if latest.version == package.current {
+            println!("ynpm: {identity} {} current", package.current);
+            continue;
+        }
+        println!(
+            "ynpm: {identity} {} -> {} ({})",
+            package.current,
+            latest.version,
+            upgrade_direction(&package.current, &latest.version)
+        );
+        if dry_run {
+            continue;
+        }
+        // The freshly fetched version rides as the explicit pin: a concrete
+        // pkg@version is the operator's choice, which is exactly the shape
+        // the discovery downgrade refusal yields to (install_npm_package).
+        match install_one_at(
+            paths,
+            &format!("{identity}@{}", latest.version),
+            true,
+            Some(&destination),
+        ) {
+            Ok(_) => updated += 1,
+            Err(error) => failed.push(format!("{identity}: {error:#}")),
+        }
+    }
+    // The PATH-shadow pass reads the state AS LANDED (installs above may have
+    // moved generations) and only touches production packages: a dev build's
+    // links are governed by the dev-convergence law, not by upgrade.
+    let state = paths.load_state()?;
+    let mut repointed = 0usize;
+    let mut foreign = 0usize;
+    let mut seen = Vec::new();
+    for package in state.packages.values() {
+        if package.dev.is_some() {
+            continue;
+        }
+        let destination = package_destination(paths, package);
+        for bin in package.bins.keys() {
+            // Two records may declare the same bin (a dying record beside its
+            // successor); the first pass to touch a bin owns its report.
+            let shadow_key = format!("{bin}\u{0}{}", destination.display());
+            if seen.contains(&shadow_key) {
+                continue;
+            }
+            seen.push(shadow_key);
+            match converge_path_shadow(paths, bin, &destination, !dry_run, None) {
+                Ok(Some(report)) => {
+                    println!("ynpm: {report}");
+                    if report.contains("repointed") {
+                        repointed += 1;
+                    }
+                    if report.contains("foreign install shadows") {
+                        foreign += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("ynpm: ⛔ could not converge {bin}: {error:#}"),
+            }
+        }
+    }
+    if dry_run {
+        println!("ynpm: dry run — nothing installed, nothing repointed");
+    } else {
+        println!("ynpm: {updated} updated, {} failed, {repointed} path links repointed, {foreign} foreign shadows named", failed.len());
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("upgrade failed: {}", failed.join("; "))
+    }
+}
+
 fn verb_prod(paths: &Paths, name: &str) -> anyhow::Result<()> {
     let (pkg, _) = expand_package(name)?;
     let state = paths.load_state()?;
@@ -6178,8 +6467,9 @@ fn main() -> anyhow::Result<()> {
     );
     const USAGE: &str = "ynpm - the yggdrasilhq package manager\n\
          verbs: install [--dest DIR] <pkg>[@<ver>]... | install --dev <pkg> [--watch PKG] [--bin NAME=PATH]... |\n\
-         list | check | doctor | sync [--integrated] | sync-fleet --hosts H1,H2 [--integrated] | self-update [--json] | export <pkg> [--metadata] [--archive PATH] | import <pkg> <ver> --archive PATH --bins a,b | import-yggterm <ver> --archive PATH | rollback <pkg> | remove <pkg> | prod <pkg> |\n\
+         list | check | doctor | sync [--integrated] | sync-fleet --hosts H1,H2 [--integrated] | upgrade [--dry-run] | self-update [--json] | export <pkg> [--metadata] [--archive PATH] | import <pkg> <ver> --archive PATH --bins a,b | import-yggterm <ver> --archive PATH | rollback <pkg> | remove <pkg> | prod <pkg> |\n\
          purge-legacy                                        # remove old yggterm/npm copies when no live process uses them\n\
+         upgrade [--dry-run]                                 # operator-explicit converge: fresh registry check, installs latest in BOTH directions, repoints stale user-local ynpm links shadowing PATH, names foreign shadows
          dev [--build CMD] [--watch PKG] [--fleet H1,H2] [--dest DIR] [--bin NAME=PATH] <checkout>\n\
          ynpx <pkg> [flags] installs/updates when online, then launches the verified bin; github:owner/repo and --dev checkout are supported\n\
          skills scan | list [--json] | info N | register N --home P [--summary S] [--notes N] [--tag T] | install N | note N TEXT | enable/disable N | check    # the fleet skills registry (~/.yggterm/skills/registry.json)";
@@ -6261,6 +6551,7 @@ fn main() -> anyhow::Result<()> {
             verb_doctor(&paths)
         }
         "sync" => verb_sync(&paths, &args[1..]),
+        "upgrade" => verb_upgrade(&paths, &args[1..]),
         "sync-fleet" => verb_sync_fleet(&paths, &args[1..]),
         "self-update" => verb_self_update(&paths, &args[1..]),
         "import-yggterm" => verb_import_yggterm(&paths, &args[1..]),
@@ -6395,7 +6686,7 @@ mod tests {
     }
 
     #[test]
-    fn the_integrated_opencode2_package_uses_the_beta_tag() {
+    fn the_integrated_npm_packages_carry_no_dist_tag_pin() {
         // The live opencode package carries NO tag pin (latest = the v2
         // stable line); the dead preview package must never resolve to beta
         // again.
@@ -7083,6 +7374,156 @@ mod tests {
         assert_eq!(downgrade_refusal_note("0.5.7", "0.6.6"), None);
         assert_eq!(downgrade_refusal_note("0.5.7", "0.5.7"), None);
         assert_eq!(downgrade_refusal_note("not-a-version", "0.5.7"), None);
+    }
+
+    /// A bin that answers a version, for the shadow fixtures.
+    fn write_versioned_bin(path: &Path, version: &str) {
+        fs::create_dir_all(path.parent().expect("bin parent")).expect("bin dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(path, format!("#!/bin/sh\necho 'tool {version}'\n")).expect("bin script");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("bin mode");
+        }
+        #[cfg(not(unix))]
+        fs::write(path, version).expect("bin file");
+    }
+
+    /// The 2026-09-29 opencode shape: the record moved its destination to the
+    /// managed bin dir (2.0.19) while a user-local link from the old layout
+    /// still points into generation 2.0.3 and shadows it on PATH.
+    fn shadow_fixture(home: &Path) -> (Paths, PathBuf, PathBuf) {
+        let paths = Paths::new(home);
+        let destination = paths.root().join("bin");
+        let old_gen = paths.generation_dir("vendor__tool", "2.0.3");
+        let new_gen = paths.generation_dir("vendor__tool", "2.0.19");
+        write_versioned_bin(&old_gen.join("bin/tool"), "2.0.3");
+        write_versioned_bin(&new_gen.join("bin/tool"), "2.0.19");
+        publish_link(&new_gen.join("bin/tool"), &destination.join("tool"))
+            .expect("managed link");
+        let user_dir = home.join(".local/bin");
+        fs::create_dir_all(&user_dir).expect("user dir");
+        publish_link(&old_gen.join("bin/tool"), &user_dir.join("tool")).expect("stale link");
+                (paths, destination, user_dir.join("tool"))
+    }
+
+    fn shadow_home(name: &str) -> PathBuf {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test home")
+            .join(".yggterm/scratchpad/ynpm")
+            .join(format!("shadow-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        home
+    }
+
+    #[test]
+    fn upgrade_direction_names_both_directions() {
+        assert_eq!(upgrade_direction("2.0.3", "2.0.19"), "upgrade");
+        assert_eq!(
+            upgrade_direction("2.0.19", "2.0.3"),
+            "downgrade; the registry answers older"
+        );
+        assert_eq!(upgrade_direction("junk", "2.0.19"), "version change");
+    }
+
+    #[test]
+    fn a_stale_user_local_ynpm_link_is_repointed_at_the_managed_build() {
+        let home = shadow_home("stale");
+        let (paths, destination, stale) = shadow_fixture(&home);
+        let managed = destination.join("tool");
+        let root = paths.root();
+        assert!(matches!(
+            classify_path_shadow(
+                &stale,
+                &managed,
+                &root,
+                Some("2.0.3"),
+                Some("2.0.19")
+            ),
+            ShadowVerdict::OwnedStale
+        ));
+        let report = converge_path_shadow(&paths, "tool", &destination, true, Some(&stale))
+            .expect("converge")
+            .expect("report");
+        assert!(report.contains("repointed"), "{report}");
+        assert!(matches!(
+            classify_path_shadow(&stale, &managed, &root, None, None),
+            ShadowVerdict::Current
+        ));
+        fs::remove_dir_all(&home).expect("cleanup");
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_stale_link_without_touching_it() {
+        let home = shadow_home("dry");
+        let (paths, destination, stale) = shadow_fixture(&home);
+        let before = fs::read_link(&stale).expect("stale link target");
+        let report = converge_path_shadow(&paths, "tool", &destination, false, Some(&stale))
+            .expect("classify")
+            .expect("report");
+        assert!(report.contains("dry run"), "{report}");
+        assert_eq!(fs::read_link(&stale).expect("link after dry run"), before);
+        fs::remove_dir_all(&home).expect("cleanup");
+    }
+
+    #[test]
+    fn a_foreign_shadow_is_named_and_never_touched() {
+        let home = shadow_home("foreign");
+        let (paths, destination, _stale) = shadow_fixture(&home);
+        let foreign_dir = home.join(".opencode/bin");
+        let foreign = foreign_dir.join("tool");
+        write_versioned_bin(&foreign, "1.18.23");
+        let root = paths.root();
+        assert!(matches!(
+            classify_path_shadow(
+                &foreign,
+                &destination.join("tool"),
+                &root,
+                Some("1.18.23"),
+                Some("2.0.19")
+            ),
+            ShadowVerdict::Foreign
+        ));
+        let report = converge_path_shadow(&paths, "tool", &destination, true, Some(&foreign))
+            .expect("converge")
+            .expect("report");
+        assert!(report.contains("foreign install shadows"), "{report}");
+        assert!(
+            foreign.is_file(),
+            "a foreign install's binary is never touched"
+        );
+        fs::remove_dir_all(&home).expect("cleanup");
+    }
+
+    #[test]
+    fn a_shadow_serving_a_newer_build_is_left_alone() {
+        let home = shadow_home("newer");
+        let (paths, destination, _stale) = shadow_fixture(&home);
+        let newer_gen = paths.generation_dir("vendor__tool", "3.0.0");
+        write_versioned_bin(&newer_gen.join("bin/tool"), "3.0.0");
+        let dev_link = home.join(".local/bin-3/tool");
+        publish_link(&newer_gen.join("bin/tool"), &dev_link).expect("newer link");
+        let root = paths.root();
+        assert!(matches!(
+            classify_path_shadow(
+                &dev_link,
+                &destination.join("tool"),
+                &root,
+                Some("3.0.0"),
+                Some("2.0.19")
+            ),
+            ShadowVerdict::Newer(_)
+        ));
+        let report = converge_path_shadow(&paths, "tool", &destination, true, Some(&dev_link))
+            .expect("converge")
+            .expect("report");
+        assert!(report.contains("left alone"), "{report}");
+        assert_eq!(
+            fs::read_link(&dev_link).expect("newer link unchanged"),
+            newer_gen.join("bin/tool")
+        );
+        fs::remove_dir_all(&home).expect("cleanup");
     }
 
     #[test]
