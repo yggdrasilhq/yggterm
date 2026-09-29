@@ -286,6 +286,19 @@ fn terminal_mount_fn_probe_script() -> String {
     )
 }
 
+/// [11.178] The trivial pipeline probe for the adaptive warm-eval gate: the
+/// smallest value-carrying eval the bridge serves. An answer proves the
+/// eval pipeline drains; while the warm mount is still bridge-silent that
+/// means the mount eval was dropped, not queued (redo justified). Silence
+/// means the page is stalled — the warm mount is queued behind the same
+/// congestion and a redo would queue behind it too, so the gate keeps
+/// waiting (the TERMINAL_WARM_EVAL_* constants in state.rs).
+pub(crate) fn terminal_mount_pipeline_probe_script() -> String {
+    // ⛔ [11.173] shape law: the eval bridge wraps every script in a
+    // function body — a value crosses ONLY via a top-level `return`.
+    "return 1 + 1;".to_string()
+}
+
 fn terminal_eval_script_with_canvas_renderer(
     host_id: &str,
     theme: &TerminalTheme,
