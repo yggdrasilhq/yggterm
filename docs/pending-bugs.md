@@ -49,19 +49,41 @@ store session id) so the class can never regress silently again; (c) the six
 dev rows need a heal onto their own pre-rebind ids (the rebind trace names
 every from_id/to_id pair, and the persisted records carry them).
 
-## ⛔ [11.201] THE `row-expanded` VERB CANNOT REACH NESTED REMOTE-FOLDER ROWS: "row is not expandable" FOR THE EXACT DISCLOSURES THE VERB WAS WRITTEN TO REACH (measured 2026-09-29 ~05:10 IST, live jojo desktop, drag-merge-scale lane)
+## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
-Filed 2026-09-29 by the drag-merge-scale lane (zcode sess_87a28b0a on jojo, work FROM dev; claim ACK-5b36ae4c33) while honoring its sidebar-restore contract.
+2026-09-29, row 11.201, lane/integration/11181-install-honesty, work FROM
+dev. The entry's three fix directions resolved: (c) the refresh-state persist ALREADY survived
+per-tool failures — the [11.182] follow-up made it unconditional with the
+per-tool failed_at_ms backoff (the "gating the write on install_error"
+comment + the_launch_ensure_skips_a_contended_lock_before_any_install lock);
+this entry's (c) text was stale against that landing. (a)+(b) LANDED HERE:
+install_latest split into the Result-shaped wrapper (the single-tool ensure
+call sites keep the bail contract) over install_latest_collecting, which
+returns the per-arm failures structured; each failed arm emits
+install_step_failed {tool, error} at failure time, the walk emits
+refresh_install_error {failed_tools, error} when any arm failed, and the
+statuses branch keys "failed" on the tool's OWN arm (arm_failure_for) —
+a tool whose arm succeeded falls through to its honest updated/checked
+arm. Suite 1626/0 (1624 baseline + 2 new locks: the_walk_reads_per_arm_
+failures_and_telemetry_carries_them, an_arm_failure_marks_only_its_own_
+tool). FALSIFIER OWED post-deploy: a real sweep on a host with the
+deterministic failing arm must show honest per-tool statuses +
+refresh_install_error naming the failing arm in event-trace.jsonl +
+last_successful_refresh_ms advancing; then DELETE this entry per the
+verified-fix law.
 
-MEASURED (live verbs + source read, 7/7 distinct paths, deterministic):
+Filed 2026-09-27 by the [11.177] lane while unblinding the drift report (zcode sess_fc6e2076-4139-4752-b3c6-95e7c5eec07d on jojo, work FROM dev; claim ACK-036bbb9074). The [11.177] fix makes the drift report fire regardless — this entry is what it will keep firing INTO until the install plane is honest.
 
-- `yggterm server app row-expanded __remote_folder__/dev/etc/apt false` → `{"accepted": false, "error": "row is not expandable: …"}` — same refusal for all 7 nested remote-folder paths under a collapsed machine root (etc/apt, .cache + greet workdirs, .codex + codex-rs chain).
-- The rows RESOLVE — the refusal is the dispatch kind guard (`Some(row) if row.kind == BrowserRowKind::Group || row_heads_a_row_set(&row)` in the `AppControlCommand::SetRowExpanded` arm; every other Some(row) falls to "row is not expandable"), not "no row found". Remote-folder rows render expander buttons in the sidebar (the `BrowserRowKind::Group` branch that emits `data-sidebar-group-expander`), and a HAND can click them — but the row the verb resolves fails both predicate halves. That is exactly the "a disclosure a hand can click and a verb cannot reach is half a feature" class the verb`s own doc comment bans.
-- The DOM workaround (expand the machine root → click the folder expander → re-collapse the root) works, so a headless agent CAN honor a fold contract — but only by driving the GUI.
+MEASURED (event-trace.jsonl + source read, 3/3 scheduled sweeps today, mode `scheduled`, ttl 7200000):
 
-⇒ Fix direction: one-predicate widening — carry the expandable kind through `resolve_app_control_row` for synthetic `__remote_folder__` rows (or accept them in the dispatch arm). Found by the lane, NOT fixed by it (lane scope: probe/docs only).
+- Every sweep's `refresh_end` carries `install_attempted: true, install_deferred: false` and **ALL 13 tool statuses `action: "failed"`** — while the SAME window's ynpm trace shows **every `operation.complete` with `result: "ok"`** (8 packages, one ynpm transaction each, incl. `@opencode/cli` 2.0.18). The npm arm is innocent.
+- `install_latest` collects failures across ALL provision arms and joins them into one `install_error` for the WHOLE refresh (`anyhow::bail!("{}", failures.join("; "))`). One failing non-ynpm arm poisons everything: every tool's status becomes "failed" — **including tools whose own arm succeeded and demonstrably changed** (`changed: true` on kimi/muse/agy in the same statuses that name them "failed") — and `persist_managed_cli_refresh_state` is skipped (same success-only block), so `last_successful_refresh_ms` starves and the TTL "skipped recently" quiet period can never engage.
+- The failing arm is one of the five non-ynpm tools (kimi/muse/devin VendorScript `curl|sh`, agy/devin SelfCommand self-updaters on this host). It is DETERMINISTIC (3/3 sweeps) and FAST (sweep completes in ~90 s). Its identity and error string are INVISIBLE in the trace: `refresh_end` statuses carry `{action, available, changed, tool}` only, the `Managed refresh failed: {error}` detail surfaces nowhere in event-trace.jsonl or daemon.log, and the GUI panel is the only consumer that ever sees it.
+
+⇒ Fix direction: (a) emit a `refresh_install_error` trace event carrying the per-arm failure strings — a machine that cannot keep its CLIs current must SAY SO in telemetry, not only in a GUI panel; (b) statuses must not lie per-tool: a tool whose own arm succeeded is not "failed" (carry the batch error on the tools that actually failed); (c) let the state persist record partial success so the TTL bookkeeping works.
+
 
 ## ⛔ [11.186] THE RETIRED CHOOSER PANE KEEPS PAINTING OVER THE MOUNTED DESKTOP: A yRDP sidebar `close` NEVER FIRES THE GUI'S `sidebar_contribution/close` ARM, SO `clear_document_panes_for_session` NEVER RUNS AND THE VIEWPORT SHOWS THE MACHINE LIST OVER THE LIVE noVNC CANVAS (measured 2026-09-27 14:50-15:25 IST, live jojo desktop, the [11.185] proof leg)
 
