@@ -18,6 +18,25 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.213] THE GUI RECOVERY DOOR LAUNDERS A HANDOVER-DEAD REMOTE ROW — EVERY RE-MOUNT READS THE STALE RETAINED BUFFER, CALLS IT LIVE OUTPUT, AND RE-ARMS THE RESIZE BURN (measured 2026-09-29 ~14:13-14:35 IST, live jojo, the [11.57] tombstone lane)
+
+**Status:** OPEN — measured and named; the fix needs the owner's call on the reconciliation shape (real liveness ask vs amber-naming)
+
+Filed 2026-09-29 by seat 11.1 (zcode sess_1981d799 on jojo, work FROM dev; claim ACK-b048fcabe8). Symptom carrier: `remote-agy://dev/6778336d` — the OWNER'S ACTIVE row, frozen mid-paint while every instrument swears it is healthy.
+
+THE CHAIN (one full cycle, 14:28:50-14:29:07 IST, every step traced):
+
+1. The daemon handover (the [11.212] deploy roll, 3.2.115) rebuilt the daemon's per-process terminal map; the row's REMOTE half died with it — dev's daemon answers `terminal session not found: agy-runtime://6778336d` forever, the resume-agy bridge on dev sits alive but CHILDLESS (its TUI dead), and dev's conversation store has 0 rows for the id (definitive miss).
+2. The GUI's periodic `daemon_declare_absent` (via: batch) notices the row is absent from the fresh daemon's map → the recovery door RE-MOUNTS the row (`bootstrap_reset`, `attach_supersede_watchdog … rearmed_via_recovery_door`, mount_epoch++).
+3. THE LAUNDRY: the mount's retained rehydrate reads 11,317 bytes of STALE client-side buffer and the daemon's `reuse_check` answers `has_runtime_output: true, needs_restart: false` — the corpse is REUSED, never respawned. `first_output {bytes: 11317, meaningful: true}` → `ready {reason: "daemon_owned_fast_ready_on_first_meaningful_output"}` → `reveal_ready "New dev Antigravity"`. The row paints, the metadata says running·idle, and the user's typing flows into a dead transport.
+4. The same mount fires its fit-resize → `forward_remote_pty_resize` → the [11.57] ssh ladder against the missing peer → verdict → next batch declare repeats the whole cycle. This loop was the [11.57] forever-burn's engine; the [11.57] tombstone (same sitting) now stops the RESIZE half within one heal window, but the re-mount + stale-paint-as-alive loop itself is THIS entry's disease and keeps burning one re-mount cycle per batch declare.
+
+THE THREE LIES, named so the next seat does not have to re-derive them: `has_runtime_output` counts retained/stale client bytes as runtime output; `daemon_owned_fast_ready_on_first_meaningful_output` cannot distinguish a live PTY's first frame from a retained-buffer replay (`terminal_transport_recovered {source: "read", ghost_frame: true}` rides the same event block); and nothing consults the [11.158] `agent-runtime-alive` verb on a RE-MOUNT — it is only asked under a fresh [11.153] memo for start-born rows.
+
+FIX DIRECTION (owner call wanted): on a re-mount of a remote row whose runtime key the fresh daemon map does NOT declare (the declare-absent trigger itself), gate `daemon_owned_fast_ready` behind ONE real liveness ask (the existing `remote_agent_session_runtime_alive` ssh verb, budgeted like the [11.158] ask) — a dead peer names the row honestly (amber/refusal banner, the [11.160] shape) instead of painting the corpse; a live peer pays one ssh round trip per re-mount, not per keystroke. The softer alternative — transport-death reconciliation marking the row amber at the daemon — leaves the GUI loop alone but needs the daemon to notice the dead ssh transport it currently reuses.
+
+Falsifier: a remote row whose peer runtime is gone (handover class) re-mounts and within one cycle emits a LIVENESS verdict naming the peer dead (new event, or the [11.158] alive-ask's false arm surfaced on the re-mount path) — and `daemon_owned_fast_ready_on_first_meaningful_output` stops firing for that row until a real birth or a real adopt. Today's baseline (the lie, live): reveal_ready + fast_ready fire on every re-mount while dev answers not-found — reproducible from the [11.57] entry's live specimen.
+
 ## ⛔ [11.212] THE [11.190]/[11.193] MINTED-BOUND FRESH START NEVER REACHES THE ROW ON THE [11.206] CLICK PATH — THE FALLTHROUGH SERVES THE CLICK (trace + deliberate re-entry + live row, GREEN) BUT THE SPAWNED COMMAND RESUMES THE ABSENT REQUESTED ID AND THE FRESH-START STAMP + [11.193] RE-POINT NEVER LAND (measured 2026-09-29 ~12:3x-14:1x IST, live jojo daemon bfe5ed19, the 11.211 mint-arm falsifier lane)
 
 **Status:** OPEN
