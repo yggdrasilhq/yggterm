@@ -16512,6 +16512,32 @@ pub(crate) fn remote_runtime_agent_session_key(
 /// answer here; they are excluded by construction because only Antigravity
 /// is session-named today. Add a kind only with measured evidence that its
 /// runtime key embeds the CLI conversation id.
+/// [11.202] THE OPENCODE KEY HEAL DECISION: an opencode-runtime key carries
+/// the row's own birth session id ([11.73]; ids are RPC-minted at birth, so
+/// the store heard them all). When the key's id is store-HELD and the row
+/// wears a different id, the divergence is an old cure's theft
+/// (pre-[11.202] there was no membership vouch): heal onto the key. An
+/// ABSENT key id is a dead session — the divergence may be the cure's
+/// legitimate dead-key adoption, and the row's current id may be the only
+/// live identity it has; leave it. An unanswerable store is never a guess
+/// license. The membership lookup is a closure so the decision stays pure
+/// and the caller owns the store access.
+pub(crate) fn opencode_key_heal_target(
+    key: &str,
+    current_id: &str,
+    mut membership: impl FnMut(&str) -> Option<bool>,
+) -> Option<String> {
+    let key_id = key
+        .strip_prefix("opencode-runtime://")?
+        .split(['/', '?'])
+        .next()?
+        .to_string();
+    if key_id.is_empty() || key_id == current_id {
+        return None;
+    }
+    (membership(&key_id) == Some(true)).then_some(key_id)
+}
+
 pub(crate) fn session_named_runtime_key_id_for_kind(
     kind: SessionKind,
     path: &str,
@@ -53906,6 +53932,49 @@ terminal_window_id: None,
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// [11.202] The opencode key-heal decision: heal ONLY a store-held key
+    /// id; a dead key id is the cure's legitimate adoption ground, an
+    /// unanswerable store is no license to guess, and non-opencode keys
+    /// never heal here (the agy plane has its own arm).
+    #[test]
+    fn the_opencode_key_heal_fires_only_for_a_store_held_key_id() {
+        let key = "opencode-runtime://ses_birth";
+        assert_eq!(
+            crate::opencode_key_heal_target(key, "ses_stolen", |_| Some(true)),
+            Some("ses_birth".to_string()),
+            "a held key id outranks whatever id the row currently wears"
+        );
+        assert_eq!(
+            crate::opencode_key_heal_target(key, "ses_birth", |_| Some(true)),
+            None,
+            "a row already on its key is not divergent"
+        );
+        assert_eq!(
+            crate::opencode_key_heal_target(key, "ses_stolen", |_| Some(false)),
+            None,
+            "a dead key id never heals — the adoption may be legitimate"
+        );
+        assert_eq!(
+            crate::opencode_key_heal_target(key, "ses_stolen", |_| None),
+            None,
+            "an unanswerable store is not absence"
+        );
+        assert_eq!(
+            crate::opencode_key_heal_target("agy-runtime://abc", "x", |_| Some(true)),
+            None,
+            "the agy plane heals through the session-named arm, not this one"
+        );
+        assert_eq!(
+            crate::opencode_key_heal_target(
+                "opencode-runtime://ses_a/machine",
+                "ses_b",
+                |_| Some(true),
+            ),
+            Some("ses_a".to_string()),
+            "suffixed spellings parse to the id segment"
+        );
     }
 
     /// [11.200] The session-named key parser: agy-runtime:// carries the

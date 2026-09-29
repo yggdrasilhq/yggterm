@@ -29,6 +29,11 @@ INVARIANTS (each maps to a lived owner pain):
                  store-candidate cure dragged four live dev rows onto the
                  dead birth id 0a1f852d), or a foreign store-candidate
                  rebind in the recent trace (the livelock's churn witness)
+  identity_convergence  one store session id worn by multiple live rows
+                 (the [11.202] cure-convergence class: eight dev opencode
+                 rows absorbed onto one cwd candidate), naming the theft
+                 shapes (held-key theft, unattributed wearer) apart from
+                 the tolerated dead-key adoption
 
 Run it UNATTENDED (cron / the ygg-ci watcher / any seat): exit 0 = clean,
 1 = at least one violation. `--json` renders the report for machines.
@@ -423,6 +428,121 @@ def invariant_identity_dedupe(report, rows, window_secs=900):
         pass
 
 
+_SESSION_NAMED_SCHEMES = (
+    "opencode-runtime://",
+    "agy-runtime://",
+    "muse-runtime://",
+    "zcode-tui-runtime://",
+    "codex-runtime://",
+    "cc-runtime://",
+    "grok-runtime://",
+    "kimi-runtime://",
+    "qwen-runtime://",
+    "pi-runtime://",
+    "devin-runtime://",
+    "mimo-runtime://",
+)
+
+
+def _key_session_id(path):
+    """The id a session-named runtime key carries, or None for key-less rows
+    (local://, remote schemes) — an unattributable wearer."""
+    for scheme in _SESSION_NAMED_SCHEMES:
+        if path.startswith(scheme):
+            key_id = path[len(scheme):].split("/")[0]
+            return key_id or None
+    return None
+
+
+def _opencode_store_session_ids():
+    """The ids the LOCAL opencode store holds (read-only), or None when the
+    store cannot be consulted at all — no answer is not an answer (the
+    [11.202] three-valued vouch law)."""
+    import sqlite3
+
+    db = HOME / ".local/share/opencode/opencode.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    ids = set()
+    try:
+        for table in ("session_v2", "session"):
+            try:
+                for row in conn.execute(f"SELECT id FROM {table}"):
+                    if row and row[0]:
+                        ids.add(str(row[0]))
+            except sqlite3.Error:
+                continue
+    finally:
+        conn.close()
+    return ids
+
+
+def invariant_identity_convergence(report, rows):
+    """[11.202] ONE CONVERSATION, ONE ROW: a store session id worn by two
+    live rows is the store-candidate cure's convergence class — measured on
+    dev 2026-09-29 as eight rows wearing one cwd candidate ("Greeting
+    message"), invisible to identity_dedupe because opencode keys are
+    row-named ([11.73]). Shape of the law: one wearer's key may name the id
+    (the row that owns it); any OTHER wearer must have a key id the store
+    says is DEAD (the cure's legitimate dead-key adoption). A wearer whose
+    key id is store-HELD, or that carries no key id at all (local://
+    corpses), is a theft."""
+    by_id = {}
+    for row in rows:
+        if row["id"]:
+            by_id.setdefault(row["id"], []).append(row)
+    violations = []
+    store_ids = None
+    store_unanswerable = False
+    for sid, wearers in by_id.items():
+        if len(wearers) < 2:
+            continue
+        if not any(_key_session_id(w["path"]) == sid for w in wearers):
+            continue  # no keyed holder — not the convergence shape
+        for w in wearers:
+            kid = _key_session_id(w["path"])
+            if kid == sid:
+                continue  # the legitimate holder
+            if kid is None:
+                violations.append(
+                    f"{sid[:20]}… worn by key-less row {w['path'][:44]}"
+                )
+            elif not w["path"].startswith("opencode-runtime://"):
+                violations.append(
+                    f"{sid[:20]}… worn by {w['path'][:44]} — membership "
+                    "unverifiable on this plane"
+                )
+            else:
+                if store_ids is None and not store_unanswerable:
+                    store_ids = _opencode_store_session_ids()
+                    if store_ids is None:
+                        store_unanswerable = True
+                if store_unanswerable:
+                    violations.append(
+                        f"{sid[:20]}… worn by {w['path'][:44]} — store "
+                        "unanswerable, membership unverifiable"
+                    )
+                elif kid in store_ids:
+                    violations.append(
+                        f"{sid[:20]}… worn by {w['path'][:44]} whose own key "
+                        f"id {kid[:20]}… is store-HELD (a live identity was "
+                        "stolen — heal owed)"
+                    )
+            # else: dead-key adoption — the cure's designed output
+    if violations:
+        report.fail(
+            "identity_convergence",
+            "one store session id worn by multiple live rows (the "
+            "[11.202] cure-convergence class): " + "; ".join(violations[:3]),
+        )
+    else:
+        report.ok("identity_convergence")
+
+
 def live_runtime_keys():
     keys = set()
     try:
@@ -632,6 +752,7 @@ def main():
     invariant_geometry(report, rows)
     invariant_ghost_pids(report, args.peer)
     invariant_identity_dedupe(report, live_snapshot_rows())
+    invariant_identity_convergence(report, live_snapshot_rows())
     if args.freeze_window_secs > 0:
         invariant_freeze_window(report, args.freeze_window_secs)
     else:

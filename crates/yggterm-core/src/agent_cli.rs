@@ -7689,6 +7689,55 @@ pub fn devin_store_holds_session(home: &Path, session_id: &str) -> Option<bool> 
 /// caller to the row's own cwd (N-windows-one-cwd picks the newest, which
 /// is strictly closer to the owner's intent than the fresh empty window
 /// this arm replaces).
+/// [11.202] THE CURE'S MEMBERSHIP VOUCH: does the OpenCode store HOLD
+/// `session_id`? The store-candidate cure's one-way contract says "never
+/// re-point a row the store already answers", but the queue's eligibility
+/// check was the TITLE read — and a title read is silent for held sessions
+/// too (a locked db at a daemon roll, a fallback-titled session, a transient
+/// failure). Measured live on dev 2026-09-29: three rows whose own ids the
+/// store HELD (live sessions, real titles) were re-pointed onto the cwd
+/// candidate because their title reads went silent at the roll tick.
+/// Membership, not title, is the identity answer.
+///
+/// Type-agnostic + table-tail as the candidate reader below; `None` only
+/// when the db cannot be consulted at all — which is NOT "absent", and a
+/// caller must never treat it as such (the three-valued vouch law).
+pub fn opencode_store_holds_session(home: &Path, session_id: &str) -> Option<bool> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let conn = open_cli_index_readonly(&home.join(".local/share/opencode/opencode.db"))?;
+    for table in ["session_v2", "session"] {
+        let Ok(mut stmt) =
+            conn.prepare(&format!("SELECT 1 FROM {table} WHERE id = ?1 LIMIT 1"))
+        else {
+            continue;
+        };
+        let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) else {
+            continue;
+        };
+        match rows.next() {
+            Ok(Some(_)) => return Some(true),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(false)
+}
+
+/// [11.202] The membership answer the store-candidate cure consults, per
+/// kind. Only OpenCode answers today: its candidate reader already speaks
+/// the store, so held/absent is measured, and the [11.202] incident is the
+/// opencode plane's. The other cure kinds stay `None` — unmeasured planes
+/// keep the pre-[11.202] cure behavior; arm them only on a measured
+/// livelock (the [11.200] close note's law).
+pub fn cure_store_membership(home: &Path, kind: SessionKind, session_id: &str) -> Option<bool> {
+    match kind {
+        SessionKind::OpenCode => opencode_store_holds_session(home, session_id),
+        _ => None,
+    }
+}
+
 pub fn opencode_store_newest_session_for_directory(home: &Path, directory: &str) -> Option<String> {
     let trimmed = directory.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -12411,6 +12460,39 @@ mod newest_session_tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("temp home");
         home
+    }
+
+    #[test]
+    fn the_cure_membership_vouch_answers_held_absent_and_unopenable() {
+        // [11.202] the cure's one-way contract keyed on the TITLE read;
+        // three store-HELD sessions wore the cwd candidate because their
+        // title reads went silent at a roll tick. Membership, not title, is
+        // the identity answer.
+        let home = temp_home("memb");
+        seed(
+            &home,
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER, time_viewed INTEGER, time_archived INTEGER);
+             INSERT INTO session_v2 VALUES ('ses_held', '/p', 100, 100, NULL);",
+        );
+        assert_eq!(
+            cure_store_membership(&home, SessionKind::OpenCode, "ses_held"),
+            Some(true),
+            "a held session is an identity no candidate may evict"
+        );
+        assert_eq!(
+            cure_store_membership(&home, SessionKind::OpenCode, "ses_missing"),
+            Some(false),
+            "a consulted-and-absent id is definitively absent"
+        );
+        let empty = temp_home("memb-empty");
+        assert_eq!(
+            cure_store_membership(&empty, SessionKind::OpenCode, "ses_held"),
+            None,
+            "no db is NOT absent — the caller must not guess"
+        );
+        // Other kinds stay unmeasured planes (the [11.200] close note's law:
+        // arm only on a measured livelock).
+        assert_eq!(cure_store_membership(&home, SessionKind::Muse, "x"), None);
     }
 
     #[test]
