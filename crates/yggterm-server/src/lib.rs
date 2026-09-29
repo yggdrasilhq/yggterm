@@ -19226,7 +19226,47 @@ fn refresh_restored_remote_runtime_codex_launch_command_in(
         && session.launch_command.contains(session_id.as_str());
     if !already_resume {
         match remote_saved_agent_session_exists(session.kind, &session_id, env) {
-            Ok(true) => {}
+            Ok(true) => {
+                // ⛔ THE [11.212] MINT-ARM GATE. The probe is FAIL-OPEN TRUE
+                // for Antigravity by [11.165] design, so this arm cannot tell
+                // "the store holds it" from "the store was never really
+                // asked" — and everything below rewrites the launch into a
+                // resume of THIS id. On the [11.206] fresh-start path the id
+                // derived from the runtime key is the store-absent REQUESTED
+                // one: the ensure minted a bound fresh conversation and
+                // re-pointed the row ([11.190]/[11.193]), then this repair —
+                // re-run inside every launch request
+                // (request_terminal_launch_for_resolved_path, LiveLocal arm)
+                // — resumed the dead id straight over the minted compose
+                // (measured live on jojo, build bfe5ed19: session_not_found
+                // painted on the PTY, rows show still wearing the absent
+                // id). The doctrine is already written at the predicate: THE
+                // DEFINITIVE-MISS GATES LIVE AT THE CONSUMERS. This consumer
+                // asks the same three-valued vouch the ensure compose asks;
+                // a DEFINITIVE miss refuses the repair and the minted
+                // fresh-start compose survives to the spawn. `None`
+                // (unreadable store) never refuses.
+                if remote_require_existing_needs_definitive_vouch(session.kind)
+                    && home.and_then(|home| {
+                        local_agent_store_vouches_for_session_in(home, session.kind, &session_id)
+                    }) == Some(false)
+                {
+                    if let Some(home) = home {
+                        append_trace_event(
+                            home,
+                            "server",
+                            "remote_runtime",
+                            "restored_codex_runtime_launch_repair_refused_definitive_miss",
+                            serde_json::json!({
+                                "key": key,
+                                "session_id": session_id,
+                                "policy": "a minted fresh start is never repaired back onto the store-absent id ([11.212])",
+                            }),
+                        );
+                    }
+                    return false;
+                }
+            }
             Ok(false) => return false,
             Err(error) => {
                 if let Ok(home) = resolve_yggterm_home() {
@@ -19511,6 +19551,124 @@ mod restored_runtime_repair_tests {
         assert!(repaired, "the restored daemon-runtime case must keep working");
         assert_eq!(session.session_path, key);
         assert_eq!(session.source, SessionSource::LiveLocal);
+    }
+
+    /// THE [11.212] MINT-ARM REGRESSION, the fixture twin of the live
+    /// falsifier: an agy row the ensure minted a fresh start for (id
+    /// re-pointed to the MINTED conversation, launch composes `--conversation
+    /// <fresh>`, "Fresh Start" stamped) whose runtime key still carries the
+    /// store-absent REQUESTED id. The repair used to derive the requested id
+    /// from the key, trust the fail-open probe's Ok(true), and resume the
+    /// dead id straight over the minted compose — every launch request
+    /// (request_terminal_launch_for_resolved_path) re-stomped it, so the row
+    /// painted agy's own session_not_found and never wore the bound id. The
+    /// mint-arm gate asks the three-valued vouch and a DEFINITIVE miss
+    /// refuses the repair: the minted compose, the re-point and the stamp
+    /// all survive to the spawn.
+    #[test]
+    fn a_minted_fresh_start_is_never_repaired_back_onto_the_absent_id() {
+        let requested = "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
+        let minted = "7c1d3a84-99e8-4fce-adbb-96a5a3807f4a";
+        let key = format!("agy-runtime://{requested}");
+        let minted_launch = format!("agy --conversation {minted}");
+        let mut session = agy_session(&key, &minted_launch);
+        // The post-ensure row shape ([11.190]/[11.193]): id re-pointed, the
+        // minted conversation named, the fresh start stamped. No "Antigravity
+        // Session" metadata — the ensure does not stamp it, so the repair's
+        // id derivation falls through to the runtime KEY (the requested id).
+        session.id = minted.to_string();
+        session.source = SessionSource::LiveLocal;
+        session.metadata = vec![
+            SessionMetadataEntry {
+                label: "Conversation",
+                value: minted.to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Fresh Start",
+                value: format!("the store definitively lacks {requested}"),
+            },
+        ];
+        // A fixture home where agy HAS run (the index root exists) but the
+        // requested id is definitively absent — the same Some(false) word the
+        // ensure's compose arm answered when it minted.
+        static MINTARM_FIXTURE_SEQ: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let seq = MINTARM_FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home =
+            std::env::temp_dir().join(format!("yggterm-agy-mintarm-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).expect("fixture dirs");
+        let before = session.launch_command.clone();
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            &key,
+            &mut session,
+            Some(&home),
+            &RemoteCodexStoreEnv::default(),
+        );
+        assert!(
+            !repaired,
+            "a definitive store miss refuses the repair — the minted fresh start survives"
+        );
+        assert_eq!(
+            session.launch_command, before,
+            "the minted compose is untouched"
+        );
+        assert_eq!(session.id, minted, "the [11.193] re-point is untouched");
+    }
+
+    /// The positive control for the gate: the SAME row shape, but the store
+    /// HOLDS the requested id (a rebind landed after the mint). The vouch
+    /// answers Some(true), the gate stands down, and the repair resumes the
+    /// real conversation exactly as before [11.212].
+    #[test]
+    fn a_minted_row_whose_store_later_rebinds_still_repairs() {
+        let requested = "3f9d0c7e-1b2a-4c5d-8e6f-aabbccdd0011";
+        let minted = "7c1d3a84-99e8-4fce-adbb-96a5a3807f4a";
+        let key = format!("agy-runtime://{requested}");
+        let mut session = agy_session(&key, &format!("agy --conversation {minted}"));
+        session.id = minted.to_string();
+        session.source = SessionSource::LiveLocal;
+        session.metadata = vec![SessionMetadataEntry {
+            label: "Conversation",
+            value: minted.to_string(),
+        }];
+        static MINTARM_FIXTURE_SEQ: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let seq = MINTARM_FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = std::env::temp_dir()
+            .join(format!("yggterm-agy-mintarm-bound-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let cli_root = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cli_root).expect("fixture dirs");
+        let conn = rusqlite::Connection::open(cli_root.join("conversation_summaries.db"))
+            .expect("fixture db");
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT);",
+            [],
+        )
+        .expect("fixture schema");
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, title) VALUES (?1, 'rebound');",
+            rusqlite::params![requested],
+        )
+        .expect("fixture row");
+        let repaired = refresh_restored_remote_runtime_codex_launch_command_in(
+            &key,
+            &mut session,
+            Some(&home),
+            &RemoteCodexStoreEnv::default(),
+        );
+        assert!(
+            repaired,
+            "a store-held id resumes: the gate never refuses on a real vouch"
+        );
+        assert!(
+            session.launch_command.contains("--conversation")
+                && session.launch_command.contains(requested),
+            "the repair composes the resume of the HELD id; got: {}",
+            session.launch_command
+        );
+        assert_eq!(session.id, requested, "the row rides the held conversation");
     }
 
     #[test]
