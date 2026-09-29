@@ -19911,19 +19911,26 @@ mod restored_runtime_repair_tests {
 
     #[test]
     fn the_definitive_bit_is_annotation_only_and_rides_the_wire_verb() {
-        // THE [11.165] COMPLETION, pinned: the shared bool predicate keeps
-        // its fail-open semantics (its own source-scan above pins the agy
-        // arm), the verb handler rides the definitive bit ALONGSIDE the
-        // unchanged bool, and the legacy bool fetch keeps its own inline
-        // parse — only the definitive twin reads the three-valued shape.
+        // THE [11.165] COMPLETION, pinned: the wire verb answers the store's
+        // COHERENT word — exists and definitive from ONE match, never the
+        // fail-open bool annotated in place (the first cut answered
+        // exists:true definitive:true for an id the store definitively
+        // lacks; measured live on the deploy). The shared bool predicate
+        // keeps its fail-open semantics for the LOCAL consumers (its own
+        // source-scan above pins the agy arm); only the wire verb carries
+        // the three-valued word.
         let source = include_str!("lib.rs");
         let verb = source_body_after(source, "pub fn run_remote_saved_agent_session_exists(");
         assert!(
-            verb.contains("exists: remote_saved_agent_session_exists(kind, session_id,")
-                && verb.contains(
-                    "definitive: remote_saved_agent_session_answer_is_definitive(kind, session_id)"
-                ),
-            "the verb answers exists AND definitive, the bool unchanged"
+            verb.contains("match kind")
+                && verb.contains("antigravity_local_db_holds_conversation(session_id)")
+                && verb.contains("Some(answer) => (answer, true)"),
+            "the agy arm answers the db read's own word, definitively"
+        );
+        assert!(
+            !verb.contains("remote_saved_agent_session_exists(kind, session_id,")
+                || verb.contains("SessionKind::ClaudeCode | SessionKind::Codex"),
+            "the fail-open bool never annotates the agy answer"
         );
         // This test's own source names the anchor below, and
         // include_str! sees this file — the definition is the SECOND
@@ -26187,48 +26194,48 @@ fn remote_agent_launch_options_from_environment() -> AgentLaunchOptions {
 /// `<slug>-session-exists` for every CLI — the descriptor-driven store lookup,
 /// answering in the same JSON shape the codex verb has always used.
 ///
-/// THE [11.165] COMPLETION: the answer now carries `definitive`, the store's
-/// own word about whether `exists` is evidence rather than the deliberate
-/// fail-open. The `exists` bit keeps its historical semantics for every
-/// existing consumer; only the [11.213] remount liveness worker reads the
-/// definitive bit, and its fail-open fall-through refuses healable and never
-/// closes — the birth composition and the rebind rebuild vouch are untouched.
+/// THE [11.165] COMPLETION: the answer is the store's own COHERENT word —
+/// `exists` and `definitive` are two halves of ONE answer and are never
+/// computed apart. (The first cut annotated the fail-open bool instead and
+/// answered `exists:true, definitive:true` for an id the store definitively
+/// lacks — measured live on the deploy, before the green run could lie for
+/// it; the pair parses as a confident vouch, which is the disease wearing
+/// the cure's clothes.) Antigravity is the only kind whose bool was
+/// fail-open, so it is the only kind whose wire `exists` bit changes: its
+/// three-valued db read — the [11.190] read — IS the word, and the local
+/// sweep never hears the flip because the self-minting guard
+/// (`id_assigned_at_birth:false` → absent-open-opens-picker) returns before
+/// any ask. Codex and Claude Code keep their readers verbatim (definitive
+/// on Ok; the Err is a transport error no consumer may interpret). Every
+/// other kind has no store word: legacy true, NOT definitive.
 pub fn run_remote_saved_agent_session_exists(
     kind: SessionKind,
     session_id: &str,
 ) -> anyhow::Result<()> {
+    let (exists, definitive) = match kind {
+        SessionKind::Antigravity => {
+            match antigravity_local_db_holds_conversation(session_id) {
+                Some(answer) => (answer, true),
+                None => (true, false),
+            }
+        }
+        SessionKind::ClaudeCode | SessionKind::Codex | SessionKind::CodexLiteLlm => (
+            remote_saved_agent_session_exists(
+                kind,
+                session_id,
+                &RemoteCodexStoreEnv::from_process(),
+            )?,
+            true,
+        ),
+        _ => (true, false),
+    };
     let response = RemoteSavedCodexSessionExistsResponse {
         session_id: session_id.to_string(),
-        exists: remote_saved_agent_session_exists(kind, session_id, &RemoteCodexStoreEnv::from_process())?,
-        definitive: remote_saved_agent_session_answer_is_definitive(kind, session_id),
+        exists,
+        definitive,
     };
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
-}
-
-/// Does this host's store answer the saved-session ask DEFINITIVELY for
-/// `kind` — i.e. is the bool [`remote_saved_agent_session_exists`] returns the
-/// store's own word rather than the deliberate fail-open? THE [11.165]
-/// COMPLETION, peer side.
-///
-/// ⛔ This is a one-bit annotation, not a new store read for codex and Claude
-/// Code: their readers are definitive whenever they answer `Ok`, and their
-/// `Err` is a transport error the worker's backoff already refuses to
-/// interpret. Antigravity is the only kind whose `Ok` can be a fail-open: its
-/// db read is three-valued already (the same read the [11.190] fresh-start
-/// compose is premised on), so `Some(_)` is the store's word and `None` — an
-/// unreadable or absent store — stays fail-open.
-fn remote_saved_agent_session_answer_is_definitive(
-    kind: SessionKind,
-    session_id: &str,
-) -> bool {
-    match kind {
-        SessionKind::ClaudeCode | SessionKind::Codex | SessionKind::CodexLiteLlm => true,
-        SessionKind::Antigravity => {
-            antigravity_local_db_holds_conversation(session_id).is_some()
-        }
-        _ => false,
-    }
 }
 
 /// Claude Code twin of [`run_remote_start_codex`].
