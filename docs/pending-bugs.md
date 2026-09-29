@@ -18,56 +18,6 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.203] THE OPENCODE TITLE READ DISCARDS REAL STORE TITLES — THE STORE COLUMN IS AUTHORED CONTENT BUT THREE CONVERSATION-SHAPE FILTER ARMS ATE IT — the busy hypothesis FALSIFIED BY MEASUREMENT, and the reap-gap half answered by the despawn verb that existed all along (measured 2026-09-29 ~06:40 IST, live dev, the [11.203] seat)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Filed 2026-09-29 by the [11.202] close seat; root-caused the same day by
-the [11.203] seat (zcode on jojo, work FROM dev, lane
-lane/integration/11203-title-busy-and-reap 69e3d341+bdc65de0).
-
-1. THE TITLE SILENCE — ROOT CAUSE CORRECTED BY MEASUREMENT. The entry's
-   busy-race hypothesis is FALSIFIED: 60 readonly opens at timeout=0
-   against the live dev store answered 0 busy failures, and a dissection
-   probe (run in the lane worktree against the real store) shows the
-   reader FINDS all three healed rows in session_v2 by exact id and READS
-   their real titles — then EATS them, one different filter arm each:
-   "How libyggterm apps embed + ship notebooks" in the question-opener arm
-   of looks_like_low_signal_generated_title, "/tmp/yggswarm prompt" in
-   looks_like_generated_fallback_title's raw-path arm
-   (compact.starts_with('/')), "Find metadata pane + title flow" in
-   looks_like_shell_command_copy ("find " is a listed shell verb). The v1
-   `session` tail is empty for all three (v2-only ids), so the loop ends
-   None and the stale cure title stands. THE STORE TITLE COLUMN IS
-   AUTHORED CONTENT: opencode names a session with the user's own first
-   prompt, so conversation-shape heuristics must not gate this read. THE
-   FIX (69e3d341): the reader rejects only the store's own placeholder
-   shapes (new session / new session - <ISO>) and opens through
-   open_cli_index_readonly anyway ([11.64] live-store reads wait, never
-   blink — the one real asymmetry the entry named, closed as hygiene).
-   Identity-safe regardless: the [11.202] membership belt, not the title
-   read, decides cure eligibility. The mimo and devin readers carry the
-   same latent filter class — unmeasured planes, left untouched per
-   campaign law. FALSIFIER (post-deploy): `server rows live` shows the
-   three healed rows (ses_fb820a4aaffenVRwTFHcP1E4WL, ses_fb294aa59ffeo…,
-   ses_f9dce8abeffe…) carrying their real store titles (chore re-titles
-   on its next pass), and the regression fixture +
-   reader-source-law lock ride the lane.
-
-2. THE REAP GAP — CLOSED BY USE, NOT BY CODE (the entry misdiagnosed).
-   The headless reap verb EXISTED all along: `server rows despawn <key>…`
-   ([11.74] ghost sweep) — tombstone-veto-first via
-   LiveRowTombstones::record_close, refuse-while-a-live-runtime-holds via
-   the daemon's despawn arm (a live pid refuses, close instead),
-   owning-daemon routing, both-binaries dispatch under lock tests. The
-   audit's rows list (live/show/drafts/departed) hid it from the filing
-   seat. MEASURED the same day: the four local:// corpses despanwned 4/4
-   (records removed + tombstoned, row_despawned trace), the legit holder
-   opencode-runtime://ses_f7e98830affeROSlZADurz7IOX untouched, and the
-   probe's identity_convergence ok line reads clean (was: "4 key-less
-   wearers … no reap verb on the headless surface yet" — that note was
-   the false signpost; bdc65de0 routes the line at the verb instead).
-
 ## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
