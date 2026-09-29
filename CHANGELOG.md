@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **The warm-mount redo can no longer double-mount the terminal host (the [11.178] race).**
+  When the warm-eval liveness gate fires, the redo-cold installer and a late-resuming warm mount
+  used to race the same host — last-writer-wins at registration could hand the host to the STALE
+  closure. Both mount invoke sites (warm and cold) now stamp a monotonic
+  `__yggtermMountAttempt` at invoke time and pass it into the mount body, which aborts a
+  superseded instance at entry / host-ready / pre-construct with a `stale_mount_attempt_abort`
+  debug instead of registering over the fresh mount (`TERMINAL_MOUNT_FN_VERSION` 1 → 2; the
+  first mount after this update reinstalls cold once, then warm resumes as before). The
+  companion idea from the same lane — widening the gate deadline 1.0 s → 2.5 s to sit "outside
+  the stall tail" — was tried in main and REVERTED the same day: the stall tail is
+  load-dependent (debug rig ~0.7 s quiet, >2.5 s loaded; live release under spawn churn ~2.9 s),
+  so the widened deadline made every gated spawn pay deadline+redo and regressed spawn-to-paint
+  from 2.0–2.3 s to 3.3–4.3 s. The 1.0 s gate + redo stays; the adaptive gate (web-process
+  liveness or a trivial-eval pipeline probe before the redo) is the entry's named next step.
+
 - **Closing the row you are looking at stops paying the 3-second teardown tax.**
   Closing the ACTIVE row cost 3111-3594 ms while an inactive row closed in
   469-612 ms — deterministic 5/5 at quiet floors — because every completion

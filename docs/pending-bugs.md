@@ -254,6 +254,38 @@ paths, `startup_terminal_restore_recover` x0, 0 rows left behind. Scope note: th
 gate arms on the WARM path only; a vanished COLD first mount (seen once in the rig) stays bounded
 by the [11.176] streak ladder.
 
+MEASURED-AND-PARTLY-FALSIFIED 2026-09-29 ~09:15-10:20 IST (lane/uxspeed/warmmount-gate-fix, zcode
+sess_9a200386 on jojo, work FROM dev; merged main 28c8dfec, revert tip = the lane):
+- The STALL DISTRIBUTION is now measured on three planes and it is LOAD-DEPENDENT, so the fix
+  direction's "deadline outside the stall tail" arm has NO constant answer: debug rig quiet
+  (fresh page, first spawn) ~0.7 s and the warm mount COMPLETES un-gated; debug rig under build
+  load (cli floor 123 ms, gui floor 211 ms) >2.5 s; LIVE RELEASE desktop under probe churn
+  (quiet 61 ms floors) ~2.9 s consistently (mount_begin->mount_open 2913/2982/2936/2933 ms,
+  4/4 iterations — the gap is exactly the 2.5 s deadline + the ~0.45 s redo parse+open).
+- The 2.5 s arm was TRIED IN MAIN (28c8dfec) and FALSIFIED by live A/B: uxprobe spawn on the
+  rotated jojo GUI, quiet floors, spawn_to_paint 4292/3609/3325/3329 ms (p50 3.3 s) vs the
+  2.0-2.3 s baselines at the 1.0 s gate — every gated spawn paid deadline+redo. REVERTED to
+  1.0 s (same lane, same day); 1.0 s + redo (~1.5 s total) remains the measured good path.
+- KEPT (merged in the same lane): the `__yggtermMountAttempt` invoke-stamp guard
+  (terminal_scripts.rs; TERMINAL_MOUNT_FN_VERSION 1->2): both invoke sites (warm + redo cold)
+  stamp a monotonic attempt counter AT INVOKE TIME and pass it as an argument; the body aborts
+  superseded instances at entry / host_ready / pre_construct (the last await before the
+  synchronous construct->register tail) with a `stale_mount_attempt_abort` debug instead of
+  registering its ownerToken over the fresh mount — the redo is now RACE-FREE against a
+  late-resuming warm mount (the double-mount class this entry filed). 0 aborts across both rig
+  runs + the live window: insurance for the race, no behavior change when no race occurs.
+  KNOWN LIMIT: the guard covers the parked-INSIDE-the-fn resume class (the evalwedge witness
+  chain); a warm eval whose statements have not STARTED when the gate fires runs whole and late
+  as the newest attempt — the task-side dispatch order is the only discriminator for that class,
+  unimplemented.
+- NAMED NEXT STEP (unowned, the surviving arm of the fix direction): make the gate ADAPTIVE
+  before redoing — web-process liveness, or a trivial-eval pipeline probe (answers => the mount
+  eval is lost, redo justified; silence => the page is stalled, keep waiting). The redo-into-
+  congestion waste the 2.5 s arm tried to avoid is real but must be bought adaptively, not with
+  a constant.
+- Rig artifacts: /tmp/warmmount-rig.sh (v3), scratch-home traces
+  /tmp/warmmount-home-*/ytrace.jsonl; live report /tmp/live-spawn-postfix.json.
+
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
 **Status:** OPEN
