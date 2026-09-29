@@ -1583,12 +1583,21 @@ dioxus.send(out);
             # already satisfied by front-seating — a satisfied drop no-ops by
             # design, so the driver would measure its own assumption, not the
             # product).
-            live_order = self.live_region_order()
-            pre_idx = {q: live_order.index(q) for q in paths if q in live_order}
-            if len(pre_idx) != len(paths):
+            live_idx: dict[str, int] = {}
+            _t1 = time.perf_counter()
+            while time.perf_counter() - _t1 < self.timeout_s:
+                live_order = self.live_region_order()
+                live_idx = {q: live_order.index(q) for q in paths
+                            if q in live_order}
+                if len(live_idx) == len(paths):
+                    break
+                time.sleep(0.3)
+            if len(live_idx) != len(paths):
                 acc.append("pre-gesture live region missing paths: %s"
-                           % [q for q in paths if q not in pre_idx])
-            pre_list = sorted(paths, key=lambda q: pre_idx[q])
+                           % [q for q in paths if q not in live_idx])
+                out["iterations"].append({"accuracy_failures": acc})
+                continue
+            pre_list = sorted(paths, key=lambda q: live_idx[q])
             set_drawn = [q for q in pre_list if q in (a_path, b_path, c_path)]
             rest = [q for q in pre_list if q not in (a_path, b_path, c_path)]
             d_i = rest.index(d_path)
