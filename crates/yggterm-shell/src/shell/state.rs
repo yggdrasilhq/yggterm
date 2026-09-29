@@ -16574,7 +16574,7 @@ fn declared_web_surface_open_or_refusal(
 /// the sibling for the `sidebar` verb, feeding the SAME applier the live path
 /// uses so the two cannot mean different things.
 async fn rebuild_sidebar_contribution_from_daemon_declare(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     trace_home: PathBuf,
     session_path: &str,
     ssh_target: Option<String>,
@@ -16606,10 +16606,7 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
             }
         };
     let now_ms = current_millis();
-    let Some(record) = declares
-        .into_iter()
-        .find(|record| record.verb == "sidebar" && record.action == "declare")
-    else {
+    let Some(record) = declares.into_iter().find(|record| record.verb == "sidebar") else {
         // Reached the owner and it genuinely holds no sidebar declare — a
         // different answer from the error above, and traced as such so the two
         // can never again look identical from the outside.
@@ -16622,6 +16619,29 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
         );
         return false;
     };
+    if record.action == "close" {
+        // [11.186] The daemon retains the app's close as the sidebar verb's
+        // current state precisely so THIS poll can deliver it: a client whose
+        // live xterm host never saw the close bytes (host unmounted at the
+        // emission instant, or a cursor-0 seed that windowed the
+        // protocol-only chunk out) used to paint the chooser pane over the
+        // mounted surface forever. Retire through the SAME owner the live
+        // close arm uses, and trace the close under the live arm's own
+        // category/name with the plane named — a close-audit grep must see
+        // both deliveries.
+        state.with_mut_counted(|shell| shell.retire_sidebar_contribution(session_path));
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "sidebar_contribution",
+            "close",
+            json!({
+                "session_path": session_path,
+                "via": "daemon_declare_rebuild",
+            }),
+        );
+        return false;
+    }
     // Decoded by the SAME parser the live OSC path uses — see
     // `parse_terminal_js_event`.
     //
@@ -24008,6 +24028,38 @@ impl ShellState {
         // (session switch, a surface reopening), and the pane must come back for
         // free when it is. Only EXPIRY — no declare for a full window while we
         // were listening — means the app is actually gone.
+    }
+
+    /// The ONE owner of "an app retired its sidebar contribution": both the
+    /// live OSC close arm ([`crate::shell::viewport`], `SidebarContribution`
+    /// action `close`) and the daemon-declare rebuild (a retained close
+    /// record — [11.186]) land here, so the two planes cannot grow two
+    /// meanings of "the app closed". Clears the document panes of the closed
+    /// session and hands the right panel back when the closed session is the
+    /// active one. The caller owns the trace row.
+    fn retire_sidebar_contribution(&mut self, session_path: &str) {
+        self.close_sidebar_contribution(session_path);
+        // The app that served the pane is gone; stop painting a schema no
+        // control endpoint backs. Only when the CLOSED session is the active
+        // one — a background app's exit must not reach across and clobber the
+        // rail (or the base) of whatever the user is looking at.
+        let closed_is_active = self.server.active_session_path() == Some(session_path);
+        if closed_is_active && matches!(self.right_panel_mode, RightPanelMode::AppPane(_)) {
+            // Hand the panel back to the user's remembered base, not to an
+            // unconditional Hidden.
+            self.close_app_pane();
+        }
+        if closed_is_active {
+            self.app_pane_schema = None;
+            self.app_pane_values.clear();
+            self.app_pane_error = None;
+        }
+        // The document surface is the same app's tenant in the viewport.
+        self.clear_document_panes_for_session(session_path);
+        // The app retired: a NEW instance in this session earns a fresh rail
+        // auto-open. (The once-guard exists to respect a USER-closed rail
+        // against heartbeats, not to outlive the app.)
+        self.document_rail_auto_opened.remove(session_path);
     }
     /// The one session whose OSC reads are live right now (active, visible,
     /// terminal view). Only ITS `last_seen_ms` is a trustworthy liveness

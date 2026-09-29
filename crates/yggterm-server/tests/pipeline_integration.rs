@@ -918,6 +918,70 @@ fn a_consumed_web_surface_open_never_replays_verbatim_on_attach() {
     );
 }
 
+// ---- [11.186] the sidebar close must SURVIVE the pipeline ----------------------
+// The chooser retired (`sidebar;close`), the record lands on `close`, and a
+// fresh client's cursor-0 attach seed must carry BOTH halves of the truth:
+// the consumed declare neutralized to `defunct` (never a flash-mount of a
+// pane the daemon knows is retired) and the close bytes verbatim (a faithful
+// transcript). The RETAINED close record is what the daemon-declare rebuild
+// poll delivers to clients whose live xterm host never saw the bytes — that
+// retention is the fix, so it is what this test pins.
+#[test]
+fn a_sidebar_close_is_retained_and_its_declare_neutralizes_on_replay() {
+    use yggterm_server::app_declare::{SIDEBAR_DECLARE_SEQUENCE, SIDEBAR_DEFUNCT_SEQUENCE};
+
+    fn sidebar_record_action(mgr: &TerminalManager, key: &str) -> Option<String> {
+        mgr.session_app_declares(key)?
+            .into_iter()
+            .find(|record| record.verb == "sidebar")
+            .map(|record| record.action)
+    }
+
+    let mut mgr = TerminalManager::new();
+    let key = "test://sidebar-close-replay";
+    mgr.ensure_session(key, &launch("--scenario sidebar-declare --hold-ms 30000"), None)
+        .expect("ensure_session");
+    wait_for_text(&mgr, key, "MOCK_SIDEBAR_READY", Duration::from_secs(5));
+
+    // Still choosing: the record is on `declare`, the seed serves it verbatim
+    // (a re-attached client must see the live chooser).
+    assert_eq!(sidebar_record_action(&mgr, key).as_deref(), Some("declare"));
+    let first = read_from_zero(&mgr, key);
+    assert!(
+        first.contains(SIDEBAR_DECLARE_SEQUENCE),
+        "with the record on declare, the attach seed keeps the declare verbatim"
+    );
+
+    // The choice lands: the app closes its contribution.
+    mgr.write(key, "c\r").expect("trigger close");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if sidebar_record_action(&mgr, key).as_deref() == Some("close") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        sidebar_record_action(&mgr, key).as_deref(),
+        Some("close"),
+        "THE HOLE: a sidebar close was not retained — the retirement is inexpressible"
+    );
+
+    let attach = read_from_zero(&mgr, key);
+    assert!(
+        !attach.contains(SIDEBAR_DECLARE_SEQUENCE),
+        "the consumed declare must not replay verbatim once the record is on close"
+    );
+    assert!(
+        attach.contains(SIDEBAR_DEFUNCT_SEQUENCE),
+        "the consumed declare must serve neutralized as defunct"
+    );
+    assert!(
+        attach.contains("\x1b]7717;sidebar;close;"),
+        "the close bytes stay a faithful part of the replayed transcript"
+    );
+}
+
 // ---- NativeAnnounce (11.6.11, wave-1 seat B) -----------------------------------
 // ⚠ LOCK — the first-party emitter's frame must survive the REAL pipeline:
 // PTY bytes → reader thread → AppDeclareScanner → retained record → the
