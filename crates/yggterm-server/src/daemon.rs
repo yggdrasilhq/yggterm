@@ -11853,9 +11853,11 @@ impl DaemonRuntime {
     /// THE [11.213] background ask worker, one per path at a time (the
     /// resize forward's in-flight pattern). Peer CLI-store ask first —
     /// DEFINITIVE when it answers; the start-born class (whose absence the
-    /// store must refuse) falls to the strict alive verb. Alive answers
-    /// vouch for the session's life here; transport errors only set the
-    /// short backoff, never a verdict.
+    /// store must refuse) falls to the strict alive verb, and since the
+    /// [11.165] completion a store answer WITHOUT the definitive word
+    /// (the fail-open shape) falls to that same alive verb — a fail-open
+    /// answer vouches nothing. Alive answers vouch for the session's life
+    /// here; transport errors only set the short backoff, never a verdict.
     fn spawn_remount_peer_liveness_ask(&self, path: &str) {
         {
             let mut pending = self
@@ -11943,20 +11945,53 @@ impl DaemonRuntime {
                          minting kinds; the strict alive verb decides"
                     ))
                 } else {
-                    crate::fetch_remote_saved_agent_session_exists(
+                    // THE [11.165] COMPLETION: the store ask is THREE-VALUED
+                    // now. A definitive miss is the confident word (the
+                    // peer's store survives its daemon's rolls — the
+                    // [11.155] close shape); a definitive hit vouches; and
+                    // the fail-open shape — an unreadable store, a kind
+                    // with no verb, a peer too old to carry the definitive
+                    // bit — is Unknowable, which vouches NOTHING: it falls
+                    // through to the strict alive verb below, exactly like
+                    // the start-born class. (Until this landed the fail-open
+                    // `exists:true` VOUCHED, and the vouched set is never
+                    // re-asked — one fail-open silenced this gate for the
+                    // row's lifetime; measured live on the stillborn-resume
+                    // corpse class.)
+                    crate::fetch_remote_saved_agent_session_exists_definitive(
                         kind,
                         &machine.ssh_target,
                         machine.prefix.as_deref(),
                         &session_id,
                     )
-                    .map(|exists| !exists)
                     .map_err(|error| {
                         anyhow::anyhow!("peer existence ask failed: {error:#}")
                     })
                 };
                 match store_answer {
-                    Ok(true) => finish(false, Some(RemountPeerGoneEvidence::PeerStoreGone)),
-                    Ok(false) => finish(true, None),
+                    Ok(crate::RemoteSavedSessionStoreAnswer::DefinitiveMissing) => {
+                        finish(false, Some(RemountPeerGoneEvidence::PeerStoreGone))
+                    }
+                    Ok(crate::RemoteSavedSessionStoreAnswer::DefinitiveExists) => {
+                        finish(true, None)
+                    }
+                    Ok(crate::RemoteSavedSessionStoreAnswer::Unknowable) => {
+                        // THE [11.165] COMPLETION fall-through: the store
+                        // proved neither life nor death, so the strict alive
+                        // verb decides — alive-gone REFUSES healable (the
+                        // spend arm tears the refused runtime down), never
+                        // the close: no birth-rewrite hazard.
+                        let alive_answer = crate::remote_agent_session_runtime_alive(
+                            &machine, &session_id, kind,
+                        );
+                        match alive_answer {
+                            Ok(false) => {
+                                finish(false, Some(RemountPeerGoneEvidence::AliveAskGone))
+                            }
+                            Ok(true) => finish(true, None),
+                            Err(_alive_error) => finish(false, None),
+                        }
+                    }
                     Err(_store_error) => {
                         if !start_born {
                             // Transport trouble is not evidence; back off and
@@ -32653,6 +32688,37 @@ mod tests {
         assert!(
             resume_arm.contains("fetch_remote_saved_agent_session_exists"),
             "the resume class keeps the cheap store-first ask"
+        );
+        // THE [11.165] COMPLETION (the stillborn-resume half of the same
+        // falsifier: one fail-open `exists:true` vouched the corpse and the
+        // vouched set is never re-asked). The store arm is THREE-VALUED: a
+        // definitive miss keeps the [11.155] close, a definitive hit
+        // vouches, and the Unknowable arm — the fail-open shape — must ask
+        // the strict alive verb and can neither vouch nor close on its own.
+        let unknowable_arm = worker
+            .split("Ok(crate::RemoteSavedSessionStoreAnswer::Unknowable)")
+            .nth(1)
+            .expect("the unknowable fall-through arm exists")
+            .split("Err(_store_error)")
+            .next()
+            .expect("the unknowable arm ends at the transport arm");
+        assert!(
+            unknowable_arm.contains("remote_agent_session_runtime_alive"),
+            "the fail-open shape falls through to the strict alive verb"
+        );
+        assert!(
+            !unknowable_arm.contains("PeerStoreGone"),
+            "an unknowable store answer never closes — the alive verb's NO \
+             is the healable refusal, never the close"
+        );
+        assert!(
+            unknowable_arm.contains("finish(true, None)"),
+            "an alive answer still vouches — but only after the ask"
+        );
+        let resume_map = resume_arm;
+        assert!(
+            resume_map.contains("fetch_remote_saved_agent_session_exists_definitive"),
+            "the resume class reads the THREE-VALUED answer, not the bool"
         );
     }
 

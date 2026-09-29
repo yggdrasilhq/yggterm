@@ -1176,6 +1176,270 @@ def scenario_startborn_remote_corpse():
         shutil.rmtree(session_cwd, ignore_errors=True)
 
 
+def scenario_stillborn_resume_corpse():
+    """THE [11.165] COMPLETION FALSIFIER — the stillborn-RESUME subclass
+    (born from a store-absent resume, NOT start-born) used to vouch itself
+    alive on the fail-open store answer, and the vouched set is never
+    re-asked, so ONE fail-open silenced the [11.213] gate for the row's
+    lifetime (measured live on d755bfd0: 5x bootstrap_reset, 14x
+    resize_failed, 4x ghost_frame while the gate slept). The cure: the
+    peer's session-exists verb answers THREE-VALUED and the worker falls
+    through to the strict alive verb on the fail-open shape — while a
+    DEFINITIVE store miss is the confident word that CLOSES the row (the
+    [11.155] shape). This scenario births the corpse the cheap way (the
+    stored-session open on a store-absent id), re-mounts twice, and asserts
+    the full close chain: verdict instrument peer_store_gone, the
+    remote_reuse_closed_peer_dead_remount spend, the row leaving the live
+    set, and no daemon_owned_fast_ready ever blessing the corpse."""
+    sc = Scenario("stillborn_resume_corpse_closes_11165")
+    this_host = os.uname().nodename
+    peer = None
+    for candidate in ("oc", "dev", "jojo", "practice"):
+        if candidate == this_host:
+            continue
+        capable = ssh_run(
+            candidate,
+            f"test -x {PEER_YGGTERM} && command -v agy >/dev/null",
+            timeout=20,
+        )
+        if capable.returncode == 0:
+            peer = candidate
+            break
+    if not peer:
+        sc.evidence = (
+            "no peer machine with yggterm + agy reachable — a cross-machine "
+            "corpse needs one; nothing was born"
+        )
+        return sc
+
+    session_uuid = f"11165-{uuid.uuid4()}"
+    key = f"remote-agy://{peer}/{session_uuid}"
+    kill_offset = YTRACE.stat().st_size if YTRACE.exists() else 0
+    wrapper_pid = None
+    daemon_at_birth = None
+    try:
+        # 1. THE BIRTH — the stored-session open (`server connect`) on a
+        # store-absent id: the daemon-plane birth whose launch action is a
+        # RESUME (the peer compose is `resume-agy <id> <cwd>
+        # --require-existing`). Measured 2026-09-29 (the red experiment,
+        # uuid 11165rb-a05d0028 on the pre-fix daemon): the peer's
+        # [11.165] gate is fail-open so the resume proceeds, the ladder
+        # finds no candidate, the wrapper hangs in the store-bind wait —
+        # childless-alive — and the daemon holds the row with the
+        # store-absent id. That hung wrapper IS the corpse's still_running
+        # truth; no pump freeze is needed.
+        answer = yggterm(["connect", key], timeout=120)
+        if key not in (answer.stdout + answer.stderr):
+            return sc.fail(
+                f"the connect birth did not name the row: "
+                f"{json.dumps(answer)[:200]}"
+            )
+        time.sleep(5)
+
+        def stillborn_shape():
+            """The wrapper alive + childless + the runtime dead — the corpse
+            shape the reuse arm needs. Returns (wrapper_pid, error)."""
+            wrapper_answer = ssh_run(
+                peer, f"pgrep -f 'resume-agy {session_uuid}' | head -1", timeout=20
+            )
+            try:
+                pid = int(wrapper_answer.stdout.strip().split()[0])
+            except (ValueError, IndexError):
+                return None, (
+                    "the peer wrapper is gone — the stillborn shape is not "
+                    f"held right now; search: {wrapper_answer.stdout!r}"
+                )
+            children = ssh_run(peer, f"pgrep -P {pid} 2>/dev/null", timeout=20)
+            if children.stdout.strip():
+                return None, (
+                    f"the [11.183] ladder re-pointed the birth onto a live "
+                    f"peer conversation (wrapper {pid} holds children "
+                    f"{children.stdout.strip().splitlines()[:2]!r}) — the row "
+                    "is a healthy resume the store genuinely holds, not a "
+                    "stillborn corpse; nothing was falsified this run"
+                )
+            return pid, None
+
+        # 2. THE STILLBORN SHAPE, verified the moment it holds. The bind
+        # wait is nondeterministic (measured: it can expire well inside a
+        # minute), and once the wrapper exits the next mount takes the
+        # RESTART arm — the reuse arm and its [11.213] gate never run. So
+        # the falsifier waits out the birth, remounts INSIDE the alive
+        # window, and if a mount still took the restart arm it re-verifies
+        # the shape (a restart re-hangs a fresh wrapper — the corpse
+        # re-forms) and remounts again.
+        wrapper_pid = None
+        for _ in range(10):
+            wrapper_pid, shape_error = stillborn_shape()
+            if wrapper_pid is not None:
+                break
+            if "re-pointed" in (shape_error or ""):
+                sc.evidence = shape_error
+                return sc
+            time.sleep(3)
+        if wrapper_pid is None:
+            return sc.fail(
+                f"the stillborn shape never held after the birth: {shape_error}"
+            )
+        alive = peer_runtime_alive(peer, session_uuid)
+        if alive is not False:
+            return sc.fail(
+                f"the stillborn shape did not form: the peer ({peer}) answers "
+                f"agent-runtime-alive = {alive!r} (want False) — the runtime "
+                "lives, so no store word could close it honestly"
+            )
+        daemon_at_birth = daemon_identity()
+        # 3. THE RE-MOUNTS — the reuse arm pays the [11.213] gate; the
+        # resume class keeps the store-first ask, and THE THREE-VALUED
+        # ANSWER DECIDES: a definitive miss is the [11.155] confident NO.
+        verdict = None
+        for attempt in range(6):
+            yggterm(["connect", key], timeout=60)
+
+            def verdict_for_row():
+                payloads = [
+                    p
+                    for p in trace_payloads(
+                        "remount_peer_liveness_verdict", kill_offset
+                    )
+                    if p.get("path") == key
+                ]
+                return (payloads[-1], "") if payloads else (None, "")
+
+            verdict = poll_until(verdict_for_row, deadline_s=60, interval_s=4.0)[0]
+            if verdict is not None:
+                break
+            # No verdict: this mount most likely took the restart arm (the
+            # bind wait expired mid-attempt). The restart re-hangs a fresh
+            # wrapper — re-verify the corpse and mount again.
+            wrapper_pid, shape_error = stillborn_shape()
+            if wrapper_pid is None:
+                if "re-pointed" in (shape_error or ""):
+                    sc.evidence = shape_error
+                    return sc
+                time.sleep(5)
+        if verdict is None:
+            return sc.fail(
+                f"no remount ever took the reuse arm for {key} (no "
+                "remount_peer_liveness_verdict across 6 mounts) — the "
+                "stillborn shape kept dissolving into restart-arm spawns or "
+                "the worker's ask never landed"
+            )
+        instrument = verdict.get("instrument")
+        if instrument != "peer_store_gone":
+            if verdict.get("vouched") and instrument is None:
+                return sc.fail(
+                    "THE FAILOPEN DISEASE (the red shape, on record: the "
+                    "store-failopen falsifier run on d755bfd0 and the 11165 "
+                    "red experiment, uuid 11165rb-a05d0028): the worker "
+                    "answered vouched=true from the fail-open store answer — "
+                    "the peer answered without the definitive bit (old peer "
+                    "binary?) or the three-valued fetch is not live on this "
+                    "daemon"
+                )
+            return sc.fail(
+                f"the store ask answered instrument={instrument!r} (want "
+                "peer_store_gone, the definitive miss). alive_ask_gone means "
+                "the peer binary predates the definitive bit — redeploy the "
+                "fleet and rerun"
+            )
+        # 4. THE SPEND — one more reuse-window mount: the gate spends the
+        # landed verdict as the CLOSE (tombstone + departure), not the
+        # healable refusal — a definitive store absence is the confident
+        # word, and the recovery door must have nothing to re-mount.
+        spent = False
+        refusal_named = False
+        combined = ""
+        for _ in range(3):
+            answer = yggterm(["connect", key], timeout=60)
+            combined = (answer.stdout + answer.stderr).strip()
+            spent = any(
+                p.get("path") == key
+                for p in trace_payloads(
+                    "remote_reuse_closed_peer_dead_remount", kill_offset
+                )
+            )
+            refusal_named = "peer session gone" in combined
+            if spent or refusal_named:
+                break
+            wrapper_pid, _shape_error = stillborn_shape()
+            if wrapper_pid is None:
+                time.sleep(5)
+        if not (spent or refusal_named):
+            return sc.fail(
+                "the landed verdict was never spent: neither "
+                f"remote_reuse_closed_peer_dead_remount nor the named "
+                f"refusal across 3 mounts (last rc={answer.returncode} "
+                f"out={answer.stdout[:120]!r} err={answer.stderr[:160]!r})"
+            )
+        # 5. THE CLOSE — the row leaves the daemon's live set.
+        row_gone_deadline = time.monotonic() + 15
+        while time.monotonic() < row_gone_deadline:
+            listing = yggterm(["connect", "--list"], timeout=60).stdout
+            if key not in listing:
+                break
+            time.sleep(1.0)
+        row_still_held = key in yggterm(["connect", "--list"], timeout=60).stdout
+        # 6. THE NEGATIVE — no daemon-owned fast-ready may bless the corpse
+        # after the birth (the disease's paint: retained bytes read as a live
+        # birth's first meaningful output).
+        fast_ready = [
+            p
+            for p in trace_payloads(
+                "daemon_owned_fast_ready_on_first_meaningful_output", kill_offset
+            )
+            if key in json.dumps(p)
+        ]
+        rotated = daemon_identity() != daemon_at_birth
+        if rotated:
+            return sc.fail(
+                "INVALID RUN: the daemon rotated mid-scenario (the verdict "
+                "and the spend landed in different daemons) — rerun on a "
+                "settled daemon"
+            )
+        problems = []
+        if fast_ready:
+            problems.append(
+                f"daemon_owned_fast_ready_on_first_meaningful_output fired "
+                f"for the corpse {len(fast_ready)}x"
+            )
+        if row_still_held:
+            problems.append(
+                "the daemon still holds the closed row 15s after the spend "
+                "(the close did not complete)"
+            )
+        if problems:
+            return sc.fail("; ".join(problems))
+        return sc.ok(
+            f"stillborn-resume corpse on {peer}: mount 1 verdict "
+            "peer_store_gone (the definitive store word — no fail-open "
+            f"vouch), mount 2 spent it as the CLOSE "
+            f"({'trace fired' if spent else 'refusal named'}"
+            f"{'; trace+refusal' if spent and refusal_named else ''}), the "
+            "row left the live set, no fast-ready"
+        )
+    finally:
+        # REAP — the row on this daemon (a spent close already removed it;
+        # both calls are idempotent), the tombstone record's peer twin, EVERY
+        # hung wrapper the restart-arm churn may have stacked, any peer
+        # runtime row.
+        yggterm(["remove", key], timeout=60)
+        yggterm(["rows", "despawn", key], timeout=60)
+        ssh_run(
+            peer,
+            f"pkill -9 -f 'resume-agy {session_uuid}' 2>/dev/null; true",
+            timeout=20,
+        )
+        ssh_run(
+            peer,
+            f"{PEER_YGGTERM} server remove agy-runtime://{session_uuid} "
+            f"2>/dev/null; "
+            f"{PEER_YGGTERM} server rows despawn "
+            f"agy-runtime://{session_uuid} 2>/dev/null",
+            timeout=60,
+        )
+
+
 SCENARIOS = [
     scenario_preflight,
     scenario_fresh_start,
@@ -1184,6 +1448,7 @@ SCENARIOS = [
     scenario_store_absent_refuses,
     scenario_defmiss_fresh_start_mint,
     scenario_startborn_remote_corpse,
+    scenario_stillborn_resume_corpse,
 ]
 
 

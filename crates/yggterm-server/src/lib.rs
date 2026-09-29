@@ -17798,6 +17798,14 @@ fn remote_saved_cc_session_exists(session_id: &str) -> anyhow::Result<bool> {
 struct RemoteSavedCodexSessionExistsResponse {
     session_id: String,
     exists: bool,
+    // THE [11.165] COMPLETION: `true` only when `exists` is the store's own
+    // definitive word rather than the deliberate fail-open. Peers older than
+    // this field omit it, which deserializes as `false` — the safe reading,
+    // because the only consumer that reads it (the [11.213] remount
+    // liveness worker) treats a non-definitive answer as proof of nothing
+    // and falls through to the strict alive verb.
+    #[serde(default)]
+    definitive: bool,
 }
 
 // Removed 2026-06-05: all external-multiplexer adapters (tmux/screen session
@@ -19860,6 +19868,83 @@ mod restored_runtime_repair_tests {
         assert!(stripped.contains("is no longer available on this machine"));
     }
 
+    #[test]
+    fn the_remote_store_answer_parses_three_valued_and_old_shapes_are_unknowable() {
+        // THE [11.165] COMPLETION: the wire answer is three-valued. An old
+        // peer (no `definitive` field) and an explicit fail-open answer both
+        // parse as Unknowable — the reading that vouches nothing and kills
+        // nothing; only the store's own word decides.
+        let old_peer =
+            parse_remote_saved_session_store_answer(r#"{"session_id":"x","exists":true}"#)
+                .expect("old shape parses");
+        assert_eq!(
+            old_peer,
+            RemoteSavedSessionStoreAnswer::Unknowable,
+            "a peer without the definitive bit proves nothing"
+        );
+        let fail_open = parse_remote_saved_session_store_answer(
+            r#"{"session_id":"x","exists":true,"definitive":false}"#,
+        )
+        .expect("fail-open shape parses");
+        assert_eq!(
+            fail_open,
+            RemoteSavedSessionStoreAnswer::Unknowable,
+            "an explicit fail-open exists proves nothing"
+        );
+        assert_eq!(
+            parse_remote_saved_session_store_answer(
+                r#"{"session_id":"x","exists":false,"definitive":true}"#
+            )
+            .expect("definitive miss parses"),
+            RemoteSavedSessionStoreAnswer::DefinitiveMissing,
+            "the store's confident NO is the close shape"
+        );
+        assert_eq!(
+            parse_remote_saved_session_store_answer(
+                r#"{"session_id":"x","exists":true,"definitive":true}"#
+            )
+            .expect("definitive hit parses"),
+            RemoteSavedSessionStoreAnswer::DefinitiveExists,
+            "the store's confident YES vouches"
+        );
+    }
+
+    #[test]
+    fn the_definitive_bit_is_annotation_only_and_rides_the_wire_verb() {
+        // THE [11.165] COMPLETION, pinned: the shared bool predicate keeps
+        // its fail-open semantics (its own source-scan above pins the agy
+        // arm), the verb handler rides the definitive bit ALONGSIDE the
+        // unchanged bool, and the legacy bool fetch keeps its own inline
+        // parse — only the definitive twin reads the three-valued shape.
+        let source = include_str!("lib.rs");
+        let verb = source_body_after(source, "pub fn run_remote_saved_agent_session_exists(");
+        assert!(
+            verb.contains("exists: remote_saved_agent_session_exists(kind, session_id,")
+                && verb.contains(
+                    "definitive: remote_saved_agent_session_answer_is_definitive(kind, session_id)"
+                ),
+            "the verb answers exists AND definitive, the bool unchanged"
+        );
+        // This test's own source names the anchor below, and
+        // include_str! sees this file — the definition is the SECOND
+        // occurrence, so slice after that one, bounded at the next fn.
+        let rest = source
+            .split("pub(crate) fn fetch_remote_saved_agent_session_exists(")
+            .nth(2)
+            .expect("the legacy fetch definition is the second occurrence");
+        let bool_fetch = &rest[..rest
+            .find("\nfn ")
+            .expect("the legacy fetch is not the last fn")];
+        assert!(
+            bool_fetch.contains("Ok(response.exists)"),
+            "the legacy fetch keeps its fail-open bool semantics"
+        );
+        assert!(
+            !bool_fetch.contains("parse_remote_saved_session_store_answer"),
+            "the legacy fetch never reads the definitive bit"
+        );
+    }
+
     /// ⛔ BUG B2 SELF-RECOVERY GATE (owner-caught 2026-09-02, "sessions opened
     /// in the ether"): the wait may end the HOLDERS only when every holder is
     /// provably yggterm's own AND orphaned to init. An external holder (a
@@ -21368,6 +21453,64 @@ pub(crate) fn fetch_remote_saved_agent_session_exists(
     let response: RemoteSavedCodexSessionExistsResponse =
         serde_json::from_str(&output).context("invalid remote saved-session response")?;
     Ok(response.exists)
+}
+
+/// The three-valued word the peer's saved-session ask can carry — THE [11.165]
+/// COMPLETION of the [11.213] remount liveness worker's store arm. The
+/// fail-open shape ("exists" without the store's definitive word) is its own
+/// answer: it proves neither life nor death, so the worker falls through to
+/// the strict alive verb instead of vouching from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteSavedSessionStoreAnswer {
+    /// The store was consulted and holds the id.
+    DefinitiveExists,
+    /// The store was consulted and does NOT hold the id — the confident word
+    /// (the [11.155] close shape, the peer's store survives its daemon's
+    /// rolls).
+    DefinitiveMissing,
+    /// The store cannot answer here: no verb for this kind, a fail-open
+    /// Antigravity read, an unreadable store, or a peer too old to carry the
+    /// definitive bit. Vouches nothing, kills nothing.
+    Unknowable,
+}
+
+fn parse_remote_saved_session_store_answer(
+    output: &str,
+) -> anyhow::Result<RemoteSavedSessionStoreAnswer> {
+    let response: RemoteSavedCodexSessionExistsResponse =
+        serde_json::from_str(output).context("invalid remote saved-session response")?;
+    if !response.definitive {
+        return Ok(RemoteSavedSessionStoreAnswer::Unknowable);
+    }
+    if response.exists {
+        Ok(RemoteSavedSessionStoreAnswer::DefinitiveExists)
+    } else {
+        Ok(RemoteSavedSessionStoreAnswer::DefinitiveMissing)
+    }
+}
+
+/// The definitive twin of [`fetch_remote_saved_agent_session_exists`], for
+/// the one consumer allowed to act on the store's confident word: the [11.213]
+/// remount liveness worker. The bool fetch above keeps its fail-open
+/// semantics for every other caller (the sweep retraction arm reads it).
+pub(crate) fn fetch_remote_saved_agent_session_exists_definitive(
+    kind: SessionKind,
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<RemoteSavedSessionStoreAnswer> {
+    // ⛔ NO VERB, NO VERDICT — and here, no vouch either. The worker falls
+    // through to the strict alive verb, which is kind-independent.
+    let Some(verb) = remote_session_exists_verb(kind) else {
+        return Ok(RemoteSavedSessionStoreAnswer::Unknowable);
+    };
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", verb.as_str(), session_id],
+        None,
+    )?;
+    parse_remote_saved_session_store_answer(&output)
 }
 
 pub fn apply_remote_preview_payload_for_path(
@@ -25214,6 +25357,9 @@ pub fn run_remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result
     let response = RemoteSavedCodexSessionExistsResponse {
         session_id: session_id.to_string(),
         exists: remote_saved_codex_session_exists(session_id)?,
+        // The codex reader is the store's own word whenever it answers Ok;
+        // its Err is a transport error no consumer may interpret.
+        definitive: true,
     };
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
@@ -26040,6 +26186,13 @@ fn remote_agent_launch_options_from_environment() -> AgentLaunchOptions {
 
 /// `<slug>-session-exists` for every CLI — the descriptor-driven store lookup,
 /// answering in the same JSON shape the codex verb has always used.
+///
+/// THE [11.165] COMPLETION: the answer now carries `definitive`, the store's
+/// own word about whether `exists` is evidence rather than the deliberate
+/// fail-open. The `exists` bit keeps its historical semantics for every
+/// existing consumer; only the [11.213] remount liveness worker reads the
+/// definitive bit, and its fail-open fall-through refuses healable and never
+/// closes — the birth composition and the rebind rebuild vouch are untouched.
 pub fn run_remote_saved_agent_session_exists(
     kind: SessionKind,
     session_id: &str,
@@ -26047,9 +26200,35 @@ pub fn run_remote_saved_agent_session_exists(
     let response = RemoteSavedCodexSessionExistsResponse {
         session_id: session_id.to_string(),
         exists: remote_saved_agent_session_exists(kind, session_id, &RemoteCodexStoreEnv::from_process())?,
+        definitive: remote_saved_agent_session_answer_is_definitive(kind, session_id),
     };
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
+}
+
+/// Does this host's store answer the saved-session ask DEFINITIVELY for
+/// `kind` — i.e. is the bool [`remote_saved_agent_session_exists`] returns the
+/// store's own word rather than the deliberate fail-open? THE [11.165]
+/// COMPLETION, peer side.
+///
+/// ⛔ This is a one-bit annotation, not a new store read for codex and Claude
+/// Code: their readers are definitive whenever they answer `Ok`, and their
+/// `Err` is a transport error the worker's backoff already refuses to
+/// interpret. Antigravity is the only kind whose `Ok` can be a fail-open: its
+/// db read is three-valued already (the same read the [11.190] fresh-start
+/// compose is premised on), so `Some(_)` is the store's word and `None` — an
+/// unreadable or absent store — stays fail-open.
+fn remote_saved_agent_session_answer_is_definitive(
+    kind: SessionKind,
+    session_id: &str,
+) -> bool {
+    match kind {
+        SessionKind::ClaudeCode | SessionKind::Codex | SessionKind::CodexLiteLlm => true,
+        SessionKind::Antigravity => {
+            antigravity_local_db_holds_conversation(session_id).is_some()
+        }
+        _ => false,
+    }
 }
 
 /// Claude Code twin of [`run_remote_start_codex`].
