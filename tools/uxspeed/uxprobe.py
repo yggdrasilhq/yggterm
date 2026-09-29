@@ -45,8 +45,9 @@ Actions:
            close-all closes ALL live sessions, so on any real desktop the
            probe refuses it and says so (blast-radius law).
 
-  resize — the felt window resize: drive the WM (wmctrl _NET_MOVERESIZE)
-           to resize the yggterm window, join the trace pair
+  resize — the felt window resize: drive the app's OWN window verbs
+           (`server app resize-window`, paced past the 150 ms begin-marker
+           throttle), join the trace pair
            window/resized (native commit) -> xterm_resize (grid applied,
            reason=resize, THIS session) -> xterm_paint/resize_repaint
            (paint at the new grid; instrument on builds carrying the
@@ -2648,92 +2649,6 @@ dioxus.send(out);
 
     # ---- resize ----------------------------------------------------------
 
-    _RESIZE_WM_CLASSES = ("yggterm", "breezed")
-
-    def _yggterm_window(self) -> dict | None:
-        """The main yggterm/breezed window via wmctrl -lxG, largest area
-        wins (the GUI may own several). None when wmctrl is missing or no
-        window matches — the resize action reports an honest refusal."""
-        try:
-            out = subprocess.run(["wmctrl", "-lxG"], capture_output=True,
-                                 text=True, timeout=5).stdout
-        except Exception:
-            return None
-        best = None
-        for line in out.splitlines():
-            parts = line.split(None, 10)
-            # did desk x y w h cls host title…  (wmctrl -lxG column order)
-            if len(parts) < 8:
-                continue
-            try:
-                x, y, w, h = (int(parts[2]), int(parts[3]),
-                              int(parts[4]), int(parts[5]))
-            except ValueError:
-                continue
-            cls = parts[6]
-            if not any(c in cls.lower() for c in self._RESIZE_WM_CLASSES):
-                continue
-            if best is None or w * h > best["area"]:
-                best = {"cls": cls, "x": x, "y": y, "w": w, "h": h,
-                        "area": w * h}
-        return best
-
-    def _wm_resize(self, cls: str, w: int, h: int) -> bool:
-        try:
-            r = subprocess.run(
-                ["wmctrl", "-x", "-r", cls, "-e", "0,-1,-1,%d,%d" % (w, h)],
-                capture_output=True, text=True, timeout=5)
-            return r.returncode == 0
-        except Exception:
-            return False
-
-    def _wm_read_maximized(self, cls: str) -> bool:
-        """True when the matching window carries both maximized state
-        atoms (xprop); False when xprop is missing or the state is unset —
-        the drive then works directly."""
-        try:
-            out = subprocess.run(["wmctrl", "-lxG"], capture_output=True,
-                                 text=True, timeout=5).stdout
-        except Exception:
-            return False
-        wid = None
-        for line in out.splitlines():
-            parts = line.split(None, 10)
-            if len(parts) < 8:
-                continue
-            cls_field = parts[6]
-            if any(c in cls_field.lower()
-                   for c in self._RESIZE_WM_CLASSES):
-                wid = parts[0]
-                break
-        if not wid:
-            return False
-        try:
-            state = subprocess.run(["xprop", "-id", wid, "_NET_WM_STATE"],
-                                   capture_output=True, text=True,
-                                   timeout=5).stdout
-        except Exception:
-            return False
-        return ("_NET_WM_STATE_MAXIMIZED_VERT" in state
-                and "_NET_WM_STATE_MAXIMIZED_HORZ" in state)
-
-    def _wm_maximized(self, cls: str, want: bool) -> bool:
-        """Set/unset the maximized state. A MAXIMIZED window is the
-        measured dead end for _NET_MOVERESIZE_WINDOW (the WM ignores the
-        geometry request, the state atom stays, any size blip snaps back —
-        live jojo 2026-09-29), and a user's edge-drag unmaximizes
-        implicitly, so the drive unmaximizes first and the action restores
-        the state at the end."""
-        act = "add" if want else "remove"
-        try:
-            r = subprocess.run(
-                ["wmctrl", "-x", "-r", cls, "-b",
-                 "%s,maximized_vert,maximized_horz" % act],
-                capture_output=True, text=True, timeout=5)
-            return r.returncode == 0
-        except Exception:
-            return False
-
     @staticmethod
     def _nested(ev: dict) -> dict:
         p = ev.get("payload")
@@ -2741,38 +2656,92 @@ dioxus.send(out);
             return p["payload"]
         return p if isinstance(p, dict) else {}
 
+    def _last_window_size(self) -> tuple[int, int] | None:
+        """The window's last recorded size from the trace history (the
+        app-native geometry truth; the GUI is a Wayland-native window —
+        wmctrl/xdotool cannot even see it, measured 2026-09-29)."""
+        best = None
+        for ev in self.ytrace_events(0, lines=4000):
+            if ev.get("name") != "window/resized":
+                continue
+            pay = self._nested(ev)
+            w, h = pay.get("width"), pay.get("height")
+            if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                best = (int(w), int(h), ev.get("ts_ms", 0))
+        return (best[0], best[1]) if best else None
+
     def action_resize(self, iters: int) -> dict:
-        win = self._yggterm_window()
-        if not win:
-            return {"error": "no yggterm/breezed window found via wmctrl",
-                    "iterations": []}
+        """The felt window resize, driven through the app's OWN window
+        verbs (`server app resize-window` / `maximize`) — the sanctioned
+        surface, and the only one that works: the GUI is a Wayland-native
+        window on kwin_wayland, invisible to wmctrl/xdotool (measured
+        2026-09-29; EWMH/_NET_MOVERESIZE_WINDOW on the XWayland Breezed
+        practice window was the wrong target entirely).
+
+        Throttle pacing is part of the driver: the begin marker carries a
+        150 ms ANY-payload rate limit (ui_telemetry, drag-flood guard), so
+        an un-maximize + resize issued back-to-back records the maximize
+        shape and EATS the real commit (measured: verb pair recorded
+        1920x1160, the 1500x900 commit never landed). The drive un-
+        maximizes once at action start, sleeps past the throttle, then
+        issues discrete resizes spaced > 150 ms apart.
+
+        Joins window/resized (native commit) -> xterm_resize (grid
+        applied, reason=resize, THIS session) -> xterm_paint/resize_repaint
+        (paint at the new grid; builds carrying the resize-repaint lane),
+        with accuracy asserts (committed size == drive ±8px, grid changed
+        for the scratch session, paint grid == grid leg, no ghost/resize-
+        error events, row survives) and restores the original geometry +
+        maximized state at the end."""
         rows_ready = self.ensure_scratch_rows(1, activate=True)
         if not rows_ready:
             return {"error": "no scratch row to probe", "iterations": []}
         path = rows_ready[0]
-        w0, h0 = win["w"], win["h"]
-        was_maximized = self._wm_read_maximized(win["cls"])
-        if was_maximized:
-            self._wm_maximized(win["cls"], False)
-            time.sleep(0.25)
-            fresh = self._yggterm_window()
-            if fresh:
-                w0, h0 = fresh["w"], fresh["h"]
-        target_w = max(900, w0 - 160)
-        sizes = [(target_w, h0), (w0, h0)]
-        out = {"iterations": [], "start_size": [w0, h0],
-               "window_class": win["cls"]}
+
+        # Discover the resting geometry: un-maximize first (the desktop
+        # rests maximized), sleep past the 150 ms throttle, then read the
+        # un-maximize ripple as the restore size.
+        self.verb("maximize", "off")
+        time.sleep(0.6)
+        t_unmax = now_ms()
+        base = None
+        deadline = time.perf_counter() + 2.0
+        while time.perf_counter() < deadline:
+            for ev in self.ytrace_events(t_unmax):
+                if ev.get("name") != "window/resized":
+                    continue
+                pay = self._nested(ev)
+                w, h = pay.get("width"), pay.get("height")
+                if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+                    base = (int(w), int(h))
+                    break
+            if base:
+                break
+            time.sleep(0.05)
+        if not base:
+            base = self._last_window_size() or (1500, 900)
+        w0, h0 = base
+        target_w = max(900, w0 - 260)
+        target_h = max(600, h0 - 200)
+        # alternate BOTH axes so the battery covers the width class (reflow)
+        # and the height class (scrollback/viewport) of the grid change
+        sizes = [(target_w, target_h), (w0, h0)]
+        out = {"iterations": [], "restore_size": [w0, h0],
+               "driver": "server app resize-window (paced)"}
         instrument_live = False
-        paint = None
         try:
             for i in range(iters):
                 tw, th = sizes[i % 2]
                 self.verb("terminal", "focus", path)
                 time.sleep(0.15)
                 t0 = now_ms()
-                if not self._wm_resize(win["cls"], tw, th):
+                r = self.verb("resize-window",
+                              "--width", str(tw), "--height", str(th))
+                if not r["ok"]:
                     out["iterations"].append({
-                        "accuracy_failures": ["wmctrl resize call failed"],
+                        "accuracy_failures":
+                            ["resize-window verb failed: %s"
+                             % (r.get("error") or "unknown")],
                     })
                     continue
                 commit = grid = paint = None
@@ -2820,13 +2789,13 @@ dioxus.send(out);
                 if paint is None and instrument_live:
                     acc.append("no xterm_paint/resize_repaint for %s "
                                "within 3s (instrument live)" % path)
-                win_ev = [e for e in self.ytrace_events(t0)
+                in_win = self.ytrace_events(t0)
+                win_ev = [e for e in in_win
                           if e.get("name") in ("terminal_resize_error",
                                                "ghost_frame_attached")]
                 if win_ev:
                     acc.append("error-class events in window: %s"
                                % sorted({e.get("name") for e in win_ev}))
-                in_win = self.ytrace_events(t0)
                 daemon_us = [self._nested(e).get("waited_us")
                              for e in in_win
                              if e.get("component") == "daemon"
@@ -2849,6 +2818,7 @@ dioxus.send(out);
                     if grid and paint else None,
                     "commit_to_paint_ms": (paint["ts_ms"] - commit["ts_ms"])
                     if commit and paint else None,
+                    "verb_wall_ms": r["wall_ms"],
                     "committed_size": ([self._nested(commit).get("width"),
                                         self._nested(commit).get("height")]
                                        if commit else None),
@@ -2876,13 +2846,11 @@ dioxus.send(out);
                 })
                 time.sleep(0.9)
         finally:
-            self._wm_resize(win["cls"], w0, h0)
+            self.verb("resize-window", "--width", str(w0),
+                      "--height", str(h0))
             time.sleep(0.4)
-            if was_maximized:
-                self._wm_maximized(win["cls"], True)
+            self.verb("maximize", "on")
             time.sleep(0.4)
-            back = self._yggterm_window()
-            out["restored_size"] = ([back["w"], back["h"]] if back else None)
             out["rows_left_behind"] = len(self.spawned_paths)
         if not instrument_live:
             out["paint_leg"] = ("instrument_absent (pre-resize-repaint "
