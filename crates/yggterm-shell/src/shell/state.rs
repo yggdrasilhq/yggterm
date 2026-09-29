@@ -59599,10 +59599,13 @@ fn remote_scanned_session_label(
     // StartPage → remote_scanned_session_label → SessionTitleStore::open →
     // execute_batch → btreeBeginTrans → pager_wait_on_lock → fcntl). The
     // shared store is one open per thread per home.
-    let saved_title = resolve_yggterm_home().ok().and_then(|home| {
+    // with_shared_title_store yields Option<Option<String>> (its own None =
+    // "no store"; the inner Option = the title) — flatten to the title.
+    let saved_title: Option<String> = resolve_yggterm_home().ok().and_then(|home| {
         yggterm_core::with_shared_title_store(&home, |store| {
             store.get_title(&session.session_id).ok().flatten()
         })
+        .flatten()
     });
     remote_scanned_session_label_with_saved_title(session, short_ids, saved_title.as_deref())
 }
