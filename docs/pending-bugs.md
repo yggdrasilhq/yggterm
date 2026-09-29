@@ -18,6 +18,69 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by zcode sess_5f387fca-ac93-45a4-b57a-f070398d001f on jojo,
+work FROM dev; claim ACK-aa075a6276. Scratch pair, menu origin, quiet floors
+(cli 58-63, gui 159-163, drift ≤+5), 5/5 accuracy every run, 0 rows left
+behind.
+
+THE INSTRUMENT HALF (measured in ONE A/B — the probe now reports BOTH
+columns; fix shipped in the same lane as this entry, `SPLIT_OPEN_JS` polls
+the appear in-eval with a dynamic clamp against the [11.200] 3 s eval
+budget, summarize rides `click_to_dom_felt_ms`):
+
+- felt (single-eval page clock, zero transport): **120-196 ms, p50 164**
+  (one 718 outlier under a load blip) — compound row + 2 panes + rects land
+  in ONE atomic DOM stamp.
+- the old two-phase `click_to_dom_ms` on the SAME iterations: **463-1066 ms**
+  — 3-6× the felt truth. The two-phase shape (click eval returns → python
+  turnaround → second eval polls at 25 ms) pays a full eval round trip plus
+  queueing behind the post-commit churn. The §BASELINES 416-491/545-755 rows
+  and the split-ungroup close's "appear leg over bar" observation were
+  reading the instrument, not the app.
+
+THE APP-SIDE RESIDUAL (real; commit → DOM → frame, ytrace ladder n=5):
+
+1. `context_menu_activate` → `split/create` **0-1 ms** — pure state commit.
+2. +40-42: `focus_split_pane` → `spawn_open_session_row` (hot branch) →
+   `request_terminal_launch` + `set_session_keep_alive` begin.
+3. +52-66: `bootstrap_reset` ×3-4 for ALL retained hosts
+   (`skipped_inactive_retained` — the [11.172]/[11.173] retention working)
+   + `cc_identity_refresh` 10-14 ms.
+4. +105-184: THE DOM STAMP (one atomic commit). `terminal_mount/begin` lands
+   within ±20 ms of it but is NOT its gate (once observed DOM 19 ms BEFORE
+   mount/begin).
+5. first animation frame after the stamp: **+77-79 ms rAF lag** — the
+   main thread is congested exactly there.
+6. Concurrent churn in-window, none singly gating the stamp:
+   `set_session_keep_alive` **225-263 ms with lock_wait_slow** (the
+   [11.214] daemon-lock family), full `daemon/persist` 105-124 ms, the
+   mount eval pipeline, and ONE owner-bump supersede per create
+   (`bootstrap_owner_superseded_during_loop` +
+   `terminal_mount_task_dropped`).
+
+FIX DIRECTION (named, NOT taken — the launch/focus plane is
+[11.176]/[11.178]-wedge-coupled and the reclaim schedule exists to fix real
+focus-steal; not ours+small under the ux-speed scope law). The create path's
+focus tail is `schedule_terminal_focus_after_activation`
+(state.rs ~57229): it (a) re-arms the activation via
+`try_arm_terminal_activation_for_focus` — the second owner bump that
+self-supersedes the mount loop it just started — and (b) runs a focus-reclaim
+JS with **NINE staggered passes** (rAF + setTimeout 0/32/96/220/420/760/1200
+ms), each re-running the reclaim script — main-thread churn inside the
+appear window where the frame lag lives. Kill or collapse the second
+activation arm, and coalesce the reclaim passes that fall inside the first
+two frames; the keep-alive lock churn belongs to [11.214]'s delta-focus
+lever.
+
+Falsifier: on a rotated build, split-create felt p50 ≤~100 ms DOM with
+first-raf ≤+20 ms after the stamp, 5/5 accuracy, 0 rows left behind — or the
+second-owner bump named to its exact call site with an A/B proving its
+removal moves the stamp.
+
 ## ⛔ [11.213] THE GUI RECOVERY DOOR LAUNDERS A HANDOVER-DEAD REMOTE ROW — EVERY RE-MOUNT READS THE STALE RETAINED BUFFER, CALLS IT LIVE OUTPUT, AND RE-ARMS THE RESIZE BURN (measured 2026-09-29 ~14:13-14:35 IST, live jojo, the [11.57] tombstone lane)
 
 **Status:** OPEN

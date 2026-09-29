@@ -349,6 +349,7 @@ SPLIT_OPEN_JS = """
 // pushed every send past the budget and dom_eval_timeout discarded the
 // whole iteration, menu included). The DOM truth read lives in SPLIT_DOM_JS.
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const t_eval_start = Date.now();
 const PATH_A = {session_a!r};
 const AXIS = {axis!r};  // "split-side-by-side" | "split-stacked"
 if (document.querySelector('[data-split-group-row="1"]')) {
@@ -420,12 +421,37 @@ const item_label = String(splitItem.textContent || '').slice(0, 80);
 await settle(100);
 const clickInit = { bubbles: true, cancelable: true, composed: true,
                      view: window, button: 0, buttons: 1 };
+const t_click = Date.now();
 splitItem.dispatchEvent(new MouseEvent('mousedown', clickInit));
 splitItem.dispatchEvent(new MouseEvent('mouseup',
     { ...clickInit, buttons: 0 }));
 splitItem.dispatchEvent(new MouseEvent('click', clickInit));
+// FELT-APPEAR poll, same eval = same page clock, ZERO transport in the
+// metric (split-create-appear lane, ACK-aa075a6276: the old two-phase
+// click_to_dom carried one full eval round trip + a 25 ms poll — 150-300 ms
+// of instrument on a ~110-180 ms felt appear). Dynamic clamp against the
+// GUI 3s eval budget ([11.200]): the menu wait above already spent some.
+const evalSpent = t_click - t_eval_start;
+const appearDeadline = t_click
+    + Math.min(1500, Math.max(0, 2850 - evalSpent));
+let felt = null, felt_panes = 0;
+while (Date.now() < appearDeadline) {
+    await settle(8);
+    const compound = document.querySelector('[data-split-group-row="1"]');
+    const pn = [...document.querySelectorAll(
+        '[data-split-session][data-split-pane-index]')];
+    if (compound && pn.length >= 2
+        && pn.every((n) => { const r = n.getBoundingClientRect();
+                             return r.width > 0 && r.height > 0; })) {
+        felt = Date.now() - t_click;
+        felt_panes = pn.length;
+        break;
+    }
+}
 dioxus.send({ accepted: true, menu_open_ms, item_label,
-              t_open, t_click: Date.now() });
+              t_open, t_click,
+              click_to_dom_felt_ms: felt,
+              felt_pane_count: felt_panes });
 """
 
 SPLIT_DOM_JS = """
@@ -2595,6 +2621,8 @@ dioxus.send(out);
             out["iterations"].append({
                 "open_wall_ms": open_wall_ms,
                 "menu_open_ms": result.get("menu_open_ms"),
+                "click_to_dom_felt_ms": result.get("click_to_dom_felt_ms"),
+                "felt_pane_count": result.get("felt_pane_count"),
                 "click_to_dom_ms": result.get("click_to_dom_ms"),
                 "dispatch_to_dom_ms": result.get("dispatch_to_dom_ms"),
                 "pair_ms": pair.get("pair_ms"),
@@ -2607,7 +2635,7 @@ dioxus.send(out);
                 "ungroup_to_gone_ms": ungroup.get("ungroup_to_gone_ms"),
                 "accuracy_failures": acc,
             })
-        return summarize(out, key="click_to_dom_ms")
+        return summarize(out, key="click_to_dom_felt_ms")
 
     # ---- waiters --------------------------------------------------------
 
