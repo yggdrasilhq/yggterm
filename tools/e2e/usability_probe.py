@@ -556,6 +556,41 @@ def invariant_identity_convergence(report, rows):
         report.ok("identity_convergence")
 
 
+RUNTIME_KEY_SCHEMES = {
+    "agy": "agy-runtime://",
+    "codex": "codex-runtime://",
+    "claude": "cc-runtime://",
+    "opencode": "opencode-runtime://",
+    "muse": "muse-runtime://",
+    "kimi": "kimi-runtime://",
+    "qwen": "qwen-runtime://",
+    "grok": "grok-runtime://",
+    "pi": "pi-runtime://",
+}
+
+
+def live_attached(cmd, identity_uuids, timeout=20):
+    """THE AUTHORITATIVE ATTACHMENT TEST: the daemon itself answers for the
+    conversation's runtime key. The persisted server-state and the peer plane
+    both LAG the live map - the owner's ACTIVE row was false-positived by
+    exactly that lag (caught 2026-09-29 00:43). Any runtime key the daemon
+    answers for means the process is attached; never a ghost."""
+    if not identity_uuids:
+        return False
+    binary = (cmd.split() or [""])[0].rsplit("/", 1)[-1]
+    scheme = RUNTIME_KEY_SCHEMES.get(binary)
+    if not scheme:
+        return False
+    for uuid in identity_uuids:
+        answer = run(
+            [YGGTERM_BIN, "server", "terminal", "screen", scheme + uuid, "--state"],
+            timeout=timeout,
+        )
+        if answer.returncode == 0 and "no session here matches" not in answer.stdout:
+            return True
+    return False
+
+
 def live_runtime_keys():
     keys = set()
     try:
@@ -598,7 +633,12 @@ def invariant_ghost_pids(report, peers=()):
                 )
             continue
         identity_uuids = uuids_in(marker) | uuids_in(cmd)
-        if truth_uuids and identity_uuids & truth_uuids:
+        # THE LIVE ATTACHMENT TEST ([11.204] follow-up): the persisted and
+        # peer truths LAG the daemon - a row restored/rescued after the last
+        # persist looks unattached to them. The daemon itself is the
+        # authority: if it answers for the conversation's runtime key, the
+        # process is attached and never a ghost.
+        if live_attached(cmd, identity_uuids):
             continue
         if age_s > GHOST_GRACE_S:
             ghosts.append(f"pid {pid} ({cmd[:60]}, {int(age_s)//60}m)")
