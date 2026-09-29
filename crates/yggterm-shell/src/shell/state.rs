@@ -90009,14 +90009,39 @@ async fn process_pending_app_control_requests(
                     );
                     let mut redirect_error = None::<String>;
                     let mut snapshot = snapshot;
+                    // The [11.208] close-residual instrument: the redirect
+                    // sync is a SECOND daemon round trip on every active
+                    // close (focus_live/open_stored hold the daemon lock
+                    // ~160 ms on top of the removal call) and without this
+                    // stage it is invisible between round_trip_done and
+                    // settle_done — close A/Bs mis-attribute it to the
+                    // settle loop.
+                    let redirect_sync_t0 = std::time::Instant::now();
+                    let mut redirect_sync_ran = false;
                     if let Some(target) = close_redirect_target_for_worker.as_ref()
                         && let Some(sync_result) =
                             close_redirect_target_daemon_sync(&endpoint, target)
                     {
+                        redirect_sync_ran = true;
                         match sync_result {
                             Ok((redirect_snapshot, _)) => snapshot = redirect_snapshot,
                             Err(error) => redirect_error = Some(error.to_string()),
                         }
+                    }
+                    if close_redirect_target_for_worker.is_some() {
+                        append_trace_event(
+                            &home_for_worker,
+                            "ui",
+                            "app_control",
+                            "remove_session_stage",
+                            json!({
+                                "stage": "redirect_sync_done",
+                                "session_path": session_path_for_worker,
+                                "ms": redirect_sync_t0.elapsed().as_millis() as u64,
+                                "ran": redirect_sync_ran,
+                                "plane": "worker",
+                            }),
+                        );
                     }
                     // A successful ROUND TRIP is not a successful REMOVAL. The
                     // daemon answers Ok while saying "no live session for this
