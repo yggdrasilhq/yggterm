@@ -25475,14 +25475,37 @@ pub fn run_remote_resume_agent(
     // On the store's DEFINITIVE word the refusal fires here, before the
     // ledger and before any composition, so zero bytes reach the CLI. A live
     // runtime never reaches this line (bridged above); `None` fails open.
+    //
+    // ⛔ THE [11.198] REOPEN FALLTHROUGH — the gate's one honest exception:
+    // when the ROW'S OWN KEY is tombstone-remembered on this machine, the
+    // user CLOSED this row and is now REOPENING it. Refusing would leave the
+    // row at Bootstrapping wearing the painted error forever (owner
+    // screenshots 2026-09-28 23:1x and 2026-09-29 07:25, row 7c2a3aec).
+    // Falling through hands the row to the daemon ensure, whose DELIBERATE
+    // re-entry inserts through the remembered close and whose fresh arm
+    // composes a MINTED, BOUND conversation; persist() then lifts the grave.
+    let row_own_close_remembered = live_row_close_is_remembered(&home, &runtime_key);
     if remote_require_existing_needs_definitive_vouch(kind)
         && remote_require_existing_definitive_miss_refuses(
             kind,
             require_existing,
             local_agent_store_vouches_for_session(kind, session_id),
         )
+        && !row_own_close_remembered
     {
         anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
+    }
+    if row_own_close_remembered {
+        append_trace_event(
+            &home,
+            "remote",
+            "resume_agent",
+            "agy_reopen_closed_row_fallthrough",
+            json!({
+                "requested_id": session_id,
+                "policy": "reopening a remembered-closed row: the ensure deliberate re-entry inserts, fresh-starts bound, and persist lifts the grave",
+            }),
+        );
     }
     // ★ §4 cli-integration-layer: the ledger answers before the saved-session
     // gate (see run_remote_resume_codex for the full rationale). Every
@@ -61694,6 +61717,52 @@ mod agy_connection_tests {
                 "external_agent_resume_processes_for_session(kind, &candidate_id).is_empty()"
             ),
             "the wrapper ladder asks the full holder witness before the bind"
+        );
+    }
+
+    /// THE [11.198] REOPEN LAW: when the row's OWN key is tombstone-remembered,
+    /// the definitive-miss gate must NOT refuse — the reopen falls through to
+    /// the ensure (deliberate re-entry + fresh arm + persist lift). The
+    /// refusal stays for rows whose close is NOT remembered (nothing was
+    /// closed; the absence is real).
+    #[test]
+    fn reopening_a_remembered_closed_row_falls_through_instead_of_refusing() {
+        let source = include_str!("lib.rs");
+        // Anchor on the real signature (the bare name matches earlier
+        // source-scan literals).
+        let wrapper = source
+            .split("pub fn run_remote_resume_agent(\n    kind: SessionKind,")
+            .nth(1)
+            .expect("wrapper body")
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        let remembered_at = wrapper
+            .find(
+                "let row_own_close_remembered = live_row_close_is_remembered(&home, &runtime_key);",
+            )
+            .expect("the reopen memory check");
+        let gate_at = wrapper
+            .find("if remote_require_existing_needs_definitive_vouch(kind)")
+            .expect("the definitive-miss gate");
+        assert!(
+            remembered_at < gate_at,
+            "the memory check precedes the gate"
+        );
+        let gate = &wrapper[gate_at..wrapper
+            .find("★ §4 cli-integration-layer")
+            .expect("the ledger section ends the gate")];
+        assert!(
+            gate.contains("&& !row_own_close_remembered"),
+            "the gate exempts the row's own remembered close"
+        );
+        assert!(
+            gate.contains("agy_reopen_closed_row_fallthrough"),
+            "the fallthrough is traced"
+        );
+        assert!(
+            gate.contains("remote_resume_missing_saved_session_error(kind, session_id)"),
+            "the honest refusal remains for rows whose close is not remembered"
         );
     }
 }
