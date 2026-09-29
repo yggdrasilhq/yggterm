@@ -31794,3 +31794,54 @@ FALSIFIER: uxprobe close_to_gone on the ACTIVE row ≤~700 ms (poll tail
 gone: first post-verb `rows` poll serves ≤~200 ms), verified-gone 5/5,
 0 rows left behind, on a rotated build, with the new render-span trace
 naming the residual under 300 ms.
+
+UPDATE 2026-09-29 ~07:3x UTC (close-render-burst lane, claim ACK-1b2e6fc7f3;
+zcode sess_7e83ed1e on jojo, work FROM dev, lane
+lane/uxspeed/close-render-burst) — ATTRIBUTION ADVANCED from plane to NAME,
+one instrument build landing. The zero-build pass (live trace + the storm
+lane's own perf captures + /proc thread sampling on build bfe5ed1909f4):
+
+- THE STALL RE-MEASURED, TWO BLOCKS PER CLOSE: the ui_block watchdog itself
+  files TWO incidents per active close on current main — gap 1134 ms
+  (last_activity terminal_mount/terminal_mount_task_dropped) ending when the
+  floating apply finally runs (apply_done ms=1174, its own legs 27 ms), then
+  a second gap 987 ms (last_activity app_control/request_begin). gone lands
+  in between (verb 482 + tail = 1465 ms). Thread sampling: main tid burns
+  R-state ~0.7 s (+437..+1130) after a ~130 ms D-state __cv_timedwait
+  (+307), parks, then burns ~0.55 s again (+3117..+3679). The watchdog's
+  mid-stall ppoll witness is its LAST sample, not the body — the body is R.
+- THE [11.180]-FAMILY CRAWL NAMED: during the close the UI thread runs
+  all_sidebar_rows_for_selection — the selection expansion crawl ([11.125]
+  class, up to 8 rounds, each a full sidebar merge over a GROWING expanded
+  set). Measured live: six merge_rows_breakdown events +220..+365 ms after
+  the verb, ~26 ms each, expanded_paths 121→133→378→900→911→912, merged
+  rows 853→4448 (421 quiet). Everything else frozen across the rounds
+  (stored 834, live 19, machines same) — the expansion set is the only
+  thing moving, which is the crawl's fingerprint. The perf leaf profile of
+  the storm lane's own capture (storm-perf.data, main thread 2482/3000
+  samples) is this crawl's signature: sqlite3RunParser/GetToken/AddColumn
+  ~5-6% (the title store's get_title_map re-parses its 500-placeholder IN
+  clause per call), sip-hash key parts, 4k-row String clones + malloc/free
+  ~20%, ZFS read path ~8-10%, unlink_chunk (file deletions) 0.59%.
+- MEASURED-CLEAN ADDITIONS: component renders are NOT the burst (the
+  dioxus_render component_window in the close window: 4 root renders, app
+  total 72.8 ms, max 22.85 — the stall is main-loop work outside component
+  functions); the rows serve path is epoch-cached (source app_control_rows,
+  421 rows, 6.6-8.3 ms quiet); overlay_live_terminal_sidebar_sample reads
+  an in-memory map, no file I/O; prepare_live_session_close_locally is
+  light (render-state drop + web surface teardown).
+- LANDED (lane build, this branch): (1) all_sidebar_rows_for_selection is
+  now attributed + memoized — every caller passes its name, a
+  `selection_crawl` event fires ONLY when a crawl ran ≥20 ms
+  {caller, rounds, total_ms, merged_row_count, expanded_path_count}, and
+  the fixed point memoizes per merge-input set (the delete-dialog openers
+  resolve three selection sets back-to-back; they now pay one crawl, not
+  three); (2) the close arm's preflight legs (pending/redirect/prepare/
+  redirect-apply) carry their own wall times on a `preflight_legs` stage
+  event (the old preflight_done stamp read ms=0 because close_stage_t0
+  started AFTER the block); (3) titles.rs prepare→prepare_cached (7 sites)
+  — repeat get_title_map calls stop re-parsing the IN clause.
+- STILL UNNAMED: the residual R-burn inside the second block. The
+  instrumented build names the crawl's CALLER per close (the selection_crawl
+  event) and the preflight legs; the next live run either drops the burst
+  below the bar or names what remains.

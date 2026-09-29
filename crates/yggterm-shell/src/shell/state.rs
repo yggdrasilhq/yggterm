@@ -18318,6 +18318,11 @@ struct ShellState {
     /// Interior mutability on purpose: filling the cache is not a state
     /// change, and must not dirty the signal.
     render_snapshot_cache: std::cell::RefCell<Option<(u64, u64, SharedSnapshot)>>,
+    /// The selection-crawl fixed-point memo ([11.208]-uxspeed close-render-burst):
+    /// key = the merge input set the crawl is deterministic in; one entry,
+    /// replaced per crawl. Interior mutability: filling it is not a state
+    /// change (same law as render_snapshot_cache).
+    selection_crawl_cache: std::cell::RefCell<Option<(u64, Vec<BrowserRow>)>>,
     bootstrap: ShellBootstrap,
     browser: SessionBrowserState,
     server: YggtermServer,
@@ -21131,6 +21136,7 @@ impl ShellState {
         let keymap = keymap_from_keytip_config(&keytip_config);
         let mut state = Self {
             render_snapshot_cache: std::cell::RefCell::new(None),
+            selection_crawl_cache: std::cell::RefCell::new(None),
             settings,
             bootstrap,
             row_menu_page: None,
@@ -35044,10 +35050,55 @@ impl ShellState {
         Some(row.clone())
     }
     fn all_sidebar_rows_for_selection(&self) -> Vec<BrowserRow> {
-        // Per [[spec-cwd-tree-agent-cli-unified]]: CC sessions now live
-        // natively in the tree. No post-hoc injection needed.
+        self.all_sidebar_rows_for_selection_for("unlabeled")
+    }
+
+    /// The selection expansion crawl ([11.125] class), instrumented + memoized
+    /// ([11.208]-uxspeed close-render-burst lane, 2026-09-29).
+    ///
+    /// The crawl converges an EVERY-GROUP-OPEN expansion fixpoint: up to 8
+    /// rounds, each a full sidebar merge over a growing expanded set. Measured
+    /// live on the 425-row desktop during an active close: six rounds,
+    /// expanded 121→912, ~26 ms per merge, ~180 ms per crawl, UI thread — and
+    /// the close burst's perf leaf profile is this crawl's signature (sqlite
+    /// re-parses from the chunked title map, sip-hash key parts, 4k-row
+    /// String clones, malloc churn, ZFS reads under it).
+    ///
+    /// Two laws follow:
+    /// 1. The fixed point is deterministic in (stored rows, remote machines,
+    ///    ssh targets, live sessions) — the expanded set is BUILT here, never
+    ///    an input — so the result memoizes per input set. The delete-dialog
+    ///    openers resolve three selection sets back-to-back against one
+    ///    state; they now pay one crawl, not three.
+    /// 2. `caller` names the entry point on the `selection_crawl` event, so a
+    ///    slow selection resolution is attributable without a debugger.
+    fn all_sidebar_rows_for_selection_for(&self, caller: &'static str) -> Vec<BrowserRow> {
+        let crawl_started_at = std::time::Instant::now();
         let stored_rows = self.browser.search_rows();
         let live_sessions = self.server.live_sessions();
+        let remote_machines = self.server.remote_machines();
+        let ssh_targets = self.server.ssh_targets();
+        // The crawl key: the same input hasher the merge cache uses, with the
+        // derived inputs empty — the crawl's expanded set is built, not read.
+        let crawl_key = sidebar_merge_cache_key_parts(
+            &stored_rows,
+            &[],
+            &remote_machines,
+            &ssh_targets,
+            &live_sessions,
+            &HashSet::new(),
+            &HashSet::new(),
+            &yggterm_core::row_set_outline::RowArrangement::default(),
+        )
+        .key;
+        if let Some(rows) = self
+            .selection_crawl_cache
+            .borrow()
+            .as_ref()
+            .and_then(|(cached_key, rows)| (*cached_key == crawl_key).then(|| rows.clone()))
+        {
+            return rows;
+        }
         let mut expanded_paths = stored_rows
             .iter()
             .filter(|row| row.kind == BrowserRowKind::Group)
@@ -35055,48 +35106,81 @@ impl ShellState {
             .collect::<HashSet<_>>();
         expanded_paths.insert("__live_sessions__".to_string());
         expanded_paths.insert("local".to_string());
-        for machine in self.server.remote_machines() {
+        for machine in remote_machines.iter() {
             expanded_paths.insert(format!("__remote_machine__/{}", machine.machine_key));
         }
         let mut previous_group_count = 0;
+        let mut rounds = 0_usize;
+        let mut expanded_final = 0_usize;
+        let mut converged_rows: Option<Vec<BrowserRow>> = None;
         for _ in 0..8 {
+            rounds += 1;
             let rows = sidebar_rows_for_selection(
                 &stored_rows,
                 merged_sidebar_rows(
                     &stored_rows,
-                    self.server.remote_machines(),
-                    self.server.ssh_targets(),
+                    &remote_machines,
+                    &ssh_targets,
                     &live_sessions,
                     &expanded_paths,
                 ),
             );
+            expanded_final = expanded_paths.len();
             let group_paths = rows
                 .iter()
                 .filter(|row| row.kind == BrowserRowKind::Group)
                 .map(|row| row.full_path.clone())
                 .collect::<HashSet<_>>();
             let next_group_count = group_paths.len();
-            if next_group_count == previous_group_count && group_paths.is_subset(&expanded_paths) {
-                return rows;
-            }
+            let converged = next_group_count == previous_group_count
+                && group_paths.is_subset(&expanded_paths);
             previous_group_count = next_group_count;
             expanded_paths.extend(group_paths);
+            if converged {
+                converged_rows = Some(rows);
+                break;
+            }
         }
-        sidebar_rows_for_selection(
-            &stored_rows,
-            merged_sidebar_rows(
+        let result = converged_rows.unwrap_or_else(|| {
+            sidebar_rows_for_selection(
                 &stored_rows,
-                self.server.remote_machines(),
-                self.server.ssh_targets(),
-                &live_sessions,
-                &expanded_paths,
-            ),
-        )
+                merged_sidebar_rows(
+                    &stored_rows,
+                    &remote_machines,
+                    &ssh_targets,
+                    &live_sessions,
+                    &expanded_paths,
+                ),
+            )
+        });
+        let total_ms = crawl_started_at.elapsed().as_secs_f64() * 1000.0;
+        *self.selection_crawl_cache.borrow_mut() = Some((crawl_key, result.clone()));
+        // The crawl event fires ONLY when it was slow: a fast crawl on a small
+        // tree is machine size, not an anomaly (the merge-recorder lesson — a
+        // recorder that fires on machine size bills the render thread).
+        if total_ms >= 20.0 {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_perf_event(
+                    &home,
+                    "sidebar",
+                    "selection_crawl",
+                    json!({
+                        "caller": caller,
+                        "rounds": rounds,
+                        "total_ms": (total_ms * 100.0).round() / 100.0,
+                        "merged_row_count": result.len(),
+                        "expanded_path_count": expanded_final,
+                        "cached": false,
+                    }),
+                );
+            }
+        }
+        result
     }
     fn select_all_tree_rows(&mut self) {
         let terms = search_terms(&self.search_query);
         let selected_rows = self
-            .all_sidebar_rows_for_selection()
+            .all_sidebar_rows_for_selection_for("select_all_tree_rows")
             .into_iter()
             .filter(is_tree_multiselect_row)
             .filter(|row| terms.is_empty() || row_matches_search(row, &terms))
@@ -35125,7 +35209,7 @@ impl ShellState {
         self.refresh_tree_debug("select_all_tree_rows");
     }
     fn selected_copy_generation_rows(&self, context_row: Option<&BrowserRow>) -> Vec<BrowserRow> {
-        let all_rows = self.all_sidebar_rows_for_selection();
+        let all_rows = self.all_sidebar_rows_for_selection_for("selected_copy_generation_rows");
         let selected_paths = if !self.selected_tree_paths.is_empty()
             && context_row.is_none_or(|row| self.selected_tree_paths.contains(&row.full_path))
         {
@@ -35435,7 +35519,7 @@ impl ShellState {
         Some((index + 1, views.len(), label))
     }
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
-        let rows = self.all_sidebar_rows_for_selection();
+        let rows = self.all_sidebar_rows_for_selection_for("extend_tree_selection");
         let anchor = self
             .selection_anchor
             .clone()
@@ -35492,7 +35576,7 @@ impl ShellState {
         self.selected_tree_rows_matching(is_tree_drag_source_row)
     }
     fn selected_tree_rows_matching(&self, predicate: fn(&BrowserRow) -> bool) -> Vec<BrowserRow> {
-        let rows = self.all_sidebar_rows_for_selection();
+        let rows = self.all_sidebar_rows_for_selection_for("selected_tree_rows_matching");
         let mut seen_paths = HashSet::new();
         let selected = rows
             .into_iter()
@@ -35515,7 +35599,7 @@ impl ShellState {
     }
     fn selected_workspace_delete_paths(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         let rows = self.selected_workspace_rows();
-        let all_rows = self.all_sidebar_rows_for_selection();
+        let all_rows = self.all_sidebar_rows_for_selection_for("selected_workspace_delete_paths");
         let mut document_paths = Vec::new();
         let mut group_paths = Vec::new();
         let mut labels = Vec::new();
@@ -35549,7 +35633,7 @@ impl ShellState {
         (document_paths, group_paths, labels)
     }
     fn selected_session_delete_paths(&self) -> (Vec<String>, Vec<String>) {
-        let rows = self.all_sidebar_rows_for_selection();
+        let rows = self.all_sidebar_rows_for_selection_for("selected_session_delete_paths");
         let selected_rows = if self.selected_tree_paths.is_empty() {
             self.browser
                 .selected_path()
@@ -35569,7 +35653,7 @@ impl ShellState {
         dedupe_session_delete_rows(session_rows)
     }
     fn selected_saved_ssh_target_machine_keys(&self) -> (Vec<String>, Vec<String>) {
-        let rows = self.all_sidebar_rows_for_selection();
+        let rows = self.all_sidebar_rows_for_selection_for("selected_saved_ssh_target_machine_keys");
         let selected_rows = if self.selected_tree_paths.is_empty() {
             self.browser
                 .selected_path()
@@ -89636,9 +89720,18 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::RemoveSession { session_path } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
-            let (pending, close_redirect_target, runtime_pid_before, remote_machines_for_removal) =
+            let close_stage_t0 = std::time::Instant::now();
+            // [11.208]-uxspeed close-render-burst: the preflight block runs ON
+            // the UI thread and its legs were invisible behind a ms=0 stage
+            // stamp (close_stage_t0 used to start AFTER the block). Each leg
+            // now carries its own wall time on the preflight_legs event, so a
+            // slow pending/redirect/prepare resolution is attributable in the
+            // same trace that already stages the worker and the floating apply.
+            let (pending, close_redirect_target, runtime_pid_before, remote_machines_for_removal, preflight_legs) =
                 state.with_mut_counted(|shell| {
+                    let pending_t0 = std::time::Instant::now();
                     let pending = app_control_remove_session_pending(shell, &session_path);
+                    let pending_ms = pending_t0.elapsed().as_secs_f64() * 1000.0;
                     // Read the PTY pid BEFORE the removal: afterwards the row is
                     // gone and nothing can say what the session was running.
                     // `None` on a live row is not "no processes" — it is "nobody
@@ -89651,22 +89744,35 @@ async fn process_pending_app_control_requests(
                         .find(|session| session.session_path == session_path)
                         .and_then(|session| session.terminal_process_id)
                         .map(|pid| pid as i32);
+                    let redirect_t0 = std::time::Instant::now();
                     let close_redirect_target = shell.close_redirect_target_for_pending(&pending);
+                    let redirect_ms = redirect_t0.elapsed().as_secs_f64() * 1000.0;
+                    let prepare_t0 = std::time::Instant::now();
                     shell.prepare_live_session_close_locally(
                         &pending,
                         "app_control_live_session_close_preflight",
                     );
+                    let prepare_ms = prepare_t0.elapsed().as_secs_f64() * 1000.0;
+                    let mut redirect_apply_ms = 0.0_f64;
                     if let Some(target) = close_redirect_target.as_ref() {
+                        let apply_t0 = std::time::Instant::now();
                         shell.apply_viewport_history_entry_locally(
                             target,
                             "app_control_live_session_close_redirect",
                         );
+                        redirect_apply_ms = apply_t0.elapsed().as_secs_f64() * 1000.0;
                     }
                     (
                         pending,
                         close_redirect_target,
                         runtime_pid_before,
                         shell.server.remote_machines().to_vec(),
+                        json!({
+                            "pending_ms": (pending_ms * 100.0).round() / 100.0,
+                            "redirect_ms": (redirect_ms * 100.0).round() / 100.0,
+                            "prepare_ms": (prepare_ms * 100.0).round() / 100.0,
+                            "redirect_apply_ms": (redirect_apply_ms * 100.0).round() / 100.0,
+                        }),
                     )
                 });
             let close_stage_t0 = std::time::Instant::now();
@@ -89680,6 +89786,18 @@ async fn process_pending_app_control_requests(
                     "session_path": session_path,
                     "ms": close_stage_t0.elapsed().as_millis() as u64,
                     "redirect": close_redirect_target.is_some(),
+                }),
+            );
+            append_trace_event(
+                &home,
+                "ui",
+                "app_control",
+                "remove_session_stage",
+                json!({
+                    "stage": "preflight_legs",
+                    "session_path": session_path,
+                    "ms": close_stage_t0.elapsed().as_millis() as u64,
+                    "legs": preflight_legs,
                 }),
             );
             let teardown_census = session_teardown_census(runtime_pid_before);
