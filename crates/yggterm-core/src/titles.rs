@@ -303,7 +303,7 @@ impl SessionTitleStore {
             let sql = format!(
                 "SELECT session_id, title FROM session_titles WHERE session_id IN ({placeholders})"
             );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = self.conn.prepare_cached(&sql)?;
             let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
             while let Some(row) = rows.next()? {
                 out.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
@@ -315,7 +315,7 @@ impl SessionTitleStore {
     pub fn get_title(&self, session_id: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT title FROM session_titles WHERE session_id = ?1")?;
+            .prepare_cached("SELECT title FROM session_titles WHERE session_id = ?1")?;
         let mut rows = stmt.query(params![session_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -357,7 +357,7 @@ impl SessionTitleStore {
     ) -> Result<Option<GeneratedCopyRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT summary, updated_at FROM session_summaries WHERE session_id = ?1")?;
+            .prepare_cached("SELECT summary, updated_at FROM session_summaries WHERE session_id = ?1")?;
         let mut rows = stmt.query(params![session_id])?;
         if let Some(row) = rows.next()? {
             let updated_at = row.get::<_, String>(1)?;
@@ -512,7 +512,7 @@ impl SessionTitleStore {
     }
 
     fn latest_summary_timeline_value(&self, session_id: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT summary
              FROM session_summary_timeline
              WHERE session_id = ?1
@@ -533,7 +533,7 @@ impl SessionTitleStore {
         limit: usize,
     ) -> Result<Vec<SessionSummaryTimelineEntry>> {
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT created_at, summary, cwd, source, model
              FROM session_summary_timeline
              WHERE session_id = ?1
@@ -570,7 +570,7 @@ impl SessionTitleStore {
     /// answers to this id" is true of a brand-new session as well as a deleted
     /// one. Age is what tells those apart.
     pub fn generated_copy_ages_in_days(&self) -> Result<Vec<(String, i64)>> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare_cached(
             "SELECT session_id, MAX(updated_at) FROM (
                  SELECT session_id, updated_at FROM session_titles
                  UNION ALL
@@ -636,7 +636,7 @@ impl SessionTitleStore {
 
     /// The source state the last attempt for this session+kind ran against.
     pub fn generation_attempt_stamp(&self, session_id: &str, kind: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT source_stamp FROM session_copy_generation_attempts
              WHERE session_id = ?1 AND kind = ?2 LIMIT 1",
         )?;

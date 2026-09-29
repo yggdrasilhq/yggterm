@@ -19,6 +19,21 @@ the daemon knows is retired.
 
 ## Unreleased
 
+## [11.208]-uxspeed the active-row close stops paying the selection-expansion crawl three times and re-parsing the title map
+
+Closing the front row of a 425-row desktop stalled the UI thread for
+~1.1-2.1 s in two blocks: the selection expansion crawl
+(`all_sidebar_rows_for_selection`, the [11.125] class) ran up to eight full
+sidebar merges over a growing expanded set on the main thread, the
+delete-dialog openers resolved three selection sets back-to-back (three
+crawls against one unchanged state), and every crawl round re-parsed the
+title store's 500-placeholder `IN` clause through fresh sqlite prepares. The
+crawl now memoizes its fixed point per merge-input set (one crawl, not
+three), every caller is named on a `selection_crawl` trace event that fires
+only when a crawl ran slow, the close arm's preflight legs
+(pending/redirect/prepare/redirect-apply) carry their own wall times on a
+`preflight_legs` stage, and the title store prepares are cached.
+
 - **The warm-mount liveness gate now probes the page before redoing (the [11.178] adaptive arm).**
   The fixed 1.0 s bridge-silence deadline fired INSIDE the load-dependent warm-eval stall
   (~0.7-1.0 s quiet, unbounded churned), so a spawn whose mount was merely stalled paid a

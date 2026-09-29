@@ -844,7 +844,7 @@ fn start_page_row_context(row: &BrowserRow) -> String {
 #[component]
 fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let palette = snapshot.palette;
-    let all_sidebar_rows = state.read().all_sidebar_rows_for_selection();
+    let all_sidebar_rows = state.read().all_sidebar_rows_for_selection_for("startpage");
     let ordered_rows =
         start_page_recent_rows_from_browser_rows(snapshot.as_ref(), &all_sidebar_rows);
     let ordered_count = ordered_rows.len();
