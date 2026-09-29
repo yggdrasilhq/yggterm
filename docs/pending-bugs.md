@@ -216,61 +216,6 @@ RESIDUE (named, owner-gated through [11.165]): Gate B's store arm cannot CLOSE a
 
 **THE [11.165] COMPLETION IS LANDED (2026-09-29 ~23:0x IST, zcode on jojo, work FROM dev; claim ACK-aec7fcafae, lane/integration/11165-three-valued-exists, commit cb3d919d):** the wire verb `<slug>-session-exists` now answers THREE-VALUED — a `definitive` bit rides alongside the UNCHANGED bool (codex+CC readers are definitive whenever they answer Ok; Antigravity is definitive exactly when its three-valued db read — the [11.190] read — answers; every other kind, and every peer binary older than the field, parses as NOT definitive, the safe reading). The [11.213] remount worker's store arm asks the three-valued fetch: a definitive miss keeps the [11.155] CLOSE, a definitive hit vouches, and the fail-open shape — the exact answer that used to vouch the corpse — now falls through to the strict alive verb, whose NO is the healable refusal + teardown, NEVER the close (no birth-rewrite hazard). The shared bool predicate keeps its fail-open semantics for the birth composition and the rebind rebuild vouch (the owed-design law stands); transport errors keep the Q4 backoff. Source-scan pins: the Unknowable arm asks the alive verb and can neither vouch nor close on its own; parse fixtures pin all four wire shapes. THE FALSIFIER ships as `scenario_stillborn_resume_corpse_closes_11165` in tools/e2e/connection_probe.py — the stillborn-resume corpse born the cheap way (the stored-session open on a store-absent id; the hung store-bind wrapper IS the corpse's still_running truth), re-mounts inside the alive window (the bind wait is nondeterministic — the falsifier re-verifies the shape per attempt because a dissolved shape takes the RESTART arm and the gate never runs). RED ON RECORD on the pre-fix daemon (this sitting, twice by hand — uuids 11165rb-a05d0028 and 11165r2-0b734b43 — and once by the shipped scenario): the peer answers `agy-session-exists` exists:true on the SAME corpse where `agent-runtime-alive` says alive:false, and the worker answers `remount_peer_liveness_verdict {instrument: null, vouched: true}` — one fail-open silencing the gate for the row's lifetime. THE GREEN rides this lane's deployed daemon: mount verdict `peer_store_gone`, spend `remote_reuse_closed_peer_dead_remount`, the row leaving the live set, and no `daemon_owned_fast_ready_on_first_meaningful_output` — this entry's green line lands in the follow-up docs commit once measured on the deployment.
 
-## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Filed 2026-09-29 (zcode row 11.206, work FROM dev; plan ACK-8cc045fa8a).
-Two mechanical defects, one jam:
-
-1. RESURRECTION: a24d5d9a deleted [11.203] with the live proof; the
-uxspeed close-latency docs commit bf576134 was based on PRE-deletion
-main, still carried the entry text, and `git log -S "OPENCODE TITLE READ
-GOES SILENT"` names bf576134 as the re-add. The delete-on-main vs
-carried-text-on-lane merge is TEXTUALLY CLEAN (different hunks), so a
-green tick would publish the dead entry. Re-deleted in this lane.
-
-2. RED-GATE DECODE KILL: the gate's own error printer truncates the
-offending heading at a BYTE boundary — the [11.204] print ended
-`~0.5 s \xe2` (a bare em-dash lead byte) — and ygg-ci.py's step runner
-(`Popen(text=True)` with no encoding) decodes the gate's stderr with the
-locale codec and dies: `'utf-8' codec can't decode byte 0xe2 in position
-188`, three ticks in a row (08:49, 08:54 build, 08:59), no deploy since
-07:50. The 09-14 [11.112] class, second occurrence. Fix direction: the
-gate truncates by CHARACTERS (decode before slicing), the step runner
-pins `encoding="utf-8", errors="replace"` so no gate output bytes can
-ever kill a tick. The [11.204] status-line jam that tripped the red gate
-is fixed in this lane too.
-
-⇒ Fix direction (ygg-ci): a tombstone check in the docs gate (refuse a
-tick whose merge re-adds a `## ⛔ [id]` heading the origin/main parent
-had deleted); the two decode hardenings above. Lane-side hygiene until
-then: rebase on origin/main BEFORE editing pending-bugs; keep status
-lines inside the closed vocabulary.
-
-LANDED — both halves FIXED IN CODE (2026-09-29 ~21:1x-22:0x IST, zcode
-sess_a1337d0a on jojo, work FROM dev; claim ACK-02f611e54f,
-lane/tools/11207-tombstone-gate). Decode half: 46bdef19 on main (the
-gate drops the awk byte-precision — the full heading prints, always
-valid UTF-8; ygg-ci.py pins encoding="utf-8", errors="replace" on the
-step runner). Tombstone half: c316f7a0, scripts/check-docs-ssot.sh
-section 2c — an id present in the tree but absent from origin/main,
-whose `## ⛔ [id]` heading line main's history ever carried
-(`git log -G` on the heading), is a resurrection: RED naming the id and
-the newest heading-touching commit; non-numeric bucket ids scoped out;
-a stale origin/main merely skips the question at commit time (the tick
-fetches fresh and is the plane that publishes). PROOF: RED on re-added
-[11.214] (names b3790486) and re-added [11.203] (names 23c571a7, the
-ghost re-deletion itself); GREEN on clean main; GREEN on a fresh id.
-Section 2d: the id-uniqueness dream (ACK-aad3de4a80) measured against
-the live queue and NOT gated — reuse is established practice (11.0 x8,
-6.7 x11, 99.1 x7, 18 groups); the ok line reports the count information-
-ally and the one-id-one-defect ruling stays with the owner. Live proof
-owed: the integrating tick runs the new gate green and deploys it; the
-entry then leaves under the verified-fix law.
-
-
-
 ## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN at the WebKitGTK layer — spawn cost FIXED IN CODE by the warm-eval liveness gate; rig recipe + dispatch-stamp recipe included)
 
 **Status:** OPEN
