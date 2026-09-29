@@ -190,7 +190,9 @@ fn terminal_grid_is_usable_cells(cols: u64, rows: u64) -> bool {
 /// changes in ANY way: the probe gates the warm path on the exact version, so
 /// a bumped version merely reinstalls (one cold parse), while a stale fn
 /// serving a changed body would be a silent semantic drift.
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 1;
+// [11.178] Bumped 2026-09-29: the invoke sites stamp __yggtermMountAttempt
+// and the body gained the attempt guard (entry / host_ready / pre_construct).
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 2;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -258,8 +260,13 @@ fn terminal_mount_params_json(
 /// version-probed) mount function. Parsing this is what a felt switch pays
 /// where it used to parse the whole body.
 fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
+    // [11.178] The invoke stamps its attempt AT INVOKE TIME and passes it as
+    // an argument: a stalled instance that resumes after the redo-cold bumped
+    // the counter still carries its OWN stamp and aborts at the body's entry
+    // guard instead of registering over the fresh mount (the stale closure
+    // used to win the host last-writer-wins via its ownerToken).
     format!(
-        "window.__yggtermMountParams = {mount_params_json};\n        await window.__yggtermMountFn();"
+        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
     )
 }
 
@@ -384,7 +391,7 @@ fn terminal_eval_script_with_canvas_renderer(
     format!(
         r#"window.__yggtermMountParams = {mount_params_json};
         window.__yggtermMountFnV = {TERMINAL_MOUNT_FN_VERSION};
-        window.__yggtermMountFn = async () => {{
+        window.__yggtermMountFn = async (__yggAttempt) => {{
         const __mp = window.__yggtermMountParams || {{}};
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const hostId = String(__mp.hostId || "");
@@ -402,6 +409,22 @@ fn terminal_eval_script_with_canvas_renderer(
                 terminalDioxusSend(payload);
             }}
         }};
+        // [11.178] ATTEMPT GUARD. The invoke site stamps
+        // __yggtermMountAttempt and passes it as an argument; a mount whose
+        // attempt was superseded (the redo-cold after a liveness-gate
+        // vanish) aborts BEFORE it can wait out the bootstrap, construct, or
+        // register its ownerToken over the fresh mount.
+        const __yggAttemptStamp = (typeof __yggAttempt === "number")
+            ? __yggAttempt
+            : (window.__yggtermMountAttempt || 0);
+        const __yggAttemptSuperseded = () => (
+            window.__yggtermMountAttempt !== undefined
+            && window.__yggtermMountAttempt !== __yggAttemptStamp
+        );
+        if (__yggAttemptSuperseded()) {{
+            sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=entry stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
+            return;
+        }}
 {trace_emitter_js}
 {frame_hash_probe_js}
 {terminal_frame_cache_js}
@@ -1044,6 +1067,10 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} mounted after wait` }});
         }}
+        if (__yggAttemptSuperseded()) {{
+            sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=host_ready stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
+            return;
+        }}
         paintNoteHostReady();
         const ensureXtermAssets = async () => {{
             window.__yggtermXtermBootstrapError = null;
@@ -1376,6 +1403,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 break;
             }}
             await sleep(20);
+        }}
+        // [11.178] Last await before the synchronous construct->register
+        // tail: a stale instance that resumes here aborts BEFORE it can
+        // construct a term into the host or register over the fresh mount.
+        if (__yggAttemptSuperseded()) {{
+            sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=pre_construct stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
+            return;
         }}
         const initialMetrics = hostMetrics();
         sendTerminalEvent({{
@@ -13287,7 +13321,11 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }}
         }};
-        await window.__yggtermMountFn();
+        // [11.178] The cold installer is the redo: its bump supersedes every
+        // prior attempt, so a late-resuming warm instance aborts at its entry
+        // guard instead of fighting this one for the host.
+        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;
+        await window.__yggtermMountFn(window.__yggtermMountAttempt);
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,
         frame_hash_probe_js = FRAME_HASH_PROBE_JS,
