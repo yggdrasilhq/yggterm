@@ -2836,6 +2836,10 @@ dioxus.send(out);
                 srv = [e for e in in_win
                        if e.get("component") == "server"
                        and e.get("name") in ("resize", "resize_noop")]
+                blocks = [self._nested(e).get("gap_ms") for e in in_win
+                          if e.get("name") == "block"]
+                crawls = sum(1 for e in in_win
+                             if e.get("name") == "selection_crawl")
                 out["iterations"].append({
                     "drive_to_commit_ms": (commit["ts_ms"] - t0)
                     if commit else None,
@@ -2863,6 +2867,10 @@ dioxus.send(out);
                     .get("geometry_usable") if paint else None,
                     "daemon_resize_wait_ms": daemon_us or None,
                     "server_resize_events": len(srv),
+                    "ui_block_gaps_ms": ([int(g) for g in blocks
+                                          if isinstance(g, (int, float))]
+                                         or None),
+                    "selection_crawls": crawls or None,
                     "instrument_live": instrument_live,
                     "accuracy_failures": acc,
                 })
