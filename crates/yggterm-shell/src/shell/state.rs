@@ -46342,7 +46342,7 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
     // cheap to synthesize exactly — the fold store keys on full_path — so
     // answer with it here rather than paying the full merge rebuild the
     // [11.114] cold-drag arm measured at seconds on the UI thread.
-    if let Some(row) = synthesize_remote_folder_group_row(session_path) {
+    if let Some(row) = synthesize_remote_folder_group_row(shell, session_path) {
         return Some(row);
     }
     if let Some(row) = synthesize_app_control_row(shell, session_path) {
@@ -46390,13 +46390,27 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
 /// `append_remote_folder_rows` draws (kind Group, folder-basename label,
 /// host label = machine key, session_cwd = the real folder path).
 ///
-/// ⭐ `expanded` reads TRUE unconditionally — the app-control convention, not
-/// a guess: rows resolved for app control are drawn with every set open, so
-/// `set_app_control_row_expanded`'s `row.expanded == expanded` short-circuit
-/// never swallows a request, and the real fold state lives in the collapse
-/// store the setter toggles (`toggle_virtual_group` — the row is synthetic
-/// by `is_synthetic_sidebar_row_path`).
-fn synthesize_remote_folder_group_row(session_path: &str) -> Option<BrowserRow> {
+/// ⭐ `expanded` carries the folder's REAL fold state
+/// (`browser.expanded_path_set()`), not a drawn-open convention: a Group row
+/// reaches `set_app_control_row_expanded`'s `row.expanded == expanded`
+/// short-circuit BEFORE the toggle, so a forced true would swallow every
+/// EXPAND request as a no-op (live-proven 2026-09-29: open-on-shut left the
+/// store untouched) and invert every COLLAPSE request into an expand. The
+/// real state makes all four request×state cases behave exactly like the
+/// hand's chevron on the rendered row — whose flag is the same store
+/// membership (`append_remote_folder_rows`: `expanded_paths.contains`).
+fn synthesize_remote_folder_group_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
+    synthesize_remote_folder_group_row_with_state(
+        session_path,
+        shell.browser.expanded_path_set().contains(session_path),
+    )
+}
+/// The path-shaping core, `expanded` parameterized so the fold-state law is
+/// testable without a running GUI.
+fn synthesize_remote_folder_group_row_with_state(
+    session_path: &str,
+    expanded: bool,
+) -> Option<BrowserRow> {
     let rest = session_path.strip_prefix("__remote_folder__/")?;
     let (machine_key, folder) = rest.split_once('/')?;
     // The wire format is `__remote_folder__/{machine_key}{abs_path}` — the
@@ -46420,7 +46434,7 @@ fn synthesize_remote_folder_group_row(session_path: &str) -> Option<BrowserRow> 
         depth: folder_path.split('/').filter(|s| !s.is_empty()).count(),
         host_label: machine_key.to_string(),
         descendant_sessions: 0,
-        expanded: true,
+        expanded,
         session_id: None,
         session_cwd: Some(folder_path.to_string()),
         session_kind: None,
