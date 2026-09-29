@@ -13041,7 +13041,23 @@ impl YggtermServer {
         // rows could never be re-opened: the veto silently ate the ensure's
         // insert, the ensure still answered Ok, and the handler's
         // terminal-ensure died later on the generic `no terminal spec` paint.
-        let deliberate_reentry = require_existing && saved_session_exists;
+        // THE [11.206] FRESH-START RE-ENTRY: a clicked row whose saved
+        // session is store-absent (the definitive miss the gate below used to
+        // bail on) is a DELIBERATE open — the owner clicked the row. Without
+        // this the fallthrough would trade the refusal frame for a silent
+        // `live_session_birth_vetoed_closed_row` (the birth veto reads the
+        // remembered close; deliberate_birth false means the insert is eaten)
+        // and the row would paint nothing all the same.
+        let agy_fresh_start_reentry = require_existing
+            && !live_runtime_held
+            && remote_require_existing_needs_definitive_vouch(kind)
+            && self
+                .user_home
+                .as_deref()
+                .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, session_id))
+                == Some(false);
+        let deliberate_reentry =
+            require_existing && (saved_session_exists || agy_fresh_start_reentry);
         if !picker_fallback
             && remote_require_existing_refusal_allowed(
                 live_runtime_held,
@@ -13059,17 +13075,30 @@ impl YggtermServer {
         // the ensure composed `agy --conversation <id>` for an id the store
         // provably lacks and the CLI painted its fabrication warning into a
         // fresh PTY under `--require-existing`.
-        if !live_runtime_held
-            && remote_require_existing_needs_definitive_vouch(kind)
-            && remote_require_existing_definitive_miss_refuses(
-                kind,
-                require_existing,
-                self.user_home
-                    .as_deref()
-                    .and_then(|home| local_agent_store_vouches_for_session_in(home, kind, session_id)),
-            )
-        {
-            anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
+        //
+        // ⛔ THE [11.206] FRESH-START FALLTHROUGH — the gate no longer bails.
+        // The [11.190]/[11.193] compose DIRECTLY BELOW already answers the
+        // definitive miss the honest way: a MINTED, BOUND fresh conversation
+        // (no doomed resume selector, named on the row), so the bail only
+        // dead-ended the owner's click in an error frame — the measured
+        // 14 ms ensure, no launch (row 41e5733d, 2026-09-29). The
+        // anti-fabrication law is untouched: nothing resumes the absent id.
+        // Stray `resume-<slug> --require-existing` calls keep the refusal at
+        // the WRAPPER gate (e2ddee1a); everything that reaches this ensure is
+        // a row-open.
+        if agy_fresh_start_reentry {
+            if let Some(home) = self.yggterm_home.clone() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "remote_runtime",
+                    "ensure_definitive_miss_fresh_start",
+                    json!({
+                        "session_id": session_id,
+                        "policy": "the click opens: a store-absent saved session fresh-starts minted and bound ([11.190]), never a dead frame ([11.206])",
+                    }),
+                );
+            }
         }
         if saved_session_exists {
             let mut external_processes =
@@ -13450,6 +13479,12 @@ impl YggtermServer {
                         "the store definitively lacks {session_id}; started a new conversation (the prior one is recoverable from the store if it exists)"
                     ),
                 );
+                // THE [11.206] SCAR CLEAR: the sticky "Saved Session: missing"
+                // mark describes the OLD id; a minted fresh start is exactly
+                // the boundary the clear exists for — leaving it armed would
+                // keep the launch-blocked reason pointed at the NEW
+                // conversation (a verdict that outlives its condition).
+                clear_missing_saved_remote_live_session(session);
             }
             if let Some(cwd) = target.cwd.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -19472,7 +19507,10 @@ mod restored_runtime_repair_tests {
         // [11.165]: the shared predicate stays fail-open (the ensure's birth
         // composition and the rebind's rebuild vouch read it); the refusal
         // lives at the wrapper gate and its peer-side twin, behind the cheap
-        // fabricator predicate, on the three-valued vouch alone.
+        // fabricator predicate, on the three-valued vouch alone. [11.206]:
+        // the ensure twin's bail became the fresh-start fallthrough — the
+        // gate is still HERE (the signal + the [11.190] compose it feeds),
+        // only the dead frame is gone.
         let source = include_str!("lib.rs");
         let predicate = source_body_after(source, "fn remote_saved_agent_session_exists(");
         let agy_arm = predicate
@@ -61283,13 +61321,78 @@ mod remote_scan_lock_wait_tests {
 mod agy_connection_tests {
     use super::*;
 
+    /// THE [11.206] FRESH-START FALLTHROUGH AS A LAW (row 41e5733d,
+    /// 2026-09-29: wrapper fallthrough → tombstoned-candidate refusal → the
+    /// ensure's definitive-miss gate BAIL — 14 ms, no launch, dead frame).
+    /// Four source-shape locks: the gate falls through (no bail at that
+    /// site), the fallthrough is traced, the fresh-start re-entry feeds
+    /// deliberate_reentry (the birth veto must not eat the insert), and the
+    /// missing-mark scar clears when the fresh start lands.
+    #[test]
+    fn the_ensure_definitive_miss_gate_falls_through_to_the_fresh_start_compose() {
+        let source = include_str!("lib.rs");
+        // concat! keeps the bare anchor OUT of this test's own source text:
+        // a source-scan literal here would shadow the definition for every
+        // later `.split(anchor)` in the file.
+        let ensure_anchor = concat!("fn ensure_remote_runtime_", "agent_session(");
+        let ensure = source
+            .split(ensure_anchor)
+            .nth(1)
+            .expect("ensure body")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        let gate_at = ensure
+            .find("THE [11.206] FRESH-START FALLTHROUGH")
+            .expect("the fallthrough comment");
+        let gate_end = gate_at
+            + ensure[gate_at..]
+                .find("if saved_session_exists {")
+                .expect("the external-holders block ends the gate");
+        let gate = &ensure[gate_at..gate_end];
+        assert!(
+            !gate.contains("anyhow::bail!(remote_resume_missing_saved_session_error"),
+            "the definitive-miss gate must not bail — the [11.190] compose below serves the click"
+        );
+        assert!(
+            gate.contains("ensure_definitive_miss_fresh_start"),
+            "the fallthrough is traced"
+        );
+        let signal_at = ensure
+            .find("let deliberate_reentry =")
+            .expect("the deliberate-reentry signal");
+        assert!(
+            signal_at < gate_at,
+            "the fresh-start re-entry is decided before the gate it feeds"
+        );
+        assert!(
+            ensure.contains(concat!(
+                "require_existing && (saved_session_exists || ",
+                "agy_fresh_start_reentry"
+            )),
+            "deliberate_reentry covers the fresh-start re-entry (the birth veto must not eat the insert)"
+        );
+        let stamp_at = ensure
+            .find("THE [11.190] HONEST-FRESH-START STAMP")
+            .expect("the fresh-start stamp");
+        let stamp_end = stamp_at
+            + ensure[stamp_at..]
+                .find("if let Some(cwd)")
+                .expect("the cwd stamp ends the fresh-start block");
+        assert!(
+            ensure[stamp_at..stamp_end]
+                .contains("clear_missing_saved_remote_live_session(session);"),
+            "the missing-mark scar clears when the fresh start lands"
+        );
+    }
+
     /// THE [11.184] REPRO AS A LAW (dev 2026-09-27 20:11): a re-birthed row
     /// the store vouches for, whose birth the [11.154] veto used to eat —
     /// the ensure answered Ok for a row it never created, and the handler's
     /// terminal-ensure died later on the generic `no terminal spec` paint.
-    /// Three source-shape locks: the deliberate signal is computed, the
-    /// ensure's insert carries it, and the veto arm branches BEFORE the veto
-    /// return.
+    /// Three source-shape locks: the deliberate signal is computed (extended
+    /// by [11.206] to cover the fresh-start re-entry), the ensure's insert
+    /// carries it, and the veto arm branches BEFORE the veto return.
     #[test]
     fn a_deliberate_reentry_lifts_a_remembered_close_and_a_vetoed_birth_never_answers_ok() {
         let source = include_str!("lib.rs");
@@ -61297,7 +61400,7 @@ mod agy_connection_tests {
         // 1. The signal exists and is exactly require-existing AND
         // saved-session (an addressed open, never a sweep).
         let signal_at = source
-            .find("let deliberate_reentry = require_existing && saved_session_exists;")
+            .find("require_existing && (saved_session_exists || agy_fresh_start_reentry)")
             .expect("the deliberate-reentry signal");
         assert!(
             signal_at
