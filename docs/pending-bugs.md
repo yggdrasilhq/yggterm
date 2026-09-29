@@ -18,6 +18,50 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by zcode sess_16f52090-3bc4-42c4-8c4c-597ffe928092 on jojo,
+work FROM dev; claim ACK-2785828b63. The accuracy twin of the [11.215]/[11.216]
+speed work: the split create's DOM lands atomically in ~130 ms, but only pane
+0 (the focused member) ever reflows its terminal content.
+
+THE TRACE FACTS (battery A n=5 + a manual create, every iteration the same
+shape): member 2 — the hidden-retained member promoted to co-visible pane —
+gets `terminal_mount/bootstrap_reset` +
+`bootstrap_spawn_skipped_inactive_retained_host` at +45 ms and then NOTHING:
+zero `terminal_js` fit/resize/refresh, zero `xterm_paint` events through
++4.9 s. Across the battery: `xterm_fit` reasons pre_restore ×5 + resize ×5 =
+EXACTLY ONE per create (always the focused member), and all 29
+`xterm_forced_refresh` events carry reason=visible_paint (the focused
+member's own mount chain). `create_split_group_from_members` spawns
+`spawn_heal_split_panes` on every create — the machinery that exists for
+exactly this "stale-atlas garble on the co-visible pane(s)" — and NO traced
+heal effect ever lands (no heal events; no non-visible_paint refresh). The
+co-visible pane shows the stale full-width atlas at half width until some
+unrelated trigger repaints it.
+
+ACCURACY CLASS: the sole goal is fast AND accurate — a split that lands a
+squashed/stale pane fails the bar at any speed. The probe cannot see it
+today: its accuracy asserts are DOM-rect-level.
+
+FALSIFIER: on a rotated build with the render-span instrument, BOTH members
+emit `split/render_span` per create with the co-visible member's span within
+~2 frames of the focused member's, and uxprobe split gains a content
+assertion (a read-buffer marker emitted per member pre-split must be visible
+in BOTH panes post-create), 5/5, 0 rows left behind. Visual proof owed:
+compositor capture was refused 3× on the probe-only desktop
+(tao_focused=false kwin_active=false even under force-foreground + grid
+click) — the stale-atlas sight is asserted from the event families, not yet
+seen.
+
+FIX DIRECTION (named, NOT taken): the `skipped_inactive_retained_host`
+branch treats the pane-embedded retained surface as still hidden. The split
+commit promotes member 2 to visible — the mount decision should see that
+(before the skip), or the heal's forced refresh must fire for the co-visible
+member (today: for neither).
+
 ## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
 
 **Status:** OPEN
@@ -109,6 +153,38 @@ structurally), NOT the tail and NOT an epoch bump. NEXT LEVER: a render-span
 trace around the split commit naming the compound re-render's legs (the
 [11.172]/[11.173] retention makes the member's pane re-mount hot; the
 reclaim is already out of the window — the re-render is not).
+UPDATE 2 2026-09-29 ~20:3x IST (split-commit-render-span lane, claim
+ACK-2785828b63; zcode sess_16f52090 on jojo, work FROM dev): THE NAMED NEXT
+LEVER DISCHARGED — the render-span trace around the split commit LANDED
+(lane/uxspeed/split-commit-render-span d4f33fa9, ygg-ci merged 8e712270,
+deployed + GUI rotated 19:4x IST): `split/render_span
+{group_id, session_path, commit_to_pane_paint_ms, pre/post grid}` — armed at
+the split/create commit (process-global anchors, NOT ShellState — the
+consumer is the terminal loop's Paint arm; lock-and-remove, never a signal
+write inside the paint path), consumed ONCE per member at the first
+post-commit grid-change paint. uxprobe split joins them per iteration
+(`render_span_max_ms` + `render_spans`).
+
+THE LEGS, NAMED (quiet battery A on 8e712270cd71, floors 63 cli / 178 gui,
+drift ≤+55; n=5, accuracy 5/5, 0 rows left behind): the FOCUSED member runs
+a FULL terminal_mount chain on an ALREADY-MOUNTED, epoch-reused surface —
+`terminal_mount/begin` +119 ms after commit → `mount_eval_warm` +
+`mount_epoch_reused` +221 → `ensure_end` +506 (285 ms warm eval) →
+**`warm_eval_vanish_redo_cold` +924 (+418 ms)** → `xterm_fit`
+reason=pre_restore +1035 → `xterm_resize` + **`split/render_span`
+commit_to_pane_paint_ms=1041** (range 1041-1146, p50 1066) → forced refresh
+visible_paint +1084 → attach_ready +1114. The pane's CONTENT reflow is
+~1.05 s behind a ~130 ms DOM stamp — `mount_epoch_reused` says the remount
+was never needed; the element re-creation (pane embedding) runs the whole
+mount pipeline anyway, and the warm eval VANISHES and redoes cold. Felt DOM
+p50 141 (127-461) — the [11.216] post-fix band holds (130.5); the
+two-phase column read 516-712 on the SAME iterations, re-confirming the
+instrument-half reading (and the split-ungroup close's 545-755 observation
+was this same two-phase metric). Under the owner's parallel cli-integration
+load (battery B, floors still quiet 65/175): felt p50 302, spans 1270-2560 —
+the documented sibling-storm pattern, not a regression. NEXT LEVER (GUI
+shell): short-circuit the mount chain when `mount_epoch_reused` and the
+surface is live — the split restructure should re-parent + fit, not remount.
 
 
 ## ⛔ [11.213] THE GUI RECOVERY DOOR LAUNDERS A HANDOVER-DEAD REMOTE ROW — EVERY RE-MOUNT READS THE STALE RETAINED BUFFER, CALLS IT LIVE OUTPUT, AND RE-ARMS THE RESIZE BURN (measured 2026-09-29 ~14:13-14:35 IST, live jojo, the [11.57] tombstone lane)
