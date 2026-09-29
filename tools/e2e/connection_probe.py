@@ -181,6 +181,20 @@ def live_holder_pids(cwd):
     return pids
 
 
+def daemon_identity():
+    """The (pid, build) of the default daemon — the rotation guard baseline.
+    During an active merge wave the ygg-ci tick rolls the host daemon every
+    few minutes; a scenario that straddles a swap is not evidence (its row
+    and its close can land in different daemons)."""
+    answer = yggterm(["server", "daemons"], timeout=30)
+    for line in answer.stdout.splitlines():
+        if line.strip().startswith("*"):
+            parts = line.split()
+            if len(parts) >= 3:
+                return (parts[1], parts[2])
+    return None
+
+
 def reap(key, cwd=None):
     """Close the row the way the click path does, then evict the corpse record.
 
@@ -198,7 +212,16 @@ def reap(key, cwd=None):
     dies from the master drop a few hundred ms LATER. A scan at T+0 counts a
     dying holder as a survivor — measured 2026-09-29: `closed terminal runtime`
     with the pair gone 3 s later, while a T+0 scan named two live pids."""
-    yggterm(["server", "remove", key], timeout=60)
+    # yggterm() already prepends `server` -- a bare [server, remove, ...]
+    # here became `server server remove` and the close NEVER ran (rc=1,
+    # "unsupported server command: server"), which re-created the exact
+    # never-closed-row shape the [11.195] assert exists to catch.
+    answer = yggterm(["remove", key], timeout=60)
+    close_message = (
+        "rc=" + str(answer.returncode)
+        + " out=" + answer.stdout.strip()[:150]
+        + " err=" + answer.stderr.strip()[:150]
+    )
     post_close = []
     if cwd is not None:
         deadline = time.monotonic() + 5.0
@@ -216,7 +239,7 @@ def reap(key, cwd=None):
                 run(["kill", "-9", str(pid)], timeout=30)
             time.sleep(1.0)
     yggterm(["rows", "despawn", key], timeout=60)
-    return post_close
+    return post_close, close_message
 
 
 def poll_until(fn, deadline_s, interval_s=3.0):
@@ -636,17 +659,23 @@ def scenario_defmiss_fresh_start_mint():
         # THEN rows despawn evicts the corpse record. THE [11.195] LAW,
         # asserted: the close itself must leave no live CLI holder — a
         # survivor orphans into the resume's holder wait.
-        post_close_holders = reap(key, cwd)
+        daemon_at_birth = daemon_identity()
+        post_close_holders, close_message = reap(key, cwd)
         if post_close_holders:
-            return sc.fail(
-                f"the close left live CLI holders {post_close_holders} — the "
-                "[11.195] no-live-holder-survives-into-the-resume law is broken "
-                "(escalation-killed for the record; the mint leg stays red until "
-                "the close kills its own CLI)"
+            rotated = daemon_identity() != daemon_at_birth
+            invalid = (
+                " — INVALID RUN: the daemon rotated mid-scenario, the row "
+                "and its close landed in different daemons"
+                if rotated
+                else ""
             )
-        # 4. The store surgery: the cwd's conversation leaves the store, so
-        # the candidate search answers None — the vouch has nothing to serve
-        # and the definitive miss falls through to the mint.
+            return sc.fail(
+                f"the close left live CLI holders {post_close_holders} \u2014 the "
+                "[11.195] no-live-holder-survives-into-the-resume law is broken "
+                f"(close said: {close_message!r}; escalation-killed for the "
+                "record; the mint leg stays red until the close kills its own "
+                f"CLI{invalid})"
+            )
         removed = db_delete_conversations_for_dir(str(cwd))
         # 5. The click — the same verb chain a GUI row-open drives: wrapper
         # gate (passes: the close IS remembered) -> ensure (definitive miss,
