@@ -674,10 +674,14 @@ def scenario_defmiss_fresh_start_mint():
             return sc.fail(f"refusal painted on the row screen: {text[:300]!r}")
         alive = screen_ok(key)[0]
         if alive:
+            # ⛔ THE ARM IS NAMED OR THE VERDICT IS WORTHLESS (measured
+            # 2026-09-29, the [11.213] grind): this branch fired three times
+            # with the wrapper's stderr hidden, and each read-through of the
+            # trace re-derived by hand what one stderr dump would have said.
             return sc.fail(
                 "CLI on screen but NO ensure_definitive_miss_fresh_start trace — "
                 "the row connected through some other arm; the mint falsifier "
-                "stays unexercised"
+                f"stays unexercised (wrapper exit={proc.poll()} stderr={refused_stderr[:400]!r})"
             )
         return sc.fail(
             "no CLI after 150s and no named refusal — stderr="

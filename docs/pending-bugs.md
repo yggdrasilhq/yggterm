@@ -37,9 +37,60 @@ FIX DIRECTION (owner call wanted — real liveness ask vs amber-naming; this is 
 
 Falsifier: a remote row whose peer runtime is gone (handover class) re-mounts and within one cycle emits a LIVENESS verdict naming the peer dead (new event, or the [11.158] alive-ask's false arm surfaced on the re-mount path) — and `daemon_owned_fast_ready_on_first_meaningful_output` stops firing for that row until a real birth or a real adopt. Today's baseline (the lie, live): reveal_ready + fast_ready fire on every re-mount while dev answers not-found — reproducible from the [11.57] entry's live specimen.
 
+## ⛔ [11.214] THE DESPAWN KILL FAILS ON A TRUST-PROMPT AGY BIRTH, AND THE RESUME FLOW RE-RESTORES THE PERSISTED ROW AHEAD OF THE ENSURE — THE [11.206] MINT ARM IS BYPASSED (live_runtime_held wins over the definitive-miss fallthrough) AND THE MINT FALSIFIER CANNOT REACH GREEN (measured 2026-09-29 ~15:0x-16:1x IST, live jojo daemon 9bf0346113c4, the 11.212 close-out falsifier)
+
+**Status:** OPEN
+
+Filed 2026-09-29 by seat 11.212 (zcode sess_9d7a1aab on jojo, work FROM dev;
+plan ACK-24de60e697) running scenario defmiss_fresh_start_mint_11206 against
+the [11.212] gate build. Three runs, all the same shape:
+
+MEASURED: (1) the birth's agy CLI sits at the "> Yes, I trust this folder"
+prompt (composer_draft_union carries the draft; a plain-launch birth mints
+nothing until trust), and `rows despawn` records the remembered close but
+FAILS TO KILL the CLI — three orphan `agy --dangerously-skip-permissions`
+processes survived minutes past their despawns (ps, killed by hand), and the
+draft kept polling after the despawn (trace 1790674413085 > despawn).
+(2) `remote resume-agy <id> <cwd> --require-existing` then fires a
+`daemon restore` for the row (trace 1790674413397, from_scheme
+agy-runtime://, id_origin cli — restore_live_session at the persisted record)
+387ms BEFORE the ensure: the row re-enters the sessions map, so the ensure's
+`live_runtime_held` is TRUE and the [11.206] definitive-miss fallthrough —
+which requires `!live_runtime_held` — never runs. The held-row resume arm
+composes a resume of the store-absent requested id; the reuse check keeps the
+orphan's PTY (`reuse_check keep_alive_runtime:true has_runtime_output:true`);
+rows show wears the requested id; no mint trace. The [11.212] gate is not in
+this causal chain — it correctly refuses the launch-path repair on every tick
+throughout.
+
+⇒ TWO halves to fix, each falsifiable: (a) the despawn kill must take a
+trust-prompt CLI (terminate path + process-tree shape at the prompt — the
+[11.195] law "no live holder survives into the resume" is broken for this
+shape); (b) restore_live_session must not re-hold a row whose close is
+remembered until an ARMED open actually evaluates (the tombstone must veto
+the CLI-handshake restore the same way it vetoes passive births), or the
+ensure must evaluate the definitive miss BEFORE the persisted restore can
+re-hold the row. PROBE: scenario defmiss_fresh_start_mint_11206 GREEN —
+ensure_definitive_miss_fresh_start traced AND rows show re-pointed — after a
+despawn whose kill provably landed (no agy process, no external holder).
+
 ## ⛔ [11.212] THE [11.190]/[11.193] MINTED-BOUND FRESH START NEVER REACHES THE ROW ON THE [11.206] CLICK PATH — THE FALLTHROUGH SERVES THE CLICK (trace + deliberate re-entry + live row, GREEN) BUT THE SPAWNED COMMAND RESUMES THE ABSENT REQUESTED ID AND THE FRESH-START STAMP + [11.193] RE-POINT NEVER LAND (measured 2026-09-29 ~12:3x-14:1x IST, live jojo daemon bfe5ed19, the 11.211 mint-arm falsifier lane)
 
 **Status:** OPEN
+
+FIXED AND LIVE-PROVEN 2026-09-29, the stomp half (the mint-arm gate, lane
+7f1af593, merged 9bf03461): the repair's probe arm now asks the same
+three-valued vouch the ensure compose asks; a DEFINITIVE miss refuses the
+repair (`restored_codex_runtime_launch_repair_refused_definitive_miss`) and
+the minted fresh-start compose + [11.193] re-point + stamp survive to the
+spawn. Unit regression `a_minted_fresh_start_is_never_repaired_back_onto_the
+_absent_id` + stand-down positive control green; LIVE-PROVEN on jojo
+9bf0346113c4: the same launch path that stamped the resume over the mint on
+bfe5ed19 (trace 1790667829622) now answers the refusal on every tick
+(1790673039751, 1790673041246, 1790673045034, 1790674415561+). The scenario
+defmiss_fresh_start_mint_11206 is still RED end to end, but the RED has
+MOVED: the mint arm is bypassed BEFORE the ensure by the new [11.214] — not
+by a stomp.
 
 Filed 2026-09-29 by seat 11.211 (zcode sess_7c1d3a84 on jojo, work FROM dev;
 plan ACK-3d14c74cb5) running the [11.206] falsifier the 11.209 door queued:
@@ -153,7 +204,7 @@ require-existing click: trace `ensure_definitive_miss_fresh_start` +
 frames (3/3 runs on daemon bfe5ed19). The BINDING half measured RED (the
 minted-bound [11.190]/[11.193] compose never reached the row — the spawned
 command resumed the absent requested id) and is filed as [11.212]; this
-entry stays until [11.212] lands and the scenario goes green end to end.
+entry stays until [11.212] lands and the scenario goes green end to end — the [11.212] STOMP half has LANDED and is live-proven (the mint-arm gate, 9bf03461) but the scenario is still RED through the NEW [11.214] (despawn kill + persisted-restore re-hold bypass the mint arm); [11.206] closes when the scenario goes green.
 
 ## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
