@@ -836,6 +836,72 @@ static TERMINAL_LOOP_REMOUNT_SPEND: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (u32, u64)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// ⛔ THE [11.204] CLOSE WAKE-CHAIN — apply-order plane. The RemoveSession arm
+/// completes its response on a dedicated worker thread (the verb must not wait
+/// for the main-thread pump, which queues behind the dying active surface's
+/// teardown storm, ~1.3 s per await boundary — measured by the uxspeed
+/// close-latency lane, fix direction endorsed in the [11.204] filing), so its
+/// GUI-state apply floats LATE while the drain loop serves the next requests.
+/// Snapshots must apply in world order: every app-control snapshot apply
+/// claims a sequence number at world-read time, and a floating apply whose
+/// sequence was already superseded skips the snapshot sync (a newer snapshot
+/// carries the removal — the daemon is the SSOT for rows) and only runs the
+/// per-close local bookkeeping. Because stamps are taken when each snapshot
+/// was read from the daemon, close-all's near-simultaneous workers can never
+/// resurrect each other's rows, and a later inline apply never reverts an
+/// earlier one.
+static APP_CONTROL_SNAPSHOT_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Claim the next snapshot-sequence number. Called at WORLD-READ time (the
+/// moment a daemon snapshot answer lands) by both the inline app-control
+/// applies and the close worker thread.
+fn next_app_control_snapshot_seq() -> u64 {
+    APP_CONTROL_SNAPSHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// Sequence number of the newest snapshot APPLIED to the shell state. Written
+/// only on the main scheduler thread (all applies poll there), read by the
+/// floating close apply.
+static APP_CONTROL_APPLIED_SNAPSHOT_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Rows the DAEMON has confirmed removed but whose GUI-state apply has not
+/// landed yet (the floating close apply of the [11.204] wake-chain fix).
+/// `server app rows` filters these so the verb answers the daemon's truth —
+/// the SSOT for rows — within milliseconds of the removal instead of waiting
+/// out the main-thread pump's teardown-storm delay. Entries are removed when
+/// the close's apply reconciles the state, when a removal FAILS verification,
+/// and by TTL so a crashed close worker can never hide a row for long.
+static CONFIRMED_REMOVED_SESSION_PATHS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const CONFIRMED_REMOVED_SESSION_PATH_TTL_MS: u64 = 15_000;
+
+fn confirm_removed_session_path(session_path: &str) {
+    if let Ok(mut confirmed) = CONFIRMED_REMOVED_SESSION_PATHS.lock() {
+        confirmed.insert(session_path.to_string(), wall_now_ms());
+    }
+}
+
+fn retract_confirmed_removed_session_path(session_path: &str) {
+    if let Ok(mut confirmed) = CONFIRMED_REMOVED_SESSION_PATHS.lock() {
+        confirmed.remove(session_path);
+    }
+}
+
+fn confirmed_removed_session_paths() -> std::collections::HashSet<String> {
+    let now = wall_now_ms();
+    let Ok(mut confirmed) = CONFIRMED_REMOVED_SESSION_PATHS.lock() else {
+        return std::collections::HashSet::new();
+    };
+    confirmed.retain(|_, confirmed_at| {
+        now.saturating_sub(*confirmed_at) < CONFIRMED_REMOVED_SESSION_PATH_TTL_MS
+    });
+    confirmed.keys().cloned().collect()
+}
+
 pub(crate) fn bump_terminal_loop_heartbeat(session_path: &str) {
     if let Ok(mut beats) = TERMINAL_LOOP_HEARTBEATS.lock() {
         beats.insert(session_path.to_string(), wall_now_ms());
@@ -30642,6 +30708,11 @@ impl ShellState {
         &mut self,
         result: Result<(ServerUiSnapshot, Option<String>)>,
     ) {
+        // This apply is the newest world read (the [11.204] wake-chain order
+        // plane): claim the sequence AND publish it as the applied frontier so
+        // a floating close apply with an older stamp skips its snapshot sync.
+        let claimed = next_app_control_snapshot_seq();
+        APP_CONTROL_APPLIED_SNAPSHOT_SEQ.store(claimed, std::sync::atomic::Ordering::SeqCst);
         self.apply_snapshot_result_without_request(
             result,
             false,
@@ -30654,6 +30725,9 @@ impl ShellState {
         request_id: &str,
         result: Result<(ServerUiSnapshot, Option<String>)>,
     ) {
+        // Same [11.204] order-plane bump as apply_interactive_snapshot_result.
+        let claimed = next_app_control_snapshot_seq();
+        APP_CONTROL_APPLIED_SNAPSHOT_SEQ.store(claimed, std::sync::atomic::Ordering::SeqCst);
         let was_initial_sync = self.needs_initial_server_sync;
         let previous_active_session = self.server.active_session().cloned();
         match result {
@@ -60929,9 +61003,86 @@ fn app_control_remove_session_pending(
 /// teardown's SIGHUP to its jobs, so a well-behaved child is a few tens of
 /// milliseconds from gone and reporting it as a survivor would be noise. The
 /// loop exits the instant nothing is left, so a clean teardown pays nothing
-/// and a genuinely surviving app is still named within half a second.
+/// and a genuinely surviving app is still named within 125 ms. The interval
+/// is 25 ms since the [11.204] wake-chain fix moved the loop onto the close
+/// worker thread (it used to sit on the UI task at 100 ms and stretch an
+/// active close by up to 500 ms).
+/// The close worker's transport-failure completion ([11.204] wake-chain):
+/// the [11.154] retry budget is exhausted, so the removal did NOT happen.
+/// Answer with the same Err shape the pump used to build (the row stays —
+/// nothing was confirmed), write the response from THIS thread so the CLI
+/// hears the refusal immediately, and keep the trace honest.
+#[allow(clippy::too_many_arguments)]
+fn finish_remove_session_response_err(
+    home: &std::path::Path,
+    inflight_path: &std::path::Path,
+    request_id: &str,
+    session_path: &str,
+    runtime_pid_before: Option<i32>,
+    teardown_census: &[SessionTeardownProcess],
+    stage_t0: std::time::Instant,
+    error: &anyhow::Error,
+) {
+    let response = AppControlResponse {
+        request_id: request_id.to_string(),
+        handled_by_pid: std::process::id(),
+        completed_at_ms: current_millis() as u128,
+        output_path: None,
+        data: Some(json!({
+            "accepted": false,
+            "verified": false,
+            "session_path": session_path,
+            "runtime_process_id": runtime_pid_before,
+            "live_processes": session_teardown_process_values(
+                &surviving_teardown_processes(teardown_census),
+            ),
+        })),
+        error: Some(error.to_string()),
+    };
+    append_trace_event(
+        home,
+        "ui",
+        "app_control",
+        "remove_session_stage",
+        json!({
+            "stage": "round_trip_failed",
+            "session_path": session_path,
+            "ms": stage_t0.elapsed().as_millis() as u64,
+            "plane": "worker",
+        }),
+    );
+    if let Err(complete_error) = complete_app_control_request(home, inflight_path, &response) {
+        append_trace_event(
+            home,
+            "ui",
+            "app_control",
+            "worker_response_complete_failed",
+            json!({
+                "request_id": request_id,
+                "error": complete_error.to_string(),
+            }),
+        );
+        return;
+    }
+    let response_data_summary =
+        summarize_app_control_response_data_for_trace(response.data.as_ref());
+    append_trace_event(
+        home,
+        "ui",
+        "app_control",
+        "request_end",
+        json!({
+            "request_id": response.request_id,
+            "handled_by_pid": response.handled_by_pid,
+            "output_path": response.output_path,
+            "data_summary": response_data_summary,
+            "error": response.error,
+        }),
+    );
+}
+
 const SESSION_TEARDOWN_SETTLE_ATTEMPTS: u32 = 5;
-const SESSION_TEARDOWN_SETTLE_INTERVAL_MS: u64 = 100;
+const SESSION_TEARDOWN_SETTLE_INTERVAL_MS: u64 = 25;
 
 /// The processes a session teardown is accountable for: its PTY child plus
 /// every descendant that child fathered.
@@ -64971,14 +65122,46 @@ fn describe_app_rows_snapshot_cached(state: &Signal<ShellState>) -> Value {
             .map(|(_, _, value)| value.clone())
     });
     if let Some(value) = cached {
-        return value;
+        return filter_app_rows_confirmed_removed(value);
     }
     let fresh = describe_app_rows_snapshot(state);
     APP_ROWS_RESPONSE_BUILDS.fetch_add(1, Ordering::Relaxed);
     APP_ROWS_RESPONSE_CACHE.with(|cache| {
         *cache.borrow_mut() = Some((epoch, now, fresh.clone()));
     });
-    fresh
+    filter_app_rows_confirmed_removed(fresh)
+}
+
+/// [11.204] wake-chain: rows the daemon already removed (see
+/// [`CONFIRMED_REMOVED_SESSION_PATHS`]) leave the answer even when the
+/// floating close apply has not caught up. Applied AFTER the epoch memo —
+/// the confirm set changes without a state write, so it must not be cached
+/// under one. Cheap no-op while the set is empty.
+fn filter_app_rows_confirmed_removed(mut value: Value) -> Value {
+    let confirmed = confirmed_removed_session_paths();
+    if confirmed.is_empty() {
+        return value;
+    }
+    if let Some(rows) = value.pointer_mut("/data/rows").and_then(Value::as_array_mut) {
+        rows.retain(|row| {
+            let Some(path) = row.get("full_path").and_then(Value::as_str) else {
+                return true;
+            };
+            !confirmed.contains(path) && !confirmed.contains(&normalize_live_session_path(path))
+        });
+    }
+    if let Some(live) = value
+        .pointer_mut("/data/live_sessions")
+        .and_then(Value::as_array_mut)
+    {
+        live.retain(|session| {
+            let Some(path) = session.get("session_path").and_then(Value::as_str) else {
+                return true;
+            };
+            !confirmed.contains(path) && !confirmed.contains(&normalize_live_session_path(path))
+        });
+    }
+    value
 }
 
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
@@ -89250,68 +89433,104 @@ async fn process_pending_app_control_requests(
                 }),
             );
             let teardown_census = session_teardown_census(runtime_pid_before);
-            let session_path_for_task = session_path.clone();
-            let close_redirect_target_for_task = close_redirect_target.clone();
-            let outcome: Result<(ServerUiSnapshot, Option<String>, Option<String>)> =
-                run_dedicated_interactive_request_io(
-                    "app_control_remove_session",
-                    &home,
-                    move || {
-                        // ⛔ THE [11.154] CLOSE RE-DELIVERY. A close issued while
-                        // the daemon is mid-rotation dies with ONE transport
-                        // error ("reading daemon response", measured
-                        // 2026-09-19 19:17:43) and the close is LOST — no local
-                        // tombstone, no removal, and every later restore or
-                        // client-handshake birth lawfully re-births the row.
-                        // A close is a deliberate user act, so transport-class
-                        // failures are re-delivered onto the successor daemon
-                        // with a bounded budget; the tombstone the successor
-                        // writes first is the shared file that outlives it. An
-                        // ANSWERED request is never retried — the daemon spoke.
-                        let mut attempt: u32 = 0;
-                        let (mut snapshot, message) = loop {
-                            match remove_session(&endpoint, &session_path_for_task, false) {
-                                Ok(answered) => break answered,
-                                Err(error) => {
-                                    attempt += 1;
-                                    let Some(delay_ms) =
-                                        remove_session_retry_delay_ms(&error, attempt)
-                                    else {
-                                        return Err(error);
-                                    };
-                                    std::thread::sleep(std::time::Duration::from_millis(
-                                        delay_ms,
-                                    ));
-                                }
-                            }
-                        };
-                        let mut redirect_error = None::<String>;
-                        if let Some(target) = close_redirect_target_for_task.as_ref()
-                            && let Some(sync_result) =
-                                close_redirect_target_daemon_sync(&endpoint, target)
-                        {
-                            match sync_result {
-                                Ok((redirect_snapshot, _)) => snapshot = redirect_snapshot,
-                                Err(error) => redirect_error = Some(error.to_string()),
+            // ⛔ THE [11.204] CLOSE WAKE-CHAIN. The close-latency seat measured
+            // the active-row close at 3111-3594 ms while an inactive row closes
+            // in 469-612 ms: every completion wake of this handler queues on
+            // the main-thread pump BEHIND the dying active surface's teardown
+            // storm — ~1.3 s per await boundary, deterministically (filed
+            // [11.204]; the fix direction below is the one that filing
+            // endorsed). So the round trip, the teardown settle, the remote
+            // liveness probe, the verdict AND the response completion run on
+            // ONE dedicated worker thread: the waiting CLI is woken by the
+            // worker's response-file write, never by the pump. This arm
+            // returns immediately, so the drain loop keeps serving `rows`
+            // polls and other verbs while the storm runs. The GUI-state apply
+            // floats on a small task; APP_CONTROL_SNAPSHOT_SEQ keeps snapshot
+            // applies in world order, and CONFIRMED_REMOVED_SESSION_PATHS
+            // answers `rows` with the daemon's truth in the meantime.
+            //
+            // Known trade (documented in the lane close): a request taken in
+            // the window between this arm returning and the worker's daemon
+            // answer can apply a snapshot that predates the removal; the
+            // world-order guard then skips the floating apply and the sidebar
+            // row ghosts until the next background merge (self-healing,
+            // seconds). `server app rows` is exact throughout.
+            let session_path_for_worker = session_path.clone();
+            let close_redirect_target_for_worker = close_redirect_target.clone();
+            let home_for_worker = home.clone();
+            let request_id_for_worker = request.request_id.clone();
+            let pending_for_worker = pending.clone();
+            let (apply_tx, apply_rx) =
+                oneshot::channel::<(Option<ServerUiSnapshot>, Option<String>, u64)>();
+            // Spawn-failure fallback keeps its own copies (the worker closure
+            // consumes the originals).
+            let inflight_for_spawn_fail = inflight_path.clone();
+            let census_for_spawn_fail = teardown_census.clone();
+            let worker_spawn = std::thread::Builder::new()
+                .name(format!(
+                    "yggterm-app-control-remove-session-{request_id_for_worker}"
+                ))
+                .spawn(move || {
+                    // ⛔ THE [11.154] CLOSE RE-DELIVERY. A close issued while
+                    // the daemon is mid-rotation dies with ONE transport
+                    // error ("reading daemon response", measured
+                    // 2026-09-19 19:17:43) and the close is LOST — no local
+                    // tombstone, no removal, and every later restore or
+                    // client-handshake birth lawfully re-births the row.
+                    // A close is a deliberate user act, so transport-class
+                    // failures are re-delivered onto the successor daemon
+                    // with a bounded budget; the tombstone the successor
+                    // writes first is the shared file that outlives it. An
+                    // ANSWERED request is never retried — the daemon spoke.
+                    let mut attempt: u32 = 0;
+                    let (snapshot, message) = loop {
+                        match remove_session(&endpoint, &session_path_for_worker, false) {
+                            Ok(answered) => break answered,
+                            Err(error) => {
+                                attempt += 1;
+                                let Some(delay_ms) =
+                                    remove_session_retry_delay_ms(&error, attempt)
+                                else {
+                                    finish_remove_session_response_err(
+                                        &home_for_worker,
+                                        &inflight_path,
+                                        &request_id_for_worker,
+                                        &session_path_for_worker,
+                                        runtime_pid_before,
+                                        &teardown_census,
+                                        close_stage_t0,
+                                        &error,
+                                    );
+                                    let _ = apply_tx.send((None, None, 0));
+                                    return;
+                                };
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                             }
                         }
-                        Ok((snapshot, message, redirect_error))
-                    },
-                )
-                .await;
-            match outcome {
-                Ok((snapshot, message, redirect_error)) => {
+                    };
                     append_trace_event(
-                        &home,
+                        &home_for_worker,
                         "ui",
                         "app_control",
                         "remove_session_stage",
                         json!({
                             "stage": "round_trip_done",
-                            "session_path": session_path,
+                            "session_path": session_path_for_worker,
                             "ms": close_stage_t0.elapsed().as_millis() as u64,
+                            "plane": "worker",
                         }),
                     );
+                    let mut redirect_error = None::<String>;
+                    let mut snapshot = snapshot;
+                    if let Some(target) = close_redirect_target_for_worker.as_ref()
+                        && let Some(sync_result) =
+                            close_redirect_target_daemon_sync(&endpoint, target)
+                    {
+                        match sync_result {
+                            Ok((redirect_snapshot, _)) => snapshot = redirect_snapshot,
+                            Err(error) => redirect_error = Some(error.to_string()),
+                        }
+                    }
                     // A successful ROUND TRIP is not a successful REMOVAL. The
                     // daemon answers Ok while saying "no live session for this
                     // path", and its teardown signals only the PTY child — so
@@ -89324,7 +89543,7 @@ async fn process_pending_app_control_requests(
                     let row_still_listed = snapshot
                         .live_sessions
                         .iter()
-                        .any(|session| session.session_path == session_path);
+                        .any(|session| session.session_path == session_path_for_worker);
                     let mut still_running = surviving_teardown_processes(&teardown_census);
                     let mut settle_attempts: u32 = 0;
                     for _ in 0..SESSION_TEARDOWN_SETTLE_ATTEMPTS {
@@ -89332,98 +89551,68 @@ async fn process_pending_app_control_requests(
                             break;
                         }
                         settle_attempts += 1;
-                        sleep(Duration::from_millis(SESSION_TEARDOWN_SETTLE_INTERVAL_MS)).await;
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            SESSION_TEARDOWN_SETTLE_INTERVAL_MS,
+                        ));
                         still_running = surviving_teardown_processes(&teardown_census);
                     }
                     append_trace_event(
-                        &home,
+                        &home_for_worker,
                         "ui",
                         "app_control",
                         "remove_session_stage",
                         json!({
                             "stage": "settle_done",
-                            "session_path": session_path,
+                            "session_path": session_path_for_worker,
                             "ms": close_stage_t0.elapsed().as_millis() as u64,
                             "attempts": settle_attempts,
                             "survivors": still_running.len(),
+                            "plane": "worker",
                         }),
                     );
-                    // The far side of the hop. A `remote-cc://` / `remote-session://`
-                    // row's agent runs under the OTHER machine's daemon and is
-                    // built to outlive ssh drops, so reaping the local ssh
-                    // client proves nothing about it. Ask the owning machine
-                    // before calling this clean.
-                    //
-                    // OFF the UI thread: this is an ssh round trip, and a
-                    // blocking one on the render loop is a bug in its own right
-                    // (AGENTS.md — synchronous IPC on the UI thread). It costs
-                    // nothing for a local row, which resolves to
-                    // `NotApplicable` without touching the network.
-                    let probe_path = session_path.clone();
-                    let remote_runtime_after = run_dedicated_interactive_request_io(
-                        "app_control_remove_session_remote_liveness",
-                        &home,
-                        move || {
-                            Ok(remote_agent_row_runtime_after_removal(
-                                &remote_machines_for_removal,
-                                &probe_path,
-                            ))
-                        },
-                    )
-                    .await
-                    // A probe we could not even dispatch is unverifiable, which
-                    // is a refusal — never a pass.
-                    .unwrap_or(RemoteRuntimeAfterRemoval::Unverifiable);
+                    // The far side of the hop. A `remote-cc://` /
+                    // `remote-session://` row's agent runs under the OTHER
+                    // machine's daemon and is built to outlive ssh drops, so
+                    // reaping the local ssh client proves nothing about it. Ask
+                    // the owning machine before calling this clean. Costs
+                    // nothing for a local row (resolves to `NotApplicable`
+                    // without touching the network); on THIS thread it cannot
+                    // block the render loop either.
+                    let remote_runtime_after = remote_agent_row_runtime_after_removal(
+                        &remote_machines_for_removal,
+                        &session_path_for_worker,
+                    );
                     append_trace_event(
-                        &home,
+                        &home_for_worker,
                         "ui",
                         "app_control",
                         "remove_session_stage",
                         json!({
                             "stage": "liveness_done",
-                            "session_path": session_path,
+                            "session_path": session_path_for_worker,
                             "ms": close_stage_t0.elapsed().as_millis() as u64,
+                            "plane": "worker",
                         }),
                     );
                     let verdict = verify_session_removal(&SessionRemovalEvidence {
-                        row_was_live: pending.live_session_close,
+                        row_was_live: pending_for_worker.live_session_close,
                         runtime_pid_before,
                         observed_before: &teardown_census,
                         still_running_after: &still_running,
                         row_still_listed,
                         remote_runtime_after,
                     });
-                    let active_session_path = state.with_mut_counted(|shell| {
-                        shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
-                        shell.prune_viewport_history_for_closed_paths(&pending.session_paths);
-                        if let Some(target) = close_redirect_target.as_ref() {
-                            shell.apply_viewport_history_entry_locally(
-                                target,
-                                "app_control_live_session_close_redirect_finished",
-                            );
-                        }
-                        if pending.live_session_close {
-                            shell.prepare_live_session_close_locally(
-                                &pending,
-                                "app_control_live_session_close",
-                            );
-                        }
-                        shell.server.active_session_path().map(ToOwned::to_owned)
-                    });
-                    append_trace_event(
-                        &home,
-                        "ui",
-                        "app_control",
-                        "remove_session_stage",
-                        json!({
-                            "stage": "apply_done",
-                            "session_path": session_path,
-                            "ms": close_stage_t0.elapsed().as_millis() as u64,
-                            "active_session_path": active_session_path,
-                        }),
-                    );
-                    AppControlResponse {
-                        request_id: request.request_id.clone(),
+                    // Claim this snapshot's place in the apply order at
+                    // world-read time (see APP_CONTROL_SNAPSHOT_SEQ).
+                    let snapshot_seq = next_app_control_snapshot_seq();
+                    let active_session_path = snapshot.active_session_path.clone();
+                    if verdict.verified {
+                        confirm_removed_session_path(&session_path_for_worker);
+                    } else {
+                        retract_confirmed_removed_session_path(&session_path_for_worker);
+                    }
+                    let response = AppControlResponse {
+                        request_id: request_id_for_worker,
                         handled_by_pid: std::process::id(),
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
@@ -89431,15 +89620,15 @@ async fn process_pending_app_control_requests(
                             "accepted": verdict.verified,
                             "verified": verdict.verified,
                             "verified_refusal": verdict.refusal.map(|refusal| refusal.as_str()),
-                            "session_path": session_path,
+                            "session_path": session_path_for_worker,
                             "active_session_path": active_session_path,
-                            "live_session_close": pending.live_session_close,
+                            "live_session_close": pending_for_worker.live_session_close,
                             "row_still_listed": row_still_listed,
                             "runtime_process_id": runtime_pid_before,
                             "remote_runtime_after": format!("{remote_runtime_after:?}"),
                             "reaped_processes": session_teardown_process_values(&verdict.reaped),
                             "live_processes": session_teardown_process_values(&verdict.still_running),
-                            "redirect_target": close_redirect_target
+                            "redirect_target": close_redirect_target_for_worker
                                 .as_ref()
                                 .map(viewport_history_entry_app_control_value),
                             "redirect_error": redirect_error,
@@ -89447,29 +89636,158 @@ async fn process_pending_app_control_requests(
                         })),
                         error: verdict.refusal.map(|refusal| {
                             format!(
-                                "session remove for {session_path} could not be verified: {}",
+                                "session remove for {session_path_for_worker} could not be verified: {}",
                                 refusal.as_str()
                             )
                         }),
+                    };
+                    // Wake the waiting CLI from HERE: the response file is the
+                    // whole contract, and this thread is not behind the
+                    // teardown storm.
+                    append_trace_event(
+                        &home_for_worker,
+                        "ui",
+                        "app_control",
+                        "request_stage",
+                        json!({
+                            "request_id": response.request_id,
+                            "command": "RemoveSession",
+                            "stage": "response_complete_begin",
+                            "payload": { "plane": "worker" },
+                        }),
+                    );
+                    let completed =
+                        complete_app_control_request(&home_for_worker, &inflight_path, &response);
+                    if let Err(error) = completed {
+                        // Same user-visible failure as the pump losing the
+                        // request: the CLI times out. Unlike the pump we do
+                        // NOT break the drain loop — keep the trace honest and
+                        // return.
+                        append_trace_event(
+                            &home_for_worker,
+                            "ui",
+                            "app_control",
+                            "worker_response_complete_failed",
+                            json!({
+                                "request_id": response.request_id,
+                                "error": error.to_string(),
+                            }),
+                        );
+                        return;
                     }
-                }
-                Err(error) => AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: None,
-                    data: Some(json!({
-                        "accepted": false,
-                        "verified": false,
-                        "session_path": session_path,
-                        "runtime_process_id": runtime_pid_before,
-                        "live_processes": session_teardown_process_values(
-                            &surviving_teardown_processes(&teardown_census),
-                        ),
-                    })),
-                    error: Some(error.to_string()),
-                },
+                    let response_data_summary = summarize_app_control_response_data_for_trace(
+                        response.data.as_ref(),
+                    );
+                    append_trace_event(
+                        &home_for_worker,
+                        "ui",
+                        "app_control",
+                        "request_end",
+                        json!({
+                            "request_id": response.request_id,
+                            "handled_by_pid": response.handled_by_pid,
+                            "output_path": response.output_path,
+                            "data_summary": response_data_summary,
+                            "error": response.error,
+                        }),
+                    );
+                    let _ = apply_tx.send((Some(snapshot), message, snapshot_seq));
+                });
+            if let Err(spawn_error) = worker_spawn {
+                // No worker thread: answer the refusal from the pump so the
+                // request cannot sit inflight forever, then keep the drain
+                // loop alive.
+                let spawn_error = anyhow!(spawn_error.to_string());
+                finish_remove_session_response_err(
+                    &home,
+                    &inflight_for_spawn_fail,
+                    &request.request_id,
+                    &session_path,
+                    runtime_pid_before,
+                    &census_for_spawn_fail,
+                    close_stage_t0,
+                    &spawn_error,
+                );
+                return Ok(true);
             }
+            // The floating apply: runs when the pump gets around to it (the
+            // storm is allowed to delay it — nothing user-facing waits on it:
+            // the verb already answered and `rows` answers from the daemon's
+            // truth via the confirm set). World-order guard: a newer snapshot
+            // already carries this removal, so the sync is skipped and only
+            // the per-close local bookkeeping runs.
+            let mut state_for_apply = state;
+            let home_for_apply = home.clone();
+            let session_path_for_apply = session_path.clone();
+            let redirect_for_apply = close_redirect_target.clone();
+            let pending_for_apply = pending;
+            let stage_t0_for_apply = close_stage_t0;
+            spawn_forever(async move {
+                let Ok((snapshot, message, snapshot_seq)) = apply_rx.await else {
+                    // Worker died before answering; nothing was confirmed (the
+                    // worker confirms only after a verified removal) — keep
+                    // `rows` honest and the trace loud.
+                    retract_confirmed_removed_session_path(&session_path_for_apply);
+                    append_trace_event(
+                        &home_for_apply,
+                        "ui",
+                        "app_control",
+                        "remove_session_stage",
+                        json!({
+                            "stage": "apply_worker_lost",
+                            "session_path": session_path_for_apply,
+                            "ms": stage_t0_for_apply.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    return;
+                };
+                if let Some(snapshot) = snapshot {
+                    let superseded =
+                        snapshot_seq <= APP_CONTROL_APPLIED_SNAPSHOT_SEQ.load(
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    state_for_apply.with_mut_counted(|shell| {
+                        if !superseded {
+                            APP_CONTROL_APPLIED_SNAPSHOT_SEQ.store(
+                                snapshot_seq,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            shell.apply_interactive_snapshot_result(Ok((snapshot, message)));
+                        }
+                        shell.prune_viewport_history_for_closed_paths(
+                            &pending_for_apply.session_paths,
+                        );
+                        if let Some(target) = redirect_for_apply.as_ref() {
+                            shell.apply_viewport_history_entry_locally(
+                                target,
+                                "app_control_live_session_close_redirect_finished",
+                            );
+                        }
+                        if pending_for_apply.live_session_close {
+                            shell.prepare_live_session_close_locally(
+                                &pending_for_apply,
+                                "app_control_live_session_close",
+                            );
+                        }
+                    });
+                }
+                // The GUI state now (or a newer snapshot already) carries the
+                // removal — the confirm set has served its purpose.
+                retract_confirmed_removed_session_path(&session_path_for_apply);
+                append_trace_event(
+                    &home_for_apply,
+                    "ui",
+                    "app_control",
+                    "remove_session_stage",
+                    json!({
+                        "stage": "apply_done",
+                        "session_path": session_path_for_apply,
+                        "ms": stage_t0_for_apply.elapsed().as_millis() as u64,
+                        "plane": "floating_apply",
+                    }),
+                );
+            });
+            return Ok(true);
         }
         AppControlCommand::SetSessionKeepAlive {
             session_path,
