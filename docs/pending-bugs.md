@@ -80,6 +80,36 @@ Falsifier: on a rotated build, split-create felt p50 ≤~100 ms DOM with
 first-raf ≤+20 ms after the stamp, 5/5 accuracy, 0 rows left behind — or the
 second-owner bump named to its exact call site with an A/B proving its
 removal moves the stamp.
+UPDATE 2026-09-29 ~13:5x UTC (split-appear-focus-churn lane, claim
+ACK-5a502e66bb; zcode sess_f0693c80 on jojo, work FROM dev): THE FOCUS-TAIL
+HALF DISCHARGED — fix LANDED as [11.216] (lane/uxspeed/split-appear-focus-
+churn ba7e06de, ygg-ci merged 1daa1c13, deployed + GUI rotated 18:41 IST,
+live-proven on 1daa1c13758b): (1) the focus tail no longer re-runs the
+retention policy — `arm_terminal_activation_preserving_siblings` guarantees
+only retained + epoch + input override (the old re-arm's eviction sweep
+stripped sibling hosts' epochs mid-create), and the reclaim schedule
+coalesced 9→4 passes (immediate, rAF, then 220/760/1200 — in-window
+invocations 5→2), both law-tested
+(`the_focus_tail_arm_preserves_sibling_hosts_epochs`,
+`the_focus_reclaim_deferred_passes_stay_out_of_the_appear_window`). (2) A/B
+same-day quiet: felt DOM p50 **176 → 130.5 ms (−26%)** (pre 136-229 n=5
+floors 63/170; post 104-225 n=10 across two runs floors 62/163 drift ≤+22),
+10/10 accuracy, 0 rows left behind, panes 2 every iteration. (3) Switch-
+raise sanity on the SHARED tail: activation 109-177, reveal_served 248-299,
+paint_reveal 424-488 (5/6 served; the two misses are the LOCKED idle-mount
+class, mounts exempt) — no regression. (4) Instrument: every epoch bump now
+carries its call site (`mount_epoch/bump {reason}` always-on). REMAINING
+OPEN (the ≤100 ms bar): the felt stamp is now the compound-restructure
+render itself — the per-create `bootstrap_owner_superseded_during_loop` +
+`terminal_mount_task_dropped` on the ORIGINAL member row SURVIVES the tail
+fix: 0 `mount_epoch/bump` events in the run window, owner instance climbing
+`:1:1:8:`→`:1:1:11:` one per create on the SAME session — the owner steal
+rides element re-creation (the pane embedding re-mounts the member
+structurally), NOT the tail and NOT an epoch bump. NEXT LEVER: a render-span
+trace around the split commit naming the compound re-render's legs (the
+[11.172]/[11.173] retention makes the member's pane re-mount hot; the
+reclaim is already out of the window — the re-render is not).
+
 
 ## ⛔ [11.213] THE GUI RECOVERY DOOR LAUNDERS A HANDOVER-DEAD REMOTE ROW — EVERY RE-MOUNT READS THE STALE RETAINED BUFFER, CALLS IT LIVE OUTPUT, AND RE-ARMS THE RESIZE BURN (measured 2026-09-29 ~14:13-14:35 IST, live jojo, the [11.57] tombstone lane)
 
