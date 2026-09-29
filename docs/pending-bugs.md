@@ -252,6 +252,41 @@ sess_9a200386 on jojo, work FROM dev; merged main 28c8dfec, revert tip = the lan
 - Rig artifacts: /tmp/warmmount-rig.sh (v3), scratch-home traces
   /tmp/warmmount-home-*/ytrace.jsonl; live report /tmp/live-spawn-postfix.json.
 
+FIXED-ADAPTIVE 2026-09-29 ~11:40-12:10 IST (lane/uxspeed/warmmount-adaptive-gate, zcode
+sess_625432ec on jojo, work FROM dev; board claim ACK-88d595b856; merged main a030694a1262
+via ygg-ci 11:51, jojo GUI+daemon rotated): the entry's NAMED NEXT STEP — the gate is
+ADAPTIVE. The fixed 1.0 s deadline is replaced by a trivial-eval pipeline probe
+(`return 1 + 1`, terminal_mount_pipeline_probe_script) dispatched at
+T0+TERMINAL_WARM_EVAL_PROBE_DISPATCH_MS (350) whose join future is held in the mount loop
+state (Eval is not Send — no task spawn; the answer ARRIVING is itself the "pipeline
+drained" signal, so no separate timeout budget exists). Decision rule, exactly the fix
+direction this entry named: probe ANSWERED while the mount is still bridge-silent => the
+eval pipeline drains => the ~1 KB mount eval was dropped, not queued => redo cold at the
+earliest TERMINAL_WARM_EVAL_ALIVE_REDO_MS (700 — ~300 ms earlier than the old constant),
+trace decision `pipeline_alive_eval_lost`; probe still PENDING => the page is stalled, the
+warm mount is queued behind the same congestion and a ~500 KB redo would queue behind it
+too => keep waiting and re-probe (TERMINAL_WARM_EVAL_STALL_REPROBE_MS 500 cadence), traced
+`warm_eval_gate_keep_waiting` {pipeline: silent|degraded, probe_count, waited_ms};
+TERMINAL_WARM_EVAL_MAX_WAIT_MS (8 s) caps the stall wait (decision `stall_cap`).
+`warm_eval_vanish_redo_cold` now carries {gate: "adaptive_probe", decision, probe_count,
+waited_ms}. PROOF: rig v4 (debug, Xvfb :77, scratch home, spawn x6): 6/6 painted,
+warm_eval_vanish_redo_cold x5 all decision=pipeline_alive_eval_lost, keep_waiting x1 —
+probe PENDING at +834 ms (the gate HELD through the stall, no redo during it) and the redo
+fired at +1336 only after the probe answered with the mount STILL bridge-silent, i.e. the
+eval was genuinely dropped behind the stall, not queued — the decision rule did the right
+thing on both arms. LIVE (rotated a030694a1262, uxprobe spawn x6, cli floor 59 ms): 6/6
+painted first_frame, spawn_to_paint p50 1557 ms / max 3312 (the 2036-2207 pre-lane
+baselines included the 1.0 s gate on every gated spawn — the ~300 ms earlier redo is
+visible in the p50), 0 startup_terminal_restore_recover, 0 stale_mount_attempt_abort,
+accuracy_failures empty, blank_frames_before_write 2-3 (the normal warm-mount counter, not
+a blank screen). The "stalled-but-alive warm completes warm un-redone" branch never
+materialized in 13 gated spawns (rig+live): every stall that cleared left the mount eval
+bridge-silent => redo was correct; the keep-waiting arm engaged twice and never mis-redid
+during a stall. RESIDUAL OPEN (sharpened): which queue holds the stall — the probe now
+BOUNDS it: the EVAL pipeline answers within ~350-700 ms under spawn churn while the
+mount's first bridge POST lands ~700 ms later (the witness chain), so the delayed half is
+the bridge POST path, not the eval dispatch path.
+
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
 **Status:** OPEN
