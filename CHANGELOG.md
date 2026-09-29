@@ -13,10 +13,12 @@ This file tracks user-visible changes in `yggterm`.
   root, deterministic, while a hand could click the same expanders and the
   sidebar rendered them as groups — a disclosure a hand can reach and a
   verb cannot is half a feature. The resolver now synthesizes the folder's
-  Group row exactly (kind Group, machine-key host label, real folder path,
-  `expanded` read OPEN per the app-control convention so the setter's
-  short-circuit cannot swallow a re-open) before the session synthesizer
-  can shadow it — cheap, no merge rebuild on the UI thread. The
+  Group row exactly (kind Group, machine-key host label, real folder path)
+  before the session synthesizer can shadow it — cheap, no merge rebuild on
+  the UI thread — and the synthesized row carries the folder's REAL fold
+  state, so open, close and re-open all behave exactly like the hand's
+  chevron (a drawn-open shortcut was live-proven to no-op every expand
+  request through the setter's state-equality short-circuit). The
   merge-scale A/B this verb was written for stands on its DOM workaround;
   the workaround is retired. ([11.201], the ux-speed row-expanded-reach lane)
 - **A serving raise stops rebuilding the sidebar from scratch.** Every raise-path switch re-ran the shell snapshot's search-context memo check, and that check keyed on raw content hashes of EVERY row's preview lines — sip-hashing every block line of every live row just to decide nothing had changed — while the store's `live_sessions()` deep-cloned every row's preview blocks out on every call: perf on the live desktop put the sidebar rebuild complex at ~19% of raise-window GUI CPU (plus a ~16% allocator shadow) on the switch plane whose whole point is feeling instant ([11.180], measured by the raise-perf-capture lane). The preview is now Arc-shared and immutable — every preview write builds a new Arc, so pointer identity IS the content version — and the memo keys on that one pointer-checked stamp (`session_preview_stamp`) instead of the lines; view clones share the pointer instead of copying the blocks. Locks pin both halves: the stamp is stable while an Arc is held and moves on any replacement, and the memo skips on a steady raise yet rebuilds exactly once when a preview is replaced. ([11.180], the ux-speed raise-memo-fix lane)

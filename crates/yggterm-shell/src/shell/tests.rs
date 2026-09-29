@@ -57811,16 +57811,15 @@ Shared connection to 192.0.2.14 closed.\r\n";
     /// setter's short-circuit never swallows a re-open; the real state lives
     /// in the collapse store the setter toggles).
     #[test]
-    fn a_remote_folder_path_resolves_to_its_group_row_with_the_app_control_expanded_convention() {
+    fn a_remote_folder_path_resolves_to_its_group_row_carrying_the_real_fold_state() {
         for path in [
             "__remote_folder__/dev/etc/apt",
             "__remote_folder__/oc/home/pi/.codex",
             "__remote_folder__/dev/home/pi/greet",
         ] {
-            let row = synthesize_remote_folder_group_row(path)
+            let row = synthesize_remote_folder_group_row_with_state(path, true)
                 .unwrap_or_else(|| panic!("the folder row must synthesize: {path}"));
             assert_eq!(row.kind, BrowserRowKind::Group, "[{path}] the kind the                 SetRowExpanded guard requires — a Session/Document synthesis is                 the [11.201] refusal");
-            assert!(row.expanded, "[{path}] drawn OPEN, so                 set_app_control_row_expanded's short-circuit cannot swallow a                 re-open of a folder a human collapsed");
             assert!(
                 row.session_cwd.as_deref().is_some_and(|cwd| cwd.starts_with('/')),
                 "[{path}] session_cwd carries the real folder path"
@@ -57829,12 +57828,32 @@ Shared connection to 192.0.2.14 closed.\r\n";
             let (machine_key, _) = rest.split_once('/').unwrap();
             assert_eq!(row.host_label, machine_key, "[{path}] host label is the                 machine key, as append_remote_folder_rows draws it");
         }
+        // ⭐ THE FOLD-STATE LAW: `expanded` is the folder's REAL store state,
+        // because the setter short-circuits `row.expanded == expanded` before
+        // its toggle — a forced true would no-op every expand request
+        // (live-proven 2026-09-29) and invert every collapse into an expand.
+        // The rendered row's flag is the same membership, so the verb now
+        // behaves exactly like the hand's chevron in all four cases.
+        assert!(synthesize_remote_folder_group_row_with_state(
+            "__remote_folder__/dev/etc/apt",
+            true
+        )
+        .unwrap()
+        .expanded);
+        assert!(
+            !synthesize_remote_folder_group_row_with_state(
+                "__remote_folder__/dev/etc/apt",
+                false
+            )
+            .unwrap()
+            .expanded
+        );
         // Not folder rows: a machine-root prefix and a bare machine key (no
         // folder segment) stay None — the session synthesizer keeps its old
         // contract for every non-`__remote_folder__` path.
-        assert!(synthesize_remote_folder_group_row("__remote_machine__/dev").is_none());
-        assert!(synthesize_remote_folder_group_row("__remote_folder__/dev").is_none());
-        assert!(synthesize_remote_folder_group_row("local://seed").is_none());
+        assert!(synthesize_remote_folder_group_row_with_state("__remote_machine__/dev", true).is_none());
+        assert!(synthesize_remote_folder_group_row_with_state("__remote_folder__/dev", true).is_none());
+        assert!(synthesize_remote_folder_group_row_with_state("local://seed", true).is_none());
     }
 
     /// A live agent row shows its TERMINAL on a restart, whatever its transcript
