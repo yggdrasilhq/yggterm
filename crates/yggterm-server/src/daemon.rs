@@ -9213,6 +9213,30 @@ impl DaemonRuntime {
         );
     }
 
+    /// THE [11.57] memo read: a fresh confident peer-missing no for this
+    /// path, lazily expiring a stale one — the same window and the same
+    /// lazy-expiry the [11.153] ensure gate spends. Read by the resize
+    /// forward (to skip the ssh ladder) and by the TerminalResize handler
+    /// (to speak the cached verdict on the Ack message).
+    fn fresh_peer_missing_error(&self, path: &str) -> Option<String> {
+        let mut memo = self
+            .peer_runtime_missing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match memo.get(path) {
+            Some(verdict) if verdict.last_verdict_at.elapsed()
+                <= REMOTE_PEER_MISSING_REFUSE_WINDOW =>
+            {
+                Some(verdict.error.clone())
+            }
+            Some(_) => {
+                memo.remove(path);
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Run #19 permanent squish fix: pin the REMOTE daemon's PTY to the new
     /// grid whenever the local daemon resizes a remote session's attachment.
     /// The implicit chain (local PTY SIGWINCH → ssh window-change → remote tty
@@ -9242,6 +9266,29 @@ impl DaemonRuntime {
         else {
             return;
         };
+        // THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, jojo row
+        // 6778336d — the owner's ACTIVE row): a fresh peer-missing verdict
+        // already names this row's runtime gone, yet every GUI recovery
+        // re-mount re-ran the whole ssh ladder against the corpse — 5
+        // retries ≈ 14 s per mount, 12 verdicts / 6.3 h on ONE row, the
+        // cadence tightening after every daemon roll. Spend the memo here,
+        // at the choke point every forward passes: no ssh until the
+        // [11.153] heal window expires or the worker earns a re-arm.
+        if let Some(error) = self.fresh_peer_missing_error(path) {
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "terminal_resize",
+                "remote_pty_resize_skipped_peer_missing",
+                serde_json::json!({
+                    "path": path,
+                    "cols": cols,
+                    "rows": rows,
+                    "error": error,
+                }),
+            );
+            return;
+        }
         {
             let mut pending = self
                 .pending_remote_pty_resizes
@@ -9323,6 +9370,46 @@ impl DaemonRuntime {
                     // which already holds the client's grid), so the user sees a
                     // TUI painting for a screen that no longer exists while the
                     // telemetry reports a healthy session. Make the failure loud.
+                    // THE [11.57] RE-ARM: the peer answering ANYTHING other
+                    // than not-found-about-our-key — success, a different
+                    // terminal error, a [11.161] key-space mismatch — is live
+                    // evidence the runtime key is back or never was verdict
+                    // evidence. Spend the tombstone so the skip cannot
+                    // outlive its cause; the heal window stays the only
+                    // clock for the not-found classes.
+                    let peer_answered = result.is_ok()
+                        || matches!(
+                            result.as_ref().err().map(|error| {
+                                classify_remote_resize_not_found(
+                                    &error.to_string(),
+                                    asked_runtime_key.as_deref(),
+                                    false,
+                                )
+                            }),
+                            Some(RemoteResizeVerdict::Other)
+                                | Some(RemoteResizeVerdict::KeySpaceMismatch { .. })
+                        );
+                    if peer_answered {
+                        let rearmed = peer_runtime_missing
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&path)
+                            .is_some();
+                        if rearmed {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_resize",
+                                "remote_pty_resize_peer_memo_rearmed",
+                                serde_json::json!({
+                                    "path": path,
+                                    "kind": kind,
+                                    "cols": cols,
+                                    "rows": rows,
+                                }),
+                            );
+                        }
+                    }
                     if let Err(error) = result {
                         // Mid-switch ordering: "terminal session not found"
                         // usually means the remote daemon does not OWN the
@@ -14652,7 +14739,20 @@ impl DaemonRuntime {
                     // Run #19: pin the remote daemon's PTY explicitly too — the
                     // implicit SIGWINCH→ssh→bridge chain is not reliable.
                     self.forward_remote_pty_resize(&path, cols, rows);
-                    ServerResponse::Ack { message: None }
+                    // THE [11.57] HONEST ACK: when a fresh peer-missing
+                    // verdict tombstoned the forward, the remote half of this
+                    // resize did NOT happen — the local mirror now agrees
+                    // with a runtime the peer does not own. Speak the cached
+                    // verdict on the Ack so the GUI-side startup repair can
+                    // name the divorce (remote_resize_unownable_divorce)
+                    // instead of tracing a clean repair over a corpse.
+                    let peer_missing = self.fresh_peer_missing_error(&path);
+                    ServerResponse::Ack {
+                        message: peer_missing
+                            .map(|error| {
+                                format!("peer runtime missing (cached verdict): {error}")
+                            }),
+                    }
                 }
             }
             ServerRequest::TerminalRestart {

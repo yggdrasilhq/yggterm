@@ -135,6 +135,16 @@ mod tests {
             body.contains("repair_error_text.contains(\"terminal session not found\")"),
             "the divorce classification must key on the not-found error class"
         );
+        // THE [11.57] second arm (measured live 2026-09-29, jojo row
+        // 6778336d): the FORWARDED failure can never take the Err arm — the
+        // verb answers Ok for the local half while the remote half fails in
+        // the fire-and-forget re-queue. The repair must also classify from
+        // the daemon's honest Ack message, or 12 unownable verdicts fire
+        // with zero divorces, exactly as measured.
+        assert!(
+            body.contains("Ok(ack_message)") && body.contains("peer_missing"),
+            "the repair must read the daemon's cached-verdict Ack message              and classify the divorce from it, beside the Err arm"
+        );
     }
 
     fn every_resume_recovery_call_runs_off_the_terminal_loop() {
