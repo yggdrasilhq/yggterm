@@ -109,6 +109,42 @@ an in-flight schema fetch (generation-stamp the fetch; a close wins).
 
 **Status:** OPEN
 
+Root cause OPEN but REFRAMED 2026-09-29 (eval-wedge-webkit-why lane, claim
+ACK-bddb4ba4c8): the WebKitGTK-phantom mechanism below is **FALSIFIED** — the
+warm eval's script EXECUTES. Statement-level witnesses (bridge-free window
+props stamped at dispatch, pre-await, mount-fn entry, host probe; read back
+through the redo-cold's own bridge) show, on every "vanished" warm mount in
+the rig: body ran → await reached → `__yggtermMountFn` CALLED → fn entered →
+host element PRESENT — and the fn's first bridge post then SUCCEEDS at
+~+995 ms (a channel-level send wrapper captured it; zero post errors), i.e.
+~700 ms AFTER WebKit's own eval-completion callback (~292 ms). The mount is
+not dead: it is STALLED ~1 s in the page's execution/message pipeline under
+spawn churn, and the 1 s liveness gate (`TERMINAL_WARM_EVAL_LIVENESS_MS`)
+fires INSIDE that stall — 5-50 ms before the mount's first post — and
+re-mounts cold on top of a still-alive warm mount. On the debug-build rig
+the stall is universal (5/5 warm mounts gated); on the release desktop it is
+occasional. Two consequences: (a) the "answers Ok(null) ~90 ms without
+executing a statement" evidence was an artifact — wry launders EVERY eval
+callback result to "null" (the callback carries the wrapper IIFE's undefined
+in all cases, and GLib errors are laundered to null too — a standalone
+WebKitGTK harness proved a web-process kill answers
+WebKitJavascriptError 601 "Unsupported result type", laundered to the same
+"null"); (b) the gate now owns a DOUBLE-MOUNT race: a stalled warm mount
+resumes after the redo-cold dispatched and two mounts race the same host
+(ghost-frame class). RESIDUAL OPEN: which queue holds the ~0.7-1.0 s stall
+(page main-thread congestion vs WebKit's script-message/eval pipeline) —
+the wry dispatch/complete stamps + the channel-send wrapper bound it from
+both sides and are ~5-line inserts (recipe below). NO upstream WebKitGTK
+report is warranted on the phantom framing. FIX DIRECTION (app plane): the
+gate deadline sits inside the observed stall distribution — key the gate on
+web-process liveness or a deadline outside the stall tail, and make a
+late-resuming warm mount idempotent against the redo (epoch check at first
+post). Rig recipe: scratch YGGTERM_HOME + Xvfb :77 + dbus-run-session,
+debug GUI, `uxprobe --actions spawn --iters 6` → every warm mount gates;
+witness readback rides the redo-cold. Standalone sweep harness
+(~/evalwedge-standalone on dev: load-window, nav races, busy-page queueing,
+web-process kill — none reproduces the phantom; kill answers 601).
+
 Root cause open; the FELT SYMPTOM is defused on `lane/uxspeed/spawn-screen-fix`.
 
 Filed 2026-09-27 on `lane/uxspeed/spawn-screen-fix` (zcode sess_04fb9058 on jojo,
