@@ -65,13 +65,24 @@ DELIBERATE (the birth veto must not eat the insert), and the sticky
 (2) the remembered-close wrapper fallthrough is e2ddee1a (landed same
 morning); (3) the two-sided sweep instrument for the proof sweep.
 
-FALSIFIER OWED (row 11.208): on the deployed build, clicking a
-store-absent agy row (41e5733d) opens a minted, bound fresh start — trace
-`ensure_definitive_miss_fresh_start`, "Fresh Start" metadata on the row,
-no refusal frame — and a rolled host daemon's rows re-arm
-(resize/input-gate refusals stop sticking); then this entry deletes per
-the verified-fix law. Not covered: wrapper-gate refusals for closes that
-are NOT remembered (e2ddee1a law, owner-blessed).
+PROOF (row 11.208, post-deploy sweep 10:54-10:59 IST on the deployed
+1a0f89a8, jojo's 23 rows, two-sided read `server connect` + `server
+screen`): EVERY clicked row opened with real content — zero dead frames,
+zero refusal banners; the holder=gone count fell 18 → 5. 41e5733d opened
+through the candidate vouch (agy_store_candidate_vouch traced on dev) —
+its REAL conversation recovered, one rung above the fresh start; the
+minted-fresh-start arm this lane landed sits BENEATH that ladder and was
+correctly not reached (no store-absent-without-candidate row presented
+itself; it stays suite-proven, live-arm-unexercised). 98a577d0 refused at
+the WRAPPER gate (close not remembered — the e2ddee1a law, owner-blessed)
+and keeps drawing resize-unownable forwards (~44/min): a row that can
+never own a runtime should stop being resize-forwarded (auto-despawn
+after N refusals) — candidate follow-up, cli-integration queue.
+
+FALSIFIER STILL OWED: a live store-absent-without-candidate agy row
+opening a MINTED fresh start (trace `ensure_definitive_miss_fresh_start`,
+"Fresh Start" metadata) — until one occurs or the owner accepts this
+sweep as the class proof, the entry stays.
 
 ## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
