@@ -31306,11 +31306,32 @@ impl ShellState {
         self.passive_copy_suspended = suspended;
         PASSIVE_COPY_SUSPENDED.store(suspended, Ordering::Relaxed);
     }
-    fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
-        // DIAGNOSTIC (hot-switch latency #milestone): every remount goes through
-        // an epoch bump. Log the hot-reveal sub-conditions so we can see WHY the
-        // switch-back didn't take the reveal path. See
-        // [[finding-hot-switch-latency-remount]]. Cheap + one event per bump.
+    fn bump_terminal_mount_epoch_for_session(
+        &mut self,
+        session_path: &str,
+        reason: &'static str,
+    ) -> u64 {
+        // [11.215] lane instrument: every remount goes through an epoch bump,
+        // and WHICH call site bumped decides whether an in-flight mount loop
+        // gets superseded mid-create/switch (bootstrap_owner_superseded_
+        // during_loop / terminal_mount_task_dropped). The reason rides every
+        // event so the ytrace ladder names the bump's exact caller. One event
+        // per bump (interaction scale, not per frame). The rich hot-reveal
+        // sub-conditions stay opt-in below — see
+        // [[finding-hot-switch-latency-remount]].
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "mount_epoch",
+                "bump",
+                json!({
+                    "session_path": session_path,
+                    "prev_epoch": self.terminal_mount_epochs.get(session_path).copied(),
+                    "reason": reason,
+                }),
+            );
+        }
         if std::env::var("YGGTERM_TRACE_HOT_REVEAL").is_ok()
             && let Ok(home) = resolve_yggterm_home()
         {
@@ -31332,6 +31353,7 @@ impl ShellState {
                     "retained": self.retained_terminal_session_paths.contains(session_path),
                     "empty_surface": self.latest_terminal_open_attempt_has_empty_surface(session_path),
                     "is_retained_live": self.terminal_session_is_retained_live(session_path),
+                    "reason": reason,
                 }),
             );
         }
@@ -31493,7 +31515,7 @@ impl ShellState {
         self.terminal_cold_remount_count
             .insert(session_path.to_string(), count.saturating_add(1));
         (
-            self.bump_terminal_mount_epoch_for_session(session_path),
+            self.bump_terminal_mount_epoch_for_session(session_path, "open_mount_epoch_resolve"),
             false,
             false,
         )
@@ -31869,7 +31891,7 @@ impl ShellState {
         if !(had_inflight || had_owner || had_lease || had_ready || had_host) {
             return false;
         }
-        let _ = self.bump_terminal_mount_epoch_for_session(session_path);
+        let _ = self.bump_terminal_mount_epoch_for_session(session_path, "remote_bootstrap_rearm_unready");
         if self.server.active_view_mode() == WorkspaceViewMode::Terminal
             && self.server.active_session_path() == Some(session_path)
         {
@@ -32378,7 +32400,7 @@ impl ShellState {
             .remove(session_path);
         self.terminal_bootstrap_lease_by_session
             .remove(session_path);
-        let _ = self.bump_terminal_mount_epoch_for_session(session_path);
+        let _ = self.bump_terminal_mount_epoch_for_session(session_path, "retained_remote_surface_invalidate");
         self.active_terminal_host_id = if self.server.active_view_mode()
             == WorkspaceViewMode::Terminal
             && self.server.active_session_path() == Some(session_path)
@@ -32922,7 +32944,7 @@ impl ShellState {
             .remove(active_session_path);
         self.terminal_resume_ready_paths.remove(active_session_path);
         if self.latest_terminal_open_attempt_has_empty_surface(active_session_path) {
-            let _ = self.bump_terminal_mount_epoch_for_session(active_session_path);
+            let _ = self.bump_terminal_mount_epoch_for_session(active_session_path, "startup_restore_recovery");
             if self.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && self.server.active_session_path() == Some(active_session_path)
             {
@@ -33159,7 +33181,7 @@ impl ShellState {
         self.terminal_bootstrap_lease_by_session
             .remove(active_session_path);
         self.terminal_resume_ready_paths.remove(active_session_path);
-        let _ = self.bump_terminal_mount_epoch_for_session(active_session_path);
+        let _ = self.bump_terminal_mount_epoch_for_session(active_session_path, "retained_fault_recovery_rearm");
         if self.server.active_view_mode() == WorkspaceViewMode::Terminal
             && self.server.active_session_path() == Some(active_session_path)
         {
@@ -57216,16 +57238,41 @@ fn arm_terminal_activation(shell: &mut ShellState, session_path: &str) {
     shell.terminal_input_override_active = true;
     shell.retain_terminal_session_path(session_path);
 }
+/// The focus tail's arm. [11.215]: the caller has ALREADY run the activation
+/// and retention policy on the open/activation path — re-running the full
+/// policy here re-sweeps the retained set mid-create and strips sibling
+/// hosts' mount epochs, which re-keys their elements and supersedes the
+/// mount loop this same interaction just started (one
+/// bootstrap_owner_superseded_during_loop + terminal_mount_task_dropped per
+/// split-create). The tail therefore guarantees only THIS path — retained,
+/// epoch present, input override — and never an eviction sweep.
+fn arm_terminal_activation_preserving_siblings(shell: &mut ShellState, session_path: &str) {
+    shell.dismiss_titlebar_transients();
+    shell.terminal_input_override_active = true;
+    shell.retained_terminal_session_paths
+        .insert(session_path.to_string());
+    shell.terminal_mount_epochs
+        .entry(session_path.to_string())
+        .or_insert(1);
+}
 fn try_arm_terminal_activation_for_focus(
     state: Signal<ShellState>,
     session_path: &str,
     context: &'static str,
 ) -> bool {
     safe_shell_mut(state, context, |shell| {
-        arm_terminal_activation(shell, session_path);
+        arm_terminal_activation_preserving_siblings(shell, session_path);
     })
     .is_ok()
 }
+/// [11.215]: the focus-reclaim follow-up passes (ms after activation). The
+/// split/switch APPEAR window is ~0-190 ms (felt DOM p50 164 ms vs the 100 ms
+/// bar; the first animation frame paid +77-79 ms of main-thread congestion
+/// from reclaim passes firing inside it). The immediate call plus the rAF
+/// pass are the only in-window invocations; the deferred passes start past
+/// the window, and the late passes stay because the sidebar's VDOM settle
+/// can steal focus for seconds after activation.
+const FOCUS_RECLAIM_DEFERRED_PASSES_MS: [u64; 3] = [220, 760, 1200];
 fn schedule_terminal_focus_after_activation(state: Signal<ShellState>, session_path: String) {
     clear_sidebar_keyboard_owner();
     let _ = try_arm_terminal_activation_for_focus(
@@ -57236,6 +57283,15 @@ fn schedule_terminal_focus_after_activation(state: Signal<ShellState>, session_p
     sync_active_terminal_input_policy(state);
     refocus_terminal_session_input(&session_path);
     let reclaim_script = terminal_reclaim_focus_script_for_session(&session_path);
+    let deferred_reclaim_passes = FOCUS_RECLAIM_DEFERRED_PASSES_MS
+        .iter()
+        .map(|ms| {
+            format!(
+                "window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, {ms});"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n          ");
     let _ = document::eval(&format!(
         r#"
         (() => {{
@@ -57255,13 +57311,7 @@ fn schedule_terminal_focus_after_activation(state: Signal<ShellState>, session_p
           releaseSidebarFocus();
           reclaim();
           window.requestAnimationFrame(() => {{ releaseSidebarFocus(); reclaim(); }});
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 0);
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 32);
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 96);
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 220);
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 420);
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 760);
-          window.setTimeout(() => {{ releaseSidebarFocus(); reclaim(); }}, 1200);
+          {deferred_reclaim_passes}
         }})();
         "#
     ));
