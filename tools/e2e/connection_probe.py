@@ -190,10 +190,23 @@ def reap(key, cwd=None):
     close_live_session_row: tombstone + PTY teardown + row removal). The
     despawn rides AFTER it, on the corpse.
 
-    Returns the live holders the CLOSE itself left behind (before any by-hand
-    escalation) — the [11.195] no-live-holder measurement."""
+    Returns the live holders still standing after the settle window (before
+    any by-hand escalation) — the [11.195] no-live-holder measurement.
+
+    ⛔ THE SETTLE WINDOW IS PART OF THE MEASUREMENT: the close tears the PTY
+    down synchronously (the session leader is awaited), but the CLI grandchild
+    dies from the master drop a few hundred ms LATER. A scan at T+0 counts a
+    dying holder as a survivor — measured 2026-09-29: `closed terminal runtime`
+    with the pair gone 3 s later, while a T+0 scan named two live pids."""
     yggterm(["server", "remove", key], timeout=60)
-    post_close = live_holder_pids(cwd) if cwd is not None else []
+    post_close = []
+    if cwd is not None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            post_close = live_holder_pids(cwd)
+            if not post_close:
+                break
+            time.sleep(0.5)
     if cwd is not None:
         for _ in range(3):
             holders = live_holder_pids(cwd)
