@@ -1,25 +1,42 @@
 // tools/probe-battery/suites/zcode-tui.js — the §9 reference CLI suite
-// (11.6.11, first-party, class B). MEASURED on origin/main zcode-tui
-// 0.5.9 (5b97267) via this battery's own drive, 2026-09-14
-// (lane/integration/zcode-tui-battery).
+// (11.6.11, first-party, class B). Originally MEASURED on origin/main
+// zcode-tui 0.5.9 (5b97267), 2026-09-14 (lane/integration/zcode-tui-battery).
+//
+// ★ RE-PINNED to the 0.6.x generation 2026-09-29 (suite-repin sitting,
+// claim ACK-4ed263776f): re-measured live on the clean main candidate
+// lane/zcode-tui/composer-submit-main 24cc1ef (main ee9714a + the
+// composer-submit fix), dist sha f669b941f4ce2b7b…, battery artifacts
+// /tmp/zt-suite-measure-1. The 0.5.9 chrome moved; every retired needle is
+// kept below as a recorded fact (expected false) so the drift stays
+// legible, and the descriptor-side phrases (working_screen_phrases /
+// composer_footer_hints — `working · working…`, `esc cancel`, `i to type`,
+// `zcode-tui`) are MEASURED-STALE against 0.6.x by these facts — the
+// descriptor re-pin is the named follow-up.
 //
 // zcode-tui carries the NativeAnnounce reference implementation (identity +
 // phase announced on the wire — the daemon-side listener owns that half).
-// This suite measures the SCREEN side through a real pty: what the 0.5.9
+// This suite measures the SCREEN side through a real pty: what the 0.6.x
 // binary actually draws per state, the byte-exact composer caret, the
 // sess_-shaped rollout-store law, and resume rederivation.
 //
-// Measured chrome (0.5.9), encoded below as the regression net:
-//   idle-at-birth  status `idle · N sessions …`, footer `esc shortcuts …`,
-//                  composer `› Ask anything…` placeholder + U+258F caret
-//   typing         draft echoes, U+258F trails the text
-//   working        status line `working · working…`, footer swaps to
-//                  `esc cancel · enter send` (NOT the descriptor's
-//                  `streaming…` / `● running` — descriptor drift, filed
-//                  11.6.11; the suite reports what it sees)
+// Measured chrome (0.6.x, at a 120-col pty), encoded below as the net:
+//   idle-at-birth  ZCODE block-art banner, ▌-rail composer box, placeholder
+//                  `Ask anything…  "<rotating example>"`, caret U+2588 at
+//                  the placeholder head (BLINKS ~200ms — caret checks poll
+//                  a blink window, never a single sample), status line
+//                  `Build auto · <model> · <effort>`, footer
+//                  `… /mcps shift+tab agents …` (`ctrl+p commands` exists
+//                  but truncates past 120 cols on the idle screen —
+//                  needled on the resume screen instead, where it fits)
+//   typing         draft echoes, U+2588 trails the text (was U+258F)
+//   working        footer swaps to `▪ esc stop` (the SINGLE working arm —
+//                  no `working` word, no spinner glyphs, measured zero in
+//                  the raw capture; the 0.5.9 `working · working…` status
+//                  phrase and `esc cancel` footer are retired)
 //   resume         `--resume sess_<uuid>` boots the conversation back
-//                  (content rederives; footer shows the `i to type · enter
-//                  sends` mode-hint state)
+//                  (content rederives; footer shows the cwd + `shift+tab
+//                  agents · ctrl+p commands` grammar; `i to type` is a
+//                  0.5.9-fact, retired)
 //
 //   node run.js --suite suites/zcode-tui.js --cwd <real-workdir> \
 //        [--suite-arg bin=zcode-tui] [--suite-arg prompt-sentinel=PROBE-OK]
@@ -56,6 +73,21 @@ module.exports = {
         .filter((f) => f.startsWith('model-io-') && f.endsWith('.jsonl')),
     );
 
+    // The composer caret BLINKS (the ~200ms App render tick): a single
+    // screen sample can land in the OFF phase (measured 2026-09-29 — run 1
+    // snapped ON, run 2 OFF at the same settle). Caret presence polls a
+    // full blink window; a fixed settle is the flake this net must not be.
+    // Returns the test's truthy result (a matched line, or true), else false.
+    const blinkSeen = async (test, ms, pollMs = 150) => {
+      const end = Date.now() + ms;
+      do {
+        const res = test(drive.screen());
+        if (res) return res;
+        await new Promise((r) => setTimeout(r, pollMs));
+      } while (Date.now() < end);
+      return false;
+    };
+
     // 1. launch → first paint + settled idle chrome.
     await ctx.probe('launch-first-paint', async () => {
       const painted = await drive.waitFor(() => drive.screen().trim().length > 0, 60000);
@@ -64,70 +96,102 @@ module.exports = {
       drive.snap('idle-settled');
       const s = drive.screen();
       ctx.facts.idle = {
+        // 0.6.x declared chrome:
         ask_placeholder: s.includes('Ask anything'),
-        composer_glyph_u203A: s.includes('\u203A'),
-        caret_u258F_at_rest: s.includes('\u258F'),
-        status_idle_word: /(^|\s|·)idle( |\s|·|$)/.test(s),
-        status_ring_idle_u25CB: s.includes('\u25CB idle'),
-        footer_esc_shortcuts: s.includes('esc shortcuts'),
-        footer_i_to_type: s.includes('i to type'),
-        brand_tail_zcode_tui: s.includes('zcode-tui'),
+        rotating_example: /Ask anything…\s+"[^"]+"/.test(s),
+        composer_rail_u258C: s.includes('\u258C'),
+        // anchored to the composer line AND polled over a blink window:
+        // the banner art is ALSO U+2588, so a bare screen-wide █ check
+        // would pass on the banner alone (vacuous), and a single sample
+        // lands in the blink-OFF phase ~half the time.
+        caret_u2588_at_rest: await blinkSeen((scr) => /\u2588\s*Ask anything/.test(scr), 1500),
+        status_build_line: /Build( auto)? · .+ · /.test(s),
+        footer_shift_tab_agents: s.includes('shift+tab agents'),
+        banner_blockart_present: s.includes('\u2580\u2580\u2580\u2588') /* ▀▀▀█ */,
+        // ctrl+p commands exists in the 0.6.x footer but truncates past
+        // 120 cols on the idle screen — measured on the resume screen
+        // (probe 5) where the shorter cwd row leaves it visible. null is
+        // honest: not measurable at this geometry, not absent.
+        footer_ctrl_p_commands: null,
+        footer_ctrl_p_commands_why: 'idle footer truncates at 120 cols; needled on resume',
+        // 0.5.9 needles, RETIRED — recorded so the drift stays legible:
+        composer_glyph_u203A_retired_0_5x: s.includes('\u203A'),
+        caret_u258F_retired_0_5x: s.includes('\u258F'),
+        status_idle_word_retired_0_5x: /(^|\s|·)idle( |\s|·|$)/.test(s),
+        status_ring_idle_u25CB_retired_0_5x: s.includes('\u25CB idle'),
+        footer_esc_shortcuts_retired_0_5x: s.includes('esc shortcuts'),
+        footer_i_to_type_retired_0_5x: s.includes('i to type'),
+        brand_tail_zcode_tui_retired_0_5x: s.includes('zcode-tui'),
       };
       if (!ctx.facts.idle.ask_placeholder) {
         throw new Error('idle screen has no `Ask anything` composer placeholder');
       }
-      return `painted; idle status: ${s.split('\n').map((l) => l.trim()).filter((l) => /idle|sessions/.test(l))[0] ?? 'n/a'}`;
+      if (!ctx.facts.idle.composer_rail_u258C || !ctx.facts.idle.caret_u2588_at_rest) {
+        throw new Error('idle screen lost the 0.6.x composer chrome (▌ rail / U+2588 caret) — re-measure');
+      }
+      if (!ctx.facts.idle.status_build_line || !ctx.facts.idle.footer_shift_tab_agents) {
+        throw new Error('idle screen lost the 0.6.x status line / footer grammar — re-measure');
+      }
+      const buildLine = s.split('\n').map((l) => l.trim()).filter((l) => /Build( auto)? · /.test(l))[0] ?? 'n/a';
+      return `painted; build line: ${buildLine.slice(0, 80)}`;
     });
 
-    // 2. the composer caret, byte-exact (descriptor: U+258F, nothing else
-    //    marks the input head — re-measured true on 0.5.9 at rest AND typing).
+    // 2. the composer caret, byte-exact (0.6.x: U+2588 FULL BLOCK trailing
+    //    the draft — re-measured true at rest AND typing; U+258F is the
+    //    retired 0.5.9 glyph).
     await ctx.probe('composer-caret-byte-exact', async () => {
       drive.write(`Reply with exactly: ${SENTINEL}`);
       await new Promise((r) => setTimeout(r, 1500));
       drive.snap('typed');
       const s = drive.screen();
-      const caretLine = s.split('\n').find((l) => l.includes('\u258F'));
+      if (!s.includes(SENTINEL)) throw new Error('draft text did not echo into the composer');
+      // anchored to the DRAFT line and polled over a blink window: the
+      // banner art is also U+2588, so the caret must be found on the line
+      // that echoes the sentinel, and a single sample can catch blink-OFF.
+      const caretLine = await blinkSeen(
+        (scr) => scr.split('\n').find((l) => l.includes(SENTINEL) && l.includes('\u2588')) || null,
+        2000,
+      );
       ctx.facts.composer_marker = {
-        declared: '\u258F',
+        declared: '\u2588',
         observed_while_typing: !!caretLine,
         context: caretLine ? caretLine.trim().slice(0, 90) : null,
+        retired_0_5x_caret_u258F_seen: s.includes('\u258F'),
       };
-      if (!s.includes(SENTINEL)) throw new Error('draft text did not echo into the composer');
-      if (!caretLine) throw new Error('U+258F caret not drawn while typing — re-measure before any descriptor edit');
+      if (!caretLine) throw new Error('U+2588 caret not drawn on the draft line while typing — re-measure before any descriptor edit');
       return `caret drawn: ${caretLine.trim().slice(0, 60)}`;
     });
 
-    // 3. the turn. Pass bar = the model's reply lands. The declared table
-    //    below IS the [11.111] fill (descriptor `working_screen_phrases`):
-    //    0.5.9 draws `working · working…` on the status line and swaps the
-    //    footer to `esc cancel · enter send`. Declared==observed is the
-    //    regression net — a miss means the chrome moved again; re-measure
-    //    before touching the descriptor.
+    // 3. the turn. Pass bar = the model's reply lands AND the 0.6.x working
+    //    arm drew. MEASURED 0.6.x truth: the SINGLE working arm is the
+    //    footer swap to `▪ esc stop` — there is no `working` word and no
+    //    spinner glyph anywhere in the turn frames (raw capture census:
+    //    zero braille, zero 'working'). The 0.5.9 declared pair
+    //    (`working · working…` + `esc cancel`) is retired; both are kept
+    //    as recorded needles expected NEVER to draw. Single-arm sampling
+    //    note: a real model turn is multi-second, so 120ms polling cannot
+    //    legitimately miss the footer swap — a miss with the reply landed
+    //    means the chrome moved again; re-measure before any descriptor
+    //    edit.
     await ctx.probe('turn-and-working-phrases', async () => {
       drive.write('\r');
-      const needles = ['working', 'working · working…', 'esc cancel', 'streaming\u2026', '\u25CF running', SENTINEL];
-      const frames = await drive.phrasePoll(needles, { maxPolls: 400, pollMs: 120, settlePolls: 25 });
+      const needles = ['esc stop', SENTINEL];
+      const retired = ['working', 'working \u00B7 working\u2026', 'esc cancel', 'streaming\u2026', '\u25CF running'];
+      const frames = await drive.phrasePoll(needles.concat(retired), { maxPolls: 400, pollMs: 120, settlePolls: 25 });
       const seen = new Set(frames.flatMap((f) => f.phrases));
       drive.snap('turn-settled');
       ctx.facts.turn = {
         reply_landed: seen.has(SENTINEL),
-        working_phrase_frames: frames.filter((f) => f.phrases.includes('working')).length,
-        status_needle_seen: seen.has('working · working…'),
-        esc_cancel_footer_seen: seen.has('esc cancel'),
-        declared_phrases_observed: ['working · working…', 'esc cancel'].map((p) => ({ phrase: p, seen: seen.has(p) })),
-        retired_0_5x_needles: ['streaming\u2026', '\u25CF running'].map((p) => ({ phrase: p, seen: seen.has(p) })),
+        working_arm_declared: 'esc stop',
+        esc_stop_frames: frames.filter((f) => f.phrases.includes('esc stop')).length,
+        declared_arm_seen: seen.has('esc stop'),
+        retired_0_5x_needles: retired.map((p) => ({ phrase: p, seen: seen.has(p) })),
       };
       if (!ctx.facts.turn.reply_landed) throw new Error(`no ${SENTINEL} reply within the turn window`);
-      // Pass bar: the reply landed AND at least one declared working arm was
-      // seen. A very fast turn can complete between polls, so ONE arm may be
-      // missed by sampling — but real chrome drift retires BOTH arms (they
-      // are independent needles on independent rows), and that is the drift
-      // this net exists to catch.
-      const seenDeclared = ctx.facts.turn.declared_phrases_observed.filter((d) => d.seen);
-      if (seenDeclared.length === 0) {
-        throw new Error('no declared working phrase ever drew — chrome drifted; re-measure before any descriptor edit');
+      if (!ctx.facts.turn.declared_arm_seen) {
+        throw new Error('the 0.6.x working arm (`esc stop` footer) never drew — chrome drifted; re-measure before any descriptor edit');
       }
-      return `reply landed; working frames: ${ctx.facts.turn.working_phrase_frames}, declared arms seen: ${seenDeclared.map((d) => `"${d.phrase}"`).join(' + ')}`;
+      return `reply landed; esc-stop frames: ${ctx.facts.turn.esc_stop_frames}`;
     });
 
     // 4. the rollout-store law: this drive minted `model-io-sess_<uuid>.jsonl`
@@ -172,7 +236,9 @@ module.exports = {
     });
 
     // 5. resume: kill the row, `--resume <sess id>`, the conversation must
-    //    rederive (descriptor: content_rederives_on_resume).
+    //    rederive (descriptor: content_rederives_on_resume). 0.6.x resume
+    //    footer: cwd + `shift+tab agents · ctrl+p commands` (fits 120 cols
+    //    on this screen — the idle footer truncates, this one doesn't).
     await ctx.probe('resume-rederives', async () => {
       const sid = ctx.facts.store.new_rollout.replace(/^model-io-/, '').replace(/\.jsonl$/, '');
       const killExit = await drive.killChild();
@@ -197,10 +263,14 @@ module.exports = {
         session_id: sid,
         painted: !!painted,
         content_rederived: !!rederived && rs.includes(SENTINEL),
-        footer_has_mode_hints: rs.includes('i type') || rs.includes('i to type'),
+        footer_agents_commands: rs.includes('shift+tab agents') && rs.includes('ctrl+p commands'),
+        footer_mode_hints_retired_0_5x: rs.includes('i type') || rs.includes('i to type'),
       };
       if (!ctx.facts.resume.content_rederived) throw new Error(`resume of ${sid} did not rederive the conversation`);
-      return `resumed ${sid}; sentinel rederived`;
+      if (!ctx.facts.resume.footer_agents_commands) {
+        throw new Error('resume footer lost the 0.6.x `shift+tab agents · ctrl+p commands` grammar — re-measure');
+      }
+      return `resumed ${sid}; sentinel rederived; 0.6.x footer grammar present`;
     });
 
     // 6. panic falsifier: SIGKILL the resumed row; the drive must NOTICE.
