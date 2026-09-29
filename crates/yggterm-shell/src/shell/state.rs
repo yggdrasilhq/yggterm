@@ -325,6 +325,20 @@ static NEXT_TERMINAL_BOOTSTRAP_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 /// on two splits made in the same millisecond, so ids are `current_millis`
 /// prefixed with a process-lifetime counter.
 static NEXT_SPLIT_GROUP_SEQ: AtomicU64 = AtomicU64::new(1);
+/// The split create's render-span anchors (ux-speed split-commit-render-span
+/// lane): member session -> (group_id, commit_ms), armed by the split/create
+/// commit and consumed ONCE by the terminal loop's Paint arm when that
+/// member's surface first repaints at its post-split grid. A process global
+/// rather than ShellState state because the consumer is the terminal read
+/// loop: consuming must be lock-and-remove, never a signal write (a state
+/// write inside the paint path would churn the snapshot cache and the
+/// render-attribution plane this instrument is here to measure).
+static SPLIT_COMMIT_RENDER_ANCHORS: Mutex<BTreeMap<String, (String, u64)>> =
+    Mutex::new(BTreeMap::new());
+/// An anchor older than this at consume time is stale (the member never
+/// repainted after its split — closed, or the group torn down inside the
+/// window) and is dropped, never served.
+const SPLIT_COMMIT_RENDER_ANCHOR_TTL_MS: u64 = 10_000;
 static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
@@ -41403,6 +41417,25 @@ fn spawn_close_session_runtime(state: Signal<ShellState>, path: String) {
 /// keep-alive on every member (the group IS the keep-alive declaration) and
 /// remembers each member's prior setting for ungroup; the new group becomes the
 /// active surface, focused on its first pane.
+/// Arm one split-commit render anchor for a member session (see
+/// [`SPLIT_COMMIT_RENDER_ANCHORS`]).
+fn arm_split_commit_render_anchor(session: &str, group_id: &str, commit_ms: u64) {
+    if let Ok(mut anchors) = SPLIT_COMMIT_RENDER_ANCHORS.lock() {
+        anchors.insert(session.to_string(), (group_id.to_string(), commit_ms));
+    }
+}
+
+/// Take a member's pending split-commit anchor, if one is fresh (see
+/// [`SPLIT_COMMIT_RENDER_ANCHORS`]). Stale anchors are dropped, never served.
+fn take_split_commit_render_anchor(session: &str, now_ms: u64) -> Option<(String, u64)> {
+    let mut anchors = SPLIT_COMMIT_RENDER_ANCHORS.lock().ok()?;
+    let (group_id, commit_ms) = anchors.remove(session)?;
+    if now_ms.saturating_sub(commit_ms) > SPLIT_COMMIT_RENDER_ANCHOR_TTL_MS {
+        return None;
+    }
+    Some((group_id, commit_ms))
+}
+
 fn create_split_group(
     state: Signal<ShellState>,
     members: Vec<String>,
@@ -41483,6 +41516,13 @@ fn create_split_group_from_members(
         let first_member = members[0].session.clone();
         // serialized before the push moves `members` into the group
         let members_payload = split_members_payload(&members);
+        // Arm the render-span anchors (ux-speed split-commit-render-span
+        // lane): each member's terminal loop reports its first post-split
+        // paint as split/render_span, anchored to THIS commit's clock.
+        let commit_ms = current_millis();
+        for member in &members {
+            arm_split_commit_render_anchor(&member.session, &group_id, commit_ms);
+        }
         shell.split_groups.push(SplitGroup {
             group_id: group_id.clone(),
             axis,

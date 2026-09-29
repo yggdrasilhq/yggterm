@@ -2505,7 +2505,7 @@ dioxus.send(out);
         (joined by the window, both one-shot events; group_id in the payload is
         the identity assert). Refusal events are surfaced, never swallowed."""
         out = {"activate": None, "create": None, "create_refused": None,
-               "ungrouped": None, "ungroup_refused": None}
+               "ungrouped": None, "ungroup_refused": None, "render_spans": []}
         for ev in self.ytrace_events(since_ms):
             name = ev.get("name")
             payload = self._ui_payload(ev)
@@ -2526,6 +2526,18 @@ dioxus.send(out);
                                     "group_id": payload.get("group_id")}
             elif name == "split/ungroup_refused":
                 out["ungroup_refused"] = {"reason": payload.get("reason")}
+            elif ev.get("category") == "split" and name == "render_span":
+                # The create's felt paint end (ux-speed
+                # split-commit-render-span lane): one per member, anchored
+                # at the split/create commit.
+                out["render_spans"].append({
+                    "ts": ev.get("ts_ms"),
+                    "group_id": payload.get("group_id"),
+                    "session_path": payload.get("session_path"),
+                    "commit_to_pane_paint_ms": payload.get("commit_to_pane_paint_ms"),
+                    "cols": payload.get("cols"),
+                    "rows": payload.get("rows"),
+                })
         if out["activate"] and out["create"]:
             out["pair_ms"] = out["create"]["ts"] - out["activate"]["ts"]
         return out
@@ -2628,6 +2640,20 @@ dioxus.send(out);
                 lost = [p for p in (a_path, b_path) if p not in live]
                 if lost:
                     acc.append("UNGROUP CLOSED SCRATCH ROWS: %s" % lost)
+            # The render-span join (split-commit-render-span lane): the
+            # commit's felt paint end per member. Read AFTER the ungroup
+            # wait so the paint arms (which can trail the DOM by a frame or
+            # two) have landed; the pane reflow paints well inside it.
+            render_spans = []
+            if committed:
+                final_pair = self.split_events_from_trace(t0)
+                want_group = (pair.get("create") or {}).get("group_id")
+                render_spans = [s for s in (final_pair.get("render_spans") or [])
+                                if not want_group
+                                or s.get("group_id") == want_group]
+                if not render_spans:
+                    acc.append("no split/render_span in ytrace (build not "
+                               "rotated onto the render-span instrument)")
             out["iterations"].append({
                 "open_wall_ms": open_wall_ms,
                 "menu_open_ms": result.get("menu_open_ms"),
@@ -2643,6 +2669,11 @@ dioxus.send(out);
                 "pane_count": result.get("pane_count"),
                 "compound_label": result.get("compound_label"),
                 "ungroup_to_gone_ms": ungroup.get("ungroup_to_gone_ms"),
+                "render_span_max_ms": (
+                    max(s.get("commit_to_pane_paint_ms") or 0
+                        for s in render_spans)
+                    if render_spans else None),
+                "render_spans": render_spans,
                 "accuracy_failures": acc,
             })
         return summarize(out, key="click_to_dom_felt_ms")

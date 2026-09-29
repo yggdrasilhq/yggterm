@@ -8026,7 +8026,38 @@ fn TerminalCanvas(
                                     if painted
                                         && resize_repaint_last_grid != Some((cols, rows))
                                     {
+                                        let pre_split_grid = resize_repaint_last_grid;
                                         resize_repaint_last_grid = Some((cols, rows));
+                                        // The split create's felt paint end
+                                        // (ux-speed split-commit-render-span
+                                        // lane): this surface repainting at its
+                                        // post-split grid, one span per member
+                                        // per commit (the anchor is consumed).
+                                        if let Some((span_group_id, span_commit_ms)) =
+                                            take_split_commit_render_anchor(
+                                                &session_path,
+                                                current_millis(),
+                                            )
+                                        {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "split",
+                                                "render_span",
+                                                json!({
+                                                    "group_id": span_group_id,
+                                                    "session_path": session_path.clone(),
+                                                    "host_id": host_id.clone(),
+                                                    "commit_to_pane_paint_ms": current_millis()
+                                                        .saturating_sub(span_commit_ms),
+                                                    "pre_cols": pre_split_grid.map(|(c, _)| c),
+                                                    "pre_rows": pre_split_grid.map(|(_, r)| r),
+                                                    "cols": cols,
+                                                    "rows": rows,
+                                                    "geometry_usable": geometry_usable,
+                                                }),
+                                            );
+                                        }
                                         append_trace_event(
                                             &trace_home,
                                             "ui",
