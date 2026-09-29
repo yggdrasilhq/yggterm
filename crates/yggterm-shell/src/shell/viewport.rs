@@ -6666,11 +6666,32 @@ fn TerminalCanvas(
             } else {
                 None
             };
-            let mut warm_liveness_deadline = if mount_fn_installed {
-                Some(tokio::time::Instant::now() + Duration::from_millis(TERMINAL_WARM_EVAL_LIVENESS_MS))
+            // [11.178] Adaptive warm-eval gate state. The first deadline
+            // (T0+PROBE_DISPATCH) only DISPATCHES the trivial pipeline probe;
+            // later fires DECIDE: probe answered while the mount is still
+            // bridge-silent => the mount eval was dropped, redo cold; silent
+            // => the page is stalled, keep waiting + re-probe; MAX_WAIT caps
+            // the stall wait. The [11.176] streak ladder stays the outer
+            // bound behind this.
+            let mut warm_gate_deadline = if mount_fn_installed {
+                Some(tokio::time::Instant::now() + Duration::from_millis(TERMINAL_WARM_EVAL_PROBE_DISPATCH_MS))
             } else {
                 None
             };
+            let warm_gate_t0_ms = if mount_fn_installed { current_millis() } else { 0 };
+            let mut warm_probe_dispatched = false;
+            // The probe's own join future, held in loop state and polled from
+            // its select arm: Eval is not Send (no task spawn), and the
+            // answer ARRIVING is itself the "pipeline drained" signal — a
+            // still-pending probe is a stalled page, which is exactly the
+            // keep-waiting evidence, so no separate timeout budget is needed.
+            let mut warm_probe_eval: Option<
+                std::pin::Pin<
+                    Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
+                >,
+            > = None;
+            let mut warm_probe_alive: Option<bool> = None;
+            let mut warm_probe_count: u32 = 0;
             let mut saw_warm_bridge_event = false;
             // [11.187] The drop witness + the liveness heartbeat. The guard
             // lives for the loop's whole life; its Drop fires at task end
@@ -7172,7 +7193,7 @@ fn TerminalCanvas(
                     }
                     result = &mut eval_result => {
                         saw_warm_bridge_event = true;
-                        warm_liveness_deadline = None;
+                        warm_gate_deadline = None;
                         let _ = safe_shell_mut(state, "terminal_attach_bridge_result", |shell| {
                             release_terminal_bootstrap_lease_if_current(
                                 shell,
@@ -7231,7 +7252,7 @@ fn TerminalCanvas(
                         // [11.178] Any bridge event proves the mount eval
                         // executed — the vanish gate is done for this mount.
                         saw_warm_bridge_event = true;
-                        warm_liveness_deadline = None;
+                        warm_gate_deadline = None;
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "js_event",
                             &session_path,
@@ -11480,43 +11501,128 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    // [11.178] The warm mount eval PHANTOM-COMPLETED: WebKitGTK
-                    // answered Ok(null) without executing a single statement, so
-                    // neither the bridge nor eval_result will ever produce
-                    // evidence. One second of total bridge silence on the warm
-                    // path is that vanish; re-dispatch the cold installer in-task
-                    // instead of paying the ~8.3 s recover ladder per spawn. The
-                    // [11.176] streak ladder stays armed behind this as the outer
-                    // bound (a vanished REDO lands there).
+                    // [11.178] The adaptive warm-eval gate. A healthy warm
+                    // mount's first bridge event lands well under 500 ms and
+                    // disarms everything (the two bridge-event sites). The
+                    // first deadline (T0+PROBE_DISPATCH) dispatches the
+                    // trivial pipeline probe; later fires read it: ANSWERED
+                    // while the mount is still bridge-silent => the eval
+                    // pipeline drains => the ~1 KB mount eval was dropped,
+                    // not queued — re-dispatch the cold installer in-task
+                    // (no recover ladder). SILENT => the page is stalled; the
+                    // warm mount is queued behind the same congestion and a
+                    // ~500 KB redo would queue behind it too — keep waiting
+                    // and re-probe. MAX_WAIT caps the stall wait. The
+                    // [11.176] streak ladder stays armed behind this as the
+                    // outer bound (a vanished REDO lands there).
+                    probe_answer = async {
+                        warm_probe_eval
+                            .as_mut()
+                            .expect("warm probe eval armed")
+                            .await
+                    },
+                        if warm_probe_eval.is_some() =>
+                    {
+                        warm_probe_alive = Some(
+                            probe_answer
+                                .as_ref()
+                                .map(|value| value.as_i64() == Some(2))
+                                .unwrap_or(false),
+                        );
+                        warm_probe_eval = None;
+                    }
                     _ = tokio::time::sleep_until(
-                        warm_liveness_deadline
+                        warm_gate_deadline
                             .unwrap_or_else(tokio::time::Instant::now),
                     ),
-                        if warm_liveness_deadline.is_some() =>
+                        if warm_gate_deadline.is_some() =>
                     {
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "warm_eval_liveness",
                             &session_path,
                         );
-                        warm_liveness_deadline = None;
-                        if !saw_warm_bridge_event {
-                            let Some(cold_script) = cold_fallback_script.take() else {
-                                continue;
-                            };
-                            append_trace_event(
-                                &trace_home,
-                                "ui",
-                                "terminal_mount",
-                                "warm_eval_vanish_redo_cold",
-                                json!({
-                                    "session_path": session_path.clone(),
-                                    "host_id": host_id.clone(),
-                                    "mount_epoch": mount_epoch,
-                                    "liveness_ms": TERMINAL_WARM_EVAL_LIVENESS_MS,
-                                }),
+                        if saw_warm_bridge_event {
+                            warm_gate_deadline = None;
+                        } else if !warm_probe_dispatched {
+                            warm_probe_dispatched = true;
+                            warm_probe_count += 1;
+                            warm_probe_eval = Some(Box::pin(
+                                document::eval(&terminal_mount_pipeline_probe_script())
+                                    .join::<Value>(),
+                            ));
+                            let waited = current_millis().saturating_sub(warm_gate_t0_ms);
+                            warm_gate_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + Duration::from_millis(
+                                        TERMINAL_WARM_EVAL_ALIVE_REDO_MS
+                                            .saturating_sub(waited),
+                                    ),
                             );
-                            eval = terminal_document.eval(cold_script);
-                            eval_result = Box::pin(eval.clone().join::<Value>());
+                        } else {
+                            let waited = current_millis().saturating_sub(warm_gate_t0_ms);
+                            let probe_says_alive = warm_probe_alive == Some(true);
+                            if probe_says_alive
+                                || waited >= TERMINAL_WARM_EVAL_MAX_WAIT_MS
+                            {
+                                let Some(cold_script) = cold_fallback_script.take() else {
+                                    warm_gate_deadline = None;
+                                    continue;
+                                };
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "warm_eval_vanish_redo_cold",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "mount_epoch": mount_epoch,
+                                        "gate": "adaptive_probe",
+                                        "decision": if probe_says_alive {
+                                            "pipeline_alive_eval_lost"
+                                        } else {
+                                            "stall_cap"
+                                        },
+                                        "probe_count": warm_probe_count,
+                                        "waited_ms": waited,
+                                    }),
+                                );
+                                warm_gate_deadline = None;
+                                eval = terminal_document.eval(cold_script);
+                                eval_result = Box::pin(eval.clone().join::<Value>());
+                            } else {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "warm_eval_gate_keep_waiting",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "mount_epoch": mount_epoch,
+                                        "pipeline": if warm_probe_alive == Some(false) {
+                                            "degraded"
+                                        } else {
+                                            "silent"
+                                        },
+                                        "probe_count": warm_probe_count,
+                                        "waited_ms": waited,
+                                    }),
+                                );
+                                if warm_probe_eval.is_none() {
+                                    warm_probe_count += 1;
+                                    warm_probe_eval = Some(Box::pin(
+                                        document::eval(&terminal_mount_pipeline_probe_script())
+                                            .join::<Value>(),
+                                    ));
+                                }
+                                warm_gate_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_millis(
+                                            TERMINAL_WARM_EVAL_STALL_REPROBE_MS,
+                                        ),
+                                );
+                            }
                         }
                     }
                     _ = tokio::time::sleep_until(next_read_deadline),

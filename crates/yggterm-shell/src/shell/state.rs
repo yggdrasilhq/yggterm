@@ -591,25 +591,32 @@ const REMOTE_LIVE_PREWARM_ROWS: u16 = 50;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
-/// [11.178] The warm mount eval can be PHANTOM-COMPLETED by WebKitGTK:
-/// run_javascript answers Ok(null) without executing a single statement
-/// (rig 2026-09-27: dispatch ok -> eval_complete ok(null), no wrapper entry,
-/// no bridge event, while small evals before and a 1.5 MB cold after both
-/// execute; wry queue, script size (<=4 MB idle), syntax and dispatch thread
-/// all exonerated). A healthy warm mount's first bridge event (the bootstrap
-/// js_debug) lands well under 500 ms, so this much silence means the eval
-/// vanished and the cold installer must be dispatched without waiting for
-/// the recover ladder.
-// [11.178] 2.5 s ("outside the stall tail") was TRIED and FALSIFIED by live
-// A/B 2026-09-29 (warmmount-gate-fix lane): the tail is LOAD-DEPENDENT and
-// the release desktop's spawn-churn stalls sit at ~2.9 s, so every gated
-// spawn paid deadline+redo and spawn_to_paint regressed 2.0-2.3 s -> 3.3-4.3 s
-// (p50 3.3 vs the 2.3 bar). 1.0 s stands: the gate-plus-redo total (~1.5 s)
-// IS the measured good path; the redo is race-free against a late-resuming
-// warm mount via the __yggtermMountAttempt invoke-stamp guard (the
-// terminal_scripts.rs side of this lane). The adaptive arm (web-process
-// liveness / pipeline probe before redo) is the entry's named next step.
-const TERMINAL_WARM_EVAL_LIVENESS_MS: u64 = 1_000;
+/// [11.178] The warm mount eval can stall in the page's execution/message
+/// pipeline: dispatched, never executes (no first js_debug, no bridge
+/// event, the eval future never settles), while small evals before and a
+/// 1.5 MB cold after both execute (rig 2026-09-27; the WebKit "phantom"
+/// framing was falsified by the evalwedge witness chain 2026-09-29 — the
+/// script RUNS, it is STALLED). The stall tail is LOAD-DEPENDENT (~0.7-1.0 s
+/// quiet rig, unbounded churned) so NO constant deadline sits outside it —
+/// the 2.5 s arm was tried and live-falsified 2026-09-29
+/// (warmmount-gate-fix lane).
+// [11.178] THE ADAPTIVE GATE (2026-09-29, warmmount-adaptive-gate lane) —
+// replaces the fixed 1.0 s bridge-silence deadline with a trivial-eval
+// pipeline probe. `return 1 + 1` is dispatched at T0+PROBE_DISPATCH; it
+// ANSWERS while the mount is still bridge-silent => the eval pipeline
+// drains => the ~1 KB mount eval was dropped, not queued — redo cold
+// (justified, and ~300 ms earlier than the old constant). It stays PENDING
+// (silent) => the page is stalled; the warm mount is queued behind the same
+// congestion and a ~500 KB redo would queue behind it too — keep waiting
+// and re-probe every REPROBE ms. MAX_WAIT caps the stall wait; the
+// [11.176] streak
+// ladder stays the outer bound (a vanished REDO lands there). The redo is
+// race-free against a late-resuming warm mount via the __yggtermMountAttempt
+// invoke-stamp guard (terminal_scripts.rs).
+const TERMINAL_WARM_EVAL_PROBE_DISPATCH_MS: u64 = 350;
+const TERMINAL_WARM_EVAL_ALIVE_REDO_MS: u64 = 700;
+const TERMINAL_WARM_EVAL_STALL_REPROBE_MS: u64 = 500;
+const TERMINAL_WARM_EVAL_MAX_WAIT_MS: u64 = 8_000;
 // Cap on consecutive startup-restore recoveries without a Ready in between —
 // past this, further remounts are futile churn (see
 // startup_terminal_restore_should_recover).

@@ -19,6 +19,20 @@ the daemon knows is retired.
 
 ## Unreleased
 
+- **The warm-mount liveness gate now probes the page before redoing (the [11.178] adaptive arm).**
+  The fixed 1.0 s bridge-silence deadline fired INSIDE the load-dependent warm-eval stall
+  (~0.7-1.0 s quiet, unbounded churned), so a spawn whose mount was merely stalled paid a
+  wasted redo-cold parse of the ~500 KB body — and a genuinely dropped eval waited the full
+  second before the redo. The gate now dispatches a trivial `return 1 + 1` pipeline probe at
+  T0+350 ms: an ANSWER while the mount is still bridge-silent proves the eval pipeline drains
+  and the mount eval was dropped (redo cold, ~300 ms earlier than the old constant); a
+  still-pending probe proves the page is stalled and the warm mount is queued behind the same
+  congestion — the gate keeps waiting and re-probes (500 ms cadence, 8 s cap) instead of
+  piling the redo into the stall. Trace: `warm_eval_gate_keep_waiting` names each wait
+  (pipeline silent/degraded, probe count, waited ms); `warm_eval_vanish_redo_cold` now carries
+  `gate: "adaptive_probe"`, the decision (`pipeline_alive_eval_lost` / `stall_cap`), probe
+  count and waited ms.
+
 - **The warm-mount redo can no longer double-mount the terminal host (the [11.178] race).**
   When the warm-eval liveness gate fires, the redo-cold installer and a late-resuming warm mount
   used to race the same host — last-writer-wins at registration could hand the host to the STALE
