@@ -24,6 +24,20 @@ probe row it creates. Scenario ↔ defect map:
   store_absent_refuses       the DESIGNED refusal: a store-absent uuid with no
                              store candidate must refuse by name (honest),
                              never fabricate a fresh conversation silently
+  defmiss_fresh_start_mint   [11.206]: the SAME shape behind a REMEMBERED
+                             close (a row reopened after a proper close) must
+                             MINT a fresh start — trace
+                             ensure_definitive_miss_fresh_start, the row
+                             RE-POINTED to a fresh yggterm-minted conversation
+                             id ([11.193] binding: rows show id != requested)
+                             — and CONNECT, never the pre-fix 14 ms bail into
+                             an error frame. The serving half (trace + live
+                             row) measured GREEN 2026-09-29 on build bfe5ed19;
+                             the binding half measured RED the same day (the
+                             spawned command resumed the ABSENT requested id,
+                             rows show kept it) — this scenario is that RED
+                             baseline until the minted-bound compose reaches
+                             the row.
 
 A scenario that cannot run (no store, no CLI) is SKIP with the reason; a
 scenario that asserts and fails is FAIL. Exit code 0 only when nothing failed.
@@ -495,12 +509,193 @@ def scenario_store_absent_refuses():
     )
 
 
+def db_conversations_for_dir(directory):
+    """(conversation_id, killed) for every summaries row whose
+    workspace_uris names `directory` — what the vouch ladder's candidate
+    search reads (exact `file://<cwd>` element, the [11.183] tightening)."""
+    import sqlite3
+
+    if not AGY_DB.exists():
+        return []
+    conn = sqlite3.connect(f"file:{AGY_DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "select conversation_id, workspace_uris, killed "
+            "from conversation_summaries"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for cid, ws, killed in rows:
+        try:
+            dirs = json.loads(ws)
+        except (TypeError, ValueError):
+            continue
+        if f"file://{directory}" in (dirs or []):
+            out.append((cid, killed))
+    return out
+
+
+def db_delete_conversations_for_dir(directory):
+    """The scenario's own store surgery, scoped to its own probe cwd: delete
+    every summaries row bound to `directory`, return the ids removed."""
+    import sqlite3
+
+    if not AGY_DB.exists():
+        return []
+    conn = sqlite3.connect(str(AGY_DB), timeout=10)
+    removed = []
+    try:
+        for cid, _killed in db_conversations_for_dir(directory):
+            conn.execute(
+                "delete from conversation_summaries where conversation_id = ?",
+                (cid,),
+            )
+            removed.append(cid)
+        conn.commit()
+    finally:
+        conn.close()
+    return removed
+
+
+def rows_show_text(key):
+    answer = yggterm(["rows", "show", key], timeout=60)
+    return (answer.stdout + answer.stderr).strip()
+
+
+def scenario_defmiss_fresh_start_mint():
+    sc = Scenario("defmiss_fresh_start_mint_11206")
+    session_id = str(uuid.uuid4())  # the requested id — never in the store by construction
+    cwd = PROBE_CWD_ROOT / f"mint-{session_id[:8]}"
+    cwd.mkdir(parents=True, exist_ok=True)
+    key = f"agy-runtime://{session_id}"
+    stderr_path = PROBE_CWD_ROOT / f"mint-{session_id[:8]}.stderr"
+    try:
+        # 1. Birth a real row in the dedicated cwd.
+        yggterm_detached(["remote", "start-agy", session_id, str(cwd)])
+        connected, text = poll_until(lambda: screen_ok(key), deadline_s=120)
+        if connected is not True:
+            return sc.fail(f"birth leg never mounted a CLI; screen: {text[-200:]!r}")
+        # 2. Give the store time to bind the birth's conversation to this cwd
+        # (a turnless birth may never write one — then the cwd is already
+        # candidate-less and step 4's surgery removes nothing).
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not db_conversations_for_dir(str(cwd)):
+            time.sleep(3)
+        # 3. Close the row through the daemon: rows despawn RECORDS the
+        # remembered close (the e2ddee1a reopen-pass) and kills the CLI, so
+        # no live holder survives into the resume ([11.195]).
+        reap(key)
+        # 4. The store surgery: the cwd's conversation leaves the store, so
+        # the candidate search answers None — the vouch has nothing to serve
+        # and the definitive miss falls through to the mint.
+        removed = db_delete_conversations_for_dir(str(cwd))
+        # 5. The click — the same verb chain a GUI row-open drives: wrapper
+        # gate (passes: the close IS remembered) -> ensure (definitive miss,
+        # no candidate) -> the [11.190] minted fresh start.
+        offset = YTRACE.stat().st_size if YTRACE.exists() else 0
+        proc = yggterm_detached(
+            ["remote", "resume-agy", session_id, str(cwd), "--require-existing"],
+            stderr_path=str(stderr_path),
+        )
+
+        def minted():
+            ok, text = screen_ok(key)
+            if ok is None:
+                return None, text
+            # Screen alive AND the mint named in the trace — either alone
+            # could be a different arm (a vouch this scenario tried to
+            # starve, or a trace the screen never followed).
+            if trace_has_event(session_id, offset, "ensure_definitive_miss_fresh_start"):
+                return True, text
+            return None, text
+
+        def wrapper_refused_early():
+            if proc.poll() is None:
+                return None
+            try:
+                err = stderr_path.read_text(errors="replace")
+            except OSError:
+                return False
+            return "no longer available" in err
+
+        deadline = time.monotonic() + 150
+        connected, text = None, ""
+        while time.monotonic() < deadline:
+            connected, text = minted()
+            if connected is not None or wrapper_refused_early():
+                break
+            time.sleep(3)
+        refused_stderr = ""
+        try:
+            refused_stderr = stderr_path.read_text(errors="replace").strip()
+        except OSError:
+            pass
+        if connected is True:
+            # THE [11.193] BINDING, the half the Fresh Start stamp names: the
+            # minted fresh start composes `--conversation <fresh uuid>` and
+            # RE-POINTS the row's id onto it — rows show must answer an id
+            # that is NOT the store-absent requested one. Measured RED
+            # 2026-09-29 on build bfe5ed19: the serving half landed (trace +
+            # live row) but the spawned command resumed the ABSENT requested
+            # id and rows show kept it — the minted-bound compose never
+            # reached the row. Split verdicts, never launder one into the
+            # other.
+            shown = rows_show_text(key)
+            id_field = ""
+            for line in shown.splitlines():
+                line = line.strip()
+                if line.startswith('"id":'):
+                    id_field = line.split('"id":')[1].strip(" \",")
+                    break
+            bound = bool(id_field) and id_field != session_id
+            if bound:
+                return sc.ok(
+                    "store-absent remembered-closed row with no cwd candidate MINTED "
+                    f"and BOUND a fresh start (trace fired; rows show id re-pointed "
+                    f"{session_id[:8]}… -> {id_field[:8]}…; {len(text)} chars)"
+                )
+            return sc.fail(
+                "SERVING half green, BINDING half red: ensure_definitive_miss_fresh_start "
+                f"traced and the row connected, but rows show answers id="
+                f"{id_field or '(none)'} — the row still wears the store-absent "
+                f"requested id {session_id[:8]}…, so the minted-bound compose "
+                "([11.190]/[11.193]) did not reach the row (the spawned command "
+                "resumed the absent id; store surgery removed "
+                f"{len(removed)} conversation(s))"
+            )
+        if "no longer available" in refused_stderr or "no longer available" in text:
+            return sc.fail(
+                "the ladder refused instead of minting — remembered close did not "
+                f"pass the wrapper or the miss was not definitive: stderr="
+                f"{refused_stderr[:240]!r} screen={text[:160]!r}"
+            )
+        if connected is False:
+            return sc.fail(f"refusal painted on the row screen: {text[:300]!r}")
+        alive = screen_ok(key)[0]
+        if alive:
+            return sc.fail(
+                "CLI on screen but NO ensure_definitive_miss_fresh_start trace — "
+                "the row connected through some other arm; the mint falsifier "
+                "stays unexercised"
+            )
+        return sc.fail(
+            "no CLI after 150s and no named refusal — stderr="
+            f"{refused_stderr[:240]!r} screen={text[-160:]!r}"
+        )
+    finally:
+        reap(key)
+        db_delete_conversations_for_dir(str(cwd))
+        stderr_path.unlink(missing_ok=True)
+
+
 SCENARIOS = [
     scenario_preflight,
     scenario_fresh_start,
     scenario_resume_store_present,
     scenario_rebirth_uuid_vouch,
     scenario_store_absent_refuses,
+    scenario_defmiss_fresh_start_mint,
 ]
 
 
