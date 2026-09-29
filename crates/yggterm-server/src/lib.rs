@@ -40454,6 +40454,51 @@ mod tests {
         );
     }
 
+    /// ⛔ THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, jojo row
+    /// 6778336d): the memo existed and the [11.153] ensure gate spent it,
+    /// but the resize forward never read its own memo — every GUI recovery
+    /// re-mount replayed the full 5-retry ssh ladder against a runtime the
+    /// peer had already confidently denied, forever (12 verdicts / 6.3 h on
+    /// ONE row). The forward must spend the memo BEFORE enqueueing, and the
+    /// worker must re-arm it the moment the peer answers anything other
+    /// than not-found-about-our-key.
+    #[test]
+    fn the_resize_forward_honors_and_rearms_the_peer_missing_memo() {
+        let source = include_str!("daemon.rs");
+        let forward = source
+            .find("fn forward_remote_pty_resize(")
+            .expect("the forward entry must exist");
+        let pending_insert = source[forward..]
+            .find("pending.insert(path.to_string()")
+            .expect("the pending insert must exist");
+        let window = &source[forward..forward + pending_insert];
+        assert!(
+            window.contains("remote_pty_resize_skipped_peer_missing"),
+            "the forward must spend a fresh peer-missing memo BEFORE \
+             enqueueing — the [11.153] gate alone cannot stop the ssh \
+             ladder the re-queue replays on every mount"
+        );
+        let rearm = source[forward..]
+            .find("remote_pty_resize_peer_memo_rearmed")
+            .expect(
+                "the worker must re-arm the memo on peer-alive evidence — \
+                 success, a different terminal error, or a [11.161] \
+                 key-space mismatch — or the tombstone outlives its cause",
+            );
+        let handler_message = source
+            .find("peer runtime missing (cached verdict)")
+            .expect(
+                "the TerminalResize handler must speak the cached verdict \
+                 on the Ack message — the GUI-side divorce classifier is \
+                 unreachable while the forward fails silently in the \
+                 fire-and-forget re-queue",
+            );
+        assert!(
+            handler_message > rearm,
+            "the handler Ack must consult the same memo the worker arms"
+        );
+    }
+
     /// ⛔ THE ENSURE REAPS STRANDED ORPHANS BEFORE REFUSING. The [11.57] cure
     /// was done by hand: a handover-lost runtime's own CLI sat orphaned to
     /// init (its PTY reader dead), the ensure's external-holder guard

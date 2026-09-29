@@ -20115,18 +20115,17 @@ async fn terminal_resize_repaint_async(
     session_path: String,
     cols: u16,
     rows: u16,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if client_is_shadow_viewer() {
         // Same D8 rule as [`terminal_resize_async`]: a viewer must never
         // SIGWINCH the user's live frame.
-        return Ok(());
+        return Ok(None);
     }
     task::spawn_blocking(move || {
         terminal_resize_repaint(&endpoint, &session_path, cols, rows, true)
     })
     .await
     .map_err(|error| anyhow!("joining terminal repaint task: {error}"))?
-    .map(|_| ())
 }
 fn spawn_terminal_startup_resize_repair(
     endpoint: ServerEndpoint,
@@ -20152,18 +20151,35 @@ fn spawn_terminal_startup_resize_repair(
         // geometry — two real SIGWINCHes — and the TUI's current frame
         // arrives as ordinary bytes.
         match terminal_resize_repaint_async(endpoint, runtime_session_path, cols, rows).await {
-            Ok(()) => {
+            Ok(ack_message) => {
+                // THE [11.57] DIVORCE, NOW REACHABLE (measured live
+                // 2026-09-29, jojo row 6778336d): the forwarded failure can
+                // never take the Err arm — the verb answers Ok for the LOCAL
+                // half while the remote half fails inside the fire-and-forget
+                // re-queue, so this classifier sat dead on the exact path it
+                // was built for (12 unownable verdicts, 0 divorces). The
+                // daemon now speaks the cached verdict on the Ack message;
+                // classify the same width-divorce here that a synchronous
+                // not-found would have taken.
+                let peer_missing = ack_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("terminal session not found"));
                 append_trace_event(
                     &trace_home,
                     "ui",
                     "terminal_mount",
-                    "terminal_startup_resize_repair",
+                    if peer_missing {
+                        "remote_resize_unownable_divorce"
+                    } else {
+                        "terminal_startup_resize_repair"
+                    },
                     json!({
                         "session_path": visible_session_path,
                         "cols": cols,
                         "rows": rows,
                         "repaint": true,
                         "source": source,
+                        "peer_missing": peer_missing,
                     }),
                 );
             }
