@@ -19,6 +19,31 @@ the daemon knows is retired.
 
 ## Unreleased
 
+## [11.174]-uxspeed the felt shift-drag stops resolving its drop on a stale mirror and stops lying about a satisfied drop
+
+A multi-row set drag resolved its landing against the server mirror instead
+of the sidebar the gesture happened on. The two views disagree around a
+fresh spawn (`browser.rows` registers the row while the mirror waits for the
+snapshot) and around a fresh snapshot (the mirror leads the redraw), and a
+drop resolved on the wrong one broke accuracy both ways: a real move was
+refused when the mirror lagged, and a set whose drop was already satisfied
+on screen got REVERSED by a commit the drawn order never asked for. The
+satisfied drop then fell through to the workspace tail and surfaced as the
+misleading `tree_drop_ignored {reorder_plan_none}`. The live reorder now
+resolves against the drag's own merged-rows cache (the drawn live-region
+order, the same surface the ghost promised on) with the mirror as fallback,
+and an already-satisfied drop is recorded as an honest
+`live_session_reorder_noop {reason: set_already_positioned}` that ends the
+gesture. The reorder plan keeps the set's drawn order (a block move) and
+`live_session_reordered_paths_for_drop` keeps its old contract on top of the
+new resolver. uxprobe `shiftdrag` now computes its expected landing from the
+observed pre-gesture order (spawns front-seat - [D, C, B, A] is the normal
+shape of a fresh batch), flips to the Before band when After is already
+satisfied, and counts the real commit markers
+(`live_session_reorder_persisted`/`row_set_arranged`) - its old counter
+hunted `live_session_persist_dropped`, the daemon's persist-telemetry for
+rows vanishing at swaps, an event that never fires on a drag.
+
 ## [11.208]-uxspeed the active-row close stops paying the selection-expansion crawl three times and re-parsing the title map
 
 Closing the front row of a 425-row desktop stalled the UI thread for

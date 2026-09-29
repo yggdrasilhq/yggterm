@@ -26500,6 +26500,10 @@ console.log('ok');
             handler.contains("LiveSessionOrderUpdate::from_message("),
             "the daemon's honest answer must be parsed, not shown raw or discarded"
         );
+        assert!(
+            handler.contains("live_session_reorder_noop"),
+            "an already-satisfied drop must be recorded as an honest noop, not fall through to the workspace tail's misleading reorder_plan_none ([11.174])"
+        );
     }
 
     #[test]
@@ -26662,6 +26666,132 @@ console.log('ok');
         // queue_drop must still handle arrangement_without_reorder (the fix)
         // Simulate queue_drop's early return for arrangement_without_reorder: it should clear drag.
         // Here we just verify that arrangement_without_reorder would be considered handled.
+    }
+
+    // The [11.174] repro shape, as the resolver now must answer it: fresh
+    // spawns front-seat, so the drawn order of a 0..3 batch is [D, C, B, A]
+    // and dropping {A, B, C} After D is ALREADY satisfied. The answer is an
+    // honest Noop — never a plan (a plan from this shape would REVERSE the
+    // set, the mirror-led accuracy defect measured live 2026-09-29) and never
+    // NotLive (that fell through to the workspace tail and read as the
+    // misleading `reorder_plan_none` refusal).
+    #[test]
+    fn a_set_already_after_its_target_resolves_noop_not_a_plan() {
+        let current = vec![
+            "local://d".to_string(),
+            "local://c".to_string(),
+            "local://b".to_string(),
+            "local://a".to_string(),
+        ];
+        let target = DragDropTarget {
+            path: "local://d".to_string(),
+            placement: DragDropPlacement::After,
+        };
+        assert!(matches!(
+            live_session_drop_reorder_plan(
+                &current,
+                &[
+                    "local://a".to_string(),
+                    "local://b".to_string(),
+                    "local://c".to_string()
+                ],
+                &target,
+            ),
+            LiveSessionDropReorder::Noop
+        ));
+    }
+
+    // A real move: the set keeps its DRAWN relative order (a block move, not
+    // a selection-order rewrite) and inserts at the dropped band.
+    #[test]
+    fn a_set_drop_lands_the_block_in_drawn_order_at_the_dropped_band() {
+        let current = vec![
+            "local://a".to_string(),
+            "local://b".to_string(),
+            "local://c".to_string(),
+            "local://d".to_string(),
+        ];
+        let after_d = DragDropTarget {
+            path: "local://d".to_string(),
+            placement: DragDropPlacement::After,
+        };
+        match live_session_drop_reorder_plan(
+            &current,
+            &[
+                "local://a".to_string(),
+                "local://b".to_string(),
+                "local://c".to_string(),
+            ],
+            &after_d,
+        ) {
+            LiveSessionDropReorder::Plan(plan) => {
+                assert_eq!(
+                    plan,
+                    vec![
+                        "local://d".to_string(),
+                        "local://a".to_string(),
+                        "local://b".to_string(),
+                        "local://c".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("a real move must resolve a plan"),
+        }
+        // Drawn order [D, C, B, A] (front-seated spawns), Before band: the
+        // block {C, B, A} keeps its drawn order and lands ahead of D.
+        let reversed = vec![
+            "local://d".to_string(),
+            "local://c".to_string(),
+            "local://b".to_string(),
+            "local://a".to_string(),
+        ];
+        let before_d = DragDropTarget {
+            path: "local://d".to_string(),
+            placement: DragDropPlacement::Before,
+        };
+        match live_session_drop_reorder_plan(
+            &reversed,
+            &[
+                "local://a".to_string(),
+                "local://b".to_string(),
+                "local://c".to_string(),
+            ],
+            &before_d,
+        ) {
+            LiveSessionDropReorder::Plan(plan) => {
+                assert_eq!(
+                    plan,
+                    vec![
+                        "local://c".to_string(),
+                        "local://b".to_string(),
+                        "local://a".to_string(),
+                        "local://d".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("a real move must resolve a plan"),
+        }
+    }
+
+    // The drop must resolve against the DRAWN live-region order (the view the
+    // ghost promised on), with the mirror only as fallback — resolving against
+    // the mirror alone is the [11.174] accuracy defect class.
+    #[test]
+    fn the_live_drop_resolves_against_the_drawn_view_not_the_mirror_alone() {
+        let source = SHELL_SOURCE;
+        let start = source
+            .find("let (live_reorder, live_noop_target) = {")
+            .expect("the drawn-view drop resolution block");
+        let block = &source[start..start + 4000];
+        assert!(
+            block.contains("live_session_drop_reorder_plan(")
+                && block.contains("&drawn_live_order"),
+            "the drop must resolve its plan against the drawn live-region order"
+        );
+        assert!(
+            block.contains("drag_merged_rows_cache"),
+            "the drawn order must come from the drag's own merged-rows cache"
+        );
     }
 
     #[test]

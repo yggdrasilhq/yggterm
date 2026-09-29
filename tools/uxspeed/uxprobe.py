@@ -1535,14 +1535,50 @@ dioxus.send(out);
                 continue
             a_path, b_path, c_path, d_path = paths
             acc = []
-            ok0, _ = self.wait_relative_order([a_path, b_path, c_path, d_path])
-            if not ok0:
-                acc.append("scratch rows did not settle in spawn order")
+            # Presence wait, not an order assert: fresh spawns FRONT-SEAT, so
+            # the drawn order of a 0..3 batch is [3, 2, 1, 0] — a spawn-order
+            # assert can never pass and hid the real landing semantics for the
+            # whole [11.174] era. The order truth lives in the expected-landing
+            # computation below, read off the OBSERVED pre-gesture order.
+            settle = False
+            _t0 = time.perf_counter()
+            while time.perf_counter() - _t0 < self.timeout_s:
+                idx0 = self.rows_order_indices(tuple(paths))
+                if all(v is not None for v in idx0.values()):
+                    settle = True
+                    break
+                time.sleep(0.3)
+            if not settle:
+                acc.append("scratch rows never all appeared in rows()")
             rs = self.verb("tree", "select", a_path, b_path, c_path,
                            "--anchor", a_path)
             if not rs["ok"]:
                 acc.append("set-selection verb failed: %s" % rs.get("error"))
             time.sleep(0.4)
+            # The drop is a BLOCK MOVE on the drawn order: the set keeps its
+            # drawn relative order and inserts at the dropped band. Compute
+            # the expected landing from what is actually on screen, and pick
+            # the band that makes the gesture a REAL move (After is often
+            # already satisfied by front-seating — a satisfied drop no-ops by
+            # design, so the driver would measure its own assumption, not the
+            # product).
+            pre_idx = self.rows_order_indices(tuple(paths))
+            if any(v is None for v in pre_idx.values()):
+                acc.append("pre-gesture rows() missing paths: %s" % pre_idx)
+            pre_list = sorted(paths, key=lambda q: pre_idx[q] or 0)
+            set_drawn = [q for q in pre_list if q in (a_path, b_path, c_path)]
+            rest = [q for q in pre_list if q not in (a_path, b_path, c_path)]
+            d_i = rest.index(d_path)
+            after_expected = rest[:d_i + 1] + set_drawn + rest[d_i + 1:]
+            before_expected = rest[:d_i] + set_drawn + rest[d_i:]
+            band = "after"
+            expected = after_expected
+            if after_expected == pre_list:
+                band = "before"
+                expected = before_expected
+            if expected == pre_list:
+                acc.append("no band produces a real move (pre=%s)" % pre_list)
+            it_expected = list(expected)
             it = {"hover_steps": 0, "attempts": 1, "drag_events": [],
                   "commit_persist_events": 0, "felt_ms": None,
                   "reorder_settle_ms": None}
@@ -1561,7 +1597,10 @@ dioxus.send(out);
                 ax = ra["x"] + min(ra["w"] / 2, 120.0)
                 ay = ra["y"] + ra["h"] / 2
                 dx = rd["x"] + min(rd["w"] / 2, 120.0)
-                dy = rd["y"] + rd["h"] - 3.0  # the After band (bottom edge)
+                if band == "before":
+                    dy = rd["y"] + 3.0  # the Before band (top edge)
+                else:
+                    dy = rd["y"] + rd["h"] - 3.0  # the After band (bottom)
                 it = {"hover_steps": 0, "attempts": attempt}
                 t_down = now_ms()
                 rpress = self.verb("pointer", "press", "--x", str(int(ax)),
@@ -1577,8 +1616,7 @@ dioxus.send(out);
                     it["hover_steps"] += 1
                 self.verb("pointer", "release")
                 t_release = now_ms()
-                landed, settle_ms = self.wait_relative_order(
-                    [d_path, a_path, b_path, c_path])
+                landed, settle_ms = self.wait_relative_order(it_expected)
                 it["felt_ms"] = now_ms() - t_down
                 it["reorder_settle_ms"] = settle_ms
                 evs = self._events_between(t_down, now_ms())
@@ -1626,11 +1664,20 @@ dioxus.send(out);
             for need in ("tree_drag_hover", "tree_drag_ended"):
                 if need not in it["drag_events"]:
                     acc.append("drag family missing %s" % need)
+            # Commit truth: the daemon's changed answer (reorder_persisted)
+            # or the arrangement arm (row_set_arranged). The old counter hunted
+            # live_session_persist_dropped — the daemon's PERSIST-telemetry for
+            # rows vanishing at swaps, an event that never fires on a drag —
+            # so every gesture in the [11.174] era read "0 commits" regardless
+            # of what actually happened.
             it["commit_persist_events"] = sum(
-                1 for n in names if n == "live_session_persist_dropped")
+                1 for n in names
+                if n in ("live_session_reorder_persisted", "row_set_arranged"))
+            if tree_drop_ignored:
+                acc.append("drop refused (tree_drop_ignored in window)")
             if not it["commit_persist_events"] and not tree_drop_ignored:
                 acc.append("drop committed nothing "
-                           "(no live_session_persist_dropped in window)")
+                           "(no reorder_persisted/row_set_arranged in window)")
             if not landed:
                 acc.append("drop did not land the set after D in set order "
                            "within timeout")
