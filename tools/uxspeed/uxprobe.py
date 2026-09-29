@@ -2687,6 +2687,53 @@ dioxus.send(out);
         except Exception:
             return False
 
+    def _wm_read_maximized(self, cls: str) -> bool:
+        """True when the matching window carries both maximized state
+        atoms (xprop); False when xprop is missing or the state is unset —
+        the drive then works directly."""
+        try:
+            out = subprocess.run(["wmctrl", "-lxG"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except Exception:
+            return False
+        wid = None
+        for line in out.splitlines():
+            parts = line.split(None, 10)
+            if len(parts) < 8:
+                continue
+            cls_field = parts[6]
+            if any(c in cls_field.lower()
+                   for c in self._RESIZE_WM_CLASSES):
+                wid = parts[0]
+                break
+        if not wid:
+            return False
+        try:
+            state = subprocess.run(["xprop", "-id", wid, "_NET_WM_STATE"],
+                                   capture_output=True, text=True,
+                                   timeout=5).stdout
+        except Exception:
+            return False
+        return ("_NET_WM_STATE_MAXIMIZED_VERT" in state
+                and "_NET_WM_STATE_MAXIMIZED_HORZ" in state)
+
+    def _wm_maximized(self, cls: str, want: bool) -> bool:
+        """Set/unset the maximized state. A MAXIMIZED window is the
+        measured dead end for _NET_MOVERESIZE_WINDOW (the WM ignores the
+        geometry request, the state atom stays, any size blip snaps back —
+        live jojo 2026-09-29), and a user's edge-drag unmaximizes
+        implicitly, so the drive unmaximizes first and the action restores
+        the state at the end."""
+        act = "add" if want else "remove"
+        try:
+            r = subprocess.run(
+                ["wmctrl", "-x", "-r", cls, "-b",
+                 "%s,maximized_vert,maximized_horz" % act],
+                capture_output=True, text=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
     @staticmethod
     def _nested(ev: dict) -> dict:
         p = ev.get("payload")
@@ -2704,6 +2751,13 @@ dioxus.send(out);
             return {"error": "no scratch row to probe", "iterations": []}
         path = rows_ready[0]
         w0, h0 = win["w"], win["h"]
+        was_maximized = self._wm_read_maximized(win["cls"])
+        if was_maximized:
+            self._wm_maximized(win["cls"], False)
+            time.sleep(0.25)
+            fresh = self._yggterm_window()
+            if fresh:
+                w0, h0 = fresh["w"], fresh["h"]
         target_w = max(900, w0 - 160)
         sizes = [(target_w, h0), (w0, h0)]
         out = {"iterations": [], "start_size": [w0, h0],
@@ -2815,7 +2869,10 @@ dioxus.send(out);
                 time.sleep(0.9)
         finally:
             self._wm_resize(win["cls"], w0, h0)
-            time.sleep(0.6)
+            time.sleep(0.4)
+            if was_maximized:
+                self._wm_maximized(win["cls"], True)
+            time.sleep(0.4)
             back = self._yggterm_window()
             out["restored_size"] = ([back["w"], back["h"]] if back else None)
             out["rows_left_behind"] = len(self.spawned_paths)
