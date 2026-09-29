@@ -2795,8 +2795,17 @@ dioxus.send(out);
                 b_path: f"UXSPEED-MARK-{i}-B-{now_ms()}",
             }
             for m_path, mk in markers.items():
+                # The send rides the app-control verb plane; under the
+                # probe's own mount churn it can wedge to its budget
+                # (measured green2 run: two 12s timeouts poisoned the
+                # marker for the whole iteration). Bigger budget + ONE
+                # retry, then record honestly.
                 sr = self.verb("terminal", "send", m_path,
-                               "--data", f"echo {mk}\n")
+                               "--data", f"echo {mk}\n", timeout=25)
+                if not sr.get("ok"):
+                    time.sleep(1.0)
+                    sr = self.verb("terminal", "send", m_path,
+                                   "--data", f"echo {mk}\n", timeout=25)
                 if not sr.get("ok"):
                     acc.append(f"terminal send failed for {m_path}: "
                                f"{str(sr.get('error'))[:120]}")
