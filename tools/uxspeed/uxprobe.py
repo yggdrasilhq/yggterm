@@ -2758,6 +2758,34 @@ dioxus.send(out);
         a_path, b_path = scratch[0], scratch[1]
         for i in range(iters):
             acc = []
+            # [11.217] ACTIVATE both members pre-split — the user path (a
+            # human splits rows they have had on screen). Activation mounts
+            # each host at FULL width and replays the daemon screen, so the
+            # pre-split markers land in the hosts' buffers and the create
+            # re-seats them at pane width: the resize story both the heal
+            # and the render-span instrument are built for. Without it a
+            # kept hidden host sits on paused reads and the pane can only
+            # ever show stale bytes.
+            self.verb("tree", "select", a_path, b_path, "--anchor", a_path)
+            time.sleep(0.2)
+            arects: dict = {}
+            for _ in range(3):
+                arects = self._row_rects([a_path, b_path])
+                if arects.get(a_path) and arects.get(b_path):
+                    break
+                time.sleep(0.5)
+            for m_path in (a_path, b_path):
+                rect = arects.get(m_path)
+                if not rect:
+                    acc.append(f"pre-split activate: row rect missing "
+                               f"({m_path})")
+                    continue
+                ax = rect["x"] + min(rect["w"] / 2, 120.0)
+                ay = rect["y"] + rect["h"] / 2
+                self.verb("pointer", "press", "--x", str(int(ax)),
+                          "--y", str(int(ay)))
+                self.verb("pointer", "release")
+                time.sleep(0.5)
             # [11.217] content markers: one per member, written through the
             # REAL daemon PTY path pre-split and verified in the daemon
             # screen buffer, so the post-create pane read asserts the
@@ -2872,8 +2900,15 @@ dioxus.send(out);
                     if time.time() >= deadline:
                         break
                     time.sleep(0.25)
-                for m_path, which in ((a_path, "focused"),
-                                      (b_path, "co-visible")):
+                create_members = [
+                    m.get("session") for m in
+                    ((pair.get("create") or {}).get("members") or [])]
+                pane0 = create_members[0] if len(create_members) == 2 \
+                    else a_path
+                pane1 = create_members[1] if len(create_members) == 2 \
+                    else b_path
+                for m_path, which in ((pane0, "pane0-focused"),
+                                      (pane1, "pane1-co-visible")):
                     pane = panes_content.get(m_path) or {}
                     if not pane.get("present"):
                         acc.append(f"{which} pane host_missing ({m_path}) "
@@ -2927,8 +2962,8 @@ dioxus.send(out);
                                "rotated onto the render-span instrument)")
                 else:
                     # [11.217]: BOTH members must paint — one span each.
-                    for m_path, which in ((a_path, "focused"),
-                                          (b_path, "co-visible")):
+                    for m_path, which in ((pane0, "pane0-focused"),
+                                          (pane1, "pane1-co-visible")):
                         if not any(s.get("session_path") == m_path
                                    for s in render_spans):
                             acc.append(f"{which} member emitted no "
