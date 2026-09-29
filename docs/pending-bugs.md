@@ -30691,8 +30691,10 @@ lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
 
 ## ⛔ [11.213] THE REORDER SEAT GATE REFUSED A HEALTHY FRESH LIVE BIRTH — a 21-second-old `local://` row, drawn in the live region with a `live_session_birth` trace, was skipped by BOTH the client's optimistic apply and the daemon's `ReorderLiveSessions` handler as `SKIPPED_NOT_A_LIVE_ROW`, so a set drop anchored on it landed the block but not relative to its target (measured 2026-09-29 ~14:3x UTC, the [11.174]-uxspeed shiftdrag falsifier run 1, iteration 2, live jojo desktop, build 9bf0346113c4)
 
-**Status:** OPEN — daemon/server plane, FILE-NOT-TAKE from ux-speed seats (the
-fix lives in `replace_live_session_order`/`live_session_row_key`,
+**Status:** OPEN
+
+Daemon/server plane, FILE-NOT-TAKE from ux-speed seats (the fix lives in
+`replace_live_session_order`/`live_session_row_key`,
 crates/yggterm-server/src/lib.rs).
 
 The gesture: a 3-row set dragged Before a freshly spawned scratch row
