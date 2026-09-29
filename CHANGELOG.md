@@ -2,6 +2,21 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## [11.186] the retired chooser pane stops painting over the mounted desktop
+
+A libyggterm app's `sidebar;close` used to be undeliverable to any client
+whose live xterm host did not happen to be mounted at the emission instant:
+the daemon retained nothing (close-cleared), the daemon-declare rebuild
+honored `declare` only, the restore batch never asked about a held
+contribution, and a cursor-0 attach seed could window the close bytes out
+entirely — so a chooser pane mounted once and painted over the live surface
+forever. The close is now RETAINED as the verb's state, the rebuild and the
+restore batch both retire through one owner (`ShellState::retire_sidebar_
+contribution`, traced under the live arm's category/name with the plane
+named), and a cursor-0 seed rewrites consumed sidebar declares to the
+same-length dead action `defunct` so a replay can never flash-mount a pane
+the daemon knows is retired.
+
 ## Unreleased
 
 - **Closing the row you are looking at stops paying the 3-second teardown tax.**
