@@ -1764,6 +1764,7 @@ mod app_surface_batch_tests {
             want_rail,
             want_web,
             web_surface_dead: false,
+            holds_contribution: !want_rail,
         }
     }
 
@@ -1813,6 +1814,9 @@ mod app_surface_batch_tests {
             has_web_surface: has_web,
             web_surface_live: live,
             active,
+            // The candidates these fixtures exercise are half-shaped, not
+            // retire-check shaped; their reads witness declares.
+            reads_live: true,
         };
         let rows = vec![
             row("local://live", true, true, false),
@@ -1825,6 +1829,7 @@ mod app_surface_batch_tests {
                 has_web_surface: false,
                 web_surface_live: false,
                 active: false,
+                reads_live: true,
             },
         ];
         let targets = app_surface_restore_targets(&rows, &HashMap::new(), 1_000, 8);
@@ -1844,6 +1849,44 @@ mod app_surface_batch_tests {
             .expect("bare row must stay a candidate");
         assert!(bare.want_web);
         assert!(!bare.web_surface_dead);
+    }
+
+    // [11.186] A HELD contribution whose reads can no longer witness a declare
+    // is its own reason to consult the batch — the zombie that started this
+    // entry (pane painted over the mounted surface forever) was starved twice:
+    // the filter read both halves "already up", and want_rail was false. The
+    // retire-check candidate must NOT set want_rail (a record still on
+    // `declare` must never re-resolve a live app's ssh -L); the retire pass
+    // reads the batch answer instead.
+    #[test]
+    fn a_held_contribution_with_dead_reads_is_a_retire_check_candidate() {
+        let row = |path: &str, reads_live: bool| AppSurfaceRestoreRow {
+            session_path: path.to_string(),
+            ssh_target: None,
+            runtime_token: None,
+            has_contribution: true,
+            has_web_surface: true,
+            web_surface_live: true,
+            active: false,
+            reads_live,
+        };
+        let rows = vec![
+            row("local://zombie", false),
+            row("local://healthy", true),
+        ];
+        let targets = app_surface_restore_targets(&rows, &HashMap::new(), 1_000, 8);
+        let zombie = targets
+            .iter()
+            .find(|t| t.session_path == "local://zombie")
+            .expect("the zombie must stay a candidate — the close can only arrive via the batch");
+        assert!(zombie.holds_contribution);
+        // THE GUARD THAT KEEPS THIS SAFE: no rebuild, no ssh -L churn for an
+        // app that may still be alive on `declare`.
+        assert!(!zombie.want_rail);
+        assert!(!zombie.want_web);
+        // A contribution whose reads ARE live needs no daemon consult — the
+        // sweep owns its expiry, and the live close arm owns its close.
+        assert!(!targets.iter().any(|t| t.session_path == "local://healthy"));
     }
 
     #[test]
@@ -39231,6 +39274,11 @@ struct AppSurfaceRestoreRow {
     web_surface_live: bool,
     /// The row the user is looking at.
     active: bool,
+    /// This client's reads can witness a declare for this session RIGHT NOW
+    /// (active, visible, terminal view — the sweep's own liveness predicate).
+    /// When this is false, a close the app emitted has no live path to arrive
+    /// by, and the held contribution needs the daemon's retained truth.
+    reads_live: bool,
 }
 
 /// One session's place in the surface-restore retry schedule.
@@ -39362,6 +39410,11 @@ struct AppSurfaceRestoreTarget {
     /// The record exists WITH tabs but its liveness is already gone: reload
     /// the corpse from local state instead of asking the daemon.
     web_surface_dead: bool,
+    /// This client HOLDS a contribution whose reads can no longer witness a
+    /// declare ([11.186]): the batch answer must be consulted for a retained
+    /// close. Never sets `want_rail` — a record still on `declare` must not
+    /// re-resolve a live app's `ssh -L`.
+    holds_contribution: bool,
 }
 
 /// PURE. Which rows this tick should ask the daemon for a retained declare, in
@@ -39374,7 +39427,10 @@ struct AppSurfaceRestoreTarget {
 ///      surface. A row is a candidate when EITHER half is missing, and the
 ///      target names which — a rail that is already up is never re-fetched
 ///      (that would re-resolve its `ssh -L` every tick), and a web surface that
-///      is already up never suppresses the rail's ask. It used to be an AND
+///      is already up never suppresses the rail's ask. Since [11.186] a held
+///      contribution whose reads can no longer witness a declare is a third,
+///      retire-only reason to ask (the backoff bounds it; `want_rail` stays
+///      false so a live app's forward is never re-resolved). It used to be an AND
 ///      over both halves, which meant a session that had picked up its web
 ///      surface but not its contribution was excluded from the sweep FOREVER —
 ///      a second, independent way to end up with `SurfacePolicyGate::Absent`
@@ -39397,7 +39453,18 @@ fn app_surface_restore_targets(
 ) -> Vec<AppSurfaceRestoreTarget> {
     let mut candidates: Vec<&AppSurfaceRestoreRow> = rows
         .iter()
-        .filter(|row| !row.has_contribution || !row.has_web_surface || !row.web_surface_live)
+        .filter(|row| {
+            !row.has_contribution
+                || !row.has_web_surface
+                || !row.web_surface_live
+                // [11.186] A HELD contribution whose reads can no longer
+                // witness a declare is itself a question: the app may have
+                // retired it while this client's xterm host was not live to
+                // hear the close bytes. The backoff ledger bounds how often
+                // the question is asked, and the batch round trip it rides is
+                // one for every candidate either way.
+                || (row.has_contribution && !row.reads_live)
+        })
         .filter(|row| match attempted.get(&row.session_path) {
             None => true,
             Some(attempt) => {
@@ -39421,6 +39488,7 @@ fn app_surface_restore_targets(
             want_rail: !row.has_contribution,
             want_web: !row.has_web_surface || !row.web_surface_live,
             web_surface_dead: row.has_web_surface && !row.web_surface_live,
+            holds_contribution: row.has_contribution,
         })
         .collect()
 }
@@ -39448,6 +39516,10 @@ impl ShellState {
                     .is_some_and(|surface| !surface.tabs.is_empty()),
                 web_surface_live: self.web_surface_record_live(&session.session_path, now_ms),
                 active: active.as_deref() == Some(session.session_path.as_str()),
+                reads_live: self
+                    .sidebar_reads_live_path()
+                    .as_deref()
+                    == Some(session.session_path.as_str()),
             })
             .collect()
     }
@@ -39575,6 +39647,18 @@ impl AppSurfaceRestoreBatch {
                 ),
             ),
         }
+    }
+
+    /// The retained sidebar record for one session, if the batch holds one —
+    /// the [11.186] retire pass reads its action.
+    fn sidebar_record(
+        &self,
+        session_path: &str,
+    ) -> Option<&yggterm_server::app_declare::AppDeclareRecord> {
+        self.by_session
+            .get(session_path)?
+            .iter()
+            .find(|record| record.verb == "sidebar")
     }
 
     fn ask_single(want: bool) -> AppSurfaceBatchVerdict {
@@ -39845,6 +39929,36 @@ async fn restore_app_surfaces_tick(
                 json!({
                     "session_path": target.session_path,
                     "via": "batch",
+                }),
+            );
+        }
+        // [11.186] THE RETIRE PASS. The daemon's retained close is ground
+        // truth from the app itself, and this batch is the one client-side
+        // channel that survives an xterm host that was never mounted to hear
+        // the live bytes — the exact shape the live repro measured (the pane
+        // mounts from the rebuild poll while the close never arrives, and
+        // paints over the mounted surface forever). Retire through the ONE
+        // owner, under the live arm's own trace category/name with the plane
+        // named. Batch-only: the single-ask fallback serves daemons too old
+        // to retain a close, so there is nothing there to deliver; and a
+        // record still on `declare` must never re-resolve a live app's
+        // `ssh -L`, which is why this never runs the rebuild.
+        if target.holds_contribution
+            && let Some(record) = batch
+                .as_ref()
+                .and_then(|batch| batch.sidebar_record(&target.session_path))
+            && record.action == "close"
+        {
+            state
+                .with_mut_counted(|shell| shell.retire_sidebar_contribution(&target.session_path));
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "close",
+                json!({
+                    "session_path": target.session_path,
+                    "via": "restore_batch",
                 }),
             );
         }
