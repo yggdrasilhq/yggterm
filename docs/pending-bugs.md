@@ -18,36 +18,45 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.202] THE OPENCODE HALF OF THE STORE-CANDIDATE CURE ABSORBS EVERY OPENCODE-KIND ROW ON THE HOST INTO ONE SESSION — SIX ROWS WEAR ONE ID AND THE CANDIDATE'S TITLE, AND THE identity_dedupe INVARIANT CANNOT SEE IT (measured 2026-09-29 ~05:15 IST, live dev, the [11.181]+[11.197] close recon)
+## ⛔ [11.203] OPENCODE TITLE READ GOES SILENT FOR session_v2-ONLY IDS (THE HEALED [11.202] ROWS KEEP THE CURE'S STALE TITLE), AND THE HEADLESS SURFACE HAS NO ROW-REAP VERB FOR THE ABSORBED CORPSES (measured 2026-09-29 ~06:10 IST, live dev, the [11.202] close)
 
 **Status:** OPEN
 
-Filed 2026-09-29 by the [11.181]+[11.197] close seat (zcode sess_4fe6051e on
-jojo, work FROM dev, row 11.201). The [11.200] close note scoped the
-non-Antigravity cure planes OUT ("add only if a muse/opencode cure livelock is
-ever measured") — this is that measurement.
+Filed 2026-09-29 by the [11.202] close seat. [11.202] itself is CLOSED
+(membership belt + unconditional holder refusal + opencode key heal,
+bad9ac74, probe identity_convergence RED→GREEN on the rolled daemon). Two
+residues of the heal, both measured on dev:
 
-MEASURED: dev's daemon rolled onto the [11.200] build (pid 1806044, born
-05:06:32 IST on the live 5c01dbe7-era binary); the roll-time restore pass ran
-the store-candidate cure on the OPENCODE plane, which has no session-named-key
-guard (the [11.200] queue-side skip is Antigravity-only by construction):
-identity_store_candidate_rebind x3 at one timestamp — ses_fb820a4a...,
-ses_fb294aa5..., ses_f9dce8ab... all re-pointed to
-ses_f7e98830affeROSlZADurz7IOX — and dev's live snapshot NOW holds SIX
-open_code rows wearing id ses_f7e98830... titled "Greeting message", including
-probe-corpses whose own names say they never held that session ("resize probe
-row" local://04788ea6..., "mirror diagnosis row" local://5e753e69...). The
-usability probe stays GREEN by construction: opencode keys are row-named
-([11.73]), so identity_dedupe (session-named keys only) has nothing to
-contradict — the class is invisible to the very invariant [11.200] added.
+1. THE TITLE SILENCE: the three healed rows (ses_fb820a4aaffen…,
+   ses_fb294aa59ffeo…, ses_f9dce8ab… — ids restored onto their keys) keep
+   the cure's stale title "Greeting message" because the tick's title read
+   answers None for them: they are session_v2-ONLY rows (the v1 `session`
+   table has no row — verified), the tick counts them in store_silent
+   (63/tick), and the [11.202] membership reader answers Some(true) for the
+   same ids from the same db. The two readers differ in exactly one
+   structural respect: read_opencode_live_store_title opens
+   SQLITE_OPEN_READ_ONLY with NO busy_timeout while the membership reader
+   goes through open_cli_index_readonly (busy-tolerant) — and the opencode
+   server on dev writes its db continuously. The working hypothesis (named,
+   not yet proven): the title read loses the busy race and the filters/
+   error arms turn it into silence. Fix: give the title reader the same
+   busy tolerance (or route it through open_cli_index_readonly). Until
+   then the belt makes this identity-safe (a silent title read for a held
+   id is refused as a cure), so the drift is cosmetic — wrong strings on
+   three dead-ish rows — but it also blinds the title-follow plane for
+   every future v2-only id.
 
-Fix direction: (a) the cure must not re-point a row whose own session is
-store-ANSWERED — a live, store-visible session is an identity, not a silent
-read (the agy cure's quiet phase already distinguishes these); (b) the probe
-grows an opencode-plane convergence invariant (no two live rows may wear one
-store session id) so the class can never regress silently again; (c) the six
-dev rows need a heal onto their own pre-rebind ids (the rebind trace names
-every from_id/to_id pair, and the persisted records carry them).
+2. THE REAP GAP: four local:// rows wear ses_f7e98830 ("resize probe row",
+   "mirror diagnosis row", two nameless "Greeting message" husks). Their
+   pre-cure ids are unrecoverable (absorbed before every retained trace
+   rotation) and the headless server surface has NO row-close verb —
+   `rows` carries live/show/drafts/departed only, and the tombstone
+   primitives are crate-internal by law (a caller outside
+   live_row_tombstones must not publish a private snapshot over the shared
+   file). The identity_convergence invariant carries them as named RESIDUE
+   on its ok line, so growth stays visible. A `server row close <key>`
+   verb (tombstone + live-map removal through the plane's own doors)
+   closes this; then reap the four and the ok line goes clean.
 
 ## ⛔ [11.181] ONE FAILED PROVISION ARM FAILS EVERY TOOL: THE SWEEP'S YNPM OPERATIONS ALL COMPLETE ok YET EVERY STATUS READS "failed" — install_error ALSO SKIPS THE REFRESH-STATE PERSIST (SO THE TTL NEVER GOES QUIET) AND THE ERROR STRING IS INVISIBLE IN THE TRACE (measured 2026-09-27 ~09:00-12:40 IST, muse lab host, the 11177-managed-drift lane)
 
