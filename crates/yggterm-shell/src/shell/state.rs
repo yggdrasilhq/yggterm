@@ -61013,17 +61013,73 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
             return;
         }
     }
-    let live_reorder = {
+    // Resolve the live reorder against the view the gesture happened on —
+    // the DRAWN sidebar (the drag's own merged-rows cache, refreshed by the
+    // last accepted hover), with the server mirror as the fallback for a view
+    // that carries no live region. The ghost promised a landing on the drawn
+    // order; resolving against the mirror instead let the two views disagree
+    // and break accuracy both ways: a mirror that lagged a fresh spawn
+    // refused a real move, and a mirror that led the redraw committed a
+    // reorder the drawn order did not ask for (a set REVERSED by a drop it
+    // had already satisfied — measured live 2026-09-29, [11.174] lane).
+    // A Noop is an answer, not a refusal: it is recorded and ends the
+    // gesture instead of falling through to the workspace tail, where it
+    // read as the misleading `reorder_plan_none`.
+    let (live_reorder, live_noop_target) = {
         let shell = state.read();
-        shell.drag_hover_target.clone().and_then(|target| {
-            live_session_reordered_paths_for_drop(
-                &shell.server.live_sessions(),
-                shell.drag_paths.as_slice(),
-                &target,
-            )
-            .map(|paths| (target, paths))
-        })
+        match shell.drag_hover_target.clone() {
+            None => (None, None),
+            Some(target) => {
+                let rows = shell.drag_merged_rows_cache.clone().unwrap_or_else(|| {
+                    merged_sidebar_rows(
+                        shell.browser.rows(),
+                        shell.server.remote_machines(),
+                        shell.server.ssh_targets(),
+                        &shell.server.live_sessions(),
+                        &shell.browser.expanded_path_set(),
+                    )
+                });
+                let drawn_live_order: Vec<String> = live_sidebar_session_row_indices(&rows)
+                    .into_iter()
+                    .filter_map(|index| rows.get(index))
+                    .map(|row| row.full_path.clone())
+                    .collect();
+                match live_session_drop_reorder_plan(
+                    &drawn_live_order,
+                    shell.drag_paths.as_slice(),
+                    &target,
+                ) {
+                    LiveSessionDropReorder::Plan(paths) => (Some((target, paths)), None),
+                    LiveSessionDropReorder::Noop => (None, Some(target)),
+                    LiveSessionDropReorder::NotLive => (
+                        live_session_reordered_paths_for_drop(
+                            &shell.server.live_sessions(),
+                            shell.drag_paths.as_slice(),
+                            &target,
+                        )
+                        .map(|paths| (target, paths)),
+                        None,
+                    ),
+                }
+            }
+        }
     };
+    if let Some(target) = live_noop_target {
+        state.with_mut_counted(|shell| {
+            shell.record_ui_telemetry(
+                "live_session_reorder_noop",
+                json!({
+                    "target": target.path,
+                    "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
+                    "drag_paths": shell.drag_paths.clone(),
+                    "reason": "set_already_positioned",
+                }),
+            );
+            shell.last_action = "already in place".to_string();
+            shell.clear_drag_state();
+        });
+        return;
+    }
     if let Some((target, reordered_paths)) = live_reorder {
         let mut should_persist = false;
         let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -62206,18 +62262,41 @@ fn sidebar_row_presence(
     }
 }
 
-fn live_session_reordered_paths_for_drop(
-    live_sessions: &[ManagedSessionView],
+/// The answer a live-region drop deserves: a real plan, an honest "already
+/// there", or "not mine".
+///
+/// ⭐ **Resolve against the DRAWN order** — the order the ghost promised on —
+/// never the server mirror alone. The two views disagree around a fresh spawn
+/// (`browser.rows` registers the row locally while the mirror waits for the
+/// snapshot) and around a fresh snapshot (the mirror leads the redraw), and a
+/// drop resolved on the wrong one either refuses a move the user made or
+/// commits a reorder the user did not ask for. Measured live 2026-09-29
+/// ([11.174] lane): the mirror-led case REVERSED a set whose drop was already
+/// satisfied on screen, and front-seated spawns made every real-looking set
+/// drop a no-op that then died in the workspace tail as a misleading
+/// `reorder_plan_none`.
+enum LiveSessionDropReorder {
+    /// The full new order to apply — a real move on the view it was resolved
+    /// against.
+    Plan(Vec<String>),
+    /// The dragged set already sits exactly where the drop says. This is an
+    /// ANSWER, not a failure: the caller records `live_session_reorder_noop`
+    /// and ends the gesture. Falling through to the workspace tail instead is
+    /// how a satisfied drop read as `reorder_plan_none` for years.
+    Noop,
+    /// Not a live-region reorder: empty inputs, or the target and drag paths
+    /// are not live-region rows on this view.
+    NotLive,
+}
+
+fn live_session_drop_reorder_plan(
+    current: &[String],
     drag_paths: &[String],
     target: &DragDropTarget,
-) -> Option<Vec<String>> {
-    if live_sessions.is_empty() || drag_paths.is_empty() {
-        return None;
+) -> LiveSessionDropReorder {
+    if current.is_empty() || drag_paths.is_empty() {
+        return LiveSessionDropReorder::NotLive;
     }
-    let current = live_sessions
-        .iter()
-        .map(|session| session.session_path.clone())
-        .collect::<Vec<_>>();
     let current_by_normalized = current
         .iter()
         .map(|path| (normalize_live_session_path(path), path.clone()))
@@ -62228,7 +62307,7 @@ fn live_session_reordered_paths_for_drop(
         .cloned()
         .collect::<HashSet<_>>();
     if drag_set.is_empty() {
-        return None;
+        return LiveSessionDropReorder::NotLive;
     }
     let moved = current
         .iter()
@@ -62256,18 +62335,46 @@ fn live_session_reordered_paths_for_drop(
         // before the first machine row ghosts but never commits.
         remaining.len()
     } else {
-        let target_key = current_by_normalized
+        let insert_at = current_by_normalized
             .get(&normalize_live_session_path(&target.path))
-            .cloned()?;
-        let target_index = remaining.iter().position(|path| path == &target_key)?;
-        match target.placement {
-            DragDropPlacement::Before => target_index,
-            DragDropPlacement::Into | DragDropPlacement::After => target_index.saturating_add(1),
-        }
+            .cloned()
+            .and_then(|target_key| {
+                remaining.iter().position(|path| path == &target_key).map(
+                    |target_index| match target.placement {
+                        DragDropPlacement::Before => target_index,
+                        DragDropPlacement::Into | DragDropPlacement::After => {
+                            target_index.saturating_add(1)
+                        }
+                    },
+                )
+            });
+        let Some(insert_at) = insert_at else {
+            return LiveSessionDropReorder::NotLive;
+        };
+        insert_at
     };
     let insert_at = insert_at.min(remaining.len());
     remaining.splice(insert_at..insert_at, moved);
-    (remaining != current).then_some(remaining)
+    if remaining == *current {
+        LiveSessionDropReorder::Noop
+    } else {
+        LiveSessionDropReorder::Plan(remaining)
+    }
+}
+
+fn live_session_reordered_paths_for_drop(
+    live_sessions: &[ManagedSessionView],
+    drag_paths: &[String],
+    target: &DragDropTarget,
+) -> Option<Vec<String>> {
+    let current = live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect::<Vec<_>>();
+    match live_session_drop_reorder_plan(&current, drag_paths, target) {
+        LiveSessionDropReorder::Plan(paths) => Some(paths),
+        LiveSessionDropReorder::Noop | LiveSessionDropReorder::NotLive => None,
+    }
 }
 
 fn resolve_workspace_drop_placement(
