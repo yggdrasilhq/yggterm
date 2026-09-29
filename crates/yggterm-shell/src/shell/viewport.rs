@@ -6506,6 +6506,14 @@ fn TerminalCanvas(
             // per transition, not once per loop tick.
             let mut last_handover_paint_suspended = false;
             let mut terminal_paint_seen = !is_remote_resume_session;
+            // The resize action's paint-truth end marker (ux-speed resize-repaint
+            // lane): the JS paint funnel only SENDS a Paint event when its
+            // paint key (structure + grid) changes, so a Paint arriving with
+            // a grid different from the last traced one is this surface
+            // repainting AT A NEW GRID — the felt end of a window resize.
+            // Memoized so one grid traces once; the probe joins
+            // window/resized -> xterm_resize -> xterm_paint/resize_repaint.
+            let mut resize_repaint_last_grid: Option<(u16, u16)> = None;
             let mut cursor = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
                 TERMINAL_REMOTE_RESUME_READ_POLL_MS
@@ -8013,6 +8021,29 @@ fn TerminalCanvas(
                                                         "terminal_surface_mounted",
                                                     );
                                             },
+                                        );
+                                    }
+                                    if painted
+                                        && resize_repaint_last_grid != Some((cols, rows))
+                                    {
+                                        resize_repaint_last_grid = Some((cols, rows));
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "xterm_paint",
+                                            "resize_repaint",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "host_id": host_id.clone(),
+                                                "child_count": child_count,
+                                                "xterm_present": xterm_present,
+                                                "screen_present": screen_present,
+                                                "viewport_present": viewport_present,
+                                                "rows_present": rows_present,
+                                                "cols": cols,
+                                                "rows": rows,
+                                                "geometry_usable": geometry_usable,
+                                            }),
                                         );
                                     }
                                     terminal_paint_seen = true;

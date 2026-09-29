@@ -45,6 +45,15 @@ Actions:
            close-all closes ALL live sessions, so on any real desktop the
            probe refuses it and says so (blast-radius law).
 
+  resize — the felt window resize: drive the WM (wmctrl _NET_MOVERESIZE)
+           to resize the yggterm window, join the trace pair
+           window/resized (native commit) -> xterm_resize (grid applied,
+           reason=resize, THIS session) -> xterm_paint/resize_repaint
+           (paint at the new grid; instrument on builds carrying the
+           resize-repaint lane), assert the committed size matches the
+           drive, the grid actually changed, the paint grid == grid leg,
+           no ghost/resize-error events, and the row survives; restores
+           the original size at the end
   switch — the felt switch: real pointer CLICKS on the pair's sidebar rows
            (press+release, no threshold cross), alternating A→B; asserts the
            user_gesture activation (latency + identity to == clicked row),
@@ -2637,6 +2646,251 @@ dioxus.send(out);
             })
         return summarize(out, key="click_to_dom_felt_ms")
 
+    # ---- resize ----------------------------------------------------------
+
+    _RESIZE_WM_CLASSES = ("yggterm", "breezed")
+
+    def _yggterm_window(self) -> dict | None:
+        """The main yggterm/breezed window via wmctrl -lxG, largest area
+        wins (the GUI may own several). None when wmctrl is missing or no
+        window matches — the resize action reports an honest refusal."""
+        try:
+            out = subprocess.run(["wmctrl", "-lxG"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except Exception:
+            return None
+        best = None
+        for line in out.splitlines():
+            parts = line.split(None, 10)
+            # did desk x y w h cls host title…  (wmctrl -lxG column order)
+            if len(parts) < 8:
+                continue
+            try:
+                x, y, w, h = (int(parts[2]), int(parts[3]),
+                              int(parts[4]), int(parts[5]))
+            except ValueError:
+                continue
+            cls = parts[6]
+            if not any(c in cls.lower() for c in self._RESIZE_WM_CLASSES):
+                continue
+            if best is None or w * h > best["area"]:
+                best = {"cls": cls, "x": x, "y": y, "w": w, "h": h,
+                        "area": w * h}
+        return best
+
+    def _wm_resize(self, cls: str, w: int, h: int) -> bool:
+        try:
+            r = subprocess.run(
+                ["wmctrl", "-x", "-r", cls, "-e", "0,-1,-1,%d,%d" % (w, h)],
+                capture_output=True, text=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _wm_read_maximized(self, cls: str) -> bool:
+        """True when the matching window carries both maximized state
+        atoms (xprop); False when xprop is missing or the state is unset —
+        the drive then works directly."""
+        try:
+            out = subprocess.run(["wmctrl", "-lxG"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except Exception:
+            return False
+        wid = None
+        for line in out.splitlines():
+            parts = line.split(None, 10)
+            if len(parts) < 8:
+                continue
+            cls_field = parts[6]
+            if any(c in cls_field.lower()
+                   for c in self._RESIZE_WM_CLASSES):
+                wid = parts[0]
+                break
+        if not wid:
+            return False
+        try:
+            state = subprocess.run(["xprop", "-id", wid, "_NET_WM_STATE"],
+                                   capture_output=True, text=True,
+                                   timeout=5).stdout
+        except Exception:
+            return False
+        return ("_NET_WM_STATE_MAXIMIZED_VERT" in state
+                and "_NET_WM_STATE_MAXIMIZED_HORZ" in state)
+
+    def _wm_maximized(self, cls: str, want: bool) -> bool:
+        """Set/unset the maximized state. A MAXIMIZED window is the
+        measured dead end for _NET_MOVERESIZE_WINDOW (the WM ignores the
+        geometry request, the state atom stays, any size blip snaps back —
+        live jojo 2026-09-29), and a user's edge-drag unmaximizes
+        implicitly, so the drive unmaximizes first and the action restores
+        the state at the end."""
+        act = "add" if want else "remove"
+        try:
+            r = subprocess.run(
+                ["wmctrl", "-x", "-r", cls, "-b",
+                 "%s,maximized_vert,maximized_horz" % act],
+                capture_output=True, text=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _nested(ev: dict) -> dict:
+        p = ev.get("payload")
+        if isinstance(p, dict) and isinstance(p.get("payload"), dict):
+            return p["payload"]
+        return p if isinstance(p, dict) else {}
+
+    def action_resize(self, iters: int) -> dict:
+        win = self._yggterm_window()
+        if not win:
+            return {"error": "no yggterm/breezed window found via wmctrl",
+                    "iterations": []}
+        rows_ready = self.ensure_scratch_rows(1, activate=True)
+        if not rows_ready:
+            return {"error": "no scratch row to probe", "iterations": []}
+        path = rows_ready[0]
+        w0, h0 = win["w"], win["h"]
+        was_maximized = self._wm_read_maximized(win["cls"])
+        if was_maximized:
+            self._wm_maximized(win["cls"], False)
+            time.sleep(0.25)
+            fresh = self._yggterm_window()
+            if fresh:
+                w0, h0 = fresh["w"], fresh["h"]
+        target_w = max(900, w0 - 160)
+        sizes = [(target_w, h0), (w0, h0)]
+        out = {"iterations": [], "start_size": [w0, h0],
+               "window_class": win["cls"]}
+        instrument_live = False
+        paint = None
+        try:
+            for i in range(iters):
+                tw, th = sizes[i % 2]
+                self.verb("terminal", "focus", path)
+                time.sleep(0.15)
+                t0 = now_ms()
+                if not self._wm_resize(win["cls"], tw, th):
+                    out["iterations"].append({
+                        "accuracy_failures": ["wmctrl resize call failed"],
+                    })
+                    continue
+                commit = grid = paint = None
+                grid_seen_at = None
+                deadline = time.perf_counter() + 3.0
+                while time.perf_counter() < deadline:
+                    for ev in self.ytrace_events(t0):
+                        name = ev.get("name")
+                        pay = self._nested(ev)
+                        if (name == "window/resized" and commit is None
+                                and abs(pay.get("width", -1) - tw) <= 8
+                                and abs(pay.get("height", -1) - th) <= 8):
+                            commit = ev
+                        elif (name == "xterm_resize" and grid is None
+                                and pay.get("session_path") == path
+                                and pay.get("reason") == "resize"
+                                and pay.get("cols")
+                                and pay.get("cols") != pay.get("prev_cols")):
+                            grid = ev
+                        elif (name == "resize_repaint"
+                                and ev.get("category") == "xterm_paint"
+                                and paint is None
+                                and pay.get("session_path") == path):
+                            paint = ev
+                            instrument_live = True
+                    if commit is not None and grid is not None:
+                        if paint is not None:
+                            break
+                        # always give the paint leg a bounded extra window,
+                        # regardless of whether the instrument has proven
+                        # itself live yet — the paint funnel runs one rAF
+                        # behind the grid change
+                        if grid_seen_at is None:
+                            grid_seen_at = time.perf_counter()
+                        elif time.perf_counter() - grid_seen_at > 0.4:
+                            break
+                    time.sleep(0.05)
+                acc = []
+                if commit is None:
+                    acc.append("no matching window/resized in trace "
+                               "within 3s (wanted %dx%d)" % (tw, th))
+                if grid is None:
+                    acc.append("no xterm_resize grid change for %s "
+                               "within 3s" % path)
+                if paint is None and instrument_live:
+                    acc.append("no xterm_paint/resize_repaint for %s "
+                               "within 3s (instrument live)" % path)
+                win_ev = [e for e in self.ytrace_events(t0)
+                          if e.get("name") in ("terminal_resize_error",
+                                               "ghost_frame_attached")]
+                if win_ev:
+                    acc.append("error-class events in window: %s"
+                               % sorted({e.get("name") for e in win_ev}))
+                in_win = self.ytrace_events(t0)
+                daemon_us = [self._nested(e).get("waited_us")
+                             for e in in_win
+                             if e.get("component") == "daemon"
+                             and e.get("name") == "terminal_resize"]
+                daemon_us = [int(u // 1000) for u in daemon_us
+                             if isinstance(u, (int, float))]
+                srv = [e for e in in_win
+                       if e.get("component") == "server"
+                       and e.get("name") in ("resize", "resize_noop")]
+                blocks = [self._nested(e).get("gap_ms") for e in in_win
+                          if e.get("name") == "block"]
+                crawls = sum(1 for e in in_win
+                             if e.get("name") == "selection_crawl")
+                out["iterations"].append({
+                    "drive_to_commit_ms": (commit["ts_ms"] - t0)
+                    if commit else None,
+                    "commit_to_grid_ms": (grid["ts_ms"] - commit["ts_ms"])
+                    if commit and grid else None,
+                    "grid_to_paint_ms": (paint["ts_ms"] - grid["ts_ms"])
+                    if grid and paint else None,
+                    "commit_to_paint_ms": (paint["ts_ms"] - commit["ts_ms"])
+                    if commit and paint else None,
+                    "committed_size": ([self._nested(commit).get("width"),
+                                        self._nested(commit).get("height")]
+                                       if commit else None),
+                    "grid_cols": self._nested(grid).get("cols")
+                    if grid else None,
+                    "grid_rows": self._nested(grid).get("rows")
+                    if grid else None,
+                    "prev_grid": ([self._nested(grid).get("prev_cols"),
+                                   self._nested(grid).get("prev_rows")]
+                                  if grid else None),
+                    "paint_cols": self._nested(paint).get("cols")
+                    if paint else None,
+                    "paint_rows": self._nested(paint).get("rows")
+                    if paint else None,
+                    "paint_geometry_usable": self._nested(paint)
+                    .get("geometry_usable") if paint else None,
+                    "daemon_resize_wait_ms": daemon_us or None,
+                    "server_resize_events": len(srv),
+                    "ui_block_gaps_ms": ([int(g) for g in blocks
+                                          if isinstance(g, (int, float))]
+                                         or None),
+                    "selection_crawls": crawls or None,
+                    "instrument_live": instrument_live,
+                    "accuracy_failures": acc,
+                })
+                time.sleep(0.9)
+        finally:
+            self._wm_resize(win["cls"], w0, h0)
+            time.sleep(0.4)
+            if was_maximized:
+                self._wm_maximized(win["cls"], True)
+            time.sleep(0.4)
+            back = self._yggterm_window()
+            out["restored_size"] = ([back["w"], back["h"]] if back else None)
+            out["rows_left_behind"] = len(self.spawned_paths)
+        if not instrument_live:
+            out["paint_leg"] = ("instrument_absent (pre-resize-repaint "
+                                "build): commit_to_paint not joinable yet")
+        summarize(out, key="commit_to_grid_ms")
+        summarize(out, key="commit_to_paint_ms")
+        return out
+
     # ---- waiters --------------------------------------------------------
 
     def wait_order(self, a_path: str, b_path: str,
@@ -2701,7 +2955,7 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch,split")
+                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch,split,resize")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
@@ -2756,6 +3010,8 @@ def main() -> int:
                 report["actions"]["closeall"] = probe.action_closeall(args.iters)
             elif action == "split":
                 report["actions"]["split"] = probe.action_split(args.iters)
+            elif action == "resize":
+                report["actions"]["resize"] = probe.action_resize(args.iters)
             else:
                 report["actions"][action] = {"error": f"unknown action {action}"}
             log(f"  {json.dumps(report['actions'][action], default=str)[:300]}")
