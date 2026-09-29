@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Closing the row you are looking at stops paying the 3-second teardown tax.**
+  Closing the ACTIVE row cost 3111-3594 ms while an inactive row closed in
+  469-612 ms — deterministic 5/5 at quiet floors — because every completion
+  wake of the remove-session handler queued on the main-thread pump behind the
+  dying active surface teardown storm (~1.3 s parked per await boundary; the
+  daemon answered in ~130 ms and the PTY was dead by +250 ms — the wait was
+  pure wake-chain, filed [11.204] by the ux-speed close-latency lane). The
+  close now completes on ONE dedicated worker thread — round trip (the
+  [11.154] re-delivery budget intact), redirect sync, teardown settle
+  (100→25 ms), remote liveness, verification, and the response file itself —
+  so the waiting verb is woken by the worker write, never by the pump, and
+  the drain loop keeps serving `server app rows` polls and other verbs while
+  the storm runs. The GUI-state apply floats on a small task; snapshot
+  applies are sequence-stamped at world-read time so a superseded floating
+  apply skips its already-superseded sync instead of resurrecting rows, and
+  `server app rows` filters daemon-confirmed removals, answering the
+  daemon truth within milliseconds of the removal even while the apply waits.
+  Trade, documented in the arm: a verb taken in the window between arm return
+  and the daemon answer can leave the sidebar row ghosting until the next
+  background merge (self-healing, seconds); the rows verb is exact
+  throughout. ([11.204], the ux-speed close-wake-chain lane)
+
 - **The `row-expanded` verb reaches nested remote-folder rows.** A
   `__remote_folder__/<machine><path>` path resolved through the session
   synthesizer's catch-all — the folder is a group, the synthesizer has no
