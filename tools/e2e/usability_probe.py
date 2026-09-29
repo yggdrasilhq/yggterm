@@ -548,8 +548,9 @@ def invariant_identity_convergence(report, rows):
         report.ok(
             "identity_convergence",
             f"no theft, but {len(residue)} key-less wearer(s) of another "
-            "row's session id remain (no reap verb on the headless surface "
-            "yet): " + "; ".join(residue[:3]),
+            "row's session id remain — reap with `server rows despawn "
+            "<key>` ([11.203] measured: the verb existed all along; these "
+            "are records, not processes): " + "; ".join(residue[:3]),
         )
     else:
         report.ok("identity_convergence")
