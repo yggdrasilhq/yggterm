@@ -600,16 +600,16 @@ const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
 /// js_debug) lands well under 500 ms, so this much silence means the eval
 /// vanished and the cold installer must be dispatched without waiting for
 /// the recover ladder.
-// [11.178] The deadline must sit OUTSIDE the observed warm-stall tail
-// (0.7-1.0 s in the page pipeline under spawn churn; eval-wedge-webkit-why
-// 2026-09-29 FALSIFIED the "never executes" reading - the warm eval EXECUTES,
-// it stalls): at 1.0 s the gate fired 5-50 ms before a healthy-but-stalled
-// mount's first post and redo-colded a still-alive mount. 2.5 s is past the
-// observed tail; a true vanish now pays 2.5 s before the redo (still far
-// under the ~8.3 s recover ladder this gate replaced), and the
-// __yggtermMountAttempt invoke-stamp guard makes the redo race-free against
-// a late-resuming warm mount.
-const TERMINAL_WARM_EVAL_LIVENESS_MS: u64 = 2_500;
+// [11.178] 2.5 s ("outside the stall tail") was TRIED and FALSIFIED by live
+// A/B 2026-09-29 (warmmount-gate-fix lane): the tail is LOAD-DEPENDENT and
+// the release desktop's spawn-churn stalls sit at ~2.9 s, so every gated
+// spawn paid deadline+redo and spawn_to_paint regressed 2.0-2.3 s -> 3.3-4.3 s
+// (p50 3.3 vs the 2.3 bar). 1.0 s stands: the gate-plus-redo total (~1.5 s)
+// IS the measured good path; the redo is race-free against a late-resuming
+// warm mount via the __yggtermMountAttempt invoke-stamp guard (the
+// terminal_scripts.rs side of this lane). The adaptive arm (web-process
+// liveness / pipeline probe before redo) is the entry's named next step.
+const TERMINAL_WARM_EVAL_LIVENESS_MS: u64 = 1_000;
 // Cap on consecutive startup-restore recoveries without a Ready in between —
 // past this, further remounts are futile churn (see
 // startup_terminal_restore_should_recover).
