@@ -30734,43 +30734,107 @@ impl ShellState {
                 if was_initial_sync {
                     sanitize_startup_view_mode(&mut snapshot);
                 }
+                // ⏱ THE CLOSE-TEARDOWN-STORM INSTRUMENT: the [11.204] floating
+                // apply reads apply_done 1159-1599 ms — one with_mut block,
+                // the state thread held, every pump-served verb queued behind
+                // it (measured 2026-09-29, uxspeed close-teardown-storm lane).
+                // This names the leg. One event per apply, never per row.
+                let mut __apply_legs: Vec<(&'static str, u128)> = Vec::new();
+                let mut __leg_t = std::time::Instant::now();
                 self.close_daemon_active_desync_for_restore(&mut snapshot);
+                __apply_legs.push(("close_daemon_active_desync", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
-                self.server.apply_snapshot(snapshot);
+                let __snapshot = snapshot;
+                self.server.apply_snapshot(__snapshot);
+                __apply_legs.push(("server_apply_snapshot", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.notify_finished_working_sessions("snapshot_apply");
+                __apply_legs.push(("notify_finished_working", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.refresh_cached_hot_session_views();
+                __apply_legs.push(("refresh_cached_hot_views", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
+                __apply_legs.push(("restore_active_preview", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.mark_active_remote_preview_dirty_if_needed();
+                __apply_legs.push(("mark_remote_preview_dirty", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.sync_live_terminal_retention();
+                __apply_legs.push(("sync_live_terminal_retention", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.rearm_active_remote_runtime_recovery_after_snapshot();
+                __apply_legs.push(("rearm_remote_recovery", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.prune_cached_hot_session_views();
+                __apply_legs.push(("prune_cached_hot_views", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.prune_terminal_attach_in_flight();
+                __apply_legs.push(("prune_attach_in_flight", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.prune_terminal_resume_ready_paths();
+                __apply_legs.push(("prune_resume_ready", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.prune_terminal_bootstrap_owners();
+                __apply_legs.push(("prune_bootstrap_owners", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.prune_terminal_resume_notifications();
+                __apply_legs.push(("prune_resume_notifications", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.prune_departed_row_arrangement();
+                __apply_legs.push(("prune_departed_arrangement", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.hydrate_generated_copy_from_remote_cache();
+                __apply_legs.push(("hydrate_generated_copy", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.needs_initial_server_sync = false;
                 self.request_background_copy_scan_if_unscheduled();
+                __apply_legs.push(("request_copy_scan", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 if was_initial_sync {
                     self.seed_dynamic_top_level_expansions();
                     self.ensure_active_session_expanded();
                 }
+                __apply_legs.push(("seed_if_initial", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 if always_sync_selection
                     || was_initial_sync
                     || self.background_active_selection_sync_needed()
                 {
                     self.sync_active_session_selection();
                 }
+                __apply_legs.push(("sync_active_selection", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 if always_sync_selection {
                     self.ensure_active_session_visible();
                 }
+                __apply_legs.push(("ensure_active_visible", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.preserve_tree_rename_selection();
+                __apply_legs.push(("preserve_rename_selection", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.sync_browser_settings();
+                __apply_legs.push(("sync_browser_settings", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.refresh_search_state(telemetry_label);
+                __apply_legs.push(("refresh_search_state", __leg_t.elapsed().as_millis()));
+                __leg_t = std::time::Instant::now();
                 self.record_restore_issue_telemetry(telemetry_label);
                 self.record_preview_issue_telemetry(telemetry_label);
+                __apply_legs.push(("record_telemetry", __leg_t.elapsed().as_millis()));
+                append_trace_event(
+                    &perf_home_dir(&self.bootstrap.settings_path),
+                    "ui",
+                    "app_control",
+                    "snapshot_apply_legs",
+                    json!({
+                        "label": telemetry_label,
+                        "total_ms": __apply_legs.iter().map(|(_, ms)| *ms).sum::<u128>(),
+                        "legs": __apply_legs,
+                    }),
+                );
                 if self.busy_request_id.is_none() && self.active_surface_requests.is_empty() {
                     self.server_busy = false;
                 }
