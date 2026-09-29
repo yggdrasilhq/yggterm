@@ -37,7 +37,12 @@ Actions:
            menu → Close All… → the bulk confirm dialog, timed as
            menu_open / click_to_mount / the in-app modal pair
            (modal_open_requested{bulk:true} → modal/shown), then CANCELLED
-           with a survivors assert (cancel accuracy). The chord leg drives
+           with a survivors assert (cancel accuracy). --closeall-via chord
+           opens the SAME dialog through the felt alt,E,O keytip walk
+           (tap→overlay → E→row-menu → badged letter→modal) with the
+           ui/chord faces + context_menu_activate asserted — the
+           §PURPOSE-verbatim alt-keypress close-all, felt end-to-end. The
+           chord leg drives
            the REAL alt-tap bridge (synthetic KeyboardEvents on window) for
            tap→overlay→row-menu walls and asserts the ui/chord identity
            events ([11.113] gap 3 instrument). The CONFIRM leg runs ONLY
@@ -345,6 +350,143 @@ while (Date.now() < deadline) {
     }
 }
 refuse("delete_overlay_did_not_close");
+"""
+
+# The FELT alt,E,O walk (alt-close-all-felt lane): the §PURPOSE-verbatim
+# "alt-keypress close-all" driven END-TO-END through the REAL bridge —
+# synthetic KeyboardEvents on window (the same capture listeners a real key
+# hits): ALT-tap → E (the selected row's context menu) → the Close All…
+# item's BADGED letter → the bulk delete modal mounts. The item letter is
+# read off the DOM (data-keytip-tip) before it is pressed, so §5-ladder
+# re-lettering is recorded, never guessed. The caller asserts the ui/chord
+# faces + the context_menu_activate/modal pair from ytrace. The modal is
+# left OPEN — cancel / the gated confirm leg run after, exactly like the
+# mouse path.
+CLOSEALL_CHORD_OPEN_JS = """
+const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+const refuse = (reason, extra) => dioxus.send(
+    Object.assign({ accepted: false, reason }, extra || {}));
+const q = (sel) => !!document.querySelector(sel);
+if (q('[data-yggterm-menu-open]') || q('[data-delete-confirm-overlay]')) {
+    refuse("menu_or_overlay_already_open");
+    return;
+}
+if (q('[data-yggterm-keytip-breadcrumb]')) {
+    // The overlay is a MODE, not content — a human presses Escape to leave
+    // it. Pre-dismiss once; refuse only if it will not leave.
+    window.dispatchEvent(new KeyboardEvent('keydown',
+        { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true,
+          composed: true }));
+    const pd = Date.now() + 800;
+    while (Date.now() < pd) {
+        await settle(40);
+        if (!q('[data-yggterm-keytip-breadcrumb]')) break;
+    }
+    if (q('[data-yggterm-keytip-breadcrumb]')) {
+        refuse("alt_overlay_stuck_open");
+        return;
+    }
+}
+const PATH = '__live_sessions__';
+const row = document.querySelector('[data-sidebar-row-path="' + PATH + '"]');
+if (!row) { refuse("live_sessions_group_row_missing"); return; }
+const kd = (key, code) => window.dispatchEvent(new KeyboardEvent('keydown',
+    { key, code, bubbles: true, cancelable: true, composed: true }));
+const ku = (key, code) => window.dispatchEvent(new KeyboardEvent('keyup',
+    { key, code, bubbles: true, cancelable: true, composed: true }));
+// ALT tap → keytip overlay
+const t_tap = Date.now();
+kd('Alt', 'AltLeft');
+ku('Alt', 'AltLeft');
+let overlaySeen = false;
+const ovDeadline = Date.now() + 1500;
+while (Date.now() < ovDeadline) {
+    await settle(40);
+    if (q('[data-yggterm-keytip-breadcrumb]')) { overlaySeen = true; break; }
+}
+if (!overlaySeen) {
+    refuse("alt_overlay_did_not_open", { tap_to_overlay_ms: null });
+    return;
+}
+const tap_to_overlay_ms = Date.now() - t_tap;
+// E → the selected row's context menu
+const t_e = Date.now();
+kd('e', 'KeyE');
+ku('e', 'KeyE');
+let menu = null;
+const mDeadline = Date.now() + 1500;
+while (Date.now() < mDeadline) {
+    await settle(40);
+    if (q('[data-yggterm-menu-open]')) {
+        menu = document.querySelector('[data-context-menu="1"]');
+        if (menu) break;
+    }
+}
+if (!menu) {
+    refuse("chord_e_did_not_open_row_menu",
+           { tap_to_overlay_ms });
+    return;
+}
+const e_to_menu_ms = Date.now() - t_e;
+// The Close All… item + its badged letter (the §5 ladder may re-letter).
+const item = menu.querySelector(
+    '[data-context-menu-action="close-all-live-sessions"]');
+if (!item) {
+    refuse("close_all_item_missing_from_menu",
+           { tap_to_overlay_ms, e_to_menu_ms });
+    return;
+}
+// The badge letter lives on a descendant badge node (§9 painter), not the
+// item itself; fall back to the item for robustness.
+const badgeEl = item.querySelector('[data-keytip-tip]') || item;
+const letter = (badgeEl.getAttribute('data-keytip-tip') || '')
+    .trim().toLowerCase();
+if (!letter || letter.length !== 1 || !/[a-z0-9]/.test(letter)) {
+    refuse("close_all_item_letter_unbadged", {
+        tap_to_overlay_ms, e_to_menu_ms,
+        item_html: item.outerHTML.slice(0, 500),
+        menu_badged: [...menu.querySelectorAll('[data-keytip-tip]')]
+            .map(n => n.getAttribute('data-keytip-tip')),
+        breadcrumb: q('[data-yggterm-keytip-breadcrumb]')
+            ?.textContent?.slice(0, 60) || null,
+    });
+    return;
+}
+// The item letter → bulk delete modal mounts
+const t_o = Date.now();
+kd(letter, 'Key' + letter.toUpperCase());
+ku(letter, 'Key' + letter.toUpperCase());
+let overlay = null;
+const dDeadline = Date.now() + 2000;
+while (Date.now() < dDeadline) {
+    await settle(20);
+    overlay = document.querySelector('[data-delete-confirm-overlay]');
+    if (overlay) break;
+}
+if (!overlay) {
+    refuse("chord_letter_did_not_mount_modal",
+           { tap_to_overlay_ms, e_to_menu_ms, letter_used: letter });
+    return;
+}
+const o_to_modal_ms = Date.now() - t_o;
+dioxus.send({
+    accepted: true,
+    via: "chord",
+    letter_used: letter,
+    letter_matches_hint: letter === "o",
+    tap_to_overlay_ms,
+    e_to_menu_ms,
+    o_to_modal_ms,
+    tap_to_modal_ms: t_o - t_tap + o_to_modal_ms,
+    overlay_count: document.querySelectorAll(
+        '[data-delete-confirm-overlay]').length,
+    dialog_title: String(overlay.querySelector(
+        '[data-delete-confirm-title]')?.textContent || ''),
+    action_label: String(overlay.querySelector(
+        '[data-delete-confirm-action]')?.textContent || ''),
+    dialog_text: String(overlay.querySelector(
+        '[data-delete-confirm-dialog]')?.textContent || '').slice(0, 400),
+});
 """
 
 # The chord leg: drives the REAL alt-tap bridge listeners with synthetic
@@ -2342,11 +2484,19 @@ dioxus.send(out);
         return [r.get("full_path") for r in self.rows()
                 if r.get("kind") == "Session" and r.get("full_path")]
 
-    def action_closeall(self, iters: int) -> dict:
+    def action_closeall(self, iters: int, via: str = "menu") -> dict:
         """The bulk-close vertical. CANCEL legs measure + assert; the CONFIRM
         leg runs once, ONLY when every live session on screen is a probe
-        scratch row (close-all closes ALL live sessions — blast-radius law)."""
-        out = {"iterations": []}
+        scratch row (close-all closes ALL live sessions — blast-radius law).
+        via="menu" drives the group-row menu with the mouse (the 2026-09-26
+        shape); via="chord" opens the SAME dialog through the felt alt,E,O
+        keytip walk (alt-close-all-felt lane) — synthetic KeyboardEvents,
+        the item letter read off its badge, walls tap→overlay → E→menu →
+        letter→modal, accuracy asserted against the ui/chord faces + the
+        real dispatch choke point's context_menu_activate."""
+        out = {"iterations": [], "via": via}
+        open_js = (CLOSEALL_CHORD_OPEN_JS if via == "chord"
+                   else CLOSEALL_OPEN_JS)
         scratch = self.ensure_scratch_rows(2, activate=True)
         if not scratch:
             return {"error": "no scratch rows to protect", "iterations": []}
@@ -2363,7 +2513,7 @@ dioxus.send(out);
             self.verb("tree", "select", "__live_sessions__")
             time.sleep(0.15)
             t0 = now_ms()
-            r = self.verb("dom-eval", CLOSEALL_OPEN_JS, timeout=20)
+            r = self.verb("dom-eval", open_js, timeout=20)
             open_wall_ms = now_ms() - t0
             result = ((r.get("json") or {}).get("data") or {}).get("result") or {}
             if not r["ok"]:
@@ -2372,6 +2522,7 @@ dioxus.send(out);
                 acc.append(f"script error: {result['dom_eval_error']}")
             if not result.get("accepted"):
                 acc.append(f"close-all open refused: {result.get('reason')}")
+                out.setdefault("open_refusals", []).append(result)
             if result.get("accepted"):
                 if result.get("overlay_count") != 1:
                     acc.append("overlay_count=%s (want exactly 1)"
@@ -2398,6 +2549,43 @@ dioxus.send(out);
                     if pair.get("shown_kind") not in ("delete", None):
                         acc.append("modal/shown kind=%s (want delete)"
                                    % pair.get("shown_kind"))
+            # The felt walk's own asserts (chord mode only): the REAL
+            # dispatch choke point fired (context_menu_activate) and the
+            # bridge named the walk (ui/chord faces tap → walk_key e →
+            # walk_key <letter>).
+            walk_activate = None
+            if via == "chord" and result.get("accepted"):
+                for ev in self.ytrace_events(t0):
+                    if ev.get("name") == "context_menu_activate":
+                        p = self._ui_payload(ev)
+                        if p.get("action") == "close-all-live-sessions":
+                            walk_activate = {"open_ms": p.get("open_ms")}
+                            break
+                if walk_activate is None:
+                    acc.append("no context_menu_activate"
+                               "{close-all-live-sessions} in ytrace — the "
+                               "item never reached the dispatch choke point")
+                cev = self.chord_events_from_trace(t0, timeout_s=3.0)
+                faces = [(f.get("face"),
+                          (f.get("key").lower()
+                           if isinstance(f.get("key"), str) else None))
+                         for f in cev.get("faces", [])]
+                if not cev.get("chord_events"):
+                    acc.append("NO ui/chord events for the chord walk — "
+                               "instrument missing or build not rotated")
+                else:
+                    if not faces or faces[0][0] != "tap":
+                        acc.append(f"chord walk face 0 = {faces[:1]!r} "
+                                   "(want tap)")
+                    if len(faces) < 2 or faces[1] != ("walk_key", "e"):
+                        acc.append(f"chord walk face 1 = "
+                                   f"{faces[1:2]!r} (want walk_key/e)")
+                    want_letter = result.get("letter_used")
+                    if len(faces) < 3 or faces[2] != ("walk_key",
+                                                      want_letter):
+                        acc.append(f"chord walk face 2 = "
+                                   f"{faces[2:3]!r} (want walk_key/"
+                                   f"{want_letter})")
             # CANCEL — and EVERY live session must survive it
             cancel = {}
             if result.get("accepted"):
@@ -2454,6 +2642,21 @@ dioxus.send(out);
                 "dialog_title": result.get("dialog_title"),
                 "unkept_button_present": result.get("unkept_button_present"),
                 "cancel_to_gone_ms": cancel.get("cancel_to_gone_ms"),
+                "via": via,
+                "walk_tap_to_overlay_ms":
+                    result.get("tap_to_overlay_ms") if via == "chord" else None,
+                "walk_e_to_menu_ms":
+                    result.get("e_to_menu_ms") if via == "chord" else None,
+                "walk_o_to_modal_ms":
+                    result.get("o_to_modal_ms") if via == "chord" else None,
+                "walk_tap_to_modal_ms":
+                    result.get("tap_to_modal_ms") if via == "chord" else None,
+                "walk_letter_used":
+                    result.get("letter_used") if via == "chord" else None,
+                "walk_letter_matches_hint":
+                    result.get("letter_matches_hint") if via == "chord" else None,
+                "walk_menu_open_ms":
+                    (walk_activate or {}).get("open_ms") if via == "chord" else None,
                 "chord_tap_to_overlay_ms": chord.get("tap_to_overlay_ms"),
                 "chord_walk_to_menu_ms": chord.get("walk_to_menu_ms"),
                 "chord_faces": [f.get("face") for f in
@@ -2466,7 +2669,7 @@ dioxus.send(out);
             confirm_result = {"ran": True}
             self.verb("tree", "select", "__live_sessions__")
             time.sleep(0.15)
-            r = self.verb("dom-eval", CLOSEALL_OPEN_JS, timeout=20)
+            r = self.verb("dom-eval", open_js, timeout=20)
             result = ((r.get("json") or {}).get("data")
                       or {}).get("result") or {}
             if not result.get("accepted"):
@@ -2498,7 +2701,8 @@ dioxus.send(out);
                     confirm_result["accuracy_failures"] = [
                         f"confirm failed: {confirm.get('reason')}"]
         out["confirm_leg_result"] = confirm_result
-        return summarize(out, key="dispatch_to_mount_ms")
+        return summarize(out, key=("walk_o_to_modal_ms" if via == "chord"
+                                   else "dispatch_to_mount_ms"))
 
     def split_events_from_trace(self, since_ms: int) -> dict:
         """The split pair: context_menu_activate{action:split-*} -> split/create
@@ -2961,6 +3165,10 @@ def main() -> int:
     ap.add_argument("--timeout-ms", type=int, default=12000)
     ap.add_argument("--keep", action="store_true",
                     help="do not close the scratch rows (debugging)")
+    ap.add_argument("--closeall-via", choices=("menu", "chord"),
+                    default="menu",
+                    help="closeall: menu = mouse-driven group-row menu "
+                         "(default); chord = the felt alt,E,O keytip walk")
     ap.add_argument("-v", action="store_true")
     args = ap.parse_args()
 
@@ -3006,7 +3214,8 @@ def main() -> int:
             elif action == "close":
                 report["actions"]["close"] = probe.action_close()
             elif action == "closeall":
-                report["actions"]["closeall"] = probe.action_closeall(args.iters)
+                report["actions"]["closeall"] = probe.action_closeall(
+                    args.iters, via=args.closeall_via)
             elif action == "split":
                 report["actions"]["split"] = probe.action_split(args.iters)
             elif action == "resize":
@@ -3029,11 +3238,11 @@ def main() -> int:
         if end_floor and report["cli_overhead_ms"]:
             drift = end_floor - report["cli_overhead_ms"]
             report["harness_load_drift_ms"] = drift
-            log(f"overhead drift {drift:+d} ms (the probe's own pollution proxy)")
+            log(f"overhead drift {drift:+.0f} ms (the probe's own pollution proxy)")
         if end_gui and report["gui_overhead_ms"]:
             gdrift = end_gui - report["gui_overhead_ms"]
             report["gui_load_drift_ms"] = gdrift
-            log(f"gui overhead drift {gdrift:+d} ms (GUI-plane pollution proxy)")
+            log(f"gui overhead drift {gdrift:+.0f} ms (GUI-plane pollution proxy)")
         with open(args.out, "w") as fh:
             json.dump(report, fh, indent=1, default=str)
         log(f"report → {args.out}")
