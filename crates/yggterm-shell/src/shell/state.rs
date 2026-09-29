@@ -39644,11 +39644,15 @@ impl AppSurfaceRestoreBatch {
                 Self::absent(target.want_web),
             ),
             Some(records) => (
+                // ANY retained sidebar record is Rebuild-worthy, a close just
+                // as much as a declare ([11.186]): the rebuild's close arm
+                // retires and traces, and it returns before the endpoint
+                // probe — no ssh, no network. Mapping a close to "absent"
+                // here made the daemon-held retirement inexpressible through
+                // the batch, which is the one channel a hostless client has.
                 Self::verdict(
                     target.want_rail,
-                    records
-                        .iter()
-                        .any(|r| r.verb == "sidebar" && r.action == "declare"),
+                    records.iter().any(|r| r.verb == "sidebar"),
                 ),
                 Self::verdict(
                     target.want_web,
