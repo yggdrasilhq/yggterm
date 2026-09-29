@@ -7825,51 +7825,16 @@ fn TerminalCanvas(
                                         });
                                     }
                                     "close" => {
+                                        // ONE retire owner for both close
+                                        // planes (this live arm and the
+                                        // [11.186] daemon-declare rebuild):
+                                        // ShellState::retire_sidebar_
+                                        // contribution. The trace stays here,
+                                        // named for the live plane.
                                         state.with_mut_counted(|shell| {
-                                            shell.close_sidebar_contribution(
+                                            shell.retire_sidebar_contribution(
                                                 &contribution_session_path,
                                             );
-                                            // The app that served the pane is
-                                            // gone; stop painting a schema no
-                                            // control endpoint backs. Only when
-                                            // the CLOSED session is the active
-                                            // one — a background app's exit must
-                                            // not reach across and clobber the
-                                            // rail (or the base) of whatever the
-                                            // user is looking at.
-                                            let closed_is_active =
-                                                shell.server.active_session_path()
-                                                    == Some(contribution_session_path.as_str());
-                                            if closed_is_active
-                                                && matches!(
-                                                    shell.right_panel_mode,
-                                                    RightPanelMode::AppPane(_)
-                                                )
-                                            {
-                                                // Hand the panel back to the
-                                                // user's remembered base, not to
-                                                // an unconditional Hidden.
-                                                shell.close_app_pane();
-                                            }
-                                            if closed_is_active {
-                                                shell.app_pane_schema = None;
-                                                shell.app_pane_values.clear();
-                                                shell.app_pane_error = None;
-                                            }
-                                            // The document surface is the same
-                                            // app's tenant in the viewport.
-                                            shell.clear_document_panes_for_session(
-                                                &contribution_session_path,
-                                            );
-                                            // The app retired: a NEW instance in
-                                            // this session earns a fresh rail
-                                            // auto-open. (The once-guard exists
-                                            // to respect a USER-closed rail
-                                            // against heartbeats, not to outlive
-                                            // the app.)
-                                            shell
-                                                .document_rail_auto_opened
-                                                .remove(&contribution_session_path);
                                         });
                                         append_trace_event(
                                             &trace_home,

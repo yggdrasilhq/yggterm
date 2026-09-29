@@ -1,6 +1,7 @@
 use crate::app_declare::{
     AppDeclareLog, AppDeclareRecord, AppDeclareScanner, OscWitness,
-    attach_replay_neutralizes_web_surface_open, rewrite_consumed_web_surface_opens,
+    attach_replay_neutralizes_web_surface_open, rewrite_consumed_sidebar_declares,
+    rewrite_consumed_web_surface_opens,
 };
 use crate::codex_cli::{
     TerminalIdentityColorProfile, normalize_terminal_identity_color,
@@ -4272,14 +4273,15 @@ impl PtySessionRuntime {
         // (cursor > 0) are deliberately left verbatim — both rules live in
         // `attach_replay_neutralizes_web_surface_open`.
         if effective_cursor == 0 {
-            let record_action = self
+            let records = self
                 .app_declares
                 .lock()
                 .expect("app declare log poisoned")
-                .records()
-                .into_iter()
+                .records();
+            let record_action = records
+                .iter()
                 .find(|record| record.verb == "web-surface")
-                .map(|record| record.action);
+                .map(|record| record.action.clone());
             if attach_replay_neutralizes_web_surface_open(record_action.as_deref()) {
                 let rewritten = neutralize_replayed_web_surface_opens(&mut chunks);
                 if rewritten > 0 {
@@ -4289,6 +4291,29 @@ impl PtySessionRuntime {
                             "path": self.key,
                             "sequences": rewritten,
                             "record_action": record_action,
+                        }),
+                    );
+                }
+            }
+            // [11.186] A consumed sidebar `declare` must never replay AS A
+            // DECLARE once the daemon's retained sidebar state is no longer
+            // `declare` (the app closed it — the close is retained — or it
+            // never declared): the seed would flash-mount the chooser pane on
+            // a client the rebuild poll is about to tell to retire it, and in
+            // the windowed-seed case the close bytes never arrive at all.
+            let sidebar_action = records
+                .iter()
+                .find(|record| record.verb == "sidebar")
+                .map(|record| record.action.clone());
+            if sidebar_action.as_deref() != Some("declare") {
+                let rewritten = neutralize_replayed_sidebar_declares(&mut chunks);
+                if rewritten > 0 {
+                    trace_terminal_event(
+                        "sidebar_declare_replay_neutralized",
+                        serde_json::json!({
+                            "path": self.key,
+                            "sequences": rewritten,
+                            "record_action": sidebar_action,
                         }),
                     );
                 }
@@ -5532,6 +5557,31 @@ fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<Termina
 /// later read as live bytes, which is the just-launched case and correct.
 ///
 /// Returns how many sequences were rewritten (0 = bytes untouched).
+/// Rewrite every consumed sidebar `declare` in a SERVED attach seed to
+/// `defunct` — the [11.186] twin of [`neutralize_replayed_web_surface_opens`].
+/// A seed that replays the chooser's declare verbatim flash-mounts the pane on
+/// a fresh client even when the daemon's retained sidebar state is no longer
+/// "declared" (the app closed it), and the close bytes themselves may sit
+/// outside the served window. Same-length swap, original boundaries kept.
+fn neutralize_replayed_sidebar_declares(chunks: &mut [TerminalChunk]) -> usize {
+    let joined: String = chunks
+        .iter()
+        .map(|chunk| chunk.data.as_str())
+        .collect();
+    let Some((rewritten, count)) = rewrite_consumed_sidebar_declares(&joined) else {
+        return 0;
+    };
+    let mut offset = 0;
+    for chunk in chunks.iter_mut() {
+        let len = chunk.data.len();
+        // Same-length swap of ASCII for ASCII: every original boundary is
+        // still a char boundary in the rewritten stream.
+        chunk.data = rewritten[offset..offset + len].to_string();
+        offset += len;
+    }
+    count
+}
+
 fn neutralize_replayed_web_surface_opens(chunks: &mut [TerminalChunk]) -> usize {
     let joined: String = chunks
         .iter()
@@ -7726,6 +7776,52 @@ line-two on the real screen\r\n\
     // exactly the shape a reviewer can construct on demand. The chunk skeleton
     // (count, seqs, per-chunk byte lengths) must come through untouched, since
     // downstream consumers filter whole chunks by seq.
+    // The [11.186] sidebar twin of the split discipline above: a consumed
+    // sidebar `declare` serves as `defunct` across EVERY chunk split, so a
+    // windowed cursor-0 seed can never flash-mount a pane the daemon knows is
+    // retired.
+    #[test]
+    fn a_replayed_sidebar_declare_is_neutralized_across_every_chunk_split() {
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(br#"{"session":"mock-app","app_name":"Mock Chooser"}"#);
+        let stream = format!(
+            "MOCK_SIDEBAR_READY\r\n\x1b]7717;sidebar;declare;{payload}\x07after the declare\r\n"
+        );
+        for cut in 1..stream.len() {
+            if !stream.is_char_boundary(cut) {
+                continue;
+            }
+            let mut chunks = vec![
+                TerminalChunk {
+                    seq: 7,
+                    data: stream[..cut].to_string(),
+                },
+                TerminalChunk {
+                    seq: 8,
+                    data: stream[cut..].to_string(),
+                },
+            ];
+            let lens: Vec<usize> = chunks.iter().map(|chunk| chunk.data.len()).collect();
+            let rewritten = neutralize_replayed_sidebar_declares(&mut chunks);
+            assert_eq!(rewritten, 1, "cut {cut} missed the straddled declare");
+            let joined: String = chunks.iter().map(|chunk| chunk.data.as_str()).collect();
+            assert!(
+                !joined.contains("\x1b]7717;sidebar;declare;"),
+                "cut {cut} served the consumed sidebar declare verbatim"
+            );
+            assert!(
+                joined.contains("\x1b]7717;sidebar;defunct;"),
+                "cut {cut} lost the declare instead of neutralizing it"
+            );
+            assert!(
+                joined.contains(&payload) && joined.contains("after the declare"),
+                "cut {cut} disturbed bytes outside the action token"
+            );
+            let rebuilt: Vec<usize> = chunks.iter().map(|chunk| chunk.data.len()).collect();
+            assert_eq!(rebuilt, lens, "cut {cut} moved a chunk boundary");
+        }
+    }
+
     #[test]
     fn a_replayed_open_is_neutralized_across_every_chunk_split() {
         let payload = base64::engine::general_purpose::STANDARD
