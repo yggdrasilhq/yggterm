@@ -1102,6 +1102,28 @@ mod screen_verb_tests {
     }
 
     #[test]
+    fn the_rows_title_and_note_verbs_are_dispatched_by_both_binaries() {
+        for (binary, source) in [
+            ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),
+            (
+                "yggterm-headless",
+                include_str!("../../../apps/yggterm/src/bin/yggterm-headless.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains(r#"args[2] == "title""#)
+                    && source.contains(r#"args[2] == "note""#),
+                "`server rows title|note` is not dispatched by {binary} - the write \
+                 half of the metadata program exists but nothing can reach it",
+            );
+            assert!(
+                source.contains("run_row_title_set(") && source.contains("run_row_note_set("),
+                "{binary} matches the title/note verbs without calling their handlers",
+            );
+        }
+    }
+
+    #[test]
     fn the_screen_verb_is_dispatched_by_both_binaries() {
         for (binary, source) in [
             ("yggterm", include_str!("../../../apps/yggterm/src/main.rs")),

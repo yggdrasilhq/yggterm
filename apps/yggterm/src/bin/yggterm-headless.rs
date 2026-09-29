@@ -1714,6 +1714,38 @@ impl std::io::Write for LossyStderrHandle {
         // persistence and the trace move together.
         return yggterm_server::run_row_re_point(&args[3], &args[4]);
     }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "title"
+        && args[3] == "set"
+    {
+        return yggterm_server::run_row_title_set(&args[4], &args[5..].join(" "));
+    }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "title"
+        && args[3] == "clear"
+    {
+        return yggterm_server::run_row_title_clear(&args[4]);
+    }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "note"
+        && args[3] == "set"
+    {
+        return yggterm_server::run_row_note_set(&args[4], &args[5..].join(" "));
+    }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "note"
+        && args[3] == "clear"
+    {
+        return yggterm_server::run_row_note_clear(&args[4]);
+    }
     if args.len() >= 4 && args[0] == "server" && args[1] == "rows" && args[2] == "despawn" {
         // The ghost sweep ([11.74]): close on the owning host AND veto
         // re-import, so the next rotation's restore cannot resurrect the

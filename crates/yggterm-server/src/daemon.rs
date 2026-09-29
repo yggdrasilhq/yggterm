@@ -2940,6 +2940,8 @@ fn persisted_live_session_from_preserved_owner_snapshot(
         ssh_target,
         prefix: session.ssh_prefix.clone(),
         cwd: snapshot_session_metadata_value(session, "Cwd"),
+        note: snapshot_session_metadata_value(session, "Note")
+            .filter(|note| !note.trim().is_empty()),
         // WHICH app verb this row is, if it is one. A row adopted off a peer
         // daemon that loses this comes back as bare bash — the same loss the
         // field exists to close, arriving through the handover door instead.
@@ -4261,6 +4263,23 @@ pub enum ServerRequest {
         path: String,
         prefix: String,
     },
+    /// Clear a row's EXPLICIT title pin (the `session rename` /
+    /// `rows title set` state), returning the title to the dynamic plane:
+    /// the title-follow chore and the CLI store readers own it again on
+    /// their next tick. Its OWN request rather than an empty explicit title
+    /// on `UpdateSessionCopy` — the explicit-but-blank arm is a measured
+    /// weird state, not a spelling of "back to generated".
+    ClearSessionExplicitTitle {
+        path: String,
+    },
+    /// Set (or clear, with `None`) a row's free-text NOTE — the agent/human
+    /// write half of the Session Metadata panel. The note is an ordinary
+    /// metadata entry under the static label "Note", so it rides the
+    /// snapshot wire, the panel renderer and the persisted view unchanged.
+    SetSessionNote {
+        path: String,
+        note: Option<String>,
+    },
     RemoveSshTarget {
         machine_key: String,
     },
@@ -5049,6 +5068,10 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         // A shared-view mutation: it moves a row in the order every client
         // renders, so a shadow may not do it.
         | ServerRequest::SetSessionOutlinePrefix { .. }
+        // A shared-view mutation: it rewrites what every client renders
+        // (the row's title pin / note), so a shadow may not do it either.
+        | ServerRequest::ClearSessionExplicitTitle { .. }
+        | ServerRequest::SetSessionNote { .. }
         | ServerRequest::RemoveSshTarget { .. }
         | ServerRequest::RemoveSession { .. }
         | ServerRequest::RowsRePointSession { .. }
@@ -13133,6 +13156,35 @@ impl DaemonRuntime {
                     format!("no live session for {path}")
                 }))
             }
+            ServerRequest::ClearSessionExplicitTitle { path } => {
+                let outcome = self.server.clear_session_title_explicit(&path);
+                if outcome == Some(true) {
+                    self.persist()?;
+                }
+                self.snapshot_response(Some(match outcome {
+                    Some(true) => {
+                        format!(
+                            "explicit title cleared on {path}; the title-follow chore owns the title again"
+                        )
+                    }
+                    Some(false) => format!("row {path} already wears a dynamic title"),
+                    // ⛔ Named, not silent — the outline arm's law.
+                    None => format!("no live session for {path}"),
+                }))
+            }
+            ServerRequest::SetSessionNote { path, note } => {
+                let outcome = self.server.set_session_note(&path, note.as_deref());
+                if outcome == Some(true) {
+                    self.persist()?;
+                }
+                self.snapshot_response(Some(match (&outcome, &note) {
+                    (None, _) => format!("no live session for {path}"),
+                    (Some(true), Some(text)) => format!("note set on {path}: {text}"),
+                    (Some(true), None) => format!("note cleared on {path}"),
+                    (Some(false), Some(_)) => format!("note unchanged on {path}"),
+                    (Some(false), None) => format!("no note to clear on {path}"),
+                }))
+            }
             ServerRequest::RemoveSshTarget { machine_key } => {
                 let removed = self.server.remove_ssh_targets_for_machine(&machine_key);
                 self.persist()?;
@@ -18889,6 +18941,8 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::RefreshPreview { .. } => "refresh_preview",
         ServerRequest::UpdateSessionCopy { .. } => "update_session_copy",
         ServerRequest::SetSessionOutlinePrefix { .. } => "set_session_outline_prefix",
+        ServerRequest::ClearSessionExplicitTitle { .. } => "clear_session_explicit_title",
+        ServerRequest::SetSessionNote { .. } => "set_session_note",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
         ServerRequest::RowsRePointSession { .. } => "rows_re_point_session",
@@ -22840,6 +22894,58 @@ pub fn set_session_outline_prefix(
             prefix: prefix.to_string(),
         },
     )?)
+}
+
+/// Set a row's EXPLICIT title (the verb half of `session rename`) on the
+/// daemon that owns it. Rides `UpdateSessionCopy` with `title_is_explicit`:
+/// one wire, the same apply the GUI rename uses — the hint writers keep out,
+/// the title-follow chore answers `refused_owner_set`, and the explicit
+/// writer's store write-through keeps the CLI's own picker in agreement.
+pub fn update_session_copy_title(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    title: &str,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::UpdateSessionCopy {
+            path: path.to_string(),
+            title: Some(title.to_string()),
+            precis: None,
+            summary: None,
+            title_is_explicit: true,
+        },
+    )?)?
+    .with_context(|| format!("missing title-set answer for {path}"))
+}
+
+/// Clear a row's explicit-title pin on the daemon that owns it. The answer
+/// names all three outcomes (cleared / already dynamic / no row) so a wrong
+/// path is never silent.
+pub fn clear_session_explicit_title(endpoint: &ServerEndpoint, path: &str) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::ClearSessionExplicitTitle {
+            path: path.to_string(),
+        },
+    )?)?
+    .with_context(|| format!("missing title-clear answer for {path}"))
+}
+
+/// Set (or clear, with `None`) a row's note on the daemon that owns it.
+pub fn set_session_note(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    note: Option<&str>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::SetSessionNote {
+            path: path.to_string(),
+            note: note.map(str::to_string),
+        },
+    )?)?
+    .with_context(|| format!("missing note answer for {path}"))
 }
 
 /// Fetch the row-order ledger report (JSON string) — all scopes or one.
@@ -31532,7 +31638,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        }
+        
+            note: None,}
     }
 
     fn owned(keys: &[&str]) -> std::collections::HashSet<String> {
@@ -41864,7 +41971,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let unkept_update_runtime = remote_scanned_session_path("dev", "temporary-update");
         server.restore_live_session(PersistedLiveSession {
             app_launch: None,
@@ -41885,7 +41993,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
         let current_owned_runtime_keys = HashSet::new();
@@ -42007,7 +42116,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let terminals = TerminalManager::new();
 
         assert!(server.represents_terminal_runtime_key(&kept_runtime));
@@ -42048,7 +42158,8 @@ mod tests {
             agent_launch_options: Default::default(),
             title_is_explicit: false,
             outline_prefix: None,
-        });
+        
+            note: None,});
         let terminals = TerminalManager::new();
 
         assert!(
@@ -42090,7 +42201,8 @@ mod tests {
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            });
+            
+                note: None,});
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
@@ -42140,7 +42252,8 @@ mod tests {
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            });
+            
+                note: None,});
         }
         let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
         let all_registry_keys = HashSet::from([kept_samplenotes.clone(), reassigned_erome.clone()]);
@@ -43447,7 +43560,8 @@ mod tests {
                 agent_launch_options: Default::default(),
                 title_is_explicit: false,
                 outline_prefix: None,
-            }],
+            
+                note: None,}],
             session_pty_grids: Vec::new(),
         };
 
@@ -44893,8 +45007,8 @@ mod tests {
         // `cargo check --tests` compiles the law, it never RUNS it. This
         // commit re-arms the stamp at the shipped truth; the NEXT shape
         // change must bump the version and this hash in its own commit.
-        const STAMPED_AT_VERSION: &str = "3.2.114";
-        const STAMPED_SHAPE_HASH: u64 = 0x2363fb2b0c9e7582;
+        const STAMPED_AT_VERSION: &str = "3.2.115";
+        const STAMPED_SHAPE_HASH: u64 = 0xd15559e723c5913c;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

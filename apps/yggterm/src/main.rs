@@ -1510,6 +1510,38 @@ fn main() -> Result<()> {
         // binaries by the both-binaries law.
         return yggterm_server::run_row_re_point(&args[3], &args[4]);
     }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "title"
+        && args[3] == "set"
+    {
+        return yggterm_server::run_row_title_set(&args[4], &args[5..].join(" "));
+    }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "title"
+        && args[3] == "clear"
+    {
+        return yggterm_server::run_row_title_clear(&args[4]);
+    }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "note"
+        && args[3] == "set"
+    {
+        return yggterm_server::run_row_note_set(&args[4], &args[5..].join(" "));
+    }
+    if args.len() >= 5
+        && args[0] == "server"
+        && args[1] == "rows"
+        && args[2] == "note"
+        && args[3] == "clear"
+    {
+        return yggterm_server::run_row_note_clear(&args[4]);
+    }
     // ⛔ THE LAST THREE `server` DIVERGENCES, AND THEY WERE ACCIDENTAL TOO.
     // These three were read as deploy/relay machinery that belonged to the
     // headless CLI by design — the one real fork this surface was said to
