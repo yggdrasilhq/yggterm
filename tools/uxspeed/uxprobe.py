@@ -436,10 +436,20 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 const t0 = Date.now();
 const deadline = t0 + 2200;
 let compound = null, panes = [], found_at = null;
+// ⛔ data-split-session is stamped on EVERY terminal container, not just
+// split panes (viewport.rs renders it unconditionally), and the
+// [11.172]/[11.173] hot-premount retention keeps hidden non-split
+// terminals mounted indefinitely — so a bare [data-split-session] count
+// never returns to 0 on a desktop with retained sessions, and >=2 can be
+// satisfied before the split even renders (the 2026-09-29
+// split-ungroup-latency lane's 1.2 s "regression" was this deadline
+// expiring; the felt dissolve is ~30-60 ms). Select split panes by the
+// split-only attribute.
 while (Date.now() < deadline) {
     await settle(25);
     compound = document.querySelector('[data-split-group-row="1"]');
-    panes = [...document.querySelectorAll('[data-split-session]')];
+    panes = [...document.querySelectorAll(
+        '[data-split-session][data-split-pane-index]')];
     if (compound && panes.length >= 2) { found_at = Date.now(); break; }
 }
 const paneRect = (n) => {
@@ -503,10 +513,16 @@ item.dispatchEvent(new MouseEvent('mouseup',
 item.dispatchEvent(new MouseEvent('click', clickInit));
 const tClick = Date.now();
 const deadline2 = tClick + 1200;
+// Same split-only selector as SPLIT_DOM_JS: data-split-session matches
+// every terminal container (retention keeps hidden ones alive), so the
+// bare count never hits 0 and "gone" degenerated to the deadline
+// expiring (measured 1207-1223 ms on 2026-09-29 = pure artifact; the
+// split-only count resolves ~30-60 ms).
 while (Date.now() < deadline2) {
     await settle(25);
     if (!document.querySelector('[data-split-group-row="1"]') &&
-        document.querySelectorAll('[data-split-session]').length === 0) break;
+        document.querySelectorAll(
+            '[data-split-session][data-split-pane-index]').length === 0) break;
 }
 const tGone = Date.now();
 const stillCompound = !!document.querySelector('[data-split-group-row="1"]');
@@ -516,7 +532,7 @@ dioxus.send({
     menu_open_ms: 0,
     still_compound: stillCompound,
     pane_count_after: document.querySelectorAll(
-        '[data-split-session]').length,
+        '[data-split-session][data-split-pane-index]').length,
 });
 """
 CHORD_LEG_JS = """
