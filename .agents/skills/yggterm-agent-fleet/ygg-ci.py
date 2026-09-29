@@ -239,8 +239,16 @@ def _run(cmd, cwd=None, timeout=120, shell=False, label=None, heartbeat_secs=0):
     try:
         # start_new_session: the child leads its own process group, so the
         # watchdog can killpg the whole tree in one signal.
+        # errors="replace": gate/step output is prose that may carry unicode
+        # (em-dash-dense docs diffs) or truncate a multibyte char at a pipe
+        # boundary; strict decode crashed communicate() and killed the WHOLE
+        # tick — every yggterm deploy since 07:50 2026-09-29 died here while
+        # builds passed (measured: 12 tick errors, byte 0xe2 at position 188,
+        # the uxspeed close-wake-chain sitting). Verdict parsing is ascii; a
+        # replaced glyph in a log line costs nothing.
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, cwd=cwd, shell=shell, start_new_session=True)
+                             text=True, errors="replace", cwd=cwd, shell=shell,
+                             start_new_session=True)
     except Exception as e:
         return subprocess.CompletedProcess(cmd, 127, "", f"{type(e).__name__}: {e}")
     shown = label or (cmd if isinstance(cmd, str) else " ".join(map(str, cmd)))
