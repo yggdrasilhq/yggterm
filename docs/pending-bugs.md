@@ -31695,6 +31695,8 @@ no iteration wall exceeding its own verb budget.
 
 ## [11.208]-uxspeed — the post-close main-thread work burst: every GUI-served verb stalls ~1.3-1.8 s after an ACTIVE row close
 
+**Status:** OPEN
+
 FILED 2026-09-29 ~11:20 IST (uxspeed close-teardown-storm lane, claim
 ACK-09461aeefd; zcode sess_b8aa4055 on jojo, work FROM dev). State: OPEN,
 attributed to a plane, NOT fixed. Supersedes the §OPEN-QUEUE 0b framing
