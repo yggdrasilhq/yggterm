@@ -1518,6 +1518,32 @@ dioxus.send(out);
             time.sleep(0.3)
         return False, None
 
+    def wait_block_landing(self, expected: list[str], band: str,
+                           target: str, timeout_s: float | None = None):
+        """Wait for the BLOCK INVARIANT a live set drop promises: the set
+        contiguous, in its pre-gesture internal order, at the dropped band
+        relative to the target. An exact full-order match is over-strict on a
+        live desktop — rows born between the pre-read and the drop shift
+        absolute positions without touching the gesture's semantics (measured
+        2026-09-29: the daemon's applied list satisfied block+band 3/3 while
+        an exact-order poll timed out). Returns (ok, wait_ms)."""
+        set_expected = [q for q in expected if q != target]
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < (timeout_s or self.timeout_s):
+            live = self.live_region_order()
+            pos = {q: live.index(q) for q in expected if q in live}
+            if len(pos) == len(expected):
+                idxs = sorted(pos[q] for q in set_expected)
+                contiguous = idxs == list(range(min(idxs), max(idxs) + 1))
+                internal = [q for q in live if q in set_expected] == set_expected
+                t_i = pos[target]
+                band_ok = (all(i < t_i for i in idxs) if band == "before"
+                           else all(i > t_i for i in idxs))
+                if contiguous and internal and band_ok:
+                    return True, int((time.perf_counter() - t0) * 1000)
+            time.sleep(0.3)
+        return False, None
+
     def _stable_rects(self, paths: list[str], tries: int = 4) -> dict | None:
         """Sidebar rects, fetched twice and required equal — the sidebar
         smooth-scrolls after a tree select, and a rect fetched mid-scroll
@@ -1648,7 +1674,8 @@ dioxus.send(out);
                     it["hover_steps"] += 1
                 self.verb("pointer", "release")
                 t_release = now_ms()
-                landed, settle_ms = self.wait_relative_order(it_expected)
+                landed, settle_ms = self.wait_block_landing(
+                    it_expected, band, d_path)
                 it["felt_ms"] = now_ms() - t_down
                 it["reorder_settle_ms"] = settle_ms
                 evs = self._events_between(t_down, now_ms())
@@ -1719,9 +1746,9 @@ dioxus.send(out);
                 acc.append("drop committed nothing "
                            "(no reorder_persisted/row_set_arranged in window)")
             if not landed:
-                acc.append("drop did not land the set at the dropped band "
-                           "in drawn order within timeout (expected %s)"
-                           % it_expected)
+                acc.append("drop did not land the block at the dropped band "
+                           "(set contiguous + internal order + %s target) "
+                           "within timeout" % band)
             it["render_attribution"] = self.render_attribution(
                 t_down, t_release, it["hover_steps"])
             acc.extend(self.assert_render_attribution(
