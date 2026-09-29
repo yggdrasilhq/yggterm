@@ -18,6 +18,61 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.206] THE CONNECTION WEDGE (OWNER TOP PRIORITY): AFTER A HOST-DAEMON ROLL THE CLICKED REMOTE ROW REFUSES EVERY PLANE — resize/input ANSWER "terminal session not found", THE INPUT GATE STICKS unrestorable, AND STORE-ABSENT ROWS DEAD-END IN ERROR FRAMES BECAUSE THE ENSURE'S DEFINITIVE-MISS GATE REFUSES BEFORE THE [11.190] FRESH-START COMPOSE CAN SERVE THE CLICK (measured 2026-09-29 ~07:00-08:40 IST, live jojo GUI + dev, the 11.205 sitting; REATTRIBUTED same day by row 11.208)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Filed 2026-09-29 by seat 11.205 (zcode sess_c10f34bf on jojo, work FROM dev)
+under the owner's PRIORITY LAW (campaign door, seq #40178): "The connection
+issue is of the highest priority and for all clis must be solved first.
+Second to that is dynamic titles and metadata get and set."
+
+MEASURED (holistic sweep, 24 rows on jojo's daemon, pre-restart): 4 live,
+1 error-frame, 19 frozen/blank. The rotated-trace window 07:00-09:18 IST
+(row 11.208 re-read): remote_pty_resize_failed x124, unownable x19,
+input_gate_stuck_unrestorable x10, request_refused x10 — dominated by
+agy-runtime:// keys (41e5733d x91, 7c2a3aec x55, both STILL holder=gone
+after dev's 09:18 restart + re-adoption of 39 runtimes).
+
+CLASS A (REATTRIBUTED 2026-09-29 ~09:5x IST, row 11.208): the original
+"the resume wrapper launches the CLI DIRECTLY on its own PTY" reading is
+FALSIFIED against main — all three resume twins (codex/cc/agent) have
+ensured through the host daemon since 2.9.5 (7caf3ca3), and the preamble
+processes the 11.205 sitting read as direct launches are the 09:18:15
+re-adoption spawns of dev's own daemon (daemon restart 09:18:03). The
+live mechanism is the ROLL WINDOW: while the host daemon is down/rolled,
+remote ensure/bridge/resize verbs 404 ("terminal session not found") and
+the input gate marks unrestorable; rows the re-adoption cannot replace
+stay wedged until a click re-ensures them.
+
+CLASS B (the surviving code hole, FIXED IN CODE by
+lane/integration/11208-defmiss-freshstart): a clicked row whose saved
+session is store-absent (deleted/never-real birth ids) dead-ended in the
+"saved <agent> session … is no longer available" error frame. The ladder
+measured live: wrapper definitive-miss gate → reopen fallthrough
+(e2ddee1a, remembered closes) → ensure candidate vouch refused tombstoned
+(agy_store_candidate_vouch_refused_tombstoned) → the ensure's [11.165]
+definitive-miss gate BAIL — 14 ms, no launch. The [11.190]/[11.193]
+minted-bound fresh-start compose sat DIRECTLY BELOW that gate, unreachable
+on the require-existing (click) path; the birth veto would also have eaten
+the insert (deliberate_reentry read false for a store-absent row).
+
+⇒ Fix direction: (1) LANDED — the ensure's definitive-miss gate falls
+through to the [11.190] fresh-start compose instead of bailing (traced
+`ensure_definitive_miss_fresh_start`), the fresh-start re-entry counts as
+DELIBERATE (the birth veto must not eat the insert), and the sticky
+"Saved Session: missing" scar is cleared when the fresh start lands;
+(2) the remembered-close wrapper fallthrough is e2ddee1a (landed same
+morning); (3) the two-sided sweep instrument for the proof sweep.
+
+FALSIFIER OWED (row 11.208): on the deployed build, clicking a
+store-absent agy row (41e5733d) opens a minted, bound fresh start — trace
+`ensure_definitive_miss_fresh_start`, "Fresh Start" metadata on the row,
+no refusal frame — and a rolled host daemon's rows re-arm
+(resize/input-gate refusals stop sticking); then this entry deletes per
+the verified-fix law. Not covered: wrapper-gate refusals for closes that
+are NOT remembered (e2ddee1a law, owner-blessed).
+
 ## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
 **Status:** OPEN
