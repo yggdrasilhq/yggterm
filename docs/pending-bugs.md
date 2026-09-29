@@ -31999,12 +31999,14 @@ residual is NAMED to a leg.
 
 ## [11.214] — EVERY ACTIVE CLOSE PAYS A SECOND SERIALIZED LOCK-HELD DAEMON MUTATION (the redirect focus): focus_live carries a FULL persist (~81 ms) + snapshot build (~75 ms) under the daemon lock — the felt active close is ~470 ms where ~300 ms is the floor (measured 2026-09-29, live jojo, the close-render-burst-2 lane)
 
-**Status:** OPEN — daemon plane (file-not-take from ux-speed seats)
+**Status:** OPEN
 
 FILED 2026-09-29 ~10:1x UTC (uxspeed close-render-burst-2 lane, claim
-ACK-3174ece348; zcode sess_63c94b4b on jojo, work FROM dev). [11.208]'s
-successor: that burst is dead (UPDATE 3 there); this is the residual leg
-it was always going to name.
+ACK-3174ece348; zcode sess_63c94b4b on jojo, work FROM dev).
+DAEMON-PLANE — file-not-take from ux-speed seats (the queue keeps the
+status vocabulary bare; the plane lives here). [11.208]'s successor:
+that burst is dead (UPDATE 3 there); this is the residual leg it was
+always going to name.
 
 SYMPTOM (build 2359e40f, jojo GUI, quiet floors 57-62 ms cli / 160-176
 gui, 426-row desktop): closing the ACTIVE row costs the close worker TWO
