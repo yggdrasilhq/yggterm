@@ -5906,21 +5906,24 @@ pub fn explain_store_title(
 /// [`AgentCliDescriptor::read_live_store_title`] for OpenCode: the v2 store's
 /// own title column (opencode2 self-titles every prompted session — measured
 /// 2026-08-30), v1 table as a legacy tail.
+///
+/// ⛔ [11.203] The store's title column is AUTHORED CONTENT, not generated
+/// copy: opencode names a session with the user's own first prompt, so the
+/// conversation-shape heuristics must not filter this read. Measured on dev
+/// 2026-09-29: three real held titles ("How …", "/tmp/… prompt", "Find …")
+/// were each eaten by a DIFFERENT heuristic arm while the v1 tail was empty
+/// for the same ids — the read answered None, and the healed rows kept the
+/// cure's stale title standing. Only the store's own placeholder shapes are
+/// rejected here. The open also goes through [`open_cli_index_readonly`]
+/// ([11.64]: a live-store read waits, never blinks) — the raw readonly open
+/// this reader used to carry was the one busy-tolerance asymmetry against
+/// the membership reader, named in the same entry.
 fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<String> {
     if session_id.trim().is_empty() {
         return None;
     }
     let db_path = home.join(".local/share/opencode/opencode.db");
-    if !db_path.exists() {
-        return None;
-    }
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = open_cli_index_readonly(&db_path)?;
     for table in ["session_v2", "session"] {
         let Ok(mut stmt) =
             conn.prepare(&format!("SELECT title FROM {table} WHERE id = ?1 LIMIT 1"))
@@ -5933,8 +5936,7 @@ fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<Strin
             if let Some(title) = title
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .filter(|s| !crate::looks_like_generated_fallback_title(s))
-                .filter(|s| !crate::looks_like_low_signal_generated_copy(s))
+                .filter(|s| !opencode_store_title_is_placeholder(&s))
             {
                 return Some(title);
             }
@@ -5943,6 +5945,14 @@ fn read_opencode_live_store_title(home: &Path, session_id: &str) -> Option<Strin
     None
 }
 
+/// The placeholder shapes opencode itself writes into the store's title
+/// column: a never-prompted session self-names `New session - <ISO>`
+/// (measured 2026-08-30), the bare form is its prefix shape. Everything
+/// else in that column is the session's own words ([11.203]).
+fn opencode_store_title_is_placeholder(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    lower == "new session" || lower.starts_with("new session - ")
+}
 /// [`AgentCliDescriptor::read_live_store_title`] for Devin: the shared
 /// sessions.db `title` column, which the CLI fills eagerly with the first
 /// prompt's text (measured 2026-09-16 on 3000.10.27). One table, one row
@@ -10043,6 +10053,91 @@ mod tests {
             "a never-prompted session's placeholder is not a title"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_opencode_store_title_that_reads_like_conversation_is_still_the_title() {
+        // [11.203]: the store's title column is authored content — opencode
+        // names a session with the user's own first prompt. The three
+        // measured dev titles, one per heuristic family that used to eat
+        // them: question opener (low-signal title), path lookalike
+        // (raw-path arm), shell-verb opener (command-copy arm). Each must
+        // read through; only the store's own placeholder shapes are
+        // rejected.
+        let home =
+            std::env::temp_dir().join(format!("yggterm-oc-title-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".local/share/opencode")).unwrap();
+        let conn = rusqlite::Connection::open(home.join(".local/share/opencode/opencode.db"))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE session_v2 (id text PRIMARY KEY, title text)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('ses_q', 'How libyggterm apps embed + ship notebooks')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('ses_p', '/tmp/yggswarm prompt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('ses_v', 'Find metadata pane + title flow')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read_opencode_live_store_title(&home, "ses_q").as_deref(),
+            Some("How libyggterm apps embed + ship notebooks"),
+            "a question opener is the user's own words, not generated copy"
+        );
+        assert_eq!(
+            read_opencode_live_store_title(&home, "ses_p").as_deref(),
+            Some("/tmp/yggswarm prompt"),
+            "a path-leading title is authored content in this column"
+        );
+        assert_eq!(
+            read_opencode_live_store_title(&home, "ses_v").as_deref(),
+            Some("Find metadata pane + title flow"),
+            "a shell-verb opener is English, not a command line"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// [11.203] LOCK: the opencode store title read is an authored-content
+    /// read. Its body must never open a raw connection (the live store
+    /// read waits, never blinks — the busy-tolerant opener is the only
+    /// door) and never route through the conversation-shape copy filters
+    /// (they ate three real held titles on dev, one arm each).
+    #[test]
+    fn the_opencode_title_read_stays_authored_content_and_busy_tolerant() {
+        let source = include_str!("agent_cli.rs");
+        let reader = source
+            .split("fn read_opencode_live_store_title(")
+            .nth(1)
+            .expect("reader body")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            !reader.contains("SQLITE_OPEN_READ_ONLY"),
+            "the reader must open through the busy-tolerant opener, not a raw readonly connection"
+        );
+        assert!(
+            reader.contains("open_cli_index_readonly"),
+            "the reader must open through the busy-tolerant opener"
+        );
+        assert!(
+            !reader.contains("generated_fallback_title"),
+            "the conversation-shape filters must not gate the authored store column"
+        );
+        assert!(
+            !reader.contains("low_signal_generated"),
+            "the conversation-shape filters must not gate the authored store column"
+        );
     }
 
     #[test]
