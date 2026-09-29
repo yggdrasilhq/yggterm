@@ -31,13 +31,12 @@ probe row it creates. Scenario ↔ defect map:
                              RE-POINTED to a fresh yggterm-minted conversation
                              id ([11.193] binding: rows show id != requested)
                              — and CONNECT, never the pre-fix 14 ms bail into
-                             an error frame. The serving half (trace + live
-                             row) measured GREEN 2026-09-29 on build bfe5ed19;
-                             the binding half measured RED the same day (the
-                             spawned command resumed the ABSENT requested id,
-                             rows show kept it) — this scenario is that RED
-                             baseline until the minted-bound compose reaches
-                             the row.
+                             an error frame. RED baseline 2026-09-29 on build
+                             bfe5ed19 (serving half green, binding half red);
+                             FULLY GREEN the same day on build 7b399aba (the
+                             [11.212] close-out run: trace fired, rows show
+                             re-pointed off the requested id, row live) — the
+                             minted-bound compose reaches the row.
 
 A scenario that cannot run (no store, no CLI) is SKIP with the reason; a
 scenario that asserts and fails is FAIL. Exit code 0 only when nothing failed.

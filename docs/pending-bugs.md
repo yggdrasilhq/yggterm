@@ -106,66 +106,6 @@ RESIDUE (named, owner-gated through [11.165]): Gate B's store arm cannot CLOSE a
 
 **THE FAIL-OPEN FALSIFIER CONFIRMED AND EXTENDED; THE START-BORN HALF OF THE IMPROVEMENT IS NOW LANDED (2026-09-29 ~18:0x-19:0x IST, zcode sess_bd9612d8 on jojo, work FROM dev; claim ACK-eacc2902cb, lane/integration/11213-store-failopen):** an independent falsifier run on the deployed d755bfd0 jojo daemon re-measured the residue live and found it WORSE than the residue line — the controlled corpse (a `remote-agy://dev/<probe-id>` row born from a store-absent resume; peer wrapper alive but childless; agy store db holds nothing for the id; peer `agent-runtime-alive` → `alive:false, owner_endpoint:null` vs `agy-session-exists` → `exists:true`, the pair measured on the SAME corpse) re-mounted ONCE and the worker answered `vouched: true` from the fail-open store arm — and because the vouched set is never re-asked, ONE fail-open silenced the gate for the row's lifetime: the corpse then cycled the full disease untouched (5 × `bootstrap_reset`, 6 × `retained_rehydrate_begin`, 14 × `remote_pty_resize_failed`, 4 × `terminal_transport_recovered {ghost_frame}`), with Gate A silent too — the stillborn-RESUME subclass arms no memo (the resize ladder's not-found never lands a verdict for it), so this class is caught by NEITHER gate and loops indefinitely. LANDED (same lane, refusal-shaped per the residue's own prescription — alive-gone refuses healable and tears down, never closes, so no birth-rewrite hazard): the start-born class now SKIPS the store ask entirely and goes straight to the strict alive verb, restoring the doctrine the [11.158] second-look comment already states ("the class the store ask must exclude"); the resume class keeps the cheap store-first ask; source-scan assertions pin the skip ahead of the ask. REMAINING (owner-gated [11.165] completion): the stillborn-resume subclass still vouches on the fail-open store answer — the three-valued session-exists verb (or a per-kind definitiveness flag in the descriptor registry) is the cure, and it is exactly the improvement this residue already names. LIVE PROOF for the landed skip rides the next start-born corpse: `remount_peer_liveness_verdict {instrument: alive_ask_gone}` then `remote_reuse_refused_peer_dead_remount` + teardown, and no `daemon_owned_fast_ready_on_first_meaningful_output` — the daemon plane births no start-born remote row (the GUI Fresh-Start flow does), so the recipe waits for one.
 
-## ⛔ [11.212] THE [11.190]/[11.193] MINTED-BOUND FRESH START NEVER REACHES THE ROW ON THE [11.206] CLICK PATH — THE FALLTHROUGH SERVES THE CLICK (trace + deliberate re-entry + live row, GREEN) BUT THE SPAWNED COMMAND RESUMES THE ABSENT REQUESTED ID AND THE FRESH-START STAMP + [11.193] RE-POINT NEVER LAND (measured 2026-09-29 ~12:3x-14:1x IST, live jojo daemon bfe5ed19, the 11.211 mint-arm falsifier lane)
-
-**Status:** OPEN
-
-FIXED AND LIVE-PROVEN 2026-09-29, the stomp half (the mint-arm gate, lane
-7f1af593, merged 9bf03461): the repair's probe arm now asks the same
-three-valued vouch the ensure compose asks; a DEFINITIVE miss refuses the
-repair (`restored_codex_runtime_launch_repair_refused_definitive_miss`) and
-the minted fresh-start compose + [11.193] re-point + stamp survive to the
-spawn. Unit regression `a_minted_fresh_start_is_never_repaired_back_onto_the
-_absent_id` + stand-down positive control green; LIVE-PROVEN on jojo
-9bf0346113c4: the same launch path that stamped the resume over the mint on
-bfe5ed19 (trace 1790667829622) now answers the refusal on every tick
-(1790673039751, 1790673041246, 1790673045034, 1790674415561+). The scenario
-defmiss_fresh_start_mint_11206 is still RED end to end, but the RED has
-MOVED: the mint arm is bypassed BEFORE the ensure by the new [11.214] — not
-by a stomp.
-
-Filed 2026-09-29 by seat 11.211 (zcode sess_7c1d3a84 on jojo, work FROM dev;
-plan ACK-3d14c74cb5) running the [11.206] falsifier the 11.209 door queued:
-a live store-absent-without-candidate agy row opening a MINTED fresh start.
-
-MEASURED (tools/e2e/connection_probe.py scenario defmiss_fresh_start_mint_11206,
-3 live runs): the construction works — birth agy row in a probe cwd, rows
-despawn (records the remembered close), the cwd's conversations deleted from
-conversation_summaries.db, `resume-agy <uuid> <cwd> --require-existing`. Every
-run: `ensure_definitive_miss_fresh_start` traced, `live_session_birth_
-deliberate_reentry` (the birth veto did NOT eat the insert), row born, CLI
-live on the PTY — the [11.206] dead frame is GONE, that half is proven. But
-`rows show` answers id == the store-absent REQUESTED uuid every time, and the
-resolved launch command (trace `resolved`, the run window in ytrace) carries
-`--conversation '<the absent id>'` — the [11.190] minted compose and the
-[11.193] re-point of session.id did NOT reach the row. A row born this way
-resumes an id the store provably lacks: agy's own "conversation not found"
-warning paints in the PTY (measured: `agent_session_error` /
-`resume_refusal` pattern session_not_found in the same window), and the store
-will never title the row — the exact disease [11.193] was cut for.
-
-MECHANISM POINTER (static read, unconfirmed): the ensure's compose is correct
-on its face (worktree bfe5ed19 lib.rs 13329-13362: resumable false,
-agy_definitive_store_miss true → fresh_conversation_id minted and bound), but
-`restored_codex_runtime_launch_repaired` fires INSIDE the same window (trace,
-between `launch` and `request_terminal_launch`) and UNCONDITIONALLY rewrites
-`session.launch_command` (lib.rs 19185-19188) — and the repair's command is
-composed by the restore/keep-alive path from `remote_saved_agent_session_
-exists`, which answers fail-open TRUE for Antigravity BY [11.165] DESIGN
-(lib.rs 16674-16705) → a resume of the ORIGINAL id stomps the minted compose.
-The Fresh Start stamp block (lib.rs 13461) then names a compose the row no
-longer carries — the naming/binding half dies between compose and repair.
-
-⇒ Fix direction: the repair must not stomp a minted fresh-start compose — the
-repair path needs the same three-valued vouch the ensure compose now has (or
-the compose must survive the repair), and the [11.193] re-point + "Fresh
-Start" stamp must land on the row that actually launches.
-
-PROBE: scenario defmiss_fresh_start_mint_11206 is the falsifier — GREEN when
-rows show re-points the id (bound != requested) with the trace still fired
-and the row live. RED baseline (this lane, build bfe5ed19): "SERVING half
-green, BINDING half red ... rows show answers id=<requested>".
-
 ## ⛔ [11.207] A GREEN INTEGRATION TICK CAN RESURRECT A DELETED pending-bugs ENTRY, AND A RED GATE'S ERROR PRINT TRUNCATES MID-CODEPOINT AND KILLS THE TICK'S DECODE (measured 2026-09-29 ~08:15-09:15 IST, dev, the 11.206 close-out lane)
 
 **Status:** OPEN
