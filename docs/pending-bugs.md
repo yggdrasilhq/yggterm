@@ -31692,3 +31692,70 @@ no iteration wall exceeding its own verb budget.
 > click, and only then score the action) and the 16-minute verb block
 > is unconditional-to-file regardless: one app-control call must never
 > hold minutes-class while the CLI floor answers pings.
+
+## [11.208]-uxspeed — the post-close main-thread work burst: every GUI-served verb stalls ~1.3-1.8 s after an ACTIVE row close
+
+**Status:** OPEN
+
+FILED 2026-09-29 ~11:20 IST (uxspeed close-teardown-storm lane, claim
+ACK-09461aeefd; zcode sess_b8aa4055 on jojo, work FROM dev). State: OPEN,
+attributed to a plane, NOT fixed. Supersedes the §OPEN-QUEUE 0b framing
+("teardown storm delays the pump") — the pump/event-loop and every plane
+named there are measured-clean; the block is the GUI main thread itself.
+
+SYMPTOM (build 8962847ca91c and 3478e2e265b5, jojo GUI, 425-row sidebar):
+closing the ACTIVE row answers the verb in 371-504 ms (the [11.204]
+worker — fine) but the row is only gone from `server app rows` at
+1810-2759 ms; INACTIVE closes report gone at 565-881 ms. The tail is ONE
+`rows` poll serving 988-2591 ms (quiet serve: 5-48 ms). Felt: after
+closing the front row, the desktop ignores agent verbs and clicks for
+over a second.
+
+MEASURED (scratch rows only, /tmp drivers storm_ab/storm_tail/
+storm_correlate/storm_threads2/storm_fd2):
+- The GUI MAIN THREAD burns ~180 jiffies (1.8 s CPU, state R) through
+  the close window; one folio_wait_bit_common (file-backed page wait)
+  early in the block.
+- During the block the app-control drain loop picks up NOTHING: a
+  describe_rows request sent right after the verb sits un-served from
+  +455 ms to +1750 ms, and the [11.204] floating apply (apply_rx ->
+  spawn_forever) lands at the END of the same window. Its own work is
+  28-45 ms (the snapshot_apply_legs instrument, this lane — landed
+  06c93d6d). The block is what delays the apply, not the apply itself.
+- EXONERATED by measurement: the worker plane (round_trip 218-358 ms),
+  the daemon plane (remove_session 222-231 ms; its other verbs ≤2 ms),
+  the sidebar merge (merge_rows trace 0.3-10 ms), the snapshot-apply
+  legs (28-45 ms), the rows JSON build itself (5-48 ms once served),
+  the transcript-store scans (~1400 files total on this desktop),
+  the pump event loop AFTER the block (clients verb ≤109 ms in-window
+  is a daemon-plane answer — do not use it as a pump-liveness probe;
+  poll `rows` instead).
+- perf (399-499 Hz, per-close 5-6 s windows, callgraphs kernel-only —
+  the release binary has no frame pointers and dwarf collect fails on
+  this kernel): blocking ZFS read path ~29% of the window (pread64 →
+  zfs_read → dmu_read), __fstatat64 ~7%, _int_malloc ~9.6% + free/
+  memmove/String-clone churn, sqlite3RunParser + sqlite mutex, sip-hash,
+  looks_like_generated_fallback_title 1.32%, set_sidebar_search_context
+  1.25%. A smeared read-stat-allocate-serialize burst, not a spin loop.
+
+ATTRIBUTION (plane-level, honest): the block is the main-thread work
+burst scheduled by the close's own state writes — the [11.180]
+sidebar/preview rebuild family at close scale (the raise path's
+"sidebar-rebuild complex + allocator" after the memo fix), plus whatever
+file reads/stat walks the render path still does inline. It is CONSTANT
+per active close (~1.3-1.8 s) and scales with the sidebar (425 rows),
+not with any transcript size measured.
+
+NEXT LEVER (GUI-shell plane): instrument the render span itself (a
+duration trace around the post-close render + its snapshot rebuild) and
+apply the [11.180] recipe to the close path: key/memoize what the close
+render pays for, move any inline file reads out of the render path, and
+re-measure with the falsifier below. strace cannot attach to this GUI
+(sandboxed, empty logs — verified twice); /proc/TID/syscall is
+unreliable under this kernel (61/-1 artifacts); perf dwarf unwinding
+unavailable. The render-span trace is the only remaining naming tool.
+
+FALSIFIER: uxprobe close_to_gone on the ACTIVE row ≤~700 ms (poll tail
+gone: first post-verb `rows` poll serves ≤~200 ms), verified-gone 5/5,
+0 rows left behind, on a rotated build, with the new render-span trace
+naming the residual under 300 ms.
