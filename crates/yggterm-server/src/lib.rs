@@ -7722,6 +7722,29 @@ impl YggtermServer {
         }
         let from = session.id.clone();
         let path = session.session_path.clone();
+        // ⛔ THE [11.214] MINTED-BINDING GUARD: a row carrying the [11.190]
+        // Fresh Start stamp is DELIBERATELY bound to an id that is not its
+        // key's (the [11.193] re-point at fresh start). The store-candidate
+        // cure reading that divergence as drift and healing it back onto the
+        // key id UN-DONES the mint mid-flight — measured 2026-09-29:
+        // identity_store_candidate_rebind 27d7b8b5→7fc90dc2 fired 2.5 s after
+        // the minted spawn, rows show answered the store-absent requested id,
+        // and the falsifier's BINDING half stayed red while its SERVING half
+        // was green. The stamp is the marker that the divergence is the
+        // design; the door refuses while it stands.
+        if session
+            .metadata
+            .iter()
+            .any(|entry| entry.label == "Fresh Start")
+        {
+            emit_identity_trace(
+                "identity_store_candidate_rebind_refused_minted_binding",
+                &path,
+                Some(&from),
+                new_session_id,
+            );
+            return false;
+        }
         // ⛔ [11.200] THE KEY-ID GUARD: a row whose session_path is a
         // session-named runtime key IS the conversation the key names. A
         // caller re-binding it onto any other id (the cwd-recency cure's
@@ -54743,6 +54766,50 @@ terminal_window_id: None,
         assert!(
             server.rebind_live_session_store_identity(&oc_key, id),
             "opencode-runtime rows are row-named; their rebind arms keep working"
+        );
+    }
+
+    /// [11.214] THE MINTED-BINDING GUARD at the rebind door: a row carrying
+    /// the [11.190] Fresh Start stamp is deliberately bound OFF its key's id
+    /// (the [11.193] re-point) — the store-candidate cure must read that
+    /// divergence as design, not drift. Measured 2026-09-29: the cure healed
+    /// the minted id back onto the key id 2.5 s after the minted spawn and
+    /// the falsifier's BINDING half stayed red while its SERVING half was
+    /// green.
+    #[test]
+    fn the_rebind_door_refuses_the_key_id_heal_on_a_minted_fresh_start() {
+        let mut server = test_server();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let minted = "33333333-3333-4333-8333-333333333333";
+        let key = format!("agy-runtime://{id}");
+        server.insert_live_session_with_launch(
+            &key,
+            id,
+            SessionKind::Antigravity,
+            &crate::local_session_target(SessionKind::Antigravity, Some("/home/user/proj")),
+            Some("New jojo Antigravity".to_string()),
+            false,
+            false,
+        );
+        // THE MINT: the [11.193] re-point + the [11.190] stamp, exactly what
+        // the ensure's fresh-start arm lands.
+        {
+            let session = server.sessions.get_mut(&key).expect("row");
+            session.id = minted.to_string();
+            session.metadata.push(crate::SessionMetadataEntry {
+                label: "Fresh Start",
+                value: "the store definitively lacks the requested id; started a new conversation"
+                    .to_string(),
+            });
+        }
+        assert!(
+            !server.rebind_live_session_store_identity(&key, id),
+            "the key-id heal must not un-do a minted fresh-start binding"
+        );
+        assert_eq!(
+            server.sessions.get(&key).expect("row").id,
+            minted,
+            "the row keeps the minted conversation id the store will title"
         );
     }
 
