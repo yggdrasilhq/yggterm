@@ -31897,3 +31897,38 @@ lane's own perf captures + /proc thread sampling on build bfe5ed1909f4):
   instrumented build names the crawl's CALLER per close (the selection_crawl
   event) and the preflight legs; the next live run either drops the burst
   below the bar or names what remains.
+
+UPDATE 2 — 2026-09-29 ~08:2x UTC (same lane/sitting): THE BLOCK IS NAMED BY
+A MID-STALL GDB BACKTRACE (ptrace_scope 0; perf walled at paranoid=3). The
+main thread, caught inside the burst: `StartPage →
+remote_scanned_session_label → SessionTitleStore::open → execute_batch →
+btreeBeginTrans → pager_wait_on_lock → unixLock/fcntl` — the label builder
+opened the title store PER CANDIDATE ROW (per-call Connection::open PLUS
+the six-statement schema DDL batch: write txn + file lock + full sqlite
+parse) and every open contended the DB file lock on ZFS. That is the perf
+capture's whole smear: sqlite RunParser ~5-6%, malloc/free churn ~20%, ZFS
+reads ~8-10%, the D-state `__cv_timedwait` at the block's head. The
+instrumented build's first live run also NAMED the crawl caller: BOTH close
+shapes redirect to the START PAGE (fresh rows have no viewport history, so
+`close_redirect_target_for_pending` falls back to StartPage) — StartPage
+mounts, its render pays `all_sidebar_rows_for_selection` ("startpage"
+caller on every `selection_crawl` event, 282-541 ms) AND the per-row label
+opens. Owner-shaped closes (a kept sibling in history) measured 1641-2374
+ms — NOT better than the probe shape, because the fallback still mounts
+StartPage and the block dominates both.
+
+FIX LANDED (second commit on this lane): titles.rs runs the schema batch
+ONCE per process per home; `with_shared_title_store` gives per-item callers
+one store per thread per home; `remote_scanned_session_label` uses it. With
+c6acc4bf's crawl memo + prepare_cached, every open on the close path is now
+a plain `Connection::open` and repeats are cache hits.
+
+FALSIFIER RE-RUN OWED on the next rotated build: both shapes, 5/5
+verified-gone, plus the block gap read off `ui block`. The named residual
+after this fix should be the crawl's remaining merges (~150-300 ms, now
+attributable per-round on selection_crawl) and the [11.204] worker plane.
+Pre-existing-on-main test failures observed during gating (NOT this lane's):
+shell teardown_honesty_locks::the_session_remove_call_site…,
+shell terminal_mount_warm_eval_is_tiny_and_version_locked, core
+install::promote_direct…, core session_bus::every_entry_point_refuses…
+(board ACK-5d7a0bf3db).

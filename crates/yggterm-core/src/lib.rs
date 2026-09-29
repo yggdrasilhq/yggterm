@@ -162,6 +162,7 @@ pub use titles::{
     copy_generation_pause_remaining_ms, error_is_endpoint_refusal, is_agent_plane_composed_title,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
     request_generated_short_name, session_title_store_open_count,
+    with_shared_title_store,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_foreign_trace_batch,
