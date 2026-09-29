@@ -2722,7 +2722,10 @@ dioxus.send(out);
             base = self._last_window_size() or (1500, 900)
         w0, h0 = base
         target_w = max(900, w0 - 260)
-        sizes = [(target_w, h0), (w0, h0)]
+        target_h = max(600, h0 - 200)
+        # alternate BOTH axes so the battery covers the width class (reflow)
+        # and the height class (scrollback/viewport) of the grid change
+        sizes = [(target_w, target_h), (w0, h0)]
         out = {"iterations": [], "restore_size": [w0, h0],
                "driver": "server app resize-window (paced)"}
         instrument_live = False
