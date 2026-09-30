@@ -134,6 +134,7 @@ LITELLM_VIA_HOST = "manin"       # fallback jump: lxc-attach into the llmproxy g
 LITELLM_CONTAINER = "llmproxy"
 LITELLM_TOKEN_DIR = "/root/chatgpt_tokens"
 LLMPROXY_SERVICE = "llmproxy.service"
+ASSIGNMENTS_FILE = os.path.join(STORE_ROOT, ".assignments.json")
 
 CHATGPT_AUTH_BASE = "https://auth.openai.com"
 CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -547,7 +548,8 @@ def pick_rotate_target(harness, measure=True):
         raise AuthError(2, f"no stored profiles for {harness} — nothing to rotate to; run `capture` or `login`")
     current = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
     current_slug = current["slug"] if current else None
-    others = [p for p in profiles if p["slug"] and p["slug"] != current_slug]
+    others = [p for p in profiles if p["slug"] and p["slug"] != current_slug
+              and assignment_of(p["slug"]) in (None, HOSTNAME)]
     if not others:
         raise AuthError(2, f"the only profile is the live one ({current_slug}); capture or login another account first")
 
@@ -622,7 +624,29 @@ def cmd_switch(args):
     harness = require_harness(args.harness)
     if not args.slug:
         raise AuthError(6, "switch needs a profile slug (see `list`)")
+    slug = slug_for(args.slug)
+    home = assignment_of(slug)
+    if home and home != HOSTNAME and not getattr(args, "force", False):
+        raise AuthError(
+            6, f"{slug}'s deterministic home is {home!r} — this host is {HOSTNAME!r}. "
+               f"Run the switch there, reassign with `assign {slug} {HOSTNAME}`, or override with --force (owner).")
     with fleet_lock():
+        # deterministic hygiene: refresh the OUTGOING grant before capturing it,
+        # so the stored copy holds the newest token, never a consumed one.
+        # Single-writer guard: only refresh when THIS host owns the live lineage.
+        if os.environ.get("YGG_AUTH_NO_PREFRESH") != "1":
+            try:
+                live_rec = live_record(harness, required=True)
+                ident = identity_of(live_rec)
+                writer = get_writer(harness, ident.get("slug") or "")
+                if writer not in (None, "unknown", HOSTNAME):
+                    print(f"⚠️  pre-switch refresh skipped: {ident.get('slug')}'s writer is {writer}",
+                          file=sys.stderr)
+                else:
+                    fresh = refresh_grant(live_rec)
+                    atomic_write_json(HARNESSES[harness]["auth_file"](harness), fresh)
+            except Exception as exc:
+                print(f"⚠️  pre-switch refresh skipped: {str(exc)[:120]}", file=sys.stderr)
         result = switch(harness, args.slug, lock_held=True)
     return result
 
@@ -960,6 +984,60 @@ def usage_snapshot(record):
             "banked": banked,
             "banked_weekly_left": round(max(0, 100 - ((sw or {}).get("used_percent") or 0))),
             "reset_credits": payload.get("rate_limit_reset_credits")}
+
+
+def load_assignments():
+    if os.path.exists(ASSIGNMENTS_FILE):
+        try:
+            return read_json(ASSIGNMENTS_FILE) or {}
+        except ValueError:
+            return {}
+    return {}
+
+
+def save_assignments(a):
+    atomic_write_json(ASSIGNMENTS_FILE, a)
+
+
+def assignment_of(slug):
+    """slug -> home host, or None when unassigned (unassigned = any host may hold it)."""
+    a = load_assignments().get(slug or "")
+    return (a or {}).get("host") if isinstance(a, dict) else None
+
+
+def push_assignments():
+    """Propagate the assignments file to every saved fleet host (deterministic
+    only works if every host reads the same table)."""
+    hosts = load_fleet_hosts()
+    pushed, failed = [], []
+    for host in hosts:
+        if host == HOSTNAME:
+            continue
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+             f"mkdir -p {STORE_ROOT} && cat > {ASSIGNMENTS_FILE}.tmp && "
+             f"mv {ASSIGNMENTS_FILE}.tmp {ASSIGNMENTS_FILE}"],
+            input=(json.dumps(load_assignments(), indent=2) + "\n").encode(),
+            capture_output=True, timeout=20)
+        (pushed if proc.returncode == 0 else failed).append(host)
+    return {"pushed": pushed, "failed": failed}
+
+
+def cmd_assign(args):
+    """Deterministic home assignment: an account lives on ONE host. switch/rotate
+    refuse to activate it elsewhere (owner override: --force)."""
+    if not args.slug or not args.host:
+        raise AuthError(6, "assign needs a slug and a host (or --clear with a slug)")
+    a = load_assignments()
+    if args.clear:
+        a.pop(slug_for(args.slug), None)
+    else:
+        a[slug_for(args.slug)] = {"host": args.host,
+                                  "since": now_rfc3339_nanos(), "by": f"{HOSTNAME}/{os.environ.get('USER','agent')}"}
+    with fleet_lock():
+        save_assignments(a)
+    prop = push_assignments()
+    return {"assignments": a, "propagated": prop}
 
 
 def cmd_redeem(args):
@@ -1384,6 +1462,8 @@ def main(argv=None):
     p = sub.add_parser("switch", parents=[sub_parent], help="switch to a stored profile (capture-on-leave)")
     p.add_argument("slug", nargs="?", help="profile slug or account email from `list`")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="override the deterministic home assignment (owner)")
     p.set_defaults(func=cmd_switch)
 
     p = sub.add_parser("rotate", parents=[sub_parent], help="switch to the freshest profile — the rate-limit verb")
@@ -1453,6 +1533,14 @@ def main(argv=None):
     p.add_argument("slug", nargs="?", help="stored profile (default: the live account)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_redeem)
+
+    p = sub.add_parser("assign", parents=[sub_parent],
+                       help="assign an account its deterministic home host")
+    p.add_argument("slug", nargs="?")
+    p.add_argument("host", nargs="?")
+    p.add_argument("--clear", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_assign)
 
     p = sub.add_parser("refresh", parents=[sub_parent], help="renew tokens via the OAuth refresh grant")
     p.add_argument("slug", nargs="?", help="stored profile (default: the live account)")
