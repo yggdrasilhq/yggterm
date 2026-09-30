@@ -945,8 +945,11 @@ def usage_snapshot(record):
                 "reset_in_minutes": round(w.get("reset_after_seconds", 0) / 60)}
 
     pw, sw = window(rl.get("primary_window")), window(rl.get("secondary_window"))
-    banked = bool(pw and sw
-                  and (pw["used_percent"] or 0) < 100 and (sw["used_percent"] or 0) < 100)
+    # BANKED = OpenAI granted a rate-limit-reset credit that is still available
+    # (owner 2026-09-30: it is the credit, not window fullness — windows are
+    # the windows). Paid plans only; free accounts have no reset credits.
+    gift = ((payload.get("rate_limit_reset_credits") or {}).get("available_count")) or 0
+    banked = gift > 0 and (payload.get("plan_type") or "") not in ("", "free")
     return {"ok": True,
             "email": payload.get("email"),
             "plan_type": payload.get("plan_type"),
@@ -955,7 +958,46 @@ def usage_snapshot(record):
             "primary": pw,
             "secondary": sw,
             "banked": banked,
-            "banked_weekly_left": round(max(0, 100 - ((sw or {}).get("used_percent") or 0)))}
+            "banked_weekly_left": round(max(0, 100 - ((sw or {}).get("used_percent") or 0))),
+            "reset_credits": payload.get("rate_limit_reset_credits")}
+
+
+def cmd_redeem(args):
+    """Redeem the account's banked rate-limit-reset credit (fresh weekly + 5h).
+    The same action as llmproxy's web "use reset" button — explicit call only."""
+    harness = require_harness(args.harness)
+    live_path = HARNESSES[harness]["auth_file"](harness)
+    if args.slug:
+        slug = slug_for(args.slug)
+        path = os.path.join(store_dir(harness), f"{slug}.json")
+        if not os.path.exists(path):
+            raise AuthError(6, f"no stored profile {slug!r} for {harness}")
+        record = read_json(path)
+    elif os.path.exists(live_path):
+        record = live_record(harness, required=True)
+    else:
+        raise AuthError(6, "no live record; pass a slug")
+    tokens = record.get("tokens") or record
+    headers = {"Authorization": "Bearer " + tokens["access_token"],
+               "ChatGPT-Account-Id": tokens.get("account_id", ""),
+               "User-Agent": CODEX_USER_AGENT, "Content-Type": "application/json"}
+    base = "https://chatgpt.com/backend-api"
+    req = urllib.request.Request(base + "/codex/rate-limit-reset-credits?client_version=1.2.0",
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        credits = [c for c in json.loads(resp.read().decode()).get("credits", [])
+                   if c.get("status") == "available"]
+    if not credits:
+        return {"redeemed": False, "reason": "no available reset credit",
+                "slug": args.slug or "(live)"}
+    req = urllib.request.Request(
+        base + "/codex/rate-limit-reset-credits/consume?client_version=1.2.0",
+        data=json.dumps({"redeem_request_id": credits[0]["id"]}).encode(),
+        headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        out = json.loads(resp.read().decode())
+    return {"redeemed": out.get("code") == "reset",
+            "credit": out.get("credit", {}), "slug": args.slug or "(live)"}
 
 
 def cmd_usage(args):
@@ -1406,6 +1448,12 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_usage)
 
+    p = sub.add_parser("redeem", parents=[sub_parent],
+                       help="redeem the account's banked rate-limit-reset credit")
+    p.add_argument("slug", nargs="?", help="stored profile (default: the live account)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_redeem)
+
     p = sub.add_parser("refresh", parents=[sub_parent], help="renew tokens via the OAuth refresh grant")
     p.add_argument("slug", nargs="?", help="stored profile (default: the live account)")
     p.add_argument("--force", action="store_true",
@@ -1478,6 +1526,8 @@ def main(argv=None):
                     flag = f"⭐ BANKED {u.get('banked_weekly_left', 0)}%"
                 elif (u.get("secondary") or {}).get("used_percent", 0) >= 100:
                     flag = "⏳ WALLED"
+                elif u.get("banked"):
+                    flag = "\U0001F381 BANKED RESET"
                 else:
                     flag = "ok"
                 print(f"  {name:<44} {u['plan_type']:<6} {flag:<8} {w(pri)} | {w(sec)}")
