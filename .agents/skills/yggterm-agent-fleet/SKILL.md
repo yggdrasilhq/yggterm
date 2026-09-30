@@ -1328,6 +1328,13 @@ The owner keeps multiple paid subscriptions per harness so the fleet can
 rotate; `ygg-auth.py` makes rotation a verb instead of a human hand-editing
 `~/.codex/auth.json`. THE rate-limit remedy: when a harness walls you on
 usage, rotate to another account and keep working.
+**Deterministic homes (owner law 2026-09-30):** every account has ONE home
+host (`ygg-auth.py assign <slug> <host>`, fleet-propagated to
+`~/.yggterm/auth/.assignments.json`); `switch`/`rotate` refuse to activate
+an account off its home (`--force` = owner override), and switching away
+refreshes the outgoing grant first so the captured copy never holds a
+consumed token. This is what killed accounts before: rotating refresh
+tokens + ad-hoc cross-host lives = grants invalidated under each other.
 
 ```
 python3 .agents/skills/yggterm-agent-fleet/ygg-auth.py status                  # live identity + every profile
