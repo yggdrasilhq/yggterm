@@ -127,10 +127,13 @@ HOSTNAME = socket.gethostname()
 FLEET_HOSTS_FILE = os.path.join(STORE_ROOT, ".fleet-hosts")
 SSH_DESTS_FILE = os.path.join(STORE_ROOT, ".ssh-dests.json")
 PROVENANCE_FILE = os.path.join(STORE_ROOT, ".provenance")
-LITELLM_VIA_HOST = "manin"
-LITELLM_CONTAINER = "litellm"
+# llmproxy era (2026-09-30): the `litellm` lxc guest is decommissioned; the
+# LITELLM_* names survive as the deprecated alias for the llmproxy guest.
+LLMPROXY_SSH_HOST = "llmproxy"   # direct ssh target (wired where the owner uses it)
+LITELLM_VIA_HOST = "manin"       # fallback jump: lxc-attach into the llmproxy guest
+LITELLM_CONTAINER = "llmproxy"
 LITELLM_TOKEN_DIR = "/root/chatgpt_tokens"
-LITELLM_CONTAINER_NAME = "root-litellm-1"
+LLMPROXY_SERVICE = "llmproxy.service"
 
 CHATGPT_AUTH_BASE = "https://auth.openai.com"
 CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -519,10 +522,15 @@ def rotate_score(p, measure=True):
     except (OSError, ValueError):
         snap = {"ok": False, "error": "unreadable"}
     if snap.get("ok"):
-        pri = snap.get("primary") or {}
-        used = pri.get("used_percent")
-        tier = 1 if snap.get("limit_reached") else 0
-        return (tier, 100 - (used if isinstance(used, (int, float)) else 100), p["slug"])
+        def free(w):
+            used = (w or {}).get("used_percent")
+            return 100 - (used if isinstance(used, (int, float)) else 100)
+        pri, sec = snap.get("primary"), snap.get("secondary")
+        # the binding constraint is the TIGHTER window: a full weekly bank
+        # walls the account even when its 5h window is untouched (and vice versa)
+        headroom = min(free(pri), free(sec)) if (pri or sec) else free(pri)
+        tier = 1 if (snap.get("limit_reached") or headroom <= 0) else 0
+        return (tier, headroom, p["slug"])
     if p["expired"]:
         return (2, 0, p["slug"])  # dead access: measurable only after activation
     return (3, 0, p["slug"])
@@ -936,13 +944,18 @@ def usage_snapshot(record):
                 "reset_at": w.get("reset_at"),
                 "reset_in_minutes": round(w.get("reset_after_seconds", 0) / 60)}
 
+    pw, sw = window(rl.get("primary_window")), window(rl.get("secondary_window"))
+    banked = bool(pw and sw
+                  and (pw["used_percent"] or 0) < 100 and (sw["used_percent"] or 0) < 100)
     return {"ok": True,
             "email": payload.get("email"),
             "plan_type": payload.get("plan_type"),
             "limit_reached": bool(rl.get("limit_reached")),
             "allowed": bool(rl.get("allowed")),
-            "primary": window(rl.get("primary_window")),
-            "secondary": window(rl.get("secondary_window"))}
+            "primary": pw,
+            "secondary": sw,
+            "banked": banked,
+            "banked_weekly_left": round(max(0, 100 - ((sw or {}).get("used_percent") or 0)))}
 
 
 def cmd_usage(args):
@@ -1122,6 +1135,16 @@ def cmd_provenance(args):
 
 
 def _litellm_ssh(cmd_argv, stdin_bytes=None, timeout=30):
+    """llmproxy transport: direct `ssh llmproxy` first (the wired path), then
+    the manin jump with lxc-attach for hosts without the direct config."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", LLMPROXY_SSH_HOST,
+           cmd_argv]
+    try:
+        proc = subprocess.run(cmd, input=stdin_bytes, capture_output=True, timeout=timeout)
+        if proc.returncode == 0:
+            return proc
+    except subprocess.TimeoutExpired:
+        proc = None
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", LITELLM_VIA_HOST,
            f"lxc-attach -n {LITELLM_CONTAINER} -- {cmd_argv}"]
     try:
@@ -1206,15 +1229,15 @@ def cmd_litellm_switch(args):
         err = writer.stderr.decode("utf-8", "replace").strip()[:160] if writer else "timed out"
         raise AuthError(5, f"writing litellm auth.json failed: {err}")
     snap = _litellm_ssh(f"sh -c 'cp {LITELLM_TOKEN_DIR}/auth.json {LITELLM_TOKEN_DIR}/auth_{slug}.json'")
-    restart = _litellm_ssh(f"docker restart {LITELLM_CONTAINER_NAME}", timeout=60)
+    restart = _litellm_ssh(f"systemctl restart {LLMPROXY_SERVICE}", timeout=60)
     if restart is None or restart.returncode != 0:
-        raise AuthError(5, "litellm auth written but the container restart failed — check docker on "
-                           f"{LITELLM_VIA_HOST}")
+        raise AuthError(5, "llmproxy auth written but the service restart failed — check "
+                           f"{LLMPROXY_SERVICE} on {LLMPROXY_SSH_HOST}")
     healthy = False
     for _ in range(6):
         time.sleep(2)
         probe = _litellm_ssh("python3 -c \"import urllib.request;print(urllib.request.urlopen("
-                             "'http://127.0.0.1:4000/health/liveliness',timeout=5).status)\"",
+                             "'http://127.0.0.1:4000/health',timeout=5).status)\"",
                              timeout=20)
         if probe is not None and probe.returncode == 0 and b"200" in probe.stdout:
             healthy = True
@@ -1449,7 +1472,14 @@ def main(argv=None):
                         return "—"
                     length = f"{x['window_minutes']}m-window"
                     return f"{length}: {x['used_percent']}% used, resets ~{x['reset_in_minutes']}m"
-                flag = "⛔ LIMIT" if u["limit_reached"] else "ok"
+                if u.get("limit_reached"):
+                    flag = "⛔ LIMIT"
+                elif u.get("banked"):
+                    flag = f"⭐ BANKED {u.get('banked_weekly_left', 0)}%"
+                elif (u.get("secondary") or {}).get("used_percent", 0) >= 100:
+                    flag = "⏳ WALLED"
+                else:
+                    flag = "ok"
                 print(f"  {name:<44} {u['plan_type']:<6} {flag:<8} {w(pri)} | {w(sec)}")
         elif args.verb == "refresh":
             print(f"🔄 refreshed {out['refreshed']}; persisted to {out['persisted']}")
