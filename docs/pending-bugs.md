@@ -32436,3 +32436,36 @@ behind — and the daemon lock_holder for focus_live ≤ ~30 ms.
 
 INSTRUMENT ALREADY LANDED (471b66ac, GUI plane): remove_session_stage
 redirect_sync_done {ms, ran} names the leg on every close.
+
+## [11.219] THE REBIND'S STORE VOUCH READ THE MACHINE'S REAL HOME — `a_rebound_agy_row_restores_as_the_resume_its_conversation_names` RED ON ANY HOST WITH A REAL ANTIGRAVITY STORE, GREEN EVERYWHERE ELSE (measured on dev 2026-10-03, the [11.165] family)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+The server-lib suite on clean main 627b93eb ran 1654/1 on dev — the single red
+the agy rebind test — while the same test passed under an empty `HOME`
+(measured both directions the same minute). ROOT CAUSE: the rebind's
+birth-command rebuild
+(`apply_agent_runtime_session_id_to_live_session_with_vouch` →
+`stored_session_launch_command_for_locality_with_options_and_identity`)
+vouched the minted conversation id through the UNSEAMED
+`local_agent_store_vouches_for_session` (`dirs::home_dir()` at call time), so
+the test's `rooted_at` fixture store was never consulted; on dev — which now
+holds a real `~/.gemini/antigravity-cli` from the fleet's agy rows — the
+fixture id vouches `Some(false)` and the rebind rebuilds a FRESH command (no
+`--conversation`), the exact class the code's own comment at the fail-open
+predicate warned about (restored-opencode twin, 2026-09-26). It also opened
+the DECLARED env window: an unseamed home read can land inside a mutator
+test's flipped `HOME`.
+
+FIXED (lane/integration/agy-rebind-home-seam): the locality builder gained the
+`_in` twin (`stored_session_launch_command_for_locality_with_options_and_identity_in`)
+taking an explicit home — `None` keeps the process home byte-identically for
+every other caller — and the rebind site passes the server's birth-resolved
+`user_home`, the same fifth-pass law every other server site already follows.
+Suite on the lane: 1651/0 (3 ignored) UNDER THE REAL STORE — green where main
+is red. LIVE PROOF (deployed build): the suite stays green on a host holding
+a real antigravity store (dev IS that host — ci's next main run is the
+witness); no runtime behavior change ships (production `user_home` ==
+`dirs::home_dir()` at birth, and the only divergence window is the DECLARED
+cross-talk the seam closes). Filed by the [11.168] legs (c)+(d) sitting
+(board plan ACK-7f409ffaf2).
