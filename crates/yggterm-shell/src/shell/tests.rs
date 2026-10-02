@@ -22685,6 +22685,56 @@ console.log('ok');
     }
 
     #[test]
+    fn terminal_mount_liveness_poll_locks_the_c2_shapes() {
+        // [11.178]-c2: the gate polls the mount's own liveness record via
+        // the eval RETURN — the one delivery path measured alive while the
+        // GUI main loop sheds script-message IPC during spawn churn. The
+        // poll must cross the bridge with a top-level return, tie the
+        // record to the dispatched attempt, and re-trigger the ready
+        // re-post ONLY for a fully "posted" mount (an early-stage re-send
+        // would lie about readiness).
+        let poll = terminal_mount_liveness_poll_script("yggterm-terminal-test");
+        assert!(
+            poll.trim_start().starts_with("const __h = "),
+            "the poll reads page state before returning"
+        );
+        assert!(poll.contains("return JSON.stringify("));
+        assert!(!poll.trim_start().starts_with("("), "an IIFE poll answers null on the live bridge");
+        assert!(poll.contains("window.__yggtermMountAlive"));
+        assert!(poll.contains("__yggtermMountDispatchedAttempt"));
+        assert!(poll.contains("window.__yggtermMountResend"));
+        assert!(poll.contains("__r.stage === \"posted\""));
+
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let cold = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // The fn advances the record at every guarded stage...
+        for stage in ["entry", "host_ready", "pre_construct", "posted"] {
+            assert!(
+                cold.contains(&format!("__yggNoteMountAlive(\"{stage}\")")),
+                "mount body must stamp the {stage} liveness stage"
+            );
+        }
+        // ...installs the resend arm on the success tail...
+        assert!(cold.contains("window.__yggtermMountResend = (h) =>"));
+        // ...and both invoke wrappers stamp the dispatched attempt so the
+        // poll can tie the record to THIS dispatch.
+        let stamp = "window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;";
+        assert_eq!(cold.matches(stamp).count(), 1);
+        let params = terminal_mount_params_json(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            false,
+            "test_reason",
+            false,
+            ("\x1b[A", "\x1b[B", 0),
+            None,
+        );
+        let warm = terminal_mount_warm_eval_script(&params);
+        assert_eq!(warm.matches(stamp).count(), 1);
+    }
+
+    #[test]
     fn env_value_truthy_accepts_expected_opt_in_values() {
         for value in ["1", "true", "yes", "on", " TRUE "] {
             assert!(env_value_truthy(value), "{value:?} should opt in");

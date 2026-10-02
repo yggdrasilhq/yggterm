@@ -521,6 +521,37 @@ mount, re-request state, do NOT remount). Receipt-based liveness on the
 one path that delivers; the remount-storm reduction ([11.215]) remains the
 load-bearing companion.
 
+GATE-C2 LANDED (2026-10-03 ~02:35-03:1x IST, lane/uxspeed/warmmount-eval-liveness,
+zcode on jojo, work FROM dev; claim ACK-3887477f63): the entry's c2 arm — mount
+liveness POLLED VIA EVAL RETURNS. The mount fn (TERMINAL_MOUNT_FN_VERSION 2→3)
+advances a page-side record `window.__yggtermMountAlive[host] = {attempt, stage,
+pageTs}` at every guarded stage (entry / host_ready / pre_construct / posted) and
+installs `window.__yggtermMountResend(host)` on the success tail; both invoke
+wrappers (warm + cold installer) stamp `window.__yggtermMountDispatchedAttempt`.
+The gate no longer convicts on a draining pipeline alone: when the pipeline probe
+answers with the mount still bridge-silent, it polls that record VIA THE EVAL
+RETURN (terminal_mount_liveness_poll_script) — matched-and-posted re-triggers the
+page-side ready re-post (idempotent under the js_ready duplicate guard) and KEEPS
+the warm mount on a 500 ms re-poll cadence; only a record that is ABSENT/stale
+(decision unchanged `pipeline_alive_eval_lost`) or the 8 s cap (decision
+`alive_at_cap`, new) redoes cold. New trace events:
+`warm_eval_mount_alive_events_shed` {stage, attempt, dispatched} and
+`warm_eval_liveness_absent`. RIG (Xvfb :78, debug, scratch home, uxprobe spawn
+×6): 0 liveness-absent convictions, 70 alive polls ALL stage=posted, the remount
+storm DEAD (1 warm dispatch per session vs ×23 cycles pre-fix; task drops
+2/session), 6/6 painted, redo only as the bounded fallback (2× alive_at_cap); the
+per-session timeline witnesses the re-request arm delivering the moment the shed
+window clears (js_ready_duplicate +40 ms after the withheld event train finally
+unblocks — a re-post landed). RESIDUAL (honest): on the debug rig the shed window
+measures ~6 s (heavier churn), so the rig's paint still rides the [11.176]
+recover ladder at +6.3 s; the sub-second warm spawn is bought where the window is
+the live-measured ~0.9 s — there the +1.2 s re-post should land and disarm the
+gate with no redo at all. LIVE PROOF OWED on the owner's next GUI rotation:
+warm_eval_mount_alive_events_shed with stage=posted, vanish_redo_cold ≈ 0 on
+spawn runs, spawn_to_paint not regressed vs the 1.5-3.3 s p50 baselines, 0
+permanent blanks. Shape locks: terminal_mount_liveness_poll_locks_the_c2_shapes;
+suite 2199/0.
+
 RIG RECIPE: /tmp/warmladder-rig.sh on dev (Xvfb :78; the readiness gate
 waits for a GUI CLIENT COUNT > 0 — a daemon answering is NOT a GUI
 attached: run2 raced this and every spawn failed "no client to drive");
