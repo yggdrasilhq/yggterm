@@ -192,7 +192,12 @@ fn terminal_grid_is_usable_cells(cols: u64, rows: u64) -> bool {
 /// serving a changed body would be a silent semantic drift.
 // [11.178] Bumped 2026-09-29: the invoke sites stamp __yggtermMountAttempt
 // and the body gained the attempt guard (entry / host_ready / pre_construct).
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 2;
+// [11.178]-c2 Bumped 2026-10-03: the body advances a page-side liveness
+// record (__yggtermMountAlive) at every guarded stage and installs the
+// __yggtermMountResend re-request arm at "posted" — the gate polls the
+// record via eval returns and keeps a live warm mount whose bridge events
+// were shed instead of redoing cold into the remount storm.
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 3;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -266,7 +271,7 @@ fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
     // guard instead of registering over the fresh mount (the stale closure
     // used to win the host last-writer-wins via its ownerToken).
     format!(
-        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
+        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
     )
 }
 
@@ -297,6 +302,31 @@ pub(crate) fn terminal_mount_pipeline_probe_script() -> String {
     // ⛔ [11.173] shape law: the eval bridge wraps every script in a
     // function body — a value crosses ONLY via a top-level `return`.
     "return 1 + 1;".to_string()
+}
+
+/// [11.178]-c2 The liveness poll for the adaptive warm-eval gate: reads the
+/// mount fn's page-side liveness record VIA THE EVAL RETURN — the delivery
+/// path measured alive while the GUI main loop sheds script-message IPC
+/// during spawn churn (the pipeline probe answers in ~10 ms while the
+/// mount's bridge posts never arrive). A record whose attempt matches the
+/// dispatched attempt proves the warm mount fn is RUNNING: its bridge
+/// events were shed, not the mount lost, so the poll re-triggers the
+/// page-side ready re-post and the gate keeps the warm mount. An absent or
+/// stale record means the mount eval never executed — redo cold.
+pub(crate) fn terminal_mount_liveness_poll_script(host_id: &str) -> String {
+    // ⛔ [11.173] shape law: the eval bridge wraps every script in a
+    // function body — a value crosses ONLY via a top-level `return`.
+    let host = serde_json::json!(host_id);
+    format!(
+        r#"const __h = {host};
+const __r = (window.__yggtermMountAlive || {{}})[__h] || null;
+const __d = window.__yggtermMountDispatchedAttempt;
+const __m = Boolean(__r && __d !== undefined && __r.attempt === __d);
+if (__m && __r.stage === "posted" && typeof window.__yggtermMountResend === "function") {{
+    try {{ window.__yggtermMountResend(__h); }} catch (_error) {{}}
+}}
+return JSON.stringify({{ record: __r, dispatched: __d === undefined ? null : __d, matched: __m }});"#
+    )
 }
 
 fn terminal_eval_script_with_canvas_renderer(
@@ -438,6 +468,27 @@ fn terminal_eval_script_with_canvas_renderer(
             sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=entry stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
             return;
         }}
+        // [11.178]-c2 LIVENESS RECORD. The fn advances this page-side record
+        // at every guarded stage; the warm-eval gate polls it VIA EVAL
+        // RETURNS — the one delivery path measured alive while the GUI main
+        // loop sheds script-message IPC during spawn churn. An advancing
+        // record means the mount is RUNNING and its bridge events were
+        // merely shed, so the gate keeps the warm mount instead of redoing
+        // cold into the remount storm.
+        const __yggNoteMountAlive = (stage) => {{
+            try {{
+                (window.__yggtermMountAlive =
+                    window.__yggtermMountAlive || {{}})[hostId] = {{
+                    attempt: __yggAttemptStamp,
+                    stage,
+                    pageTs:
+                        performance && performance.now
+                            ? performance.now()
+                            : Date.now(),
+                }};
+            }} catch (_error) {{}}
+        }};
+        __yggNoteMountAlive("entry");
 {trace_emitter_js}
 {frame_hash_probe_js}
 {terminal_frame_cache_js}
@@ -1084,6 +1135,7 @@ fn terminal_eval_script_with_canvas_renderer(
             sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=host_ready stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
             return;
         }}
+        __yggNoteMountAlive("host_ready");
         paintNoteHostReady();
         const ensureXtermAssets = async () => {{
             window.__yggtermXtermBootstrapError = null;
@@ -1424,6 +1476,7 @@ fn terminal_eval_script_with_canvas_renderer(
             sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=pre_construct stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
             return;
         }}
+        __yggNoteMountAlive("pre_construct");
         const initialMetrics = hostMetrics();
         sendTerminalEvent({{
             kind: "debug",
@@ -13049,6 +13102,16 @@ fn terminal_eval_script_with_canvas_renderer(
         scheduleResizeNudges();
         {constructed_debug}
         sendTerminalEvent({{ kind: "ready" }});
+        __yggNoteMountAlive("posted");
+        // [11.178]-c2 RE-REQUEST ARM. A "posted" mount whose ready event was
+        // shed in the IPC window never reaches Rust; the gate's liveness
+        // poll re-calls this to re-post ready until one lands. Rust's
+        // js_ready duplicate guard makes the re-send idempotent.
+        window.__yggtermMountResend = (h) => {{
+            if (h === hostId) {{
+                sendTerminalEvent({{ kind: "ready" }});
+            }}
+        }};
         while (true) {{
             const message = await recvTerminalCommand();
             if (!message) {{
@@ -13338,6 +13401,7 @@ fn terminal_eval_script_with_canvas_renderer(
         // prior attempt, so a late-resuming warm instance aborts at its entry
         // guard instead of fighting this one for the host.
         window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;
+        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;
         await window.__yggtermMountFn(window.__yggtermMountAttempt);
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,

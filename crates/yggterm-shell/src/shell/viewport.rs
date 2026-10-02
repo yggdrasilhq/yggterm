@@ -6865,6 +6865,19 @@ fn TerminalCanvas(
             let mut warm_probe_alive: Option<bool> = None;
             let mut warm_probe_count: u32 = 0;
             let mut saw_warm_bridge_event = false;
+            // [11.178]-c2 The mount-liveness poll's join future (same
+            // not-Send discipline as the pipeline probe) and its verdict.
+            // Some(true) = the fn's page-side liveness record matched the
+            // dispatched attempt: the mount is RUNNING and its bridge
+            // events were shed — keep the warm mount. Some(false) = the
+            // record is absent/stale: the mount eval never executed, the
+            // redo is justified.
+            let mut warm_alive_poll_eval: Option<
+                std::pin::Pin<
+                    Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
+                >,
+            > = None;
+            let mut warm_alive_matched: Option<bool> = None;
             // [11.187] The drop witness + the liveness heartbeat. The guard
             // lives for the loop's whole life; its Drop fires at task end
             // (normal or panic) and leaves a NAMED trace. The heartbeat is
@@ -11761,6 +11774,56 @@ fn TerminalCanvas(
                         );
                         warm_probe_eval = None;
                     }
+                    alive_answer = async {
+                        warm_alive_poll_eval
+                            .as_mut()
+                            .expect("alive poll armed")
+                            .await
+                    },
+                        if warm_alive_poll_eval.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "warm_alive_poll",
+                            &session_path,
+                        );
+                        // [11.178]-c2 The answer rides the eval-return path,
+                        // the one delivery leg measured alive while the GUI
+                        // main loop sheds script-message IPC. The poll script
+                        // already re-triggered the page-side ready re-post
+                        // when the record read "posted".
+                        let verdict = alive_answer
+                            .as_ref()
+                            .ok()
+                            .and_then(|value| value.as_str())
+                            .and_then(|body| serde_json::from_str::<Value>(body).ok());
+                        let record = verdict.as_ref().and_then(|payload| payload.get("record"));
+                        let matched = verdict
+                            .as_ref()
+                            .and_then(|payload| payload.get("matched"))
+                            .and_then(|flag| flag.as_bool())
+                            .unwrap_or(false);
+                        warm_alive_matched = Some(matched);
+                        warm_alive_poll_eval = None;
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            if matched {
+                                "warm_eval_mount_alive_events_shed"
+                            } else {
+                                "warm_eval_liveness_absent"
+                            },
+                            json!({
+                                "session_path": session_path.clone(),
+                                "host_id": host_id.clone(),
+                                "mount_epoch": mount_epoch,
+                                "stage": record.and_then(|r| r.get("stage")).cloned().unwrap_or(Value::Null),
+                                "attempt": record.and_then(|r| r.get("attempt")).cloned().unwrap_or(Value::Null),
+                                "dispatched": verdict.as_ref().and_then(|p| p.get("dispatched")).cloned().unwrap_or(Value::Null),
+                                "waited_ms": current_millis().saturating_sub(warm_gate_t0_ms),
+                            }),
+                        );
+                    }
                     _ = tokio::time::sleep_until(
                         warm_gate_deadline
                             .unwrap_or_else(tokio::time::Instant::now),
@@ -11791,7 +11854,14 @@ fn TerminalCanvas(
                         } else {
                             let waited = current_millis().saturating_sub(warm_gate_t0_ms);
                             let probe_says_alive = warm_probe_alive == Some(true);
-                            if probe_says_alive
+                            // [11.178]-c2 A draining pipeline alone no longer
+                            // convicts the eval: the mount's own liveness
+                            // record must read ABSENT first. MATCHED keeps
+                            // the warm mount below — its bridge events were
+                            // shed in the IPC window, and the poll re-posts
+                            // ready until one lands.
+                            let eval_lost = warm_alive_matched == Some(false);
+                            if eval_lost
                                 || waited >= TERMINAL_WARM_EVAL_MAX_WAIT_MS
                             {
                                 let Some(cold_script) = cold_fallback_script.take() else {
@@ -11808,8 +11878,10 @@ fn TerminalCanvas(
                                         "host_id": host_id.clone(),
                                         "mount_epoch": mount_epoch,
                                         "gate": "adaptive_probe",
-                                        "decision": if probe_says_alive {
+                                        "decision": if eval_lost {
                                             "pipeline_alive_eval_lost"
+                                        } else if probe_says_alive {
+                                            "alive_at_cap"
                                         } else {
                                             "stall_cap"
                                         },
@@ -11820,6 +11892,25 @@ fn TerminalCanvas(
                                 warm_gate_deadline = None;
                                 eval = terminal_document.eval(cold_script);
                                 eval_result = Box::pin(eval.clone().join::<Value>());
+                            } else if probe_says_alive {
+                                // Pipeline drains, mount bridge-silent: ask
+                                // the MOUNT (not the pipeline) whether it
+                                // ran — via the eval return, the one leg
+                                // that delivers during the shed window.
+                                if warm_alive_poll_eval.is_none() {
+                                    warm_alive_poll_eval = Some(Box::pin(
+                                        document::eval(
+                                            &terminal_mount_liveness_poll_script(&host_id),
+                                        )
+                                        .join::<Value>(),
+                                    ));
+                                }
+                                warm_gate_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_millis(
+                                            TERMINAL_WARM_EVAL_STALL_REPROBE_MS,
+                                        ),
+                                );
                             } else {
                                 append_trace_event(
                                     &trace_home,
