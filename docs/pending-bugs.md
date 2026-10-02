@@ -31901,6 +31901,29 @@ daemon should stamp the runtime with it, covering the peer-side managed spawn
 profile like the theme-change path; (c) frontend `onColor` answer as backstop
 for non-daemon-rendered paths; (d) OSC 4 slots 16-255 are never answered.
 
+LEG (d) CLOSED IN CODE 2026-10-03 (lane/trace/11168-osc256 3a7b08cc, zcode on
+jojo work FROM dev): the parser's `slot > 15` refusal meant a 16-255 query
+PASSED THROUGH to the webview — normal-buffer rows got NO answer at all (the
+mount script's gated fallback answers only on alternate buffer / hot frame),
+and alternate-buffer answers came from the VIEWING CLIENT's computed palette
+rather than the row's own identity (this entry's flip class). The daemon now
+answers slots 16-231 (6x6x6 cube) and 232-255 (grey ramp) from the static
+xterm-256 table — theme-independent values every terminal answers — while
+0-15 stay the row's embedded identity exports and slots >255 still pass
+through unanswered. Tests lock exact cube/grey values, mixed low+high slot
+queries, and the out-of-range pass-through. LEG (c) DISPOSITION (scoped, no
+new code): the backstop the original plan asked for ALREADY EXISTS — the
+bundled xterm.js `_handleColorEvent` auto-answers OSC 10/11/4 queries from
+the live theme, and the mount script gates that fallback
+(`registerOscHandler` 4/10/11 + `terminalDataIsSuppressedProtocolResponse`
+allow it on alternate/hot, suppress it on a cold normal buffer); with (d)
+answered daemon-side, the cold normal-buffer residue for OSC 4 is closed, and
+OSC 10/11 were always daemon-answered for daemon-read rows. No remaining
+frontend gap identified for daemon-read rows; (a)/(b) stay owner-gated on the
+[11.145] re-stamp GO. Falsifier for (d) on the deployed build: a CLI querying
+`ESC]4;196;?` on a NORMAL-buffer row receives `rgb:ffff/0000/0000` in-band
+(trace `protocol_color_response_sent` carrying `4:196`), not silence.
+
 FUNNEL-CARRY LEG LANDED IN CODE 2026-09-26 (lane/trace/11168-funnel-carry
 69afca26, worked on the muse lab host while the build host was offline —
 deploy + live proof owed when it returns; ygg-ci subscription owed too):

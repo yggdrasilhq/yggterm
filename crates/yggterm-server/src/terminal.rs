@@ -60,6 +60,32 @@ const OSC_PALETTE_CODE: u16 = 4;
 const OSC_COLOR_FOREGROUND_CODE: u16 = 10;
 const OSC_COLOR_BACKGROUND_CODE: u16 = 11;
 
+/// Slots 16-255 of the xterm 256-color palette: the 6x6x6 cube (16-231) and
+/// the 24-step grey ramp (232-255). These slots are theme-independent -- a
+/// terminal theme recolors 0-15 only -- so every terminal answers them with
+/// these same values. Answering them daemon-side keeps a row's palette
+/// coherent with its own identity exports instead of whichever client last
+/// viewed it; before this, the parser refused the slot, the query passed
+/// through to the webview, and normal-buffer rows got no answer at all.
+fn xterm_256_color(slot: u16) -> Option<(u8, u8, u8)> {
+    match slot {
+        16..=231 => {
+            let index = usize::from(slot - 16);
+            const LEVELS: [u8; 6] = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+            Some((
+                LEVELS[(index / 36) % 6],
+                LEVELS[(index / 6) % 6],
+                LEVELS[index % 6],
+            ))
+        }
+        232..=255 => {
+            let component = 8 + 10 * u16::from(slot - 232);
+            u8::try_from(component).ok().map(|value| (value, value, value))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
     pub seq: u64,
@@ -280,7 +306,10 @@ impl TerminalProtocolProfile {
         let color = match query.code {
             OSC_COLOR_FOREGROUND_CODE => self.foreground,
             OSC_COLOR_BACKGROUND_CODE => self.background,
-            OSC_PALETTE_CODE => *self.palette.get(usize::from(query.slot))?,
+            OSC_PALETTE_CODE => match self.palette.get(usize::from(query.slot)) {
+                Some(color) => *color,
+                None => xterm_256_color(query.slot)?,
+            },
             _ => return None,
         };
         let response_slot = if query.code == OSC_PALETTE_CODE {
@@ -621,7 +650,7 @@ fn parse_osc_color_query_content(content: &str) -> Option<Vec<TerminalProtocolCo
             return None;
         }
         let slot = slot_value.parse::<u16>().ok()?;
-        if slot > 15 {
+        if slot > 255 {
             return None;
         }
         queries.push(TerminalProtocolColorQuery {
@@ -7374,6 +7403,89 @@ line-two on the real screen\r\n\
                 .collect::<Vec<_>>(),
             vec!["4:0".to_string(), "4:1".to_string(), "4:15".to_string()]
         );
+    }
+
+    #[test]
+    fn xterm_256_palette_table_matches_the_terminal_constants() {
+        // Theme slots are not this table's business.
+        assert_eq!(xterm_256_color(0), None);
+        assert_eq!(xterm_256_color(15), None);
+        // Cube corners and steps: 16 is black, 21 blue, 46 green, 196 red,
+        // 231 white; the 16-level ramp is [00,5f,87,af,d7,ff].
+        assert_eq!(xterm_256_color(16), Some((0x00, 0x00, 0x00)));
+        assert_eq!(xterm_256_color(21), Some((0x00, 0x00, 0xff)));
+        assert_eq!(xterm_256_color(46), Some((0x00, 0xff, 0x00)));
+        assert_eq!(xterm_256_color(196), Some((0xff, 0x00, 0x00)));
+        assert_eq!(xterm_256_color(231), Some((0xff, 0xff, 0xff)));
+        // Grey ramp: 232 = 8, +10 per step, 250 = 188, 255 = 238.
+        assert_eq!(xterm_256_color(232), Some((8, 8, 8)));
+        assert_eq!(xterm_256_color(250), Some((188, 188, 188)));
+        assert_eq!(xterm_256_color(255), Some((238, 238, 238)));
+        assert_eq!(xterm_256_color(256), None);
+    }
+
+    #[test]
+    fn terminal_protocol_filter_answers_high_palette_slots_from_the_static_table() {
+        let profile = test_protocol_profile(
+            "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
+        );
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process("pre\u{1b}]4;16;?;196;?;250;?\u{1b}\\post", profile);
+
+        assert_eq!(result.data, "prepost");
+        assert_eq!(
+            result.responses,
+            vec![
+                "\u{1b}]4;16;rgb:0000/0000/0000\u{1b}\\".to_string(),
+                "\u{1b}]4;196;rgb:ffff/0000/0000\u{1b}\\".to_string(),
+                "\u{1b}]4;250;rgb:bcbc/bcbc/bcbc\u{1b}\\".to_string(),
+            ]
+        );
+        assert_eq!(
+            result
+                .answered_queries
+                .iter()
+                .map(|query| query.label())
+                .collect::<Vec<_>>(),
+            vec!["4:16".to_string(), "4:196".to_string(), "4:250".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_protocol_filter_answers_mixed_low_and_high_palette_slots() {
+        let profile = test_protocol_profile(
+            "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
+        );
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process("\u{1b}]4;1;?;250;?\u{1b}\\", profile);
+
+        // Slot 1 keeps answering from the row's identity palette; 250 rides
+        // the static table. One query, one coherent source pair.
+        assert_eq!(
+            result.responses,
+            vec![
+                "\u{1b}]4;1;rgb:cdcd/3131/3131\u{1b}\\".to_string(),
+                "\u{1b}]4;250;rgb:bcbc/bcbc/bcbc\u{1b}\\".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_protocol_filter_passes_through_out_of_range_palette_slots() {
+        let profile = test_protocol_profile(
+            "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
+        );
+        let mut filter = TerminalProtocolFilter::default();
+
+        let query = "\u{1b}]4;300;?\u{1b}\\";
+        let result = filter.process(query, profile);
+
+        // A slot beyond 255 is not a palette query this filter understands;
+        // it flows to the renderer untouched and nothing is answered.
+        assert_eq!(result.data, query);
+        assert!(result.responses.is_empty());
     }
     #[test]
     fn terminal_protocol_profile_uses_synced_theme_colors_from_launch_command() {
