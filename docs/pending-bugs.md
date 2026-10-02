@@ -77,7 +77,16 @@ deploy rotates the daemon mid-hunt and invalidates the run).
 
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Merged 8bd618a2 2026-09-29 21:50 IST: the VISIBLE-tier widening of the
+bootstrap predicate (terminal_session_should_bootstrap_host) via
+session_is_visible_split_pane, + law test + uxprobe per-member
+content/render_span asserts. The docs flip was owed then and is paid
+here — the seat posted no outcome. The observation that would falsify
+it: on the owner live GUI, a split create shows BOTH panes reflowed and
+painted (both members render_span within ~2 frames, the pre-split
+content marker visible in both panes, 5/5, 0 rows behind).
 
 Filed 2026-09-29 by zcode sess_16f52090-3bc4-42c4-8c4c-597ffe928092 on jojo,
 work FROM dev; claim ACK-2785828b63. The accuracy twin of the [11.215]/[11.216]
@@ -243,6 +252,41 @@ the documented sibling-storm pattern, not a regression. NEXT LEVER (GUI
 shell): short-circuit the mount chain when `mount_epoch_reused` and the
 surface is live — the split restructure should re-parent + fit, not remount.
 
+
+UPDATE 3 2026-10-03 ~01:4x-02:5x IST (epoch-reuse-remount-skip takeover, claim
+ACK-ab23022682; zcode on jojo, work FROM dev): THE NAMED LEVER LANDED IN CODE
+(lane/uxspeed/epoch-reuse-remount-skip e313f97c + 4c9c2323) — the RE-PARENT
+RAISE, a third arm between the reveal raise and the lease. Measured first on
+a dev Xvfb split rig (3 rows x 3 creates): every reveal_raise_refused on the
+split path carries has_host_epoch=true, transport_degraded=false,
+was_ever_ready=FALSE — the ready-history latch lags the split members, the
+reveal gate refused exactly there, and both panes paid the full remount. The
+new arm: state gate (fresh [11.187] heartbeat REQUIRED — silent loops refuse;
+no latched failure/Recovering; [11.179] remote proof; not degraded; NO
+ready-history requirement — the page registry is the canvas witness) -> an
+async page probe on __yggtermXtermHosts[host_id]: a live entry with a
+complete term whose element is OUTSIDE the re-created connected host (husk
+guard: .xterm-screen must exist) -> ONE entry.redrawTerminal re-parents the
+live element into the fresh node and fits (the SSOT re-attach primitive, no
+second spelling), focus handed per active member, open attempt latched Ready
+(reparent_retained_host), trace reparent_served — no mount eval, no ensure,
+NO new lease/owner so the owning read loop keeps pumping. Probe verdicts
+split transient (3 = host not yet in DOM, retried 10x50ms) from final
+(0 = no entry — a first mount must not pay the retry budget; 1 = already
+in host — the reveal class). A REFUSED key stands down for the bootstrap
+(the probe latch doubles as refusal memory) — the first rig run of this very
+fix deadlocked both panes unmounted without that handoff (host_missing x2),
+found and fixed by the rig in the same sitting. Rig A/B after: exactly ONE
+bootstrap per split create (was 5-9 storm), suite 2198/0 (also fixed 4
+pre-existing stale-test reds on 22c0a202: the [11.178] warm-eval/version
+needles, the [11.204] liveness_done witness, the paint self-test harnesses
+null host vs host.getAttribute). STILL OWED: the SERVE falsifier — the rig's
+timing was bimodal (early splits bump the epoch -> no entry by construction;
+late splits reveal-serve via the CSS flip), so no reparent_served has been
+observed live yet. Falsifier: on a live release rotation, a split create in
+the reused-epoch window emits reparent_served with commit_to_pane_paint_ms
+within ~2 frames of the DOM stamp, 5/5 accuracy, 0 rows behind, no
+warm_eval_vanish_redo_cold on the reused path — or the refusing arm named.
 
 ## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN at the WebKitGTK layer — spawn cost FIXED IN CODE by the warm-eval liveness gate; rig recipe + dispatch-stamp recipe included)
 
@@ -32088,61 +32132,6 @@ Repro (original filing, kept): dev store has conversation `c70b6a9c-…` (db row
 Second half, same seam: when the dev-side twin record DOES exist, its `.id` (the real conversation) is IGNORED at recompose — the compose uses the request's session_id (the row uuid), so a held twin resumes by row id and agy fabricates a fresh conversation under it (peer-side [11.165] gate is skipped by `live_runtime_held` by design).
 
 Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the key the ensure just wrote (the alias seam — `local_runtime_id_from_key` → `local_live_runtime_key` vs `remote_runtime_agent_session_key` spellings), add the missing-record healing arm for agent runtimes (recompose spec from the descriptor + STORE-conversation id when the twin carries one), and add a repro test: ensure-then-terminal-ensure for a remote agent row with no pre-existing record.
-
-## ⛔ [11.199] UXPROBE SWITCH+SPLIT ACTIONS BLIND ON CURRENT BUILDS: SCRATCH-ROW NODES VIRTUALIZED OUT OF THE SIDEBAR — CLICKS MISS, MENUS NEVER OPEN, SPLIT REFUSES None ×3, AND ONE POINTER/EVAL VERB BLOCKED 972895 ms WHILE THE CLI FLOOR STAYED 58-74 ms (measured 2026-09-29 ~01:18-01:40 IST, post-wedge-ladder lane, live jojo desktop, GUI ff5630c299, claim ACK-e14828a759)
-
-**Status:** OPEN
-
-Filed 2026-09-29 by the ux-speed post-wedge-ladder lane (zcode
-sess_8add2320 on jojo, work FROM dev). The re-baseline battery ran
-spawn/menu/modal/drag CLEAN (see the campaign door's refreshed
-§BASELINES — spawn p50 2.2 s verb→content, modal pair 23-42 ms, all
-accuracy 0) but TWO driver actions that were LIVE-PROVEN on 2026-09-27
-(split pair p50 1 ms on 13d5bf59bd76; switch 8/8 paint ends on
-58999b0b) now cannot complete:
-
-- `switch`: 0 iterations, error "row nodes not rendered (virtualized
-  out?)" — ensure_two_scratch_rows' rows are not reachable in the
-  sidebar DOM on a 423-row virtualized sidebar. The raise-memo-fix
-  seat's independent switch attempts the same night also produced no
-  report (switch-report3.json never written), corroborating.
-- `split`: 3/3 "split refused: None" with menu_open_ms null — the
-  right-click never produced an observable menu, consistent with the
-  click landing on nothing (virtualized-out row) — and iteration 1's
-  menu-open verb BLOCKED for 972895 ms (16.2 minutes) while the probe's
-  own CLI floor stayed 58-74 ms: a single app-control call held
-  seconds-class while the plane it rides answered pings normally
-  throughout. Same block class as the known `rows --json` wedge under
-  probe+perf load (drag-begin-cold side finding 2026-09-27,
-  corroborated twice this night at >45 s).
-
-Not a probe-staging artifact: the staged driver is origin/main's own
-(77b3c2a2 lineage). The suspects are the sidebar virtualization window
-(row count grew; fresh bottom-anchored scratch rows land outside the
-rendered window and the driver never scrolls them into view) plus the
-app-control verb that can hold a lock minutes-class independent of the
-CLI round-trip floor.
-
-FIX SHAPE: the driver needs scroll-into-view (or row-path-anchored
-scroll) before every node-touching step, and a wall-clock bound +
-honest-null on every verb so one blocked call cannot cost a 16-minute
-iteration. The app-control 16-minute hold wants its own attribution
-(trace the blocked verb; ytrace has no app_control request span for
-it — an instrument gap in itself).
-
-Falsifier: uxprobe switch reports >=7/8 paint ends and split reports a
-non-null create pair on a fresh scratch pair, on a rotated build, with
-no iteration wall exceeding its own verb budget.
-
-> AMENDMENT (2026-09-29 ~01:55, same lane): the raise-memo-falsifier
-> seat's switch runs DID serve on 4aa6d5bd's GUI 2285010 the same hour
-> (7 serving raises measured, door close ~01:50) — the blind class is
-> therefore INTERMITTENT or ff5630c299-specific, not build-universal.
-> The falsifier for this entry must reproduce the class first (spawn a
-> fresh bottom-anchored scratch pair on a 423+-row sidebar, try the
-> click, and only then score the action) and the 16-minute verb block
-> is unconditional-to-file regardless: one app-control call must never
-> hold minutes-class while the CLI floor answers pings.
 
 ## [11.208]-uxspeed — the post-close main-thread work burst: every GUI-served verb stalls ~1.3-1.8 s after an ACTIVE row close
 

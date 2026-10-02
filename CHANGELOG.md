@@ -2,6 +2,11 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## [11.215] a split create re-parents a still-live surface instead of re-mounting it
+
+- **A split create no longer re-mounts a still-live terminal surface whose pane element was re-created — the re-parent raise.** The pane embedding re-creates the member's host element while the mount epoch is reused, and the reveal raise refused exactly there (measured: every split-path refusal carried was_ever_ready=false), so both panes paid the full mount pipeline on a live surface (warm eval -> vanish -> cold redo, first paint ~1.05 s behind a ~130 ms DOM stamp). A third raise arm now asks the page: when the xterm host registry still holds a LIVE term for this exact host id whose element is merely outside the re-created node, ONE redraw re-parents the live element into the fresh node and fits — no mount eval, no ensure, and no new lease/owner, so the owning read loop keeps pumping instead of being superseded. A refused probe stands down for the normal bootstrap (key-guarded handoff — the rig caught the first version of this very arm deadlocking both panes unmounted); split-create mount count per create measured 5-9 -> 1 on the rig. Also greened 4 stale-test reds pre-existing on main (warm-eval/version needles, the remove-arm liveness witness, the paint self-test host stub). ([11.215], the ux-speed epoch-reuse-remount-skip lane)
+
+
 ## [11.186] the retired chooser pane stops painting over the mounted desktop
 
 A libyggterm app's `sidebar;close` used to be undeliverable to any client
