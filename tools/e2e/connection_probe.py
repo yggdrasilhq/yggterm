@@ -232,6 +232,29 @@ def completed_json(answer, limit=300):
     })
 
 
+def holder_identity(pid):
+    """cmdline + state + ppid of a surviving holder, read while it lives —
+    the [11.218] convict naming (a wrapper, the CLI itself, or a third
+    child each imply a different fix direction)."""
+    parts = []
+    try:
+        cmdline = (
+            pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+            .replace(b"\0", b" ").decode(errors="replace").strip()[:120]
+        )
+        parts.append(repr(cmdline))
+    except OSError:
+        parts.append("(cmdline unreadable)")
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        # pid (comm) state ppid ... — comm may contain spaces/parens
+        tail = stat[stat.rindex(")") + 2:].split()
+        parts.append(f"state={tail[0]} ppid={tail[1]}")
+    except (OSError, ValueError, IndexError):
+        pass
+    return " ".join(parts) if parts else "(gone at evidence time)"
+
+
 def reap(key, cwd=None):
     """Close the row the way the click path does, then evict the corpse record.
 
@@ -267,6 +290,13 @@ def reap(key, cwd=None):
             if not post_close:
                 break
             time.sleep(0.5)
+    if post_close:
+        # Name the convict BEFORE the escalation kill — the [11.218] lesson:
+        # the first capture attempt read /proc AFTER the kill and could only
+        # ever name "(gone at evidence time)". pids alone cannot drive the
+        # next sitting; identity read while the holder still lives can.
+        for pid in list(post_close):
+            close_message += f" | holder {pid}: {holder_identity(pid)}"
     if cwd is not None:
         for _ in range(3):
             holders = live_holder_pids(cwd)
@@ -275,19 +305,6 @@ def reap(key, cwd=None):
             for pid in holders:
                 run(["kill", "-9", str(pid)], timeout=30)
             time.sleep(1.0)
-    if post_close:
-        # Name the convict: pids alone cannot drive the next sitting (the
-        # [11.195] race of 2026-10-02 survived unidentified because the
-        # evidence carried numbers only).
-        for pid in list(post_close):
-            try:
-                cmdline = (
-                    pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
-                    .replace(b"\0", b" ").decode(errors="replace")[:120]
-                )
-                close_message += f" | holder {pid}: {cmdline!r}"
-            except OSError:
-                close_message += f" | holder {pid}: (gone at evidence time)"
     yggterm(["rows", "despawn", key], timeout=60)
     return post_close, close_message
 
