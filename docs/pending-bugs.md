@@ -52,6 +52,29 @@ third child), and the fix direction follows from which it is. If the
 holder is a wrapper the close never owned, the law's scan is over-broad
 and the law needs narrowing instead.
 
+UPDATE 2026-10-03 ~00:28-01:30 IST (the convict-naming + hunt sitting; zcode
+on jojo, work FROM dev): reap() now names the holder BEFORE the escalation
+kill (holder_identity: cmdline+state+ppid read while the holder lives — the
+first capture attempt read /proc AFTER the kill and could only ever say
+"gone at evidence time"; merged 7905b520). Hunt: 31 green runs across two
+young headless daemons + ONE young-window perturbation, run 3 of the
+01:01-born daemon at age 3m — and that window is the faithful one: the
+daemon's own ytrace shows 19 main_enter events in it (a GUI attaching =
+the restore prewarm era with remount workers, the original conditions).
+The manifestation is NOT the holder-survivor class (the [11.195] assert
+passed): the mint leg failed with "CLI on screen but NO mint trace; the
+row connected through some other arm; wrapper exit=None" and the trace
+carries ONE resume_refusal {kind: antigravity, pattern: session_not_found}
+at +72 s — i.e. mid-scenario the resume wrapper was refused while a CLI
+appeared from another source. Reading: a prewarm-era ensure/spawn touched
+the row post-close (the entry's working hypothesis, seen from the mint
+side instead of the holder side). NEXT SEAT: extend the probe to NAME the
+arm (grep the window for ensure/vouch/spawn arms on the scenario's session
+id — the current evidence does not name it); hunt under a GUI-ATTACHED
+young daemon (headless windows produced 0 perturbations in 29 runs; the
+one capture rode GUI attach churn); sequence hunts AFTER deploys (a lane
+deploy rotates the daemon mid-hunt and invalidates the run).
+
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
 **Status:** OPEN
