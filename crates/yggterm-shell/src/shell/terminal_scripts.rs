@@ -266,7 +266,7 @@ fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
     // guard instead of registering over the fresh mount (the stale closure
     // used to win the host last-writer-wins via its ownerToken).
     format!(
-        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
+        "window.__yggWarmLadder = window.__yggWarmLadder || [];\n        window.__yggWarmLadder.push([\"t1_iife\", performance.now()]);\n        window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
     )
 }
 
@@ -296,7 +296,7 @@ fn terminal_mount_fn_probe_script() -> String {
 pub(crate) fn terminal_mount_pipeline_probe_script() -> String {
     // ⛔ [11.173] shape law: the eval bridge wraps every script in a
     // function body — a value crosses ONLY via a top-level `return`.
-    "return 1 + 1;".to_string()
+    "try { (window.__yggWarmLadder = window.__yggWarmLadder || []).push([\"t_probe_exec\", performance.now()]); } catch (_e) { }\nreturn 1 + 1;".to_string()
 }
 
 fn terminal_eval_script_with_canvas_renderer(
@@ -438,9 +438,20 @@ fn terminal_eval_script_with_canvas_renderer(
             sendTerminalEvent({{ kind: "debug", message: `stale_mount_attempt_abort host=${{hostId}} site=entry stamp=${{__yggAttemptStamp}} current=${{window.__yggtermMountAttempt}}` }});
             return;
         }}
+        window.__yggWarmLadder = window.__yggWarmLadder || [];
+        window.__yggWarmLadder.push(["t2_fn_entry", performance.now()]);
+        try {{
 {trace_emitter_js}
+        window.__yggWarmLadder.push(["t2a_after_trace_emitter", performance.now()]);
 {frame_hash_probe_js}
+        window.__yggWarmLadder.push(["t2b_after_frame_hash", performance.now()]);
 {terminal_frame_cache_js}
+        window.__yggWarmLadder.push(["t2c_after_frame_cache", performance.now()]);
+        sendTerminalEvent({{ kind: "debug", message: `warm_t2c_post_probe host=${{hostId}} ladder=${{JSON.stringify(window.__yggWarmLadder || [])}} hasDioxus=${{typeof dioxus !== "undefined"}} hasSend=${{!!terminalDioxusSend}}` }});
+        }} catch (__yggPrefixError) {{
+            sendTerminalEvent({{ kind: "debug", message: `warm_prefix_throw host=${{hostId}} at=${{performance.now()}} err=${{String(__yggPrefixError && __yggPrefixError.stack || __yggPrefixError)}}` }});
+            return;
+        }}
         // ── xterm.js probes (layer=xterm) ──────────────────────────────────
         // These serve the open ghost-frame / glyph-soup entry in
         // docs/pending-bugs.md, whose fix direction asks for "the xterm.js write
@@ -1052,7 +1063,7 @@ fn terminal_eval_script_with_canvas_renderer(
         const YGG_FLOOD_EXIT_CHARS_PER_S = 3000;
         const YGG_FLOOD_WRITE_FRAME_MS = 66;
         let host = document.getElementById(hostId);
-        sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
+        sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}} ladder=${{JSON.stringify(window.__yggWarmLadder || [])}} postNow=${{performance.now()}}` }});
         if (!host) {{
             for (let attempt = 0; attempt < 80; attempt += 1) {{
                 await sleep(25);
@@ -13337,6 +13348,8 @@ fn terminal_eval_script_with_canvas_renderer(
         // [11.178] The cold installer is the redo: its bump supersedes every
         // prior attempt, so a late-resuming warm instance aborts at its entry
         // guard instead of fighting this one for the host.
+        window.__yggWarmLadder = window.__yggWarmLadder || [];
+        window.__yggWarmLadder.push(["t5_cold_iife", performance.now()]);
         window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;
         await window.__yggtermMountFn(window.__yggtermMountAttempt);
         "#,
