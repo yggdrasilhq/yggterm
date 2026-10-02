@@ -75,6 +75,16 @@ young daemon (headless windows produced 0 perturbations in 29 runs; the
 one capture rode GUI attach churn); sequence hunts AFTER deploys (a lane
 deploy rotates the daemon mid-hunt and invalidates the run).
 
+UPDATE 2026-10-03 ~02:5x IST (arm-naming seat, zcode on jojo, work FROM
+dev; lane/integration/111218-arm-naming): the probe's mint-leg failure
+verdict now carries the trace window's own account — window_arms=[every
+event name that mentioned the scenario's id since the scenario's offset,
+counted] (trace_arm_summary in tools/e2e/connection_probe.py). The next
+failing run names its arm from the TRACE side (which ensure/vouch/spawn/
+remount arm touched the row) while holder_identity names it from the
+PROC side — the two together pin the race. The GUI-ATTACHED young-daemon
+hunt and the AFTER-deploys sequencing remain the next seat's run.
+
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
