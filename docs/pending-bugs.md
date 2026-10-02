@@ -434,6 +434,26 @@ not remount) is the load-bearing fix; the [11.214] daemon-lock family
 owns the keep-alive leg of the same window. The sub-second warm spawn
 this entry wants is bought on (c), not on the gate.
 
+CORRECTION + MECHANISM SHARPENED (same sitting, ~01:10-01:20 IST, two more
+rig runs): the "+787..+908 ordered train" was MISATTRIBUTED — those arriving
+events belong to the REDO instances (their embedded ladders end with the
+redo's own t2c stamps). The WARM instance's identical sends NEVER ARRIVE,
+not even late. And the absent-channel hypothesis is FALSIFIED by
+measurement: the ladder now carries per-instance flags at t2c, and EVERY
+instance including the warm ones reads hasDioxus=true, hasSend=true,
+sendType=function — the send exists, is called, does not throw, and the
+message is silently SHED in the GUI main-loop IPC leg during the spawn
+churn window. Net: dioxus.send during the window is a black hole for that
+message — no delivery, no error, no late arrival. FIX DIRECTION (c2, new,
+concrete): the EVAL-ANSWER path is PROVEN alive during the same window
+(the pipeline probe answers in ~10 ms while events are shed) — so mount
+liveness should be POLLED VIA EVAL RETURNS (a tiny `return window.<mount
+alive stamp>` the fn advances at entry/each stage; an advancing answer =
+the mount is running and its events are merely shed — keep the warm
+mount, re-request state, do NOT remount). Receipt-based liveness on the
+one path that delivers; the remount-storm reduction ([11.215]) remains the
+load-bearing companion.
+
 RIG RECIPE: /tmp/warmladder-rig.sh on dev (Xvfb :78; the readiness gate
 waits for a GUI CLIENT COUNT > 0 — a daemon answering is NOT a GUI
 attached: run2 raced this and every spawn failed "no client to drive");
