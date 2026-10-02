@@ -71338,6 +71338,109 @@ mod web_surface_immersion_locks {
     }
 
     #[test]
+    fn a_remote_host_with_a_fresh_full_chain_read_is_reveal_eligible() {
+        // [11.179] THE REMOTE OWNERSHIP STORY. The daemon's ownership list
+        // is local-PTY-shaped and can never cover a remote row — the PTY
+        // lives on the peer's daemon — so before this proof existed the
+        // gate refused EVERY remote raise (measured: 63 remote refusals,
+        // serve x0, daemon_owns false in 100% of payloads). A fresh
+        // successful bridge read — answered through GUI -> local daemon ->
+        // ssh -> remote daemon -> PTY — is the positive liveness proof the
+        // raise serves on. Every other guard ([11.187]'s stale-heartbeat
+        // refusal, latched failures, degraded transport) still applies.
+        let session_path = "remote-cc://dev/reveal-fresh-read-host-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        let status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "reveal-lock",
+            "host_kind": "remote",
+            "host_detail": "reveal-lock",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "owned_terminal_session_keys": ["remote-cc://someone-else"],
+        }))
+        .expect("runtime status fixture parses");
+        shell.latest_runtime_status = Some(status);
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "pre-condition: with no read stamp the remote row must still refuse"
+        );
+        super::record_terminal_remote_runtime_read_ok(session_path);
+        assert!(
+            shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a remote host whose own read answered through the full chain \
+             must raise, not remount — the [11.179] fix"
+        );
+        // The SAME stamp must carry the epoch pin (the retained replay
+        // path re-bootstrapped remote hosts for the same structural
+        // reason — the pin consulted bare daemon ownership).
+        assert!(
+            shell.terminal_session_host_reusable_for_reveal(session_path),
+            "the reveal-reuse predicate must honor the same proof — an \
+             epoch pin that ignores it re-bootstraps every remote host"
+        );
+    }
+
+    #[test]
+    fn a_remote_host_whose_last_read_is_stale_is_not_reveal_eligible() {
+        // The stamp is FRESHNESS, not history: 5x the 3 s background
+        // trickle cadence. A remote that stopped answering must fall back
+        // to the honest bootstrap (which discovers any death by name,
+        // [11.190]/[11.213]), never raise a canvas that may be dead.
+        let session_path = "remote-cc://dev/reveal-stale-read-host-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        let status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "reveal-lock",
+            "host_kind": "remote",
+            "host_detail": "reveal-lock",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "owned_terminal_session_keys": [],
+        }))
+        .expect("runtime status fixture parses");
+        shell.latest_runtime_status = Some(status);
+        super::record_terminal_remote_runtime_read_ok_at(
+            session_path,
+            wall_now_ms().saturating_sub(super::TERMINAL_REMOTE_RUNTIME_LIVENESS_MS + 1_000),
+        );
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a remote row whose last full-chain answer predates the \
+             liveness window must bootstrap — the stamp ages OUT"
+        );
+    }
+
+    #[test]
+    fn the_reveal_gates_consult_the_completed_liveness_proof_not_bare_ownership() {
+        // Source law: the two reveal gates and the retained-epoch pin must
+        // consult `terminal_runtime_provably_live`, never bare
+        // `daemon_owns_session_runtime` — bare ownership is the structural
+        // refusal that made every remote raise dead ([11.179]); a refactor
+        // that reintroduces it re-breaks the remote plane silently.
+        for fn_name in [
+            "fn terminal_session_host_reusable_for_reveal",
+            "fn terminal_host_ready_for_reveal_raise",
+        ] {
+            let body = SHELL_SOURCE
+                .split(fn_name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .unwrap_or("");
+            assert!(
+                super::seam_contains(body, "terminal_runtime_provably_live"),
+                "{fn_name} must prove liveness through terminal_runtime_provably_live"
+            );
+            let bare_ownership_in_body = body
+                .matches("daemon_owns_session_runtime")
+                .count();
+            assert!(
+                bare_ownership_in_body <= 1,
+                "{fn_name} still gates on bare daemon_owns_session_runtime \
+                 ({bare_ownership_in_body} mentions) — the [11.179] regression"
+            );
+        }
+    }
+
+    #[test]
     fn the_reveal_branch_skips_the_bootstrap_and_latches_ready() {
         // The raise must (a) swallow the bootstrap candidate BEFORE the lease,
         // (b) latch the open attempt Ready with the reveal reason (the same

@@ -3761,7 +3761,11 @@ fn TerminalCanvas(
                 .retained_terminal_session_paths
                 .contains(&session_path),
             shell.terminal_session_was_ever_ready(&session_path),
-            shell.daemon_owns_session_runtime(&session_path),
+            // [11.179] the completed liveness proof, not bare daemon
+            // ownership — a remote row's epoch pins on its own fresh read
+            // answer, so the retained replay path stops re-bootstrapping
+            // remote hosts the local daemon can never "own".
+            shell.terminal_runtime_provably_live(&session_path),
             shell
                 .latest_terminal_open_attempt_for_path(&session_path)
                 .is_some_and(|attempt| attempt.latched_failure_reason.is_some()),
@@ -5588,6 +5592,9 @@ fn TerminalCanvas(
                 "has_host_epoch": raise_has_host,
                 "was_ever_ready": raise_was_ready,
                 "daemon_owns_runtime": raise_daemon_owns,
+                // [11.179] the remote arm's evidence: how old the row's last
+                // full-chain read answer is (None = never under this build).
+                "remote_read_age_ms": terminal_remote_runtime_read_age_ms(&session_path),
                 "transport_degraded": raise_degraded,
             }),
         );
@@ -5608,6 +5615,9 @@ fn TerminalCanvas(
             json!({
                 "session_path": session_path.clone(),
                 "host_id": host_id.clone(),
+                // [11.179] the proof that served this raise — daemon-owned,
+                // or the remote row's fresh full-chain read answer.
+                "remote_read_age_ms": terminal_remote_runtime_read_age_ms(&session_path),
                 "mount_epoch": mount_epoch,
                 "mount_identity": mount_identity.clone(),
                 "open_request_id": latest_open_request_id,
@@ -11085,6 +11095,10 @@ fn TerminalCanvas(
                             OffLoopTerminalRpcResult::FrameHashFresh { hash } => {
                                 frame_hash_fetch_in_flight = false;
                                 if let Some(hash) = hash {
+                                    // [11.179] the quiet tick's hash fetch
+                                    // answered through the full chain — the
+                                    // same positive liveness proof as a read.
+                                    record_terminal_remote_runtime_read_ok(&session_path);
                                     let _ = eval.send(TerminalJsCommand::FrameHash { hash });
                                 }
                             }
@@ -11924,6 +11938,13 @@ fn TerminalCanvas(
                                 resync_required,
                                 screen_hash,
                             )) => {
+                                // [11.179] A read that ANSWERED is the remote
+                                // runtime's positive liveness proof — the full
+                                // chain (GUI -> local daemon -> ssh -> remote
+                                // daemon -> PTY) just served this row. Stamp it
+                                // so a later raise can serve a retained remote
+                                // host on this evidence instead of remounting.
+                                record_terminal_remote_runtime_read_ok(&session_path);
                                 // [11.167] A runtime START under this watch is a
                                 // replacement: the child the watch accumulated its
                                 // hard-fail evidence against is gone. Re-arm the

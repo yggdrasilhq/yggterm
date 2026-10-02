@@ -946,6 +946,51 @@ pub(crate) fn terminal_loop_heartbeat_age_ms(session_path: &str) -> Option<u64> 
     Some(wall_now_ms().saturating_sub(*at))
 }
 
+/// [11.179] Wall-ms of the session's last SUCCESSFUL bridge read — the
+/// REMOTE runtime's ownership proof. A retained remote host trickle-reads
+/// every `TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS` while hidden, and
+/// every successful read is answered through the FULL chain (GUI -> local
+/// daemon -> ssh -> remote daemon -> PTY), so a fresh-enough stamp is
+/// positive proof the remote runtime is alive — the thing
+/// `daemon_owns_session_runtime` can never say for a remote row, because
+/// the local daemon never holds the remote PTY (by construction, which is
+/// why every remote raise on main refuses). Keyed by the ROW path (the
+/// mount loop's `session_path`), exactly like `TERMINAL_LOOP_HEARTBEATS`;
+/// non-reactive on purpose — a state write per read would re-render every
+/// poll tick.
+static TERMINAL_REMOTE_RUNTIME_LAST_OK_READ_MS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How fresh a remote row's last successful read must be to prove its
+/// runtime live for a raise: 5x the 3 s background-trickle cadence. A
+/// remote that stopped answering ages past this window and the raise
+/// REFUSES — the bootstrap path then does the honest full mount and
+/// discovers any death by name ([11.190]/[11.213]'s refusal machinery),
+/// never a raise on a stale canvas.
+pub(crate) const TERMINAL_REMOTE_RUNTIME_LIVENESS_MS: u64 = 15_000;
+
+pub(crate) fn record_terminal_remote_runtime_read_ok(session_path: &str) {
+    record_terminal_remote_runtime_read_ok_at(session_path, wall_now_ms());
+}
+
+/// The stamp with an explicit clock — the tests age a stamp without
+/// sleeping out the liveness window.
+pub(crate) fn record_terminal_remote_runtime_read_ok_at(session_path: &str, at_ms: u64) {
+    if let Ok(mut reads) = TERMINAL_REMOTE_RUNTIME_LAST_OK_READ_MS.lock() {
+        reads.insert(session_path.to_string(), at_ms);
+    }
+}
+
+/// Age of the session's last successful bridge read, in ms. `None` = no
+/// successful read under a build that carries the stamp — nothing to prove
+/// with, and the caller must treat that as NOT live, never as live.
+pub(crate) fn terminal_remote_runtime_read_age_ms(session_path: &str) -> Option<u64> {
+    let reads = TERMINAL_REMOTE_RUNTIME_LAST_OK_READ_MS.lock().ok()?;
+    let at = reads.get(session_path)?;
+    Some(wall_now_ms().saturating_sub(*at))
+}
+
 /// Does the session still have remount budget, and record the spend when yes.
 pub(crate) fn terminal_loop_remount_budget_allows(session_path: &str) -> bool {
     let Ok(mut spend) = TERMINAL_LOOP_REMOUNT_SPEND.lock() else {
@@ -31424,7 +31469,7 @@ impl ShellState {
             }
         }
         if self.terminal_session_uses_remote_runtime(session_path)
-            && !self.daemon_owns_session_runtime(session_path)
+            && !self.terminal_runtime_provably_live(session_path)
         {
             return false;
         }
@@ -31596,9 +31641,14 @@ impl ShellState {
     /// can never disagree about whether a switch is a reveal or a remount.
     /// See [[finding-hot-switch-latency-remount]].
     fn terminal_session_host_reusable_for_reveal(&self, session_path: &str) -> bool {
+        // [11.179] `terminal_runtime_provably_live`, not bare daemon
+        // ownership: the ownership list is local-PTY-shaped and can never
+        // cover a remote row, so gating on it alone made every retained
+        // remote host non-reusable (the full remount on every switch-back).
+        // A remote row proves liveness with its own fresh successful read.
         self.terminal_session_host_id(session_path).is_some()
             && self.terminal_session_was_ever_ready(session_path)
-            && self.daemon_owns_session_runtime(session_path)
+            && self.terminal_runtime_provably_live(session_path)
     }
     // ---- Split-view groups ([[campaign-split-view-groups]]) ----
     //
@@ -32071,6 +32121,26 @@ impl ShellState {
             .iter()
             .chain(runtime_status.preserved_terminal_owner_keys.iter())
             .any(|key| key == &runtime_key)
+    }
+
+    /// [11.179] THE REMOTE OWNERSHIP STORY. For reveal/raise purposes a
+    /// session's runtime is provably live when the daemon owns it (local
+    /// PTY, owned or preserved) OR — the remote row's case the ownership
+    /// list can never cover, because the remote PTY lives on the peer's
+    /// daemon — when the row's own bridge read answered through the full
+    /// chain recently (`terminal_remote_runtime_read_age_ms`). The [11.187]
+    /// machinery already refuses a raise on a stale loop heartbeat and
+    /// reconciles a frozen stream, so the positive read stamp COMPLETES the
+    /// liveness proof without weakening a single existing guard; before it,
+    /// every remote raise refused and every remote switch paid the full
+    /// remount ([11.179]: reveal_raise_refused x63 remote, serve x0).
+    fn terminal_runtime_provably_live(&self, session_path: &str) -> bool {
+        if self.daemon_owns_session_runtime(session_path) {
+            return true;
+        }
+        self.terminal_session_uses_remote_runtime(session_path)
+            && terminal_remote_runtime_read_age_ms(session_path)
+                .is_some_and(|age| age < TERMINAL_REMOTE_RUNTIME_LIVENESS_MS)
     }
     /// Returns true if the GUI has spawned enough retained_fault_recovery
     /// attempts for this session that further attempts are clearly futile.

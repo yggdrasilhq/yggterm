@@ -903,13 +903,36 @@ class Probe:
         return statistics.median(walls) if walls else None
 
     def ytrace_events(self, since_ms: int, lines: int = 1200) -> list[dict]:
+        """The trace tail, with a FILE fallback. The CLI form needs `ytrace`
+        on PATH; under a rig whose shell PATH lacks ~/.local/bin every tail
+        call raised and returned [] SILENTLY — the [11.179] red run measured
+        clicks whose raise verdicts existed in the trace file while the
+        probe attributed nothing. The fallback reads the ytrace.jsonl the
+        daemon writes in YGGTERM_HOME directly, newest `lines` events."""
+        events = None
         try:
             proc = subprocess.run(
                 [YTRACE, "tail", "--lines", str(lines), "--json"],
                 capture_output=True, text=True, timeout=15)
             events = json.loads(proc.stdout)
         except Exception:
-            return []
+            events = None
+        if not isinstance(events, list) or not events:
+            try:
+                import os
+                home = os.environ.get("YGGTERM_HOME") or os.path.expanduser(
+                    "~/.yggterm")
+                path = os.path.join(home, "ytrace.jsonl")
+                events = []
+                with open(path, errors="replace") as f:
+                    tail = f.readlines()[-lines:]
+                for line in tail:
+                    try:
+                        events.append(json.loads(line))
+                    except Exception:
+                        continue
+            except Exception:
+                return []
         return [e for e in events if isinstance(e, dict)
                 and e.get("ts_ms", 0) >= since_ms]
 
@@ -998,9 +1021,18 @@ class Probe:
         return False
 
     def spawn_scratch_row(self, index: int, activate: bool = False) -> dict:
-        """One scratch terminal row; returns the probe row-dict (not a report)."""
+        return self.spawn_scratch_row_at(None, index, activate=activate)
+
+    def spawn_scratch_row_at(self, machine_key, index: int,
+                             activate: bool = False) -> dict:
+        """One scratch terminal row; returns the probe row-dict (not a report).
+        `machine_key` spawns the row ON that machine — a REMOTE runtime row
+        from this GUI's perspective, born the way the owner's remote rows
+        are (the [11.179] rig shape)."""
         title = f"{PROBE_TITLE_PREFIX}{index}-{now_ms()}"
         argv = ["terminal", "new", "--title", title, "--cwd", "/tmp"]
+        if machine_key:
+            argv += ["--machine-key", machine_key]
         if not activate:
             argv.append("--no-activate")
         t0 = now_ms()
@@ -1952,6 +1984,16 @@ dioxus.send(out);
         return summarize(out, key="felt_ms")
 
     def action_switch(self, iters: int) -> dict:
+        return self.action_switch_pair(iters, remote_machine=None)
+
+    def action_rswitch(self, iters: int, remote_machine: str = "oc") -> dict:
+        """[11.179] the REMOTE felt switch: the same real-pointer switch
+        measurement over a LOCAL+REMOTE pair (remote_machine's runtime row),
+        with the raise gate's verdict per click — the falsifier numbers are
+        the per-kind served/refused/remounted split."""
+        return self.action_switch_pair(iters, remote_machine=remote_machine)
+
+    def action_switch_pair(self, iters: int, remote_machine=None) -> dict:
         """The felt switch: real pointer CLICKS on sidebar tree rows — press
         and release at the row node, no threshold cross (a click must never
         begin a drag) — so the switch enters through the SAME user-gesture
@@ -1972,11 +2014,25 @@ dioxus.send(out);
         included); the report's cli_overhead_ms is the floor to subtract.
         paint_end_rate is the falsifier number: >=7/8 clicks must report a
         first_frame end with rows painted."""
-        rows_ready = self.ensure_two_scratch_rows()
+        if remote_machine:
+            rows_ready = self.ensure_remote_scratch_pair(remote_machine)
+        else:
+            rows_ready = self.ensure_two_scratch_rows()
         if len(rows_ready) < 2:
             return {"error": "could not establish two scratch rows",
                     "iterations": []}
         a_path, b_path = rows_ready
+        kinds = {a_path: row_kind(a_path), b_path: row_kind(b_path)}
+        if remote_machine and kinds[b_path] != "remote":
+            return {"error": f"remote pair row came back {kinds[b_path]!r} "
+                             f"({b_path}) — the machine-key create did not "
+                             f"produce a remote runtime row",
+                    "iterations": []}
+        # Both hosts must be RETAINED and trickle-reading before the first
+        # measured click: the [11.172] raise serves a host whose canvas the
+        # background trickle kept current while hidden, so a pair measured
+        # the instant after spawn measures cold mounts, not raises.
+        time.sleep(8.0)
         # make both nodes exist under the sidebar's virtualization, as felt does
         self.verb("tree", "select", a_path)
         self.verb("tree", "select", b_path)
@@ -2001,6 +2057,7 @@ dioxus.send(out);
                     "iterations": []}
         out = {"iterations": []}
         confirmed_active: str | None = None
+        activated_paths: set[str] = set()
 
         def _other(p: str) -> str:
             return b_path if p == a_path else a_path
@@ -2019,7 +2076,8 @@ dioxus.send(out);
             rect = rects[path]
             x = rect["x"] + min(rect["w"] / 2, 120.0)
             y = rect["y"] + rect["h"] / 2
-            it = {"cold": i == 0, "target": path}
+            cold = path not in activated_paths
+            it = {"cold": cold, "target": path, "kind": kinds[path]}
             acc: list[str] = []
             rd = self.verb("pointer", "press", "--x", str(int(x)),
                            "--y", str(int(y)))
@@ -2042,6 +2100,7 @@ dioxus.send(out);
             # settle recheck belongs to the mount chain), so the raise's break
             # does not wait for one.
             reveal_served = None
+            reveal_refused = None
             paint_reveal = None
             deadline = time.time() + self.timeout_s
             t_loop = time.time()
@@ -2095,6 +2154,10 @@ dioxus.send(out);
                         elif (reveal_served is None and c == "terminal_mount"
                                 and n == "reveal_served"):
                             reveal_served = e
+                        elif (reveal_refused is None
+                                and c == "terminal_mount"
+                                and n == "reveal_raise_refused"):
+                            reveal_refused = e
                         elif (paint_reveal is None and c == "xterm_paint"
                                 and n == "reveal"):
                             paint_reveal = e
@@ -2123,6 +2186,21 @@ dioxus.send(out);
                 if reveal_served is not None:
                     it["reveal_served_ms"] = (reveal_served.get("ts_ms", 0)
                                               - t_release)
+                if reveal_refused is not None:
+                    it["reveal_refused_ms"] = (reveal_refused.get("ts_ms", 0)
+                                               - t_release)
+                    rp = reveal_refused.get("payload") or {}
+                    it["refused_daemon_owns"] = rp.get("daemon_owns_runtime")
+                    it["refused_was_ever_ready"] = rp.get("was_ever_ready")
+                    it["refused_has_host_epoch"] = rp.get("has_host_epoch")
+                    if (kinds[path] == "remote"
+                            and rp.get("has_host_epoch")
+                            and rp.get("was_ever_ready")
+                            and rp.get("daemon_owns_runtime") is False):
+                        acc.append("REMOTE REFUSED BY THE OWNERSHIP GATE — "
+                                   "the [11.179] signature (host retained, "
+                                   "ever-ready, but the local daemon can "
+                                   "never own a remote PTY by construction)")
                 if first_frame is not None:
                     it["first_frame_ms"] = first_frame.get("ts_ms", 0) - t_release
                     fp = first_frame.get("payload") or {}
@@ -2221,8 +2299,15 @@ dioxus.send(out);
                 time.sleep(0.4)
             else:
                 confirmed_active = path
-            # give the previous switch's churn room to drain before the next
-            time.sleep(0.6)
+                activated_paths.add(path)
+            # give the previous switch's churn room to drain before the
+            # next. The remote pair dwells LONGER on purpose ([11.179]): a
+            # freshly mounted row completes its reveal + ready latch only
+            # while VISIBLE — switching away within ~1-2 s of attach_ready
+            # cancels the latch and the next switch remounts (the warm-up
+            # property, measured on clean main), so the probe must give the
+            # row the dwell a real user's eyes give it.
+            time.sleep(6.0 if remote_machine else 0.6)
         ready = [i for i in out["iterations"]
                  if i.get("reveal_name") == "reveal_ready"]
         out["reveal_ready_rate"] = len(ready) / len(out["iterations"])
@@ -2237,6 +2322,33 @@ dioxus.send(out);
         completes = [i for i in ends if i.get("settle_complete")]
         out["settle_complete_rate"] = (
             len(completes) / len(ends) if ends else None)
+        # [11.179] THE REMOTE FALSIFIER NUMBERS: per-kind served/refused/
+        # remounted. The entry's remote arm closes when remote refusals
+        # read 0 AND the remote raises serve — the ownership gate no longer
+        # structurally excludes remote rows.
+        if remote_machine:
+            out["kind_split"] = {}
+            for kind in ("local", "remote"):
+                ks = [i for i in out["iterations"]
+                      if i.get("kind") == kind and not i.get("cold")]
+                out["kind_split"][kind] = {
+                    "switches": len(ks),
+                    "raise_served": sum(1 for i in ks
+                                        if i.get("reveal_served_ms") is not None),
+                    "raise_refused": sum(1 for i in ks
+                                         if i.get("reveal_refused_ms") is not None),
+                    "remounted": sum(1 for i in ks
+                                     if i.get("mount_begin_ms") is not None),
+                    "paint_end_rate": (sum(1 for i in ks
+                                           if i.get("first_frame_ms") is not None
+                                           or i.get("paint_reveal_ms") is not None)
+                                       / len(ks)) if ks else None,
+                }
+            rs = out["kind_split"].get("remote") or {}
+            if rs.get("switches"):
+                out["remote_ownership_gate_dead"] = bool(
+                    rs.get("raise_refused") == 0
+                    and rs.get("raise_served", 0) > 0)
         return summarize(out, key="activation_ms")
 
     def action_group(self, iters: int) -> dict:
@@ -3222,6 +3334,30 @@ dioxus.send(out);
     def ensure_two_scratch_rows(self) -> list[str]:
         return self.ensure_scratch_rows(2)
 
+    def ensure_remote_scratch_pair(self, machine_key: str) -> list[str]:
+        """One LOCAL row + one REMOTE row on `machine_key` — the [11.179]
+        pair. Returns [local_path, remote_path]; a shorter list is a failure
+        the caller names."""
+        row = self.spawn_scratch_row_at(None, 40)
+        if "error" in row:
+            return []
+        out = [row["path"]]
+        row = self.spawn_scratch_row_at(machine_key, 41)
+        if "error" in row:
+            return out
+        out.append(row["path"])
+        return out
+
+
+def row_kind(path: str) -> str:
+    """local vs remote for a row path — the [11.179] kind split. A remote
+    runtime row is any remote-scheme path (`remote-*://`) or an ssh/live-ssh
+    spelling (`ssh://`, `live::`); everything else is local."""
+    p = (path or "").lstrip("/")
+    if p.startswith("remote-") or p.startswith("ssh://") or p.startswith("live::"):
+        return "remote"
+    return "local"
+
 
 # [11.217] The content truth per split member: the member's live xterm host
 # (window.__yggtermXtermHosts, entry.sessionPath set by the terminal host
@@ -3277,8 +3413,11 @@ def summarize(out: dict, key: str, rate_key: str | None = None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--actions",
-                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch,split,resize")
+                    default="spawn,drag,group,menu,modal,close,felt,shiftdrag,closeall,switch,rswitch,split,resize")
     ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--remote-machine", default="oc",
+                        help="rswitch: the fleet machine whose runtime row "
+                             "pairs against the local row ([11.179])")
     ap.add_argument("--out", default="/tmp/uxspeed-report.json")
     ap.add_argument("--artifacts", default="/tmp/uxspeed-artifacts")
     ap.add_argument("--timeout-ms", type=int, default=12000)
@@ -3324,6 +3463,9 @@ def main() -> int:
                 report["actions"]["shiftdrag"] = probe.action_shiftdrag(args.iters)
             elif action == "switch":
                 report["actions"]["switch"] = probe.action_switch(args.iters)
+            elif action == "rswitch":
+                report["actions"]["rswitch"] = probe.action_rswitch(
+                    args.iters, remote_machine=args.remote_machine)
             elif action == "group":
                 report["actions"]["group"] = probe.action_group(args.iters)
             elif action == "menu":
