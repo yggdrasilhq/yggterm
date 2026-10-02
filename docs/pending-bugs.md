@@ -392,7 +392,60 @@ the bridge POST path, not the eval dispatch path.
 
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — remote arm rig-proven; live-desktop falsifier owed on the owner's next GUI rotation
+
+FIXED 2026-10-02 (lane/integration/11179-remote-raise, zcode on jojo work FROM
+dev; the remote-ownership story). ROOT: the ce64fc1d gate asked
+`daemon_owns_session_runtime` of rows whose PTY lives on the PEER's daemon —
+the local ownership list is local-PTY-shaped and can never answer yes, so the
+gate was structurally always-false for the remote plane (this entry's 63/63,
+serve x0). THE FIX — one predicate, five sites: a non-reactive
+last-ok-read stamp (`TERMINAL_REMOTE_RUNTIME_LAST_OK_READ_MS`, the heartbeat
+shape) recorded wherever a bridge read ANSWERS (main read Ok arm + the
+[11.187] quiet tick's FrameHashFresh arm); `terminal_runtime_provably_live` =
+daemon-owned OR (remote AND read age < 15 s = 5x the 3 s retained trickle);
+wired into `terminal_session_host_reusable_for_reveal` (carrying retained-live's
+hot-reveal arm, the reveal-grace arm, the rearm path, the existing-lease-skip
+resolution), the raise gate's remote arm, and the retained-epoch pin caller.
+`reveal_served`/`reveal_raise_refused` carry `remote_read_age_ms`. A remote
+that stops answering ages out and the bootstrap path still discovers death by
+name ([11.190]/[11.213]); no existing guard weakened ([11.187] heartbeat
+refusal, latched failures, degraded transport all intact).
+
+RIG-PROVEN per the E2E law (dev Xvfb scratch home + machine-key oc ssh row —
+the seeded server-state must copy the REAL state's field shapes:
+`active_view_mode` is `Terminal` and `session_pty_grids` is a SEQUENCE; a
+hand-shaped seed parse-fails the daemon boot):
+- RED on clean main (b12e4955): remote 7x refused {daemon_owns: false,
+  has_host_epoch: true, was_ever_ready: true}, serve x0 — the signature
+  verbatim. LOCAL arm already cleared there (3 serves; the a4e25bff +
+  adaptive-gate prediction held).
+- GREEN on the lane: remote warm clicks SERVE — reveal_served 301/402 ms,
+  xterm_paint/reveal 514/601 ms, NO mount begin — riding read stamps
+  1163/2723 ms old; the only refusals are COLD first activations (ready
+  false, stamp None — legitimate bootstraps, identical for both kinds).
+- The probe ships in-repo: `uxprobe rswitch` (local+remote pair, per-kind
+  served/refused/remounted split, per-path cold accounting) + the
+  ytrace_events FILE fallback (the rig lesson: the CLI tail silently
+  returned [] under a PATH without ~/.local/bin — a probe that reads
+  empty is a probe that lies).
+
+MEASURED ALONG THE WAY — THE WARM-UP PROPERTY (pre-existing, UNFIXED, both
+builds): a row switched away from within ~1-2 s of attach_ready never
+completes its reveal-ready latch (the latch arms need the visible surface) and
+the next switch re-bootstraps it. Benign at human cadence; the file for the
+next felt-switch pass.
+
+OPS ALONG THE WAY (2026-10-02): oc carried a 6.1-DAY pre-fix [11.182]-class
+walker holding the install flock (pid 17357 + two stuck mimo children) —
+cleared per the entry's own remedy; dev carried three orphaned mimo upgrades
+(5-6 days, lock NOT held) — cleared. Also: oc's daemon runs as
+`yggterm-headless` — a pgrep for the literal "yggterm server daemon" misses it.
+
+LIVE-DESKTOP FALSIFIER (owed): after the fleet deploys this lane and the
+owner's GUI restarts, `uxprobe rswitch` (or natural traffic) reads
+reveal_served > 0 for remote rows with remote_read_age_ms fresh, warm remote
+refusals 0, and no mount begin on the served switches.
 
 Filed 2026-09-27 by the ux-speed webproc-raise-capture lane (zcode
 sess_75faf0ad on jojo, work FROM dev, board claim ACK-aa18fa4a43) while
