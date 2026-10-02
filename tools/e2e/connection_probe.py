@@ -526,6 +526,31 @@ def trace_has_event(requested_id, since_bytes, event_name):
     return False
 
 
+def trace_arm_summary(requested_id, since_bytes, limit=12):
+    """[11.218] NAME THE ARM: every event whose trace line mentions the
+    requested id since the offset, counted. The one captured perturbation
+    read 'the row connected through some other arm' without naming it — a
+    verdict that cannot name the arm cannot direct the fix (ensure vs vouch
+    vs spawn vs remount each have different owners)."""
+    if not YTRACE.exists():
+        return []
+    needle = requested_id.encode()
+    counts = collections.Counter()
+    with open(YTRACE, "rb") as handle:
+        handle.seek(since_bytes)
+        for line in handle:
+            if needle not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            name = ev.get("name")
+            if name:
+                counts[name] += 1
+    return counts.most_common(limit)
+
+
 def scenario_rebirth_uuid_vouch():
     sc = Scenario("rebirth_uuid_lands_on_store_candidate_11183")
     conversations = store_conversations()
@@ -832,10 +857,18 @@ def scenario_defmiss_fresh_start_mint():
             # 2026-09-29, the [11.213] grind): this branch fired three times
             # with the wrapper's stderr hidden, and each read-through of the
             # trace re-derived by hand what one stderr dump would have said.
+            # [11.218] The trace window's own account rides the verdict now:
+            # every event that touched the scenario's id, counted — the arm
+            # that birthed the CLI names itself.
+            arms = trace_arm_summary(session_id, offset)
+            arms_text = ", ".join(f"{n}x{c}" for n, c in arms)
+            if not arms_text:
+                arms_text = "NO trace event mentions the id in the window"
             return sc.fail(
                 "CLI on screen but NO ensure_definitive_miss_fresh_start trace — "
                 "the row connected through some other arm; the mint falsifier "
-                f"stays unexercised (wrapper exit={proc.poll()} stderr={refused_stderr[:400]!r})"
+                f"stays unexercised (wrapper exit={proc.poll()} stderr={refused_stderr[:400]!r} "
+                f"window_arms=[{arms_text}])"
             )
         return sc.fail(
             "no CLI after 150s and no named refusal — stderr="
