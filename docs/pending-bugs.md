@@ -1058,14 +1058,35 @@ not the gate's decision. (b) and (c) stay armed on natural events.
 
 The owner's 2026-09-10 hunch: *"yggterm's working indicator is buggy for ALL
 CLIs except codex, claude, and plain shells."* Codex and ClaudeCode needles are
-measured (their descriptor docs cite the PTY drives); the rest of the table
-(opencode, qwen, kimi, muse, antigravity, grokbuild, zcode-tui, pi) is
-unaudited. One concrete suspect already: **OpenCode's needle is
-`esc interrupt`**, which is not a substring of the conventional
-`esc to interrupt` footer spelling — if that is what opencode paints, its
-working indicator has NEVER fired, and per §3.1 the dangerous direction is
-exactly this: a silent mid-turn (tool exec writing nothing) clears every other
-arm, the gate reads idle, and the update fires into a live turn.
+measured (their descriptor docs cite the PTY drives). One concrete suspect
+already: **OpenCode's needle is `esc interrupt`**, which is not a substring
+of the conventional `esc to interrupt` footer spelling — DISCHARGED 2026-09-27:
+opencode really paints the short form (six real-turn drives, both
+resolution planes).
+
+RECONCILED 2026-10-02 (the [11.213] green-closeout seat): the per-CLI
+battery suites carry a real-turn working-needle leg each, and the table's
+audit is now DISCHARGED for eight CLIs, every one measured against a live
+binary, not guessed: codex (PTY drives + suites/codex.js 8/8 on 0.154.0) ·
+claude (suites/claude.js 6/6 on 2.1.272, `esc to interrupt` in the
+spinner-phase footer) · opencode (2026-09-27, six drives, short form holds
+verbatim on 2.0.3 and managed 2.0.18) · antigravity (suites/agy.js
+`real-turn-working-needles`, 9/9 live on 1.2.x) · muse (suites/muse.js 8/8
+on 1.3.0, `esc to interrupt`) · grok (suites/grok.js 8/8 on 1.0.30, the
+09-11 needle surgery re-measured: spinner line + `[stop]` + the
+Ctrl+c turn-duration swap) · zcode-tui (suites/zcode-tui.js, the 0.6.x
+single working arm `▪ esc stop` — no `working` word, no spinner glyphs;
+announce-wire state rides OSC 7717 anyway) · devin (suites/devin.js 8/8
+twice on 3000.10.27).
+
+THE REMAINDER IS OWNER-GATED, all four legs, none blocked on code:
+- kimi — `working_screen_phrases` stays an honest null: the suite needs a
+  real turn and kimi is login-gated (needs the owner's login on the muse
+  lab host).
+- qwen / pi — not installed anywhere in the fleet (owner installs pending
+  since the 2026-09-11 wave-2 note).
+- mimo — measured WITHOUT auth (suites/mimo.js): working phrases stay
+  honest nulls until an authed pass.
 
 THE AUDIT (standing campaign work, one CLI at a time): drive the real CLI in a
 PTY until it is mid-turn, read the working screen through
