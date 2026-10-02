@@ -390,6 +390,59 @@ BOUNDS it: the EVAL pipeline answers within ~350-700 ms under spawn churn while 
 mount's first bridge POST lands ~700 ms later (the witness chain), so the delayed half is
 the bridge POST path, not the eval dispatch path.
 
+ROOT CAUSE NAMED 2026-10-03 ~00:35-01:05 IST (diag lane
+lane/integration/11178-warm-ladder, NOT merged — diagnostic stamps; zcode on
+jojo, work FROM dev; the five-stamp ladder rig). A page-side timing ladder
+(t1 warm-IIFE start · t2 fn entry · t2a/t2b/t2c after the three inlined
+chunks · the bootstrap post's own postNow · t5 cold-redo IIFE · t_probe_exec
+inside the pipeline probe; read out of the bootstrap/t2c debug messages in
+ytrace, Xvfb :78 scratch-home rig, uxprobe spawn ×6) DECOMPOSES the stall:
+
+- eval DELIVERY: ~5-8 ms (dispatch -> t1; two independent wall<->page offset
+  computations agree within 7 ms). The eval pipeline is exonerated — again.
+- fn PREFIX incl. trace_emitter/frame_hash/frame_cache chunks: 0 ms
+  (t1=t2=t2a=t2b=t2c, same millisecond, every invocation). The chunks,
+  the consts, getElementById: all exonerated.
+- POST-PATH JS: 0 ms — the warm instance EXECUTES sendTerminalEvent at
+  t1+~0 (a t2c-placed probe post carries hasDioxus=true hasSend=true).
+- THE STALL: the warm mount's bridge events ARRIVE AT RUST ~780-900 ms
+  after they were sent (t2c probe +787, bootstrap +788, assets +792,
+  js_ready +908 — one ordered train), while the gate fires at +700: the
+  events were QUEUED, not lost. The delayed leg is the GUI process's OWN
+  main loop — one thread runs the WebKit render churn of a spawn (the
+  [11.215] rAF-lag/settle family) AND the script-message IPC dispatch,
+  and under spawn churn the IPC delivery tail is ~0.8-0.9 s.
+- CONSEQUENCE, measured: the adaptive gate's decision
+  "pipeline_alive_eval_lost" MISREADS delayed-but-queued events — the
+  probe's ANSWER path (eval completion) does not ride the script-message
+  IPC leg, so a fast probe answer cannot certify EVENT delivery. Per
+  spawn on the settled-GUI rig: mount_eval_warm -> vanish_redo_cold ->
+  terminal_mount_task_dropped -> remount, x23 cycles, 0 mount_open —
+  every cycle parks the same way (the warm instance AND its redo both
+  lose the race to the task drop), mount_epoch_reused x6. The remount
+  amplification is itself churn that feeds the stall.
+
+FIX DIRECTION (sharpened): the gate cannot see this class from the eval
+plane. (a) Counting any bridge event as liveness is insufficient alone —
+the first event arrives at +787, AFTER the +700 gate. The honest fix is
+(b) read TERMINAL_WARM_EVAL_ALIVE_REDO_MS as sitting inside a measured
+0.8-0.9 s IPC delivery tail and key the redo on delivery evidence (first
+debug-kind event RECEIPT, not js-ready-class only), or (c) attack the
+tail itself: the churn congesting the loop is the per-spawn remount storm
+— the [11.215] render-span lever (epoch-reused surfaces re-parent+fit,
+not remount) is the load-bearing fix; the [11.214] daemon-lock family
+owns the keep-alive leg of the same window. The sub-second warm spawn
+this entry wants is bought on (c), not on the gate.
+
+RIG RECIPE: /tmp/warmladder-rig.sh on dev (Xvfb :78; the readiness gate
+waits for a GUI CLIENT COUNT > 0 — a daemon answering is NOT a GUI
+attached: run2 raced this and every spawn failed "no client to drive");
+readout /tmp/warmladder-readout.py; traces /tmp/warmladder-home-*/ytrace.jsonl.
+The ladder stamps: window.__yggWarmLadder pushes in terminal_scripts.rs
+(warm script IIFE, fn entry, post-chunk x3, cold redo IIFE, pipeline
+probe) + the bootstrap message carries ladder+postNow — rebuild them from
+lane/integration/11178-warm-ladder (diagnostic-only, not merged).
+
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
