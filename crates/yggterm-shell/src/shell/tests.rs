@@ -10957,7 +10957,7 @@ const term = {
         },
     },
 };
-const host = null;
+const host = { getAttribute: () => '' };
 const document = { hidden: false };
 const window = {
     performance: { now: () => clock },
@@ -11137,7 +11137,7 @@ const term = {
         },
     },
 };
-const host = null;
+const host = { getAttribute: () => '' };
 const document = { hidden: false };
 const window = {
     performance: { now: () => clock },
@@ -22656,7 +22656,7 @@ console.log('ok');
             warm.len()
         );
         assert!(warm.contains("__yggtermMountParams ="));
-        assert!(warm.contains("await window.__yggtermMountFn();"));
+        assert!(warm.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt);"));
 
         let probe = terminal_mount_fn_probe_script();
         // ⛔ Bridge contract (live-proven 2026-09-27): the eval bridge wraps
@@ -22668,13 +22668,13 @@ console.log('ok');
         assert!(probe.trim_start().starts_with("return "), "the probe must cross the eval bridge via a top-level return - bare expressions and IIFE returns are both dropped");
         assert!(!probe.trim_start().starts_with("("), "an IIFE probe answers null on the live bridge");
         assert!(probe.contains("Boolean(window.__yggtermMountFn)"));
-        assert!(probe.contains("__yggtermMountFnV === 1"));
+        assert!(probe.contains(&format!("__yggtermMountFnV === {TERMINAL_MOUNT_FN_VERSION}")));
 
         let cold = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        assert!(cold.contains("window.__yggtermMountFnV = 1"));
-        assert!(cold.contains("window.__yggtermMountFn = async () =>"));
+        assert!(cold.contains(&format!("window.__yggtermMountFnV = {TERMINAL_MOUNT_FN_VERSION}")));
+        assert!(cold.contains("window.__yggtermMountFn = async (__yggAttempt) =>"));
         assert!(cold.contains("const __mp = window.__yggtermMountParams || {};"));
-        assert!(cold.contains("await window.__yggtermMountFn();"));
+        assert!(cold.contains("await window.__yggtermMountFn("));
         // The body must read its identity from the per-mount params, never
         // bake it in: a baked host id would silently serve one session's
         // mount fn to another after the fn is cached in the page.
@@ -71452,11 +71452,150 @@ mod web_surface_immersion_locks {
             "shell.mark_terminal_open_attempt_ready_for_session(&session_path, \"reveal_retained_host\",)",
             "\"terminal_mount\", \"reveal_served\"",
             "terminal_reveal_stamp_script(&session_path, &host_id,)",
-            "let bootstrap_schedule_candidate = bootstrap_schedule_candidate && !reveal_raise_eligible",
+            "bootstrap_schedule_candidate && !reveal_raise_eligible && !reparent_raise_probe_needed",
         ] {
             assert!(
                 seam_contains(SHELL_SOURCE, needle),
                 "the reveal raise lost a load-bearing wire: {needle:?}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // [11.215] THE EPOCH-REUSE RE-PARENT RAISE. A split create re-creates
+    // the member's host element while the mount epoch is REUSED; the
+    // measured refusing arm of the reveal raise on that path is
+    // was_ever_ready (split rig 2026-10-03: every refusal carried
+    // has_host_epoch=true, transport_degraded=false, was_ever_ready=FALSE).
+    // These locks pin the arm, its state gate, and the probe's verdict
+    // contract.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_reparent_gate_serves_where_the_reveal_gate_refused_on_ready_history() {
+        // THE measured lock: the split-member class has a host epoch and a
+        // live pumping loop but no ready-history latch yet — the reveal
+        // raise refused exactly here and both panes paid the full remount.
+        let session_path = "local://reparent-ready-history-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        shell.terminal_sessions_reached_ready.remove(session_path);
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "pre-condition: the reveal gate refuses on ready history"
+        );
+        super::bump_terminal_loop_heartbeat(session_path);
+        assert!(
+            shell.terminal_host_ready_for_reparent_raise(session_path),
+            "a live pumping loop with a host epoch must re-parent, not remount"
+        );
+    }
+
+    #[test]
+    fn a_stale_or_silent_loop_never_reparents() {
+        // [11.187] the freeze guard: retained pixels with no pumping loop
+        // must take the bootstrap, never a raise on a stale frame.
+        let session_path = "local://reparent-stale-loop-test";
+        let shell = shell_with_a_ready_retained_host(session_path);
+        // Silent loop (no beat at all) and stale loop (beat older than
+        // TERMINAL_LOOP_STALE_MS) both refuse.
+        {
+            let mut beats = super::TERMINAL_LOOP_HEARTBEATS.lock().unwrap();
+            beats.remove(session_path);
+        }
+        assert!(
+            !shell.terminal_host_ready_for_reparent_raise(session_path),
+            "a loop that has never beat must not be raised on"
+        );
+        super::bump_terminal_loop_heartbeat(session_path);
+        {
+            let mut beats = super::TERMINAL_LOOP_HEARTBEATS.lock().unwrap();
+            if let Some(at) = beats.get_mut(session_path) {
+                *at = wall_now_ms().saturating_sub(super::TERMINAL_LOOP_STALE_MS + 1_000);
+            }
+        }
+        assert!(
+            !shell.terminal_host_ready_for_reparent_raise(session_path),
+            "a heartbeat-stale loop must take the bootstrap, not a raise"
+        );
+    }
+
+    #[test]
+    fn the_reparent_gate_keeps_the_dead_surface_guards() {
+        let session_path = "local://reparent-degraded-guard-test";
+        let mut shell = shell_with_a_ready_retained_host(session_path);
+        super::bump_terminal_loop_heartbeat(session_path);
+        shell.set_terminal_surface_status(
+            session_path,
+            true,
+            false,
+            0,
+            "reparent-degraded-lock",
+        );
+        assert!(
+            !shell.terminal_host_ready_for_reparent_raise(session_path),
+            "a degraded surface must recover, not re-parent"
+        );
+    }
+
+    #[test]
+    fn the_reparent_probe_verdicts_are_the_raise_contract() {
+        let script = terminal_reparent_probe_script("host-id-reparent-test");
+        // The shape law: a value crosses ONLY via a top-level return.
+        for needle in [
+            "return 3;",
+            "return 2;",
+            "return 1;",
+            "return 0;",
+            "window.__yggtermXtermHosts",
+            "document.getElementById(\"host-id-reparent-test\")",
+        ] {
+            assert!(
+                script.contains(needle),
+                "the re-parent probe lost a load-bearing wire: {needle:?}"
+            );
+        }
+        // The husk guard: a bare .xterm root with no screen must be
+        // declined — moving a husk is powerless (the attachTerminalSurfaceToHost SSOT).
+        assert!(
+            script.contains(".xterm-screen"),
+            "the probe must refuse to re-parent a husk element"
+        );
+    }
+
+    #[test]
+    fn the_reparent_raise_composes_the_ssot_redraw_and_spells_no_second_reattach() {
+        let script = terminal_reparent_raise_script("host-id-reparent-test", true);
+        assert!(
+            script.contains("entry.redrawTerminal(\"epoch_reuse_reparent_11215\")"),
+            "the raise must compose the registry's redrawTerminal — a second re-attach spelling is how the guards drift"
+        );
+        for forbidden in ["appendChild", "term.open(", "new Terminal("] {
+            assert!(
+                !script.contains(forbidden),
+                "the raise must not spell its own re-attach ({forbidden:?})"
+            );
+        }
+        assert!(
+            script.contains("entry.focusTerminal()"),
+            "a focused member's raise must hand focus to the live term"
+        );
+    }
+
+    #[test]
+    fn the_reparent_arm_runs_only_after_the_reveal_and_re_arms_on_refusal() {
+        let viewport = include_str!("viewport.rs");
+        for needle in [
+            "let reparent_raise_probe_needed = bootstrap_schedule_candidate",
+            "&& !reveal_raise_eligible",
+            "shell.terminal_host_ready_for_reparent_raise(&session_path)",
+            "if *task_latch.borrow() == probe_key {",
+            "\"reparent_retained_host\"",
+            "\"reparent_served\"",
+            "\"reparent_raise_refused\"",
+        ] {
+            assert!(
+                viewport.contains(needle),
+                "the re-parent raise lost a load-bearing wire: {needle:?}"
             );
         }
     }

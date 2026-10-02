@@ -15980,6 +15980,94 @@ fn terminal_scroll_control_script(session_path: &str, action: &'static str) -> S
     )
 }
 
+/// [11.215] THE EPOCH-REUSE RE-PARENT PROBE. A split create re-creates the
+/// pane-embedded member's host ELEMENT (same id, fresh node) while the
+/// session's mount epoch is REUSED — the page's `__yggtermXtermHosts` entry
+/// still owns a LIVE term whose element is simply parented to the discarded
+/// node. The full mount pipeline re-runs anyway today (measured 2026-09-29
+/// ~22:25 IST, claim ACK-4dc8694001: mount_eval_warm +221 ms, warm eval
+/// vanish +924, first pane paint ~1.05 s behind a ~130 ms DOM stamp). This
+/// probe answers whether the cheap path can serve instead: re-parent the
+/// live element into the fresh node and fit.
+///
+/// Verdicts (⛔ the eval bridge shape law: a value crosses ONLY via a
+/// TOP-LEVEL `return` — a bare expression's completion value and an
+/// IIFE-without-return are both dropped):
+///   * `2` — a live entry with a complete term exists, the current host
+///     element is connected, and the term's element is OUTSIDE it: the
+///     re-parent raise serves.
+///   * `1` — the term is already inside the current host (the retained /
+///     reveal class): nothing to re-parent; the caller falls through.
+///   * `3` — the host element is not in the document YET (the DOM commit
+///     can lag the probe; the caller retries briefly before believing it).
+///   * `0` — no servable entry (no entry, no term, a husk element): the
+///     bootstrap path stands, immediately — a genuine first mount must not
+///     pay the retry budget for an entry that cannot exist.
+pub fn terminal_reparent_probe_script(host_id: &str) -> String {
+    format!(
+        r#"
+        const host = document.getElementById({host_id:?});
+        if (!host || !host.isConnected) {{
+            return 3;
+        }}
+        const registry = window.__yggtermXtermHosts || {{}};
+        const entry = registry[{host_id:?}] || null;
+        if (!entry || !entry.term || typeof entry.redrawTerminal !== "function") {{
+            return 0;
+        }}
+        const term = entry.term;
+        const termElement = term && term.element ? term.element : null;
+        if (!termElement) {{
+            return 0;
+        }}
+        // A husk is not a surface (the SSOT comment on
+        // `attachTerminalSurfaceToHost`): a bare `.xterm` root with no
+        // screen under it must be rebuilt by the bootstrap, not moved.
+        const surfaceComplete = Boolean(
+            termElement.querySelector
+                && termElement.querySelector(".xterm-screen")
+        );
+        if (!surfaceComplete) {{
+            return 0;
+        }}
+        if (host.contains(termElement)) {{
+            return 1;
+        }}
+        return 2;
+        "#
+    )
+}
+
+/// [11.215] THE EPOCH-REUSE RE-PARENT RAISE. Moves the LIVE term's element
+/// into the re-created host and fits — one redraw, no mount pipeline, no
+/// supersede of the owning read loop. `entry.redrawTerminal` is the SSOT
+/// re-attach primitive (rebind → repair → fit → refresh → paint), so the
+/// raise composes it instead of spelling a second re-attach — a second
+/// spelling is how the rebind guards drift apart.
+///
+/// Returns `1` when the redraw ran, `0` when the entry vanished or declined
+/// (the caller must then fall back to the bootstrap path).
+pub fn terminal_reparent_raise_script(host_id: &str, focus: bool) -> String {
+    format!(
+        r#"
+        const registry = window.__yggtermXtermHosts || {{}};
+        const entry = registry[{host_id:?}] || null;
+        if (!entry || !entry.term || typeof entry.redrawTerminal !== "function") {{
+            return 0;
+        }}
+        try {{
+            entry.redrawTerminal("epoch_reuse_reparent_11215");
+        }} catch (_error) {{
+            return 0;
+        }}
+        if ({focus} && typeof entry.focusTerminal === "function") {{
+            try {{ entry.focusTerminal(); }} catch (_error) {{}}
+        }}
+        return 1;
+        "#
+    )
+}
+
 #[cfg(test)]
 mod flood_adaptive_paint_tests {
     use super::*;
