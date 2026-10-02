@@ -5656,8 +5656,15 @@ fn TerminalCanvas(
     // itself. A refused probe RE-ARMS the schedule candidate (guarded on
     // the key) so the bootstrap path runs exactly as before -- the raise
     // can never strand a pane that only a mount could fill.
+    // A key the probe already REFUSED must not probe again: the refusal
+    // re-arms the bootstrap below, and a re-probe would re-suppress it —
+    // the deadlock that left both split panes unmounted on the first rig
+    // run of this very fix (host_missing x2, no mount ever scheduled).
+    let reparent_probe_refused = *reparent_probe_identity.borrow()
+        == format!("{combined_bootstrap_key}:refused");
     let reparent_raise_probe_needed = bootstrap_schedule_candidate
         && !reveal_raise_eligible
+        && !reparent_probe_refused
         && state.with(|shell| shell.terminal_host_ready_for_reparent_raise(&session_path));
     if reparent_raise_probe_needed {
         let probe_key = combined_bootstrap_key.clone();
@@ -5668,6 +5675,7 @@ fn TerminalCanvas(
             let host_id = host_id.clone();
             let trace_home = trace_home.clone();
             let task_latch = bootstrap_task_identity.clone();
+            let reparent_probe_identity_for_task = reparent_probe_identity.clone();
             let reparent_focus = host_is_active_session;
             let reparent_mount_epoch = mount_epoch;
             let reparent_mount_identity = mount_identity.clone();
@@ -5678,9 +5686,12 @@ fn TerminalCanvas(
                 // 80 x 25 ms retries), so ONLY the not-yet-in-DOM verdict
                 // (3) is retried. A no-entry verdict (0) is FINAL — a
                 // genuine first mount has no registry entry and must not
-                // pay a retry budget for one that cannot exist.
+                // pay a retry budget for one that cannot exist. The retry
+                // budget is short because an id whose element will NEVER
+                // exist (a bumped epoch's old canvas) is billed to the
+                // pane's own bootstrap latency.
                 let mut verdict: Option<i64> = None;
-                for _ in 0..30 {
+                for _ in 0..10 {
                     if let Some(value) = document::eval(&terminal_reparent_probe_script(&host_id))
                         .await
                         .ok()
@@ -5734,6 +5745,14 @@ fn TerminalCanvas(
                 // be clobbered by this older probe's refusal.
                 if *task_latch.borrow() == probe_key {
                     *task_latch.borrow_mut() = String::new();
+                }
+                // Mark the KEY refused (the probe latch doubles as the
+                // refusal memory): the next render's candidate must take
+                // the bootstrap path, not re-probe this key.
+                if let Ok(mut latch) = std::rc::Rc::clone(&reparent_probe_identity_for_task)
+                    .try_borrow_mut()
+                {
+                    *latch = format!("{probe_key}:refused");
                 }
                 append_trace_event(
                     &trace_home,
