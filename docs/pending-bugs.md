@@ -392,7 +392,7 @@ the bridge POST path, not the eval dispatch path.
 
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
-**Status:** FIXED IN CODE — remote arm rig-proven; live-desktop falsifier owed on the owner's next GUI rotation
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 FIXED 2026-10-02 (lane/integration/11179-remote-raise, zcode on jojo work FROM
 dev; the remote-ownership story). ROOT: the ce64fc1d gate asked
@@ -435,6 +435,10 @@ builds): a row switched away from within ~1-2 s of attach_ready never
 completes its reveal-ready latch (the latch arms need the visible surface) and
 the next switch re-bootstraps it. Benign at human cadence; the file for the
 next felt-switch pass.
+
+LIVE PROOF OWED (falsifier): on the owner's next GUI rotation after deploy, a
+retained REMOTE row raises instead of remounting — remote reveal_served > 0,
+warm refusals 0 on the live desktop.
 
 OPS ALONG THE WAY (2026-10-02): oc carried a 6.1-DAY pre-fix [11.182]-class
 walker holding the install flock (pid 17357 + two stuck mimo children) —
