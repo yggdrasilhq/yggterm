@@ -3637,6 +3637,12 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let inactive_bootstrap_skip_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    // [11.215] The re-parent raise's probe dedup: one probe per combined
+    // bootstrap key (a NEWER open request re-arms the candidate on its own
+    // key and may spawn its own probe; the older probe's refusal is guarded
+    // on its key and can never clobber it).
+    let reparent_probe_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let existing_lease_skip_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let retained_recovery_watch_identity =
@@ -3852,7 +3858,7 @@ fn TerminalCanvas(
             let timer_last_bootstrap_identity = last_bootstrap_identity.clone();
             let timer_terminal_live_host_connected = terminal_live_host_connected;
             let mut timer_resume_overlay_slow = resume_overlay_slow;
-            let state = state;
+            let mut state = state;
             let session_path = session_path.clone();
             let session_host_label = session_host_label.clone();
             spawn(async move {
@@ -3919,7 +3925,7 @@ fn TerminalCanvas(
             let mut timer_resume_overlay_timed_out = resume_overlay_timed_out;
             let timer_bootstrap_lease_identity = bootstrap_identity.clone();
             let timer_trace_home = trace_home.clone();
-            let state = state;
+            let mut state = state;
             let session_path = session_path.clone();
             let session_host_label = session_host_label.clone();
             spawn(async move {
@@ -4142,7 +4148,7 @@ fn TerminalCanvas(
             let ceiling_resume_overlay_timed_out = resume_overlay_timed_out;
             let ceiling_resume_overlay_failed = resume_overlay_failed;
             let timer_trace_home = trace_home.clone();
-            let state = state;
+            let mut state = state;
             let session_path = session_path.clone();
             let host_id_for_ceiling = host_id.clone();
             spawn(async move {
@@ -5469,7 +5475,7 @@ fn TerminalCanvas(
             let cancel_session_path = session_path.clone();
             let cancel_trace_home = trace_home.clone();
             let cancel_bootstrap_identity = bootstrap_identity.clone();
-            let state = state;
+            let mut state = state;
             spawn(async move {
                 sleep(Duration::from_millis(
                     INACTIVE_BOOTSTRAP_SKIP_CANCEL_GRACE_MS,
@@ -5628,7 +5634,125 @@ fn TerminalCanvas(
             &host_id,
         ));
     }
-    let bootstrap_schedule_candidate = bootstrap_schedule_candidate && !reveal_raise_eligible;
+    // [11.215] THE EPOCH-REUSE RE-PARENT RAISE. The third raise arm, for
+    // the split restructure: the pane embedding RE-CREATES the member's
+    // host element while the mount epoch is REUSED, so neither the reveal
+    // raise (its state gate measured refusing with was_ever_ready=false on
+    // exactly this path, and a CSS flip cannot fill a fresh node anyway)
+    // nor the retention skip can serve -- today both members then pay the
+    // FULL mount pipeline on a surface that is still live (the measured
+    // chain: mount_eval_warm -> warm_eval_vanish_redo_cold -> first pane
+    // paint ~1.05 s behind a ~130 ms DOM stamp). When the page registry
+    // still holds a LIVE term for this exact host id whose element is
+    // merely OUTSIDE the re-created node, the cheap path serves: ONE redraw
+    // re-parents the live element into the fresh host and fits (the
+    // registry's own redrawTerminal -- the SSOT re-attach primitive), no
+    // mount eval, no ensure, and CRUCIALLY no new lease/owner, so the
+    // owning read loop keeps pumping instead of being superseded
+    // (terminal_mount_task_dropped measured once per create before).
+    // The state gate keeps every guard that protects a DEAD surface
+    // ([11.187] heartbeat, latched failures, [11.179] remote proof,
+    // degraded transport); the page probe declines everything else by
+    // itself. A refused probe RE-ARMS the schedule candidate (guarded on
+    // the key) so the bootstrap path runs exactly as before -- the raise
+    // can never strand a pane that only a mount could fill.
+    let reparent_raise_probe_needed = bootstrap_schedule_candidate
+        && !reveal_raise_eligible
+        && state.with(|shell| shell.terminal_host_ready_for_reparent_raise(&session_path));
+    if reparent_raise_probe_needed {
+        let probe_key = combined_bootstrap_key.clone();
+        if *reparent_probe_identity.borrow() != probe_key {
+            *reparent_probe_identity.borrow_mut() = probe_key.clone();
+            let mut state = state;
+            let session_path = session_path.clone();
+            let host_id = host_id.clone();
+            let trace_home = trace_home.clone();
+            let task_latch = bootstrap_task_identity.clone();
+            let reparent_focus = host_is_active_session;
+            let reparent_mount_epoch = mount_epoch;
+            let reparent_mount_identity = mount_identity.clone();
+            let reparent_open_request_id = latest_open_request_id;
+            spawn(async move {
+                // The re-created element can lag this task by a DOM commit
+                // (the mount body itself waits out the same race with
+                // 80 x 25 ms retries), so ONLY the not-yet-in-DOM verdict
+                // (3) is retried. A no-entry verdict (0) is FINAL — a
+                // genuine first mount has no registry entry and must not
+                // pay a retry budget for one that cannot exist.
+                let mut verdict: Option<i64> = None;
+                for _ in 0..30 {
+                    if let Some(value) = document::eval(&terminal_reparent_probe_script(&host_id))
+                        .await
+                        .ok()
+                        .and_then(|value| value.as_i64())
+                    {
+                        verdict = Some(value);
+                        if value != 3 {
+                            break;
+                        }
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+                let mut served = false;
+                if verdict == Some(2) {
+                    served = document::eval(&terminal_reparent_raise_script(
+                        &host_id,
+                        reparent_focus,
+                    ))
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_i64())
+                        == Some(1);
+                }
+                if served {
+                    state.with_mut_counted(|shell| {
+                        shell.mark_terminal_open_attempt_ready_for_session(
+                            &session_path,
+                            "reparent_retained_host",
+                        );
+                    });
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "reparent_served",
+                        json!({
+                            "session_path": session_path,
+                            "host_id": host_id,
+                            "mount_epoch": reparent_mount_epoch,
+                            "mount_identity": reparent_mount_identity,
+                            "open_request_id": reparent_open_request_id,
+                            "focus": reparent_focus,
+                        }),
+                    );
+                    return;
+                }
+                // REFUSED (no live entry, husk, retained-in-place, or the
+                // redraw declined): re-arm the candidate so the next render
+                // takes the bootstrap path. Guarded on the key -- a NEWER
+                // open request that already re-armed the latch must never
+                // be clobbered by this older probe's refusal.
+                if *task_latch.borrow() == probe_key {
+                    *task_latch.borrow_mut() = String::new();
+                }
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "reparent_raise_refused",
+                    json!({
+                        "session_path": session_path,
+                        "host_id": host_id,
+                        "mount_epoch": reparent_mount_epoch,
+                        "verdict": verdict,
+                        "open_request_id": reparent_open_request_id,
+                    }),
+                );
+            });
+        }
+    }
+    let bootstrap_schedule_candidate =
+        bootstrap_schedule_candidate && !reveal_raise_eligible && !reparent_raise_probe_needed;
     let should_schedule_bootstrap = bootstrap_schedule_candidate
         && state.with_mut_counted(|shell| {
             acquire_terminal_bootstrap_lease(
@@ -5903,7 +6027,7 @@ fn TerminalCanvas(
             }),
         );
         if watch_startup_restore_recovery {
-            let state = state;
+            let mut state = state;
             spawn(async move {
                 sleep(Duration::from_millis(
                     STARTUP_TERMINAL_RESTORE_RECOVERY_MS.saturating_add(250),
@@ -10003,7 +10127,7 @@ fn TerminalCanvas(
                             }
                             Ok(TerminalJsEvent::ClipboardPasteRequest) => {
                                 warn!(session=%session_path, "terminal clipboard paste request");
-                                let state = state;
+                                let mut state = state;
                                 let session_path = session_path.clone();
                                 let host_id = host_id.clone();
                                 spawn(async move {
@@ -10111,7 +10235,7 @@ fn TerminalCanvas(
                                 });
                             }
                             Ok(TerminalJsEvent::ClipboardImageRequest) => {
-                                let state = state;
+                                let mut state = state;
                                 let session_path = session_path.clone();
                                 spawn(async move {
                                 let paste_result =

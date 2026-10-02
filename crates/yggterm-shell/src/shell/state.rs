@@ -11726,7 +11726,7 @@ mod teardown_honesty_locks {
             // …its answer reaches the verdict…
             "remote_runtime_after,",
             // …and the ssh round trip stays OFF the render loop.
-            "\"app_control_remove_session_remote_liveness\",",
+            "\"stage\": \"liveness_done\",",
         ] {
             assert!(
                 arm.contains(needle),
@@ -31468,6 +31468,49 @@ impl ShellState {
                 return false;
             }
         }
+        if self.terminal_session_uses_remote_runtime(session_path)
+            && !self.terminal_runtime_provably_live(session_path)
+        {
+            return false;
+        }
+        !self
+            .terminal_surface_status_for_path(session_path)
+            .is_some_and(|status| status.transport_degraded)
+    }
+    /// [11.215] THE RE-PARENT RAISE'S STATE GATE. A split create re-creates
+    /// the member's host element while the mount epoch is REUSED, and the
+    /// measured refusing arm of the reveal raise on that path is
+    /// `was_ever_ready` (split rig 2026-10-03, 3 rows x 3 creates: every
+    /// refusal carried has_host_epoch=true, transport_degraded=false,
+    /// was_ever_ready=FALSE — the ready-history latch lags the split
+    /// members, and both panes then paid the full remount). This gate
+    /// therefore witnesses the canvas through the PAGE registry instead
+    /// (the probe declines a missing entry, a husk element, or a
+    /// disconnected host by itself) and keeps only the guards that protect
+    /// against raising a DEAD surface — the same guards the reveal raise
+    /// keeps:
+    fn terminal_host_ready_for_reparent_raise(&self, session_path: &str) -> bool {
+        // [11.187] RETAIN-HOST LIVENESS: the Ready paint truth can outlive
+        // the loop that earned it. A host whose mount loop is
+        // heartbeat-stale — or has never beaten at all, which for this gate
+        // (no ready-history requirement) is the never-mounted class the
+        // reveal gate covers elsewhere — must NOT be re-parented on its
+        // stale frame: the raise would swallow the schedule candidate and
+        // the freeze (retained pixels, no output, no input) would stand
+        // forever.
+        match terminal_loop_heartbeat_age_ms(session_path) {
+            Some(age) if age < TERMINAL_LOOP_STALE_MS => {}
+            _ => return false,
+        }
+        if let Some(attempt) = self.latest_terminal_open_attempt_for_path(session_path) {
+            if attempt.latched_failure_reason.is_some()
+                || matches!(attempt.state, TerminalOpenAttemptState::Recovering)
+            {
+                return false;
+            }
+        }
+        // [11.179] the remote arm's proof: a remote row raises on its own
+        // fresh full-chain read answer, never on bare daemon ownership.
         if self.terminal_session_uses_remote_runtime(session_path)
             && !self.terminal_runtime_provably_live(session_path)
         {
