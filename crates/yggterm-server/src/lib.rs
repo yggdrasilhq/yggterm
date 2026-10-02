@@ -8910,8 +8910,10 @@ impl YggtermServer {
             if let Some(cwd) = session_metadata_value(session, "Cwd") {
                 let carried_repoint_identity =
                     funnel_carried_identity_exports(Some(&session.launch_command));
+                let rebind_home = self.user_home.as_deref();
                 session.launch_command = if vouch_from_store {
-                    stored_session_launch_command_for_locality_with_options_and_identity(
+                    stored_session_launch_command_for_locality_with_options_and_identity_in(
+                        rebind_home,
                         session.kind,
                         &cwd,
                         session_id,
@@ -39273,8 +39275,45 @@ fn stored_session_launch_command_for_locality_with_options_and_identity(
     launch: &AgentLaunchOptions,
     carried_identity_exports: Option<&[String]>,
 ) -> String {
+    stored_session_launch_command_for_locality_with_options_and_identity_in(
+        None,
+        kind,
+        cwd,
+        session_id,
+        is_local,
+        ssh_target,
+        launch,
+        carried_identity_exports,
+    )
+}
+
+/// The locality builder against an explicit home. The unseamed law vouches
+/// through `dirs::home_dir()` at call time, so a server whose homes are
+/// birth-resolved (every test server via `rooted_at`, and the env-crosstalk
+/// window a DECLARED mutator can open mid-process) asks a stranger's store:
+/// on any host with a real antigravity store the fixture id vouches
+/// `Some(false)` and the rebind rebuilds a FRESH command, which is the
+/// machine-sensitive server-lib red measured on dev 2026-10-03 (green under
+/// an empty HOME, red under the real one). `None` keeps the process home —
+/// byte-identical for every other caller.
+fn stored_session_launch_command_for_locality_with_options_and_identity_in(
+    home: Option<&std::path::Path>,
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    is_local: bool,
+    ssh_target: Option<&str>,
+    launch: &AgentLaunchOptions,
+    carried_identity_exports: Option<&[String]>,
+) -> String {
     let vouch = is_local
-        .then(|| local_agent_store_vouches_for_session(kind, session_id))
+        .then(|| {
+            home.map(std::path::Path::to_path_buf)
+                .or_else(dirs::home_dir)
+                .and_then(|resolved| {
+                    local_agent_store_vouches_for_session_in(&resolved, kind, session_id)
+                })
+        })
         .flatten();
     stored_session_launch_command_from_vouch_with_identity(
         kind,
