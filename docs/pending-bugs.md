@@ -140,6 +140,23 @@ accept even lockless when the lock is UNHELD (nobody can be mid-takeover);
 DOWN and the stale daemon is the cause" case — deferring the rotation
 preserves one working row at the cost of every new spawn.
 
+UPDATE 2026-10-03 ~19:0x IST (same seat, addendum): REMEDY LANDED BY THE
+TRAIN — the train-restore subscribe (lane/ci/train-restore, this seat;
+the 18:28 sweep had left yggterm with ZERO subs so the watcher's tick
+returned "no subscriptions — nothing to do" BEFORE the main-moved trigger
+— a project with no subs is not under the plane's watch, and the
+docs-push-is-a-deploy law silently died with it) woke the plane, the
+18:42 tick built main b8ec32c7 and deployed, and the successor daemon
+3419462 (born 18:46) FINALLY TOOK THE BIND LOCK — the rotation the 17:03
+and 17:41 deploys could not land. FALSIFIER LEG MET: a hand
+`server remote start-agy` mint on the rotated daemon painted its CLI
+(chars 0 → 440, running:true) where the same verb had failed "did not
+become reachable" twice on the stale daemon. The structural defect STAYS
+OPEN: a deploy that retires a live daemon's bind lock without a successor
+still defeats the [11.159] accept arm for the whole window (fix
+directions above unchanged; the window this time was 17:03→18:46, ~1 h 43
+min of dead spawn plane on the integration host).
+
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
 **Status:** AWAITING A DECISION
@@ -31472,6 +31489,15 @@ squished viewport local-fit vs remote-PTY geometry fight) remains the open
 lane with its fix shape unchanged (fit must propose-and-FORWARD on confirmed
 remote resize; the xterm-harness GUI lane).
 
+UPDATE 2026-10-03 ~19:2x IST (same seat, final): the deferred E2E
+re-verification RAN GREEN on the healed stack (post-[11.225]-rotation
+daemon 3419462, build b8ec32c7): defmiss_fresh_start_mint,
+store_absent_no_candidate_refuses, and the full probe — see the close
+commits for the tally. SYMPTOM 1 is now independently verified from both
+sides (the 12/12 full-window hunt on jojo + the E2E pass on dev). SYMPTOM
+2 (the squished viewport local-fit vs remote-PTY geometry fight) remains
+this entry's open lane with its fix shape unchanged.
+
 ## ⛔ [11.187] A REMOTE ROW'S OUTPUT STREAM DIES SECONDS AFTER BIRTH AND NOTHING EVER RECONCILES — THE ROW STAYS ACTIVE, THE DAEMON'S OWN SCREEN MOVES ON, AND THE VIEWPORT FREEZES ON THE BIRTH PAINT FOREVER (measured 2026-09-27 19:35-19:41 IST live on the owner's GUI, the [11.187] sitting; owner screenshot: "New dev Antigravity" frozen at "Signing in…")
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -31555,59 +31581,4 @@ code-side read of the landed lock sites is owed; (c) the escalation arm
 (defect #3) remains un-landed and the orphan class it would reap is real
 ([11.224]: two PPID-1 mimo orphans, one 5 d 20 h old, ops-cleared). Status
 stays OPEN on [11.224]'s convergence + the lock-span code read.
-
-## ⛔ [11.183] THE AGY ROW→CONVERSATION BINDING IS PERSISTED NOWHERE ON THE ROW — RE-BIRTH ORPHANS THE ROW FROM ITS STORE CONVERSATION; PRE-[11.165] THIS ATE SESSIONS SILENTLY (FABRICATE), POST-[11.165] IT REFUSES AND THE ROW HANGS IN "Bootstrapping · idle" FOREVER (measured 2026-09-27, jojo + dev, the owner's five work rows)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-E2E-PROVEN 2026-09-27 ~22:2x IST (the [11.187] sitting): tools/e2e/connection_probe.py scenario `rebirth_uuid_lands_on_store_candidate_11183` proves the ladder lands a store-absent uuid on ITS conversation (a connect without the vouch trace fails as possible fabrication). Full probe 5/5 on the live fixed dev stack.
-
-FIXED IN CODE 2026-09-27 evening (same seat): (a) THE ENSURE-SIDE VOUCH LADDER — the peer-side ensure now mirrors opencode's ladder for Antigravity: on a DEFINITIVE store miss (`Some(false)` only; `None` never vouches) for an addressed `--require-existing` row the daemon does not hold, the store is asked for the newest conversation of the row's own cwd and the resume re-points to it — traced `agy_store_candidate_vouch {requested_id, vouched_id, vouched_title, cwd}`, bus-notified as `StoreCandidateResume`, and the ladder runs BEFORE the [11.165] gate so a vouched id passes it. Source-law test: `the_agy_ladder_precedes_the_gate_and_the_binding_is_stamped_on_the_row`. (b) THE CANDIDATE ARM TIGHTENED — `store_candidate_session_for_directory(Antigravity)` no longer substring-matches `workspace_uris` (a `/home/pi` row vouched a `/home/pi/sol-correction/…` conversation — the store's newest-modified row WAS that interloper): exact `"file://<cwd>"` element match, killed excluded (type-agnostic column reads), recency = the user's own `last_user_input_time` (a typed conversation always outranks a never-typed one whose background agents churned `last_modified_time`). Fixture tests: `agy_store_candidate_tests` ×4, on the measured pelvic-pain/repair-json shape. (c) THE BINDING PERSISTED ON THE ROW — the ensure stamps `Conversation: <id>` on the runtime row whenever the store vouches the id, and the start path stamps the birth id at birth, so a later re-birth carries what the daemon-lifetime twin used to hold alone. (d) THE PROBE — `rebirth_uuid_lands_on_store_candidate_11183` spawns a store-absent uuid over a store-holding cwd and asserts the row CONNECTS with the vouch trace present (a connect WITHOUT the trace fails as possible silent fabrication). Baseline on the UNFIXED daemon: RED with the owner's exact string.
-
-Owner data verified INTACT in the store; the GUI cannot reach it.
-
-Facts measured this sitting:
-- jojo's persisted row records (`~/.yggterm/server-state.json`, all six `remote-agy://dev/<uuid>` rows) carry NO conversation binding — the row `id` doubles as the resume id (`resume-agy <row-uuid>` is what the stored launch command runs). Contrast the claude_code rows: they carry `storage_path` pointing at their transcript.
-- The real conversation ids live only in ephemeral places: the runtime generation ([11.162] stamp is per-generation) and the DEV-side runtime twin record, whose `.id` field DOES carry the real conversation (dev `server-state.json`: key `agy-runtime://845ddc17…` → `id: e7693814…` = "Repair JSON Math Formatting", the store's newest entry).
-- The owner's bulk close re-birthed rows under new uuids ([11.156] class); every re-birthed row's uuid probes ABSENT in dev's agy store (`conversation_summaries.db` checked per id: 5 of 6 absent), so the [11.165] definitive-miss gate refuses (`saved Antigravity session … is no longer available`) and the row never leaves Bootstrapping. Before [11.165] the same resume FABRICATED a fresh conversation — the "deep and recurring" loss the owner has been feeling is this exact hole.
-- The store conversations survive: e.g. jojo row 102.1 "pelvic pain…" ↔ db `79189666…` "Pelvic Pain And Bridge Exercise" (Sep 26 17:09 IST); row 100.0 medgraph ↔ `656843b5…` "Medgraph Campaign And Traccar Run" (the 09-24 rebind target). Title-match is how I recovered them; the row cannot.
-
-Fix direction: (a) persist the bound conversation id on the ROW record at stamp/rebind time (a `storage_path`-class field; carried through close/tombstone/restore like terminal_identity_exports); (b) compose resume from the persisted binding, falling back to the row uuid; (c) an agy vouch ladder mirroring opencode's (focus stamp → store candidate by cwd/recency → honest fresh-start affordance) so a binding-less row lands on ITS conversation or an explicit new one — never an eternal Bootstrapping, never a silent fabrication.
-
-UPDATE 2026-10-03 ~18:3x IST (queue-completion seat, zcode sess_813045b5 on
-jojo, work FROM dev): independent re-verification ATTEMPTED and DEFERRED —
-the E2E probe's agy-spawning scenarios cannot run on dev tonight because of
-[11.225] (the spawn-plane outage: every start-path verb fails "local yggterm
-daemon did not become reachable"); rebirth_uuid_vouch PASSED in the same
-window (17:55, connecting through the serving daemon) and
-agy_store_candidate_vouch_refused_tombstoned fired naturally in production
-today 10:13 (the ladder + its tombstone guard live), so the fix keeps
-accumulating support. The full-probe green run that flips this entry is owed
-to the first seat after dev's daemon rotates ([11.225] remedy).
-
-## ⛔ [11.184] REMOTE AGY RESUME HITS `no terminal spec for session: agy-runtime://<uuid>` WHEN THE DEV-SIDE RUNTIME RECORD IS GONE — EVEN WHEN THE STORE HAS THE CONVERSATION; THE ENSURE'S OWN COMPOSE IS UNDONE BY THE TERMINAL-ENSURE KEY RESOLUTION (measured 2026-09-27, dev 3.2.113, row c70b6a9c whose conversation EXISTS in the db)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-E2E-PROVEN 2026-09-27 ~22:2x IST (the [11.187] sitting): tools/e2e/connection_probe.py scenario `resume_store_present_connects_11184` replays THIS entry's exact repro and CONNECTS; the owner row check ran the real thing — resume-agy 845ddc17 vouched to 79189666 Pelvic-Pain-And-Bridge-Exercise and the screen showed HIS transcript. Full probe 5/5 on the live fixed dev stack.
-
-ROOT CAUSE CORRECTED 2026-09-27 evening (same seat; the repro was re-run live and traced): the terminal-ensure bail was the SECOND failure, not the first. The ensure's insert ran into the [11.154] BIRTH VETO — the row's key is tombstoned (the owner's bulk close), the ensure inserts passively (`launch_now=false`), so `insert_live_session_with_launch_options` vetoed the insert, the get_mut block found nothing, and the ensure STILL returned Ok(key); the handler's terminal-ensure then died on the generic `no terminal spec`. The veto fired at 20:11:00 live (trace `live_session_birth_vetoed_closed_row` for `agy-runtime://c70b6a9c…`).
-
-FIXED IN CODE: (1) THE DELIBERATE RE-ENTRY — an addressed `--require-existing` open of a session the store vouches for (or a runtime the daemon holds) is the permissive open verb's peer, NOT a sweep's resurrection: `insert_live_session_with_launch_deliberate` inserts THROUGH the remembered close and `persist()`'s reconcile lifts the grave exactly as it already does for a user-driven start (traced `live_session_birth_deliberate_reentry`); sweeps and keep-alive re-ensures keep the veto. (2) NEVER ANSWER OK FOR A ROW THAT DOES NOT EXIST — the ensure now bails BY NAME (`ensure_runtime_row_absent_after_birth` trace + a message naming the remembered close) when its runtime row is absent after the birth, instead of handing the handler a key nothing answers to. Source-law test: `a_deliberate_reentry_lifts_a_remembered_close_and_a_vetoed_birth_never_answers_ok`. THE PROBE: `resume_store_present_connects_11184` replays THIS entry's repro (store-present conversation, no runtime record) and must CONNECT.
-
-Repro (original filing, kept): dev store has conversation `c70b6a9c-…` (db row verified, Sep 23); dev's daemon has NO `agy-runtime://c70b6a9c` record (post-reboot). `yggterm server remote resume-agy c70b6a9c-… /home/pi --require-existing` on dev → passes both [11.165] gates (store answers exists) → the ensure arm inserts the runtime row + sets `launch_command` (lib.rs `ensure_remote_runtime_agent_session`, the `sessions.get_mut(&key)` block) → the handler's `ensure_terminal_for_path_with_initial_size` then bails at daemon.rs:10687 `no terminal spec for session: {path}` — `terminal_spec` → `resolve_terminal_session_key` fails to resolve the very key the ensure just inserted/returned. The [11.162] classifier knows these words (its test literally uses `agy-runtime://b8f0c09d…`) and stamps the row, but there is NO healing arm: the row paints the raw error forever; birth (`start-agy`) through the same terminal-ensure works, so the seam is ensure-vs-resolve specific.
-
-Second half, same seam: when the dev-side twin record DOES exist, its `.id` (the real conversation) is IGNORED at recompose — the compose uses the request's session_id (the row uuid), so a held twin resumes by row id and agy fabricates a fresh conversation under it (peer-side [11.165] gate is skipped by `live_runtime_held` by design).
-
-Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the key the ensure just wrote (the alias seam — `local_runtime_id_from_key` → `local_live_runtime_key` vs `remote_runtime_agent_session_key` spellings), add the missing-record healing arm for agent runtimes (recompose spec from the descriptor + STORE-conversation id when the twin carries one), and add a repro test: ensure-then-terminal-ensure for a remote agent row with no pre-existing record.
-
-
-UPDATE 2026-10-03 ~18:3x IST (queue-completion seat, zcode sess_813045b5 on
-jojo, work FROM dev): independent re-verification ATTEMPTED and DEFERRED —
-the scenario's agy spawn cannot run on dev tonight because of [11.225] (the
-spawn-plane outage; resume_store_present failed twice on empty screens 17:50
-and 18:17 with the lock even free in the second window); the symptom stays
-dead in production (zero "no terminal spec" refusals across both trace
-generations since the fix landed). The full-probe green run that flips this
-entry is owed to the first seat after dev's daemon rotates ([11.225] remedy).
 
