@@ -858,46 +858,6 @@ The ladder stamps: window.__yggWarmLadder pushes in terminal_scripts.rs
 probe) + the bootstrap message carries ladder+postNow — rebuild them from
 lane/integration/11178-warm-ladder (diagnostic-only, not merged).
 
-## ⛔ [11.223] THE COMPOSER DRAFT-HOLD SILENTLY EATS PROGRAMMATIC MARKER SENDS — FIRST SEND ANSWERS accepted:true WHILE NOTHING EXECUTES, AND THE STUCK DRAFT THEN REFUSES EVERY LATER SEND (measured 2026-10-03 ~13:5x IST, jojo production GUI 8c9c7433, live shell row)
-
-**Status:** OPEN
-
-Filed 2026-10-03 by the [11.217] falsifier re-run sitting (zcode on jojo,
-work FROM dev; plan ACK-c645bc55ea). The uxprobe falsifier seeds per-member
-content markers with `server app terminal send <row> --data 'echo MARKER\n'`.
-
-THE MEASURED FACTS (a live `--kind shell` row, no human at the keyboard):
-send 1 (no trailing newline) answered accepted:true, bytes counted — and the
-payload sat in the row composer as a typed-but-unsent draft; nothing reached
-the PTY. send 2 (with newline) REFUSED: reason pending_draft_refusal,
-detail says a programmatic send would clobber a person words — but the only
-words there are the probe own prior send. An empty write (--data '') answers
-accepted:true yet does NOT clear the block (the refusal hint says it should).
---allow-multiline is refused the same way. The draft is only clearable by a
-human pressing keys on that row. In the two [11.217] falsifier runs the same
-hold ate every marker seed: terminal send reported ok for both members every
-iteration while 10/10 pre-split daemon-buffer asserts went red — the probe
-was convicting the app on its own undelivered seeds.
-
-WHAT IT IS NOT: not the close-path draft guard (that one protects a person
-unsent words from remove — this row was closed fine by the probe teardown).
-The refusal REASONING is right for a human composer; the defect is that a
-PROGRAMMATIC send is indistinguishable from typing: it lands in the composer
-at all, reports accepted with a byte count, and then needs a human to flush.
-
-FALSIFIER: a probe-shaped send (echo plus newline) on a fresh shell row
-executes within the read window (marker visible in read-buffer --mode
-screen) — or the send verb grows an explicit executes-now path
-(--no-composer / submit-through) and uxprobe seeds through it. Secondarily:
-an empty write must actually clear a held programmatic draft as its own
-refusal hint promises.
-
-FIX DIRECTION (named, NOT taken): the send verb already knows it is
-programmatic; route send payloads around the composer draft store (straight
-to the PTY write path) unless the row is an agent CLI mid-turn, where the
-composer semantics exist for a reason. The falsifier-side workaround (seed
-via terminal submit) is NOT equivalent — submit is the brief path and its
-echo behavior differs.
 ## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
