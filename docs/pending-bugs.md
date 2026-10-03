@@ -671,7 +671,18 @@ lane/integration/11178-warm-ladder (diagnostic-only, not merged).
 
 ## ⛔ [11.179] THE RETAINED-RAISE PATH NEVER SERVES: reveal_raise_refused ×173 IN ONE GENERATION (110 LOCAL + 63 REMOTE), daemon_owns_runtime FALSE IN 100% OF PAYLOADS, reveal_served ×0 — EVERY FELT SWITCH EITHER REMOUNTS INTO THE [11.176] WEDGE (ROOT CAUSE [11.178]) OR REFUSES THE RAISE BY THE OWNERSHIP GATE (measured 2026-09-27 ~10:15-10:45 IST, webproc-raise-capture lane, live jojo desktop, build d1a568cf)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** CLOSED (live falsifier met 2026-10-03)
+
+LIVE-PROVEN 2026-10-03 ~07:29 IST on the OWNER'S LIVE DESKTOP (jojo GUI
+859d783f7ab4, the first rotated build carrying the lane): his real remote row
+`remote-cc://dev/bb64eba2` SERVED raises on natural traffic — reveal_served
+x3 (06:42:50 read_age 57.6 s via the daemon-owned arm; 07:29:24 read_age
+4422 ms and 07:29:28 read_age 8986 ms via the fresh-read arm) — and the
+whole day's trace carries ZERO refusals with the pre-fix ownership signature
+(daemon_owns false + was_ever_ready true + has_host_epoch true), the shape
+that refused 63/63 before. The refusals that do appear on the row are the
+OTHER guards firing as designed (transport_degraded recovery, post-remount
+cold mounts, one heartbeat/recovery-class refusal at 07:35 with owns=true).
 
 FIXED 2026-10-02 (lane/integration/11179-remote-raise, zcode on jojo work FROM
 dev; the remote-ownership story). ROOT: the ce64fc1d gate asked
