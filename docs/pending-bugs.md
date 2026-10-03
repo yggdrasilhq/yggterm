@@ -18,6 +18,43 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## [11.221] THE ROW-FACING MANAGED ynpm IS A STALE STATE-LESS DEV GENERATION — TERMINAL PATHS PUT IT FIRST, SO ROW-INVOKED ynpm VERBS RUN A GUARD-LESS BINARY WHILE EVERY DAEMON'S OWN RESOLVER IS CURRENT
+
+**Status:** OPEN
+
+FILED 2026-10-03 ~12:0x IST (the [11.123] close-out sitting; zcode on jojo, work
+FROM dev; claim ACK-564174c2fc). Measured while closing [11.123] (its narrative,
+including the NPM_TOKEN history, is in git at the deletion commit):
+
+- On all three hosts the DAEMON's PATH resolves `ynpm` to `~/.local/bin/ynpm`,
+  which carries the discovery downgrade refusal (binary literal present; the
+  managed-CLI refresh is guarded — dev, jojo, oc each verified).
+- The TERMINAL launch path puts `~/.yggterm/ynpm/bin` FIRST (the [11.123] trace
+  evidence), and there `ynpm` is a symlink into `generations/yggterm/dev-1789032*/`
+  — an `activate-yggterm-dev`-era generation from 2026-09-08/09 that predates the
+  [11.132] guard. Rows invoking `ynpm` verbs get the old behavior.
+- The slot is STATE-LESS: jojo's state.json carries no `yggterm` key while the
+  generation dirs and bin link live on. Release rolls do NOT refresh the link (it
+  survived 3.2.99 to 3.2.116 unchanged).
+
+WHY IT MATTERS: the guard that closed [11.123] protects the daemon's refresh; every
+agent-driven `ynpm sync --integrated` inside a row runs the guard-less binary — the
+downgrade class is one hand-typed verb away from recurring.
+
+NEXT LEVER: decide the refresh owner for the yggterm package's managed generation
+(the self-update arm of `ynpm sync`, or a re-cut `activate-yggterm-dev` per release
+in deploy-fleet.sh), then reconcile the orphan (re-record the slot or remove the
+orphan links). Related owner item inherited from the closed [11.123]: the NPM_TOKEN
+publish-secret loss that froze `@avikalpa/zcode-tui` npm latest at 0.5.7 is still
+unfixed — the dev-watch channel carries the CLI meanwhile, and the production
+handback (`ynpm prod @avikalpa/zcode-tui` per host) is an owner call after the
+secret is restored.
+
+FALSIFIER: after a release roll, `~/.yggterm/ynpm/bin/ynpm` answers the new version
+AND its binary carries the refusal literal; the state record exists; a
+row-invoked `ynpm sync --integrated` pointed at an older registry dist-tag keeps
+the newer generation.
+
 ## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd jojo daemon, freshly started, 17 restored live sessions)
 
 **Status:** OPEN
@@ -27617,118 +27654,6 @@ sandbox and a promotion step, never a seat at a shared table.**
 or whether foreign CLIs stay file-supervised by design. **Both are defensible; the current state
 is neither, and it is undocumented.**
 
-## [11.9] THE MATRIX'S LOCAL COLUMN PROBES THE GUI PROCESS'S OWN `PATH`, DURING RENDER
-
-**Status:** OPEN
-
-Every REMOTE machine in the Agent CLI installation matrix now reports what a launch there
-would resolve — managed CLI bin dir, then the login-shell dirs the launch prepends. The
-`This machine` row did not move with them: it still walks the GUI process's `PATH`, which
-is whatever the desktop session happened to hand that process.
-
-**Two separate costs, and the second is the one that matters more.**
-
-**1. Two columns, two questions.** A machine that appears as `This machine` in one GUI and
-as a remote row in another can now be described two different ways at the same instant,
-and only one of them is the question the user is actually asking — *will the CLI start if
-I click this row.* The process `PATH` is not derived from anything the launch consults, so
-where the two agree it is coincidence, not agreement.
-
-**2. It is filesystem work on the render path.** The walk stats one candidate per directory
-per registered CLI, every time the settings rail or the modal renders. That is cheap until
-it is not, and it sits on the exact thread whose latency is this project's standing
-priority. Routing it through the launch-parity resolver instead would be worse: that
-resolver consults a login shell, and a failed consult is deliberately not cached, so a
-machine where the probe fails would spawn a subprocess per render.
-
-**The shape of the fix.** The daemon already produces a presence report for every machine
-it can reach. Have it produce one for the machine it runs on, carry that in the snapshot
-beside the remote ones, and let the GUI render a report rather than take a measurement. The
-render path then does no I/O and both columns answer the same question by construction.
-
-**Falsified by:** starting the GUI from an environment whose `PATH` omits the managed CLI
-bin dir, then comparing its `This machine` count against what another host's matrix reports
-for that same machine over ssh. Equal counts falsify the divergence; unequal counts are it.
-
-## ⛔ NOTHING RUNS `ygg-land`, SO A LANE EITHER SITS UNLANDED OR BREAKS THE SPLIT ITSELF
-
-**Status:** OPEN
-
-⚠ **This is one layer ABOVE the roll gap below it, not a duplicate of it.** That entry owns
-`main` → the machine someone is using. This one owns a lane branch → `main`. Both are absent;
-either alone strands work, and they fail in the same silent direction.
-
-`ygg-land.py`'s own header states the split it enforces: *"a LANE pushes its own branch and
-says it is ready. The ORCHESTRATOR lands it and is the only thing that rolls."* The lane half
-works — branches are pushed. **The orchestrator half is nobody.** No process anywhere runs the
-verb, on any interval, and the seat the split names has been dead since the afternoon.
-
-**Measured 2026-08-21 19:56:** `ygg-land.py status` reports **9 branches carrying unlanded
-work**. One of them had been pushed, tested and green for two hours while its author believed
-the mechanism would take it, because the mechanism took two other branches in that window —
-which is the tell. A queue that empties sometimes reads as a queue that is being served.
-
-⛔ **And the lane is left with only bad options.** Wait, and the work never reaches the roll
-that builds from `main`. Or land itself, which is exactly what the split forbids, and which
-this lane then did — deliberately and recorded here, because landing without rolling touches
-neither of the two hazards the split names (divergence, which landing *removes*, and two
-agents allocating two versions, which only rolling can cause). ⚠ **That reasoning is sound for
-one branch and does not generalise:** the moment two lanes reach it at once it is the
-divergence the split exists to prevent, arrived at by the same argument.
-
-**The shape of the fix:** supervise `ygg-land.py land --all` the way the other recurring jobs
-are supervised, so its lifetime does not depend on a session; and give "when did a land last
-run" a surface, so its absence is reported rather than inferred from a branch that sat.
-
-**Falsified by:** a supervisor that runs the verb after its launching session exits, or any
-surface answering how long it has been since a land completed.
-
-## [11.9] THE JOB THAT LANDS EVERY LANE'S WORK IS ITSELF A LOOP NOBODY RESTARTS
-
-**Status:** OPEN
-
-`scripts/ygg-roll-watch.sh` is what carries merged work from `main` onto the machine
-someone is actually using: it builds, bumps, deploys and reconciles the client. Its own
-header names the gap it exists to close — a version bump falls to a seat "that may be
-mid-task, out of context, or gone", and *"somebody decides to run it" is not a mechanism.*
-
-**It is started by somebody deciding to run it.** There is no cron entry, no timer and no
-supervisor for it anywhere; it is a foreground loop that lives and dies with whatever
-session launched it.
-
-**Observed.** It came up on a 3600 s interval, completed exactly one cycle, and stopped
-about seventy minutes later when its launching session ended. Two hours after that, `main`
-carried **44 commits past the version deployed on the machine running the app**, including
-fixes whose lanes had already reported them as shipped. Nothing anywhere said so.
-
-**Why it matters more than a missed deploy.** The failure is silent and it inverts a lane's
-own reporting. A lane lands a fix, sees it merged, and correctly believes the mechanism will
-carry it; the mechanism is absent, and the only way to discover that is to go looking for a
-process nobody thinks to check. Every lane pays the same discovery cost separately, and the
-"is it shipped" question has no owner in between.
-
-**The shape of the fix.** Supervise it the way the other recurring jobs on these machines are
-already supervised, so its lifetime does not depend on a session; and give "when did a roll
-last complete" a surface, so its absence is reported rather than inferred. ⚠ Note before
-automating it further: the loop notifies and then RESTARTS the client, by an owner ruling that
-reversed its original refusal to do so — so a supervisor is a decision about when someone's
-window may be restarted, not merely about uptime.
-
-**Re-measured four hours later, and the entry survives it.** The deployed version has since
-moved forward and now carries the fixes that were stranded — but **the roller did not do it**:
-no process carries the loop, and its log has not gained a line since the cycle that stopped it.
-Some other hand rolled the build. The gap it describes had already begun to reopen at the time
-of the re-measurement, with `main` sitting five commits past the deployed release.
-
-⚠ **That is the failure mode, not a reprieve from it.** A deploy that happens because somebody
-happened to do one is the same absent mechanism as a deploy that does not happen; it merely
-fails silently in the direction that looks fine. Reading "the fix arrived" as evidence the
-lane is healthy is the specific mistake this entry exists to prevent, and it is available to
-be made every time the gap is small.
-
-**Falsified by:** finding a supervisor that brings it back after its launching session exits,
-or any surface that reports how long it has been since a roll completed.
-
 ## [11.9] THE PRESENCE MATRIX HAS NO READ-ONLY SURFACE, SO VERIFYING IT TAKES SOMEONE'S SCREEN
 
 **Status:** OPEN
@@ -27761,6 +27686,14 @@ running window.
 
 **Falsified by:** any read-only verb or describe field that returns the per-machine
 present/total counts the modal renders.
+
+
+UPDATE 2026-10-03 ~12:0x IST (the [11.123] close-out sitting, zcode on jojo, work
+FROM dev): the LOCAL-column half of this family landed 2026-08-27 with the
+cli-install-ux lane — `local_cli_presence` answers the modal's local row the way a
+launch resolves, replacing the render-path `PATH` probe. The projection gap is the
+only remaining leg: `cli_presence` still rides no wire projection (grep over
+shell/core returns only the internal cache and the modal render). Still OPEN.
 
 ## [11.9] A ROLL REPLACES A LIVE DAEMON'S SOCKET WITH A SYMLINK TO THE NEW ONE, SO THE WRONG DAEMON ANSWERS
 
@@ -27812,38 +27745,13 @@ own the session says exactly that instead of returning an empty screen.
 **Falsified by:** a superseded daemon that is still reachable at its own socket path while it
 holds sessions, or a redirected screen read that reports "not my session" rather than an
 empty one.
-## [11.9] THE CLI-PRESENCE PROBE READS THE NON-LOGIN PATH, SO EVERY REMOTE MACHINE UNDERSTATES WHAT IT HAS
 
-**Status:** OPEN
-
-The Agent CLI installation matrix asks each machine "which agent CLIs are on your
-`PATH`" by running `server remote cli-presence` over ssh. That call is assembled by
-`run_remote_yggterm_command` -> `run_remote_binary_command_with_timeout`, which builds a
-bare `Command::new("ssh")` in `crates/yggterm-server/src/lib.rs`. No login shell.
-
-The LAUNCH path deliberately does the opposite. Every remote launch funnels through
-`assemble_remote_ssh_command` -> `login_shell_wrap` -> `exec bash -lc`, and the test
-`remote_launch_commands_run_under_login_shell_for_path_parity` asserts it. Its own
-comment gives the reason: the handoff must resolve the same CLI an interactive ssh
-would, "not the non-login PATH that shadows it". `login_shell_wrap` has exactly ONE
-call site, and the presence probe is not it.
-
-=> The two halves answer the same question against different `PATH`s, and the probe
-uses the one the launch path was explicitly built to reject.
-
-**Observed.** A machine that reports 10/10 when it probes itself locally reports 1/10
-when the GUI probes it over ssh -- same machine, same instant, and the rendered matrix
-faithfully shows the lower number. At that moment an agent CLI the matrix listed as
-missing on that machine was running a live session there, launched by yggterm itself.
-
-**Why it matters beyond a wrong number.** The matrix drives an install offer for
-third-party programs. Understated presence invites the user to install CLIs that are
-already installed.
-
-**The shape of the fix.** Route the presence probe through the same login-shell wrap
-the launch path uses, so one `PATH` answers both questions. **Falsified by:** probing a
-machine whose CLIs sit on a login-only `PATH` entry and seeing the matrix disagree with
-that machine's own local self-report.
+UPDATE 2026-10-03 ~12:0x IST (same sitting): re-measured on jojo after the day's
+rotations — the symlink write is unchanged (every `server-2-10-*.sock` points at
+`server-3-2-116.sock`), but predecessors are now REAPED at rotation (exactly one
+daemon alive after three rolls), so the live-owner window this entry names is the
+transient rotation window, not a standing one. Still OPEN; the falsifier wants a
+rotation-window capture.
 
 ## ⛔⛔⛔ [11.28] A ROW RESUMES INTO A BLANK SESSION AND KEEPS ITS OLD TITLE — 91% OF ONE CLI'S ROWS
 
@@ -31051,60 +30959,6 @@ names. Until then the fleet's landed fixes adopt only via the startup
 update workflow at the GUI's next real restart (which the same staged
 state satisfies — startup auto-restarts into the pending build).
 
-
-## [11.123] ynpm sync --integrated downgrades the agent bin to npm latest with no semver guard (ynpm)
-
-**Status:** OPEN
-
-**Component:** `crates/ynpm/src/main.rs` `sync_integrated` (production arm) + the daemon
-background managed-CLI refresh that runs it.
-
-**Measured 2026-09-15 (jojo, live trace + a fresh zcode-tui row):** the daemon refresh
-tick runs `ynpm sync --integrated`, which for every npm-backed integrated CLI installs
-`<package>@latest` from the registry and republishes the agent-bin link
-(`~/.yggterm/ynpm/bin`) — with NO comparison against the installed generation. With
-@avikalpa/zcode-tui npm latest frozen at 0.5.7 (every `ynpm-publish` workflow run since
-tag v0.5.8 fails: npm PUT returns E404 — the repo NPM_TOKEN secret lost publish rights;
-runs 3445095932/34501613876/34951532930), the refresh auto-DOWNGRADED a newer locally
-installed zcode-tui back to 0.5.7. The owner spawned a fresh zcode-tui row and got the
-0.5.x UI ("pre-historic"): the launch arm
-(`terminal_spec_resolved`, trace g1789454667760 ts 1789463157498, session
-eb5088d9-b081-4048-a78b-5bd110cc2d3d) sets PATH with `~/.yggterm/ynpm/bin` FIRST, so the
-agent bin decides what rows run. Trace: `ynpm sync.integrated.package cli=zcode-tui
-result=updated version=0.5.7` (ts 1789464242330).
-
-**Why it violates the spec:** docs/ynpm.md rule 6 allows a production handback to
-replace a generation only when production is NEWER. The sync production arm re-links an
-OLDER registry version over a NEWER installed generation.
-
-**What shipped meanwhile (2026-09-15, zcode sess_b3f6d8ca):** zcode-tui 0.6.6 (paste
-fix + exitOnCtrlC, lane/zcode-tui/paste-input) is installed as a DEV generation on
-jojo/dev/oc — the sync DEV arm keeps it ("cli zcode-tui is on a dev generation;
-keeping it", force-verified on all three hosts) and bridges it into the agent bin, so
-rows get 0.6.6 and stop self-downgrading. This is a STOPGAP: the dev record shadows the
-registry flow, so after the NPM_TOKEN secret is fixed and a v0.6.7+ tag publishes,
-each host needs `ynpm prod @avikalpa/zcode-tui` to hand back to production flow.
-
-**Fix direction:** in the sync production arm, skip the install (or only relink) when
-the registry dist-tag version is not newer than the installed generation — the same
-rule-6 guard `dev_handback` already implements. Secondary coherence defect, same
-component: a pre-rename `@ygghq/zcode-tui` ghost slot (dev 0.6.5 recorded at
-~/.local/bin) still sits in ynpm state beside the canonical @avikalpa slot.
-
-**Falsifier:** fix the NPM_TOKEN secret, publish any version, and watch a refresh tick
-NOT downgrade a newer installed generation; or (code-side) point the registry dist-tag
-at an older version than a locally imported production generation and show sync keeps
-the newer one.
-
-**Update 2026-09-15, later (lane/ynpm/dev-converge-guard, [11.132]):** the
-stopgap above died exactly as its own risk predicted, by a different hand than
-feared: `install_npm_package`'s fresh-publish path sets `dev = None` on the
-record, so the refresh's next `@latest` install on the shared storage key
-ERASED the dev marker and repointed the agent bin to 0.5.7 on every host
-(measured the same night: record shows dev False, versions
-[0.5.7, 0.6.6, 0.5.7]). [11.132] refuses that install outright, so the dev
-record survives and the refresh re-bridges it. This entry's production-arm
-relink guard stays the filer's to land.
 
 ## ⛔ [11.125] A FRESH ROW'S FIRST `server app drag begin` PAYS ~1.5-1.7 s QUEUING BEHIND THE SPAWN-PROMOTION SNAPSHOT APPLY'S TAIL — SIX BACK-TO-BACK UNCACHED FULL SIDEBAR MERGES (~220 ms EACH, `push_remote_ms` ≈ 220 DOMINANT, EXPANSION CRAWLING 111→288 PATHS / 855→2583 ROWS) RUN ON THE UI THREAD INSIDE ONE APPLY AND THE VERB'S HANDLER QUEUE BEHIND ALL OF THEM (traced live 2026-09-15 ~17:27 IST, GUI host, the ux-speed drag-cold-residual lane)
 
