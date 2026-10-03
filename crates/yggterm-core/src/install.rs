@@ -843,13 +843,17 @@ pub fn promote_direct_install_active_version(
     target_version: &str,
     target_executable: &Path,
 ) -> Result<bool> {
-    let found = if let Some(root) = std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT)
+    // The override is AUTHORITATIVE when set: promote consults only this
+    // root, so a caller (or test) pointing it at a root without state reads
+    // "unmanaged" instead of adopting the machine's own install — the
+    // ambient-host-state family. No production caller sets the var at
+    // promote time; the launch-path finder keeps its own fallthrough law.
+    let found = match std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .filter(|root| root.join(INSTALL_STATE_FILENAME).is_file())
     {
-        load_direct_install_state(&root)?.map(|state| (root, state))
-    } else {
-        find_direct_install_state(target_executable)?
+        Some(root) => load_direct_install_state(&root)?.map(|state| (root, state)),
+        None => find_direct_install_state(target_executable)?,
     };
     let Some((root, state)) = found else {
         return Ok(false);
@@ -1892,8 +1896,16 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Serializes the two promote tests: the noop test mutates the process
+    /// environment (`set_var` is process-global and cargo runs tests on
+    /// threads) while the flips test reads it through promote.
+    static PROMOTE_ENV_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn promote_direct_install_active_version_flips_state_to_target() {
+        let _guard = PROMOTE_ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root =
             std::env::temp_dir().join(format!("yggterm-promote-test-{}", uuid::Uuid::new_v4()));
         let next_dir = root.join("versions").join("2.8.5");
@@ -1924,23 +1936,31 @@ mod tests {
 
     #[test]
     fn promote_direct_install_active_version_is_noop_without_managed_install() {
-        // An executable with no install-state in any ancestor is not managed.
+        let _guard = PROMOTE_ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // An executable under a root with no install-state is not managed —
+        // HERMETIC on every host ([11.54]): the override is authoritative
+        // when set, so the machine's own canonical/legacy state cannot
+        // adopt the exe the way the launch-path finder's fleet-launcher law
+        // would. Before this, the test either read the ambient host (red on
+        // live-install machines) or skipped itself there — a pass-by-skip is
+        // the same ambient-dependence the entry condemns.
         let bare = std::env::temp_dir().join(format!("yggterm-unmanaged-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&bare).expect("mkdir");
         let exe = bare.join("yggterm");
-        // Only meaningful when neither the env override nor the machine's
-        // canonical direct root points at a real install ([11.220]: the
-        // finder's canonical leg sees the machine's own state, so on a
-        // fleet host a bare exe IS managed — adopting the machine's record
-        // there is the same fleet-launcher law as the home fallback).
-        let machine_canonical = direct_install_root()
-            .ok()
-            .and_then(|root| load_direct_install_state(&root).ok().flatten().map(|_| ()))
-            .is_some();
-        if std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT).is_none() && !machine_canonical {
-            let promoted = promote_direct_install_active_version("2.8.5", &exe)
-                .expect("promote should not error");
-            assert!(!promoted, "unmanaged install should report false");
+        unsafe {
+            std::env::set_var(ENV_YGGTERM_DIRECT_INSTALL_ROOT, &bare);
+        }
+        let promoted =
+            promote_direct_install_active_version("2.8.5", &exe).expect("promote should not error");
+        assert!(!promoted, "unmanaged install should report false");
+        assert!(
+            !bare.join(INSTALL_STATE_FILENAME).is_file(),
+            "an unmanaged promote must write nothing"
+        );
+        unsafe {
+            std::env::remove_var(ENV_YGGTERM_DIRECT_INSTALL_ROOT);
         }
         let _ = fs::remove_dir_all(bare);
     }
