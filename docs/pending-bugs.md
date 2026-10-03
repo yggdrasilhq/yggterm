@@ -330,6 +330,26 @@ rig recipe predates the flag and does not name it). EVERY rig GUI must
 launch as `yggterm --skip-active-exec-handoff` (apps/yggterm/src/main.rs
 honors it; CLI verbs and --supervise are spared by args non-empty).
 
+MERGED-STATE RIG ADDENDUM 2026-10-03 ~09:1x IST (same sitting): the
+deployed merge (3ebe7fce — this lane + the twin 11217-prune-owners)
+still shows a NEVER-PAINTER on the rig, now on the FOCUSED member (3/5
+creates; the never-painter flips between members — matching the falsifier
+sitting's two-run observation). The measured death is attack-plan point
+#2 UNDONE: the focused member's bootstrap task reaches ensure_end, then
+`bootstrap_owner_superseded_during_loop` +309 kills it
+(terminal_mount_task_dropped{remount_armed:false}) and NO successor ever
+paints — its already-existing retained host (has_host_epoch:true,
+mount_epoch_reused) also skips the fit/resize/render_span chain this
+window (the reparent raise refused, and nothing re-fits). The dead
+task's warm eval polls alive forever (stage=posted, events shed). So the
+stay-mounted leg (this lane) and the prune-keep leg (the twin) are each
+necessary and landed, but the supersede-without-successor-paint death
+remains: either the dropped task must arm a remount when its host has no
+paint, or the retained-host reparent path must fit when the raise is
+refused. Evidence: /tmp/11217-rig-home/ytrace.jsonl (dev), iteration-2
+window of the 5-iter run; the superseded trace now carries its arm
+diagnostics. Owner-GUI falsifier stays the close bar.
+
 ## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
 
 **Status:** OPEN
