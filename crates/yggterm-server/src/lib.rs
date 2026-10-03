@@ -27106,9 +27106,8 @@ fn reachable_local_daemon_is_current(endpoint: &ServerEndpoint, stage: &'static 
     false
 }
 
-/// Whether the endpoint is answered by a live daemon that holds the
-/// version's bind lock, whatever bits it runs from — the ensure's accept arm
-/// for that case.
+/// Whether the endpoint is answered by a live daemon this client can serve
+/// from, whatever bits it runs from — the ensure's accept arm for that case.
 ///
 /// ⛔ [11.159], measured 2026-09-20 (the muse lab host): after a deploy lands a
 /// new same-version aggregate, the serving daemon keeps the previous
@@ -27118,12 +27117,28 @@ fn reachable_local_daemon_is_current(endpoint: &ServerEndpoint, stage: &'static 
 /// 100 × 150 ms before failing "local yggterm daemon did not become
 /// reachable". Seven verbs burned ~24.5 s each (187 stale-binary polls
 /// apiece, 1309 events in the storm window) and one storm won a
-/// bequest-window race into a rowless second daemon. A held bind lock proves
-/// the demand-start CANNOT win; a version-compatible status answer proves the
-/// daemon that holds it CAN serve this client. Accept it — the deliberate
-/// upgrade stays with the startup reconcile + hot-restart paths, exactly as
-/// the shell-side ensure's preserved-owner doctrine already says. The build
-/// identity is still traced once per process when this arm fires.
+/// bequest-window race into a rowless second daemon. A version-compatible
+/// status answer proves the answerer CAN serve this client; its live
+/// listener on the socket proves the demand-start CANNOT win the name under
+/// it. Accept it — the deliberate upgrade stays with the startup reconcile +
+/// hot-restart paths, exactly as the shell-side ensure's preserved-owner
+/// doctrine already says. The build identity is still traced once per
+/// process when this arm fires.
+///
+/// ⛔ [11.225], measured 2026-10-03 (dev): a deploy can retire a live
+/// daemon's bind lock and then FAIL to land its successor (the rotation was
+/// gated by an owned working row). The serving daemon stays lockless but
+/// keeps answering version-compatible status through its live listener —
+/// and this arm refused it on "lock not held", demand-started children the
+/// old daemon's handover gate refused ([11.136]), and every spawn-carrying
+/// verb burned the full boot-wait + spawn + 15 s poll ladder before failing
+/// "local yggterm daemon did not become reachable" — a 1 h 43 min
+/// spawn-plane outage while read verbs kept answering the same socket. The
+/// held lock is therefore a WITNESS here, not a gate: when it is held the
+/// demand-start is futile the [11.159] way; when it is retired nobody can
+/// be mid-takeover (a takeover holds the lock first), and the listener
+/// alone still makes the demand-start futile. The lock state is traced in
+/// `bind_lock_held` so the two shapes stay distinguishable.
 #[cfg(unix)]
 fn served_by_live_bind_lock_owner(endpoint: &ServerEndpoint) -> bool {
     let ServerEndpoint::UnixSocket(path) = endpoint else {
@@ -27132,10 +27147,13 @@ fn served_by_live_bind_lock_owner(endpoint: &ServerEndpoint) -> bool {
     let Ok(runtime_status) = status(endpoint) else {
         return false;
     };
-    let lock_held = daemon::canonical_socket_lock_is_held(&daemon::daemon_socket_lock_path(path));
-    if !bind_lock_owner_accept_verdict(&runtime_status.server_version, lock_held) {
+    // The answered status IS the live-listener witness ([11.225]): something
+    // occupies the socket and can serve this client, so the demand-start
+    // cannot win the name under it whatever the lock says.
+    if !bind_lock_owner_accept_verdict(&runtime_status.server_version, true) {
         return false;
     }
+    let lock_held = daemon::canonical_socket_lock_is_held(&daemon::daemon_socket_lock_path(path));
     static ACCEPTED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !ACCEPTED_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
         if let Some(home) = daemon_trace_home_for_endpoint(endpoint) {
@@ -27149,6 +27167,10 @@ fn served_by_live_bind_lock_owner(endpoint: &ServerEndpoint) -> bool {
                     "server_pid": runtime_status.server_pid,
                     "server_build_id": runtime_status.server_build_id,
                     "server_version": runtime_status.server_version,
+                    // [11.225]: false = the retired-lock accept shape (a
+                    // lockless live listener); true = the [11.159] held-lock
+                    // shape. Same verdict, different witness.
+                    "bind_lock_held": lock_held,
                     // The skew witness (consult Q1 correction): the accept is
                     // licensed by version compatibility, so the trace names
                     // what the client WOULD have spawned — the delta between
@@ -27168,13 +27190,19 @@ fn served_by_live_bind_lock_owner(_endpoint: &ServerEndpoint) -> bool {
 }
 
 /// The pure half of [`served_by_live_bind_lock_owner`]: the compound verdict a
-/// live bind-lock owner must pass before an ensure accepts it instead of
+/// live listener must pass before an ensure accepts it instead of
 /// demand-starting a child that cannot win. Version-compatible (the wire gate
-/// the rest of the ensure already speaks) AND the lock actually held (the
-/// spawn-futility witness — a free lock means the demand-start can still win
-/// and must be allowed to run).
-fn bind_lock_owner_accept_verdict(server_version: &str, lock_held: bool) -> bool {
-    server_version == daemon::SERVER_PROTOCOL_VERSION && lock_held
+/// the rest of the ensure already speaks) AND the endpoint answered by a live
+/// listener — the listener IS the spawn-futility witness: a demand-start
+/// child cannot win the socket name under it, lock or no lock. ⛔ [11.225]
+/// falsified the prior law's second half ("a free lock means the demand-start
+/// can still win"): the deploy that retires a lock without landing a
+/// successor leaves the serving daemon lockless, its listener still owns the
+/// socket, and the children the old law demanded all lost to that listener
+/// for a 1 h 43 min spawn-plane outage. The held lock remains a traced
+/// witness in the caller, not a gate here.
+fn bind_lock_owner_accept_verdict(server_version: &str, live_listener_answered: bool) -> bool {
+    server_version == daemon::SERVER_PROTOCOL_VERSION && live_listener_answered
 }
 
 #[cfg(target_os = "linux")]
@@ -60044,23 +60072,31 @@ terminal_window_id: None,
     }
 
     /// The accept verdict is a compound: version-compatible (the client can
-    /// ride the wire) AND the bind lock held (the demand-start cannot win).
-    /// Each half alone is the defect one way or the other — version alone
-    /// accepts a daemon a spawn could legally replace; lock alone accepts a
-    /// daemon the client cannot talk to. ⛔ [11.159]: the measured storm was
-    /// the opposite error — NEITHER half accepted a live same-version owner,
-    /// so seven verbs burned ~24.5 s each demanding spawns the lock refused.
+    /// ride the wire) AND the endpoint answered by a live listener (the
+    /// demand-start cannot win the socket name under it). Each half alone is
+    /// the defect one way or the other — version alone accepts a daemon
+    /// nothing vouches for; a listener alone accepts a daemon the client
+    /// cannot talk to. ⛔ [11.159]: the measured storm was the opposite
+    /// error — NEITHER half accepted a live same-version owner, so seven
+    /// verbs burned ~24.5 s each demanding spawns the lock refused.
+    /// ⛔ [11.225]: the law this test USED to lock (refuse a compatible
+    /// listener when the bind lock is free — "the demand-start can still
+    /// win") was falsified 2026-10-03: a deploy that retires the lock
+    /// without landing a successor leaves the serving daemon lockless, its
+    /// listener still owns the socket, and every demanded child lost to
+    /// that listener for a 1 h 43 min spawn-plane outage. The lock state is
+    /// a traced witness now, not an input.
     #[test]
-    fn a_live_bind_lock_owner_is_accepted_only_version_compatible_and_held() {
+    fn a_live_listener_is_accepted_version_compatible_whatever_the_lock() {
         let current = daemon::SERVER_PROTOCOL_VERSION;
         assert!(super::bind_lock_owner_accept_verdict(current, true));
         assert!(
             !super::bind_lock_owner_accept_verdict("0.0.1", true),
-            "an incompatible version is not servable, lock or no lock"
+            "an incompatible version is not servable, listener or no listener"
         );
         assert!(
             !super::bind_lock_owner_accept_verdict(current, false),
-            "a free lock means the demand-start can still win — the ensure must spawn"
+            "no live listener means no witness the demand-start is futile — the ensure must spawn"
         );
     }
 
