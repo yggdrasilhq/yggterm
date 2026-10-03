@@ -1555,32 +1555,6 @@ owner stays healthy, WHO adopts the PTYs and WHEN? If the design is
 canonical socket until adoption is possible — binding it first is what
 stranded the GUI at zero rows.
 
-## ⛔ [11.54] THE INSTALL-PROMOTION TEST ONLY PASSES ON HOSTS WITHOUT A LIVE INSTALL — THE HOME FALLBACK MAKES ITS "UNMANAGED" PREMISE FALSE
-
-**Status:** OPEN
-
-`cargo test -p yggterm-core --lib` red on dev, verified identical on
-pristine main (83af34cb5, 2026-09-04) — pre-existing, not brought by the
-wry 0.56.1 vendor lane, and unACKed until this entry:
-
-`install::tests::promote_direct_install_active_version_is_noop_without_managed_install`
-panics `unmanaged install should report false`
-(`crates/yggterm-core/src/install.rs:2077`).
-
-Mechanism: the test creates a bare exe under a fresh `/tmp` dir and
-expects `promote_direct_install_active_version` to report it unmanaged.
-But with `ENV_YGGTERM_DIRECT_INSTALL_ROOT` unset (the test's own guard
-insists on that), the finder takes the `resolve_yggterm_home()` fallback
-(`install.rs:557`) — the state file's canonical home is not an ancestor
-of the binary, so a `~/.yggterm/install-state.json` on ANY live-install
-host answers `Some`, the promote runs, and the assert dies. dev is such
-a host; every fleet seat likely is. This is the
-test-reads-ambient-host-state family
-([[finding-a-test-that-reads-ambient-host-state-is-not-flaky]]): the fix
-is for the test to point the env override at the temp root it created
-(or drive `find_direct_install_state_scoped` with `home_fallback: None`),
-not to weaken the finder.
-
 ## ⛔ [11.50] THE GUI RESTART-LOOPED ON A SAME-VERSION DAEMON_PENDING FOR FIVE MINUTES — EVERY RESPAWN RE-ARMED THE TRIGGER, AND A DEAD STDERR PIPE PANICKED THE REST
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -31706,7 +31680,7 @@ behind; the owner re-reported the same ghosts three times.
 
 ## ⛔ [11.147] THE 90s IDLE-SHUTDOWN DEFAULT RETIRES A ROW-FLEET HOST'S DAEMON WHILE KEEP-ALIVE ROWS ARE REGISTERED — MISSING_RUNTIME ROWS BLOCK NOTHING, AND THE HOST SITS DARK UNTIL SOMETHING NEEDS IT (filed 2026-09-19, owner screenshot)
 
-**Status:** OPEN
+**Status:** AWAITING A DECISION
 
 Measured 2026-09-19 on the build host: `idle_shutdown` fired at 10:50:29
 (`idle_shutdown_ms: 90000`, the default) because
@@ -31728,7 +31702,7 @@ override via `YGGTERM_DAEMON_IDLE_SHUTDOWN_MS` on row-heavy hosts
 (config, no code); (d) shorter default with the dying-rows ledger write
 as the only persistence (today's behavior). Owner GO pending.
 
-## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL) — BOTH SWEEPS LANDED 2026-09-19 (server leg lane/integration/11145-reds, shell leg lane/integration/11145-shell-reds): 19 of the 21 die with named causes, shell is 2147/0; the remainder is the stamp (owner GO) + the [11.54] install-promote
+## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL) — BOTH SWEEPS LANDED 2026-09-19 (server leg lane/integration/11145-reds, shell leg lane/integration/11145-shell-reds): 19 of the 21 die with named causes, shell is 2147/0; the remainder is the stamp (owner GO) — the [11.54] install-promote red was closed 2026-10-03 (lane/integration/1154-hermetic-promote: the promote env override is authoritative when set, the test hermetic on live-install hosts)
 
 **Status:** AWAITING A DECISION
 
@@ -31816,7 +31790,7 @@ edges it carried remain in the campaign door and the [11.150] close records.
 
 ## ⛔ [11.158] A START-BORN REMOTE ROW EXCLUDED FROM THE PEER-CLOSE GATE KEEPS ITS [11.153] PRESERVE STATE FOREVER — THE GUARD IS DELIBERATE, BUT THE CLASS IT EXCLUDES STILL ENDS IN A PERMANENT GHOST (filed 2026-09-20, the [11.155] close)
 
-**Status:** OPEN
+**Status:** AWAITING A DECISION
 
 The [11.155] gate asks the peer's own CLI store before spending a mount and
 closes the row on a confident NO. A start-born row (Remote Launch Action
@@ -32246,6 +32220,20 @@ THE TWO DEFECTS IN ONE: (1) the row's output pump (and its write-coupled frame-h
 CONFIRMED LIVE AGAIN 2026-09-28 ~11:25-11:32 IST on the OWNER'S ACTIVE ROW (remote-agy://dev/41e5733d): the stream died at 11:25:35 mid-TYPING (three frame_hash_probes with consecutive_mismatch=1, backed_off=false, then silence — same signature as birth), his keystrokes reached the daemon PTY until 11:26:34 (typing into the void — the draft sat unsent at the CLI), and the CLI side stayed state=ready with a CURRENT daemon screen while the row looked input-blocked. THE DEAD THING IS THE PER-SESSION TERMINAL LOOP TASK ITSELF: the per-branch loop_share flusher (pre_select count 624/window) went silent at 11:26:50 and never returned — a silent tokio-task death (GUI stderr is /dev/null, so the panic is invisible). The daemon-side composer polls, the GUI process, and the input policy (allow_input=true) all continued around the corpse.
 
 FIX MAP (scouted 2026-09-28, the 11.188 lane): the recovery lever is a RETAIN-HOST LIVENESS GATE at re-bootstrap — the [11.178] phantom-eval pattern applied to the `daemon_retained_replay` eval (viewport.rs, the replay task: `document::eval(&terminal_replay_retained_data_script_for_session(...))` must be joined and its result checked; null/timeout = the phantom-complete class = the host JS is dead) followed by a `shell.terminal_mount_epochs[path] += 1` bump so the keyed element `{path}:{epoch}` recreates TerminalCanvas fresh (state.rs:18460; the fold at 19776 manages entries — verify the bump survives the next snapshot fold). The decision site is `terminal_session_should_bootstrap_host` (viewport.rs:2091) + the skip branch at 5429. ⚠ Mount-storm risk: the replay has retry budgets — bound the bump by them. WORKAROUND (until the fix lands): a frozen row recovers by CLOSING and RE-OPENING the row — the [11.183] vouch ladder reconnects the conversation on the fresh mount (proven 2026-09-27 on the medgraph row); the unsent draft at the dead CLI's composer is lost, so copy it first. Toggling the row's view mode is worth a try first (cheaper) but re-mounts only if the view path does not reuse the retained host.
+
+UPDATE 2026-10-03 ~10:0x IST (queue-completion seat, zcode sess_654d9543 on
+jojo, work FROM dev): FIVE DAYS DEPLOYED, ZERO NATURAL FREEZES — the watchdog
+never fired (no loop-stale remounts, no `loop_stale_watchdog_exhausted` stamps,
+no panic-witness freeze names in the jojo trace plane since the landing), and
+the one standing mismatch examined (`remote-cc://dev/bb64eba2…`, consecutive 44,
+backed off) is EXONERATED as the quiet-divergent class, not the freeze: BOTH
+hashes pinned together (client and daemon constant over the window — the
+daemon's own screen had gone quiet), keystrokes and composer reads kept
+flowing through it, and the reconcile arm engaged without a spurious remount.
+Note for the hash-exchange design: a quiet surface whose client and daemon
+renders differ by a CONSTANT delta (theme/status-line class, cf [11.168]) can
+never agree; the watchdog correctly keys on staleness, not mismatch — keep it
+that way. The heal observation stays owed to the next natural freeze.
 
 Falsifier/design direction: a daemon-vs-client screen reconciliation that does NOT depend on writes — a periodic hash exchange (the daemon already computes frame hashes; the GUI host can poll the ROW's remote screen hash through the daemon it already talks to) whose mismatch triggers the existing replay arm, armed on every re-activation of a retained host. Live-proving needs the row to freeze again (or a forced freeze: suspend the bridge process and watch whether ANY plane notices — it did not for 6 minutes of owner activity).
 
