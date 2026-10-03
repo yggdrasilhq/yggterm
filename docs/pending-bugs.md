@@ -18,22 +18,22 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE  npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
+## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
 **Status:** AWAITING A DECISION
 
-The publish secret for the @avikalpa npm scope was lost, so 
+The publish secret for the @avikalpa npm scope was lost, so `@avikalpa/zcode-tui`
 npm latest is frozen at 0.5.7. The dev-watch channel carries the CLI meanwhile
 (managed dev generations per host, state-recorded — NOT the [11.221] orphan
 class; [11.221] itself is deleted under the verified-fix law: reap_orphan_yggterm_dev
 landed via lane/ynpm/1121-dev-orphan-reap 0b016b9b, deployed in build
 yggterm--20261003-125014--102d200cf8f6, and the live falsifier was met on all
-three hosts the same sitting — one  per host reaped the
+three hosts the same sitting — one `ynpm sync --integrated` per host reaped the
 four managed-bin links plus every state-less dev generation (trace
-), leaving the row-facing  resolving the roll-refreshed
+`yggterm.dev.reap`), leaving the row-facing `ynpm` resolving the roll-refreshed
 3.2.116 with the refusal literal on dev, jojo and oc). OWNER CALLS: (1)
 restore/rotate NPM_TOKEN in the publishing path; (2) after the secret is
-restored, whether the production handback ( per
+restored, whether the production handback (`ynpm prod @avikalpa/zcode-tui` per
 host) runs seat-side or owner-side.
 
 ## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd jojo daemon, freshly started, 17 restored live sessions)
