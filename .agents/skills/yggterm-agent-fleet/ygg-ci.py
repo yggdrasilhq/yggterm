@@ -922,6 +922,34 @@ def _quarantine_entry(entry, now, ttl_secs):
     return {"tip": entry, "expires": now + ttl_secs}
 
 
+def _quarantine_expiry_verdict(lane, qentry, tip, now, probes_left):
+    """[11.97] residual — the expiry probe is LANE-shaped, ONE per tick.
+
+    Measured live 2026-10-03 14:17 (the [11.97] live-proof experiment): when a
+    guilty and an innocent lane were quarantined by the SAME failed union and
+    both TTLs popped in the same tick, both re-merged into the SAME union, the
+    gate failed identically, and both were re-quarantined — an unchanged
+    innocent lane could never land while its unchanged co-failer stayed
+    subscribed: the TTL had turned the old permanent bystander deadlock into a
+    900 s retry loop of the same doomed union. The fix is the named direction:
+    at most ONE expired quarantine re-enters a tick's merge union, so an
+    innocent lands SOLO and a guilty re-quarantines ALONE. Deferred lanes keep
+    their (past) expiry — the next tick admits the next one in the loop's
+    FIFO-by-tip order, and a guilty re-quarantine's fresh TTL sends it to the
+    back naturally. No cursor to persist, no lane to starve.
+
+    Returns (verdict, reason): verdict is "rearm" (new tip), "hold"
+    (unexpired), "defer" (expired but this tick's one probe is spent), or
+    "probe" (expired and admitted — the caller must decrement its budget)."""
+    if qentry.get("tip") != tip:
+        return "rearm", None
+    if qentry.get("expires", 0) >= now:
+        return "hold", None
+    if probes_left <= 0:
+        return "defer", "quarantine_expiry_deferred"
+    return "probe", None
+
+
 def _quarantine_load():
     try:
         return json.loads(QUARANTINE.read_text())
@@ -1055,6 +1083,8 @@ def _do_tick_project(project, dry=False):
     ttl_secs = int(pcfg.get("quarantine_ttl_secs", DEFAULT_QUARANTINE_TTL_SECS))
     now = time.time()
     quar = {lane: _quarantine_entry(e, now, ttl_secs) for lane, e in quar.items()}
+    # [11.97] residual: at most ONE expired quarantine probes per tick.
+    expired_probes_left = 1
     for s in subs:
         lane = s["lane"]
         remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
@@ -1068,17 +1098,25 @@ def _do_tick_project(project, dry=False):
             continue
         qentry = quar.get(lane)
         if qentry is not None:
-            if qentry.get("tip") != tip:
+            verdict, reason = _quarantine_expiry_verdict(lane, qentry, tip, time.time(), expired_probes_left)
+            if verdict == "rearm":
                 # a new tip re-arms the lane (the standing rule)
                 quar.pop(lane, None)
                 quar_changed = True
-            elif qentry.get("expires", 0) < time.time():
+            elif verdict == "probe":
                 # the quarantine expired: probe this tip again. A guilty lane
                 # re-fails and re-quarantines with a fresh TTL; an innocent
-                # bystander lands here without a hand-made commit.
+                # bystander lands here without a hand-made commit. ONE expiry
+                # probe per tick ([11.97] residual — see the helper): a
+                # co-expired sibling is deferred, never re-unioned.
+                expired_probes_left -= 1
                 quar.pop(lane, None)
                 quar_changed = True
-                log(f"  ⏳ quarantine expired for {lane} ({tip[:12]}) — probing again")
+                log(f"  ⏳ quarantine expired for {lane} ({tip[:12]}) — probing again (solo this tick)")
+            elif verdict == "defer":
+                log(f"  ⏳ defer {lane}: quarantine is expired but this tick's one expiry probe is spent — its solo turn comes on a later tick")
+                conflicts.append({"lane": lane, "tip": tip, "reason": reason})
+                continue
             else:
                 log(f"  ⏳ skip {lane}: quarantined until {time.strftime('%H:%M:%S', time.localtime(qentry['expires']))} (this tip failed a build) — new tip or expiry re-arms it")
                 conflicts.append({"lane": lane, "tip": tip, "reason": "quarantined"})
