@@ -18,6 +18,70 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.226] THE agy 1.2.16 SELF-UPDATE PAINTS A FOLDER-TRUST GATE THE ROW CANNOT ANSWER AND THE E2E PROBE CANNOT SEE — FRESH-CWD agy ROWS SIT AT "Do you trust the contents of this project?" FOREVER, THE PROBE'S CLI MARKER MATCHES THE GATE TEXT ITSELF, AND THE 19:0x [11.225] FALSIFIER LEG'S "painted its CLI" WAS THE GATE (measured 2026-10-03 ~21:37-22:0x IST, jojo + dev, agy 1.2.16 md5-identical on both)
+
+**Status:** OPEN
+
+Filed 2026-10-03 ~22:0x IST by the proof-collection seat (zcode on jojo,
+work FROM dev; board outcome ACK pending). Found collecting the [11.225]
+production falsifier: the E2E connection probe's fresh_start_connects
+returned a row born-but-blank (0 chars, 150 s) on dev while the [11.218]
+hunt's defmiss scenarios on jojo "passed" with 818 chars minutes apart —
+the two contradictory readings forced the dig.
+
+THE MEASUREMENT (agy 1.2.16, self-updated under the descriptor 2026-10-03
+~10:10 dev / ~10:58 jojo, md5 56361e4b… IDENTICAL on both hosts — the
+[11.175] drift class for provenance):
+- A daemon-minted agy row in a FRESH cwd paints the folder-trust gate:
+  "Accessing workspace: <cwd> / Do you trust the contents of this project?
+  Antigravity CLI requires permission to read, edit, and execute files
+  here. / > Yes, I trust this folder / No, exit / ↑/↓ Navigate · enter
+  Confirm" plus a live model footer ("Gemini 3.8 Flash · high"). The
+  daemon's classifier answers `startup_gate` — the [99.1] gate-table work
+  pays off here; the state is VISIBLE and may_type is false.
+- THE GATE IS NOT ANSWERABLE BY THE SANCTIONED INSTRUMENTS, all tried on
+  a live row this sitting: `server app terminal send --data '\r'` and
+  `--stdin` (handled by the GUI, state unchanged — headless-minted row,
+  send-path suspect: an UNMOUNTED row), and direct slave-PTY writes to
+  the holder's /dev/pts/N (CR, LF, and 'y' — none consumed; the row's agy
+  is IDLE at the gate, its cli log quiet, no input processing). Whether
+  the real mounted viewport's Enter clears it is the owner's one-keystroke
+  test. THE [99.1] LAW ("nine CLIs declare no startup gate, so their
+  trust prompt reads as typeable") is hereby LIVE on agy: a seat that
+  submits a brief into this row types into a gate.
+- ⛔ THE E2E CONNECTION PROBE IS BLIND TO THE GATE: CLI_MARKERS includes
+  "Antigravity CLI" — which appears IN THE GATE TEXT. Every agy scenario
+  that "connected" tonight (the [11.218] hunt's 20+ defmiss PASSes at 818
+  chars; fresh-start PASSes) was reading a GATED row as a signed-in TUI.
+  The marker must require a post-gate signature (the composer footer "? for
+  shortcuts" marker already exists — "Antigravity CLI" must be dropped or
+  the screen state must be asserted ≠ startup_gate).
+- ⛔ THE 19:0x [11.225] HEAL FALSIFIER LEG CARRIES THE SAME LIE: "a hand
+  server remote start-agy mint … painted its CLI (chars 0 → 440" — ~440
+  chars is the GATE TEXT LENGTH. The spawn-plane heal itself stands (the
+  verb minted, the row ran — the plane was up); the "CLI painted" leg was
+  the gate. Recorded here so no future audit re-uses that leg as
+  signed-in-TUI evidence.
+- THE dev/jojo VARIANCE IS REAL AND UNEXPLAINED: same binary, but dev's
+  fresh_start row painted NOTHING at all in 150 s (not even the gate —
+  empty screen, running:true) while jojo's painted the gate in ~30 s. A
+  standalone PTY run on jojo (no daemon, TERM=xterm-256color) also paints
+  nothing for 5+ minutes and logged a crash at ~3 min
+  (crashes/crash_1981227_*.log, empty). Print mode is healthy on both
+  hosts (`--print` round-trips in seconds) — auth/model/network are fine;
+  only the interactive path is affected.
+- The chore reads the gate's "> Yes, I trust this folder" grid row as a
+  composer draft (composer_draft_union grid_row_text on the gated row) —
+  the [11.86]-adjacent class, now evidenced on agy.
+
+WHAT IT WANTS: (1) the probe's marker fix + a gate-state assertion (small,
+this campaign's own instrument); (2) an owner call on the gate itself —
+auto-answer policy for the spawn path (the default option is Yes), a
+spawn-time `--trust-folder`-style flag if agy grows one, or manual
+viewport confirmation per fresh project; (3) the unanswerable-from-slave
+input finding wants the row-mounted `terminal send` path re-verified once
+a gated row is mounted (suspect: send to unmounted rows silently no-ops).
+
 ## ⛔ [11.224] `mimo upgrade` NEVER COMPLETES — EVERY SCHEDULED MANAGED-CLI REFRESH HANGS ITS 900 s MIMO STEP AND IS DEADLINE-KILLED (26/26 WALKS SINCE ≥09-29), `devin update` EXITS 130 ON EVERY WALK, AND ORPHANED MIMO UPGRADES ESCAPE THE KILL FOREVER — THE REFRESH NEVER CONVERGES AND ITS LOCK HOLDS PIN EVERY CONCURRENT ENSURE (measured 2026-10-03, dev trace gen g1791022605539 + live /proc evidence)
 
 **Status:** OPEN
@@ -120,6 +184,17 @@ growing remaining_ms, mimo's 900s deadline kills STOP, and a mimo retry
 happens at most once a day. Owner shapes (a)/(b)/(c) above REMAIN OPEN
 CHOICES — the escalation is the general law's repair, orthogonal to them
 ((a) would still kill the daily retry, (b) still covers the orphan gap).
+UPDATE 2026-10-03 ~22:0x IST (proof-collection seat): the escalation fix
+(46c76193) is deployed in 113abe5c since 21:08, but its production
+falsifier CANNOT fire yet: the scheduled walker is dev's daemon, which
+still runs b8ec32c7 bits — the 21:08 deploy's restart leg was draft-gated
+(owned codex row codex-runtime://01a0bf3b… holds a pending draft, the
+[11.136] class), so no rotation landed. First rotation after the gate
+clears puts the new walker on; the falsifier then reads itself from the
+next scheduled walks (managed_cli_tool_backoff_skip for mimo with growing
+remaining_ms; mimo 900 s kills stop; ≤1 mimo retry/day). The law itself is
+unit-proven (amber-treadmill suite incl. the escalation test, 1660/0).
+
 
 ## ⛔ [11.225] THE 17:03 DEPLOY RETIRED DEV'S LIVE DAEMON BIND LOCK WITHOUT A SUCCESSOR — THE SERVING DAEMON IS NOW LOCKLESS, THE [11.159] ACCEPT ARM CANNOT FIRE, AND EVERY SPAWN-CARRYING VERB ON DEV FAILS "local yggterm daemon did not become reachable" WHILE READS KEEP WORKING (measured live 2026-10-03 17:44-18:2x IST; spawn plane dead ~90 min and counting)
 
@@ -233,6 +308,24 @@ Shape-lock test rewritten to the new law (compatible + live listener
 accepts whatever the lock; no listener → refuse). Full server-lib
 1660/0. Directions (a) deploy-atomicity and (c) the [11.136] escape hatch
 REMAIN OPEN.
+UPDATE 2026-10-03 ~21:5x IST (proof-collection seat; zcode on jojo, work
+FROM dev): DIRECTION (b) IS NOW PRODUCTION-PROVEN ON THE INCIDENT'S OWN
+RECURRENCE. The 21:08 deploy of 113abe5c retired the live daemon 3419462's
+bind lock AGAIN (server-3-2-116.sock.lock.retired-3419462) and — the codex
+draft gate holding, exactly the 17:03 shape — rotated nothing: dev served
+lockless on b8ec32c7 bits with a 113abe5c client. The spawn plane STAYED
+UP this time: the E2E probe's spawn verbs minted rows (fresh_start row
+born, running) and the dev trace records repeated
+`ensure_accepted_live_bind_lock_owner` with `bind_lock_held:false` 21:37+
+— zero spawned_daemon_child, zero "did not become reachable". The same
+deploy shape that cost 1 h 43 min at 17:03 was harmless at 21:08 with the
+fix deployed. (The probe's fresh_start FAIL in that window is NOT a
+spawn-plane failure — it is [11.226], the agy trust gate.) CAVEAT ON THE
+19:0x LEG ABOVE: its "painted its CLI (chars 0 → 440)" was the [11.226]
+GATE TEXT, not a signed-in TUI — the heal stands (mint + run), the paint
+leg does not. Directions (a) and (c) remain open; the entry's casualty
+(spawn plane down through a lock-retiring deploy) is closed in production.
+
 
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
