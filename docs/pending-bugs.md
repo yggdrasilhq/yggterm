@@ -18,6 +18,128 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.224] `mimo upgrade` NEVER COMPLETES — EVERY SCHEDULED MANAGED-CLI REFRESH HANGS ITS 900 s MIMO STEP AND IS DEADLINE-KILLED (26/26 WALKS SINCE ≥09-29), `devin update` EXITS 130 ON EVERY WALK, AND ORPHANED MIMO UPGRADES ESCAPE THE KILL FOREVER — THE REFRESH NEVER CONVERGES AND ITS LOCK HOLDS PIN EVERY CONCURRENT ENSURE (measured 2026-10-03, dev trace gen g1791022605539 + live /proc evidence)
+
+**Status:** OPEN
+
+Filed 2026-10-03 ~18:1x IST by the queue-completion seat (zcode sess_813045b5
+on jojo, work FROM dev; board plan ACK-4e4b35fc52). Found reading [11.182]'s
+post-fix production evidence for its close audit — the close audit FAILED and
+this is why.
+
+THE MEASUREMENT (dev, trace gen g1791022605539 spanning 09-29 22:46 → 10-03
+16:17, plus the current gen):
+- `mimo upgrade` timed out at the [11.182] 900 s deadline and was killed WITH
+  ITS PROCESS GROUP **26 times — every single scheduled refresh walk in the
+  generation** (09-29 23:38; 09-30 ×12 through 12:08; 10-02 20:18/22:49/23:04;
+  10-03 00:49, 03:22, 06:55, 07:10, 08:56, 09:11, 10:56, 11:34, 12:57, 13:55,
+  14:56, 15:56) — ZERO successes. The upgrade is broken, not slow: every
+  attempt hangs past 15 minutes.
+- `devin update` exited 130 on every one of those walks (26/26, always paired
+  with the mimo kill in the same refresh_install_error).
+- ORPHANED mimo upgrades escape the deadline kill when their walker dies first
+  (a daemon rotation kills the refresh-managed-cli parent; the child tree
+  reparents to init and the group kill never arrives): live /proc evidence
+  captured ~18:05 — pid 3523617 + grandchild 3523632 hung since ~09-27 22:00
+  (**5 d 20 h**), pid 4140805 + grandchild 4140822 hung 17 h, all four PPID 1,
+  all sleeping in do_epoll_wait (syscall 281/441), no TTY, no deadline.
+  Ops-cleared same sitting (TERM, all four died — the [11.182] remedy
+  pattern). No reaper exists for PPID-1 install children.
+- THE COLLATERAL: each walk's lock hold refuses every concurrent ensure — 22
+  `install_step_failed` refusals 10-02 22:00 → 10-03 09:11 (kimi ×9, muse ×7,
+  agy ×1, plus refresh errors), holders 3550476/4122291/163539/438854/471987/
+  1079210/1120344 all NAMED by the [11.182] holder provenance (it works). An
+  agy/kimi/muse row born inside one of these ≥15-min windows goes amber/blank
+  — the 10:4x seat's "nondeterministic first-spawn blank" watch item (E2E
+  fresh_start FAILED once ~10:05, minutes before the 10:56 walk's mimo kill)
+  is this class: deterministic given the lock window. TONIGHT's E2E agy
+  failures (17:44-18:2x) were measured to be a SECOND, larger cause —
+  [11.225], the dev spawn-plane outage — with the 17:41 post-rotation walk's
+  mimo hold (child 3217538, killed 18:01) layered on top.
+
+ROOT CAUSE UNMEASURED: what `.mimocode upgrade` (mimo-ai__cli 0.1.15) waits on
+in epoll_wait forever — no TTY, likely a dead upgrade endpoint or an auth
+prompt nobody answers ([11.93]'s mimo-needs-auth note is adjacent). devin's
+130 (SIGINT-shaped) is unmeasured too.
+
+FALSIFIER: run `timeout 90 ~/.yggterm/ynpm/bin/mimo upgrade` by hand with
+stderr captured and read where it stalls (the epoll wait has no event source —
+a DEBUG env pass or strace names it); `devin update` by hand likewise.
+
+FIX SHAPES (a taste call among them, none coded): (a) drop mimo from the
+scheduled refresh (a per-tool refresh disable) until its upgrade works — the
+walk converges and the recurring lock holds vanish; (b) a reaper arm for
+PPID-1 install children (the [11.182] escalation gap's narrowest form);
+(c) a shorter per-step deadline for known-broken upgraders (fail fast instead
+of 15 min × every walk). Until one lands, the fleet pays a ≥15-min toolchain
+write-lock every refresh cycle and any agy/kimi/muse row born in that window
+goes amber/blank.
+
+## ⛔ [11.225] THE 17:03 DEPLOY RETIRED DEV'S LIVE DAEMON BIND LOCK WITHOUT A SUCCESSOR — THE SERVING DAEMON IS NOW LOCKLESS, THE [11.159] ACCEPT ARM CANNOT FIRE, AND EVERY SPAWN-CARRYING VERB ON DEV FAILS "local yggterm daemon did not become reachable" WHILE READS KEEP WORKING (measured live 2026-10-03 17:44-18:2x IST; spawn plane dead ~90 min and counting)
+
+**Status:** OPEN
+
+Filed 2026-10-03 ~18:3x IST by the queue-completion seat (zcode sess_813045b5
+on jojo, work FROM dev; board plan ACK-4e4b35fc52). Found because the E2E
+connection probe's agy scenarios all failed and the lock-window theory
+([11.224]) only explained the first batch.
+
+THE MEASURED CHAIN (dev):
+- The 17:03 deploy (19651489) retired the LIVE daemon 2956875's bind lock
+  (`server-3-2-116.sock.lock.retired-2956875`, mtime 17:03) and the 17:40
+  deploy (1b76a310) rewrote the active lock (mtime 17:41) — but 2956875
+  (born 16:27 on build 32aa1570) NEVER handed over and is STILL the only
+  daemon, still LISTENING on server-3-2-116.sock. jojo and oc rotated fine
+  on the same deploys (jojo → 1829367 @17:41, oc → 3512118 @~17:50); dev is
+  the build host and the one host with an OWNED working row at deploy time
+  (codex-runtime://01a0bf3b…, the [11.136]/[11.137] hot-restart-defers-on-
+  working-rows class is the likely reason the takeover never landed).
+- The active bind lock is UNHELD (flock acquired+released by hand 18:2x);
+  the serving daemon holds no lock. The installed CLI binary was rolled to
+  1b76a310 (mtime 17:40) while the daemon still runs 32aa1570 bits —
+  `reachable_local_daemon_is_current` refuses it on binary currency
+  (`local_daemon_binary_current_problem`), and the [11.159] accept arm
+  `served_by_live_bind_lock_owner` — added precisely for the same-version
+  stale-binary storm, see its ⛔ [11.159] comment in
+  crates/yggterm-server/src/lib.rs — requires a HELD bind lock, which is
+  exactly what the deploy retired. Every spawn-carrying verb then
+  demand-starts a daemon child (8× spawned_daemon_child 18:18-18:26), the
+  child cannot take over, `wait_for_local_daemon` polls 100 × 150 ms and
+  bails "local yggterm daemon did not become reachable".
+- IMPACT: `server remote start-agy` (hand-reproduced twice, empty-screen
+  rows minted) and every E2E probe scenario that spawns through the start
+  path — fresh_start_connects ×2, resume_store_present ×2,
+  defmiss_fresh_start_mint, startborn_remote_corpse,
+  stillborn_resume_corpse — all RED 17:44→18:2x; read verbs (screen,
+  status) keep answering through the socket, so the outage is invisible to
+  anyone only reading rows. rebirth_uuid_vouch and store_absent_refuses
+  PASSED in the same window (17:55/17:58) — the resume-path verbs that
+  connected through the serving daemon directly.
+- This is the [11.159] storm shape with a new precondition: the fix's
+  accept arm assumes the deploy either rotates the daemon or leaves its
+  lock held; a deploy that retires the lock of a daemon it then FAILS to
+  rotate defeats both arms. [11.106]/[11.121] (same-version deploys not
+  reaching the daemon) are the parent class; this is the spawn-plane
+  casualty of it.
+
+REMEDY (owner call — a seat must not kill the daemon serving an owned
+working row): rotate dev's daemon once the codex row is idle (any deploy's
+restart leg with the gate green, or the owner's restart door); the successor
+takes the unheld lock, binds fresh, and the spawn plane heals. Everything
+restores from the ledger ([11.146]).
+
+FALSIFIER: on a rotated dev daemon, `server remote start-agy` mints a row
+that shows its CLI within the probe's window, and the full E2E connection
+probe goes 8/8. FIX DIRECTIONS (none coded): (a) the deploy's lock-retire
+step must be atomic with a verified successor (retire only AFTER the
+successor holds the lock — a retired lock with a live lockless daemon is a
+worse state than a stale-held one); (b) extend the [11.159] accept arm: a
+version-compatible status answer from the socket's live listener should
+accept even lockless when the lock is UNHELD (nobody can be mid-takeover);
+(c) the [11.136] deferral needs an escape hatch for the "spawn plane is
+DOWN and the stale daemon is the cause" case — deferring the rotation
+preserves one working row at the cost of every new spawn.
+
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
 **Status:** AWAITING A DECISION
@@ -31338,6 +31460,18 @@ FOLLOW-UP 2026-09-28 EVENING (lane/integration/11192-vouch-contention, row 11.19
 
 SYMPTOM 2 — THE SQUISHED VIEWPORT (OPEN, the mechanism measured): the viewport squish is a LOCAL-FIT vs REMOTE-PTY GEOMETRY FIGHT, traced 15:24:56-15:25:10 on 41e5733d: `terminal_js/xterm_fit` proposes 170x81 → `terminal_startup_resize_repair` forces 170x63 (the remote PTY truth) → bootstrap m2→m3 → fit 81 again → repair 63 again. The renderer ends with fit-81 CELL METRICS on a 63-row grid — the compressed top-left paint in the owner screenshot. THE INVARIANT VIOLATED: `fitTerminalToHost` (terminal_scripts.rs:2919) resizes the LOCAL xterm from `proposedTerminalFitDimensions()` with NO reference to the remote PTY geometry, and the local/remote divergence is never reconciled (the family has history: the 2026-08-10 "squished viewport" comment at :2900 — same family, different trigger). FIX SHAPE: the fit must propose-and-FORWARD, applying locally only on a confirmed remote resize (the resize-forward machinery exists Rust-side: `remote_pty_resize_forwarded ok` — needs a JS↔Rust handshake on the forward result, or the PTY dims carried onto the host element as attributes to clamp the proposal). A GUI lane of its own with the xterm-harness — not rushed into the embedded script. Interim: nudge the window size (forces the reconcile cycle) or restart the row.
 
+UPDATE 2026-10-03 ~18:3x IST (queue-completion seat, zcode sess_813045b5 on
+jojo, work FROM dev): SYMPTOM 1's compose family carries independent
+evidence as of today — the [11.218] full-window hunt ran THIS entry's
+descended defmiss_fresh_start_mint scenario 12/12 PASS through a complete
+31-min young window on jojo's healthy rotated daemon (docs 1b76a310), and
+store_absent_no_candidate_refuses PASSED on dev 17:58; the dev-side E2E
+re-run of defmiss itself is deferred to after [11.225] (the dev spawn-plane
+outage fails every start-path spawn, not the compose). SYMPTOM 2 (the
+squished viewport local-fit vs remote-PTY geometry fight) remains the open
+lane with its fix shape unchanged (fit must propose-and-FORWARD on confirmed
+remote resize; the xterm-harness GUI lane).
+
 ## ⛔ [11.187] A REMOTE ROW'S OUTPUT STREAM DIES SECONDS AFTER BIRTH AND NOTHING EVER RECONCILES — THE ROW STAYS ACTIVE, THE DAEMON'S OWN SCREEN MOVES ON, AND THE VIEWPORT FREEZES ON THE BIRTH PAINT FOREVER (measured 2026-09-27 19:35-19:41 IST live on the owner's GUI, the [11.187] sitting; owner screenshot: "New dev Antigravity" frozen at "Signing in…")
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -31404,6 +31538,24 @@ Structural defects, all four needed:
 
 Fix direction: per-CLI lock span + per-child deadline (kill + continue) + holder-progress escalation (break-after-N-min with /proc evidence) + row stamp naming the ensure failure. Repro instrument: `server monitor --scenario managed-cli-refresh` exists; add a hung-child scenario.
 
+UPDATE 2026-10-03 ~18:1x IST (queue-completion seat, zcode sess_813045b5 on
+jojo, work FROM dev): CLOSE AUDIT FAILED — the fix's machinery is live and
+the 18 h wedge class is dead (26 deadline-kills in gen g1791022605539, zero
+unbounded holds, holder provenance names every holder), but the entry cannot
+close on this evidence: (a) the scheduled refresh's mimo step hangs 900 s on
+EVERY walk and each walk's lock hold refuses every concurrent ensure (22
+refusals 10-02 22:00→10-03 09:11 + live E2E agy-scenario failures
+17:41-18:0x) — filed as [11.224]; (b) one overnight holder (3550476) showed
+CONSTANT acquired_at_ms (22:24:27) across TWO consecutive 900 s mimo kills
+(22:49:27, 23:04:34) with a refusal at 23:04:39 still citing it — while
+today's live walk REWROTE provenance mid-walk (acquired_at 17:51:47 while a
+17:46-born mimo child still ran): either the per-step re-acquire does not
+rewrite provenance on some path, or the walk holds across steps — a
+code-side read of the landed lock sites is owed; (c) the escalation arm
+(defect #3) remains un-landed and the orphan class it would reap is real
+([11.224]: two PPID-1 mimo orphans, one 5 d 20 h old, ops-cleared). Status
+stays OPEN on [11.224]'s convergence + the lock-span code read.
+
 ## ⛔ [11.183] THE AGY ROW→CONVERSATION BINDING IS PERSISTED NOWHERE ON THE ROW — RE-BIRTH ORPHANS THE ROW FROM ITS STORE CONVERSATION; PRE-[11.165] THIS ATE SESSIONS SILENTLY (FABRICATE), POST-[11.165] IT REFUSES AND THE ROW HANGS IN "Bootstrapping · idle" FOREVER (measured 2026-09-27, jojo + dev, the owner's five work rows)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -31422,6 +31574,17 @@ Facts measured this sitting:
 
 Fix direction: (a) persist the bound conversation id on the ROW record at stamp/rebind time (a `storage_path`-class field; carried through close/tombstone/restore like terminal_identity_exports); (b) compose resume from the persisted binding, falling back to the row uuid; (c) an agy vouch ladder mirroring opencode's (focus stamp → store candidate by cwd/recency → honest fresh-start affordance) so a binding-less row lands on ITS conversation or an explicit new one — never an eternal Bootstrapping, never a silent fabrication.
 
+UPDATE 2026-10-03 ~18:3x IST (queue-completion seat, zcode sess_813045b5 on
+jojo, work FROM dev): independent re-verification ATTEMPTED and DEFERRED —
+the E2E probe's agy-spawning scenarios cannot run on dev tonight because of
+[11.225] (the spawn-plane outage: every start-path verb fails "local yggterm
+daemon did not become reachable"); rebirth_uuid_vouch PASSED in the same
+window (17:55, connecting through the serving daemon) and
+agy_store_candidate_vouch_refused_tombstoned fired naturally in production
+today 10:13 (the ladder + its tombstone guard live), so the fix keeps
+accumulating support. The full-probe green run that flips this entry is owed
+to the first seat after dev's daemon rotates ([11.225] remedy).
+
 ## ⛔ [11.184] REMOTE AGY RESUME HITS `no terminal spec for session: agy-runtime://<uuid>` WHEN THE DEV-SIDE RUNTIME RECORD IS GONE — EVEN WHEN THE STORE HAS THE CONVERSATION; THE ENSURE'S OWN COMPOSE IS UNDONE BY THE TERMINAL-ENSURE KEY RESOLUTION (measured 2026-09-27, dev 3.2.113, row c70b6a9c whose conversation EXISTS in the db)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -31437,4 +31600,14 @@ Repro (original filing, kept): dev store has conversation `c70b6a9c-…` (db row
 Second half, same seam: when the dev-side twin record DOES exist, its `.id` (the real conversation) is IGNORED at recompose — the compose uses the request's session_id (the row uuid), so a held twin resumes by row id and agy fabricates a fresh conversation under it (peer-side [11.165] gate is skipped by `live_runtime_held` by design).
 
 Fix direction: make `resolve_terminal_session_key`/`terminal_spec` resolve the key the ensure just wrote (the alias seam — `local_runtime_id_from_key` → `local_live_runtime_key` vs `remote_runtime_agent_session_key` spellings), add the missing-record healing arm for agent runtimes (recompose spec from the descriptor + STORE-conversation id when the twin carries one), and add a repro test: ensure-then-terminal-ensure for a remote agent row with no pre-existing record.
+
+
+UPDATE 2026-10-03 ~18:3x IST (queue-completion seat, zcode sess_813045b5 on
+jojo, work FROM dev): independent re-verification ATTEMPTED and DEFERRED —
+the scenario's agy spawn cannot run on dev tonight because of [11.225] (the
+spawn-plane outage; resume_store_present failed twice on empty screens 17:50
+and 18:17 with the lock even free in the second window); the symptom stays
+dead in production (zero "no terminal spec" refusals across both trace
+generations since the fix landed). The full-probe green run that flips this
+entry is owed to the first seat after dev's daemon rotates ([11.225] remedy).
 
