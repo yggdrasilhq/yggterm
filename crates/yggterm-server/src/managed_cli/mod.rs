@@ -209,13 +209,42 @@ struct ManagedCliRefreshState {
     /// the success state persists, and the lock frees.
     #[serde(default)]
     failed_at_ms: BTreeMap<String, u64>,
+    /// Per-tool count of CONSECUTIVE install-step failures ([11.224], the
+    /// never-converging refresh of 2026-10-03): the flat 30-minute backoff
+    /// expires before the next walk (TTL 2h, observed cadence ~1h), so a
+    /// deterministically-wedged upgrader — `mimo upgrade` paints an
+    /// interactive "Install anyways?" prompt no scheduled walk can answer —
+    /// rode 26/26 walks and paid a 900s toolchain-lock window each time.
+    /// The backoff now doubles per consecutive failure of THAT tool; the
+    /// tool's own success resets its streak, so a transient npm hiccup still
+    /// retries within the hour while a permanent wedge fades to the cap.
+    #[serde(default)]
+    failure_streaks: BTreeMap<String, u32>,
 }
 
 /// How long a tool whose install step failed is skipped by walks and by the
-/// launch-path ensure. Long enough to starve a permanently-wedged upgrader
-/// out of every walk; short enough that a transient npm hiccup retries this
-/// hour.
+/// launch-path ensure, BEFORE escalation: the first failure of a run backs
+/// off 30 minutes — long enough that a transient npm hiccup retries this
+/// hour. Consecutive failures double it (see [`failure_streaks`]), because
+/// a flat window shorter than the walk cadence puts a permanently-wedged
+/// upgrader back into EVERY walk — the exact treadmill this constant's law
+/// exists to prevent.
 const MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS: u64 = 30 * 60_000;
+
+/// The ceiling of the escalating backoff. A permanently-wedged upgrader is
+/// retried at most once a day (one step-deadline of lock window), instead of
+/// once every walk; the daily retry keeps an upstream fix (e.g. mimo gaining
+/// a non-interactive flag) picked up within a day of landing.
+const MANAGED_CLI_TOOL_FAILURE_BACKOFF_MAX_MS: u64 = 24 * 60 * 60_000;
+
+/// The backoff a tool with `streak` consecutive failures carries: doubling
+/// from the base, capped.
+fn managed_cli_tool_failure_backoff_for_streak(streak: u32) -> u64 {
+    let shift = streak.saturating_sub(1).min(16);
+    MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS
+        .saturating_mul(1_u64 << shift)
+        .min(MANAGED_CLI_TOOL_FAILURE_BACKOFF_MAX_MS)
+}
 
 /// The tool's remaining failure backoff, if it is currently backed off.
 fn managed_cli_tool_backoff_remaining_ms(
@@ -224,8 +253,13 @@ fn managed_cli_tool_backoff_remaining_ms(
     now_ms: u64,
 ) -> Option<u64> {
     let failed_at = *state.failed_at_ms.get(tool.binary_name())?;
+    let streak = state
+        .failure_streaks
+        .get(tool.binary_name())
+        .copied()
+        .unwrap_or(1);
     let remaining = failed_at
-        .saturating_add(MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS)
+        .saturating_add(managed_cli_tool_failure_backoff_for_streak(streak))
         .saturating_sub(now_ms);
     (remaining > 0).then_some(remaining)
 }
@@ -1120,6 +1154,7 @@ fn managed_cli_refresh_state_from_probes(
         last_successful_refresh_ms: Some(refreshed_at_ms),
         managed_versions,
         failed_at_ms: BTreeMap::new(),
+        failure_streaks: BTreeMap::new(),
     }
 }
 
@@ -1232,11 +1267,13 @@ fn persist_managed_cli_refresh_state(
     probes: &[(ManagedCliTool, ToolProbe)],
     refreshed_at_ms: u64,
 ) -> Result<()> {
-    // The backoff map is CARRIED OVER, never reset by a refresh-state write:
+    // The backoff maps are CARRIED OVER, never reset by a refresh-state write:
     // a walk that succeeded for six tools and failed for mimo must not erase
     // mimo's backoff (it would be retried — and re-wedge — on the next walk).
     let mut state = managed_cli_refresh_state_from_probes(probes, refreshed_at_ms);
-    state.failed_at_ms = load_managed_cli_refresh_state(home).failed_at_ms;
+    let prior = load_managed_cli_refresh_state(home);
+    state.failed_at_ms = prior.failed_at_ms;
+    state.failure_streaks = prior.failure_streaks;
     if state.managed_versions.is_empty() {
         return Ok(());
     }
@@ -1858,6 +1895,7 @@ mod tests {
                 ("codex-litellm".to_string(), "4.5.6".to_string()),
             ]),
             failed_at_ms: BTreeMap::new(),
+            failure_streaks: BTreeMap::new(),
         };
         let remaining_ms = managed_cli_refresh_skip_remaining_ms(&before, &state, now_ms, ttl_ms);
         assert_eq!(remaining_ms, Some(ttl_ms.saturating_sub(1_000)));
@@ -1874,6 +1912,7 @@ mod tests {
                 ("codex-litellm".to_string(), "4.5.6".to_string()),
             ]),
             failed_at_ms: BTreeMap::new(),
+            failure_streaks: BTreeMap::new(),
         };
         let system_before = vec![
             (
@@ -2048,6 +2087,7 @@ mod tests {
             last_successful_refresh_ms: Some(now_ms.saturating_sub(1_000)),
             managed_versions: BTreeMap::from([("codex".to_string(), "1.2.3".to_string())]),
             failed_at_ms: BTreeMap::new(),
+            failure_streaks: BTreeMap::new(),
         };
         let system_probe = ToolProbe {
             version: Some("1.2.3".to_string()),
@@ -4803,6 +4843,7 @@ fn install_latest_collecting(
     // no such case, so `?` was safe there and is not safe here.
     let mut failures: Vec<ManagedCliArmFailure> = Vec::new();
     let mut failed_tools: Vec<ManagedCliTool> = Vec::new();
+    let mut succeeded_tools: Vec<ManagedCliTool> = Vec::new();
     let now_ms = current_time_ms();
     let backoff_state = load_managed_cli_refresh_state(&paths.home);
     for (tool, step) in per_tool {
@@ -4843,6 +4884,8 @@ fn install_latest_collecting(
                 display: tool.display_name().to_string(),
                 error: error.to_string(),
             });
+        } else {
+            succeeded_tools.push(tool);
         }
     }
 
@@ -4881,35 +4924,35 @@ fn install_latest_collecting(
                 display: tool.display_name().to_string(),
                 error: error.to_string(),
             });
+        } else {
+            succeeded_tools.push(tool);
         }
     }
-    record_install_tool_outcomes(paths, &failed_tools, failures.is_empty(), now_ms);
+    record_install_tool_outcomes(paths, &failed_tools, &succeeded_tools, now_ms);
 
     failures
 }
 
-/// Persist the per-tool failure backoff after a walk: failed tools stamp
-/// `failed_at_ms`, and a fully-successful walk clears the map (a tool that
-/// installs cleanly today may hang tomorrow; a tool that hung may be fixed —
-/// the backoff expires and it retries).
+/// Persist the per-tool failure backoff after a walk: a failed tool stamps
+/// `failed_at_ms` and grows its consecutive-failure streak (the backoff
+/// doubles per streak, capped); a tool whose own step SUCCEEDED resets its
+/// own stamps even in a walk that failed elsewhere — with a permanently
+/// wedged sibling making every walk "failed", a fully-clean-walk-only clear
+/// would never fire and a recovered tool would escalate forever on stale
+/// failures ([11.224]). A tool that hung may be fixed — its backoff expires
+/// and it retries.
 fn record_install_tool_outcomes(
     paths: &ManagedCliPaths,
     failed_tools: &[ManagedCliTool],
-    all_succeeded: bool,
+    succeeded_tools: &[ManagedCliTool],
     now_ms: u64,
 ) {
     let mut state = load_managed_cli_refresh_state(&paths.home);
-    if all_succeeded {
-        if state.failed_at_ms.is_empty() {
-            return;
-        }
-        state.failed_at_ms.clear();
-    } else {
-        for tool in failed_tools {
-            state
-                .failed_at_ms
-                .insert(tool.binary_name().to_string(), now_ms);
-        }
+    let was_quiet =
+        state.failed_at_ms.is_empty() && state.failure_streaks.is_empty();
+    apply_install_tool_outcomes(&mut state, failed_tools, succeeded_tools, now_ms);
+    if was_quiet && state.failed_at_ms.is_empty() && state.failure_streaks.is_empty() {
+        return;
     }
     if let Err(error) = save_managed_cli_refresh_state(&paths.home, &state) {
         append_trace_event(
@@ -4919,6 +4962,33 @@ fn record_install_tool_outcomes(
             "install_backoff_state_write_error",
             serde_json::json!({ "error": error.to_string() }),
         );
+    }
+}
+
+/// The backoff maps' mutation law, free of I/O so the law itself is testable.
+fn apply_install_tool_outcomes(
+    state: &mut ManagedCliRefreshState,
+    failed_tools: &[ManagedCliTool],
+    succeeded_tools: &[ManagedCliTool],
+    now_ms: u64,
+) {
+    for tool in succeeded_tools {
+        state.failed_at_ms.remove(tool.binary_name());
+        state.failure_streaks.remove(tool.binary_name());
+    }
+    for tool in failed_tools {
+        let streak = state
+            .failure_streaks
+            .get(tool.binary_name())
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        state
+            .failure_streaks
+            .insert(tool.binary_name().to_string(), streak);
+        state
+            .failed_at_ms
+            .insert(tool.binary_name().to_string(), now_ms);
     }
 }
 
@@ -7861,6 +7931,7 @@ mod amber_treadmill_tests {
             last_successful_refresh_ms: None,
             managed_versions: BTreeMap::new(),
             failed_at_ms: BTreeMap::new(),
+            failure_streaks: BTreeMap::new(),
         };
         let mimo = ManagedCliTool::Mimo;
         assert!(managed_cli_tool_backoff_remaining_ms(&state, mimo, now).is_none());
@@ -7875,6 +7946,72 @@ mod amber_treadmill_tests {
         assert!(
             managed_cli_tool_backoff_remaining_ms(&state, mimo, now).is_none(),
             "the backoff expires: the tool retries"
+        );
+    }
+
+    /// ⛔ THE [11.224] ESCALATION LAW: a flat backoff shorter than the walk
+    /// cadence puts a permanently-wedged upgrader back into EVERY walk — the
+    /// measured treadmill (mimo, 26/26 walks deadline-killed, 900s lock
+    /// window each). Consecutive failures DOUBLE the backoff up to a daily
+    /// cap, so a permanent wedge costs one step-deadline a day instead of
+    /// one per walk; the FIRST failure keeps the transient-hiccup budget
+    /// (base backoff, retries this hour).
+    #[test]
+    fn a_permanently_wedged_upgrader_escalates_out_of_every_walk() {
+        let now = 1_000_000_000_u64;
+        let mimo = ManagedCliTool::Mimo;
+        let mut state = ManagedCliRefreshState {
+            last_successful_refresh_ms: None,
+            managed_versions: BTreeMap::new(),
+            failed_at_ms: BTreeMap::new(),
+            failure_streaks: BTreeMap::new(),
+        };
+        // First failure: the base budget.
+        state
+            .failed_at_ms
+            .insert("mimo".to_string(), now - 1000);
+        state.failure_streaks.insert("mimo".to_string(), 1);
+        let first = managed_cli_tool_backoff_remaining_ms(&state, mimo, now)
+            .expect("first failure backs off");
+        assert!(first <= MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS);
+        // A streak equal to the walk TTL's worth of hourly failures must NOT
+        // be retryable within the hour: the flat-law treadmill shape.
+        state.failure_streaks.insert("mimo".to_string(), 3);
+        let escalated = managed_cli_tool_backoff_remaining_ms(
+            &state,
+            mimo,
+            now - 1000 + 45 * 60_000,
+        )
+        .expect("a three-failure streak is still backed off 45 minutes in");
+        assert!(
+            escalated > 15 * 60_000,
+            "the escalated backoff outlasts the walk cadence, not just the half-hour"
+        );
+        // The cap is a daily retry, not an exile.
+        state.failure_streaks.insert("mimo".to_string(), 40);
+        let at_cap = managed_cli_tool_failure_backoff_for_streak(40);
+        assert_eq!(at_cap, MANAGED_CLI_TOOL_FAILURE_BACKOFF_MAX_MS);
+        let beyond_cap = managed_cli_tool_failure_backoff_for_streak(4000);
+        assert_eq!(beyond_cap, MANAGED_CLI_TOOL_FAILURE_BACKOFF_MAX_MS);
+        // And a tool's OWN success resets its OWN budget — even while a
+        // sibling stays wedged (the apply_install_tool_outcomes law).
+        let mut mixed = state.clone();
+        mixed.failure_streaks.insert("codex".to_string(), 5);
+        mixed.failed_at_ms.insert("codex".to_string(), now - 1000);
+        apply_install_tool_outcomes(
+            &mut mixed,
+            &[mimo],
+            &[ManagedCliTool::Codex],
+            now,
+        );
+        assert!(
+            managed_cli_tool_backoff_remaining_ms(&mixed, ManagedCliTool::Codex, now).is_none(),
+            "a recovered tool is never held hostage to a wedged sibling's streak"
+        );
+        assert_eq!(
+            mixed.failure_streaks.get("mimo"),
+            Some(&(40 + 1)),
+            "the wedged sibling's streak still grows in the same walk"
         );
     }
 
