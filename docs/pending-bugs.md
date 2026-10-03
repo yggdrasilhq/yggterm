@@ -30252,43 +30252,6 @@ LARGELY THE SHELL RENDERER ITSELF: the heat and the swap-thrash are the
 same defect. Box carried 9.5G/15G swap through the morning. The growth
 feeder remains unprofiled; the falsifier stands unchanged.
 
-## ⛔ [11.112] THE YGG-CI WATCHER DIES ON MULTIBYTE GATE OUTPUT — ONE UTF-8 CHAR SPLIT ACROSS A READ CHUNK KILLED THE WHOLE TICK LOOP AND EVERY SUBSCRIBED LANE WAITED IN SILENCE (wedged 2026-09-14 22:29:54 IST, found by the kimi-draft-guard seat waiting on its lane)
-
-**Status:** OPEN
-
-The 22:26 tick built yggterm ok and started the docs gate; at 22:29:54 the
-watcher logged `tick error: 'utf-8' codec can't decode byte 0xe2 in
-position 191: invalid continuation byte` and the log went SILENT for 32+
-minutes at interval=300 — seven ticks missing, the process alive but never
-ticking again (recovery: kill + setsid restart, the pattern another seat
-used earlier the same day). Byte 0xe2 mid-string is a multibyte UTF-8 char
-(box-drawing/arrows in gate output) split across a pipe-read chunk boundary
-and decoded per-chunk — the classic incremental-decode defect. The fix is
-in the watcher's gate-output read: decode with an incremental decoder (or
-`errors='replace'`), never chunk-wise str-decoding; a gate crash must also
-be contained to its tick (log + continue), not able to take the loop down.
-Board record: infra/meta ACK-cc6f9f88d0 + recovery ACK-a3a32ade01.
-
-UPDATE 2026-10-03 ~10:0x IST (queue-completion seat, zcode sess_654d9543 on
-jojo, work FROM dev): THE FIX WAS ON MAIN SINCE 46bdef19 ([11.207], Sep 29 —
-errors="replace" at every gate-output read + per-tick containment) BUT THE
-RUNNING WATCHER PREDATED IT — pid 25687 started Sep 26 19:06 and Python held
-the old code in memory, so the class stayed LIVE: three ticks today (08:49:41,
-08:59:07, 09:08:53) died on the exact signature (`'utf-8' codec can't decode
-byte 0xe2 in position 188`) — each aborting a tick MID-FLIGHT (the [11.97]
-lane-drop shape; a post-merge abort would strand an unpushed integration
-main). The loop itself survived (per-tick catch + log + continue — the
-Sept-14 whole-loop death shape no longer reproduces on this code), and the
-09:46/09:59 ticks passed their gates (chunk boundaries are timing luck).
-OPERATIONAL LESSON: a fix to the CI watcher's own code takes effect only at
-watcher RESTART — after landing one, restart the watcher in the same sitting,
-or the fix ships while the hazard keeps firing. Watcher restarted 10:03:19 on
-the fixed code (pid 1428019, killed 25687 mid-idle — never mid-build: a
-half-dead cargo colliding with a fresh tick's build on target/ is worse than
-the decode risk). FALSIFIER ARMED: subsequent multibyte-laden gate outputs
-(the docs gate's own em-dashes qualify) produce no `tick error` decode lines
-in ci.log.
-
 ## ⛔ [11.113] THE TRACE PLANE CANNOT SEE THE UX ACTIONS THE UX-SPEED CAMPAIGN MUST MEASURE — NO DRAG END, NO MENU CLOSE/ACTIVATE, CHORD-IDENTITY ABSENT FROM `input/keystroke`, AND `first_frame` NEVER FIRES FOR IDLE SHELLS (measured 2026-09-14 late, live ytrace + synthetic verbs, the ux-speed founding lane)
 
 **Status:** OPEN
