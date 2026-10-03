@@ -44647,6 +44647,71 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn co_visible_split_pane_keeps_its_bootstrap_owner_across_snapshot_prunes() {
+        // [11.217] THE SECOND GATE: the periodic snapshot-apply prune kept
+        // bootstrap owners/leases and resume-ready paths for RETAINED + THE
+        // ACTIVE session only — a split group's co-visible member is
+        // neither, so the prune erased the owner/lease of a LIVE mount task
+        // mid-flight; the task read itself superseded and dropped without
+        // arming a remount (terminal_mount_task_dropped{remount_armed:false}
+        // measured 5/5 on the live GUI, 2026-10-03), leaving the promoted
+        // pane forever unpainted. The keep-set must include the active
+        // group's members — the same visibility tier the bootstrap
+        // predicate honors.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.split_groups.push(SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        });
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert("local://b".to_string(), "owner-b".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert("local://b".to_string(), "lease-b".to_string());
+        shell.terminal_resume_ready_paths.insert("local://b".to_string());
+        shell.prune_terminal_bootstrap_owners();
+        shell.prune_terminal_resume_ready_paths();
+        assert!(
+            shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key("local://b"),
+            "the co-visible member's live mount owner must survive the prune"
+        );
+        assert!(
+            shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key("local://b"),
+            "the co-visible member's live mount lease must survive the prune"
+        );
+        assert!(
+            shell.terminal_resume_ready_paths.contains("local://b"),
+            "the co-visible member's resume-ready marker must survive the prune"
+        );
+        // A row OUTSIDE the active group is still pruned by both.
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert("local://z".to_string(), "owner-z".to_string());
+        shell.terminal_resume_ready_paths.insert("local://z".to_string());
+        shell.prune_terminal_bootstrap_owners();
+        shell.prune_terminal_resume_ready_paths();
+        assert!(
+            !shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key("local://z")
+        );
+        assert!(!shell.terminal_resume_ready_paths.contains("local://z"));
+    }
+
+    #[test]
     fn co_visible_split_pane_member_bootstraps_its_host() {
         // [11.217]: the split create promotes the hidden-retained member to
         // a co-visible pane, but the host-bootstrap predicate answered

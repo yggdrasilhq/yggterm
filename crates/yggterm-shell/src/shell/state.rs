@@ -33413,21 +33413,38 @@ impl ShellState {
         }
     }
     fn prune_terminal_resume_ready_paths(&mut self) {
-        let mut keep_paths = self.retained_terminal_session_paths.clone();
-        if let Some(active_path) = self.server.active_session_path() {
-            keep_paths.insert(active_path.to_string());
-        }
+        let keep_paths = self.terminal_snapshot_prune_keep_paths();
         self.terminal_resume_ready_paths
             .retain(|session_path| keep_paths.contains(session_path));
         if self.server.active_session_path().is_none() {
             self.active_terminal_host_id = None;
         }
     }
-    fn prune_terminal_bootstrap_owners(&mut self) {
+    /// [11.217] The keep-set every periodic snapshot-apply prune must
+    /// honor: retained sessions, THE active session, and every member of
+    /// the ACTIVE SPLIT GROUP. A split's co-visible member is neither
+    /// retained (it is visible) nor "the" active session (only the focused
+    /// pane is), so a keep-set of the first two alone let the prune erase
+    /// the owner/lease of a LIVE mount task mid-flight — the task then read
+    /// itself superseded and dropped WITHOUT arming a remount
+    /// (terminal_mount_task_dropped{remount_armed:false} measured 5/5 on
+    /// the live GUI, 2026-10-03), leaving the promoted pane forever
+    /// unpainted. Same visibility tier the host-bootstrap predicate already
+    /// widened to (session_is_visible_split_pane).
+    fn terminal_snapshot_prune_keep_paths(&self) -> std::collections::HashSet<String> {
         let mut keep_paths = self.retained_terminal_session_paths.clone();
         if let Some(active_path) = self.server.active_session_path() {
             keep_paths.insert(active_path.to_string());
         }
+        if let Some(group) = self.active_split_group() {
+            for member in &group.members {
+                keep_paths.insert(member.session.clone());
+            }
+        }
+        keep_paths
+    }
+    fn prune_terminal_bootstrap_owners(&mut self) {
+        let keep_paths = self.terminal_snapshot_prune_keep_paths();
         self.terminal_bootstrap_owner_by_session
             .retain(|session_path, _| keep_paths.contains(session_path));
         self.terminal_bootstrap_lease_by_session

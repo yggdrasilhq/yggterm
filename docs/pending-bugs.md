@@ -209,6 +209,39 @@ commit promotes member 2 to visible — the mount decision should see that
 (before the skip), or the heal's forced refresh must fire for the co-visible
 member (today: for neither).
 
+UPDATE 2026-10-03 ~08:2x IST (second-gate sitting; zcode on jojo, work
+FROM dev): THE OWNER-GUI FALSIFIER WAS RUN — RED 5/5, AND THIS TIME IT
+CONVICTS. uxprobe --actions split --iters 5 on the LIVE Wayland GUI
+(daemon 859d783f, post-[11.220] restart): 5/5 creates, the co-visible
+member NEVER emits split/render_span and its pane never shows its pre-split
+marker (pane present=true — the 8bd618a2 predicate holds; the focused
+member paints 267-370 ms warm, 1987 ms cold iter-0). Root cause NAMED from
+the live trace: the SECOND GATE the split lane missed —
+prune_terminal_bootstrap_owners (and prune_terminal_resume_ready_paths,
+same keep-set) run on every periodic background snapshot apply with a
+keep-set of RETAINED + THE ACTIVE SESSION ONLY. A split group's co-visible
+member is neither (it is visible, and only the focused pane is "the"
+active session), so ~450 ms after the create the snapshot chore ERASED the
+owner/lease of the LIVE, correctly-working mount task — the task then read
+itself superseded (bootstrap_owner_superseded_during_loop), released the
+lease, and dropped WITHOUT arming a remount
+(terminal_mount_task_dropped{remount_armed:false}); the "superseding
+owner" never existed (no second begin in the window). The last surviving
+mount attempt then rides the warm eval into the [11.178] wedge (alive
+sheds, then silence) with the 60 s watchdog as the only recovery — far
+past the falsifier's 4 s window and the felt bar. FIX (lane
+lane/integration/11217-prune-owners): terminal_snapshot_prune_keep_paths =
+retained ∪ active ∪ active-split-group-members (the same visibility tier
+session_is_visible_split_pane already honors), used by BOTH prunes + law
+test co_visible_split_pane_keeps_its_bootstrap_owner_across_snapshot_
+prunes; shell lib 2200/2200. Residual (not this lane, no conviction):
+prune_terminal_attach_in_flight keeps only foreground-AND-retained — a
+remote co-visible member's in-flight attach may face the same erase; and
+the superseded-during-loop break still arms no remount (its [11.139]
+watchdog covers remote attaches only) — both recorded for the next
+wedge-class sitting. The live falsifier re-run on the deployed fix stays
+OWED (the jojo GUI was quit by the owner mid-sitting; daemon headless).
+
 UPDATE 2026-10-03 ~07:0x IST (falsifier sitting; zcode sess_b85fd20c on
 jojo, work FROM dev): the falsifier battery was RUN on the deployed build
 (87237c338787 — predates the 04:03/04:10 deploys per [11.220], but CARRIES
