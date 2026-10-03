@@ -88449,7 +88449,7 @@ async fn process_pending_app_control_requests(
                         // draft refusal used to wear the gate's detail because
                         // only the gate slug was recognized at all).
                         let detail = match reason {
-                            "pending_draft" => "the row's composer holds typed-but-unsent input. A programmatic send would submit or clobber a person's words. Clear the row's input (or send an empty write first) and resend.",
+                            "pending_draft" => "the row's composer holds typed-but-unsent input. A programmatic send would submit or clobber a person's words. Clear the row's input first — a Ctrl+U write, or the sized clear of Ctrl+U plus held_len backspaces the refusal's held_len names — then resend. (An empty write forwards no bytes and cannot clear anything; the daemon's own stuck programmatic bytes are auto-cleared on resend.)",
                             _ => "the row is parked on its CLI's startup gate (a first-run modal). Typed input is discarded by the CLI and the trailing Enter answers the gate. Answer it interactively in the row (arrow keys + Enter), then resend.",
                         };
                         AppControlResponse {

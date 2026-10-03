@@ -10044,6 +10044,7 @@ impl DaemonRuntime {
         path: &str,
         runtime_key: &str,
         data: &str,
+        programmatic: bool,
     ) -> Result<ServerResponse> {
         // ytrace input latency: PTY register (daemon has the bytes, about to write to PTY)
         yggterm_core::perf::ytrace_emit_event(
@@ -10056,7 +10057,7 @@ impl DaemonRuntime {
                 "data_len": data.len(),
             }),
         );
-        match self.terminals.write(runtime_key, data) {
+        match self.terminals.write_with_provenance(runtime_key, data, programmatic) {
             Ok(()) => Ok(ServerResponse::Ack { message: None }),
             Err(error)
                 if Self::preserved_owner_error_means_missing_runtime(runtime_key, &error) =>
@@ -14872,6 +14873,51 @@ impl DaemonRuntime {
                         self.server.live_session_kind(&runtime_path),
                     ) == Some(true)
                 {
+                    // ⛔ [11.223] THE GUARD PROTECTS A PERSON'S WORDS — SO IT
+                    // must PROVE they are a person's. The walk is fed by every
+                    // client write through one path and the wire marks the
+                    // programmatic ones, so the daemon knows exactly whether a
+                    // human's bytes stand on the line. When the held line is
+                    // entirely this machine's own send, the refusal's premise
+                    // is false and the refusal itself is the measured defect:
+                    // send 1 (no newline) accepted, send 2 refused
+                    // pending_draft with held_len=11 for the probe's own 11
+                    // bytes — an automator locked out of a row only a human
+                    // could flush. Reclaim our own bytes with the [11.150]
+                    // sized clear and let the write through on the reclaimed
+                    // line. A line with ANY human contribution keeps today's
+                    // refusal byte-for-byte, and so does an adopted runtime's
+                    // rebuilt-from-zero walk (empty line = unknown provenance
+                    // = the person's standing sentence).
+                    if self
+                        .terminals
+                        .session_pending_line_is_programmatic_only(&runtime_path)
+                        == Some(true)
+                    {
+                        let held_len = self
+                            .terminals
+                            .session_walk_line_len(&runtime_path)
+                            .unwrap_or(0);
+                        let clear = crate::terminal::sized_draft_clear(held_len);
+                        let cleared =
+                            self.terminals
+                                .write_with_provenance(&runtime_path, &clear, true);
+                        if let Ok(home) = resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_input",
+                                "terminal_input_draft_autocleared",
+                                serde_json::json!({
+                                    "path": runtime_path,
+                                    "held_len": held_len,
+                                    "clear_ok": cleared.is_ok(),
+                                }),
+                            );
+                        }
+                        // Fall through: the stuck bytes were ours, the line is
+                        // reclaimed, and the caller's write proceeds.
+                    } else {
                     // [11.150] The remedy message carries the held line's
                     // character count so a caller on a CLI that binds no
                     // Ctrl+U (opencode, measured 2026-09-19) can size the
@@ -14886,6 +14932,7 @@ impl DaemonRuntime {
                             held_len.unwrap_or(0)
                         )),
                     });
+                    }
                 }
                 // The conditional submit, answered HERE for the same reason the
                 // draft guard is: this is where the runtime — and therefore the
@@ -14973,6 +15020,7 @@ impl DaemonRuntime {
                         &path,
                         &runtime_path,
                         &data,
+                        refuse_if_draft,
                     );
                 }
                 if matches!(write_strategy, TerminalWriteStrategy::RemoteDirectFallback) {
@@ -15026,6 +15074,7 @@ impl DaemonRuntime {
                     &path,
                     &runtime_path,
                     &data,
+                    refuse_if_draft,
                 );
             }
             ServerRequest::TerminalResize {
