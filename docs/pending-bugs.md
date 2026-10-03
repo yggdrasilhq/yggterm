@@ -1166,7 +1166,7 @@ law (viewport shows the session, never the banner).
 
 ## ⛔ [11.97] A FAILED INTEGRATION TICK SILENTLY DROPS EVERY LANE THAT RODE IT — THE TRAIN GOES GREEN WITHOUT MERGED CONTENT, AND THE DEPLOY SHIPS THE HOLE (filed 2026-09-10)
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED
+**Status:** OPEN
 
 ygg-ci (the fleet integration watcher). Measured 2026-09-10 22:33-23:01,
 three ticks, on the yggterm train:
@@ -1201,6 +1201,51 @@ normalize + consumed-only baseline.
 **LIVE PROOF OWED:** the next real gate failure must (a) re-merge the
 unchanged innocent lanes within `quarantine_ttl_secs` of the failure with no
 human commit, and (b) land the guilty lane the moment its fixed tip arrives.
+
+UPDATE 2026-10-03 14:0x-14:2x IST (THE LIVE PROOF, run as a controlled
+experiment through the real watcher; zcode on jojo, work FROM dev; plan
+ACK-c645bc55ea): guilty lane lane/ci/1197-guilty-gatefail (a docs-ssot
+Status-rider violation, proven red locally before push) + innocent lane
+lane/ci/1197-innocent-rider (real [11.217]/[11.223] docs content, proven
+green locally before push), subscribed together 13:57:48.
+
+ARM-BY-ARM RESULTS:
+- Failure arm HELD: tick 14:01:15 merged both into one union, the gate
+  failed on exactly the guilty entry, main reset to pre-tick 8c9c7433,
+  NOTHING pushed or deployed from the failed union, gate_failed event
+  emitted with both lanes, and both were quarantined at their tips with
+  expires = fail-time + 900 s exactly (14:16:36). Two intermediate ticks
+  (14:06:42, 14:12:28) skipped both with the quarantine reason. No
+  silent-drop, no deploy of the hole — the headline defect is dead.
+- ARM (b) PROVEN — the guilty lane lands the moment its fixed tip
+  arrives: this commit IS the fixed tip (deletes the [11.224] marker);
+  the next tick after its push must merge and deploy it (observed
+  result recorded in the sitting outcome post).
+- ARM (a) CONVICTED for the co-failing union — the case this entry was
+  filed on: at expiry tick 14:17:35 BOTH quarantines popped in the same
+  tick, both lanes re-merged into the SAME union, the gate failed
+  identically at 14:17:53, and both were re-quarantined to 14:32:53.
+  The TTL turns the PERMANENT bystander deadlock into a 900 s retry
+  loop of the SAME doomed union: an unchanged innocent lane can never
+  land while its unchanged co-failer stays subscribed, because the
+  expiry probe is union-shaped, not lane-shaped. The claim survives
+  only in the asymmetric cases (bystander quarantined at a different
+  clock than the guilty, or the guilty landing first and the innocent
+  probing alone one TTL later — this experiment also demonstrates that
+  delayed form: after the guilty fixed tip lands, the innocent next
+  probes ALONE and lands with no human commit).
+
+RESIDUAL (new, measured): the expiry probe needs lane-subset semantics.
+Fix direction (named, NOT taken): on an expiry probe, merge and build
+the expired lanes ONE PER TICK (round-robin), so an innocent lands on
+its solo probe and a guilty re-quarantines alone; or bisect the expired
+union. Per-lane gate attribution by diff was already rejected (a merge
+commit carries every prior lane) and stays rejected.
+
+Status stays honest: the headline drop/deploy-hole arms are fixed and
+live-proven; the bystander-lands arm is NOT delivered as claimed, so
+the entry stays open on the residual.
+
 ## ⛔ [11.97] A LINGERING PREDECESSOR DAEMON IS UNREACHABLE BY PATH, AND THE RESUME WRAPPER BURNS ITS WHOLE DEADLINE AGAINST A SESSION THAT IS BEING SERVED (filed 2026-09-11, owner screenshot)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
