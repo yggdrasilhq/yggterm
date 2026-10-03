@@ -121,6 +121,19 @@ this sitting: [11.220] found — the bare-launch handoff was executing the
 b9c6e0c3); all hunts above predate the divergence and their builds carry
 the instruments, so they stand.
 
+UPDATE 2026-10-03 ~16:3x IST (post-[11.223]-deploy hunts; zcode on jojo,
+work FROM dev): two young-window hunts on the 43ca1f00 and 765cd7c5
+daemons (harness rebuilt at /tmp/yggterm-218-hunt; hunt-direct.sh arms on
+any daemon pid) took 7 PASS / 0 FAIL defmiss_fresh_start_mint samples —
+both hunts cut short by deploy rotations (docs landings rotate jojo within
+minutes; a full 31-min window needs a rotation-quiet period). Cumulative
+91+ green runs across headless, GUI-attached, and post-deploy windows;
+zero holder-survivors and zero mint perturbations since the original
+2/11. The rotation-armed wrapper (hunt-daemon-change.sh — fires on the
+next daemon rotation, then samples every 75 s through the 31-min window)
+is LIVE on jojo and completes the owed full window the moment the fleet
+goes quiet; no human re-arm needed.
+
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
