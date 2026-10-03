@@ -269,6 +269,67 @@ Instrument note: the probe's daemon-screen marker read (read-buffer
 runs) — that leg is unreliable on this rig; the pane-content assert (the
 live xterm buffer) is the authoritative one.
 
+UPDATE-2 2026-10-03 ~08:0x IST (the repair sitting; zcode on jojo, work FROM
+dev, lane/integration/11217-split-repair): the owner-GUI conviction post
+(02:02Z) named three death points; the LIVE TRACE names the one that kills.
+Re-derived from the conviction window itself (create group ...-5, M1
+focused/painted, M2 co-visible/blank): M2's spawn WAS scheduled
+(bootstrap_spawn_scheduled +390 ms — the 8bd618a2 predicate held; the
+skip-branch death point did NOT fire in this window), the task began
+(+421) and reached ensure (+550) — then the mount loop's still-active
+tick read terminal_session_bridge_should_stay_mounted FALSE and broke
+("superseded", terminal_mount_task_dropped{remount_armed:false} +550):
+during its FIRST mount the pane is neither the focused session (M1 is)
+nor retained-live (it was a hidden row; the retained set gains it only
+on reveal), so BOTH existing arms are structurally false — the freshly
+scheduled bootstrap kills itself ~160 ms in, the JS host never lands
+(which is ALSO why the heal answers terminal_host_missing — death point
+3 is a consequence, not a cause), and the pane never paints.
+
+THE FIX (one arm, host-scoped like the retained arm):
+terminal_session_bridge_should_stay_mounted gains
+  || (session_is_visible_split_pane(path)
+      && (terminal_session_host_id(path) == Some(host_id)
+          || terminal_attach_in_flight.contains(path)))
+— a co-visible pane member's bridge is born MOUNTING, not retained; the
+arm carries it through the first mount and for the group's lifetime,
+and a stale host cannot ride it (host-scoped). Ungroup naturally withdraws
+it (the predicate returns to the old law for the now-hidden member).
+Law test: co_visible_split_pane_bridge_stays_mounted_through_its_first_paint
+(in-flight shape, steady-state host shape, stale-host negative, ungrouped
+negative); shell lib 2200/0 on the lane. The skip-branch ordering concern
+(death point 1) stays THEORETICAL until a trace shows it firing on a
+post-fix build — no code change made for it this lane.
+
+PROOF 2026-10-03 ~08:2x IST (same sitting, the rig falsifier GREEN on the
+fix): Xvfb :78 + private dbus + scratch home, the WORKTREE DEBUG GUI —
+uxprobe --actions split --iters 5: BOTH members emit split/render_span
+5/5 creates (spans 559/561, 163/230, 139/191, 114/204, 500/814 ms — the
+co-visible member within ~60-90 ms of the focused one in the warm
+iterations), BOTH panes present with the pre-split marker visible
+single_line 4/5 (iteration 0 missed the pane-marker tail inside the
+4 s wait — cold first create; both spans still emitted), ZERO rows left
+behind. The residual "pre-split marker missing in daemon buffer" legs are
+the KNOWN-unreliable rig instrument (the daemon-screen read misses
+markers the client buffer holds — instrument note above); the
+pane-content assert is the authoritative one and it passes. RED/GREEN
+delta is the ONE predicate arm: the identical rig against the production
+binary (see the rig gotcha below — rigs 1-3 unknowingly ran it) measured
+the co-visible member NEVER painting (5/5 no render_span, marker absent).
+The superseded trace now carries the arm diagnostics
+(split_pane_visible/host_entry/host_match/attach_in_flight) so any
+future break names its missing arm. OWED: the owner-GUI re-proof on the
+deployed build (the entry's visual falsifier — both panes reflowed and
+painted 5/5 through the compositor), armed for the next natural GUI
+session.
+
+⛔ RIG GOTCHA (paid for, three runs deep): a bare `yggterm` launch in a
+rig HANDS OFF to the production direct-install binary — the [11.220]
+finder — and the rig then silently tests the WRONG build (the [11.178]
+rig recipe predates the flag and does not name it). EVERY rig GUI must
+launch as `yggterm --skip-active-exec-handoff` (apps/yggterm/src/main.rs
+honors it; CLI verbs and --supervise are spared by args non-empty).
+
 ## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
 
 **Status:** OPEN

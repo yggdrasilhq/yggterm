@@ -1945,6 +1945,20 @@ fn terminal_session_bridge_should_stay_mounted(
     terminal_session_still_active(shell, session_path, host_id)
         || (shell.terminal_session_is_retained_live(session_path)
             && shell.terminal_session_host_id(session_path).as_deref() == Some(host_id))
+        // [11.217] The split create promotes the hidden member to a
+        // CO-VISIBLE pane whose bridge is born MOUNTING, not retained: at
+        // the loop's still-active tick the pane is neither the focused
+        // session nor in the retained set yet, so the freshly scheduled
+        // bootstrap read "superseded" and killed itself ~160 ms in — the
+        // pane never painted (render_span x0, heal found no JS host,
+        // terminal_mount_task_dropped{remount_armed:false}). The spawn-side
+        // widening (terminal_session_should_bootstrap_host) mounts the host;
+        // THIS arm keeps its bridge alive through the mount and for the
+        // group's lifetime. Host-scoped like the retained arm: the session's
+        // current host entry (or its in-flight attach) must be this bridge.
+        || (shell.session_is_visible_split_pane(session_path)
+            && (shell.terminal_session_host_id(session_path).as_deref() == Some(host_id)
+                || shell.terminal_attach_in_flight.contains(session_path)))
 }
 fn terminal_session_bridge_should_pause_reads(shell: &ShellState, session_path: &str) -> bool {
     if !terminal_active_visible_for_session(shell, session_path) {
@@ -7170,6 +7184,14 @@ fn TerminalCanvas(
                     terminal_session_bridge_should_stay_mounted(&shell, &session_path, &host_id)
                 };
                 if !still_active {
+                    let diag = {
+                        let shell = state.read();
+                        (
+                            shell.session_is_visible_split_pane(session_path.as_str()),
+                            shell.terminal_session_host_id(session_path.as_str()),
+                            shell.terminal_attach_in_flight.contains(session_path.as_str()),
+                        )
+                    };
                     clear_terminal_resume_notification(state, &session_path);
                     let _ = safe_shell_mut(state, "terminal_attach_superseded", |shell| {
                         release_terminal_bootstrap_lease_if_current(
@@ -7187,6 +7209,12 @@ fn TerminalCanvas(
                         "superseded",
                         json!({
                             "session_path": session_path.clone(),
+                            // [11.217] diagnostic: which stay-mounted arm was
+                            // missing when this break fired.
+                            "split_pane_visible": diag.0,
+                            "host_entry": diag.1,
+                            "host_match": diag.1.as_deref() == Some(host_id.as_str()),
+                            "attach_in_flight": diag.2,
                         }),
                     );
                     break;
