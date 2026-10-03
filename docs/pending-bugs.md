@@ -81,6 +81,27 @@ spawn-time `--trust-folder`-style flag if agy grows one, or manual
 viewport confirmation per fresh project; (3) the unanswerable-from-slave
 input finding wants the row-mounted `terminal send` path re-verified once
 a gated row is mounted (suspect: send to unmounted rows silently no-ops).
+UPDATE 2026-10-03 ~23:1x IST (the continuation seat, zcode on jojo, work
+FROM dev; board plan ACK-c62c39ea56): THE dev/jojo VARIANCE IS ROOT-CAUSED
+— it was never agy being flaky. agy 1.2.16 gates its whole TUI startup on
+a DA2 handshake (`ESC[>c` — secondary device attributes): measured
+standalone on dev (fresh cwd, TERM=xterm-256color, real PTY), agy emits
+exactly 53 bytes — the `ESC[>c` query — then paints NOTHING past a 75 s
+kill. The daemon's terminal protocol filter answered CPR (`ESC[6n`), DSR
+(`ESC[5n`) and DA-primary (`ESC[c`) but NOT DA2, so an UNMOUNTED row's
+agy blocked forever on the unanswered query: dev's probe-minted
+(headless, unmounted) row zero-painted 150 s, while jojo's gated row was
+MOUNTED and its xterm.js viewport answered DA2 itself (`ESC[>0;277;0c`)
+— gate painted ~30 s. The jojo standalone zero-paint + ~3-min crash log
+is the same nobody-answered class. FIXED IN CODE this sitting: the daemon
+filter now answers `ESC[>c`/`ESC[>0c` with `ESC[>0;277;0c` (xterm.js
+parity — an unmounted row now behaves like a mounted one at the protocol
+layer), unit-tested in `terminal_protocol_filter_answers_secondary_da_queries`;
+the probe marker fix (bb4a1dab) rides the same lane. Want (2) — the gate
+auto-answer policy — REMAINS THE OWNER CALL; every agy-minting E2E
+scenario stays honestly RED until it lands. LIVE PROOF OWED: after
+deploy, a fresh-cwd UNMOUNTED agy row on dev must paint the gate (not
+zero-paint), and the probe must fail it as `[startup_gate painted…]`.
 
 ## ⛔ [11.224] `mimo upgrade` NEVER COMPLETES — EVERY SCHEDULED MANAGED-CLI REFRESH HANGS ITS 900 s MIMO STEP AND IS DEADLINE-KILLED (26/26 WALKS SINCE ≥09-29), `devin update` EXITS 130 ON EVERY WALK, AND ORPHANED MIMO UPGRADES ESCAPE THE KILL FOREVER — THE REFRESH NEVER CONVERGES AND ITS LOCK HOLDS PIN EVERY CONCURRENT ENSURE (measured 2026-10-03, dev trace gen g1791022605539 + live /proc evidence)
 
@@ -194,137 +215,34 @@ clears puts the new walker on; the falsifier then reads itself from the
 next scheduled walks (managed_cli_tool_backoff_skip for mimo with growing
 remaining_ms; mimo 900 s kills stop; ≤1 mimo retry/day). The law itself is
 unit-proven (amber-treadmill suite incl. the escalation test, 1660/0).
-
-
-## ⛔ [11.225] THE 17:03 DEPLOY RETIRED DEV'S LIVE DAEMON BIND LOCK WITHOUT A SUCCESSOR — THE SERVING DAEMON IS NOW LOCKLESS, THE [11.159] ACCEPT ARM CANNOT FIRE, AND EVERY SPAWN-CARRYING VERB ON DEV FAILS "local yggterm daemon did not become reachable" WHILE READS KEEP WORKING (measured live 2026-10-03 17:44-18:2x IST; spawn plane dead ~90 min and counting)
-
-**Status:** OPEN
-
-Filed 2026-10-03 ~18:3x IST by the queue-completion seat (zcode sess_813045b5
-on jojo, work FROM dev; board plan ACK-4e4b35fc52). Found because the E2E
-connection probe's agy scenarios all failed and the lock-window theory
-([11.224]) only explained the first batch.
-
-THE MEASURED CHAIN (dev):
-- The 17:03 deploy (19651489) retired the LIVE daemon 2956875's bind lock
-  (`server-3-2-116.sock.lock.retired-2956875`, mtime 17:03) and the 17:40
-  deploy (1b76a310) rewrote the active lock (mtime 17:41) — but 2956875
-  (born 16:27 on build 32aa1570) NEVER handed over and is STILL the only
-  daemon, still LISTENING on server-3-2-116.sock. jojo and oc rotated fine
-  on the same deploys (jojo → 1829367 @17:41, oc → 3512118 @~17:50); dev is
-  the build host and the one host with an OWNED working row at deploy time
-  (codex-runtime://01a0bf3b…, the [11.136]/[11.137] hot-restart-defers-on-
-  working-rows class is the likely reason the takeover never landed).
-- The active bind lock is UNHELD (flock acquired+released by hand 18:2x);
-  the serving daemon holds no lock. The installed CLI binary was rolled to
-  1b76a310 (mtime 17:40) while the daemon still runs 32aa1570 bits —
-  `reachable_local_daemon_is_current` refuses it on binary currency
-  (`local_daemon_binary_current_problem`), and the [11.159] accept arm
-  `served_by_live_bind_lock_owner` — added precisely for the same-version
-  stale-binary storm, see its ⛔ [11.159] comment in
-  crates/yggterm-server/src/lib.rs — requires a HELD bind lock, which is
-  exactly what the deploy retired. Every spawn-carrying verb then
-  demand-starts a daemon child (8× spawned_daemon_child 18:18-18:26), the
-  child cannot take over, `wait_for_local_daemon` polls 100 × 150 ms and
-  bails "local yggterm daemon did not become reachable".
-- IMPACT: `server remote start-agy` (hand-reproduced twice, empty-screen
-  rows minted) and every E2E probe scenario that spawns through the start
-  path — fresh_start_connects ×2, resume_store_present ×2,
-  defmiss_fresh_start_mint, startborn_remote_corpse,
-  stillborn_resume_corpse — all RED 17:44→18:2x; read verbs (screen,
-  status) keep answering through the socket, so the outage is invisible to
-  anyone only reading rows. rebirth_uuid_vouch and store_absent_refuses
-  PASSED in the same window (17:55/17:58) — the resume-path verbs that
-  connected through the serving daemon directly.
-- This is the [11.159] storm shape with a new precondition: the fix's
-  accept arm assumes the deploy either rotates the daemon or leaves its
-  lock held; a deploy that retires the lock of a daemon it then FAILS to
-  rotate defeats both arms. [11.106]/[11.121] (same-version deploys not
-  reaching the daemon) are the parent class; this is the spawn-plane
-  casualty of it.
-
-REMEDY (owner call — a seat must not kill the daemon serving an owned
-working row): rotate dev's daemon once the codex row is idle (any deploy's
-restart leg with the gate green, or the owner's restart door); the successor
-takes the unheld lock, binds fresh, and the spawn plane heals. Everything
-restores from the ledger ([11.146]).
-
-FALSIFIER: on a rotated dev daemon, `server remote start-agy` mints a row
-that shows its CLI within the probe's window, and the full E2E connection
-probe goes 8/8. FIX DIRECTIONS (none coded): (a) the deploy's lock-retire
-step must be atomic with a verified successor (retire only AFTER the
-successor holds the lock — a retired lock with a live lockless daemon is a
-worse state than a stale-held one); (b) extend the [11.159] accept arm: a
-version-compatible status answer from the socket's live listener should
-accept even lockless when the lock is UNHELD (nobody can be mid-takeover);
-(c) the [11.136] deferral needs an escape hatch for the "spawn plane is
-DOWN and the stale daemon is the cause" case — deferring the rotation
-preserves one working row at the cost of every new spawn.
-
-UPDATE 2026-10-03 ~19:0x IST (same seat, addendum): REMEDY LANDED BY THE
-TRAIN — the train-restore subscribe (lane/ci/train-restore, this seat;
-the 18:28 sweep had left yggterm with ZERO subs so the watcher's tick
-returned "no subscriptions — nothing to do" BEFORE the main-moved trigger
-— a project with no subs is not under the plane's watch, and the
-docs-push-is-a-deploy law silently died with it) woke the plane, the
-18:42 tick built main b8ec32c7 and deployed, and the successor daemon
-3419462 (born 18:46) FINALLY TOOK THE BIND LOCK — the rotation the 17:03
-and 17:41 deploys could not land. FALSIFIER LEG MET: a hand
-`server remote start-agy` mint on the rotated daemon painted its CLI
-(chars 0 → 440, running:true) where the same verb had failed "did not
-become reachable" twice on the stale daemon. The structural defect STAYS
-OPEN: a deploy that retires a live daemon's bind lock without a successor
-still defeats the [11.159] accept arm for the whole window (fix
-directions above unchanged; the window this time was 17:03→18:46, ~1 h 43
-min of dead spawn plane on the integration host).
-
-UPDATE 2026-10-03 ~21:0x IST (lockless-accept sitting; zcode on jojo, work
-FROM dev; board plan ACK-da82a34004): FIX DIRECTION (b) LANDED IN CODE on
-lane/integration/11225-lockless-accept — the [11.159] accept arm's verdict
-no longer gates on the held bind lock: a version-compatible status answer
-from the endpoint IS the spawn-futility witness (its live listener owns the
-socket name; a demand-start child cannot bind under it whatever the lock
-says — [11.225]'s own measurement falsified "a free lock means the
-demand-start can still win"). The held lock downgraded to a traced witness
-(`bind_lock_held` on `ensure_accepted_live_bind_lock_owner`; false = the
-retired-lock shape, true = the [11.159] shape). RED/GREEN measured on an
-isolated rig (scratch YGGTERM_HOME; daemon on an out-of-tree bits path no
-allowed-binary root covers, `YGGTERM_DIRECT_INSTALL_ROOT` pinned so it
-cannot re-exec to the newest build; lock retired the deploy's way, then the
-canonical lock path made unholdable so no child can ever satisfy the old
-held-check — the incident's fast-exiting-children state):
-- UNFIXED client (dcc8cdc5): 24.5 s burn, one doomed spawned child,
-  rc=1 `Error: local yggterm daemon did not become reachable`, row NOT
-  born — the incident signature, byte-for-byte, at the incident's cost.
-- FIXED client: 42 ms accept (`bind_lock_held:false`), ZERO spawned
-  children, row born and streaming on the lockless serving daemon.
-ALSO MEASURED (the rig's accidental middle shape): when the retired lock
-path is merely free-and-holdable, today's-build doomed child holds it
-transiently during its failed bequest negotiation and BACK-DOORS the old
-arm's held-check (accept at +6.7 s) — the old law's satisfaction was
-incidental to a child's death timing, which is why the incident's version
-pair failed hard for 1 h 43 min while a same-day pair can luck green.
-Shape-lock test rewritten to the new law (compatible + live listener
-accepts whatever the lock; no listener → refuse). Full server-lib
-1660/0. Directions (a) deploy-atomicity and (c) the [11.136] escape hatch
-REMAIN OPEN.
-UPDATE 2026-10-03 ~21:5x IST (proof-collection seat; zcode on jojo, work
-FROM dev): DIRECTION (b) IS NOW PRODUCTION-PROVEN ON THE INCIDENT'S OWN
-RECURRENCE. The 21:08 deploy of 113abe5c retired the live daemon 3419462's
-bind lock AGAIN (server-3-2-116.sock.lock.retired-3419462) and — the codex
-draft gate holding, exactly the 17:03 shape — rotated nothing: dev served
-lockless on b8ec32c7 bits with a 113abe5c client. The spawn plane STAYED
-UP this time: the E2E probe's spawn verbs minted rows (fresh_start row
-born, running) and the dev trace records repeated
-`ensure_accepted_live_bind_lock_owner` with `bind_lock_held:false` 21:37+
-— zero spawned_daemon_child, zero "did not become reachable". The same
-deploy shape that cost 1 h 43 min at 17:03 was harmless at 21:08 with the
-fix deployed. (The probe's fresh_start FAIL in that window is NOT a
-spawn-plane failure — it is [11.226], the agy trust gate.) CAVEAT ON THE
-19:0x LEG ABOVE: its "painted its CLI (chars 0 → 440)" was the [11.226]
-GATE TEXT, not a signed-in TUI — the heal stands (mint + run), the paint
-leg does not. Directions (a) and (c) remain open; the entry's casualty
-(spawn plane down through a lock-retiring deploy) is closed in production.
+UPDATE 2026-10-03 ~22:4x IST (same seat, correction): THE ROTATION LANDED —
+the codex draft cleared and the 22:29 deploy of 08c50ee4 swapped dev to
+daemon 31742 on the new bits; the walker is ARMED. Two same-session finds
+sharpen what fires the falsifier: (1) the NEW daemon's scheduled walks
+DEFER the install leg (refresh_end install_attempted:false,
+background_install_enabled:false — installs in scheduled mode are gated on
+YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL, default off), so no treadmill runs
+while deferred; the falsifier fires on the first refresh that ATTEMPTS the
+install leg (env-gated scheduled walk, or a spawn-driven ensure in a
+non-deferring mode — dev's constant spawning makes this the likely arm).
+(2) The 21:49 failed_at_ms for mimo+devin was the E2E probe's OWN
+spawn-ensure (the 21:37 fresh_start run) — the probe itself paid one mimo
+deadline window during its scenario, the collateral class measured live.
+With failure_streaks:{} fresh, the first install-attempting refresh arms
+streak 1; the one after must trace the skip with escalating remaining_ms.
+UPDATE 2026-10-03 ~23:1x IST (the continuation seat): THE FALSIFIER IS
+ARMED ON THE POST-FIX BITS. The 22:29 deploy rotated dev's walker daemon
+to 08c50ee4 (the codex draft gate cleared — first post-21:08 rotation),
+and ~/.yggterm/managed-cli-refresh-state.json now carries
+failure_streaks {devin:1, mimo:1} written at 22:43 IST — per the
+correction above, a spawn-driven ensure, not a scheduled walk (streaks are
+persisted beside failed_at_ms and survive rotation). READ ON THE NEXT
+INSTALL-ATTEMPTING REFRESH: mimo+devin must skip
+with `managed_cli_tool_backoff_skip` at an ESCALATED window — materially
+above the old flat ~30 min (expect ≈1 h at streak 1, doubling per
+subsequent failure, cap 24 h), and growing across walks. A flat
+~30-min-class remaining_ms again means the escalation is not reading the
+persisted streak — that is the falsifier's red.
 
 
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
