@@ -18,59 +18,6 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
-## ⛔ [11.220] A BARE `yggterm` LAUNCH HANDS THE NEW BUILD'S INVOCATION DOWN TO THE PREVIOUS SAME-VERSION DEPLOY — THE HANDOFF READS THE STALE LEGACY `~/.yggterm/install-state.json` MIRROR WHILE THE CANONICAL DIRECT STATE NAMES THE NEW BUILD, AND THE VERSION-COMPARE GUARD CANNOT SEE BUILD AGE (measured 2026-10-03 ~06:33 IST, jojo, rig launch of the b9c6e0c3 deploy)
-
-**Status:** OPEN
-
-MEASURED: launching `~/.local/bin/yggterm` (md5-identical to
-builds/b9c6e0c3251a, the 04:10 deploy) with NO args re-exec'd BOTH the GUI
-and its spawned daemon into builds/87237c338787 (the 03:54 deploy):
-/proc/\<gui\>/exe + /proc/\<daemon\>/exe + the app-clients reply's
-build_commit "87237c338787-dirty". The only honest witness is the client's
-build_commit — `--version` reads 3.2.115 on every build (the 2026-08-07
-lesson again: a pure builtin is exempt from the handoff).
-
-THE CHAIN: (1) deploys flip ONLY
-~/.local/share/yggterm/direct/install-state.json (deploy-fleet.sh FLIP_PY
-default path); (2) the legacy mirror ~/.yggterm/install-state.json is
-refreshed only by the ynpm promote path (mirror_legacy_compatibility_state),
-so it sat at the 03:54 build; (3) `find_direct_install_state_scoped` walked
-the binary's ANCESTORS (the canonical root is NOT an ancestor of
-~/.local/bin) then fell to the home fallback = the legacy mirror →
-preferred_executable = the OLD build; (4)
-`maybe_handoff_to_preferred_executable` fires on a BARE launch
-(args.is_empty()) and its guard `handoff_target_is_usable` compares VERSIONS
-— both builds read 3.2.115 — while a `builds/<sha>` path "makes no claim"
-(install_path_declared_version knows only the versions/<v>/ layout), so the
-handoff routed a NEW invocation into an OLDER binary — the exact law the
-2026-08-07 doc states ("must never route a NEW one into an older binary"),
-blind at same-version; (5) SELF-PERPETUATING: the 87237c338787 daemon
-rewrote the mirror naming ITSELF at launch (mtime witness), so every
-subsequent bare launch repeats the trip.
-
-BLAST RADIUS: bare `yggterm` invocations (agent rig scripts, terminal
-launches). The DESKTOP entry (`yggterm --supervise`) and every CLI verb pass
-args → no handoff → they run ~/.local/bin (current bytes). The daemon
-hot-restart promote resolves through the same finder → could promote the
-stale-mirror build too; the same fix covers it.
-
-FIX (this lane): (a) `find_direct_install_state_with_roots` consults the
-CANONICAL direct root (`direct_install_root()`) BEFORE the legacy home
-fallback — in the production wrapper only, so the scoped test surface keeps
-its hermetic shape; a canonical record naming a MISSING executable falls
-through rather than routing into a dead path; hosts whose only state is the
-legacy root keep the old behaviour; (b) deploy-fleet.sh gains a
-legacy-mirror ride-along pass (refresh the mirror when it exists, never
-create it — idempotent, and it heals mirrors staled by EARLIER rolls); (c)
-law test `the_canonical_direct_root_outranks_the_stale_legacy_mirror` (same
-version, different builds, missing-exe fallthrough).
-
-FALSIFIER: on the deployed fix, with a mirror naming an older same-version
-build and a canonical naming the new one — a bare `yggterm` launch's
-/proc/\<pid\>/exe names the CANONICAL build's path (or no handoff fires);
-after a deploy, the mirror names the new build within the same deploy pass;
-the law test holds on a clean tree.
-
 ## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd jojo daemon, freshly started, 17 restored live sessions)
 
 **Status:** OPEN
