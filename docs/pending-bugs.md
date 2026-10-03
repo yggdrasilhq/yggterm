@@ -418,6 +418,23 @@ THE APP-SIDE RESIDUAL (real; commit → DOM → frame, ytrace ladder n=5):
    (`bootstrap_owner_superseded_during_loop` +
    `terminal_mount_task_dropped`).
 
+DE-STaled 2026-10-03 ~14:0x IST (zcode, the [11.221] seat, meeting
+this entry while routing the queue): the paragraph below is STALE — the
+ux-speed campaign took BOTH halves after this entry was filed. (1) ba7e06de
+2026-09-29 18:35 ([11.216], lane split-appear-focus-churn, board
+ACK-5a502e66bb): the focus tail's second arm is now NON-EVICTING (sibling
+epochs preserved) and the reclaim passes collapsed to deferred
+220/760/1200 + immediate/rAF only — in-window churn gone, felt DOM p50
+176 -> 130.5 ms, 10/10 accuracy. (2) e313f97c 2026-10-03 02:09 (OWNER, lane
+epoch-reuse-remount-skip): the re-parent raise — the epoch-reused focused
+member no longer pays the full cold mount pipeline (~1.05 s paint behind the
+~130 ms DOM stamp). OWNERSHIP: the live state, the residual
+(compound-restructure re-render vs the <=100 ms bar), and the falsifier ride
+the ux-speed campaign door (`campaign-ux-speed.md` §BASELINES "split create
+APPEAR" row + §HISTORY) — cli-integration seats route there before touching
+this. The entry stays OPEN only as the cross-campaign pointer for the bar.
+The original paragraph, kept verbatim for its historical measurement content:
+
 FIX DIRECTION (named, NOT taken — the launch/focus plane is
 [11.176]/[11.178]-wedge-coupled and the reclaim schedule exists to fix real
 focus-steal; not ours+small under the ux-speed scope law). The create path's
