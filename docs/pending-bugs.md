@@ -18,6 +18,59 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.220] A BARE `yggterm` LAUNCH HANDS THE NEW BUILD'S INVOCATION DOWN TO THE PREVIOUS SAME-VERSION DEPLOY — THE HANDOFF READS THE STALE LEGACY `~/.yggterm/install-state.json` MIRROR WHILE THE CANONICAL DIRECT STATE NAMES THE NEW BUILD, AND THE VERSION-COMPARE GUARD CANNOT SEE BUILD AGE (measured 2026-10-03 ~06:33 IST, jojo, rig launch of the b9c6e0c3 deploy)
+
+**Status:** OPEN
+
+MEASURED: launching `~/.local/bin/yggterm` (md5-identical to
+builds/b9c6e0c3251a, the 04:10 deploy) with NO args re-exec'd BOTH the GUI
+and its spawned daemon into builds/87237c338787 (the 03:54 deploy):
+/proc/\<gui\>/exe + /proc/\<daemon\>/exe + the app-clients reply's
+build_commit "87237c338787-dirty". The only honest witness is the client's
+build_commit — `--version` reads 3.2.115 on every build (the 2026-08-07
+lesson again: a pure builtin is exempt from the handoff).
+
+THE CHAIN: (1) deploys flip ONLY
+~/.local/share/yggterm/direct/install-state.json (deploy-fleet.sh FLIP_PY
+default path); (2) the legacy mirror ~/.yggterm/install-state.json is
+refreshed only by the ynpm promote path (mirror_legacy_compatibility_state),
+so it sat at the 03:54 build; (3) `find_direct_install_state_scoped` walked
+the binary's ANCESTORS (the canonical root is NOT an ancestor of
+~/.local/bin) then fell to the home fallback = the legacy mirror →
+preferred_executable = the OLD build; (4)
+`maybe_handoff_to_preferred_executable` fires on a BARE launch
+(args.is_empty()) and its guard `handoff_target_is_usable` compares VERSIONS
+— both builds read 3.2.115 — while a `builds/<sha>` path "makes no claim"
+(install_path_declared_version knows only the versions/<v>/ layout), so the
+handoff routed a NEW invocation into an OLDER binary — the exact law the
+2026-08-07 doc states ("must never route a NEW one into an older binary"),
+blind at same-version; (5) SELF-PERPETUATING: the 87237c338787 daemon
+rewrote the mirror naming ITSELF at launch (mtime witness), so every
+subsequent bare launch repeats the trip.
+
+BLAST RADIUS: bare `yggterm` invocations (agent rig scripts, terminal
+launches). The DESKTOP entry (`yggterm --supervise`) and every CLI verb pass
+args → no handoff → they run ~/.local/bin (current bytes). The daemon
+hot-restart promote resolves through the same finder → could promote the
+stale-mirror build too; the same fix covers it.
+
+FIX (this lane): (a) `find_direct_install_state_with_roots` consults the
+CANONICAL direct root (`direct_install_root()`) BEFORE the legacy home
+fallback — in the production wrapper only, so the scoped test surface keeps
+its hermetic shape; a canonical record naming a MISSING executable falls
+through rather than routing into a dead path; hosts whose only state is the
+legacy root keep the old behaviour; (b) deploy-fleet.sh gains a
+legacy-mirror ride-along pass (refresh the mirror when it exists, never
+create it — idempotent, and it heals mirrors staled by EARLIER rolls); (c)
+law test `the_canonical_direct_root_outranks_the_stale_legacy_mirror` (same
+version, different builds, missing-exe fallthrough).
+
+FALSIFIER: on the deployed fix, with a mirror naming an older same-version
+build and a canonical naming the new one — a bare `yggterm` launch's
+/proc/\<pid\>/exe names the CANONICAL build's path (or no handoff fires);
+after a deploy, the mirror names the new build within the same deploy pass;
+the law test holds on a clean tree.
+
 ## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd jojo daemon, freshly started, 17 restored live sessions)
 
 **Status:** OPEN
@@ -85,6 +138,24 @@ remount arm touched the row) while holder_identity names it from the
 PROC side — the two together pin the race. The GUI-ATTACHED young-daemon
 hunt and the AFTER-deploys sequencing remain the next seat's run.
 
+UPDATE 2026-10-03 ~07:1x IST (falsifier sitting; zcode sess_b85fd20c on
+jojo, work FROM dev): the GUI-ATTACHED young-daemon hunt RAN and was CLEAN
+— the 03:00-03:30 seat's rig (real-store daemon born 02:59 + Xvfb GUI on
+the deployed build, i.e. post-deploy sequencing held) looped 27/27
+defmiss_fresh_start_mint PASS (hunt-030015.log, window closed 03:30:48) —
+the "remains the next seat's run" note above is PAID. Cumulative: 84+
+green runs across headless (two daemons), GUI-attached, and post-deploy
+windows; zero holder-survivors and zero mint perturbations since the
+original 2/11. BOTH naming instruments are live in production
+(holder_identity + window_arms) — the next natural capture, including the
+owner's own GUI rotations, names its arm from both sides. The entry stays
+OPEN as the rare-race watcher: no fix exists to verify; a failing run's
+two-sided evidence is the conviction the fix direction waits on. ALSO
+this sitting: [11.220] found — the bare-launch handoff was executing the
+03:54 build on jojo (every rig launch this window rode 87237c338787, not
+b9c6e0c3); all hunts above predate the divergence and their builds carry
+the instruments, so they stand.
+
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -137,6 +208,33 @@ branch treats the pane-embedded retained surface as still hidden. The split
 commit promotes member 2 to visible — the mount decision should see that
 (before the skip), or the heal's forced refresh must fire for the co-visible
 member (today: for neither).
+
+UPDATE 2026-10-03 ~07:0x IST (falsifier sitting; zcode sess_b85fd20c on
+jojo, work FROM dev): the falsifier battery was RUN on the deployed build
+(87237c338787 — predates the 04:03/04:10 deploys per [11.220], but CARRIES
+the 8bd618a2 fix) via an Xvfb rig GUI on the REAL store: uxprobe
+--actions split --iters 5, twice (daemon age ~3 m and ~13 m). BOTH RUNS
+RED, but NOT in this entry's fixed shape: exactly ONE member paints per
+create (render_span + pre-split marker in its pane buffer) while the other
+stays blank — and WHICH member flips between pairs (run 1: the focused
+member painted, co-visible blank; run 2: co-visible painted, focused
+blank). The never-painter's signature is NOT host_missing (present=true —
+the 8bd618a2 predicate DID mount the host); it is a supersede→drop loop:
+mount_eval_warm → superseded →
+terminal_mount_task_dropped{remount_armed:false} →
+reveal_raise_refused{daemon_owns_runtime:false, has_host_epoch:false} ×N —
+the [11.178] mount-eval wedge and the [11.179] raise-never-serves gate
+CONVERGING on the promoted pane. RIG CAVEAT, honestly stated: the rig
+runs software GL under Xvfb (MESA DRI3 errors) and its window showed 54
+warm-eval alive-events-shed + 10 mount-task drops + 18 raise refusals —
+conditions the real Wayland GUI did NOT show in the 03:00-03:45
+[11.178]-c2 live read (375 shed, 0 false convictions). The rig therefore
+CONVICTS nothing about the fix; it names the convergence the owner-GUI
+proof must watch for. The entry's owner-GUI visual falsifier stays OWED.
+Instrument note: the probe's daemon-screen marker read (read-buffer
+--mode screen) missed markers the CLIENT buffer had (both members, both
+runs) — that leg is unreliable on this rig; the pane-content assert (the
+live xterm buffer) is the authoritative one.
 
 ## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
 

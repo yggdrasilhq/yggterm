@@ -793,6 +793,26 @@ $open_exe_paths
     echo "  · $host: $label — nothing to stage or flip"
     fb64=$(printf '%s' "$FLIP_PY" | base64 | tr -d '\n')
   fi
+  # ⛔ [11.220] THE LEGACY-MIRROR RIDE-ALONG. The ynpm promote path mirrors
+  # the canonical state into ~/.yggterm/install-state.json for older
+  # launchers, but THIS script flips only the canonical file — measured
+  # 2026-10-03 on jojo the mirror sat one same-version deploy behind and
+  # every BARE `yggterm` launch handed the NEW build's invocation down to
+  # the OLD binary (the handoff guard compares versions, not build ids).
+  # Refresh the mirror whenever it exists (never create it) so a stale
+  # mirror cannot outlive the deploy that staled it. Idempotent — a fresh
+  # mirror answers "already names this build" — and it runs in the
+  # no-flip arm too, so a mirror staled by an EARLIER deploy heals on the
+  # next roll.
+  if [ -n "$dnewexe" ]; then
+    mcmd="test -f ~/.yggterm/install-state.json || exit 0; echo $fb64 | base64 -d | python3 - '${dver:-KEEP}' '$dnewexe' ~/.yggterm/install-state.json"
+    if is_self "$host"; then mout=$(bash -c "$mcmd" 2>&1) || true
+    else mout=$(ssh "$host" "$mcmd" 2>&1) || true; fi
+    case "$mout" in
+      *flipped*|*already*) echo "  ✅ $host: legacy mirror refreshed ($mout)" ;;
+      *) echo "  · $host: legacy mirror untouched (${mout:-absent})" ;;
+    esac
+  fi
   # ⛔ SUPERVISED PINS: THE FILE ABOVE MAY NOT BE THE ONE THE LIVE STACK READS.
   # A supervised install (YGGTERM_SUPERVISED=1) is LAUNCHED with
   # YGGTERM_DIRECT_INSTALL_ROOT naming another root, and

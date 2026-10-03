@@ -215,10 +215,87 @@ pub fn handoff_target_is_usable(
 #[cfg(test)]
 mod handoff_target_tests {
     use super::{
-        find_direct_install_state_scoped, handoff_target_is_usable, install_path_declared_version,
-        write_direct_install_state,
+        find_direct_install_state_scoped, find_direct_install_state_with_roots,
+        handoff_target_is_usable, install_path_declared_version, write_direct_install_state,
     };
     use std::path::Path;
+
+    /// [11.220] THE MIRROR CAN NEVER OUTRANK THE CANONICAL STATE. Deploys
+    /// flip only the canonical direct state; the legacy `~/.yggterm`
+    /// mirror is refreshed by the ynpm promote path alone and can sit one
+    /// same-version deploy behind — exactly the shape where the
+    /// version-compare handoff guard is blind (both builds read the same
+    /// version, and a `builds/<sha>` path declares none). Measured
+    /// 2026-10-03 on jojo: a bare launch of the b9c6e0c3 build exec'd the
+    /// previous deploy's binary for both GUI and daemon. The finder must
+    /// answer the canonical build; only a canonical record naming a
+    /// MISSING executable may fall through to the mirror.
+    #[test]
+    fn the_canonical_direct_root_outranks_the_stale_legacy_mirror() {
+        let base = std::env::temp_dir().join(format!(
+            "yggterm-install-canonical-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let exe_root = base.join("local").join("bin");
+        let canonical = base.join("share").join("yggterm").join("direct");
+        let legacy = base.join("yggterm-home");
+        std::fs::create_dir_all(&exe_root).expect("exe root");
+        std::fs::create_dir_all(&canonical).expect("canonical root");
+        let canonical_exe = canonical.join("builds").join("new").join("yggterm");
+        let legacy_exe = legacy.join("builds").join("old").join("yggterm");
+        std::fs::create_dir_all(canonical_exe.parent().expect("canonical exe dir"))
+            .expect("make canonical exe dir");
+        std::fs::create_dir_all(legacy_exe.parent().expect("legacy exe dir"))
+            .expect("make legacy exe dir");
+        std::fs::write(&canonical_exe, b"new").expect("canonical exe");
+        std::fs::write(&legacy_exe, b"old").expect("legacy exe");
+        // Both records claim the SAME version (the guard-blind shape) and
+        // name different same-version builds.
+        write_direct_install_state(
+            &canonical,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "3.2.115",
+            &canonical_exe,
+        )
+        .expect("write canonical");
+        write_direct_install_state(&legacy, "yggdrasilhq/yggterm", "linux-x86_64", "3.2.115", &legacy_exe)
+            .expect("write legacy");
+
+        let exe = exe_root.join("yggterm");
+        let found = find_direct_install_state_with_roots(&exe, Some(&canonical), Some(&legacy))
+            .expect("probe both roots");
+        let Some((root, state)) = found else {
+            panic!("the finder must find one of the roots");
+        };
+        assert_eq!(root, canonical, "the canonical root must win");
+        assert_eq!(state.active_executable, canonical_exe);
+
+        // The legacy-only host keeps the old behaviour.
+        let legacy_only =
+            find_direct_install_state_with_roots(&exe, None, Some(&legacy)).expect("legacy only");
+        assert_eq!(
+            legacy_only.expect("legacy fallback").0,
+            legacy,
+            "a host with no canonical state still falls to the legacy root"
+        );
+
+        // A canonical record naming a MISSING executable falls through
+        // rather than routing into a dead path.
+        std::fs::remove_file(&canonical_exe).expect("remove canonical exe");
+        let dead = find_direct_install_state_with_roots(&exe, Some(&canonical), Some(&legacy))
+            .expect("probe dead canonical");
+        assert_eq!(
+            dead.expect("fallthrough").0,
+            legacy,
+            "a canonical record naming a missing executable must fall through to the mirror"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// THE FLEET SHAPE, LOCKED: the state file lives in the yggterm HOME while
     /// the binary runs from an unrelated root (`~/.local/bin`), and the finder
@@ -539,7 +616,12 @@ fn find_direct_install_state(
     executable_path: &Path,
 ) -> Result<Option<(PathBuf, DirectInstallState)>> {
     let home_fallback = crate::resolve_yggterm_home().ok();
-    find_direct_install_state_scoped(executable_path, home_fallback.as_deref())
+    let canonical_root = direct_install_root().ok();
+    find_direct_install_state_with_roots(
+        executable_path,
+        canonical_root.as_deref(),
+        home_fallback.as_deref(),
+    )
 }
 
 /// The finder proper, with the yggterm-home fallback passed explicitly so
@@ -548,9 +630,41 @@ fn find_direct_install_state_scoped(
     executable_path: &Path,
     home_fallback: Option<&Path>,
 ) -> Result<Option<(PathBuf, DirectInstallState)>> {
+    find_direct_install_state_with_roots(executable_path, None, home_fallback)
+}
+
+/// The finder proper, with every non-ancestor root passed explicitly so
+/// tests can exercise the precedence without touching process-global env
+/// or the real machine's data dir.
+fn find_direct_install_state_with_roots(
+    executable_path: &Path,
+    canonical_root: Option<&Path>,
+    home_fallback: Option<&Path>,
+) -> Result<Option<(PathBuf, DirectInstallState)>> {
     for ancestor in executable_path.ancestors() {
         if let Some(state) = load_direct_install_state(ancestor)? {
             return Ok(Some((ancestor.to_path_buf(), state)));
+        }
+    }
+    // ⛔ THE CANONICAL DIRECT ROOT OUTRANKS THE LEGACY HOME MIRROR. The
+    // mirror exists only "to prevent an older launcher from routing into a
+    // dead or stale generation" (mirror_legacy_compatibility_state) — but
+    // deploys flip ONLY the canonical state, so on a host carrying both
+    // files the mirror is the stale one. Measured 2026-10-03 on jojo: the
+    // canonical state named b9c6e0c3251a while the legacy mirror still
+    // named the previous same-version deploy, and every BARE `yggterm`
+    // launch handed the new build's invocation down to the old binary —
+    // the handoff guard compares versions, the two builds shared one, and
+    // a `builds/<sha>` path makes no version claim. Consulting the
+    // canonical root first routes the handoff (and the hot-restart
+    // promote) to the build the deploy actually activated; a canonical
+    // record naming a MISSING executable falls through rather than
+    // routing into a dead path.
+    if let Some(root) = canonical_root {
+        if let Some(state) = load_direct_install_state(root)? {
+            if state.active_executable.is_file() {
+                return Ok(Some((root.to_path_buf(), state)));
+            }
         }
     }
     // ⛔ THE STATE FILE'S CANONICAL HOME IS NOT ALWAYS AN ANCESTOR OF THE
@@ -1814,8 +1928,16 @@ mod tests {
         let bare = std::env::temp_dir().join(format!("yggterm-unmanaged-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&bare).expect("mkdir");
         let exe = bare.join("yggterm");
-        // Only meaningful when the env override is not pointing at a real install.
-        if std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT).is_none() {
+        // Only meaningful when neither the env override nor the machine's
+        // canonical direct root points at a real install ([11.220]: the
+        // finder's canonical leg sees the machine's own state, so on a
+        // fleet host a bare exe IS managed — adopting the machine's record
+        // there is the same fleet-launcher law as the home fallback).
+        let machine_canonical = direct_install_root()
+            .ok()
+            .and_then(|root| load_direct_install_state(&root).ok().flatten().map(|_| ()))
+            .is_some();
+        if std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT).is_none() && !machine_canonical {
             let promoted = promote_direct_install_active_version("2.8.5", &exe)
                 .expect("promote should not error");
             assert!(!promoted, "unmanaged install should report false");
