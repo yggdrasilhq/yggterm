@@ -44690,6 +44690,66 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn co_visible_split_pane_bridge_stays_mounted_through_its_first_paint() {
+        // [11.217] repair: the split-pane member's bridge is born MOUNTING,
+        // not retained — before this arm the mount loop's still-active tick
+        // read "superseded" ~160 ms into the freshly scheduled bootstrap and
+        // killed it (terminal_mount_task_dropped{remount_armed:false},
+        // render_span x0, the heal then found no JS host). The spawn-side
+        // widening mounts the host; THIS arm keeps its bridge alive through
+        // the mount and for the group's lifetime, host-scoped like the
+        // retained arm.
+        let bootstrap = test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.split_groups.push(SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec![
+                SplitMember::terminal("local://a"),
+                SplitMember::terminal("local://b"),
+            ],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        });
+        // THE FIX, mount-in-flight shape: the pane is neither the focused
+        // session nor retained yet; only its in-flight attach identifies the
+        // bridge that must live.
+        shell
+            .terminal_attach_in_flight
+            .insert("local://b".to_string());
+        assert!(terminal_session_bridge_should_stay_mounted(
+            &shell,
+            "local://b",
+            "host-b"
+        ));
+        // Steady state: the session's current host entry is this bridge.
+        shell.terminal_attach_in_flight.clear();
+        shell.bump_terminal_mount_epoch_for_session("local://b", "test");
+        let host_b = shell
+            .terminal_session_host_id("local://b")
+            .expect("pane member should have a host entry after its epoch bump");
+        assert!(terminal_session_bridge_should_stay_mounted(
+            &shell,
+            "local://b",
+            &host_b
+        ));
+        // A stale host of the same session must not ride the pane's
+        // visibility — the arm is host-scoped like the retained arm.
+        assert!(!terminal_session_bridge_should_stay_mounted(
+            &shell,
+            "local://b",
+            "stale-host"
+        ));
+        // Ungrouped background session: the old law still governs it.
+        assert!(!terminal_session_bridge_should_stay_mounted(
+            &shell,
+            "local://z",
+            "host-z"
+        ));
+    }
+
+    #[test]
     fn inactive_retained_ready_session_keeps_bridge_mounted_but_pauses_reads() {
         let active_session_path = "codex://active";
         let inactive_session_path = "remote-session://dev/inactive";
