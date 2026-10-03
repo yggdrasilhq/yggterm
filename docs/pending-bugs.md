@@ -134,6 +134,22 @@ next daemon rotation, then samples every 75 s through the 31-min window)
 is LIVE on jojo and completes the owed full window the moment the fleet
 goes quiet; no human re-arm needed.
 
+
+UPDATE 2026-10-03 17:35 IST (zcode on jojo, work FROM dev): hunt-170610.log
+on the fresh post-deploy daemon 1786239 (born ~17:04, build 19651489,
+armed 17:06:10 after the sitting's last deploy) ran the FULL young window
+— WINDOW CLOSED (age 31m) at 17:35:12, 12 PASS / 0 FAIL
+defmiss_fresh_start_mint samples. Every earlier hunt today was cut short
+by deploy rotations (the 16:33 arming died at daemon age 12m to the
+docs-close deploy at 16:40 — LESSON: a docs push to origin/main IS a
+deploy ~5 min later; never land docs while a young-window hunt is
+running). Cumulative 110+ green runs across headless, GUI-attached,
+post-deploy, and now one complete young window; zero holder-survivors and
+zero mint perturbations since the original 2/11. The entry stays OPEN as
+the rare-race watcher: no fix exists to verify; a failing run's
+two-sided evidence (holder_identity + window_arms, both live in
+production) is the conviction the fix direction waits on.
+
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
