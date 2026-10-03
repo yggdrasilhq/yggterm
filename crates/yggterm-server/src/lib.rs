@@ -179,7 +179,7 @@ pub use daemon::{
     connect_ssh_custom, default_endpoint,
     resolve_client_daemon_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
-    focus_live_with_view, hot_restart, hot_restart_detailed, open_remote_session,
+    focus_live_light_with_view, focus_live_with_view, hot_restart, hot_restart_detailed, open_remote_session,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view, ping, working_flags,
     prepare_client_close, prepare_update_restart, raise_external_window,
     PeerDaemonSummary, stale_daemon_answer_warning,

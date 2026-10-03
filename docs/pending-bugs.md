@@ -32515,7 +32515,7 @@ residual is NAMED to a leg.
 
 ## [11.214] — EVERY ACTIVE CLOSE PAYS A SECOND SERIALIZED LOCK-HELD DAEMON MUTATION (the redirect focus): focus_live carries a FULL persist (~81 ms) + snapshot build (~75 ms) under the daemon lock — the felt active close is ~470 ms where ~300 ms is the floor (measured 2026-09-29, live jojo, the close-render-burst-2 lane)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 FILED 2026-09-29 ~10:1x UTC (uxspeed close-render-burst-2 lane, claim
 ACK-3174ece348; zcode sess_63c94b4b on jojo, work FROM dev).
@@ -32554,4 +32554,25 @@ behind — and the daemon lock_holder for focus_live ≤ ~30 ms.
 
 INSTRUMENT ALREADY LANDED (471b66ac, GUI plane): remove_session_stage
 redirect_sync_done {ms, ran} names the leg on every close.
+
+UPDATE 2026-10-03 ~10:5x IST (the delta-focus lane, claim ACK-8522cb7f05;
+zcode sess_8946f23e on jojo, work FROM dev, lane
+lane/integration/11214-delta-focus) — THE LEVER TAKEN, daemon plane. The
+light arm: `FocusLive` gained `#[serde(default)] light: bool` (the audited
+85a5ac5a wire shape, both-directions test in-tree,
+docs/protocol-shape-stamp-drift addendum); the close redirect now sends
+`light: true`. A new daemon performs the focus + view switch + terminal
+ensure, DEFERS the persist to a coalescing flusher (5 s; any natural
+persist also flushes it — the deferral is one AtomicBool cleared at every
+persist's head), and answers `Ack` — no ~75 ms snapshot build, no ~81 ms
+inline persist. An old daemon answers a snapshot and the light client
+falls back to today's behavior (`Ok(Some(..))`), so mixed-version closes
+are safe in both directions. The GUI callers keep the removal snapshot on
+the Ack and land the redirect locally exactly as before (the local apply
+was already the user-visible path). Crash-window bound for the deferred
+persist: at risk is only the FOCUS pointer — the removal persist is
+already on disk and `remove_live_session` already repaired active.
+Falsifier owed on the rotated build: uxprobe close ACTIVE n=5 apply_done
+≤~300 ms, redirect_sync_done ≤~30 ms, daemon lock_holder focus_live
+≤~30 ms, verified 5/5, 0 rows left behind.
 

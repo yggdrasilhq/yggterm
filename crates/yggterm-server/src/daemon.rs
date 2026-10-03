@@ -4524,6 +4524,19 @@ pub enum ServerRequest {
     FocusLive {
         key: String,
         view_mode: Option<WorkspaceViewMode>,
+        /// [11.214] The delta-focus arm, for callers that already hold a
+        /// fresher world than the daemon could answer with (the close
+        /// redirect: the GUI kept the removal snapshot and applied the
+        /// target locally). When `true` the daemon performs the focus, the
+        /// view switch and the terminal ensure, defers the persist to the
+        /// coalescing flusher (any natural persist also flushes it) and
+        /// answers `Ack` instead of building a full snapshot (~75 ms of
+        /// lock-held build saved per active close). Wire-safe both
+        /// directions in the 85a5ac5a pattern: an OLD daemon ignores the
+        /// unknown field (no `deny_unknown_fields`) and answers a snapshot;
+        /// a NEW daemon reads the field's absence as `false`.
+        #[serde(default)]
+        light: bool,
     },
     SetViewMode {
         mode: WorkspaceViewMode,
@@ -5749,6 +5762,11 @@ pub(crate) struct DaemonRuntime {
     /// [`write_persisted_state_if_changed`]. `None` until this daemon has
     /// written the file once, so the first persist of a process always writes.
     last_persisted_state: Option<PersistedStateFingerprint>,
+    /// [11.214] Set when a `FocusLive { light: true }` mutated state but
+    /// deferred its persist. Every completed `persist` clears it (it
+    /// serializes current state, which already carries the mutation), and
+    /// [`spawn_deferred_persist_flusher`] lands it when nothing else did.
+    deferred_persist_pending: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5934,6 +5952,7 @@ impl DaemonRuntime {
             remount_peer_ask_backoff: Arc::new(Mutex::new(HashMap::new())),
             remount_peer_ask_pending: Arc::new(Mutex::new(HashSet::new())),
             last_persisted_state: None,
+            deferred_persist_pending: Arc::new(AtomicBool::new(false)),
         };
         // Baseline, not an observation: rows restored at boot have not "come
         // back", they never left as far as this process can tell. Seeding them
@@ -11410,6 +11429,13 @@ impl DaemonRuntime {
         )
     }
 
+    /// [11.214] Record that state mutated without an inline persist; the
+    /// coalescing flusher (or the next natural persist) lands the write.
+    fn defer_persist(&mut self) {
+        self.deferred_persist_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn persist(&mut self) -> Result<()> {
         if self.routine_persist_muted() {
             // Never clobber the update-restart snapshot during retire, and
@@ -11420,6 +11446,12 @@ impl DaemonRuntime {
             return Ok(());
         }
         let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "persist");
+        // A persist about to run serializes CURRENT state, which already
+        // carries whatever a light request deferred — retire the deferral.
+        // (Deliberately AFTER the mute gate above: a muted persist wrote
+        // nothing and must keep the deferral alive for the flusher.)
+        self.deferred_persist_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
         self.refresh_live_agent_runtime_session_ids_for_persistence();
@@ -12316,6 +12348,10 @@ impl DaemonRuntime {
             "daemon",
             "persist_state_only",
         );
+        // Same contract as `persist`: a completed state write has flushed
+        // any deferred mutation along with it.
+        self.deferred_persist_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         write_persisted_state_if_changed(
             &self.state_path,
             &self.server.persisted_state(),
@@ -14265,7 +14301,11 @@ impl DaemonRuntime {
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
             }
-            ServerRequest::FocusLive { key, view_mode } => {
+            ServerRequest::FocusLive {
+                key,
+                view_mode,
+                light,
+            } => {
                 self.server.focus_live_session(
                     &key,
                     ActivationOrigin::app_control("request_focus_live"),
@@ -14286,14 +14326,28 @@ impl DaemonRuntime {
                         focused_in_terminal = true;
                     }
                 }
-                self.persist()?;
-                self.snapshot_response(Some(
-                    if view_mode == Some(WorkspaceViewMode::Terminal) && !focused_in_terminal {
-                        format!("focused {key} in preview")
-                    } else {
-                        format!("focused {key}")
-                    },
-                ))
+                if light {
+                    // [11.214] The delta-focus: this caller already holds a
+                    // fresher world, so a full snapshot answer would be ~75 ms
+                    // of lock-held build for state it overwrites locally, and
+                    // an inline full persist (~81 ms, hot on the heels of the
+                    // removal's own persist) buys one pointer of durability.
+                    // Do the real work (focus + view + ensure, above), mark
+                    // the state dirty for the coalescing flusher, answer Ack.
+                    self.defer_persist();
+                    ServerResponse::Ack {
+                        message: Some(format!("focused {key}")),
+                    }
+                } else {
+                    self.persist()?;
+                    self.snapshot_response(Some(
+                        if view_mode == Some(WorkspaceViewMode::Terminal) && !focused_in_terminal {
+                            format!("focused {key} in preview")
+                        } else {
+                            format!("focused {key}")
+                        },
+                    ))
+                }
             }
             ServerRequest::SetViewMode { mode } => {
                 let mut effective_mode = mode;
@@ -19847,6 +19901,49 @@ fn spawn_peer_anomaly_relay(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>
     });
 }
 
+/// How long a deferred persist may sit before its own flusher lands it
+/// ([11.214]). The window bounds what a daemon crash can lose: the removal
+/// persist is already on disk when the deferral is armed, so the only
+/// at-risk fact is the FOCUS pointer — which `remove_live_session` already
+/// repaired to a sane value before the deferral existed.
+const DEFERRED_PERSIST_FLUSH_SECS: u64 = 5;
+
+/// [11.214] The coalescing flusher for light requests that mutated state
+/// without paying an inline persist. Sleeps cheap, touches the runtime lock
+/// ONLY when a deferral is actually pending, and lands a normal `persist`
+/// (identity refreshes, ledger and tombstone reconciliation ride along as on
+/// any write). A natural persist that raced in between flag and lock makes
+/// this a no-op write (the content gate skips identical state).
+fn spawn_deferred_persist_flusher(
+    home_dir: PathBuf,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    flag: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(
+            DEFERRED_PERSIST_FLUSH_SECS,
+        ));
+        if !flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let mut guard = lock_daemon_runtime(&runtime, "deferred_persist_flush");
+        if let Err(error) = guard.persist() {
+            tracing::warn!(%error, "deferred persist flush failed");
+            // The swap already retired the deferral — re-arm so the next
+            // tick retries instead of silently dropping the write.
+            guard.defer_persist();
+            continue;
+        }
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "persist",
+            "deferred_flush_landed",
+            serde_json::json!({ "secs": DEFERRED_PERSIST_FLUSH_SECS }),
+        );
+    });
+}
+
 fn spawn_stale_owner_retirement(home_dir: PathBuf, runtime: Arc<Mutex<DaemonRuntime>>) {
     if parse_self_retire_handoff_disabled(
         std::env::var("YGGTERM_DISABLE_STALE_OWNER_RETIRE")
@@ -23843,8 +23940,33 @@ pub fn focus_live_with_view(
         &ServerRequest::FocusLive {
             key: key.to_string(),
             view_mode,
+            light: false,
         },
     )?)
+}
+
+/// [11.214] The delta-focus ask for the close redirect: the caller already
+/// holds the post-removal world and has applied the target locally, so a
+/// full snapshot answer is redundant. A new daemon answers `Ack` (focus +
+/// view + ensure done, persist coalesced) → `Ok(None)`; an old daemon
+/// ignores the `light` field and answers a snapshot, returned as
+/// `Ok(Some(..))` so the caller keeps today's behavior.
+pub fn focus_live_light_with_view(
+    endpoint: &ServerEndpoint,
+    key: &str,
+    view_mode: Option<WorkspaceViewMode>,
+) -> Result<Option<(ServerUiSnapshot, Option<String>)>> {
+    match send_request(
+        endpoint,
+        &ServerRequest::FocusLive {
+            key: key.to_string(),
+            view_mode,
+            light: true,
+        },
+    )? {
+        ServerResponse::Ack { message: _ } => Ok(None),
+        other => Ok(Some(expect_snapshot(other)?)),
+    }
 }
 
 pub fn switch_agent_session_mode(
@@ -28504,6 +28626,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // [11.164 v2] The peer relay: headless peers' anomalies reach a GUI
         // host through this daemon's scan of their status payloads.
         spawn_peer_anomaly_relay(home_dir.clone(), runtime.clone());
+        // [11.214] The deferred-persist flusher for light focus requests:
+        // clone the flag under a brief lock, then hand both handles to the
+        // thread so it never touches the lock on a clean tick.
+        {
+            let deferred_flag = {
+                let guard = lock_daemon_runtime(&runtime, "deferred_persist_flusher_arm");
+                std::sync::Arc::clone(&guard.deferred_persist_pending)
+            };
+            spawn_deferred_persist_flusher(home_dir.clone(), runtime.clone(), deferred_flag);
+        }
         loop {
             let mut start_migration_drain = false;
             if drain_unix_client_outcomes(
@@ -37281,6 +37413,7 @@ mod tests {
             ServerRequest::FocusLive {
                 key: "k".into(),
                 view_mode: None,
+                light: false,
             },
             ServerRequest::HotRestart {
                 daemon_executable: "x".into(),
@@ -37400,6 +37533,37 @@ mod tests {
             old_daemon,
             ServerRequest::TerminalRead { cursor: 9, .. }
         ));
+    }
+
+    #[test]
+    fn focus_live_light_field_is_old_peer_safe() {
+        use super::ServerRequest;
+        // (a) OLD bytes on a NEW daemon: the field is absent and must read
+        // false — every pre-[11.214] caller keeps today's snapshot answer.
+        let old_shape = r#"{"kind":"focus_live","key":"k","view_mode":null}"#;
+        match serde_json::from_str::<ServerRequest>(old_shape).expect("old shape parses") {
+            ServerRequest::FocusLive { light, .. } => assert!(!light),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // (b) NEW bytes on an OLD daemon: `light` is an unknown field on a
+        // known variant and must be ignored (no deny_unknown_fields) — the
+        // old daemon answers a snapshot and the light client falls back.
+        let new_shape = r#"{"kind":"focus_live","key":"k","view_mode":null,"light":true}"#;
+        match serde_json::from_str::<ServerRequest>(new_shape).expect("new shape parses") {
+            ServerRequest::FocusLive { light, .. } => assert!(light),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // (c) The round trip is lossless through the tagged wire form.
+        let round = ServerRequest::FocusLive {
+            key: "k".into(),
+            view_mode: None,
+            light: true,
+        };
+        let wire = serde_json::to_string(&round).unwrap();
+        match serde_json::from_str::<ServerRequest>(&wire).unwrap() {
+            ServerRequest::FocusLive { light, .. } => assert!(light),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -45647,8 +45811,8 @@ mod tests {
         // `cargo check --tests` compiles the law, it never RUNS it. This
         // commit re-arms the stamp at the shipped truth; the NEXT shape
         // change must bump the version and this hash in its own commit.
-        const STAMPED_AT_VERSION: &str = "3.2.115";
-        const STAMPED_SHAPE_HASH: u64 = 0xd15559e723c5913c;
+        const STAMPED_AT_VERSION: &str = "3.2.116";
+        const STAMPED_SHAPE_HASH: u64 = 0xd2c47821980429bc;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",

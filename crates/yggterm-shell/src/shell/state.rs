@@ -197,7 +197,8 @@ use yggterm_server::{
     YggtermServer, agent_plane_session_title, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons, complete_app_control_request,
     connect_ssh_custom, enqueue_app_control_request, fetch_remote_generation_context,
-    focus_live_with_view, hot_restart, hot_restart_detailed, local_app_verb_launch_command,
+    focus_live_light_with_view, focus_live_with_view, hot_restart, hot_restart_detailed,
+    local_app_verb_launch_command,
     local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
@@ -61559,32 +61560,46 @@ fn deletion_redirect_row_for_pending(
 fn close_redirect_target_daemon_sync(
     endpoint: &ServerEndpoint,
     target: &ViewportHistoryEntry,
-) -> Option<Result<(ServerUiSnapshot, Option<String>)>> {
+) -> Option<Result<Option<(ServerUiSnapshot, Option<String>)>>> {
     let ViewportHistoryEntry::Session { row, mode } = target else {
         return None;
     };
     if is_live_sidebar_row(row) || row.full_path.starts_with("codex-runtime://") {
-        return Some(focus_live_with_view(endpoint, &row.full_path, Some(*mode)));
-    }
-    if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
-        return Some(open_remote_session_with_view(
+        // [11.214] The light ask: the caller already holds the post-removal
+        // snapshot and applies the target locally, so a new daemon's Ack
+        // (`Ok(None)`) is the cheap win; an old daemon answers a snapshot,
+        // which falls back to today's behavior.
+        return Some(focus_live_light_with_view(
             endpoint,
-            machine_key,
-            session_id,
-            row.session_cwd.as_deref(),
-            Some(row.label.as_str()),
+            &row.full_path,
             Some(*mode),
         ));
     }
-    Some(open_stored_session_with_view(
-        endpoint,
-        session_kind_for_row(row),
-        &row.full_path,
-        row.session_id.as_deref(),
-        row.session_cwd.as_deref(),
-        Some(row.label.as_str()),
-        Some(*mode),
-    ))
+    if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
+        return Some(
+            open_remote_session_with_view(
+                endpoint,
+                machine_key,
+                session_id,
+                row.session_cwd.as_deref(),
+                Some(row.label.as_str()),
+                Some(*mode),
+            )
+            .map(Some),
+        );
+    }
+    Some(
+        open_stored_session_with_view(
+            endpoint,
+            session_kind_for_row(row),
+            &row.full_path,
+            row.session_id.as_deref(),
+            row.session_cwd.as_deref(),
+            Some(row.label.as_str()),
+            Some(*mode),
+        )
+        .map(Some),
+    )
 }
 
 fn app_control_remove_session_pending(
@@ -61976,7 +61991,11 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                     && let Some(sync_result) = close_redirect_target_daemon_sync(&endpoint, target)
                 {
                     match sync_result {
-                        Ok(result) => daemon_result = Some(result),
+                        // [11.214] The light Ack carries no snapshot to
+                        // apply: the removal result (already captured)
+                        // stands, and the local redirect lands the target.
+                        Ok(Some(result)) => daemon_result = Some(result),
+                        Ok(None) => {}
                         Err(error) => redirect_error = Some(error.to_string()),
                     }
                 }
@@ -90244,7 +90263,12 @@ async fn process_pending_app_control_requests(
                     {
                         redirect_sync_ran = true;
                         match sync_result {
-                            Ok((redirect_snapshot, _)) => snapshot = redirect_snapshot,
+                            // [11.214] A new daemon's light Ack carries no
+                            // snapshot: keep the removal snapshot — the
+                            // local redirect apply below lands the target on
+                            // top of it either way.
+                            Ok(Some((redirect_snapshot, _))) => snapshot = redirect_snapshot,
+                            Ok(None) => {}
                             Err(error) => redirect_error = Some(error.to_string()),
                         }
                     }
