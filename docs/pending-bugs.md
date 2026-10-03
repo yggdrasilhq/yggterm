@@ -203,6 +203,37 @@ still defeats the [11.159] accept arm for the whole window (fix
 directions above unchanged; the window this time was 17:03→18:46, ~1 h 43
 min of dead spawn plane on the integration host).
 
+UPDATE 2026-10-03 ~21:0x IST (lockless-accept sitting; zcode on jojo, work
+FROM dev; board plan ACK-da82a34004): FIX DIRECTION (b) LANDED IN CODE on
+lane/integration/11225-lockless-accept — the [11.159] accept arm's verdict
+no longer gates on the held bind lock: a version-compatible status answer
+from the endpoint IS the spawn-futility witness (its live listener owns the
+socket name; a demand-start child cannot bind under it whatever the lock
+says — [11.225]'s own measurement falsified "a free lock means the
+demand-start can still win"). The held lock downgraded to a traced witness
+(`bind_lock_held` on `ensure_accepted_live_bind_lock_owner`; false = the
+retired-lock shape, true = the [11.159] shape). RED/GREEN measured on an
+isolated rig (scratch YGGTERM_HOME; daemon on an out-of-tree bits path no
+allowed-binary root covers, `YGGTERM_DIRECT_INSTALL_ROOT` pinned so it
+cannot re-exec to the newest build; lock retired the deploy's way, then the
+canonical lock path made unholdable so no child can ever satisfy the old
+held-check — the incident's fast-exiting-children state):
+- UNFIXED client (dcc8cdc5): 24.5 s burn, one doomed spawned child,
+  rc=1 `Error: local yggterm daemon did not become reachable`, row NOT
+  born — the incident signature, byte-for-byte, at the incident's cost.
+- FIXED client: 42 ms accept (`bind_lock_held:false`), ZERO spawned
+  children, row born and streaming on the lockless serving daemon.
+ALSO MEASURED (the rig's accidental middle shape): when the retired lock
+path is merely free-and-holdable, today's-build doomed child holds it
+transiently during its failed bequest negotiation and BACK-DOORS the old
+arm's held-check (accept at +6.7 s) — the old law's satisfaction was
+incidental to a child's death timing, which is why the incident's version
+pair failed hard for 1 h 43 min while a same-day pair can luck green.
+Shape-lock test rewritten to the new law (compatible + live listener
+accepts whatever the lock; no listener → refuse). Full server-lib
+1660/0. Directions (a) deploy-atomicity and (c) the [11.136] escape hatch
+REMAIN OPEN.
+
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
 **Status:** AWAITING A DECISION
@@ -334,6 +365,25 @@ zero mint perturbations since the original 2/11. The entry stays OPEN as
 the rare-race watcher: no fix exists to verify; a failing run's
 two-sided evidence (holder_identity + window_arms, both live in
 production) is the conviction the fix direction waits on.
+
+UPDATE 2026-10-03 20:29:23 IST (the repaired rotation-armed hunt on the
+20:02 jojo rotation to dcc8cdc5, daemon born 20:02:23): CATCH #3 — the
+first 12 runs (daemon ages ~3-25 m) PASSED; the run at daemon age 26 m
+(20:29:23) FAILED: the close of `agy-runtime://04f0baac…` left live CLI
+holder 1913464 past the FULL 5 s settle window (a live cwd match — not a
+zombie: a zombie has no /proc/<pid>/cwd link and the scan skips it), and
+the holder then exited in the milliseconds between the scan and the
+identity read, dying unnamed AGAIN ("(cmdline unreadable)", no state=
+either — every /proc open OSError'd; the pid is gone now and nothing in
+the daemon trace names it). TWO consequences: (1) the window claim
+stretches — this catch is at 26 m, just past the "~25 minutes" bound of
+the original 2/11; (2) the single-shot identity read was a probe defect
+under the [11.187] law — it can never name a holder that dies at the
+evidence boundary. PROBE REPAIRED same sitting (repo lane + the live
+/tmp hunt copy): `holder_identity` retries while /proc/<pid> exists and
+now distinguishes `state=Z` (a reap-gap convict — adjacent to [11.126]'s
+unreaped-children leak) from a true (gone). The hunt stays armed; the
+next catch names its convict.
 
 ## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
 
