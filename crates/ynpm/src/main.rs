@@ -534,18 +534,35 @@ fn package_identity(key: &str, package: &Package) -> String {
         .unwrap_or_else(|| format!("@ygghq/{key}"))
 }
 
+/// A rename leaves the pre-rename slot behind; every fallback rank below
+/// the exact `package_name` match can hit that stale slot when map order
+/// cooperates (the @ygghq/zcode-tui ghost, [11.123]). Rank the predicates
+/// instead of letting BTreeMap order decide: an exact identity always wins,
+/// then the storage key, then the pre-rename @ygghq key, then the bare-name
+/// fallback — same rank keeps first-in-map-order for stability.
 fn find_package_key<'a>(state: &'a State, package: &str) -> Option<&'a str> {
     let storage_key = package_storage_key(package);
-    state
-        .packages
-        .iter()
-        .find(|(key, value)| {
-            value.package_name.as_deref() == Some(package)
-                || key.as_str() == storage_key
-                || (package.starts_with("@ygghq/") && key.as_str() == &package[7..])
-                || value.package_name.is_none() && package.rsplit('/').next() == Some(key.as_str())
-        })
-        .map(|(key, _)| key.as_str())
+    let legacy_key = package.strip_prefix("@ygghq/");
+    let mut ranked: [Option<&'a str>; 4] = [None, None, None, None];
+    for (key, value) in state.packages.iter() {
+        let rank = if value.package_name.as_deref() == Some(package) {
+            0
+        } else if key.as_str() == storage_key {
+            1
+        } else if legacy_key.is_some_and(|legacy| key.as_str() == legacy) {
+            2
+        } else if value.package_name.is_none()
+            && package.rsplit('/').next() == Some(key.as_str())
+        {
+            3
+        } else {
+            continue;
+        };
+        if ranked[rank].is_none() {
+            ranked[rank] = Some(key.as_str());
+        }
+    }
+    ranked.into_iter().flatten().next()
 }
 
 fn package_name_for_app(state: &State, app_name: &str) -> Option<String> {
@@ -7078,6 +7095,65 @@ mod tests {
             ]),
         };
         assert!(another_package_owns_app_name(&state, "ydesign", "ydesign"));
+    }
+
+    #[test]
+    fn an_exact_identity_beats_a_stale_pre_rename_slot() {
+        // The [11.123] ghost shape: a legacy slot whose key sorts BEFORE the
+        // canonical storage key and still matches the bare-name fallback.
+        // Without ranking, map order answers the lookup with the ghost.
+        let canonical = Package {
+            package_name: Some("@zeta/new-cli".to_string()),
+            current: "9.9.9".to_string(),
+            versions: vec!["9.9.9".to_string()],
+            bins: BTreeMap::from([("new-cli".to_string(), "bin/new-cli".to_string())]),
+            external_prev: None,
+            destination: Some("/home/user/.yggterm/ynpm/bin".to_string()),
+            dev: None,
+            dev_generation: None,
+            channel: None,
+            source: None,
+            integration: None,
+        };
+        let mut ghost = canonical.clone();
+        ghost.package_name = None;
+        ghost.current = "0.0.1".to_string();
+        let state = State {
+            packages: BTreeMap::from([
+                ("new-cli".to_string(), ghost),
+                ("zeta__new-cli".to_string(), canonical),
+            ]),
+        };
+        assert_eq!(
+            find_package_key(&state, "@zeta/new-cli"),
+            Some("zeta__new-cli")
+        );
+    }
+
+    #[test]
+    fn the_pre_rename_name_still_finds_the_pre_rename_slot() {
+        // Asking by the old @ygghq name is an exact identity question and
+        // must keep answering the slot that recorded that name.
+        let ghost = Package {
+            package_name: Some("@ygghq/zcode-tui".to_string()),
+            current: "0.6.14".to_string(),
+            versions: vec!["0.6.14".to_string()],
+            bins: BTreeMap::from([("zcode-tui".to_string(), "bin/zcode-tui".to_string())]),
+            external_prev: None,
+            destination: Some("/home/user/.local/bin".to_string()),
+            dev: None,
+            dev_generation: None,
+            channel: None,
+            source: None,
+            integration: None,
+        };
+        let state = State {
+            packages: BTreeMap::from([("zcode-tui".to_string(), ghost)]),
+        };
+        assert_eq!(
+            find_package_key(&state, "@ygghq/zcode-tui"),
+            Some("zcode-tui")
+        );
     }
 
     #[test]
