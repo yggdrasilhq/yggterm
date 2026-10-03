@@ -1200,7 +1200,7 @@ law (viewport shows the session, never the banner).
 
 ## ⛔ [11.97] A FAILED INTEGRATION TICK SILENTLY DROPS EVERY LANE THAT RODE IT — THE TRAIN GOES GREEN WITHOUT MERGED CONTENT, AND THE DEPLOY SHIPS THE HOLE (filed 2026-09-10)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 ygg-ci (the fleet integration watcher). Measured 2026-09-10 22:33-23:01,
 three ticks, on the yggterm train:
@@ -1269,16 +1269,29 @@ ARM-BY-ARM RESULTS:
   delayed form: after the guilty fixed tip lands, the innocent next
   probes ALONE and lands with no human commit).
 
-RESIDUAL (new, measured): the expiry probe needs lane-subset semantics.
-Fix direction (named, NOT taken): on an expiry probe, merge and build
-the expired lanes ONE PER TICK (round-robin), so an innocent lands on
-its solo probe and a guilty re-quarantines alone; or bisect the expired
-union. Per-lane gate attribution by diff was already rejected (a merge
-commit carries every prior lane) and stays rejected.
+RESIDUAL LANDED (2026-10-03 ~16:1x IST, the round-robin sitting; zcode on
+jojo, work FROM dev): the named fix direction is taken — the expiry probe is
+now LANE-shaped. `_quarantine_expiry_verdict` owns the per-lane decision
+(rearm / hold / probe / defer) and the merge loop admits at most ONE expiry
+probe per tick: an innocent lands SOLO, a guilty re-quarantines ALONE.
+Deferred lanes keep their past-expiry entry (no pop), so the next tick
+admits the next one in the loop's FIFO-by-tip order and a guilty
+re-quarantine's fresh TTL sends it to the back naturally — round-robin with
+no persisted cursor and no starvation. Deferred lanes appear in
+`last_build.conflicts` as `quarantine_expiry_deferred`. Lane
+lane/ci/1197-expiry-round-robin 4b64ada8 → main 765cd7c5 → deployed
+20261003-161847; the watcher was restarted same sitting per the [11.112]
+law (pid 2932064, born from the merged main). Locked by
+tests/test_yggci_expiry_one_per_tick.py (the pure verdict: first expired
+probes, spent budget defers BY NAME, defer never pops the entry so the next
+tick admits it); the watchdog suite stayed green.
 
-Status stays honest: the headline drop/deploy-hole arms are fixed and
-live-proven; the bystander-lands arm is NOT delivered as claimed, so
-the entry stays open on the residual.
+FALSIFIER (live proof owed): the next production co-expiry — two lanes
+quarantined by the same failed union, both TTLs popping — must show in
+ci.log ONE `quarantine expired … probing again (solo this tick)` line with
+its sibling logged `defer … this tick's one expiry probe is spent`, and the
+innocent sibling must LAND on its own next tick with no human commit. A
+co-expired rebuild of the same doomed union re-opens this entry.
 
 ## ⛔ [11.99] A GUI READ STALL DESTROYS A LIVE BROWSER SURFACE AND A DEAD ONE WEDGES THE ROW — THE CORPSE ARM NEVER ASKED THE ONE WITNESS THAT STAYS FRESH (filed 2026-09-12, owner screenshot)
 
