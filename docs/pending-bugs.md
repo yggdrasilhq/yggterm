@@ -18,6 +18,15 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## [11.224] CI GATE-FAILURE LIVE-PROOF GUILTY TIP — DELIBERATE DOCS-SSOT VIOLATION, DO NOT LAND THIS TIP (the [11.97] quarantine-TTL falsifier, zcode 2026-10-03)
+
+**Status:** OPEN (deliberate guilty tip — the rider on this line fails check-docs-ssot on purpose)
+
+This tip exists to fail the docs-ssot gate exactly once so the [11.97] watcher
+arms can be live-proven: the innocent rider lane must re-merge with no human
+commit, and this lane must land the moment its fixed tip arrives. The fix tip
+deletes this entry. Filed by the [11.97] live-proof sitting (plan ACK-c645bc55ea).
+
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
 **Status:** AWAITING A DECISION
