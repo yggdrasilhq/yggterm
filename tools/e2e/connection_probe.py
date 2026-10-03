@@ -232,27 +232,48 @@ def completed_json(answer, limit=300):
     })
 
 
-def holder_identity(pid):
+def holder_identity(pid, attempts=40):
     """cmdline + state + ppid of a surviving holder, read while it lives —
     the [11.218] convict naming (a wrapper, the CLI itself, or a third
-    child each imply a different fix direction)."""
-    parts = []
-    try:
-        cmdline = (
-            pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
-            .replace(b"\0", b" ").decode(errors="replace").strip()[:120]
-        )
-        parts.append(repr(cmdline))
-    except OSError:
-        parts.append("(cmdline unreadable)")
-    try:
-        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
-        # pid (comm) state ppid ... — comm may contain spaces/parens
-        tail = stat[stat.rindex(")") + 2:].split()
-        parts.append(f"state={tail[0]} ppid={tail[1]}")
-    except (OSError, ValueError, IndexError):
-        pass
-    return " ".join(parts) if parts else "(gone at evidence time)"
+    child each imply a different fix direction).
+
+    ⛔ THE DEATH-RACE REPAIR (caught run #3, 2026-10-03 20:29:23 IST, the
+    [11.218] hunt on jojo): pid 1913464 outlived the FULL 5 s settle window
+    (a live cwd match — not a zombie), then exited in the milliseconds
+    between the scan and this read, so every /proc open raised OSError and
+    printed "(cmdline unreadable)" — the convict died unnamed, the same
+    loss as catch #1/#2 ("the survivor never identified"). A single-shot
+    read can NEVER name a holder that dies at the evidence boundary; retry
+    while /proc/<pid> exists (an empty cmdline with state=Z is a REAP-gap
+    convict, not an unreadable one), and only report (gone) once the pid is
+    truly absent from the table."""
+    import time as _time
+    for attempt in range(attempts):
+        parts = []
+        got_any = False
+        try:
+            cmdline = (
+                pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+                .replace(b"\0", b" ").decode(errors="replace").strip()[:120]
+            )
+            parts.append(repr(cmdline))
+            got_any = True
+        except OSError:
+            parts.append("(cmdline unreadable)")
+        try:
+            stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+            # pid (comm) state ppid ... — comm may contain spaces/parens
+            tail = stat[stat.rindex(")") + 2:].split()
+            parts.append(f"state={tail[0]} ppid={tail[1]}")
+            got_any = True
+        except (OSError, ValueError, IndexError):
+            pass
+        if got_any:
+            return " ".join(parts)
+        if not pathlib.Path(f"/proc/{pid}").exists():
+            return "(gone at evidence time)"
+        _time.sleep(0.05)
+    return "(gone at evidence time)"
 
 
 def reap(key, cwd=None):
