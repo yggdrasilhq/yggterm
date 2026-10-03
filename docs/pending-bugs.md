@@ -20,7 +20,7 @@ Closed narratives from before 2026-08-02 are in
 
 ## [11.221] THE ROW-FACING MANAGED ynpm IS A STALE STATE-LESS DEV GENERATION — TERMINAL PATHS PUT IT FIRST, SO ROW-INVOKED ynpm VERBS RUN A GUARD-LESS BINARY WHILE EVERY DAEMON'S OWN RESOLVER IS CURRENT
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 FILED 2026-10-03 ~12:0x IST (the [11.123] close-out sitting; zcode on jojo, work
 FROM dev; claim ACK-564174c2fc). Measured while closing [11.123] (its narrative,
@@ -54,6 +54,44 @@ FALSIFIER: after a release roll, `~/.yggterm/ynpm/bin/ynpm` answers the new vers
 AND its binary carries the refusal literal; the state record exists; a
 row-invoked `ynpm sync --integrated` pointed at an older registry dist-tag keeps
 the newer generation.
+
+UPDATE 2026-10-03 ~13:0x IST (the reap sitting; zcode on jojo, work FROM dev;
+claim ACK-fe18611140, lane lane/ynpm/1121-dev-orphan-reap): ROOT CAUSE in code —
+`ynpm install --dev @ygghq/yggterm` (the Sep-08/10 fleet dev era) linked the dev
+generation's four bins (yggterm, yggterm-headless, ynpm, ynpx) into the managed
+bin dir, and `clear_yggterm_dev_state` clears ONLY the state key: the generation
+dirs and managed-bin links survive as state-less orphans no verb can even see
+(`verb_remove` bails with "package is not recorded by ynpm"). Release rolls
+refresh `~/.local/bin` + `~/.yggterm/bin`, never the managed bin dir, so the
+orphan shadowed every row-facing `ynpm`/`yggterm` invocation with a guard-less
+3.2.99 while both roll-refreshed locations carried 3.2.116 (measured on all
+three hosts before the fix).
+
+THE FIX (chosen lever: the managed slot has NO refresh owner on the fleet —
+deploy-fleet already owns two roll-refreshed locations, and a third full copy
+per host would be redundant bytes; the defect was the ORPHAN, not a missing
+slot): `reap_orphan_yggterm_dev` — a `generations/yggterm/dev-*` artifact is
+live ONLY while the state's dev marker references it; every unreferenced one is
+reaped. Managed-bin links into orphaned dev generations are unlinked (the
+shadow), unreferenced dev generation dirs are deleted (running_process_paths
+guard, the verb_remove pattern — a generation a live process executes from is
+skipped and reaped by a later sweep), and aux-dir links the removal left
+dangling are cleaned. Wired into BOTH `clear_yggterm_dev_state` (the release
+and self-update paths stop manufacturing new orphans) and the START of
+`sync_integrated`, so the daemon's own refresh self-heals every host at the
+next roll with no per-host chore; the reap is failure-isolated (reports, never
+throws) and traces `yggterm.dev.reap`. Unit tests: the state-less fleet shape
+reaps links+generations while a versioned release generation and a foreign
+package's link survive untouched + idempotency; a live dev marker shields its
+own generation while older orphan generations still reap. ynpm suite 46 green.
+
+FALSIFIER (re-stated for the shipped lever): after the next roll, per host, one
+`~/.local/bin/ynpm sync --integrated` answers green AND the trace carries
+`yggterm.dev.reap` for the reaped artifacts; `~/.yggterm/ynpm/bin` holds none of
+the four yggterm-slot links; `generations/yggterm` holds no unreferenced
+`dev-*` dir; a row-shaped `PATH=$HOME/.yggterm/ynpm/bin:$PATH ynpm --version`
+answers the release version with the refusal literal in the binary that
+resolves.
 
 ## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd jojo daemon, freshly started, 17 restored live sessions)
 

@@ -1721,6 +1721,7 @@ fn install_yggterm_release(
 fn clear_yggterm_dev_state(paths: &Paths) -> anyhow::Result<()> {
     let mut state = paths.load_state()?;
     let Some(key) = find_package_key(&state, "@ygghq/yggterm").map(str::to_string) else {
+        reap_orphan_yggterm_dev(paths);
         return Ok(());
     };
     if state
@@ -1731,7 +1732,116 @@ fn clear_yggterm_dev_state(paths: &Paths) -> anyhow::Result<()> {
         state.packages.remove(&key);
         paths.save_state(&state)?;
     }
+    reap_orphan_yggterm_dev(paths);
     Ok(())
+}
+
+fn referenced_yggterm_dev_generation(paths: &Paths) -> Option<String> {
+    let state = paths.load_state().ok()?;
+    let key = find_package_key(&state, "@ygghq/yggterm")?;
+    let entry = state.packages.get(key)?;
+    let marker = entry.dev.as_ref()?;
+    entry
+        .dev_generation
+        .clone()
+        .or_else(|| marker.generation.clone())
+}
+
+/// Reap state-less yggterm dev artifacts ([11.221]). A `dev-*` generation is
+/// live only while the state's dev marker still references it; anything else
+/// under `generations/yggterm/dev-*` is the residue of a cleared dev
+/// activation, and the managed-bin links into it shadow the roll-refreshed
+/// binaries with a guard-less build for every row whose PATH puts the
+/// managed bin dir first. Reports what it reaped; a failed removal is
+/// printed, never thrown, so callers stay failure-isolated.
+fn reap_orphan_yggterm_dev(paths: &Paths) -> Vec<String> {
+    let mut reaped = Vec::new();
+    let referenced = referenced_yggterm_dev_generation(paths);
+    let generation_root = paths.generations().join("yggterm");
+    // 1. Managed-bin links into an orphaned dev generation: the live defect,
+    //    because terminal PATHs put this dir first.
+    if let Ok(entries) = fs::read_dir(paths.root().join("bin")) {
+        for entry in entries.flatten() {
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            let Some(generation) = target
+                .strip_prefix(&generation_root)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .and_then(|component| component.as_os_str().to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !generation.starts_with("dev-") || referenced.as_deref() == Some(&generation) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => reaped.push(format!(
+                    "bin-link:{}->{}",
+                    entry.file_name().to_string_lossy(),
+                    generation
+                )),
+                Err(error) => {
+                    eprintln!("ynpm: could not reap {}: {error}", entry.path().display())
+                }
+            }
+        }
+    }
+    // 2. Unreferenced dev generation dirs. One a running process still
+    //    executes from is skipped; the next sweep reaps it once dead.
+    if let Ok(entries) = fs::read_dir(&generation_root) {
+        let live = running_process_paths();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with("dev-") || referenced.as_deref() == Some(&name) {
+                continue;
+            }
+            let dir = entry.path();
+            if live.iter().any(|path| path.starts_with(&dir)) {
+                continue;
+            }
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => reaped.push(format!("generation:{name}")),
+                Err(error) => eprintln!("ynpm: could not reap {}: {error}", dir.display()),
+            }
+        }
+    }
+    // 3. Aux-dir links the generation removal left dangling. The
+    //    roll-refreshed copies in these dirs are files, not links, and the
+    //    release generation links are live, so only reaped-tree links match.
+    for directory in [
+        paths.home.join(".local/bin"),
+        paths.home.join(".yggterm/bin"),
+    ] {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            if target.starts_with(&generation_root) && !target.exists() {
+                let _ = fs::remove_file(entry.path());
+                reaped.push(format!(
+                    "aux-link:{}@{}",
+                    entry.file_name().to_string_lossy(),
+                    directory.display()
+                ));
+            }
+        }
+    }
+    if !reaped.is_empty() {
+        ynpm_trace(
+            paths,
+            "yggterm.dev.reap",
+            serde_json::json!({ "reaped": reaped }),
+        );
+    }
+    reaped
 }
 
 fn activate_yggterm_dev(paths: &Paths) -> anyhow::Result<()> {
@@ -4079,6 +4189,12 @@ fn sync_integrated(paths: &Paths) -> anyhow::Result<()> {
         "sync.integrated.begin",
         serde_json::json!({ "scope": "AGENT_CLIS" }),
     );
+    // The daemon's refresh is the fleet-scale heal for [11.221]: every host
+    // runs this, so the stale managed-bin shadow dies at the next roll
+    // without a per-host chore. Failure-isolated inside the reap itself.
+    for artifact in reap_orphan_yggterm_dev(paths) {
+        println!("ynpm: reaped orphaned yggterm dev artifact {artifact}");
+    }
     let destination = paths.root().join("bin");
     fs::create_dir_all(&destination)?;
     let mut failures = Vec::new();
@@ -6676,6 +6792,142 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    struct ReapSandbox {
+        home: PathBuf,
+    }
+
+    impl ReapSandbox {
+        fn new(name: &str) -> Self {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .expect("test home")
+                .join(".yggterm/scratchpad/ynpm")
+                .join(format!("reap-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&home);
+            Self { home }
+        }
+        fn paths(&self) -> Paths {
+            Paths::new(self.home.clone())
+        }
+        /// A fake dev generation carrying `bins`, each optionally linked
+        /// into the managed bin dir (terminal-PATH-first, the [11.221] shadow).
+        fn dev_generation(&self, generation: &str, bins: &[&str], link: bool) -> PathBuf {
+            let dir = self
+                .home
+                .join(".yggterm/ynpm/generations/yggterm")
+                .join(generation);
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            for bin in bins {
+                fs::write(dir.join(format!("bin/{bin}")), "#!/bin/sh\n").unwrap();
+                if link {
+                    let managed = self.home.join(".yggterm/ynpm/bin");
+                    fs::create_dir_all(&managed).unwrap();
+                    let link = managed.join(bin);
+                    let _ = fs::remove_file(&link);
+                    std::os::unix::fs::symlink(dir.join(format!("bin/{bin}")), &link).unwrap();
+                }
+            }
+            dir
+        }
+        /// A foreign package's managed-bin link must never be touched by a
+        /// yggterm-scoped sweep.
+        fn foreign_package_link(&self, package: &str, generation: &str, bin: &str) {
+            let dir = self.home.join(format!(
+                ".yggterm/ynpm/generations/{package}/{generation}/bin"
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(bin), "#!/bin/sh\n").unwrap();
+            let managed = self.home.join(".yggterm/ynpm/bin");
+            fs::create_dir_all(&managed).unwrap();
+            std::os::unix::fs::symlink(dir.join(bin), managed.join(bin)).unwrap();
+        }
+        fn state_with_live_dev(&self, generation: &str) {
+            let package = Package {
+                package_name: Some("@ygghq/yggterm".to_string()),
+                current: "0.0.0".to_string(),
+                versions: Vec::new(),
+                bins: BTreeMap::from([("ynpm".to_string(), "bin/ynpm".to_string())]),
+                external_prev: None,
+                destination: Some(self.home.join(".yggterm/ynpm/bin").display().to_string()),
+                dev: Some(DevMarker {
+                    built_at_ms: 1,
+                    commit: None,
+                    host: None,
+                    watch: None,
+                    supersedes: None,
+                    supersedes_fingerprint: None,
+                    dev_fingerprint: None,
+                    generation: Some(generation.to_string()),
+                }),
+                dev_generation: Some(generation.to_string()),
+                channel: Some("dev".to_string()),
+                source: None,
+                integration: None,
+            };
+            let state = State {
+                packages: BTreeMap::from([("yggterm".to_string(), package)]),
+            };
+            self.paths().save_state(&state).unwrap();
+        }
+    }
+
+    impl Drop for ReapSandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.home);
+        }
+    }
+
+    #[test]
+    fn stateless_yggterm_dev_links_and_generations_are_reaped() {
+        let sandbox = ReapSandbox::new("stateless");
+        let managed = sandbox.home.join(".yggterm/ynpm/bin");
+        let gens = sandbox.home.join(".yggterm/ynpm/generations/yggterm");
+        sandbox.dev_generation("dev-1", &["ynpm", "yggterm"], true);
+        sandbox.dev_generation("dev-2", &["ynpx"], true);
+        // A versioned (release) generation with its own managed link: the
+        // sweep is dev-only and must leave it standing.
+        sandbox.dev_generation("3.2.116", &["yggterm-headless"], true);
+        sandbox.foreign_package_link("openai__codex", "0.160.0", "codex");
+        // An aux-dir link into a dev generation: reaping the generation must
+        // not leave it dangling behind.
+        let aux = sandbox.home.join(".local/bin");
+        fs::create_dir_all(&aux).unwrap();
+        std::os::unix::fs::symlink(gens.join("dev-2/bin/ynpx"), aux.join("ynpx")).unwrap();
+
+        let reaped = reap_orphan_yggterm_dev(&sandbox.paths());
+
+        assert!(!managed.join("ynpm").exists());
+        assert!(!managed.join("yggterm").exists());
+        assert!(!managed.join("ynpx").exists());
+        assert!(managed.join("yggterm-headless").exists());
+        assert!(managed.join("codex").exists());
+        assert!(!gens.join("dev-1").exists());
+        assert!(!gens.join("dev-2").exists());
+        assert!(gens.join("3.2.116").exists());
+        assert!(!aux.join("ynpx").exists());
+        assert!(reaped.iter().any(|item| item == "generation:dev-1"));
+        assert!(reaped.iter().any(|item| item == "generation:dev-2"));
+        // Idempotent: a second sweep over the healed tree reaps nothing.
+        assert!(reap_orphan_yggterm_dev(&sandbox.paths()).is_empty());
+    }
+
+    #[test]
+    fn a_live_dev_marker_shields_only_its_generation() {
+        let sandbox = ReapSandbox::new("live-marker");
+        let managed = sandbox.home.join(".yggterm/ynpm/bin");
+        let gens = sandbox.home.join(".yggterm/ynpm/generations/yggterm");
+        sandbox.dev_generation("dev-live", &["ynpm"], true);
+        sandbox.dev_generation("dev-old", &["ynpm-old-bin"], false);
+        sandbox.state_with_live_dev("dev-live");
+
+        let reaped = reap_orphan_yggterm_dev(&sandbox.paths());
+
+        assert!(managed.join("ynpm").exists());
+        assert!(gens.join("dev-live").exists());
+        assert!(!gens.join("dev-old").exists());
+        assert!(reaped.iter().any(|item| item == "generation:dev-old"));
+        assert!(!reaped.iter().any(|item| item.contains("dev-live")));
+    }
     use super::*;
 
     #[test]
