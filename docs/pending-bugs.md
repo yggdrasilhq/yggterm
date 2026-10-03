@@ -297,6 +297,65 @@ refused. Evidence: /tmp/11217-rig-home/ytrace.jsonl (dev), iteration-2
 window of the 5-iter run; the superseded trace now carries its arm
 diagnostics. Owner-GUI falsifier stays the close bar.
 
+UPDATE 2026-10-03 ~09:5x IST (posted-proof sitting; zcode on jojo, work
+FROM dev; lane/integration/11217-rearm-remount): THE SUPERSEDE-WITHOUT-
+SUCCESSOR DEATH, ROOT-CAUSED FROM THE ADDENDUM'S OWN TRACE AND FIXED —
+BOTH named directions were wrong-side; the real kill is upstream of both.
+Re-derived from /tmp/11217-rig-home/ytrace.jsonl (the focused never-painter
+0d38974d, creates 3-5): its mount fn ran to stage "posted" EVERY create
+(the [11.178]-c2 record, matched, via eval-return — 44 alive-shed polls at
+~500 ms cadence) but its `ready` post rode the SHED script-message leg, so
+`js_ready` NEVER landed (fired only at creates 1-2 in the whole trace — the
+smoking gun): no Reset, no read pump, a constructed-but-empty term, and the
+pane blank; each next create's lease claim then superseded the waiting task
+(`bootstrap_owner_superseded_during_loop`, drop
+terminal_mount_task_dropped{remount_armed:false}) and the loop repeated.
+The alive poll already HELD the ready proof over the one live wire and used
+it only to keep waiting. FIX, two arms (gemini-3.8-flash HIGH consult,
+verdicts applied — as-corrected): (a) THE POSTED PROOF COMPLETES THE
+HANDSHAKE — in the alive-poll branch, matched + stage "posted" + !js_ready
+now synthesizes the SAME init the bridge Ready event runs (factored into
+`terminal_stage_js_ready`; `source` names the wire on the js_ready trace):
+Reset + placeholder staging, `saw_warm_bridge_event=true` (the vanish gate
+is done — the mount's execution is proven), and for LOCAL rows only
+`mark_terminal_open_attempt_ready_for_session("warm_alive_posted_ready")`
+so the NEXT create's raise paths can serve (remote rows keep the bridge
+event as the ready witness — a DOM mount proves nothing about a remote
+attach handshake). The page-side resend keeps re-posting ready; when the
+IPC heals, the real event no-ops on the duplicate guard. (b) THE
+RETAINED-IN-PLACE RE-PARENT SERVES — the [11.215] probe's verdict 1 (the
+term already lives in this host) was treated as a REFUSAL: the candidate
+fell through to a fresh lease claim whose acquire SUPERSEDED the healthy
+read loop of the node-reused member (the supersede's source whenever the
+probe runs — the addendum's rig had 4× verdict-1 refusals). Verdict 1 now
+serves via the same redraw re-fit, latches ready
+("reparent_retained_host"), and carries `verdict` on the
+reparent_served trace. NOT taken (consult + measurement concur): arming
+remount on the superseded drop — it would bump the remount epoch on every
+healthy supersede (identity churn → self-inflicted remount storm). Law
+tests the_warm_alive_posted_proof_completes_the_ready_handshake +
+reparent_verdict_one_retained_in_place_serves_the_pane; shell 2203/2203.
+RIG (worktree GUI, /proc-exe-verified — see the rig gotcha addendum):
+uxprobe --actions split --iters 5 GREEN — BOTH members render_span 5/5
+(spans 517/524 cold-0, then 126-193 ms warm), both panes present with the
+pre-split marker single_line 4/5 (iter-0 cold miss, the known instrument
+gap), 0 rows left behind; the trace shows reparent_served{verdict:1} (the
+new serve) and ZERO bootstrap_owner_superseded_during_loop events (the
+pre-fix rig showed 4). Owner-GUI falsifier stays the close bar, ARMED for
+the next natural GUI session.
+
+⛔ RIG GOTCHA #2 (this sitting, two rig runs deep): the rig GUI can be
+swapped onto the PRODUCTION build MID-RUN even under
+`--skip-active-exec-handoff` — the worktree GUI's AUTO-UPDATER fires
+(`auto_update_install` → `restart_state_prepared_before_preserve_close` →
+a BARE relaunch, and the bare launch hands off per [11.220]; the
+app-clients build_commit then names the deployed build while /proc/<gui>
+/exe names the worktree — the witness disagreement IS the tell). EVERY
+rig must ALSO export YGGTERM_SKIP_SELF_UPDATE=1 (the Auto-policy gate,
+launch.rs) and YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1 (covers bare relaunches
+by any helper), and verify /proc/<gui-pid>/exe — build_commit alone
+cannot distinguish a worktree-dirty from a same-commit deploy.
+
 ## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
 
 **Status:** OPEN

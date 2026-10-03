@@ -71775,6 +71775,59 @@ mod web_surface_immersion_locks {
         }
     }
 
+    // ------------------------------------------------------------------
+    // [11.217] THE POSTED-PROOF READY COMPLETION + THE RETAINED-IN-PLACE
+    // SERVE. The never-painter death: the mount fn runs to stage "posted"
+    // but its ready post rides the shed IPC leg, so js_ready never lands —
+    // no Reset, no read pump, a constructed-but-empty term. The [11.178]-c2
+    // alive poll already holds the proof over the eval-return wire; these
+    // locks pin that the proof COMPLETES the handshake, and that a
+    // retained-in-place re-parent verdict serves instead of falling through
+    // to a lease claim that supersedes the healthy read loop.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_warm_alive_posted_proof_completes_the_ready_handshake() {
+        let viewport = include_str!("viewport.rs");
+        for needle in [
+            // The synthesis gate: matched + stage "posted" + not yet ready.
+            "let alive_stage_posted = record",
+            "== Some(\"posted\");",
+            "if matched && alive_stage_posted && !js_ready {",
+            // Both wires run the SAME factored init — a second spelling is
+            // how the arms drift.
+            "fn terminal_stage_js_ready(",
+            "\"warm_alive_posted\",",
+            "\"bridge_event\",",
+            // The mount's execution being proven ends the vanish-gate wait.
+            "saw_warm_bridge_event = true;",
+            // The attempt-ready latch is LOCAL-rows only (a remote attach
+            // handshake is not proven by a DOM mount).
+            "\"warm_alive_posted_ready\"",
+            "if !is_remote_resume_session {",
+        ] {
+            assert!(
+                viewport.contains(needle),
+                "the posted-proof ready completion lost a load-bearing wire: {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reparent_verdict_one_retained_in_place_serves_the_pane() {
+        let viewport = include_str!("viewport.rs");
+        assert!(
+            viewport.contains("if verdict == Some(1) || verdict == Some(2) {"),
+            "a retained-in-place verdict (1) must SERVE via the redraw's re-fit — \
+             treating it as a refusal falls through to a lease claim that \
+             supersedes the healthy read loop"
+        );
+        assert!(
+            viewport.contains("\"reparent_served\""),
+            "the served arm must still latch + trace"
+        );
+    }
+
     #[test]
     fn the_reveal_stamp_reports_paint_truth_without_reinitializing_xterm() {
         let script = terminal_reveal_stamp_script("local://stamp-test", "host-id-stamp-test");

@@ -5719,7 +5719,14 @@ fn TerminalCanvas(
                     sleep(Duration::from_millis(50)).await;
                 }
                 let mut served = false;
-                if verdict == Some(2) {
+                // [11.217] Verdict 1 (retained-in-place: the term already
+                // lives inside this host) SERVES too — the pane still needs
+                // the redraw's re-fit for the new split geometry. Treating it
+                // as a refusal fell through to a fresh lease claim, and the
+                // claim superseded the healthy read loop of the member whose
+                // node was reused (the never-painter's supersede source on
+                // the merged-state rig).
+                if verdict == Some(1) || verdict == Some(2) {
                     served = document::eval(&terminal_reparent_raise_script(
                         &host_id,
                         reparent_focus,
@@ -5748,15 +5755,17 @@ fn TerminalCanvas(
                             "mount_identity": reparent_mount_identity,
                             "open_request_id": reparent_open_request_id,
                             "focus": reparent_focus,
+                            "verdict": verdict,
                         }),
                     );
                     return;
                 }
-                // REFUSED (no live entry, husk, retained-in-place, or the
-                // redraw declined): re-arm the candidate so the next render
-                // takes the bootstrap path. Guarded on the key -- a NEWER
-                // open request that already re-armed the latch must never
-                // be clobbered by this older probe's refusal.
+                // REFUSED (no live entry, a husk, or the redraw declined —
+                // retained-in-place now serves above): re-arm the candidate
+                // so the next render takes the bootstrap path. Guarded on
+                // the key -- a NEWER open request that already re-armed the
+                // latch must never be clobbered by this older probe's
+                // refusal.
                 if *task_latch.borrow() == probe_key {
                     *task_latch.borrow_mut() = String::new();
                 }
@@ -7486,88 +7495,27 @@ fn TerminalCanvas(
                                     continue;
                                 }
                                 js_ready = true;
-                                append_trace_event(
+                                // [11.217] The Ready init is factored so the
+                                // bridge event and the warm-eval alive-poll
+                                // proof run the SAME completion — a second
+                                // spelling is how the two arms drift.
+                                terminal_stage_js_ready(
+                                    &eval,
+                                    &session_path,
+                                    &host_id,
+                                    &title,
+                                    &theme,
+                                    placeholder.clone(),
+                                    &mut placeholder_rendered,
+                                    cursor,
+                                    is_remote_resume_session,
                                     &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "js_ready",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "host_id": host_id.clone(),
-                                    }),
+                                    terminal_resume_overlay_excerpt,
+                                    terminal_resume_surface_staged,
+                                    terminal_has_meaningful_output,
+                                    terminal_prompt_only,
+                                    "bridge_event",
                                 );
-                                let _ = eval.send(TerminalJsCommand::Reset {
-                                    title: title.clone(),
-                                    background: theme.background.clone(),
-                                    foreground: theme.foreground.clone(),
-                                    cursor: theme.cursor.clone(),
-                                    cursor_muted: terminal_cursor_muted(&theme),
-                                    cursor_text: terminal_cursor_text(&theme),
-                                    input_line_background: terminal_input_line_background(&theme),
-                                    input_line_border: terminal_input_line_border(&theme),
-                                    dim_foreground: terminal_dim_foreground(&theme),
-                                    selection: theme.selection.clone(),
-                                    black: theme.black.clone(),
-                                    red: theme.red.clone(),
-                                    green: theme.green.clone(),
-                                    yellow: theme.yellow.clone(),
-                                    blue: theme.blue.clone(),
-                                    magenta: theme.magenta.clone(),
-                                    cyan: theme.cyan.clone(),
-                                    white: theme.white.clone(),
-                                    bright_black: theme.bright_black.clone(),
-                                    bright_red: theme.bright_red.clone(),
-                                    bright_green: theme.bright_green.clone(),
-                                    bright_yellow: theme.bright_yellow.clone(),
-                                    bright_blue: theme.bright_blue.clone(),
-                                    bright_magenta: theme.bright_magenta.clone(),
-                                    bright_cyan: theme.bright_cyan.clone(),
-                                    bright_white: theme.bright_white.clone(),
-                                    font_family: TERMINAL_FONT_FAMILY.to_string(),
-                                    font_weight: terminal_font_weight(&theme),
-                                    font_weight_bold: terminal_font_weight_bold(&theme),
-                                    line_height: terminal_font_line_height(&theme),
-                                    minimum_contrast_ratio: terminal_minimum_contrast_ratio(&theme),
-                                    font_size: theme.font_size,
-                                });
-                                if !placeholder_rendered
-                                    && let Some(data) = placeholder.clone()
-                                    && (is_remote_resume_session || terminal_prefill_should_render_to_host(&data))
-                                {
-                                    if let Some(excerpt) =
-                                        terminal_resume_output_excerpt(&data)
-                                    {
-                                        set_signal_if_changed(
-                                            terminal_resume_overlay_excerpt,
-                                            Some(excerpt),
-                                        );
-                                    }
-                                    append_trace_event(
-                                        &trace_home,
-                                        "ui",
-                                        "terminal_mount",
-                                        "placeholder_stage",
-                                        json!({
-                                            "session_path": session_path.clone(),
-                                            "cursor": cursor,
-                                            "bytes": data.len(),
-                                            "render_to_host": true,
-                                            "source": "js_ready",
-                                        }),
-                                    );
-                                    let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
-                                    set_signal_if_changed(terminal_resume_surface_staged, true);
-                                    if !is_remote_resume_session {
-                                        set_signal_if_changed(
-                                            terminal_has_meaningful_output,
-                                            true,
-                                        );
-                                        set_signal_if_changed(terminal_prompt_only, false);
-                                    }
-                                    placeholder_rendered = true;
-                                } else if is_remote_resume_session {
-                                    set_signal_if_changed(terminal_resume_surface_staged, false);
-                                }
                             }
                             Ok(TerminalJsEvent::OpenUrl { url }) => {
                                 // User bug 6: a clicked terminal link (OSC-8 or
@@ -11851,6 +11799,63 @@ fn TerminalCanvas(
                                 "waited_ms": current_millis().saturating_sub(warm_gate_t0_ms),
                             }),
                         );
+                        // [11.217] THE POSTED PROOF COMPLETES THE READY
+                        // HANDSHAKE. `matched` with stage "posted" proves —
+                        // over the eval-return wire, the one leg alive through
+                        // the shed window — that the mount fn ran to completion
+                        // and posted ready. The post itself rides the dead IPC
+                        // leg, so js_ready would never land: no Reset, no read
+                        // pump, a constructed-but-empty term, and the pane
+                        // blank until some unrelated trigger (the never-painter
+                        // death measured on the split rig, creates 3-5).
+                        // Synthesize the SAME init the bridge Ready event
+                        // runs; the page-side resend arm keeps re-posting
+                        // ready, and when the IPC leg heals the real event
+                        // no-ops on the duplicate guard.
+                        let alive_stage_posted = record
+                            .and_then(|r| r.get("stage"))
+                            .and_then(|stage| stage.as_str())
+                            == Some("posted");
+                        if matched && alive_stage_posted && !js_ready {
+                            js_ready = true;
+                            terminal_stage_js_ready(
+                                &eval,
+                                &session_path,
+                                &host_id,
+                                &title,
+                                &theme,
+                                placeholder.clone(),
+                                &mut placeholder_rendered,
+                                cursor,
+                                is_remote_resume_session,
+                                &trace_home,
+                                terminal_resume_overlay_excerpt,
+                                terminal_resume_surface_staged,
+                                terminal_has_meaningful_output,
+                                terminal_prompt_only,
+                                "warm_alive_posted",
+                            );
+                            // The mount's execution is proven; the vanish
+                            // gate has nothing left to wait for.
+                            saw_warm_bridge_event = true;
+                            warm_gate_deadline = None;
+                            // LOCAL rows only: the DOM proof says nothing
+                            // about a remote attach handshake, and an early
+                            // was_ever_ready latch would poison the remote
+                            // recovery machinery.
+                            if !is_remote_resume_session {
+                                let _ = safe_shell_mut(
+                                    state,
+                                    "warm_alive_posted_ready",
+                                    |shell| {
+                                        shell.mark_terminal_open_attempt_ready_for_session(
+                                            &session_path,
+                                            "warm_alive_posted_ready",
+                                        )
+                                    },
+                                );
+                            }
+                        }
                     }
                     _ = tokio::time::sleep_until(
                         warm_gate_deadline
@@ -20728,6 +20733,73 @@ fn terminal_identity_color_profile_from_theme(
             theme.bright_cyan.clone(),
             theme.bright_white.clone(),
         ],
+    }
+}
+/// [11.217] The js_ready completion, factored so the bridge Ready event and
+/// the warm-eval alive-poll proof (matched + stage "posted", the [11.178]-c2
+/// poll) run the SAME init — a second spelling is how the two arms drift
+/// apart. The caller owns the `js_ready` flag and its duplicate guard; this
+/// stages the trace, the Reset command, and the resume-placeholder block.
+/// `source` names the wire that served the completion on the js_ready trace
+/// ("bridge_event" | "warm_alive_posted").
+fn terminal_stage_js_ready(
+    eval: &dioxus::document::Eval,
+    session_path: &str,
+    host_id: &str,
+    title: &str,
+    theme: &TerminalTheme,
+    placeholder: Option<String>,
+    placeholder_rendered: &mut bool,
+    cursor: u64,
+    is_remote_resume_session: bool,
+    trace_home: &std::path::Path,
+    terminal_resume_overlay_excerpt: Signal<Option<String>>,
+    terminal_resume_surface_staged: Signal<bool>,
+    terminal_has_meaningful_output: Signal<bool>,
+    terminal_prompt_only: Signal<bool>,
+    source: &'static str,
+) {
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_mount",
+        "js_ready",
+        json!({
+            "session_path": session_path,
+            "host_id": host_id,
+            "source": source,
+        }),
+    );
+    let _ = eval.send(terminal_reset_command(title, theme));
+    if !*placeholder_rendered
+        && let Some(data) = placeholder
+        && (is_remote_resume_session || terminal_prefill_should_render_to_host(&data))
+    {
+        if let Some(excerpt) = terminal_resume_output_excerpt(&data) {
+            set_signal_if_changed(terminal_resume_overlay_excerpt, Some(excerpt));
+        }
+        append_trace_event(
+            trace_home,
+            "ui",
+            "terminal_mount",
+            "placeholder_stage",
+            json!({
+                "session_path": session_path,
+                "cursor": cursor,
+                "bytes": data.len(),
+                "render_to_host": true,
+                "source": source,
+            }),
+        );
+        let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
+        set_signal_if_changed(terminal_resume_surface_staged, true);
+        if !is_remote_resume_session {
+            set_signal_if_changed(terminal_has_meaningful_output, true);
+            set_signal_if_changed(terminal_prompt_only, false);
+        }
+        *placeholder_rendered = true;
+    } else if is_remote_resume_session {
+        set_signal_if_changed(terminal_resume_surface_staged, false);
     }
 }
 fn terminal_reset_command(title: &str, theme: &TerminalTheme) -> TerminalJsCommand {
