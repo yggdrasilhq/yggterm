@@ -90,3 +90,24 @@ nine days until the [11.144] seat ran the suites on clean main.
 - Stamp comment for the new constants: re-cut for 3.2.113 retroactively
   covering 85a5ac5a (configured_extra_args on the Codex daemon-runtime
   twins, serde(default)+Option, both-direction safe — this document).
+
+
+## Addendum — a second intentional field, [11.214] (2026-10-03)
+
+`lane/integration/11214-delta-focus` adds ONE serde-defaulted field to ONE
+variant, in the exact 85a5ac5a shape the audit above validated:
+
+- `FocusLive` gained `#[serde(default)] light: bool`
+
+Serde audit, same test in-tree (`focus_live_light_field_is_old_peer_safe`):
+
+- OLD daemon reads NEW client bytes: `light` is an unknown FIELD on a known
+  struct variant; the enum has no `deny_unknown_fields` — safely ignored,
+  the old daemon answers its snapshot and the new client falls back to
+  today's behavior by design.
+- NEW daemon reads OLD client bytes: field absent → `serde(default)` →
+  `false` → the full persist + snapshot answer, byte-identical to
+  pre-[11.214] semantics.
+
+The computed enum hash changes (it is already red on main from 85a5ac5a);
+the pending owner-GO re-stamp covers both fields when it lands.
