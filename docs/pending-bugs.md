@@ -103,6 +103,55 @@ scenario stays honestly RED until it lands. LIVE PROOF OWED: after
 deploy, a fresh-cwd UNMOUNTED agy row on dev must paint the gate (not
 zero-paint), and the probe must fail it as `[startup_gate painted…]`.
 
+## ⛔ [11.227] ygg-ci LOGGED pushed=True AND DEPLOYED A MERGE origin/main NEVER RECEIVED — THE SUBSCRIPTION WAS THEN AUTO-UNSUBSCRIBED ON LOCAL TRUTH, AND THE FLEET RAN BUILT BITS NO REFERENCE ON origin/main POINTED AT (measured 2026-10-03 23:30-23:4x IST, dev ci.log + git)
+
+**Status:** OPEN
+
+Filed 2026-10-03 ~23:4x IST by the proof-collection seat (zcode on jojo,
+work FROM dev). Found landing the [11.224] falsifier-note lane.
+
+THE MEASURED CHAIN (dev, ci.log + git state):
+- 23:30:39 — the first integration of lane/integration/11224-falsifier-note
+  FAILED: gate check-docs-ssot.sh overrun (killed at 1800 s), "integration
+  failed — main reset to 08c50ee45c2d". The merge commit 4f80c66d1644 was
+  already built and recorded.
+- 23:35:10-23:36:49 — the retry INTEGRATED the same merge (same sha),
+  PASSED the same gate that had just blown 30 minutes (the gate's runtime
+  is wildly variable — 2x measured at ~5 min, 16 min, and one 30-min
+  overrun; dream ACK-a8a9eec7c3), DEPLOYED it (hosts ran 4f80c66d bits),
+  logged "pushed=True", then auto-unsubscribed the lane "already in main".
+- AT CLOSE: origin/main = 08c50ee4 (the push NEVER landed), local main
+  checkout = 08c50ee4 (never moved), 4f80c66d a dangling object. The
+  auto-unsubscribe's "already in main" consulted a truth the remote
+  contradicts; the stranded lane tip was nearly lost with its remote
+  branch deleted in good faith by a seat that read "pushed=True".
+- CONSEQUENCE: the deployed binary identity had NO commit on origin/main
+  describing it — the class the [11.15] build-identity deploy gate exists
+  to kill; a lane can be silently consumed without landing.
+
+ROOT CAUSE CAUGHT SAME SITTING (23:55 IST): TWO WATCHERS WERE CONCURRENTLY
+ALIVE — pid 343080 (born 23:30:15, at the failure moment) and pid 393738
+(born 23:40:21, spawned by a subscribe that read the long-gate-staled
+heartbeat as "no watcher"). A second watcher integrating from a pre-merge
+view is sufficient to produce the whole paradox: A merges + pushes +
+deploys, B resets main to its older base and rewrites it, A's merge is
+orphaned while its bits are live. The rogue was killed 23:5x (between
+ticks, no children); the pid-file watcher (393738) is sole since.
+
+FALSIFIER: subscribe a lane, force a gate overrun or spawn a second
+watcher during a long gate, observe attempt 2: "pushed=True" in ci.log
+while `git ls-remote origin main` answers the pre-merge sha.
+
+WHAT IT WANTS: (a) the push step must VERIFY (ls-remote read-back after
+push; a failed verification is a FAILED integration, never pushed=True);
+(b) the auto-unsubscribe "already in main" check must consult
+origin/main, not local refs; (c) a deploy whose push did not verify must
+not record status=deployed; (d) single-instance spawn guard that checks
+for a LIVE pid, not a heartbeat age (a watcher mid-30-minute gate cannot
+heartbeat and must not read as dead); (e) monotonic main — the reset step
+must never move main BACKWARD past a sha another watcher pushed (fetch +
+verify before reset).
+
 ## ⛔ [11.224] `mimo upgrade` NEVER COMPLETES — EVERY SCHEDULED MANAGED-CLI REFRESH HANGS ITS 900 s MIMO STEP AND IS DEADLINE-KILLED (26/26 WALKS SINCE ≥09-29), `devin update` EXITS 130 ON EVERY WALK, AND ORPHANED MIMO UPGRADES ESCAPE THE KILL FOREVER — THE REFRESH NEVER CONVERGES AND ITS LOCK HOLDS PIN EVERY CONCURRENT ENSURE (measured 2026-10-03, dev trace gen g1791022605539 + live /proc evidence)
 
 **Status:** OPEN
