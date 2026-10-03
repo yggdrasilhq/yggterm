@@ -94,9 +94,12 @@ REFUSAL_WORDS = (
     "terminal session not found",
 )
 CLI_MARKERS = (
-    "Antigravity CLI",
     "? for shortcuts",  # the composer footer — the signed-in TUI
     "Google AI",  # the welcome header's account line
+    # [11.226] "Antigravity CLI" was REMOVED: agy 1.2.16's folder-trust
+    # gate paints that string ("Antigravity CLI requires permission…"),
+    # so the marker read a GATED row as a signed-in TUI — every agy
+    # "connected" PASS of 2026-10-03 evening was the gate, not the CLI.
 )
 
 
@@ -169,9 +172,16 @@ class Scenario:
         return self
 
 
+ANSI_RE = re.compile(r"\[[0-9;?]*[a-zA-Z]|\][^]*|[>=][0-9;?]*[a-zA-Z]?")
+
 def screen(key, timeout=30):
     answer = yggterm(["terminal", "screen", key], timeout=timeout)
-    return answer.stdout if answer.returncode == 0 else ""
+    if answer.returncode != 0:
+        return ""
+    # [11.226] the raw terminal buffer carries escapes that can split a
+    # marker mid-sentence (agy gates bold words in place); match on the
+    # stripped text, report the raw tail as before.
+    return ANSI_RE.sub("", answer.stdout)
 
 
 def screen_ok(key):
@@ -184,6 +194,13 @@ def screen_ok(key):
     for marker in CLI_MARKERS:
         if marker in text:
             return True, text
+    # [11.226] a row parked at a startup gate has NOT connected, and it
+    # must read as a refusal (the False verdict prints the text HEAD, so
+    # the named gate is visible in the scenario output; a None verdict's
+    # timeout message prints only the tail and hides it). The gate's own
+    # signature line is the witness.
+    if "Do you trust the contents of this project" in text:
+        return False, "[startup_gate painted — row is at a trust gate, not connected] " + text
     return None, text
 
 

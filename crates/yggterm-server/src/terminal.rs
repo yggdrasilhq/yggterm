@@ -506,6 +506,7 @@ impl TerminalProtocolFilter {
         //   ESC[6n  -> CPR (cursor position report) -> ESC[row;colR (1-based)
         //   ESC[5n  -> DSR status -> ESC[0n (ready)
         //   ESC[c / ESC[0c -> DA primary -> ESC[?1;2c (VT100)
+        //   ESC[>c / ESC[>0c -> DA secondary -> ESC[>0;277;0c (xterm.js parity)
         let osc_visible = visible;
         let mut filtered_visible = String::with_capacity(osc_visible.len());
         let mut i = 0usize;
@@ -534,6 +535,16 @@ impl TerminalProtocolFilter {
                     // DA - device attributes (primary)
                     if seq == "\u{1b}[c" || seq == "\u{1b}[0c" {
                         responses.push("\u{1b}[?1;2c".to_string());
+                        i = seq_end;
+                        continue;
+                    }
+                    // DA2 - secondary device attributes. A mounted viewport's
+                    // xterm.js answers `ESC[>0;277;0c`; the daemon answers the
+                    // same so an UNMOUNTED row's startup handshake cannot wedge
+                    // (agy 1.2.16 gates its whole TUI on this query and painted
+                    // nothing at all on a row nobody answered — [11.226]).
+                    if seq == "\u{1b}[>c" || seq == "\u{1b}[>0c" {
+                        responses.push("\u{1b}[>0;277;0c".to_string());
                         i = seq_end;
                         continue;
                     }
@@ -7415,6 +7426,32 @@ line-two on the real screen\r\n\
         );
         assert_eq!(flush_terminal_utf8_pending(&mut pending), "\u{fffd}");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn terminal_protocol_filter_answers_secondary_da_queries() {
+        // agy 1.2.16 gates its entire TUI startup on DA2: on an unmounted row
+        // nothing answered `ESC[>c` and the CLI painted nothing for 150 s+
+        // (the [11.226] dev zero-paint). A mounted viewport's xterm.js answers
+        // `ESC[>0;277;0c`; the daemon must answer the same.
+        let profile = test_protocol_profile("agy");
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process("q\u{1b}[>c", profile);
+        assert_eq!(result.data, "q");
+        assert_eq!(result.responses, vec!["\u{1b}[>0;277;0c".to_string()]);
+
+        // The parameterised form answers identically, and the whole DA family
+        // stays filtered out of the visible stream.
+        let result = filter.process("\u{1b}[>0c\u{1b}[c", profile);
+        assert_eq!(result.data, "");
+        assert_eq!(
+            result.responses,
+            vec![
+                "\u{1b}[>0;277;0c".to_string(),
+                "\u{1b}[?1;2c".to_string(),
+            ]
+        );
     }
 
     #[test]
