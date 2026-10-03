@@ -75,6 +75,52 @@ of 15 min × every walk). Until one lands, the fleet pays a ≥15-min toolchain
 write-lock every refresh cycle and any agy/kimi/muse row born in that window
 goes amber/blank.
 
+UPDATE 2026-10-03 ~20:0x IST (root-cause sitting; zcode on jojo, work FROM
+dev; board ACK-bdf73d5680): BOTH ROOT CAUSES MEASURED.
+
+**(1) mimo: `mimo upgrade` ALWAYS paints an interactive "Install anyways?"
+confirmation** — strace-from-birth + stdout capture (`timeout 90`, rc 124):
+the CLI prints "mimocode is installed to …/ynpm/generations/mimo-ai__cli/
+0.1.15/… and may be managed by a package manager" then a ○Yes/●No radio
+prompt and waits. The generation path always looks package-manager-managed,
+so the prompt fires on EVERY upgrade — not an auth screen, not a dead
+endpoint. `mimo upgrade --help` carries NO non-interactive flag (--print-logs/
+--log-level/--pure/-m method only). Piping an Enter (default ●No, no install
+side effect) DOES NOT SATISFY it — rc 124 again — it is a raw-mode/tty-key
+prompt, so NO non-TTY context (the scheduled walk, a pipe, /dev/null) can
+ever answer it. The walk can never converge; 26/26 is deterministic. The
+only keep-mimo shapes are upstream (a --yes flag) or possibly `-m curl`
+bypassing the detection (UNTESTED — it would install, a side effect this
+sitting declined; note mimo self-upgrading out of the generation plane is
+the [11.175] kimi drift class — an owner call).
+
+**(2) devin: `devin update` exits ITSELF with 130, silently, every run** —
+hand repro rc=130 with EMPTY stdout/stderr; strace shows interface-MAC
+reads, two TLS connects to a GCP endpoint (35.223.238.178), then
+`exit_group(130)` — a self-chosen exit code, not a signal kill. Auth is
+HEALTHY (`devin auth status`: logged in). It is devin's own closed-source
+bug; it fails in ~1s so it adds no lock window — after the mimo fix it is
+cosmetic walk noise.
+
+**(3) THE LOCK-WINDOW LAW DEFECT (measured in source): the [11.182] failure
+backoff CANNOT fulfill its own contract.** The constant's doc says it
+"starve[s] a permanently-wedged upgrader out of every walk", but
+MANAGED_CLI_TOOL_FAILURE_BACKOFF_MS = 30 min < the walk cadence (TTL 2h,
+observed hourly) — the backoff always expires before the next walk, so a
+deterministically-wedged tool rides every walk forever. FIXED IN CODE this
+sitting (lane/integration/11224-backoff-escalation): the backoff now
+DOUBLES per consecutive failure of that tool (30m → 1h → … capped at 24h),
+`failure_streaks` persisted beside `failed_at_ms`; a tool's OWN success
+resets its own streak (the old law cleared only on a fully-clean walk,
+which a wedged sibling makes impossible — a recovered tool would have
+escalated forever). Amber-treadmill suite green incl. the new escalation
+law test; full server-lib 1660/0. FALSIFIER for the fix: after deploy, the
+next scheduled walks trace `managed_cli_tool_backoff_skip` for mimo with a
+growing remaining_ms, mimo's 900s deadline kills STOP, and a mimo retry
+happens at most once a day. Owner shapes (a)/(b)/(c) above REMAIN OPEN
+CHOICES — the escalation is the general law's repair, orthogonal to them
+((a) would still kill the daily retry, (b) still covers the orphan gap).
+
 ## ⛔ [11.225] THE 17:03 DEPLOY RETIRED DEV'S LIVE DAEMON BIND LOCK WITHOUT A SUCCESSOR — THE SERVING DAEMON IS NOW LOCKLESS, THE [11.159] ACCEPT ARM CANNOT FIRE, AND EVERY SPAWN-CARRYING VERB ON DEV FAILS "local yggterm daemon did not become reachable" WHILE READS KEEP WORKING (measured live 2026-10-03 17:44-18:2x IST; spawn plane dead ~90 min and counting)
 
 **Status:** OPEN
