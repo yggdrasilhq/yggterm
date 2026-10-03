@@ -31722,75 +31722,6 @@ override via `YGGTERM_DAEMON_IDLE_SHUTDOWN_MS` on row-heavy hosts
 (config, no code); (d) shorter default with the dying-rows ledger write
 as the only persistence (today's behavior). Owner GO pending.
 
-## ⛔ [11.145] MAIN'S TEST SUITE CARRIES 21 PRE-EXISTING REDS, ONE OF THEM A SELF-GATE — THE PROTOCOL SHAPE STAMP (the ServerRequest/ServerResponse wire source drifted after 3.2.78 and shipped without a re-stamp) — the SECOND self-gate, the reconcile-fetch starvation lock, FIXED 2026-09-19 (lane/integration/11145-starvation-lock, see below) — the stamp SELF-GATE now INVENTORIED 2026-09-19: the drift is ONE commit (85a5ac5a, serde-defaulted both directions, old-peer safe), re-stamp recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md, owner GO pending — ygg-ci runs check-only by design, so the suite bar is every seat's job, and every seat since the drift inherited a lying baseline (measured 2026-09-19, lane/integration/oc208-1144-inputcheck: clean main eb77c32a vs the lane, failure sets IDENTICAL) — BOTH SWEEPS LANDED 2026-09-19 (server leg lane/integration/11145-reds, shell leg lane/integration/11145-shell-reds): 19 of the 21 die with named causes, shell is 2147/0; the remainder is the stamp (owner GO) — the [11.54] install-promote red was closed 2026-10-03 (lane/integration/1154-hermetic-promote: the promote env override is authoritative when set, the test hermetic on live-install hosts)
-
-**Status:** AWAITING A DECISION
-
-The [11.144] input-check lane ran the full yggterm-server and yggterm-shell
-suites on CLEAN MAIN (eb77c32a) and on the lane before claiming anything:
-the two failure sets are identical — 11 server + 11 shell, none of them the
-lane's. Two of the original 22 were gates, not tests (one since fixed):
-
-- `daemon::tests::protocol_shape_stamp_forces_version_bump` computes
-  0x2363fb2b0c9e7582 against STAMPED_AT_VERSION 3.2.78 / hash
-  0x74843ba79da0f1fa — the wire enums drifted post-3.2.78 and no seat
-  re-stamped; serde(default) kept old peers alive, which is why nothing
-  broke loudly. The wire-shape gate is currently decorative. The honest
-  repair needs the drift inventory (which commits touched the enums; each
-  field serde(default)-guarded?) and a re-stamp at the shipped version —
-  the wire contract owner's call, deliberately not taken as a drive-by.
-  **INVENTORY LANDED 2026-09-19**
-  ([docs/protocol-shape-stamp-drift-2026-09-19.md](protocol-shape-stamp-drift-2026-09-19.md),
-  lane/integration/11145-stamp-inventory): the ENTIRE drift is ONE commit —
-  85a5ac5a (2026-09-10, forward Codex flags through remote wrapper) added
-  `#[serde(default)] configured_extra_args: Option<String>` to the
-  `EnsureRemoteRuntimeCodexSession` + `StartRemoteRuntimeCodexSession`
-  request twins (the AgentSession twins already had the field AT the stamp;
-  `ServerResponse` byte-identical; shape stable at 0x2363fb2b0c9e7582 across
-  the seven release bumps since). serde audit: unknown-field-ignore both
-  directions (no `deny_unknown_fields` on the enum), old peers safe, the
-  latch-storm class does NOT apply — damage was a decorative gate + lying
-  baseline for nine days, not a compat break. Re-stamp recipe staged:
-  `STAMPED_AT_VERSION="3.2.113"`, `STAMPED_SHAPE_HASH=0x2363fb2b0c9e7582`,
-  no Cargo bump needed (shape stable since 85a5ac5a; invariant
-  stamped <= current holds at equality) — ONE owner GO away from green.
-  Scope note: the gate hashes ONLY the two enum blocks in daemon.rs; wire
-  shapes living elsewhere are invisible to it.
-- FIXED 2026-09-19 (lane/integration/11145-starvation-lock, a zcode seat on
-  the muse lab host, work FROM dev): `the_reconcile_fetch_is_dispatched_
-  off_the_select_loop` pinned `screen_reconcile_decision(` inside
-  include_str!("viewport.rs"), but 3d1ef1b0 (fix(terminal): honor screen
-  reconcile deadline, Sep 10) moved the decision fn to state.rs and renamed
-  the apply-branch call site to `screen_reconcile_apply_decision(` — the
-  needle was dead in viewport.rs and the lock red-on-main since. The needle
-  now pins the current literal; the invariant is unchanged (the apply branch
-  routes the never-repaint-a-working-surface decision, traces failed
-  fetches, releases the in-flight latch). Lock green on the lane; the
-  remaining red set unchanged.
-
-The other 20, verbatim for their owners: server —
-a_forced_same_version_handoff_is_never_deferred, a_symlink_to_our_own_
-socket_is_self_not_a_peer (known environment-sensitive since 2026-09-11),
-a_local_row_of_a_cli_with_no_measured_reader_says_so,
-no_live_agent_row_is_refused_by_both_title_chores_without_saying_so,
-remote_store_title_poll_selects_working_and_unconfirmed_rows, an_anchor_
-without_a_viewing_stamp_still_degrades_instead_of_resuming_a_phantom,
-a_reparented_agent_is_still_ours_by_its_own_environment, a_stampless_
-anchor_resumes_the_newest_store_session_for_its_cwd, the_argv_identity_
-walk_reads_a_live_tuis_own_cmdline, title_follow_reads_the_persisted_
-records_the_audit_reads. shell — every_registered_cli_has_both_shell_arms,
-every_shellstate_write_goes_through_a_counted_wrapper,
-no_uncounted_raw_write_to_shell_state_survives_in_this_file,
-supports_generated_session_copy_accepts_local_stored_session_paths,
-the_markdown_adapter_owns_no_typography_of_its_own,
-the_chrome_gate_is_fed_by_the_engine_and_worn_by_every_surface,
-the_placement_rule_is_wired_to_the_reconciler_and_the_render,
-the_reclaim_pass_call_site_is_wired_to_the_live_machine,
-the_reconcile_loop_still_sweeps_surfaces_whose_row_was_closed_elsewhere,
-a_menu_heading_says_only_what_the_row_underneath_it_cannot.
-
-RE-INVENTORIED 2026-09-27 (suite-honesty lane, zcode GLM seat on the muse lab host, work FROM dev; lane/integration/suite-load-flicker): clean main 57cfd4d0 runs the server-lib suite at 1596 pass / 1 red — THE ONLY REMAINING RED IS THE STAMP SELF-GATE below (3 ignored). The env-sensitive restored_opencode red is FIXED (e76fa55c, the `_in` home seam). The load-flicker class the [11.168] leg-2/leg-3 updates named (a_row_whose_launch_process_died_stops_reading_as_idle, a_row_dropped_from_the_state_file_leaves_a_record_saying_so, a_rebound_muse_row_resumes_the_real_session_across_a_restart, local_cc_relaunch_rebuild_collapses_poisoned_identity_to_row_id) is ROOT-CAUSED as the declared process-global env cross-talk this gate's own doc has carried since 2026-08-21 — REPRODUCED on clean main with a 16-thread collision run of the mutator set (two unlocked YGGTERM_HOME setters red; the same set green in isolation) and MITIGATED in the same lane: the lock is renamed `declared_env_test_lock` and is now held for the whole body by every declared-env mutator test (YGGTERM_HOME x8, CODEX_HOME x8, YGGTERM_APP_CONTROL_* x1) plus the known reader-victims; the collision instrument reads 30/30 green post-fix. Threading the `_in` seams (removing variables from DECLARED) remains the only complete fix — named next-seat work. What this entry still guards is THE STAMP RE-STAMP: owner GO pending, drift is ONE commit (85a5ac5a), recipe staged in docs/protocol-shape-stamp-drift-2026-09-19.md — hence AWAITING A DECISION.
-
 ## ⛔ [11.149] THE BIND-VERDICT CHECK'S DATA SOURCE IS DEAD ON PRODUCTION 2.0.x — THE CLIENT-SIDE `tabs.json` IS NEVER PERSISTED (NOT ON LAUNCH, NOT ON TURNS, NOT ON A GRACEFUL `/exit`), SO `opencode_bind_verified`/`opencode_bind_diverged` CAN NEVER FIRE AND EVERY TICK RETRIES `Unknown` SILENTLY (measured live 2026-09-19, the muse lab host, lane/integration/oc-bind-proof; claim ACK-ac4fedcd57)
 
 **Status:** OPEN
@@ -31998,7 +31929,7 @@ dark → assert the row's command turns 15;0") is rewritten to the carry law.
 STILL OPEN (fix directions): (a) BIRTH-TIME PER-CLIENT IDENTITY — a row born
 while a foreign theme holds the global still inherits it; spawn/ensure
 requests should carry the spawning client's profile (wire-additive,
-serde-default — rides the [11.145] re-stamp, owner GO pending) and the peer
+serde-default — the [11.145] re-stamp precedent LANDED: re-cut at 3.2.115 by d8a4ec88, again at 3.2.116 by [11.214]) and the peer
 daemon should stamp the runtime with it, covering the peer-side managed spawn
 (`ManagedLauncher::shell_exports` still reads the peer global);
 (b) `initial_server_sync` sends appearance-ONLY — it should carry the client
@@ -32024,7 +31955,7 @@ allow it on alternate/hot, suppress it on a cold normal buffer); with (d)
 answered daemon-side, the cold normal-buffer residue for OSC 4 is closed, and
 OSC 10/11 were always daemon-answered for daemon-read rows. No remaining
 frontend gap identified for daemon-read rows; (a)/(b) stay owner-gated on the
-[11.145] re-stamp GO. Falsifier for (d) on the deployed build: a CLI querying
+wire-shape precedent (the [11.145] re-stamp landed at 3.2.115; [11.145] closed 2026-10-03 — zero reds on main, the semantic call alone remains). Falsifier for (d) on the deployed build: a CLI querying
 `ESC]4;196;?` on a NORMAL-buffer row receives `rgb:ffff/0000/0000` in-band
 (trace `protocol_color_response_sent` carrying `4:196`), not silence.
 
