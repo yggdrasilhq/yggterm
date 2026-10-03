@@ -1753,11 +1753,30 @@ impl TerminalManager {
     }
 
     pub fn write(&self, key: &str, data: &str) -> Result<()> {
+        self.write_with_provenance(key, data, false)
+    }
+
+    /// [`Self::write`] carrying the caller's provenance — `programmatic` is
+    /// the `refuse_if_draft` mark off the wire ([11.223]).
+    pub fn write_with_provenance(
+        &self,
+        key: &str,
+        data: &str,
+        programmatic: bool,
+    ) -> Result<()> {
         let session = self
             .sessions
             .get(key)
             .with_context(|| format!("terminal session not found: {key}"))?;
-        session.write(data)
+        session.write_with_provenance(data, programmatic)
+    }
+
+    /// [11.223] Is the walk line's standing content entirely programmatic?
+    /// `None` = no such session here — a proxying daemon must not decide.
+    pub fn session_pending_line_is_programmatic_only(&self, key: &str) -> Option<bool> {
+        self.sessions
+            .get(key)
+            .map(|session| session.pending_line_is_programmatic_only())
     }
 
     /// Write text THIS DAEMON authored — a readiness probe, its line-clear, or a
@@ -1800,7 +1819,10 @@ impl TerminalManager {
                 return Ok(PromptSubmitOutcome::NoSession);
             };
             if is_ready(&screen) {
-                self.write(key, data)?;
+                // [11.223] The automation's prompt is programmatic content:
+                // it must not arm the human-draft protection against the
+                // very sender that typed it.
+                self.write_with_provenance(key, data, true)?;
                 return Ok(PromptSubmitOutcome::Submitted {
                     waited_ms: start.elapsed().as_millis() as u64,
                 });
@@ -2313,6 +2335,19 @@ impl TerminalManager {
 /// backspace run stays refused — see `terminal_write_is_draft_remedy` in
 /// `crate::daemon` for the clobber doctrine this carves a measured exception
 /// out of.
+/// [11.223]+[11.150] The one clear the guard itself accepts, sized to the
+/// line it is clearing: Ctrl+U, then one backspace per character the walk
+/// holds. The backspaces are load-bearing for CLIs that bind no Ctrl+U
+/// (opencode, measured 2026-09-19); on CLIs that do bind it they land on an
+/// already-empty line and cost nothing.
+pub fn sized_draft_clear(line_chars: usize) -> String {
+    let mut clear = String::from("\u{15}");
+    for _ in 0..line_chars {
+        clear.push('\u{7f}');
+    }
+    clear
+}
+
 pub fn walk_line_erase_is_sized_to(data: &str, line: &[u8]) -> bool {
     let Some(rest) = data.strip_prefix('\u{15}') else {
         return false;
@@ -2385,6 +2420,19 @@ struct PtySessionRuntime {
     /// comparison and the submit. That gap is what put a supervision tool's
     /// text into the middle of a half-typed sentence and sent it.
     pending_input_line: Arc<Mutex<Vec<u8>>>,
+    /// [11.223] Do the bytes standing on the current line include a HUMAN's?
+    ///
+    /// ⛔ THE DRAFT GUARD'S PREMISE IS PROVENANCE, NOT PRESENCE. The walk is
+    /// fed by every client write through one path, and the guard long read
+    /// "the line holds text" as "a person is mid-sentence" — so the daemon's
+    /// OWN programmatic sends stuck exactly like a person's typing, and the
+    /// next programmatic send was refused "to protect" words the machine
+    /// itself had typed (measured live 2026-10-03, [11.223]: send without
+    /// newline accepted, then refusal with held_len=11 for the probe's own
+    /// 11 bytes; only a human pressing keys could flush). `true` only when a
+    /// write WITHOUT the programmatic mark grew the line; a submit, Ctrl+C,
+    /// Ctrl+U, or an erase down to empty resets it with the line.
+    pending_input_line_human: Arc<AtomicBool>,
     /// Bytes of CLIENT input this runtime has ever been handed — never the
     /// daemon's own writes.
     ///
@@ -3160,6 +3208,7 @@ impl PtySessionRuntime {
         let last_output_ms = Arc::new(AtomicU64::new(started_at_ms));
         let pending_input_draft = Arc::new(AtomicBool::new(false));
         let pending_input_line: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_input_line_human = Arc::new(AtomicBool::new(false));
         let runtime_output_seen = Arc::new(AtomicBool::new(false));
         let eof_without_output = Arc::new(AtomicBool::new(false));
         let attach_ready_seen = Arc::new(AtomicBool::new(false));
@@ -3600,6 +3649,7 @@ impl PtySessionRuntime {
             last_output_ms,
             pending_input_draft,
             pending_input_line,
+            pending_input_line_human,
             client_input_bytes: Arc::new(AtomicU64::new(0)),
             runtime_output_seen,
             eof_without_output,
@@ -3855,6 +3905,7 @@ impl PtySessionRuntime {
     /// could still be echo lag — the caller owns the persistence window.
     fn clear_stale_pending_input(&self) {
         self.pending_input_draft.store(false, Ordering::SeqCst);
+        self.pending_input_line_human.store(false, Ordering::SeqCst);
         self.pending_input_line
             .lock()
             .expect("pty input line lock poisoned")
@@ -3878,6 +3929,21 @@ impl PtySessionRuntime {
             .lock()
             .expect("pty input line lock poisoned");
         String::from_utf8_lossy(&line).chars().count()
+    }
+
+    /// [11.223] Does the line standing in the walk hold ONLY programmatic
+    /// bytes — no human contribution since it was last cleared? The draft
+    /// guard's auto-clear reads this: presence alone is not a person's
+    /// words, and the daemon's own stuck send may be reclaimed. An EMPTY
+    /// line answers false — an empty line is nobody's draft, and an adopted
+    /// runtime's rebuilt-from-zero walk must never masquerade as
+    /// "our bytes" while a person's sentence stands in the composer.
+    fn pending_line_is_programmatic_only(&self) -> bool {
+        let line = self
+            .pending_input_line
+            .lock()
+            .expect("pty input line lock poisoned");
+        !line.is_empty() && !self.pending_input_line_human.load(Ordering::SeqCst)
     }
 
     /// Press Enter IFF the composer's current line is exactly `expected`.
@@ -4374,6 +4440,15 @@ impl PtySessionRuntime {
     }
 
     fn write(&self, data: &str) -> Result<()> {
+        self.write_with_provenance(data, false)
+    }
+
+    /// [`Self::write`] carrying the caller's provenance. `programmatic = true`
+    /// is a write the wire marked `refuse_if_draft` — an automation's send —
+    /// or one the daemon authored on an automation's behalf (`submit_prompt`).
+    /// Its bytes are not a person's, and the draft guard's protection must not
+    /// fire on them ([11.223]).
+    fn write_with_provenance(&self, data: &str, programmatic: bool) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -4382,17 +4457,27 @@ impl PtySessionRuntime {
         // daemon-internal protocol auto-responses (DA/DSR replies) bypass it,
         // so they never fabricate a draft. See `pending_input_draft`.
         let prev_draft = self.pending_input_draft.load(Ordering::SeqCst);
-        let next = {
+        let (next, before_len) = {
             let mut line = self
                 .pending_input_line
                 .lock()
                 .expect("pty input line lock poisoned");
+            let before_len = line.len();
             let next = yggterm_core::input_line_after(prev_draft, &line, data.as_bytes());
             *line = next.line.clone();
-            next
+            (next, before_len)
         };
         if next.draft != prev_draft {
             self.pending_input_draft.store(next.draft, Ordering::SeqCst);
+        }
+        // [11.223] Provenance of whatever still stands on the line: a line
+        // cleared by submit / Ctrl+C / Ctrl-U / full erase drops the human
+        /// mark with it; a HUMAN payload that grew the line sets it; a
+        // programmatic payload never does.
+        if next.line.is_empty() {
+            self.pending_input_line_human.store(false, Ordering::SeqCst);
+        } else if !programmatic && next.line.len() > before_len {
+            self.pending_input_line_human.store(true, Ordering::SeqCst);
         }
         self.client_input_bytes
             .fetch_add(data.len() as u64, Ordering::SeqCst);
@@ -11215,6 +11300,213 @@ line-two on the real screen\r\n\
         runtime.shutdown(None).expect("shutdown test runtime");
         let _ = std::fs::remove_file(&gate1);
         let _ = std::fs::remove_file(&gate2);
+    }
+
+    /// ⛔ [11.223] THE DRAFT GUARD'S PREMISE IS PROVENANCE, NOT PRESENCE —
+    /// pure arms first: the constructor the auto-clear writes must BE the one
+    /// payload the [11.150] carve-out admits, for any line length, or the
+    /// daemon would clear its own line and then refuse its own clear.
+    #[test]
+    fn a_sized_draft_clear_is_always_the_admitted_erase() {
+        for held in 0..24usize {
+            let clear = sized_draft_clear(held);
+            let line: Vec<u8> = "x".repeat(held).into_bytes();
+            assert!(
+                walk_line_erase_is_sized_to(&clear, &line),
+                "held={held}: the guard's own clear must be admitted by the guard's own predicate"
+            );
+        }
+    }
+
+    /// ⛔ [11.223] THE LIVE ARM, END-TO-END ON A REAL BASH PTY: a
+    /// PROGRAMMATIC send that sticks (no newline) is reclaimable — the walk
+    /// reports the line as programmatic-only and the sized clear empties it —
+    /// while a HUMAN's typed line keeps the protection, and a submit resets
+    /// the provenance with the line. bash's echo gives the union's grid arm
+    /// the same rendered line the production row showed when the defect was
+    /// measured (held_len=11 for the probe's own 11 bytes).
+    #[test]
+    fn a_stuck_programmatic_line_is_reclaimable_and_a_human_line_is_not() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("bash start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send_master_fd");
+        let master = crate::pty_handoff_wire::recv_master_fd(&recv)
+            .expect("recv_master_fd")
+            .0;
+        drop(pair);
+
+        let mut manager = TerminalManager::new();
+        let key = "local://zq223-provenance-test";
+        manager
+            .adopt_session(key, "bash", None, 100, 24, master, pid, start, None)
+            .expect("adopt_session");
+        let mut ready = false;
+        for _ in 0..50 {
+            if manager.session_screen_plain_rows(key).is_some_and(|rows| {
+                rows.iter().any(|row| row.contains("ash") || row.trim().is_empty())
+                    && manager.session_screen_snapshot(key).is_some_and(|s| !s.trim().is_empty())
+            }) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !ready {
+            // PS1 is empty, so an idle fixture paints nothing: force one
+            // benign newline through the pty (an empty submit — the walk
+            // keeps the line clean) and give the reader a last window.
+            manager.write(key, "\r").expect("nudge");
+            for _ in 0..30 {
+                if manager
+                    .session_screen_snapshot(key)
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        assert!(ready, "the bash fixture never painted a prompt");
+
+        // ARM 1 — the programmatic stick: exactly the [11.223] shape.
+        manager
+            .write_with_provenance(key, "echo ZQPROG", true)
+            .expect("programmatic stick write");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            manager.session_has_pending_input_draft(key),
+            Some(true),
+            "the stuck programmatic bytes must stand in the walk"
+        );
+        assert_eq!(
+            manager.session_pending_line_is_programmatic_only(key),
+            Some(true),
+            "no human wrote those bytes — the guard's premise must not fire"
+        );
+
+        // THE RECLAIM — the auto-clear's own two calls: the predicate admits,
+        // the sized clear empties line and draft together.
+        let held = manager.session_walk_line_len(key).unwrap_or(0);
+        assert_eq!(held, 11, "held_len must count the programmatic payload (echo ZQPROG = 11 chars, the production measurement shape)");
+        manager
+            .write_with_provenance(key, &sized_draft_clear(held), true)
+            .expect("sized clear");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            manager.session_pending_line_is_programmatic_only(key),
+            Some(false),
+            "an emptied line is nobody's draft"
+        );
+        assert_eq!(manager.session_has_pending_input_draft(key), Some(false));
+
+        // ARM 2 — the human line keeps the protection.
+        manager.write(key, "human words").expect("human write");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(manager.session_has_pending_input_draft(key), Some(true));
+        assert_eq!(
+            manager.session_pending_line_is_programmatic_only(key),
+            Some(false),
+            "a human payload that grew the line must keep the refusal armed"
+        );
+
+        // ARM 3 — a submit resets provenance with the line: the next
+        // programmatic stick is programmatic-only again, not heir to the
+        // human mark the submitted line carried.
+        manager.write(key, "\r").expect("submit the human line");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        manager
+            .write_with_provenance(key, "echo ZPROG2", true)
+            .expect("second programmatic stick");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            manager.session_pending_line_is_programmatic_only(key),
+            Some(true),
+            "a submitted line's provenance must not leak into the next line"
+        );
+
+        // ARM 4 — unknown key is None, never a decision.
+        assert_eq!(manager.session_pending_line_is_programmatic_only("local://nope"), None);
+
+        let _ = manager.remove_session(key, None);
+    }
+
+    /// ⛔ [11.223] THE MIXED LINE: a human's keystrokes landing on top of a
+    /// stuck programmatic send must re-arm the protection — the auto-clear
+    /// may reclaim the daemon's own bytes, never a line a person touched.
+    #[test]
+    fn a_human_typing_over_a_stuck_programmatic_line_re_arms_the_guard() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        let child = pair.slave.spawn_command(cmd).expect("spawn bash");
+        let pid = child.process_id().expect("bash pid");
+        let start = crate::pty_adoption::process_start_time(pid).expect("bash start time");
+        let (send, recv) = UnixStream::pair().expect("socketpair");
+        let raw = pair.master.as_raw_fd().expect("master raw fd");
+        crate::pty_handoff_wire::send_master_fd(&send, raw, b"t").expect("send_master_fd");
+        let master = crate::pty_handoff_wire::recv_master_fd(&recv)
+            .expect("recv_master_fd")
+            .0;
+        drop(pair);
+
+        let mut manager = TerminalManager::new();
+        let key = "local://zq223-mixed-line-test";
+        manager
+            .adopt_session(key, "bash", None, 100, 24, master, pid, start, None)
+            .expect("adopt_session");
+        for _ in 0..50 {
+            if manager
+                .session_screen_snapshot(key)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        manager
+            .write_with_provenance(key, "echo STUCK", true)
+            .expect("programmatic stick");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            manager.session_pending_line_is_programmatic_only(key),
+            Some(true)
+        );
+        // The person continues the sentence the machine started.
+        manager.write(key, " MORE").expect("human continuation");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            manager.session_pending_line_is_programmatic_only(key),
+            Some(false),
+            "one human keystroke on the line and the bytes are no longer only ours to reclaim"
+        );
+
+        let _ = manager.remove_session(key, None);
     }
 
     /// [11.138] probe (b): the observed keepalive carried `ESC[?2026h` with no
