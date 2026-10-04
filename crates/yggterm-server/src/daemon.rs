@@ -11382,24 +11382,35 @@ impl DaemonRuntime {
                 );
             }
         }
-        // RECORD-ON-CREATE (born-at-correct-size invariant): persist whatever grid this
-        // session was ensured at — whether client-supplied (`initial_size`) or the
-        // persisted fallback — so a FUTURE re-resume always has the real grid and codex
-        // initial-paints correctly, even if the client never sends a separate
-        // TerminalResize. Flush only on change. Pairs with the synchronous flush in the
-        // TerminalResize handler. See campaign D1 / the squish root cause.
-        if let Some((cols, rows)) = effective_initial_size
+        // RECORD-ON-CREATE (born-at-correct-size invariant): persist the grid
+        // this session was ensured at so a FUTURE re-resume always has the
+        // real grid and codex initial-paints correctly, even if the client
+        // never sends a separate TerminalResize. Flush only on change. Pairs
+        // with the synchronous flush in the TerminalResize handler. See
+        // campaign D1 / the squish root cause.
+        // ⛔ [11.228] CLIENT GRID ONLY: a FALLBACK grid (persisted stale or
+        // the viewport guess) must never be (re)recorded — recording a guess
+        // is how the record gets poisoned, and the poisoned record is what
+        // the re-pin used to push wrong grids at the remote. The fallbacks
+        // size THIS spawn only; the record carries client-attested truth.
+        if let Some((cols, rows)) = initial_size
             && self.server.record_session_pty_grid(path, cols, rows)
         {
             let _ = self.persist_state_only();
         }
-        // Run #19: EVERY ensure of a remote session pins the REMOTE daemon's
-        // PTY to the known grid — not just the local-mismatch resync. The
-        // squish lives on the remote owner, where the local attachment can be
-        // correct while the remote runtime was recreated at DEFAULT (the
-        // local-mismatch gate never fires then). Latest-wins + single
-        // in-flight makes this cheap and idempotent; no-op for local paths.
-        if let Some((cols, rows)) = effective_initial_size {
+        // Run #19 + THE [11.228] POISONED-RE-PIN LAW (measured 2026-10-04
+        // 08:08:15, the owner's squished Claude row): only a CLIENT-SUPPLIED
+        // grid may pin the remote. The persisted/viewport fallbacks above
+        // size the LOCAL spawn — but a stale persisted record (poisoned by a
+        // failed-forward era that could never record the client's truth)
+        // forwarded here actively re-pins the remote PTY to the WRONG grid
+        // and races the client's own attach repair, latest-wins losing to
+        // the stale pin — the self-sustaining squish loop. Fallback grids
+        // never travel to the remote: the client's attach repair owns the
+        // remote's correction, and the remote's own record owns its re-resume
+        // spawn size. Latest-wins + single in-flight still makes this cheap
+        // and idempotent; no-op for local paths.
+        if let Some((cols, rows)) = initial_size {
             self.forward_remote_pty_resize(path, cols, rows);
         }
         if let Ok(home) = crate::resolve_yggterm_home() {
@@ -36731,6 +36742,10 @@ mod tests {
         assert!(
             ensure_block.contains("self.forward_remote_pty_resize(path, cols, rows);"),
             "EVERY ensure of a remote session must forward the grid to the remote daemon's PTY"
+        );
+        assert!(
+            ensure_block.contains("if let Some((cols, rows)) = initial_size {\n            self.forward_remote_pty_resize(path, cols, rows);"),
+            "the ensure arm must forward only the CLIENT-SUPPLIED grid — a persisted-fallback grid must never re-pin the remote (the [11.228] poisoned-re-pin loop)"
         );
     }
 

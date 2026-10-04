@@ -18,6 +18,42 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — A REUSED-HOST MOUNT FIRES NO GRID REPAIR (09:17:45 shape), A RUNTIME REPLACED UNDERNEATH A MOUNTED HOST NEVER RE-BINDS (the frozen-buffer squish that survived every daemon-side heal), THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), AND session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
+
+**Status:** OPEN
+
+Filed 2026-10-04 ~12:0x IST by the core-fix seat (board plan
+ACK-cedf8f0241). All four signatures measured live this morning; the
+daemon-side roots are fixed in [11.228]/lane 11229 — these are the
+CLIENT halves that still recur on healthy rows.
+
+- (a) REUSE-WITHOUT-REPAIR: `mount_epoch_reused reused_live_host:true`
+  (launch.rs ~1777) returns without firing the startup resize repair —
+  a wrong-grid remote is never corrected on a reused mount (fresh
+  mounts repair; reuses don't). FIX SHAPE: fire the repaint-safe
+  `spawn_terminal_startup_resize_repair` (viewport.rs 20491 — currently
+  private; needs pub(crate) + launch-side call with the host grid) on
+  reuse; it is a winsize bounce at identical geometry by design, a heal
+  at wrong geometry.
+- (b) REPLACED-RUNTIME FROZEN BUFFER: when the daemon replaces a remote
+  runtime (restart/rotation re-spawn), a mounted client host keeps the
+  DEAD runtime's last frame forever (measured: client buffer 120-wide
+  while the daemon frame carried 170-wide lines for 25+ minutes);
+  `terminal redraw` does not re-consume; only an epoch-bumping refocus
+  or GUI restart heals. FIX SHAPE: the client must invalidate its host
+  when the stream reports a new `runtime_spawn_id`, and re-reconcile
+  from the daemon screen.
+- (c) REVEAL DEADLINE → PERMANENT BLANK: `reveal_cover_released
+  reason:deadline bytes:0` when a cold transcript re-render outruns the
+  cover deadline — the cover drops to a blank viewport that never
+  self-heals. FIX SHAPE: on deadline expiry, paint the daemon-screen
+  reconcile instead of dropping the cover empty.
+- (d) REMOVE-VS-KEEPALIVE RACE: `session remove` answered
+  verified:true / remote_runtime_after:ConfirmedGone while the runtime
+  RESURRECTED within seconds (spawn pid changed under the verdict) —
+  the removal needs a post-reap verification window or the keep-alive
+  must observe the tombstone before re-spawning.
+
 ## ⛔ [11.228] THE REMOTE-PTY RESIZE HEAL FORWARD DROPS TRANSIENT-IO FAILURES — A DAEMON-BUSY READ TIMEOUT ("reading daemon response / Resource temporarily unavailable (os error 11)" — WouldBlock under set_read_timeout) KILLED EVERY HEAL FOR AN IDEMPOTENT RESIZE, SO THE OWNER'S CLAUDE ROW SAT AT THE 120×36 SPAWN DEFAULT UNDER A 170×63 CLIENT FOR SEVEN HOURS — "THE ACTIVE VIEWPORT IS SQUISHED" (measured live 2026-10-04 ~07:3x IST, jojo GUI + dev PTY, the unattended night after three fleet deploys)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
@@ -70,6 +106,22 @@ resize that hits a busy-peer timeout must re-queue and land (trace
 `remote_pty_resize_failed will_retry:true` followed by a successful
 forward, and the remote PTY converging to the client grid within the
 budget) — not 11 silent drops.
+
+CORE FIX LANDED (the same family's root, 2026-10-04 ~11:5x IST, lane
+11229-grid-truth): trace-correlated TWO recurring shapes — (A) at
+08:08:15 the client's own 170-col repair RACED the ensure arm's
+persisted-fallback forward (spawn@120 in the same second) and the stale
+pin won latest-wins; (B) at 09:17:45 a reused-host mount fired NO
+startup repair at all. BOTH arms of (A) are now code: the ensure arm
+forwards ONLY a client-supplied grid (a persisted/viewport fallback may
+size the local spawn but never travels to the remote), and
+RECORD-ON-CREATE records only client-supplied grids (recording a guess
+is how the record gets poisoned). Source-law test pins both laws in
+`terminal_restart_and_resize_carry_grid_to_remote_pty`. FALSIFIER
+(strengthened): after deploy, no ensure may re-pin a remote over a
+client grid — a trace scan for remote_pty_resize_forwarded with
+cols≠client-grid following an ensure is the red; and a stale record can
+no longer self-sustain. (B) and the blank family are filed as [11.229].
 
 TWO ADJACENT FACTS RECORDED, NOT FIXED HERE: (1) jojo's serving daemon
 is 4f80c66d-dirty (born 00:06:11) holding the default endpoint while
