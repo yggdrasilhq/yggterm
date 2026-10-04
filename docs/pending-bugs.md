@@ -18,6 +18,68 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+## ⛔ [11.228] THE REMOTE-PTY RESIZE HEAL FORWARD DROPS TRANSIENT-IO FAILURES — A DAEMON-BUSY READ TIMEOUT ("reading daemon response / Resource temporarily unavailable (os error 11)" — WouldBlock under set_read_timeout) KILLED EVERY HEAL FOR AN IDEMPOTENT RESIZE, SO THE OWNER'S CLAUDE ROW SAT AT THE 120×36 SPAWN DEFAULT UNDER A 170×63 CLIENT FOR SEVEN HOURS — "THE ACTIVE VIEWPORT IS SQUISHED" (measured live 2026-10-04 ~07:3x IST, jojo GUI + dev PTY, the unattended night after three fleet deploys)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Filed 2026-10-04 ~07:5x IST by the squish root-cause seat (zcode on jojo;
+board plan ACK-c9797f023b). The owner returned to a squished active
+viewport after an unattended night (daemon uptime 7h25m; only agent work
+ran: deploys 22:29 / 23:36 / 00:16 + ~21 probe rows).
+
+THE MEASURED CHAIN:
+- SPLIT-BRAIN GRID: dev's daemon (the PTY owner) reported pty 120×36
+  while the jojo client grid was 170×63 everywhere (xterm 170×63, PTY
+  170×63 on the jojo view, no view-contract violations). Claude Code
+  laid out at 119-120 cols inside a 170-col viewport — content stopped
+  at x≈1230 of a 273..1633 viewport box (pixel-measured), the right
+  ~400 px blank. NOT a glyph/font defect: cell 8.0 px layout vs 8.4 px
+  measured char advance is the long-known quiet-divergent delta, and the
+  xterm grid matched its PTY contract exactly on the client side.
+- THE TRIGGER: remote runtimes re-resume at the DEFAULT 120×36 on every
+  daemon rotation (the known default the Run #19 forward exists to heal —
+  its own comment names "the remote codex PTY stuck at DEFAULT 120×36
+  under a 159×63 client"). The 23:36 and 00:16 rotations re-resumed the
+  row at 120×36 (client nudges at 120 cols appear 23:36:12 and 00:16:32).
+- THE FAILED HEAL: the client re-forwarded 170×63 all night (mount/nudge
+  cadence) and EVERY forward since 00:21 died. Three error classes:
+  "terminal session not found" (handover races — retried by design),
+  "connecting to server-3-2-115.sock — Connection refused" (stale
+  versioned socket, 10-02 era), and the killer: "reading daemon response
+  / Resource temporarily unavailable (os error 11)" — a READ TIMEOUT
+  (WouldBlock under set_read_timeout) while dev's daemon ground its
+  rotation re-resume storm. The classifier retried ONLY the not-found
+  text; the transient-IO class returned Other → will_retry=false →
+  DROPPED, 11 drops overnight. A busy peer is precisely the retry case
+  for an idempotent resize.
+- THE HEAL (live, this sitting): `ssh dev 'yggterm server terminal
+  resize cc-runtime://<id> --cols 170 --rows 63'` → resized:true, dev
+  snapshot 170×63, Claude Code reflowed; pixel re-measure: content now
+  to x=1628 (full viewport). This is the recipe for any future
+  recurrence until the fix deploys.
+
+FIXED IN CODE this sitting (lane/integration/11228-squish-retry):
+`classify_remote_resize_not_found` grows a TRANSIENT-IO arm — "reading
+daemon response", "Resource temporarily unavailable", "timed out",
+"Connection refused", "Connection reset" → Retriable inside the existing
+5×2 s budget; exhausted transient returns Other, NEVER Unownable, so the
+[11.153] peer-gone memo cannot arm on a busy peer. Unit test with the
+verbatim production string (`a_busy_peers_read_timeout_is_retriable`).
+FALSIFIER (live proof owed): at the next daemon rotation, a forwarded
+resize that hits a busy-peer timeout must re-queue and land (trace
+`remote_pty_resize_failed will_retry:true` followed by a successful
+forward, and the remote PTY converging to the client grid within the
+budget) — not 11 silent drops.
+
+TWO ADJACENT FACTS RECORDED, NOT FIXED HERE: (1) jojo's serving daemon
+is 4f80c66d-dirty (born 00:06:11) holding the default endpoint while
+the ea4ea567 successor LINGERS on server-3-2-116-linger-2112851.sock —
+the 00:16 deploy's handover never completed on jojo ([11.225] family,
+directions (a)/(c)); the owner's GUI rode the older bits all night.
+(2) The re-resume could inherit the session's last-known client grid
+instead of the 120×36 default — a direction, not coded (the forward is
+the architecture's chosen heal; make it reliable first).
+
 ## ⛔ [11.226] THE agy 1.2.16 SELF-UPDATE PAINTS A FOLDER-TRUST GATE THE ROW CANNOT ANSWER AND THE E2E PROBE CANNOT SEE — FRESH-CWD agy ROWS SIT AT "Do you trust the contents of this project?" FOREVER, THE PROBE'S CLI MARKER MATCHES THE GATE TEXT ITSELF, AND THE 19:0x [11.225] FALSIFIER LEG'S "painted its CLI" WAS THE GATE (measured 2026-10-03 ~21:37-22:0x IST, jojo + dev, agy 1.2.16 md5-identical on both)
 
 **Status:** OPEN
