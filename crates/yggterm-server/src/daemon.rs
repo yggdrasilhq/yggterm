@@ -2150,6 +2150,30 @@ fn classify_remote_resize_not_found(
     asked_runtime_key: Option<&str>,
     retries_exhausted: bool,
 ) -> RemoteResizeVerdict {
+    // THE [11.228] TRANSIENT-IO ARM (measured live 2026-10-03/04, the owner's
+    // squished Claude row): the remote answer reader surfaces a read timeout
+    // as "reading daemon response / Resource temporarily unavailable (os
+    // error 11)" — WouldBlock under set_read_timeout — and that class hit
+    // exactly while the peer daemon ground its rotation re-resume storm, so
+    // every heal forward for an idempotent resize was DROPPED (will_retry
+    // false, 11 drops overnight) and the remote PTY sat at its DEFAULT
+    // 120×36 under a 170×63 client for seven hours. A busy or mid-rotation
+    // peer is the RETRY case, not the terminal one — and it must never arm
+    // the peer-gone memo, so exhaustion returns Other, never Unownable.
+    const TRANSIENT_IO_NEEDLES: [&str; 5] = [
+        "reading daemon response",
+        "Resource temporarily unavailable",
+        "timed out",
+        "Connection refused",
+        "Connection reset",
+    ];
+    if TRANSIENT_IO_NEEDLES.iter().any(|needle| error_text.contains(needle)) {
+        return if retries_exhausted {
+            RemoteResizeVerdict::Other
+        } else {
+            RemoteResizeVerdict::Retriable
+        };
+    }
     const NEEDLE: &str = "terminal session not found";
     if !error_text.contains(NEEDLE) {
         return RemoteResizeVerdict::Other;
@@ -46269,6 +46293,43 @@ terminal session not found: codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c
                 Some(asked),
                 true
             ),
+            RemoteResizeVerdict::Other,
+        );
+    }
+
+    #[test]
+    fn a_busy_peers_read_timeout_is_retriable_not_terminal() {
+        // [11.228], verbatim production string (jojo event-trace, 2026-10-04
+        // 00:22): the heal forward for the owner's squished Claude row died
+        // on the read-timeout spelling eleven times overnight while dev's
+        // daemon ground its rotation re-resume storm — the remote PTY kept
+        // the 120×36 spawn default under a 170×63 client for seven hours.
+        let production = "remote yggterm command failed for dev: Error: \
+reading daemon response\n\nCaused by:\n    Resource temporarily unavailable (os error 11)";
+        assert_eq!(
+            classify_remote_resize_not_found(production, None, false),
+            RemoteResizeVerdict::Retriable,
+            "a busy peer is the retry case for an idempotent resize"
+        );
+        assert_eq!(
+            classify_remote_resize_not_found(production, None, true),
+            RemoteResizeVerdict::Other,
+            "past the budget it drops — but never Unownable, so the peer-gone memo cannot arm on a busy peer"
+        );
+        // The mid-rotation socket flip (stale versioned socket, connection
+        // refused) is the same class: the retry ladder rides it out.
+        assert_eq!(
+            classify_remote_resize_not_found(
+                "remote yggterm command failed for dev: Error: connecting to \
+/home/pi/.yggterm/server-3-2-115.sock\n\nCaused by:\n    Connection refused (os error 111)",
+                None,
+                false
+            ),
+            RemoteResizeVerdict::Retriable,
+        );
+        // Unrelated errors stay terminal.
+        assert_eq!(
+            classify_remote_resize_not_found("failed to upload yggterm binary", None, false),
             RemoteResizeVerdict::Other,
         );
     }
