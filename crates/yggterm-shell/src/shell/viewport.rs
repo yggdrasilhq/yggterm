@@ -6901,6 +6901,25 @@ fn TerminalCanvas(
                 >,
             > = None;
             let mut warm_alive_matched: Option<bool> = None;
+            // [F1] THE SYNTHESIZED FULL CONTRACT. When js_ready arrives via
+            // the warm-eval posted proof, the mount eval's per-eval channel is
+            // dead BOTH ways (its captured dioxus bindings were replaced under
+            // spawn churn) — eval.send writes never reach the page and Paint /
+            // Resize / Geometry events never reach Rust. The synthesis then:
+            // fetches the daemon screen snapshot off-loop as the content seed,
+            // runs the one-shot proof eval (seed + surface proof over the
+            // fresh-script leg, the one measured alive), and routes this
+            // mount's read-pump writes through the page host registry for the
+            // rest of its life.
+            let (synth_snapshot_tx, mut synth_snapshot_rx) =
+                tokio::sync::mpsc::channel::<String>(1);
+            let mut synth_snapshot_requested = false;
+            let mut synth_proof_eval: Option<
+                std::pin::Pin<
+                    Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
+                >,
+            > = None;
+            let mut js_ready_synthesized = false;
             // [11.187] The drop witness + the liveness heartbeat. The guard
             // lives for the loop's whole life; its Drop fires at task end
             // (normal or panic) and leaves a NAMED trace. The heartbeat is
@@ -11872,6 +11891,180 @@ fn TerminalCanvas(
                                     },
                                 );
                             }
+                            // [F1] Synthesize the mount_open HALF of the bridge
+                            // contract (the ready half is staged above): the
+                            // seed snapshot goes off-loop, the proof eval is
+                            // armed when it answers, and every later read-pump
+                            // write rides the page host registry. Without this
+                            // the mount is a constructed-but-never-fed term
+                            // that called ready — the blank-forever zombie.
+                            js_ready_synthesized = true;
+                            if !synth_snapshot_requested {
+                                synth_snapshot_requested = true;
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "synthesized_mount_open_armed",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "mount_epoch": mount_epoch,
+                                    }),
+                                );
+                                let snap_endpoint = endpoint.clone();
+                                let snap_session = runtime_session_path.clone();
+                                let snap_trace_home = trace_home.clone();
+                                let snap_tx = synth_snapshot_tx.clone();
+                                tokio::spawn(async move {
+                                    let seed = terminal_snapshot_async(
+                                        snap_endpoint,
+                                        snap_session,
+                                        &snap_trace_home,
+                                    )
+                                    .await
+                                    .map(|answer| {
+                                        sanitize_terminal_replay_payload(&answer.text)
+                                    })
+                                    .unwrap_or_default();
+                                    let _ = snap_tx.send(seed).await;
+                                });
+                            }
+                        }
+                    }
+                    Some(synth_seed_text) = synth_snapshot_rx.recv() => {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "synth_seed",
+                            &session_path,
+                        );
+                        let seed_bytes = synth_seed_text.len();
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "synthesized_mount_open_seed",
+                            json!({
+                                "session_path": session_path.clone(),
+                                "host_id": host_id.clone(),
+                                "seed_bytes": seed_bytes,
+                            }),
+                        );
+                        synth_proof_eval = Some(Box::pin(
+                            document::eval(&terminal_synthesized_mount_open_script(
+                                &host_id,
+                                if synth_seed_text.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(&synth_seed_text)
+                                },
+                            ))
+                            .join::<Value>(),
+                        ));
+                    }
+                    synth_proof_answer = async {
+                        synth_proof_eval
+                            .as_mut()
+                            .expect("synth proof armed")
+                            .await
+                    },
+                        if synth_proof_eval.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "synth_proof",
+                            &session_path,
+                        );
+                        synth_proof_eval = None;
+                        let proof = match synth_proof_answer {
+                            Ok(value) => value
+                                .as_str()
+                                .and_then(|body| serde_json::from_str::<Value>(body).ok()),
+                            Err(_error) => None,
+                        };
+                        match proof {
+                            Some(proof) => {
+                                let constructed = proof
+                                    .get("constructed")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                let screen_in_host = proof
+                                    .get("screen_in_host")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                let rows_value =
+                                    proof.get("rows").and_then(Value::as_u64).unwrap_or(0);
+                                let cols_value =
+                                    proof.get("cols").and_then(Value::as_u64).unwrap_or(0);
+                                let painted = proof
+                                    .get("painted")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                let wrote_seed = proof
+                                    .get("wrote_seed")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0);
+                                let geometry_usable = screen_in_host
+                                    && terminal_geometry_is_usable(
+                                        cols_value as u16,
+                                        rows_value as u16,
+                                    );
+                                if geometry_usable {
+                                    resize_seen = true;
+                                    terminal_geometry_ready = true;
+                                    current_terminal_cols = cols_value as u16;
+                                    current_terminal_rows = rows_value as u16;
+                                }
+                                let surface_painted = painted || wrote_seed > 0;
+                                if surface_painted {
+                                    terminal_paint_seen = true;
+                                    if !terminal_host_painted() {
+                                        set_signal_if_changed(terminal_host_painted, true);
+                                    }
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "synthesized_mount_open_painted",
+                                        |shell| {
+                                            shell.note_terminal_session_painted(&session_path);
+                                        },
+                                    );
+                                }
+                                let payload = json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                    "constructed": constructed,
+                                    "screen_in_host": screen_in_host,
+                                    "rows": rows_value,
+                                    "cols": cols_value,
+                                    "painted": painted,
+                                    "wrote_seed": wrote_seed,
+                                    "geometry_usable": geometry_usable,
+                                    "surface_painted": surface_painted,
+                                });
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "synthesized_mount_open",
+                                    payload.clone(),
+                                );
+                                yggterm_core::perf::ytrace_emit_event(
+                                    "ui",
+                                    "terminal_mount",
+                                    "synthesized_mount_open",
+                                    payload,
+                                );
+                            }
+                            None => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "synthesized_mount_open_proof_unreadable",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                    }),
+                                );
+                            }
                         }
                     }
                     _ = tokio::time::sleep_until(
@@ -13440,10 +13633,27 @@ fn TerminalCanvas(
                                                             current_millis(),
                                                         );
                                                         let write_len = write.len();
-                                                        if eval
-                                                            .send(TerminalJsCommand::Write { data: write, protocol_only: forward_terminal_protocol_only_output })
-                                                            .is_err()
-                                                        {
+                                                        // [F1] A synthesized mount's per-eval channel is dead
+                                                        // BOTH ways — route the batch through the page host
+                                                        // registry via a fresh eval, the transport measured
+                                                        // alive through the shed window. Healthy mounts keep
+                                                        // eval.send unchanged.
+                                                        let write_sent_ok = if js_ready_synthesized {
+                                                            let _ = document::eval(
+                                                                &terminal_page_write_script(
+                                                                    &host_id,
+                                                                    &write,
+                                                                ),
+                                                            );
+                                                            true
+                                                        } else {
+                                                            eval.send(TerminalJsCommand::Write {
+                                                                data: write,
+                                                                protocol_only: forward_terminal_protocol_only_output,
+                                                            })
+                                                            .is_ok()
+                                                        };
+                                                        if !write_sent_ok {
                                                             trace_terminal_write_send_failure(
                                                                 &trace_home,
                                                                 &session_path,
@@ -13609,12 +13819,25 @@ fn TerminalCanvas(
                                                         current_millis(),
                                                     );
                                                     let write_len = write.len();
-                                                    if eval
-                                                        .send(TerminalJsCommand::Write {
-                                                            data: write, protocol_only: forward_terminal_protocol_only_output,
+                                                    // [F1] Same synthesized-leg routing as the mainline
+                                                    // write site — this mount's per-eval channel is
+                                                    // dead both ways.
+                                                    let write_sent_ok = if js_ready_synthesized {
+                                                        let _ = document::eval(
+                                                            &terminal_page_write_script(
+                                                                &host_id,
+                                                                &write,
+                                                            ),
+                                                        );
+                                                        true
+                                                    } else {
+                                                        eval.send(TerminalJsCommand::Write {
+                                                            data: write,
+                                                            protocol_only: forward_terminal_protocol_only_output,
                                                         })
-                                                        .is_err()
-                                                    {
+                                                        .is_ok()
+                                                    };
+                                                    if !write_sent_ok {
                                                         trace_terminal_write_send_failure(
                                                             &trace_home,
                                                             &session_path,
