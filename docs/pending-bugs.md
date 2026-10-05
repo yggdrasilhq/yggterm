@@ -52,11 +52,28 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (a) [11.231]-adjacent rig law — always override XDG_DATA_HOME and
   assert the served exe; (b) INPUT LEG STILL DEAD: keystrokes ride
   kind:"input" over the dead per-eval leg — a synthesized mount is
-  painted-but-input-dead until the input dual-leg lands (page ring +
-  monotonic ids, exactly-once across legs) — THE NEXT UNIT; (c) the
+  painted-but-input-dead until the input dual-leg lands — LANDED
+  2026-10-05 (cb8fc542, lane/f1/input-dual-leg): page input ring under
+  per-mount monotonic ids, ring_id on the wire, Rust cursor dedupe, and a
+  read-cadence ring drain over the eval-return leg; typing-rig proof on a
+  warm_alive_posted mount (synthesized_input_drained 2/2 chunks, "echo
+  F1LEG4 / F1LEG4" painted on screen); (c) the
   stale-receiver WHY (sol ranked-attack #3) — page-side send ring +
   IPC-ingress stamps decide it; (d) the healthy row's page→Rust ytrace
-  still rides the dead leg (cosmetic, trace-only). LONG-TERM: sol's
+  still rides the dead leg (cosmetic, trace-only); (e) THE OUTPUT FENCE
+  (sol patch-review Q1+Q2, node
+  lores/chain-of-thought/2026-10-05-yggterm-f1-sol-patch-review.md): the
+  painted-guard does not order the seed against in-flight differentials,
+  and frame-hash reconcile itself rides the dead leg — install the
+  authoritative screen with an output watermark, ack after xterm's write
+  callback, retain unacked batches, or move reconcile onto fresh evals;
+  (f) THE RING WATERMARK REWORK (Q4+Q5): splice-before-ack loses input on
+  a lost return, the high-water cursor discards older chunks on cross-leg
+  reordering, the ring never prunes on healthy mounts, and HOST REUSE
+  REPLAYS HISTORY (Rust cursor resets to 0, page bucket survives) —
+  non-destructive reads + acked contiguous watermark + incarnation id +
+  byte bound; THE NEXT UNIT (replay is a correctness regression risk);
+  (g) flush_due routing (Q3) — LANDED with this lane. LONG-TERM: sol's
   owner-backed attach transaction (ContentReady only on a JS ack of
   applied cursor+buffer; one bounded reconstruction then an explicit
   failure surface).

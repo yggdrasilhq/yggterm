@@ -7046,7 +7046,18 @@ fn TerminalCanvas(
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
                 {
                     record_terminal_forward_sample(&trace_home, data.len(), current_millis());
-                    let _ = eval.send(TerminalJsCommand::Write { data, protocol_only: false });
+                    // [F1] sol-review Q3: this frame-budgeted flush is the
+                    // THIRD output site and also dies with the per-eval
+                    // channel on a synthesized mount — same routing as the
+                    // two mainline sites.
+                    if js_ready_synthesized {
+                        let _ = document::eval(&terminal_page_write_script(&host_id, &data));
+                    } else {
+                        let _ = eval.send(TerminalJsCommand::Write {
+                            data,
+                            protocol_only: false,
+                        });
+                    }
                 }
                 // Post-resize background reconcile: a settled column-resize reflow
                 // may have dropped cell backgrounds (codex composer bg-split bug). Once
