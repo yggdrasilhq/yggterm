@@ -17648,10 +17648,42 @@ console.log('ok');
         );
         let armed = viewport.matches("mount_task_guard.arm_remount.set(true)").count();
         assert!(
-            armed >= 2 && armed <= 3,
-            "exactly the bridge-death breaks arm the remount — supersede and \
-             ensure-error exits must NOT (a successor exists / the host is \
-             genuinely unreachable)"
+            armed >= 3 && armed <= 4,
+            "the bridge-death breaks plus the [F1-(h2)] env-gated test hook \
+             arm the remount — supersede and ensure-error exits must NOT (a \
+             successor exists / the host is genuinely unreachable)"
+        );
+        // [F1-(h2)] The surface-remount test hook: one-shot per process,
+        // fired only on a quiesced drain (zero new chunks after applied
+        // input), executing the bridge-ended arms' cleanup verbatim before
+        // it breaks — a test exit that skipped the lease/attach cleanup
+        // would poison the very remount it forces.
+        assert!(
+            viewport
+                .find("YGGTERM_TEST_SURFACE_REMOUNT_ON_IDLE")
+                .is_some(),
+            "the (h2) hook must be env-gated by name"
+        );
+        assert!(
+            viewport.find("TEST_SURFACE_REMOUNT_ON_IDLE_FIRED").is_some(),
+            "the (h2) hook must be one-shot per process via the fired latch"
+        );
+        assert!(
+            viewport
+                .find("\"test_hook_surface_remount_forced\"")
+                .is_some(),
+            "the (h2) hook must leave a named trace the rig can barrier on"
+        );
+        assert!(
+            viewport
+                .find("test_surface_remount_exit")
+                .and_then(|at| viewport[at..].find("release_terminal_bootstrap_lease_if_current"))
+                .is_some(),
+            "the (h2) hook exit must run the bridge-death cleanup (lease release first)"
+        );
+        assert!(
+            viewport.find("synthesized_input_chunk_enqueued").is_some(),
+            "the (h2) writer-enqueue granularity trace must exist"
         );
         assert!(
             viewport.find("terminal_mount_loop_stale_degraded").is_some(),
@@ -17661,10 +17693,22 @@ console.log('ok');
         let state = include_str!("state.rs");
         assert!(
             state
-                .find("terminal_loop_heartbeat_age_ms(session_path).is_some_and(|age| age >= TERMINAL_LOOP_STALE_MS)")
+                .find("match terminal_loop_heartbeat_age_ms(session_path) {")
                 .is_some(),
             "the reveal-raise must refuse a heartbeat-stale host — raising on \
              stale Ready truth is the freeze itself"
+        );
+        assert!(
+            state.find("fn remove_terminal_loop_heartbeat").is_some(),
+            "the armed-death heartbeat punch must exist — a fresh beat on a \
+             dead loop made the raise serve the corpse and eat the remount \
+             candidate (measured 2026-10-05)"
+        );
+        assert!(
+            viewport
+                .find("remove_terminal_loop_heartbeat(&self.session_path);")
+                .is_some(),
+            "the drop guard must punch the heartbeat when it arms the remount"
         );
     }
 
@@ -71529,6 +71573,12 @@ mod web_surface_immersion_locks {
         shell.bump_terminal_mount_epoch_for_session(session_path, "test");
         shell.terminal_sessions_reached_ready
             .insert(session_path.to_string());
+        // [F1-(h2)] The live shape this helper models — a MOUNTED,
+        // ever-ready host — carries a BEATING mount loop: readiness is
+        // earned by the loop itself. The reveal-raise predicate refuses
+        // an absent heartbeat (a dead loop's punched-out entry), so the
+        // synthetic host needs its beat.
+        super::bump_terminal_loop_heartbeat(session_path);
         shell
     }
 
@@ -71542,6 +71592,26 @@ mod web_surface_immersion_locks {
         assert!(
             shell.terminal_host_ready_for_reveal_raise(session_path),
             "a mounted host with ready history must raise, not remount"
+        );
+    }
+
+    #[test]
+    fn a_silent_or_stale_loop_never_reveals() {
+        // [F1-(h2)/11.187] the reveal arm of the freeze guard: a dead
+        // loop's host must take the bootstrap, never a raise — including
+        // the SILENT shape (absent heartbeat, the armed-death punch),
+        // which used to pass the is_some_and(stale) check and served the
+        // corpse (measured 2026-10-05: reveal_served 4 ms after
+        // terminal_mount_task_remount_armed, then no mount ever again).
+        let session_path = "local://reveal-silent-loop-test";
+        let shell = shell_with_a_ready_retained_host(session_path);
+        {
+            let mut beats = super::TERMINAL_LOOP_HEARTBEATS.lock().unwrap();
+            beats.remove(session_path);
+        }
+        assert!(
+            !shell.terminal_host_ready_for_reveal_raise(session_path),
+            "a loop that has never beat (or was punched out on death) must              not be raised on"
         );
     }
 
