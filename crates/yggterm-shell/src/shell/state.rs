@@ -939,6 +939,20 @@ pub(crate) fn bump_terminal_loop_heartbeat(session_path: &str) {
     }
 }
 
+/// [F1-(h2)/11.187] Punched by the mount-task drop guard on an ARMED death
+/// (bridge-ended break or the (h2) test signal): removing the entry makes
+/// the very next render's reveal-raise predicate REFUSE — an absent
+/// heartbeat is a DEAD loop, not a fresh one. Leaving the last beat in
+/// place let the raise serve the corpse while the heartbeat still read
+/// fresh (<60 s) and permanently consume the armed remount's schedule
+/// candidate: measured 2026-10-05, reveal_served 4 ms after
+/// terminal_mount_task_remount_armed, then no mount ever again.
+pub(crate) fn remove_terminal_loop_heartbeat(session_path: &str) {
+    if let Ok(mut beats) = TERMINAL_LOOP_HEARTBEATS.lock() {
+        beats.remove(session_path);
+    }
+}
+
 /// Age of the session's mount-loop heartbeat, in ms. `None` = never mounted
 /// under a build that carries the heartbeat (nothing to judge).
 pub(crate) fn terminal_loop_heartbeat_age_ms(session_path: &str) -> Option<u64> {
@@ -31501,9 +31515,15 @@ impl ShellState {
         // (retained pixels, no output, no input) would stand forever. Refuse
         // the raise so the bootstrap path re-runs and re-arms the pump; a
         // LIVE loop's heartbeat is fresh and never enters this arm.
-        if terminal_loop_heartbeat_age_ms(session_path).is_some_and(|age| age >= TERMINAL_LOOP_STALE_MS)
-        {
-            return false;
+        // ⭐ [F1-(h2)/11.187] REFUSE ON ABSENT TOO: an absent heartbeat is a
+        // DEAD loop (the drop guard punches it out on armed death) — raising
+        // it would serve a corpse's retained pixels and permanently consume
+        // the armed remount's candidate (the reveal_served-at-+4 ms race,
+        // measured 2026-10-05). A never-mounted host never reaches this line
+        // (was_ever_ready is false), so None here means death.
+        match terminal_loop_heartbeat_age_ms(session_path) {
+            Some(age) if age < TERMINAL_LOOP_STALE_MS => {}
+            _ => return false,
         }
         if let Some(attempt) = self.latest_terminal_open_attempt_for_path(session_path) {
             if attempt.latched_failure_reason.is_some()

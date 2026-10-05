@@ -3606,6 +3606,12 @@ fn next_input_ring_incarnation() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [F1-(h2)] One-shot latch for the surface-remount test hook: the hook
+/// fires at most once per PROCESS however many mounts run, so a rig can
+/// never trip itself into a remount storm.
+static TEST_SURFACE_REMOUNT_ON_IDLE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[component]
 fn TerminalCanvas(
     session: ManagedSessionView,
@@ -7036,6 +7042,21 @@ fn TerminalCanvas(
                     }),
                 );
             }
+            // [F1-(h2)] TEST HOOK (sol Q2, filed 2026-10-05): fire the
+            // EXISTING arm_remount exit ONCE per process, at a barrier a
+            // rig can rely on — the first QUIESCED drain (a drain answer
+            // with zero new chunks after this mount has already applied
+            // input means every old chunk is acked and pruned; the 150 ms
+            // drain deadline guarantees the idle answer arrives). The exit
+            // is the bridge-ended arms' exit verbatim: lease/attach cleanup,
+            // arm_remount, break — the drop witness and the watchdog do the
+            // remount. NO verb re-runs the GUI mount loop (sitting-6 map),
+            // so this hook is the only deterministic surface-remount trigger.
+            let test_surface_remount_on_idle = std::env::var(
+                "YGGTERM_TEST_SURFACE_REMOUNT_ON_IDLE",
+            )
+            .map(|value| value != "0")
+            .unwrap_or(false);
             // [11.178]-c2 The mount-liveness poll's join future (same
             // not-Send discipline as the pipeline probe) and its verdict.
             // Some(true) = the fn's page-side liveness record matched the
@@ -12371,6 +12392,23 @@ fn TerminalCanvas(
                             if enqueued {
                                 input_ring_cursor.commit();
                                 applied += 1;
+                                // [F1-(h2)] Writer-enqueue granularity for the
+                                // rig's exactly-once asserts: one trace per
+                                // chunk the writer accepted, id + length only
+                                // (the shape law — content never lands in the
+                                // trace). Screen command counts are secondary.
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "synthesized_input_chunk_enqueued",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "chunk_id": chunk.id,
+                                        "len": chunk.data.len(),
+                                    }),
+                                );
                             } else {
                                 // The writer channel is gone — the mount is
                                 // tearing down. Un-mark so a racing drain
@@ -12402,6 +12440,8 @@ fn TerminalCanvas(
                                     "pruned_stale": drained.stale,
                                     "watermark": input_ring_cursor.watermark(),
                                     "overflowed": drained.overflowed,
+                                    "input_incarnation": input_ring_incarnation,
+                                    "baseline": drained.baseline,
                                 }),
                             );
                         }
@@ -12412,6 +12452,50 @@ fn TerminalCanvas(
                         // lost prune only costs a re-read Rust dedupes.
                         if input_ring_cursor.watermark() > synth_input_acked_watermark {
                             synth_input_acked_watermark = input_ring_cursor.watermark();
+                        }
+                        // [F1-(h2)] The quiesced-drain barrier: this answer
+                        // carried no new chunks while this mount HAS applied
+                        // input — the ring is drained, acked, and pruned,
+                        // the honest moment to end the mount exactly as a
+                        // bridge death would. One-shot per process.
+                        if test_surface_remount_on_idle
+                            && drained_count == 0
+                            && synth_input_acked_watermark > 0
+                            && !TEST_SURFACE_REMOUNT_ON_IDLE_FIRED
+                                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            let _ = safe_shell_mut(
+                                state,
+                                "test_surface_remount_exit",
+                                |shell| {
+                                    release_terminal_bootstrap_lease_if_current(
+                                        shell,
+                                        &session_path,
+                                        &bootstrap_lease_identity,
+                                    );
+                                    shell.terminal_attach_in_flight.remove(&session_path);
+                                    shell.maybe_finish_terminal_surface_request_for_session(
+                                        &session_path,
+                                    );
+                                },
+                            );
+                            maybe_spawn_missing_remote_machine_refreshes(state);
+                            maybe_spawn_missing_managed_cli_refreshes(state);
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "test_hook_surface_remount_forced",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                    "mount_epoch": mount_epoch,
+                                    "acked_watermark": synth_input_acked_watermark,
+                                    "input_incarnation": input_ring_incarnation,
+                                }),
+                            );
+                            mount_task_guard.arm_remount.set(true);
+                            break;
                         }
                     }
                     // [F1-(f)] The drain deadline: synthesized input must
@@ -19070,6 +19154,12 @@ impl Drop for TerminalMountTaskDropGuard {
             let epoch = self
                 .state
                 .with_mut_counted(|shell| shell.bump_terminal_watchdog_remount_epoch(&self.session_path));
+            // [F1-(h2)/11.187] Punch the heartbeat: a fresh-looking beat on
+            // a dead loop made the reveal-raise serve this corpse and
+            // swallow the armed candidate forever (measured 2026-10-05).
+            // Absent => the raise refuses => the candidate reaches the
+            // bootstrap path on the next render.
+            remove_terminal_loop_heartbeat(&self.session_path);
             append_trace_event(
                 &self.trace_home,
                 "ui",
@@ -21860,6 +21950,13 @@ pub(crate) fn terminal_host_id_belongs_to_session(session_path: &str, host_id: &
 }
 
 pub(crate) fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
+    // [F1-(h2)] MEASURED 2026-10-05: the watchdog remount REUSES the mount
+    // epoch, so this id — and the page input-ring bucket keyed by it — is
+    // the SAME key across every remount of a session. Genuine bucket reuse
+    // is therefore exercised by EVERY remount the rig forces (baseline
+    // continuation + zero old enqueues, incarnation-defended); no separate
+    // reuse hook exists because a bare epoch-less id collides with the
+    // `-m` prefix parsing below.
     format!("{}-m{}", terminal_host_id(session_path), mount_epoch)
 }
 fn sidebar_row_dom_id(path: &str) -> String {
