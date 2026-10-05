@@ -125,6 +125,9 @@ pub(crate) enum TerminalJsEvent {
     },
     Input {
         data: String,
+        /// [F1-input] The page-side input-ring id (dual-leg exactly-once
+        /// cursor); None from older in-page scripts.
+        ring_id: Option<u64>,
     },
     ReadNudge {
         reason: String,
@@ -476,6 +479,8 @@ enum TerminalJsEventWire {
     },
     Input {
         data: String,
+        #[serde(default)]
+        ring_id: Option<u64>,
     },
     ReadNudge {
         #[serde(default)]
@@ -744,7 +749,9 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 cols,
                 rows,
             },
-            TerminalJsEventWire::Input { data } => TerminalJsEvent::Input { data },
+            TerminalJsEventWire::Input { data, ring_id } => {
+                TerminalJsEvent::Input { data, ring_id }
+            }
             TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
             TerminalJsEventWire::WheelGate {
                 decision,
@@ -760,9 +767,15 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 owns_input,
             },
             TerminalJsEventWire::Resize { cols, rows } => TerminalJsEvent::Resize { cols, rows },
-            TerminalJsEventWire::MouseMode { mode, enabled, suppressed } => {
-                TerminalJsEvent::MouseMode { mode, enabled, suppressed }
-            }
+            TerminalJsEventWire::MouseMode {
+                mode,
+                enabled,
+                suppressed,
+            } => TerminalJsEvent::MouseMode {
+                mode,
+                enabled,
+                suppressed,
+            },
             TerminalJsEventWire::FrameHashRequest => TerminalJsEvent::FrameHashRequest,
             TerminalJsEventWire::FrameHash {
                 daemon_hash,
@@ -1135,7 +1148,7 @@ mod tests {
                 "data": payload,
             }))
             .expect("terminal input whitespace should deserialize unchanged");
-            assert!(matches!(event, TerminalJsEvent::Input { data } if data == payload));
+            assert!(matches!(event, TerminalJsEvent::Input { data, .. } if data == payload));
         }
     }
 

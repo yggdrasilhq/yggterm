@@ -349,6 +349,24 @@ if (__t && typeof __t.write === 'function') {{
     )
 }
 
+/// [F1-input] Drain the page-side input ring for a synthesized mount: the
+/// keystrokes the page recorded (per-mount monotonic ids) come back over
+/// the eval-return leg — the one transport alive through the shed window.
+/// Rust owns the exactly-once cursor, so a chunk that already arrived via
+/// the (healed) dioxus leg no-ops there and here.
+pub(crate) fn terminal_input_ring_drain_script(host_id: &str) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"const __h = {host};
+const __bucket = (window.__yggtermInputRing || {{}})[__h] || null;
+let __out = [];
+if (__bucket && __bucket.chunks && __bucket.chunks.length) {{
+    __out = __bucket.chunks.splice(0, __bucket.chunks.length);
+}}
+return JSON.stringify(__out);"#
+    )
+}
+
 /// [F1] The full-contract synthesis probe for a warm mount whose bridge was
 /// shed: a single value-carrying one-shot eval (⛔ top-level `return` — the
 /// eval bridge shape law) that (a) seeds the daemon's screen snapshot into
@@ -518,6 +536,33 @@ fn terminal_eval_script_with_canvas_renderer(
         const sendTerminalEvent = (payload) => {{
             if (terminalDioxusSend) {{
                 terminalDioxusSend(payload);
+            }}
+        }};
+        // [F1-input] THE INPUT DUAL-LEG. The dioxus.send leg dies with the
+        // mount eval's captured bindings under spawn churn; a synthesized
+        // mount's keystrokes would be lost. EVERY input chunk is ALSO
+        // recorded here under a per-mount monotonic id — Rust drains the
+        // ring over the eval-return leg only while synthesized, and the id
+        // cursor makes delivery exactly-once across the two legs (whichever
+        // leg delivers an id first wins; the other no-ops).
+        const sendTerminalInput = (data) => {{
+            let ringId = null;
+            try {{
+                const ring = (window.__yggtermInputRing = window.__yggtermInputRing || {{}});
+                const bucket = (ring[hostId] = ring[hostId] || {{ nextId: 1, chunks: [] }});
+                ringId = bucket.nextId;
+                bucket.nextId += 1;
+                bucket.chunks.push({{ id: ringId, data: String(data) }});
+                if (bucket.chunks.length > 1024) {{
+                    bucket.chunks.splice(0, bucket.chunks.length - 1024);
+                }}
+            }} catch (_error) {{
+                ringId = null;
+            }}
+            if (ringId !== null) {{
+                sendTerminalEvent({{ kind: "input", data: data, ring_id: ringId }});
+            }} else {{
+                sendTerminalEvent({{ kind: "input", data: data }});
             }}
         }};
         // [11.178] ATTEMPT GUARD. The invoke site stamps
@@ -8411,7 +8456,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.lastInputBatchLength = data.length;
                 entry.lastInputBatchAtMs = Date.now();
             }}
-            sendTerminalEvent({{ kind: "input", data }});
+            sendTerminalInput(data);
             return true;
         }};
         const queueTerminalInputData = (data) => {{
@@ -10237,7 +10282,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         return;
                     }}
                 }} catch (_triggerError) {{}}
-                sendTerminalEvent({{ kind: "input", data: text }});
+                sendTerminalInput(text);
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].lastPrimarySelectionPasteMethod = 'direct_event';
                 }}
@@ -12903,7 +12948,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (terminalProtocolResponseFallbackAllowed(data)) {{
                     recordSuppressedTerminalProtocolResponse('onData-fallback', data);
                     flushPendingTerminalInput('before_protocol_response_fallback');
-                    sendTerminalEvent({{ kind: "input", data }});
+                    sendTerminalInput(data);
                     return;
                 }}
                 recordSuppressedTerminalProtocolResponse('onData', data);
@@ -12928,7 +12973,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             if (protocolBypass) {{
                 flushPendingTerminalInput('before_protocol');
-                sendTerminalEvent({{ kind: "input", data }});
+                sendTerminalInput(data);
                 return;
             }}
             markTerminalInputHot('data');

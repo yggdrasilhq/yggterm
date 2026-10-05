@@ -6920,6 +6920,15 @@ fn TerminalCanvas(
                 >,
             > = None;
             let mut js_ready_synthesized = false;
+            // [F1-input] The dual-leg input cursor + the synthesized-mode ring
+            // drain (a pinned eval over the one leg alive through the shed
+            // window, kicked on the read-pump cadence).
+            let mut synth_last_input_id: u64 = 0;
+            let mut synth_input_drain_eval: Option<
+                std::pin::Pin<
+                    Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
+                >,
+            > = None;
             // [11.187] The drop witness + the liveness heartbeat. The guard
             // lives for the loop's whole life; its Drop fires at task end
             // (normal or panic) and leaves a NAMED trace. The heartbeat is
@@ -8348,7 +8357,15 @@ fn TerminalCanvas(
                                     }
                                 }
                             }
-                            Ok(TerminalJsEvent::Input { data }) => {
+                            Ok(TerminalJsEvent::Input { data, ring_id }) => {
+                                // [F1-input] Dual-leg exactly-once: whichever leg
+                                // delivers an id first applies it; the other no-ops.
+                                if let Some(ring_id_value) = ring_id {
+                                    if ring_id_value <= synth_last_input_id {
+                                        continue;
+                                    }
+                                    synth_last_input_id = ring_id_value;
+                                }
                                 set_signal_if_changed(terminal_has_meaningful_output, true);
                                 set_signal_if_changed(terminal_prompt_only, false);
                                 // ytrace input latency: keystroke → PTY register → render
@@ -12067,6 +12084,60 @@ fn TerminalCanvas(
                             }
                         }
                     }
+                    synth_input_drain_answer = async {
+                        synth_input_drain_eval
+                            .as_mut()
+                            .expect("input drain armed")
+                            .await
+                    },
+                        if synth_input_drain_eval.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "synth_input_drain",
+                            &session_path,
+                        );
+                        synth_input_drain_eval = None;
+                        let chunks = match synth_input_drain_answer {
+                            Ok(value) => value
+                                .as_str()
+                                .and_then(|body| serde_json::from_str::<Vec<Value>>(body).ok())
+                                .unwrap_or_default(),
+                            Err(_error) => Vec::new(),
+                        };
+                        if !chunks.is_empty() {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "synthesized_input_drained",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                    "chunks": chunks.len(),
+                                }),
+                            );
+                        }
+                        for chunk in chunks {
+                            let ring_id_value = chunk.get("id").and_then(Value::as_u64);
+                            let Some(data) = chunk.get("data").and_then(Value::as_str) else {
+                                continue;
+                            };
+                            if let Some(ring_id_value) = ring_id_value {
+                                if ring_id_value <= synth_last_input_id {
+                                    continue;
+                                }
+                                synth_last_input_id = ring_id_value;
+                            }
+                            set_signal_if_changed(terminal_has_meaningful_output, true);
+                            set_signal_if_changed(terminal_prompt_only, false);
+                            let track_completion = is_remote_resume_session;
+                            let _ = terminal_write_tx.send(TerminalWriteCommand::Input {
+                                data: data.to_string(),
+                                enqueued_ms: current_millis(),
+                                track_completion,
+                            });
+                        }
+                    }
                     _ = tokio::time::sleep_until(
                         warm_gate_deadline
                             .unwrap_or_else(tokio::time::Instant::now),
@@ -12304,6 +12375,16 @@ fn TerminalCanvas(
                                 .send((read_generation, read_issued_at_cursor, outcome))
                                 .await;
                         });
+                        // [F1-input] Synthesized mounts drain the page-side input
+                        // ring on the read cadence — the dual-leg's second
+                        // half over the one transport alive in the shed
+                        // window.
+                        if js_ready_synthesized && synth_input_drain_eval.is_none() {
+                            synth_input_drain_eval = Some(Box::pin(
+                                document::eval(&terminal_input_ring_drain_script(&host_id))
+                                    .join::<Value>(),
+                            ));
+                        }
                     }
                     Some((read_generation, read_issued_at_cursor, terminal_read_outcome)) =
                         terminal_read_rx.recv() =>
