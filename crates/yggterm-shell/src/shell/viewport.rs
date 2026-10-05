@@ -3487,6 +3487,125 @@ async fn retained_rehydrate_seed_retry_or_refuse(
         );
     });
 }
+/// [F1-(f)] The dual-leg input cursor — sol Q4's acked CONTIGUOUS
+/// watermark. The first cut kept a high-water mark, which silently
+/// DISCARDED an older chunk whenever the bridge leg delivered id 2 before
+/// the ring leg returned 1+2; this cursor only forgets an id once every id
+/// up to it has been committed, and only after the writer enqueue for that
+/// id succeeded (begin → commit/rollback). The guarantee is exactly-once
+/// ENQUEUE per id across both legs; daemon-side execution keeps its own
+/// write-completion semantics.
+#[derive(Debug, Default)]
+pub(crate) struct InputRingCursor {
+    /// Highest id such that every id in 1..=watermark has been enqueued.
+    watermark: u64,
+    /// Ids > watermark already applied by one leg, awaiting their contiguous
+    /// prefix (the cross-leg reorder window).
+    pending: std::collections::BTreeSet<u64>,
+}
+
+impl InputRingCursor {
+    /// First sighting of `id`? Tentatively marks it applied; the caller MUST
+    /// `commit` (writer accepted) or `rollback` (writer rejected). `None`
+    /// (legacy chunk without an id) is always a first sighting and never
+    /// gates the watermark.
+    pub(crate) fn begin(&mut self, id: Option<u64>) -> bool {
+        let Some(id) = id else { return true; };
+        if id <= self.watermark || self.pending.contains(&id) {
+            return false;
+        }
+        self.pending.insert(id);
+        true
+    }
+
+    /// The writer accepted a chunk: seal the contiguous prefix that may now
+    /// be complete. Advancing the watermark is what an ack may prune up to.
+    pub(crate) fn commit(&mut self) {
+        while self.pending.contains(&(self.watermark + 1)) {
+            self.watermark += 1;
+            self.pending.remove(&self.watermark);
+        }
+    }
+
+    /// The writer rejected a chunk (channel gone — the mount is tearing
+    /// down): un-mark so a later drain can retry it. Only meaningful for
+    /// ids the watermark has not yet passed.
+    pub(crate) fn rollback(&mut self, id: Option<u64>) {
+        if let Some(id) = id {
+            if id > self.watermark {
+                self.pending.remove(&id);
+            }
+        }
+    }
+
+    /// [F1-(f) Q-A] The incarnation baseline: the page captured its
+    /// nextId at THIS mount's stamp, so every id below it predates the
+    /// mount. Sealing below it (once, monotonically) lets the contiguous
+    /// watermark start where this mount's ids actually start — without
+    /// this, a mount inheriting a bucket at id 58 would stall at 0
+    /// forever, growing `pending` and never acking (sol Q-A's stall).
+    pub(crate) fn baseline(&mut self, below: u64) {
+        if below > self.watermark {
+            self.watermark = below;
+            self.pending.retain(|&pending| pending > below);
+        }
+    }
+
+    /// [F1-(f) Q-A] The page dropped its OLDEST chunks past the byte
+    /// bound — the missing ids are already lost there, so seal the
+    /// watermark past the gap instead of stalling the contiguous prefix
+    /// (which would grow `pending` unboundedly and never ack).
+    pub(crate) fn seal_to(&mut self, id: u64) {
+        if id > self.watermark {
+            self.watermark = id;
+            self.pending.retain(|&pending| pending > id);
+        }
+    }
+
+    pub(crate) fn watermark(&self) -> u64 {
+        self.watermark
+    }
+}
+
+/// [F1-(f)] The drain script's JSON response (see
+/// `terminal_input_ring_drain_script`): fresh chunks plus the prune and
+/// overflow bookkeeping Rust traces.
+#[derive(Debug, Default, serde::Deserialize)]
+struct InputRingDrainResponse {
+    #[serde(default)]
+    chunks: Vec<InputRingChunk>,
+    /// The incarnation the drain script ran under — MUST echo the
+    /// requesting mount's or the whole answer is stale (sol Q-B).
+    #[serde(default)]
+    inc: Option<u64>,
+    /// The bucket's nextId at THIS mount's stamp — everything below it
+    /// predates the mount (sol Q-A's baseline).
+    #[serde(default)]
+    baseline: Option<u64>,
+    #[serde(default)]
+    pruned: u64,
+    #[serde(default)]
+    stale: u64,
+    #[serde(default)]
+    overflowed: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InputRingChunk {
+    #[serde(default)]
+    id: Option<u64>,
+    data: String,
+}
+
+/// [F1-(f) Q-B] Process-unique per-mount incarnation for the input ring:
+/// each TerminalCanvas draw takes one and stamps it into the page at mount
+/// start, binding ring chunks and drain answers to the mount that owns
+/// them across any remount race.
+fn next_input_ring_incarnation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[component]
 fn TerminalCanvas(
     session: ManagedSessionView,
@@ -6920,15 +7039,130 @@ fn TerminalCanvas(
                 >,
             > = None;
             let mut js_ready_synthesized = false;
-            // [F1-input] The dual-leg input cursor + the synthesized-mode ring
-            // drain (a pinned eval over the one leg alive through the shed
-            // window, kicked on the read-pump cadence).
-            let mut synth_last_input_id: u64 = 0;
+            // [F1-(f)] The dual-leg input CURSOR (sol Q4: an acked
+            // CONTIGUOUS watermark, not a high-water mark — cross-leg
+            // reordering must never discard an older unapplied chunk), the
+            // watermark the page ring has already pruned up to, and the
+            // drain deadline that frees input draining from the read pump.
+            let mut input_ring_cursor = InputRingCursor::default();
+            let input_ring_incarnation = next_input_ring_incarnation();
+            let mut synth_input_acked_watermark: u64 = 0;
+            let mut synth_input_drain_deadline: Option<tokio::time::Instant> = None;
             let mut synth_input_drain_eval: Option<
                 std::pin::Pin<
                     Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
                 >,
             > = None;
+            // [F1-(f)] SHARED apply handler (sol Q5: the drain leg must not
+            // fork the healthy leg's bookkeeping). Expands to a block ending
+            // in the writer-enqueue result — exactly-once ENQUEUE is the
+            // stated guarantee; everything else (ytrace latency, remote
+            // queued-input accounting, echo-burst scheduling, busy hint,
+            // input-hot snapshot) behaves identically on both legs.
+            macro_rules! apply_terminal_input {
+                ($data:expr, $leg:expr) => {{
+                    set_signal_if_changed(terminal_has_meaningful_output, true);
+                    set_signal_if_changed(terminal_prompt_only, false);
+                    // ytrace input latency: keystroke → PTY register → render
+                    yggterm_core::perf::ytrace_emit_event(
+                        "shell",
+                        "input",
+                        "keystroke",
+                        serde_json::json!({
+                            "session_path": terminal_input_session_path.clone(),
+                            "data_len": $data.len(),
+                            "is_remote": is_remote_resume_session,
+                            "leg": $leg,
+                            // Shape, never content — this is the human's own
+                            // typing and the stream it lands in is durable.
+                            "shape": yggterm_core::perf::input_shape($data),
+                        }),
+                    );
+                    // ENQUEUE, never await: the dedicated writer task
+                    // performs the daemon write in order, and a failure
+                    // comes back on the `write_failure` select branch
+                    // below. The echo-anticipation state (read burst,
+                    // busy hint, input-hot mark) arms optimistically at
+                    // enqueue — if the write later fails, the recovery
+                    // branch resets the cadence exactly as the inline
+                    // error path did.
+                    let track_completion = is_remote_resume_session;
+                    // Normal healthy input has a small in-flight
+                    // queue on every key. Keep that count local to
+                    // the writer instead of publishing a transient
+                    // ShellState status that would re-render the
+                    // whole sidebar and flash amber for 50–100 ms.
+                    // Publish queued bytes only while transport or
+                    // the frame is genuinely under attention.
+                    if track_completion
+                        && (terminal_transport_degraded || terminal_ghost_frame)
+                    {
+                        cached_input_bytes = cached_input_bytes.saturating_add($data.len());
+                        update_terminal_surface_status(
+                            state,
+                            &session_path,
+                            terminal_transport_degraded,
+                            terminal_ghost_frame,
+                            cached_input_bytes,
+                            "input_queued",
+                        );
+                    }
+                    let enqueued = terminal_write_tx
+                        .send(TerminalWriteCommand::Input {
+                            data: $data.to_string(),
+                            enqueued_ms: current_millis(),
+                            track_completion,
+                        })
+                        .is_ok();
+                    if is_remote_resume_session {
+                        set_signal_if_changed(terminal_resume_surface_staged, true);
+                        // Enqueueing is not an acknowledgement. The
+                        // old optimistic green transition made an
+                        // offline peer look healthy and discarded
+                        // the distinction between cached input and
+                        // delivered input. The writer/read edges
+                        // below own these transitions.
+                    }
+                    read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                    input_echo_read_burst_remaining =
+                        TERMINAL_INPUT_ECHO_READ_BURST_READS;
+                    next_read_deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
+                    let (show_busy_hint, next_pending_input_has_text) =
+                        terminal_input_busy_hint_decision(
+                            $data,
+                            pending_terminal_input_has_text,
+                        );
+                    pending_terminal_input_has_text = next_pending_input_has_text;
+                    if codex_completion_notifications_enabled && show_busy_hint {
+                        codex_busy_since_input = true;
+                        codex_busy_started_at_ms.get_or_insert_with(current_millis);
+                        codex_completion_notified = false;
+                    }
+                    // Mark input hot + arm the post-input snapshot WITHOUT a
+                    // per-keystroke whole-shell re-render. The optimistic busy
+                    // hint still shows on submit (it changes reactive state, so
+                    // it takes the re-render path inside the helper).
+                    let optimistic_busy_hint = show_busy_hint
+                        && terminal_input_uses_optimistic_busy_hint(&session_path);
+                    mark_terminal_input_hot_and_schedule_snapshot(
+                        state,
+                        &session_path,
+                        optimistic_busy_hint,
+                    );
+                    enqueued
+                }};
+            }
+            // [F1-(f) Q-B] Stamp this mount's incarnation into the page
+            // BEFORE any input can be recorded — fire-and-forget (the
+            // established pattern); the stamp script owns bucket.inc and
+            // the baseline capture atomically.
+            {
+                let _ = document::eval(&terminal_input_ring_stamp_script(
+                    &host_id,
+                    input_ring_incarnation,
+                ));
+            }
             // [11.187] The drop witness + the liveness heartbeat. The guard
             // lives for the loop's whole life; its Drop fires at task end
             // (normal or panic) and leaves a NAMED trace. The heartbeat is
@@ -8369,100 +8603,22 @@ fn TerminalCanvas(
                                 }
                             }
                             Ok(TerminalJsEvent::Input { data, ring_id }) => {
-                                // [F1-input] Dual-leg exactly-once: whichever leg
-                                // delivers an id first applies it; the other no-ops.
-                                if let Some(ring_id_value) = ring_id {
-                                    if ring_id_value <= synth_last_input_id {
-                                        continue;
-                                    }
-                                    synth_last_input_id = ring_id_value;
+                                // [F1-(f)] Dual-leg exactly-once ENQUEUE: the
+                                // cursor tentatively marks an id at first
+                                // sighting and seals it only when the writer
+                                // accepted the chunk — a duplicate sighting on
+                                // the other leg no-ops, and cross-leg
+                                // reordering cannot discard an older chunk
+                                // because the watermark is CONTIGUOUS (sol Q4).
+                                if !input_ring_cursor.begin(ring_id) {
+                                    continue;
                                 }
-                                set_signal_if_changed(terminal_has_meaningful_output, true);
-                                set_signal_if_changed(terminal_prompt_only, false);
-                                // ytrace input latency: keystroke → PTY register → render
-                                yggterm_core::perf::ytrace_emit_event(
-                                    "shell",
-                                    "input",
-                                    "keystroke",
-                                    serde_json::json!({
-                                        "session_path": terminal_input_session_path.clone(),
-                                        "data_len": data.len(),
-                                        "is_remote": is_remote_resume_session,
-                                        // Shape, never content — this is the human's own
-                                        // typing and the stream it lands in is durable.
-                                        "shape": yggterm_core::perf::input_shape(&data),
-                                    }),
-                                );
-                                // ENQUEUE, never await: the dedicated writer task
-                                // performs the daemon write in order, and a failure
-                                // comes back on the `write_failure` select branch
-                                // below. The echo-anticipation state (read burst,
-                                // busy hint, input-hot mark) arms optimistically at
-                                // enqueue — if the write later fails, the recovery
-                                // branch resets the cadence exactly as the inline
-                                // error path did.
-                                let track_completion = is_remote_resume_session;
-                                // Normal healthy input has a small in-flight
-                                // queue on every key. Keep that count local to
-                                // the writer instead of publishing a transient
-                                // ShellState status that would re-render the
-                                // whole sidebar and flash amber for 50–100 ms.
-                                // Publish queued bytes only while transport or
-                                // the frame is genuinely under attention.
-                                if track_completion
-                                    && (terminal_transport_degraded || terminal_ghost_frame)
-                                {
-                                    cached_input_bytes = cached_input_bytes.saturating_add(data.len());
-                                    update_terminal_surface_status(
-                                        state,
-                                        &session_path,
-                                        terminal_transport_degraded,
-                                        terminal_ghost_frame,
-                                        cached_input_bytes,
-                                        "input_queued",
-                                    );
+                                let enqueued = apply_terminal_input!(&data, "dioxus");
+                                if enqueued {
+                                    input_ring_cursor.commit();
+                                } else {
+                                    input_ring_cursor.rollback(ring_id);
                                 }
-                                let _ = terminal_write_tx.send(TerminalWriteCommand::Input {
-                                    data: data.clone(),
-                                    enqueued_ms: current_millis(),
-                                    track_completion,
-                                });
-                                if is_remote_resume_session {
-                                    set_signal_if_changed(terminal_resume_surface_staged, true);
-                                    // Enqueueing is not an acknowledgement. The
-                                    // old optimistic green transition made an
-                                    // offline peer look healthy and discarded
-                                    // the distinction between cached input and
-                                    // delivered input. The writer/read edges
-                                    // below own these transitions.
-                                }
-                                read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
-                                input_echo_read_burst_remaining =
-                                    TERMINAL_INPUT_ECHO_READ_BURST_READS;
-                                next_read_deadline = tokio::time::Instant::now()
-                                    + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
-                                let (show_busy_hint, next_pending_input_has_text) =
-                                    terminal_input_busy_hint_decision(
-                                        &data,
-                                        pending_terminal_input_has_text,
-                                    );
-                                pending_terminal_input_has_text = next_pending_input_has_text;
-                                if codex_completion_notifications_enabled && show_busy_hint {
-                                    codex_busy_since_input = true;
-                                    codex_busy_started_at_ms.get_or_insert_with(current_millis);
-                                    codex_completion_notified = false;
-                                }
-                                // Mark input hot + arm the post-input snapshot WITHOUT a
-                                // per-keystroke whole-shell re-render. The optimistic busy
-                                // hint still shows on submit (it changes reactive state, so
-                                // it takes the re-render path inside the helper).
-                                let optimistic_busy_hint = show_busy_hint
-                                    && terminal_input_uses_optimistic_busy_hint(&session_path);
-                                mark_terminal_input_hot_and_schedule_snapshot(
-                                    state,
-                                    &session_path,
-                                    optimistic_busy_hint,
-                                );
                             }
                             Ok(TerminalJsEvent::ReadNudge { reason }) => {
                                 read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
@@ -11927,6 +12083,14 @@ fn TerminalCanvas(
                             // the mount is a constructed-but-never-fed term
                             // that called ready — the blank-forever zombie.
                             js_ready_synthesized = true;
+                            // [F1-(f)] Start the drain-deadline cadence the
+                            // moment synthesis arms — input draining must not
+                            // depend on read-pump ticks.
+                            if synth_input_drain_deadline.is_none() {
+                                synth_input_drain_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_millis(50),
+                                );
+                            }
                             if !synth_snapshot_requested {
                                 synth_snapshot_requested = true;
                                 append_trace_event(
@@ -12108,14 +12272,91 @@ fn TerminalCanvas(
                             &session_path,
                         );
                         synth_input_drain_eval = None;
-                        let chunks = match synth_input_drain_answer {
+                        // [F1-(f)] Read cadence or drain-deadline tick: read
+                        // ONLY the chunks this mount has not enqueued yet
+                        // (non-destructive; the next cycle's acked watermark
+                        // prunes), then route each through the SAME
+                        // apply_terminal_input! handler the healthy dioxus
+                        // leg uses — no forked bookkeeping (sol Q5).
+                        let drained = match synth_input_drain_answer {
                             Ok(value) => value
                                 .as_str()
-                                .and_then(|body| serde_json::from_str::<Vec<Value>>(body).ok())
+                                .and_then(|body| {
+                                    serde_json::from_str::<InputRingDrainResponse>(body).ok()
+                                })
                                 .unwrap_or_default(),
-                            Err(_error) => Vec::new(),
+                            Err(_error) => InputRingDrainResponse::default(),
                         };
-                        if !chunks.is_empty() {
+                        // [F1-(f) Q-B] Bind the answer to THIS mount: a
+                        // drain eval whose return crossed a remount echoes
+                        // the OLD incarnation — discard it whole, chunks
+                        // and prune alike, and leave the ring untouched.
+                        if drained.inc != Some(input_ring_incarnation) {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "synthesized_input_stale_answer",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                    "answer_inc": drained.inc,
+                                    "mount_inc": input_ring_incarnation,
+                                }),
+                            );
+                            continue;
+                        }
+                        // [F1-(f) Q-A] Seal below the incarnation baseline
+                        // BEFORE applying chunks: the reorder window can
+                        // deliver a higher id first, and the baseline must
+                        // never swallow an unapplied lower id.
+                        if let Some(baseline) = drained.baseline {
+                            input_ring_cursor.baseline(baseline.saturating_sub(1));
+                        }
+                        if drained.overflowed {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "synthesized_input_ring_overflow",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                }),
+                            );
+                        }
+                        let mut applied = 0usize;
+                        let mut skipped = 0usize;
+                        let mut drained_max_id: u64 = 0;
+                        let drained_count = drained.chunks.len();
+                        for chunk in drained.chunks {
+                            if let Some(chunk_id) = chunk.id {
+                                drained_max_id = drained_max_id.max(chunk_id);
+                            }
+                            if !input_ring_cursor.begin(chunk.id) {
+                                skipped += 1;
+                                continue;
+                            }
+                            let enqueued = apply_terminal_input!(&chunk.data, "ring");
+                            if enqueued {
+                                input_ring_cursor.commit();
+                                applied += 1;
+                            } else {
+                                // The writer channel is gone — the mount is
+                                // tearing down. Un-mark so a racing drain
+                                // cannot seal past this chunk.
+                                input_ring_cursor.rollback(chunk.id);
+                            }
+                        }
+                        // [F1-(f) Q-A] The page flagged overflow: its byte
+                        // bound dropped OLDEST chunks, so the contiguous
+                        // prefix may never complete — seal past the gap
+                        // (those ids are already lost page-side) instead
+                        // of stalling the watermark and growing pending.
+                        if drained.overflowed && drained_max_id > 0 {
+                            input_ring_cursor.seal_to(drained_max_id);
+                        }
+                        if applied > 0 || skipped > 0 || drained.pruned > 0 {
                             append_trace_event(
                                 &trace_home,
                                 "ui",
@@ -12124,29 +12365,50 @@ fn TerminalCanvas(
                                 json!({
                                     "session_path": session_path.clone(),
                                     "host_id": host_id.clone(),
-                                    "chunks": chunks.len(),
+                                    "chunks": drained_count,
+                                    "applied": applied,
+                                    "skipped_duplicates": skipped,
+                                    "pruned": drained.pruned,
+                                    "pruned_stale": drained.stale,
+                                    "watermark": input_ring_cursor.watermark(),
+                                    "overflowed": drained.overflowed,
                                 }),
                             );
                         }
-                        for chunk in chunks {
-                            let ring_id_value = chunk.get("id").and_then(Value::as_u64);
-                            let Some(data) = chunk.get("data").and_then(Value::as_str) else {
-                                continue;
-                            };
-                            if let Some(ring_id_value) = ring_id_value {
-                                if ring_id_value <= synth_last_input_id {
-                                    continue;
-                                }
-                                synth_last_input_id = ring_id_value;
-                            }
-                            set_signal_if_changed(terminal_has_meaningful_output, true);
-                            set_signal_if_changed(terminal_prompt_only, false);
-                            let track_completion = is_remote_resume_session;
-                            let _ = terminal_write_tx.send(TerminalWriteCommand::Input {
-                                data: data.to_string(),
-                                enqueued_ms: current_millis(),
-                                track_completion,
-                            });
+                        // [F1-(f)] ACK: the contiguous watermark advances ONLY
+                        // after the writer enqueue succeeded, and the prune
+                        // rides the NEXT drain call — a lost return can never
+                        // lose input (the read was non-destructive), and a
+                        // lost prune only costs a re-read Rust dedupes.
+                        if input_ring_cursor.watermark() > synth_input_acked_watermark {
+                            synth_input_acked_watermark = input_ring_cursor.watermark();
+                        }
+                    }
+                    // [F1-(f)] The drain deadline: synthesized input must
+                    // not wait on the read pump (sol Q4 — a drain cadence
+                    // independent of reads).
+                    _ = tokio::time::sleep_until(
+                        synth_input_drain_deadline
+                            .unwrap_or_else(tokio::time::Instant::now),
+                    ),
+                        if synth_input_drain_deadline.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "synth_input_drain_tick",
+                            &session_path,
+                        );
+                        synth_input_drain_deadline = Some(
+                            tokio::time::Instant::now() + Duration::from_millis(150),
+                        );
+                        if js_ready_synthesized && synth_input_drain_eval.is_none() {
+                            synth_input_drain_eval = Some(Box::pin(
+                                document::eval(&terminal_input_ring_drain_script(
+                                    &host_id,
+                                    synth_input_acked_watermark,
+                                    input_ring_incarnation,
+                                ))
+                                .join::<Value>(),
+                            ));
                         }
                     }
                     _ = tokio::time::sleep_until(
@@ -12392,8 +12654,12 @@ fn TerminalCanvas(
                         // window.
                         if js_ready_synthesized && synth_input_drain_eval.is_none() {
                             synth_input_drain_eval = Some(Box::pin(
-                                document::eval(&terminal_input_ring_drain_script(&host_id))
-                                    .join::<Value>(),
+                                document::eval(&terminal_input_ring_drain_script(
+                                    &host_id,
+                                    synth_input_acked_watermark,
+                                    input_ring_incarnation,
+                                ))
+                                .join::<Value>(),
                             ));
                         }
                     }

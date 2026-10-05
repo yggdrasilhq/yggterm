@@ -13245,7 +13245,7 @@ console.log('ok');
         assert!(script.contains("return false;"));
         assert!(script.contains("const terminalDataIsSuppressedProtocolResponse = (data) => {"));
         assert!(script.contains("terminalProtocolResponseFallbackAllowed(data)"));
-        assert!(script.contains("sendTerminalEvent({ kind: \"input\", data });"));
+        assert!(script.contains("sendTerminalInput(data);"));
         assert!(script.contains("recordSuppressedTerminalProtocolResponse('onData', data);"));
         assert!(script.contains("suppressedTerminalProtocolResponseCount"));
         assert!(script.contains("lastSuppressedTerminalProtocolResponse"));
@@ -18485,7 +18485,9 @@ console.log('ok');
             .expect("terminal script should have a stable post-bootstrap body");
         let stable_channel_body = &script[stable_channel_start..];
         assert!(
-            stable_channel_body.contains("sendTerminalEvent({ kind: \"input\", data });")
+            script.contains("const sendTerminalInput = (data) => {")
+                && script
+                    .contains("sendTerminalEvent({ kind: \"input\", data: data, ring_id: ringId });")
                 && stable_channel_body.contains("const message = await recvTerminalCommand();"),
             "long-lived terminal handlers should use the captured channel for input and command receive"
         );
@@ -18711,7 +18713,7 @@ console.log('ok');
             "enter/control input should flush immediately while fast printable typing is coalesced"
         );
         assert!(
-            script.contains("flushPendingTerminalInput('before_protocol');\n                sendTerminalEvent({ kind: \"input\", data });"),
+            script.contains("flushPendingTerminalInput('before_protocol');\n                sendTerminalInput(data);"),
             "terminal protocol replies must bypass the user-input batch after flushing pending user bytes"
         );
         assert!(
@@ -19226,8 +19228,9 @@ console.log('ok');
                 )
                 && source.contains("const TERMINAL_IDLE_READ_BACKOFF_STEP_MS: u64 = 500;")
                 && source.contains("let mut input_echo_read_burst_remaining = 0_u8;")
-                && source.contains(
-                    "input_echo_read_burst_remaining =\n                                    TERMINAL_INPUT_ECHO_READ_BURST_READS;"
+                && seam_contains(
+                    source,
+                    "input_echo_read_burst_remaining = TERMINAL_INPUT_ECHO_READ_BURST_READS;",
                 )
                 && source.contains("terminal_read_nudge_burst_reads(&reason,")
                 && source.contains(
@@ -69577,7 +69580,7 @@ mod terminal_loop_input_starvation_locks {
     fn the_keystroke_write_is_dispatched_off_the_select_loop() {
         let source = include_str!("viewport.rs");
 
-        let input_marker = "Ok(TerminalJsEvent::Input { data }) =>";
+        let input_marker = "Ok(TerminalJsEvent::Input { data, ring_id }) =>";
         let input_at = source
             .find(input_marker)
             .expect("the terminal loop must still have an Input arm");
@@ -69598,8 +69601,12 @@ mod terminal_loop_input_starvation_locks {
              without waiting on any round trip"
         );
         assert!(
-            input_arm.contains("terminal_write_tx.send("),
-            "the Input arm no longer enqueues onto the ordered writer channel"
+            input_arm.contains("apply_terminal_input!("),
+            "the Input arm no longer routes through the shared apply handler"
+        );
+        assert!(
+            source.contains("let enqueued = terminal_write_tx"),
+            "the shared apply handler no longer enqueues onto the ordered writer channel"
         );
 
         // The writer task: ordered, off the loop, and it still performs the
@@ -71942,5 +71949,188 @@ mod web_surface_immersion_locks {
             script.contains("local://stamp-test"),
             "the stamp must carry the session identity (the [11.171] join key)"
         );
+    }
+
+    // ======================================================================
+    // [F1-(f)] The input-ring cursor — sol patch-review Q4's acked
+    // CONTIGUOUS watermark (node
+    // lores/chain-of-thought/2026-10-05-yggterm-f1-sol-patch-review.md).
+    // ======================================================================
+
+    /// Cross-leg reordering must never discard an older unapplied chunk:
+    /// the bridge leg can deliver id 2 before the ring leg returns 1+2.
+    /// The first cut's high-water mark dropped chunk 1 exactly here.
+    #[test]
+    fn input_ring_cursor_survives_cross_leg_reordering() {
+        // Every shell/*.rs is `include!`d into one flat `shell` module.
+        use super::InputRingCursor;
+
+        let mut cursor = InputRingCursor::default();
+        assert!(cursor.begin(Some(2)));
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 0, "id 2 alone must not seal the prefix");
+        assert!(
+            cursor.begin(Some(1)),
+            "an older unapplied chunk must survive cross-leg reordering"
+        );
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 2);
+        // Duplicates sighted on the other leg no-op.
+        assert!(!cursor.begin(Some(2)));
+        assert!(!cursor.begin(Some(1)));
+        // The next chunk applies once and advances the watermark.
+        assert!(cursor.begin(Some(3)));
+        assert!(!cursor.begin(Some(3)));
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 3);
+    }
+
+    /// A chunk whose writer enqueue failed is retryable: rollback un-marks
+    /// it so a later drain re-offers it (non-destructive reads, sol Q4).
+    #[test]
+    fn input_ring_cursor_rollback_retries_failed_enqueue() {
+        use super::InputRingCursor;
+
+        let mut cursor = InputRingCursor::default();
+        assert!(cursor.begin(Some(1)));
+        cursor.commit();
+        assert!(cursor.begin(Some(2)));
+        cursor.rollback(Some(2));
+        assert!(
+            cursor.begin(Some(2)),
+            "a rolled-back chunk must be retryable"
+        );
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 2);
+        // Rollback can never un-seal what the watermark already passed.
+        assert!(!cursor.begin(Some(1)));
+    }
+
+    /// Legacy chunks without an id (older in-page scripts) apply
+    /// unconditionally and never gate the contiguous watermark.
+    #[test]
+    fn input_ring_cursor_unnumbered_chunks_never_gate_the_watermark() {
+        use super::InputRingCursor;
+
+        let mut cursor = InputRingCursor::default();
+        assert!(cursor.begin(Some(1)));
+        cursor.commit();
+        assert!(cursor.begin(None));
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 1);
+        assert!(cursor.begin(Some(2)));
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 2);
+    }
+
+    /// The drain script is NON-DESTRUCTIVE and prunes by the acked
+    /// watermark + incarnation (the replay kill-switch, sol Q5/Q-B) —
+    /// lock the shape against a refactor regressing it back to splice.
+    #[test]
+    fn input_ring_drain_script_is_non_destructive_and_incarnation_aware() {
+        use super::seam_contains;
+        use super::terminal_input_ring_drain_script;
+
+        let script = terminal_input_ring_drain_script("host-x", 7, 42);
+        assert!(
+            !script.contains(".splice("),
+            "the drain must never splice — a lost eval return must not lose input"
+        );
+        assert!(
+            seam_contains(&script, "__c.id <= __acked || __staleChunk"),
+            "the prune filter must be acked-watermark + stale-incarnation"
+        );
+        assert!(
+            seam_contains(&script, "__c.inc !== __inc"),
+            "the stale filter must bind chunks to the REQUESTING mount's incarnation"
+        );
+        assert!(
+            seam_contains(&script, "const __acked = 7;"),
+            "the acked watermark must ride the script"
+        );
+        assert!(
+            seam_contains(&script, "const __inc = 42;"),
+            "the requesting mount's incarnation must ride the script"
+        );
+        assert!(
+            seam_contains(&script, "inc: __inc"),
+            "the answer must echo the incarnation for Rust to validate"
+        );
+        assert!(
+            script.contains("overflowed"),
+            "the overflow flag must ride the response"
+        );
+        assert!(
+            script.contains("baseline"),
+            "the incarnation baseline must ride the response"
+        );
+    }
+
+    /// sol Q-A/Q-C: a fresh mount inheriting a bucket at id 58 must not
+    /// stall its watermark at 0 — the baseline (stamp-time nextId - 1)
+    /// lets the contiguous prefix start where this mount's ids start.
+    #[test]
+    fn input_ring_cursor_baseline_starts_where_the_mount_starts() {
+        use super::InputRingCursor;
+
+        let mut cursor = InputRingCursor::default();
+        // The drain answer reports baseline 58 (nextId 59 at stamp).
+        cursor.baseline(57);
+        assert_eq!(cursor.watermark(), 57);
+        // Reorder window: dioxus delivers 59 BEFORE the drain returns 58+59.
+        assert!(cursor.begin(Some(59)));
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 57, "59 alone must not seal the prefix");
+        assert!(
+            cursor.begin(Some(58)),
+            "an older unapplied chunk must survive above the baseline"
+        );
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 59);
+        // The next chunk applies once; the ack can prune to 60.
+        assert!(cursor.begin(Some(60)));
+        assert!(!cursor.begin(Some(60)));
+        cursor.commit();
+        assert_eq!(cursor.watermark(), 60);
+    }
+
+    /// sol Q-A: baseline is monotonic and can never UNSEAL or swallow —
+    /// a late, LOWER baseline report changes nothing.
+    #[test]
+    fn input_ring_cursor_baseline_is_monotonic() {
+        use super::InputRingCursor;
+
+        let mut cursor = InputRingCursor::default();
+        cursor.baseline(57);
+        assert!(cursor.begin(Some(58)));
+        cursor.commit();
+        cursor.baseline(3);
+        assert_eq!(cursor.watermark(), 58, "a stale lower baseline is a no-op");
+        assert!(!cursor.begin(Some(58)));
+    }
+
+    /// sol Q-A: the page's byte bound drops OLDEST chunks — the missing
+    /// ids are lost page-side, so the cursor seals past the gap instead of
+    /// stalling the contiguous prefix forever (and growing `pending`).
+    #[test]
+    fn input_ring_cursor_seals_over_byte_bound_gaps() {
+        use super::InputRingCursor;
+
+        let mut cursor = InputRingCursor::default();
+        cursor.baseline(9);
+        // Chunks 10..=12 applied; the page then flags overflow after
+        // dropping 13+ — chunk 14 still arrives.
+        for id in 10..=12 {
+            assert!(cursor.begin(Some(id)));
+            cursor.commit();
+        }
+        assert_eq!(cursor.watermark(), 12);
+        assert!(cursor.begin(Some(14)));
+        // Overflow report: seal to the max id seen this cycle.
+        cursor.seal_to(14);
+        assert_eq!(cursor.watermark(), 14);
+        // A late 13 (the dropped id, somehow re-delivered) is now a dup.
+        assert!(!cursor.begin(Some(13)));
+        assert_eq!(cursor.watermark(), 14);
     }
 }
