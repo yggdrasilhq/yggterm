@@ -1096,6 +1096,34 @@ def _do_tick_project(project, dry=False):
     # A project with no subscriptions is still not under the plane's watch.
     last_attempt = _last_build(project, consumed_only=False)
     main_moved = bool(last_attempt and last_attempt.get("sha"))         and local_main != last_attempt["sha"]
+    # [11.230] SWEEP: consume subs whose lane branch is gone from origin and
+    # whose enlist tip is already in main — BEFORE the dirty check. The
+    # clean-skip path ("subs but none dirty — skipping") never reaches the
+    # merge loop where the same arm lives, so without this sweep a
+    # branch-deleted sub sits unconsumed forever while every tick reports
+    # "none dirty" (measured live 2026-10-05 13:03-13:08 after the arm above
+    # landed — the sub survived its own fix's first ticks).
+    for s in list(subs):
+        lane = s["lane"]
+        remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
+        if git_rev(repo, remote_ref):
+            continue
+        enlist = (s.get("tip_at_enlist") or "").strip()
+        if enlist and git_is_ancestor(repo, enlist, local_main):
+            log(f"  sweep {lane}: branch deleted, enlist tip {enlist[:12]} in main — consuming the sub")
+            pth = _sub_path(project, lane)
+            if pth.exists():
+                pth.unlink(missing_ok=True)
+            subs.remove(s)
+        elif enlist:
+            log(f"  sweep {lane}: branch deleted, enlist tip {enlist[:12]} NOT in main — abandoned lane, consuming the sub as consumed-abandoned")
+            pth = _sub_path(project, lane)
+            if pth.exists():
+                pth.unlink(missing_ok=True)
+            subs.remove(s)
+    if not subs:
+        log(f"tick {project}: all subs consumed by the [11.230] sweep — nothing to do")
+        return {"status": "clean", "last": (last_attempt or {}).get("id")}
     dirty, last = _dirty_subs(project, pcfg, subs)
     if not dirty and last and upstream_main == local_main and not main_moved:
         log(f"tick {project}: {len(subs)} subs but none dirty since {last.get('id')} — skipping")
