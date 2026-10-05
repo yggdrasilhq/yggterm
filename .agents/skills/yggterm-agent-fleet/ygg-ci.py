@@ -1133,6 +1133,21 @@ def _do_tick_project(project, dry=False):
         remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
         tip = git_rev(repo, remote_ref)
         if not tip:
+            # [11.230] A sub whose lane branch was DELETED (the worktree law's
+            # post-merge cleanup) is not a merge conflict — it is a consumed
+            # or abandoned lane. The old arm booked "no-remote-branch" as a
+            # conflict forever: every tick reported merged=0 conflicts=N while
+            # real lanes sat behind the wedge (measured 2026-10-05, five stale
+            # subs, 25 min). Fall back to the enlist tip's ancestry.
+            enlist_tip = (s.get("tip_at_enlist") or "").strip()
+            if enlist_tip and git_is_ancestor(repo, enlist_tip, local_main):
+                log(f"  skip {lane}: branch deleted, enlist tip {enlist_tip[:12]} IS in main — consumed (merged, possibly under a rebase)")
+                merged.append({"lane": lane, "tip": enlist_tip, "already_in_main": True, "branch_deleted": True})
+                continue
+            if enlist_tip:
+                log(f"  ⛔ drop sub {lane}: branch deleted AND enlist tip {enlist_tip[:12]} NOT in main — an abandoned lane, not a retryable merge")
+                conflicts.append({"lane": lane, "tip": enlist_tip, "reason": "branch-deleted-abandoned", "drop_sub": True})
+                continue
             conflicts.append({"lane": lane, "reason": "no-remote-branch"})
             continue
         if git_is_ancestor(repo, tip, local_main):
