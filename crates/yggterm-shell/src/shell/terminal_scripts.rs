@@ -349,21 +349,92 @@ if (__t && typeof __t.write === 'function') {{
     )
 }
 
-/// [F1-input] Drain the page-side input ring for a synthesized mount: the
-/// keystrokes the page recorded (per-mount monotonic ids) come back over
-/// the eval-return leg — the one transport alive through the shed window.
-/// Rust owns the exactly-once cursor, so a chunk that already arrived via
-/// the (healed) dioxus leg no-ops there and here.
-pub(crate) fn terminal_input_ring_drain_script(host_id: &str) -> String {
+/// [F1-(f) Q-B] Stamp this mount's Rust-owned ring incarnation into the
+/// page, ONCE, at mount start. The stamp owns two things the send path and
+/// the drain both lean on:
+///   · `window.__yggtermInputInc[host] = N` — every chunk
+///     `sendTerminalInput` records carries it, and every drain answer
+///     echoes it for Rust to validate: a drain issued by one mount can
+///     never consume or acknowledge another mount's chunks, however its
+///     eval return is delayed across a remount (sol Q-B's stale-drain
+///     race).
+///   · `bucket.inc`/`bucket.baseline` — captured atomically with the
+///     stamp, the baseline is the bucket's nextId AT MOUNT START: every
+///     id below it predates this mount, so Rust seals the contiguous
+///     watermark below it instead of stalling at 0 forever (sol Q-A's
+///     baseline; ids stay monotonic across remounts by design).
+pub(crate) fn terminal_input_ring_stamp_script(host_id: &str, incarnation: u64) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"".to_string());
+    format!(
+        r#"(window.__yggtermInputInc = window.__yggtermInputInc || {{}})[{host}] = {incarnation};
+const __ring = (window.__yggtermInputRing = window.__yggtermInputRing || {{}});
+const __b = (__ring[{host}] = __ring[{host}] || {{ nextId: 1, chunks: [], bytes: 0, overflowed: false }});
+__b.inc = {incarnation};
+__b.baseline = __b.nextId;"#
+    )
+}
+
+/// [F1-(f)] Drain the page-side input ring for a synthesized mount — the
+/// sol-Q4/Q5 rework of the input dual-leg's second half. The keystrokes the
+/// page recorded (per-mount monotonic ids) come back over the eval-return
+/// leg, the one transport alive through the shed window. Three laws changed
+/// from the first cut:
+///   · NON-DESTRUCTIVE: chunks are READ here, never spliced — a lost eval
+///     return must not lose input (splice-before-ack was sol Q4's first
+///     defect). The `acked_watermark` Rust earned on the PREVIOUS cycle
+///     prunes the prefix the writer already accepted, and any chunk whose
+///     attempt stamp names a superseded mount is pruned as stale — a host
+///     reused by a fresh mount can never replay the old mount's history.
+///   · INCARNATION: chunks carry the mount attempt that typed them, so the
+///     filter above is the replay kill-switch; ids themselves stay
+///     monotonic across mounts for the Rust-side contiguous cursor.
+///   · OVERFLOW: the bucket's sticky byte-bound flag rides the response so
+///     Rust traces dropped input instead of losing it silently.
+/// Rust owns the contiguous acked watermark; a chunk that already arrived
+/// via the (healed) dioxus leg no-ops there and here.
+pub(crate) fn terminal_input_ring_drain_script(
+    host_id: &str,
+    acked_watermark: u64,
+    incarnation: u64,
+) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"const __h = {host};
+const __acked = {acked_watermark};
+const __inc = {incarnation};
 const __bucket = (window.__yggtermInputRing || {{}})[__h] || null;
 let __out = [];
+let __pruned = 0;
+let __stale = 0;
 if (__bucket && __bucket.chunks && __bucket.chunks.length) {{
-    __out = __bucket.chunks.splice(0, __bucket.chunks.length);
+    const __kept = [];
+    for (const __c of __bucket.chunks) {{
+        // [F1-(f) Q-B] stale = recorded under ANOTHER mount's incarnation
+        // (undefined/null included — a chunk without the stamp predates
+        // the stamp, i.e. this page never saw this mount's init).
+        const __staleChunk = __c.inc !== __inc;
+        if (__c.id <= __acked || __staleChunk) {{
+            __pruned += 1;
+            if (__staleChunk) {{ __stale += 1; }}
+            continue;
+        }}
+        __kept.push(__c);
+    }}
+    if (__pruned > 0) {{
+        __bucket.chunks = __kept;
+        __bucket.bytes = 0;
+        for (const __c of __kept) {{ __bucket.bytes += (__c.data || "").length; }}
+    }}
+    __out = __kept;
 }}
-return JSON.stringify(__out);"#
+return JSON.stringify({{
+    chunks: __out,
+    inc: __inc,
+    baseline: (__bucket && typeof __bucket.baseline === "number") ? __bucket.baseline : 1,
+    pruned: __pruned,
+    stale: __stale,
+    overflowed: __bucket ? !!__bucket.overflowed : false,
+}});"#
     )
 }
 
@@ -548,13 +619,31 @@ fn terminal_eval_script_with_canvas_renderer(
         const sendTerminalInput = (data) => {{
             let ringId = null;
             try {{
+                // [F1-(f) Q-B] The chunk's incarnation is the Rust-owned id
+                // the mount loop stamped into the page at mount start —
+                // ids alone are only monotonic; THIS is what binds a chunk
+                // to the mount that typed it.
+                const inc = (window.__yggtermInputInc || {{}})[hostId] || null;
                 const ring = (window.__yggtermInputRing = window.__yggtermInputRing || {{}});
-                const bucket = (ring[hostId] = ring[hostId] || {{ nextId: 1, chunks: [] }});
+                const bucket = (ring[hostId] = ring[hostId] || {{
+                    nextId: 1, chunks: [], bytes: 0, overflowed: false }});
                 ringId = bucket.nextId;
                 bucket.nextId += 1;
-                bucket.chunks.push({{ id: ringId, data: String(data) }});
-                if (bucket.chunks.length > 1024) {{
-                    bucket.chunks.splice(0, bucket.chunks.length - 1024);
+                bucket.chunks.push({{ id: ringId, inc: inc, data: String(data) }});
+                bucket.bytes += String(data).length;
+                // [F1-(f) Q-A/Q5] BYTE BOUND with explicit overflow. The
+                // budget counts UTF-16 units (JS .length) — the practical
+                // bound for typed input. Drop OLDEST and set the sticky
+                // flag Rust traces; a SINGLE chunk larger than the whole
+                // bound is retained and flagged, never silently dropped
+                // (dropping live input is worse than exceeding a soft
+                // bound). A dropped chunk opens an id GAP — Rust seals
+                // over it on the overflow flag rather than stalling.
+                while ((bucket.bytes > 131072 || bucket.chunks.length > 4096)
+                       && bucket.chunks.length > 1) {{
+                    const dropped = bucket.chunks.shift();
+                    bucket.bytes -= (dropped && dropped.data) ? dropped.data.length : 0;
+                    bucket.overflowed = true;
                 }}
             }} catch (_error) {{
                 ringId = null;
