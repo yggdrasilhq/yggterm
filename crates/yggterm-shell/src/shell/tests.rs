@@ -18513,7 +18513,7 @@ console.log('ok');
             "data": "/",
         }))
         .expect("valid terminal input events should still deserialize");
-        assert!(matches!(input, TerminalJsEvent::Input { data } if data == "/"));
+        assert!(matches!(input, TerminalJsEvent::Input { data, .. } if data == "/"));
         let read_nudge: TerminalJsEvent = serde_json::from_value(json!({
             "kind": "read_nudge",
             "reason": "app_control_send",
