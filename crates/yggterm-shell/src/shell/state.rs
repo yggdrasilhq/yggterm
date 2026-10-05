@@ -18867,6 +18867,17 @@ struct ShellState {
     // Drives hot-reveal recognition when the latest attempt is a cold-recovery
     // one. See [[followups-switch-hotness-update-friction]].
     terminal_sessions_reached_ready: HashSet<String>,
+    // [11.229] Sticky PAINT witness: sessions whose CURRENT host has actually
+    // rendered a frame (set at the terminal loop's first paint, cleared on
+    // every epoch bump and render-state drop). Readiness liveness (bytes
+    // forwarded, host object present) is NOT paint — the measured 2026-10-05
+    // blank-viewport incident had a host whose JS eval answered while the
+    // mount script never constructed a terminal: every write vanished, the
+    // client buffer stayed 63 rows of blank, and the ready-by-cancel latch
+    // below immortalized that host because forwarded bytes counted as
+    // "meaningful output". A retained host without this witness must never be
+    // treated as revealable.
+    terminal_sessions_painted: HashSet<String>,
     // Bounded history of finished terminal reveals (ready or failed), newest
     // last. Each entry carries timing + the swap snapshot taken at reveal start
     // so a slow reveal is self-diagnosing (swap thrash vs render stall) without
@@ -21373,6 +21384,7 @@ impl ShellState {
             terminal_cold_remount_since_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
+            terminal_sessions_painted: HashSet::new(),
             reveal_log: VecDeque::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
@@ -28707,6 +28719,7 @@ impl ShellState {
             .remove(session_path);
         self.terminal_reveal_grace_until_ms.remove(session_path);
         self.terminal_sessions_reached_ready.remove(session_path);
+        self.terminal_sessions_painted.remove(session_path);
         if self
             .active_terminal_host_id
             .as_deref()
@@ -29221,6 +29234,16 @@ impl ShellState {
             Some(update.session_path),
         );
         true
+    }
+    /// Record that this session's CURRENT host painted a real frame (the
+    /// terminal-loop's first-paint site). Sticky for the host's life; cleared
+    /// by every epoch bump (a fresh host must re-earn it) and by render-state
+    /// drop. [11.229]
+    fn note_terminal_session_painted(&mut self, session_path: &str) {
+        self.terminal_sessions_painted.insert(session_path.to_string());
+    }
+    fn terminal_session_host_has_painted(&self, session_path: &str) -> bool {
+        self.terminal_sessions_painted.contains(session_path)
     }
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
@@ -30181,7 +30204,23 @@ impl ShellState {
             .terminal_open_attempts
             .get(&attempt_id)
             .is_some_and(|attempt| attempt.first_meaningful_output_at_ms.is_some());
-        if saw_live_host_output && self.terminal_session_host_id(session_path).is_some() {
+        // ⛔ [11.229] THE PAINT WITNESS IS REQUIRED. Forwarded "meaningful
+        // output" proves the PTY and the transport, never the SURFACE: the
+        // measured 2026-10-05 blank-viewport row had 2,244 forwarded bytes
+        // counted meaningful while its client buffer held 63 blank rows —
+        // the host's eval answered but its mount script never constructed a
+        // terminal. Without this clause the latch marked that paint-zombie
+        // ready and every later switch revealed it forever (the owner's
+        // refocus logged mount_epoch_reused on the same dead host, epoch 1,
+        // twice). The 2026-08-29 class this latch exists for is unaffected:
+        // that host HAD mounted and painted ~400 ms in. Trade-off accepted: a
+        // legitimately slow first paint that has not landed by cancel time
+        // now takes one cold remount instead of a false hot reveal.
+        let host_has_painted = self.terminal_session_host_has_painted(session_path);
+        if saw_live_host_output
+            && host_has_painted
+            && self.terminal_session_host_id(session_path).is_some()
+        {
             self.mark_terminal_open_attempt_ready_for_session(
                 session_path,
                 "ready_on_inactive_cancel_host_already_live",
@@ -31371,6 +31410,10 @@ impl ShellState {
         session_path: &str,
         reason: &'static str,
     ) -> u64 {
+        // [11.229] The bumped-to host is a NEW surface: its paint witness
+        // starts empty. A stale witness surviving the bump would let the
+        // ready-by-cancel latch trust the dead host's history.
+        self.terminal_sessions_painted.remove(session_path);
         // [11.215] lane instrument: every remount goes through an epoch bump,
         // and WHICH call site bumped decides whether an in-flight mount loop
         // gets superseded mid-create/switch (bootstrap_owner_superseded_
