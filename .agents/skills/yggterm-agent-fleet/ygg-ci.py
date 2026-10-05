@@ -45,6 +45,7 @@ Usage:
 import argparse
 import json
 import os
+import pathlib
 import re
 import shlex
 import signal
@@ -443,23 +444,65 @@ def _write_heartbeat():
     }
     HEARTBEAT.write_text(json.dumps(rec))
 
+def _pid_is_ygg_ci_watcher(pid):
+    # [11.227] pid-recycle guard: the pid must BE a ygg-ci watch process.
+    try:
+        cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+        return "ygg-ci.py" in cmdline and "watch" in cmdline
+    except Exception:
+        # /proc unreadable (non-Linux or gone): fall back to the signal check
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
 def watcher_alive():
+    # [11.227] THE LIVE-PID LAW: a live pid is ALIVE regardless of heartbeat
+    # age. The old heartbeat-staleness clause (stale > 700s => dead) made
+    # every watcher mid-long-gate (the docs gate runs 5-30 min and cannot
+    # heartbeat) read as dead — subscribe then spawned a SECOND watcher and
+    # the two raced main (measured 2026-10-03 23:30-23:55: one pushed its
+    # merge, the other reset main to its older base; deployed bits with no
+    # origin ref). Heartbeat age stays observability only.
     if not PIDFILE.exists():
         return False
     try:
         pid = int(PIDFILE.read_text().strip().split()[0])
         os.kill(pid, 0)
-        # heartbeat freshness: if stale > interval*2+60s, consider dead
-        if HEARTBEAT.exists():
-            hb = json.loads(HEARTBEAT.read_text())
-            if time.time() - hb.get("ts", 0) > 700:
-                return False
-        return True
+        return _pid_is_ygg_ci_watcher(pid)
     except Exception:
         return False
 
+def any_watcher_process_live():
+    # [11.227] belt for pidfile-less rogues (a watcher spawned when another
+    # held the pidfile, a crash that never wrote one): scan /proc for ANY
+    # live ygg-ci watch process that is not THIS process.
+    me = os.getpid()
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == me:
+            continue
+        try:
+            cmdline = (proc / "cmdline").read_bytes().decode("utf-8", "replace")
+        except Exception:
+            continue
+        if "ygg-ci.py" in cmdline and "watch" in cmdline:
+            return int(proc.name)
+    return None
+
 def ensure_watcher(interval=DEFAULT_INTERVAL, project=None):
     if watcher_alive():
+        return True
+    # [11.227] the belt: a live watcher WITHOUT the pidfile (rogue born
+    # beside a pidfile holder) is still a live watcher — adopt it, never
+    # spawn a second.
+    rogue = any_watcher_process_live()
+    if rogue:
+        log(f"watcher pidfile stale but live watcher pid {rogue} exists — adopting, not spawning")
+        try:
+            PIDFILE.write_text(str(rogue))
+        except Exception:
+            pass
         return True
     # spawn detached watcher
     CI_STATE.mkdir(parents=True, exist_ok=True)
@@ -1186,6 +1229,17 @@ def _do_tick_project(project, dry=False):
             r = _run(["git", "push", upstream, main_branch], cwd=str(repo), timeout=600)
             pushed = (r.returncode == 0)
             push_err = (r.stderr or "")[-1200:]
+            if pushed:
+                # [11.227] PUSH READ-BACK: rc=0 is a CLAIM, not a landing
+                # (measured 2026-10-03: "pushed=True" logged while origin
+                # never received the merge and the fleet ran the built bits).
+                # ls-remote must answer the pushed sha or this is a failure.
+                rr = _run(["git", "ls-remote", upstream, main_branch], cwd=str(repo), timeout=120)
+                remote_tip = (rr.stdout or "").split()[0] if (rr.returncode == 0 and (rr.stdout or "").strip()) else None
+                if remote_tip != integ_sha:
+                    pushed = False
+                    push_err = f"push read-back mismatch: ls-remote says {remote_tip}, pushed {integ_sha}"
+                    log(f"  ⛔ {push_err}")
             if not pushed:
                 log(f"  ⛔ push FAILED: {push_err}")
                 # ⛔ A FAILED PUSH MEANS UPSTREAM MOVED DURING OUR BUILD. The
@@ -1197,7 +1251,18 @@ def _do_tick_project(project, dry=False):
                 # on the next tick. This arm must never fire for a
                 # privacy-guard refusal (those fail closed and repeat, which
                 # is correct — the guard's message rides the event).
-                reset = _run(["git", "reset", "--hard", pre_tick], cwd=str(repo), timeout=120)
+                # [11.227] MONOTONIC MAIN: a reset may never move main
+                # backward past what origin holds (a second watcher's push
+                # included) — if origin moved beyond our pre_tick knowledge,
+                # skip the reset and let the next tick re-derive from origin.
+                git_fetch(repo, upstream)
+                rr2 = _run(["git", "ls-remote", upstream, main_branch], cwd=str(repo), timeout=120)
+                origin_tip = (rr2.stdout or "").split()[0] if (rr2.returncode == 0 and (rr2.stdout or "").strip()) else pre_tick
+                if origin_tip != pre_tick and not git_is_ancestor(repo, origin_tip, pre_tick):
+                    log(f"  ⛔ monotonic-main: origin moved to {origin_tip[:12]} — reset to {pre_tick[:12]} SKIPPED")
+                    reset = type("R", (), {"returncode": 1})()
+                else:
+                    reset = _run(["git", "reset", "--hard", pre_tick], cwd=str(repo), timeout=120)
                 _emit_event(project, "push_failed", sha=integ_sha, upstream=upstream,
                             reset_to=pre_tick if reset.returncode == 0 else None,
                             stderr=push_err[-500:])
