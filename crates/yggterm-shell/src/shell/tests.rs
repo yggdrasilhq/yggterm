@@ -52357,6 +52357,88 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
     #[test]
+    fn prune_terminal_attach_in_flight_spares_a_live_loop_with_ready_attempt() {
+        // (j) THE +6s SNAPSHOT-PRUNE KILL: the background snapshot's attach
+        // prune saw marker+ready-attempt and evicted marker+owner+lease out
+        // from under the LIVE mount loop (registry_owner null at supersede,
+        // mountless row). A fresh heartbeat must stay the eviction.
+        let active_path = "local://live-ready-attach";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_path);
+        shell.begin_terminal_open_attempt(active_path, "req-open", 1, "hot_open_row");
+        shell
+            .terminal_attach_in_flight
+            .insert(active_path.to_string());
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_path.to_string(), "owner:live".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_path.to_string(), "lease:live".to_string());
+        shell.mark_terminal_open_attempt_ready_for_session(active_path, "test_ready_attempt");
+        bump_terminal_loop_heartbeat(active_path);
+
+        shell.prune_terminal_attach_in_flight();
+
+        assert!(
+            shell.terminal_attach_in_flight.contains(active_path),
+            "a live loop keeps its attach gate until its own attach_ready"
+        );
+        assert!(
+            shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key(active_path),
+            "a live loop keeps its bootstrap owner — evicting it supersedes the task"
+        );
+        assert!(
+            shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_path),
+            "a live loop keeps its bootstrap lease"
+        );
+        remove_terminal_loop_heartbeat(active_path);
+    }
+    #[test]
+    fn prune_terminal_attach_in_flight_still_ejects_a_dead_ready_attach() {
+        // The leak-GC this prune was built for: marker + ready attempt, but
+        // NO live loop (heartbeat absent) — the stale marker and its
+        // bookkeeping must still go.
+        let active_path = "local://dead-ready-attach";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_path);
+        shell.begin_terminal_open_attempt(active_path, "req-open", 1, "hot_open_row");
+        shell
+            .terminal_attach_in_flight
+            .insert(active_path.to_string());
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_path.to_string(), "owner:dead".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_path.to_string(), "lease:dead".to_string());
+        shell.mark_terminal_open_attempt_ready_for_session(active_path, "test_ready_attempt");
+        remove_terminal_loop_heartbeat(active_path);
+
+        shell.prune_terminal_attach_in_flight();
+
+        assert!(
+            !shell.terminal_attach_in_flight.contains(active_path),
+            "a dead loop's ready-marker is stale garbage and must be evicted"
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key(active_path)
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_path)
+        );
+    }
+    #[test]
     fn prune_terminal_attach_in_flight_keeps_active_retained_attach() {
         let active_path = "remote-session://dev/active";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));

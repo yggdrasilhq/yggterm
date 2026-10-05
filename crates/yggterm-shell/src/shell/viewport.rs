@@ -7486,6 +7486,14 @@ fn TerminalCanvas(
                     }
                 }
                 if !bootstrap_owner_still_current(state) {
+                    // (j) instrument: what does the registry hold NOW — a
+                    // newer owner (overwrite) or nothing (prune)? Read
+                    // before the release mutates the maps.
+                    let registry_owner = state
+                        .read()
+                        .terminal_bootstrap_owner_by_session
+                        .get(session_path.as_str())
+                        .cloned();
                     release_bootstrap_lease(
                         state,
                         "terminal_bootstrap_release_superseded_during_loop",
@@ -7500,6 +7508,7 @@ fn TerminalCanvas(
                             "session_path": session_path.clone(),
                             "host_id": host_id.clone(),
                             "owner": bootstrap_owner_identity.clone(),
+                            "registry_owner": registry_owner,
                         }),
                     );
                     // [11.139] The begin's `remote_attach_pending` now has no
