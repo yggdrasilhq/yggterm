@@ -7007,6 +7007,33 @@ fn TerminalCanvas(
             let mut warm_probe_alive: Option<bool> = None;
             let mut warm_probe_count: u32 = 0;
             let mut saw_warm_bridge_event = false;
+            // [F1-(h)] TEST HOOK (sol Q-C, filed 2026-10-05): suppress the
+            // ENTIRE page→Rust bridge channel for this mount — the exact
+            // production shed condition — so the synthesis path (warm probe
+            // → alive poll → matched+posted) fires deterministically on ANY
+            // mount, remounts included. Suppressing only Ready would be
+            // wrong: any other bridge event closes the warm gate via
+            // saw_warm_bridge_event and the alive poll never arms. Eval
+            // RETURNS ride fresh document::eval objects and stay live — the
+            // one leg measured alive through the shed window.
+            let suppress_mount_ipc_for_test = std::env::var(
+                "YGGTERM_TEST_SUPPRESS_MOUNT_IPC",
+            )
+            .map(|value| value != "0")
+            .unwrap_or(false);
+            if suppress_mount_ipc_for_test {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "test_hook_mount_ipc_suppressed",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "host_id": host_id.clone(),
+                        "mount_epoch": mount_epoch,
+                    }),
+                );
+            }
             // [11.178]-c2 The mount-liveness poll's join future (same
             // not-Send discipline as the pipeline probe) and its verdict.
             // Some(true) = the fn's page-side liveness record matched the
@@ -7743,7 +7770,8 @@ fn TerminalCanvas(
                         mount_task_guard.arm_remount.set(true);
                         break;
                     }
-                    event = eval.recv::<TerminalJsEvent>() => {
+                    event = eval.recv::<TerminalJsEvent>(),
+                        if !suppress_mount_ipc_for_test => {
                         // [11.178] Any bridge event proves the mount eval
                         // executed — the vanish gate is done for this mount.
                         saw_warm_bridge_event = true;
