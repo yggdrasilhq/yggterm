@@ -67,13 +67,46 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   and frame-hash reconcile itself rides the dead leg — install the
   authoritative screen with an output watermark, ack after xterm's write
   callback, retain unacked batches, or move reconcile onto fresh evals;
-  (f) THE RING WATERMARK REWORK (Q4+Q5): splice-before-ack loses input on
-  a lost return, the high-water cursor discards older chunks on cross-leg
-  reordering, the ring never prunes on healthy mounts, and HOST REUSE
-  REPLAYS HISTORY (Rust cursor resets to 0, page bucket survives) —
-  non-destructive reads + acked contiguous watermark + incarnation id +
-  byte bound; THE NEXT UNIT (replay is a correctness regression risk);
-  (g) flush_due routing (Q3) — LANDED with this lane. LONG-TERM: sol's
+  (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
+  lane/f1/ring-watermark; sol correction round applied same sitting, node
+  lores/chain-of-thought/2026-10-05-yggterm-f1-ring-rework-sol-review.md):
+  non-destructive drain reads (a lost eval return can no longer lose
+  input) with prune-by-acked-watermark riding the NEXT drain call; the
+  Rust InputRingCursor is an ACKED CONTIGUOUS watermark (begin/commit/
+  rollback; cross-leg reorder APPLIES the older chunk instead of
+  discarding it; advance only after a successful writer enqueue) with an
+  INCARNATION BASELINE (the bucket's stamp-time nextId — no stall-at-0,
+  no unbounded pending) and gap-sealing on byte-bound overflow (128 KiB
+  UTF-16 units + 4096 chunks, drop-oldest, sticky overflow flag traced);
+  a Rust-owned incarnation (process counter, stamped into the page at
+  mount start) binds chunks AND drain answers to the requesting mount —
+  a stale drain crossing a remount is discarded whole (traced
+  synthesized_input_stale_answer), and host-reuse replay is structurally
+  dead (foreign-incarnation chunks are filtered at the drain; pre-
+  baseline ids are sealed). Both legs share one apply handler (macro —
+  ytrace/leg, remote accounting, echo burst, busy hint, input-hot). A
+  150 ms drain-deadline select arm frees draining from the read pump.
+  PROOFS: 7 unit tests incl. the drain-script shape lock; typing rig
+  through a synthesized mount (applied 2/2, ack pruned 2, watermark 2,
+  "echo F1LEG4 / F1LEG4" painted); warmmount falsifier 6/6 painted WITH
+  content, 5/5 proofs wrote_seed=63 (the F1 cure holds). ALSO repaired
+  the 4 seam locks cb8fc542 left red on main (input-arm marker,
+  captured-channel literal, protocol-bypass flush, osc-fallback) — full
+  shell suite 2212/0. RIG FINDING (honest bar): three replay-rig
+  variants (quiet, churn-race, close-race) could NOT force a synthesized
+  REMOUNT — the measured shed window covers FRESH-SPAWN mounts under
+  churn, not refocus remounts; the replay defect stands proven by
+  construction + the unit/shape locks, not by a GUI-level RED. The
+  close-race variant on UNPATCHED main lost the marker entirely (content
+  loss through a teardown-race remount — the [11.229] family's arm, not
+  this unit's);
+  (g) flush_due routing (Q3) — LANDED with its lane; (h) THE
+  SYNTHESIZED-REMOUNT TEST HOOK (sol Q-C, filed 2026-10-05): a test-only
+  hook that suppresses remount readiness delivery while preserving eval
+  returns would force synthesis deterministically — then seed old input,
+  remount, assert ZERO old enqueues + exactly one new; plus the delayed-
+  drain-across-remount case. NEXT UNIT CANDIDATE (rig infrastructure);
+  LONG-TERM: sol's
   owner-backed attach transaction (ContentReady only on a JS ack of
   applied cursor+buffer; one bounded reconstruction then an explicit
   failure surface).
