@@ -329,6 +329,74 @@ return JSON.stringify({{ record: __r, dispatched: __d === undefined ? null : __d
     )
 }
 
+/// [F1] The page-side write leg for a SYNTHESIZED mount: the mount eval's
+/// captured dioxus bindings die under spawn churn (both directions of its
+/// per-eval channel), so read-pump output can no longer ride `eval.send`.
+/// This one-shot eval finds the term in the page host registry and writes
+/// directly — the same transport (fresh script execution) as the liveness
+/// poll, measured alive through the shed window. Fire-and-forget by
+/// design: the caller never awaits it.
+pub(crate) fn terminal_page_write_script(host_id: &str, data: &str) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
+    let data = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"const __h = {host};
+const __e = (window.__yggtermXtermHosts || {{}})[__h];
+const __t = __e && __e.term ? __e.term : null;
+if (__t && typeof __t.write === 'function') {{
+    try {{ __t.write({data}); }} catch (_error) {{}}
+}}"#
+    )
+}
+
+/// [F1] The full-contract synthesis probe for a warm mount whose bridge was
+/// shed: a single value-carrying one-shot eval (⛔ top-level `return` — the
+/// eval bridge shape law) that (a) seeds the daemon's screen snapshot into
+/// the constructed-but-never-fed term when its buffer is still empty,
+/// (b) waits for xterm to parse the seed (the write callback), and
+/// (c) returns the surface proof — constructed / screen / geometry /
+/// painted — over the one leg measured alive through the shed window.
+pub(crate) fn terminal_synthesized_mount_open_script(
+    host_id: &str,
+    seed: Option<&str>,
+) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
+    let seed_lit = match seed.filter(|text| !text.trim().is_empty()) {
+        Some(text) => serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
+        None => "null".to_string(),
+    };
+    format!(
+        r#"const __h = {host};
+const __seed = {seed_lit};
+const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
+const __t = __e && __e.term ? __e.term : null;
+const __hostEl = document.getElementById(__h);
+const __screen = __hostEl && __hostEl.querySelector ? __hostEl.querySelector('.xterm-screen') : null;
+const __painted = (t) => {{
+    try {{
+        const b = t && t.buffer && t.buffer.active;
+        return Boolean(b && (Number(b.baseY || 0) > 0 || Number(b.cursorY || 0) > 0 || Number(b.cursorX || 0) > 0));
+    }} catch (_error) {{
+        return false;
+    }}
+}};
+let __wrote = 0;
+if (__t && typeof __t.write === 'function' && __seed && !__painted(__t)) {{
+    __t.write(__seed);
+    await new Promise((resolve) => __t.write('', resolve));
+    __wrote = __seed.length;
+}}
+return JSON.stringify({{
+    constructed: Boolean(__t),
+    screen_in_host: Boolean(__screen),
+    rows: Number((__t && __t.rows) || 0),
+    cols: Number((__t && __t.cols) || 0),
+    painted: __painted(__t),
+    wrote_seed: __wrote,
+}});"#
+    )
+}
+
 fn terminal_eval_script_with_canvas_renderer(
     host_id: &str,
     theme: &TerminalTheme,
