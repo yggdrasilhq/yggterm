@@ -18,6 +18,86 @@ on the owner's word.
 Closed narratives from before 2026-08-02 are in
 [`archive/pending-bugs-closed-2026-08-02.md`](archive/pending-bugs-closed-2026-08-02.md).
 
+**⚙ FAMILIES — the mechanism index (continuously reorganized; owner law 2026-10-05).**
+As mechanisms are measured or falsified, this index is RESTRUCTURED in the
+same sitting: symptom entries are re-homed under their measured mechanism,
+dead framings are killed in the entries' text, and each family's attack
+state is re-scaffolded. Appending-only is banned — the index is the
+campaign's living map, maintained by the zcode+sol loop (consult node
+2026-10-05-yggterm-178-sol-attack-verdict is the protocol's first proof).
+
+- **F1 — THE DEAD-IPC-LEG / INCOMPLETE-SYNTHESIZED-HANDSHAKE** (root
+  MEASURED 2026-10-05, rig v4 on dev — /tmp/rig4.sh, 5/6 fresh spawns
+  wedge deterministically): the mount fn completes page-side (alive ring
+  stage=posted over the working eval-return leg; term constructed, ready
+  sent) while the ENTIRE page→Rust IPC leg sheds its events (the captured
+  dioxus.send dies with its receiver under spawn churn); the [11.217]
+  handshake synthesizes ONLY ready — the mount_open half (read pump,
+  content arming, reset seeding) is never synthesized → blank-forever
+  terminal called ready. MEMBERS: [11.178]'s residual stall (its "phantom
+  eval" framing is dead; the "vanish" was this shed window), the [11.217]
+  half-handshake site, [11.229](a)+(c) blank shapes, the first-spawn-blank
+  readings beside [11.226]. ATTACK: synthesize the FULL bridge contract on
+  posted-proof (drive what mount_open arms; trace synthesized_mount_open);
+  falsifier = rig 0/6 wedges, 6/6 painted WITH content. OPEN SUB-Q: the
+  stale-receiver WHY (sol ranked-attack #3) — page-side send ring +
+  IPC-ingress stamps decide it. LONG-TERM: sol's owner-backed attach
+  transaction (ContentReady only on a JS ack of applied cursor+buffer;
+  one bounded reconstruction then an explicit failure surface).
+- **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
+  reveal / presence paths consult a CACHED remote scan and assorted
+  authorities that disagree with the owning daemon ([11.32]'s empty reads,
+  reveal_failed "is not in the scan" over a live row, running:false over
+  alive, declare_absent noise). ATTACK (sol #1): ONE owner-resolution
+  function for read/screen/presence/attach, distinguishing Absent /
+  Unavailable / valid-empty; measured HEALTHY on a fresh row when the IPC
+  leg is healthy — the divergence compounds with F1. MEMBERS: [11.32],
+  the [11.229] absent-declaration sub-item.
+- **F3 — HOST-LIFECYCLE IMMORTALITY**: a bad host must be replaced, never
+  revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71).
+  REMAINDERS: [11.229](b) replaced-runtime frozen buffer, (d)
+  remove-vs-keepalive race.
+- **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
+  [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
+  auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
+  [11.175] kimi descriptor drift, the 11.6.x family stone.
+- **F5 — CI-PLANE SELF-INTEGRITY**: [11.227] four-part guard LANDED
+  (accf7b5b — live-pid liveness, any-watcher belt, push read-back,
+  monotonic main) ⛔ RE-DISPERSE OWED (ygg-disperse install --fleet from
+  main + watcher restart — the running watcher is old code); [11.230] the
+  sub-file wedge (below); the docs-gate 16-30 min cost (dream
+  ACK-a8a9eec7c3 — wants a path-scoped gate skip).
+- **F6 — MANAGED-CLI REFRESH CONVERGENCE**: [11.224] escalation LIVE
+  (streak doubling measured; final falsifier = a day of walks without mimo
+  kills, ≤1 retry/day); devin 130 cosmetic; owner shapes (a)/(b)/(c) in
+  the entry.
+- **F7 — FELT-LATENCY BUDGET RESIDUE** (the ux-speed residue; probe
+  baselines in the uxprobe reports): [11.215] split-create appear over
+  bar, [11.172] switch remount cost (FIXED in code — proof owed), the
+  close/teardown family. Re-derive this family's shape after F1 lands
+  (the wedge contaminated spawn-latency baselines).
+
+## ⛔ [11.230] DELETING A MERGED LANE'S REMOTE BRANCH WEDGES ITS CI SUBSCRIPTION FOREVER — THE WATCHER COUNTS A SUB WHOSE BRANCH IS GONE AS A CONFLICT AND EVERY TICK REPORTS merged=0 (measured live 2026-10-05 11:20-11:45 IST, five stale subs, conflicts=5 × six ticks)
+
+**Status:** OPEN
+
+Filed 2026-10-05 ~12:5x IST by the zcode seat (board ACK-9b24b841bf).
+The mechanism: the worktree law deletes a lane's remote branch after its
+merge; the watcher's merge step then cannot resolve the branch (git
+ls-remote answers nothing), the failure is booked as a hunk conflict, and
+the sub file is never consumed — every subsequent tick reports
+merged=0 conflicts=N while REAL lanes (the [11.227] guard among them) sit
+stuck behind the wedge. The auto-unsubscribe's "already in main" check
+also needs the branch to exist to compare, so it never fires. Repaired by
+hand this sitting (five sub files removed after verifying each
+tip_at_enlist's content was in main). FIX SHAPE: when the sub's branch is
+absent from origin, fall back to checking tip_at_enlist ancestry against
+origin/main — ancestor ⇒ auto-unsubscribe ("merged under a rebase"),
+non-ancestor ⇒ drop the sub with an EXPIRED notice (a deleted unmerged
+branch is an abandoned lane, not a retryable merge). FALSIFIER: merge a
+lane, delete its remote branch, watch the next tick consume the sub
+instead of reporting conflicts.
+
 ## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — A REUSED-HOST MOUNT FIRES NO GRID REPAIR (09:17:45 shape), A RUNTIME REPLACED UNDERNEATH A MOUNTED HOST NEVER RE-BINDS (the frozen-buffer squish that survived every daemon-side heal), THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), AND session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
 
 **Status:** OPEN
