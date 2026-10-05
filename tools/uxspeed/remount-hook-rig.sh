@@ -17,15 +17,21 @@
 #          then switch immediately; readout is the
 #          synthesized_input_stale_answer trace (or zero duplication) —
 #          reported as measured, never laundered.
-# REMOUNT TRIGGER (measured sitting 6): focus away+back does NOT remount a
-# healthy mount — the retention policy retains the host
-# (bootstrap_spawn_skipped_inactive_retained_host), and cap-eviction via
-# YGGTERM_HOT_PREMOUNT_CAP=2 does not drop it either. The deterministic
-# trigger is `server terminal restart` — the deploy/daemon-swap remount
-# class. The retained-switch stays as the CONTROL arm (expects NO new
-# mount). Input focus latches at synthesis time for the ACTIVE row (the
-# run-3 finding), so b is created last and stays active until the control
-# switch returns to it.
+# REMOUNT TRIGGER MAP (measured sitting 6, sol-reviewed): NO verb-level
+# trigger re-runs the GUI mount loop — focus away+back retains the host
+# (bootstrap_spawn_skipped_inactive_retained_host), cap-eviction via
+# YGGTERM_HOT_PREMOUNT_CAP=2 retains too, and `server terminal restart`
+# restarts the PTY with the mount loop SURVIVING (epochs unchanged). The
+# true surface-remount trigger is the (h2) one-shot bridge-end hook (sol
+# Q2 bar: same session, surviving page AND pty, higher epoch, fresh
+# incarnation, verified synthesis). Until it lands the restart arm is
+# the PTY-RESTART INPUT CONTROL (zero old-chunk re-delivery through a
+# pty restart) and the retained switch is the second control. Input
+# focus latches at synthesis time for the ACTIVE row (the run-3 finding),
+# so b is created last and stays active until the control switch returns
+# to it. FAILED VERDICTS EXIT NONZERO AFTER ALL ARMS RUN (sol Q4):
+# 2=rows/hook, 4=pre-flight, 5=remount-not-forced (expected until (h2)),
+# 6=replay, 7=new-input, 8=exe-mismatch (wrapper).
 # Usage: tools/uxspeed/remount-hook-rig.sh [worktree] [binary]
 #   binary defaults to $worktree/target/debug/yggterm (cargo build -p
 #   yggterm --bin yggterm). Runs on dev's Xvfb :78 — jojo untouched.
@@ -98,14 +104,15 @@ a = row_session(1)
 b = row_session(2)
 print("rows: a=%s b=%s" % (a, b))
 if not (a and b):
-    print("FAIL: could not create rows"); raise SystemExit
+    print("FAIL: could not create rows"); raise SystemExit(2)
 time.sleep(20)
 
 hook_events = events("test_hook_mount_ipc_suppressed")
 synths = events("synthesized_mount_open")
 print("hook_events=%d synthesized_mount_open=%d" % (len(hook_events), len(synths)))
 if not hook_events:
-    print("VERDICT HOOK: NOT ENGAGED — env gate never traced; rig invalid"); raise SystemExit
+    print("VERDICT HOOK: NOT ENGAGED — env gate never traced; rig invalid")
+    raise SystemExit(2)
 
 def screen_count(marker, session):
     body = (verb("server", "screen", session).stdout or "")
@@ -128,7 +135,7 @@ if pre_lines < 1:
     print("PRE-FLIGHT FAIL: seed did not paint — b never synthesized; dump:")
     for e in events("warm_eval_mount_alive_events_shed", b)[-3:]:
         print("  shed:", json.dumps(e)[:200])
-    raise SystemExit
+    raise SystemExit(4)
 
 # --- control arm: retained switch (away+back) — expects NO new mount ---
 verb("server", "app", "terminal", "focus", a); time.sleep(3)
@@ -137,27 +144,36 @@ epochs_control = sorted({e.get("mount_epoch") for e in events("test_hook_mount_i
 ctrl_lines, _ = screen_count("HOOKOLD", b)
 print("CONTROL retained-switch epochs=%s marker_lines=%d (expect unchanged+1)" % (epochs_control, ctrl_lines))
 
-# --- THE REMOUNT: `server terminal restart` — the deterministic trigger
-# (focus-eviction does NOT remount: the retention policy keeps the host —
-# bootstrap_spawn_skipped_inactive_retained_host, measured run 4). The
-# restart re-runs the mount; the hook forces it to synthesize.
+# --- PTY-RESTART INPUT CONTROL: `server terminal restart` restarts the
+# pty (fresh screen) while the mount loop SURVIVES (no new epoch —
+# measured run 5). The bar here is INPUT correctness through pty churn:
+# the old ring chunks must NOT re-deliver to the fresh pty. The
+# surface-remount arm lands with the (h2) bridge-end hook.
 verb("server", "terminal", "restart", b)
 time.sleep(15)  # fresh bootstrap + synthesis + paint
 
 epochs_after = sorted({e.get("mount_epoch") for e in events("test_hook_mount_ipc_suppressed", b)})
 print("epochs for row b: control=%s after_restart=%s" % (epochs_control, epochs_after))
 forced = bool(epochs_after) and max(epochs_after) > max(epochs_control)
-print("VERDICT REMOUNT-SYNTHESIS: %s" % ("FORCED (new synthesized mount at higher epoch)" if forced else "NOT FORCED — report honestly"))
+fail_rc = 0
+print("VERDICT REMOUNT-SYNTHESIS: %s" % ("FORCED (new synthesized mount at higher epoch)" if forced else "NOT FORCED — report honestly (expected until the (h2) bridge-end hook lands; still nonzero per sol Q4)"))
+if not forced:
+    fail_rc = fail_rc or 5
 
 post_lines, post_tail = screen_count("HOOKOLD", b)
 print("HOOKOLD post-restart command_lines=%d (control was %d; growth=replay, same/fewer=reseed-or-fresh)" % (post_lines, ctrl_lines))
-print("VERDICT REPLAY: %s" % ("NONE (zero old enqueues)" if post_lines <= ctrl_lines else "REPRODUCED (command re-executed: lines %d -> %d)" % (ctrl_lines, post_lines)))
+verdict_replay = post_lines <= ctrl_lines
+print("VERDICT REPLAY: %s" % ("NONE (zero old enqueues; screen-level evidence — writer-enqueue asserts land with (h2))" if verdict_replay else "REPRODUCED (command re-executed: lines %d -> %d)" % (ctrl_lines, post_lines)))
+if not verdict_replay:
+    fail_rc = fail_rc or 6
 
 # --- exactly one NEW input after the remount ---
 typed(b, "echo HOOKNEW")
 time.sleep(5)
 new_lines, _ = screen_count("HOOKNEW", b)
 print("VERDICT NEW-INPUT: %s (command_lines=%d)" % ("EXACTLY-ONCE" if new_lines == 1 else "WRONG", new_lines))
+if new_lines != 1:
+    fail_rc = fail_rc or 7
 
 # --- delayed-drain race arm: type then restart IMMEDIATELY (a drain eval
 # straddling the remount must be discarded by the incarnation echo) ---
@@ -173,6 +189,9 @@ drains = events("synthesized_input_drained", b)
 print("drain events for row b: %d; payloads:" % len(drains))
 for d in drains[:8]:
     print("  ", json.dumps({k: d.get(k) for k in ("applied", "skipped", "inc", "pruned", "watermark", "mount_epoch") if k in d}))
+if fail_rc:
+    print("RIG FAIL rc=%d — verdicts above; (5) is the open (h2) surface-remount arm" % fail_rc)
+    raise SystemExit(fail_rc)
 PYEOF
 RC=$?
 kill "$GUI_WRAP" 2>/dev/null; sleep 1
@@ -184,7 +203,7 @@ pkill -f "dbus-run-session" 2>/dev/null; sleep 1; kill "$XVFB_PID" 2>/dev/null
 echo "=== EXE PROOF ==="
 EXE=$(grep -m1 -o '"executable_path":"[^"]*"' "$SCRATCH/event-trace.jsonl" 2>/dev/null | head -1 | cut -d'"' -f4)
 echo "served executable_path=$EXE"
-if [ "$EXE" = "$BIN" ]; then echo "EXE OK: worktree binary served this run"; else echo "EXE MISMATCH: verdicts above are VOID"; RC=3; fi
+if [ "$EXE" = "$BIN" ]; then echo "EXE OK: worktree binary served this run"; else echo "EXE MISMATCH: verdicts above are VOID"; RC=8; fi
 echo "=== DRIVER OUTPUT ==="
 tail -30 /tmp/f1h-run.log
 echo "scratch=$SCRATCH rc=$RC"

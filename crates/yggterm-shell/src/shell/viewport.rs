@@ -7008,8 +7008,10 @@ fn TerminalCanvas(
             let mut warm_probe_count: u32 = 0;
             let mut saw_warm_bridge_event = false;
             // [F1-(h)] TEST HOOK (sol Q-C, filed 2026-10-05): suppress the
-            // ENTIRE page→Rust bridge channel for this mount — the exact
-            // production shed condition — so the synthesis path (warm probe
+            // ENTIRE page→Rust bridge channel for this mount — this forces
+            // the same no-event condition at the mount loop the production
+            // shed produces (it does not model page-side dropping,
+            // buffering, or healing) — so the synthesis path (warm probe
             // → alive poll → matched+posted) fires deterministically on ANY
             // mount, remounts included. Suppressing only Ready would be
             // wrong: any other bridge event closes the warm gate via
