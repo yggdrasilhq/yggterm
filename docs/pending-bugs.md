@@ -48,7 +48,24 @@ CLIENT halves that still recur on healthy rows.
   cover deadline — the cover drops to a blank viewport that never
   self-heals. FIX SHAPE: on deadline expiry, paint the daemon-screen
   reconcile instead of dropping the cover empty.
-- (d) REMOVE-VS-KEEPALIVE RACE: `session remove` answered
+- UPDATE 2026-10-05 ~08:2x IST (recurrence, owner-reported live; board
+ACK-d3e73eac18): a FRESH agy row (remote-agy://dev/4314d6ee…, born
+08:19:59 on dev, cwd /home/pi) sat BLANK in the owner's active viewport
+with the (a) signature verbatim — mount_epoch_reused reused_live_host:true
+without the startup repair at 08:19:52, then
+screen_reconcile_skipped_unwritable (reason:reveal_screen_reconcile) ×3
+with screen_bytes:0 and retry_armed:false by 08:19:59, and FIRST OUTPUT
+ARRIVED 3 s AFTER the reconcile disarmed (08:20:02, 1171 bytes) — the
+frame streamed to a view that had abandoned painting. The row itself is
+HEALTHY on dev (ready, signed-in banner + composer on its screen). NEW
+SIGNATURE beyond the four: the UI has declared the row absent every 60 s
+since 08:21:22 (daemon_declare_absent via:batch) while BOTH daemons list
+it live (rows_order position 0) — the batch liveness check consults a
+witness that contradicts both daemons; wants its own sub-item under (a).
+Workaround that heals (handed to the owner): epoch-bumping refocus —
+switch to another row and back.
+
+(d) REMOVE-VS-KEEPALIVE RACE: `session remove` answered
   verified:true / remote_runtime_after:ConfirmedGone while the runtime
   RESURRECTED within seconds (spawn pid changed under the verdict) —
   the removal needs a post-reap verification window or the keep-alive
