@@ -100,16 +100,56 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   close-race variant on UNPATCHED main lost the marker entirely (content
   loss through a teardown-race remount — the [11.229] family's arm, not
   this unit's);
-  (g) flush_due routing (Q3) — LANDED with its lane; (h) THE
-  SYNTHESIZED-REMOUNT TEST HOOK (sol Q-C, filed 2026-10-05): a test-only
-  hook that suppresses remount readiness delivery while preserving eval
-  returns would force synthesis deterministically — then seed old input,
-  remount, assert ZERO old enqueues + exactly one new; plus the delayed-
-  drain-across-remount case. NEXT UNIT CANDIDATE (rig infrastructure);
-  LONG-TERM: sol's
-  owner-backed attach transaction (ContentReady only on a JS ack of
-  applied cursor+buffer; one bounded reconstruction then an explicit
-  failure surface).
+  (g) flush_due routing (Q3) — LANDED with its lane; (f2) THE PAGE-SIDE
+  PRUNE RACE (sol code-review find, 2026-10-05, node
+  lores/chain-of-thought/2026-10-05-yggterm-f1h-remount-hook-sol-review.md):
+  an old-incarnation drain EXECUTING after a reused bucket is restamped
+  classifies the NEW chunks as stale and prunes them page-side BEFORE Rust
+  checks the answer's echo — the Rust return guard cannot undo page-side
+  pruning. Wants a bucket-incarnation check BEFORE mutation in the drain
+  script + a test of that ordering; (h) THE SYNTHESIZED-REMOUNT TEST HOOK
+  — INFRASTRUCTURE LANDED 2026-10-05 (068a94c4, lane/f1/remount-hook):
+  YGGTERM_TEST_SUPPRESS_MOUNT_IPC gates the WHOLE bridge-event select arm
+  per mount loop — Ready-only suppression would close the warm gate via
+  saw_warm_bridge_event and the alive-poll would never arm; total channel
+  silence is the shed condition AT THE MOUNT LOOP (it does not model
+  page-side dropping/buffering/healing), while eval returns ride fresh
+  document::eval objects and stay live — one loud per-mount trace event
+  test_hook_mount_ipc_suppressed for rig asserts, + the in-tree falsifier
+  tools/uxspeed/remount-hook-rig.sh (hermetic XDG+exe-proofed; verdicts
+  exit nonzero after all arms: 2 rows/hook, 4 pre-flight, 5 remount, 6
+  replay, 7 new-input, 8 exe). MEASURED (5 runs, exe-proofed): synthesis
+  forced deterministically on fresh mounts (typing/paint/drain all
+  synthesized); input correct across retained switches (no replay,
+  exactly-once); `server terminal restart` restarts the PTY with the
+  mount loop SURVIVING (epochs unchanged) and ZERO old-chunk
+  re-delivery through it (acked watermark holds, no re-execution on the
+  fresh pty); and NO verb-level trigger re-runs the GUI mount loop —
+  focus away+back retains (bootstrap_spawn_skipped_inactive_retained_
+  host) and cap-eviction via YGGTERM_HOT_PREMOUNT_CAP=2 retains too.
+  SOL Q4 REBUT APPLIED — (h) STAYS OPEN: (h2) THE ONE-SHOT
+  SURFACE-REMOUNT TRIGGER (NEXT UNIT): end the original mount bridge or
+  an explicitly traced test signal executing the EXISTING arm_remount
+  exit (arbitrary DOM removal need not end the loop). Bar: same session,
+  surviving page AND pty, higher mount epoch, fresh incarnation,
+  verified synthesis; assert ZERO OLD WRITER ENQUEUES + exactly one
+  enqueue per new input chunk using identified chunks (screen command
+  counts are secondary); force the drain/remount ordering with BARRIERS
+  not timing; PLUS the BUCKET-REUSE test — the host id embeds the mount
+  epoch and the ring is keyed by host id, so a fresh -mN bucket never
+  sees -mN-1 history; the incarnation filter needs a genuinely reused
+  bucket id; (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
+  run 3; sol Q3): a row demoted from active before its synthesis
+  completes cannot re-latch input focus under total bridge suppression
+  (probe-type refuses terminal_input_not_focused), while a row
+  synthesized while active keeps input across later switches. SCOPE
+  DISCIPLINE: the refusal is a POST-DISPATCH classification, not proven
+  dispatch refusal; Rust→page set_input_enabled and policy evals still
+  run. Reproduce, record host_stdin_enabled/effective focus/ring
+  additions/writer enqueues/PTY receipt, restore delivery, test
+  recovery. LONG-TERM: sol's owner-backed attach transaction
+  (ContentReady only on a JS ack of applied cursor+buffer; one bounded
+  reconstruction then an explicit failure surface).
 - **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
