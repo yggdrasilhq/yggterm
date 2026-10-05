@@ -127,18 +127,69 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   fresh pty); and NO verb-level trigger re-runs the GUI mount loop —
   focus away+back retains (bootstrap_spawn_skipped_inactive_retained_
   host) and cap-eviction via YGGTERM_HOT_PREMOUNT_CAP=2 retains too.
-  SOL Q4 REBUT APPLIED — (h) STAYS OPEN: (h2) THE ONE-SHOT
-  SURFACE-REMOUNT TRIGGER (NEXT UNIT): end the original mount bridge or
-  an explicitly traced test signal executing the EXISTING arm_remount
-  exit (arbitrary DOM removal need not end the loop). Bar: same session,
-  surviving page AND pty, higher mount epoch, fresh incarnation,
-  verified synthesis; assert ZERO OLD WRITER ENQUEUES + exactly one
-  enqueue per new input chunk using identified chunks (screen command
-  counts are secondary); force the drain/remount ordering with BARRIERS
-  not timing; PLUS the BUCKET-REUSE test — the host id embeds the mount
-  epoch and the ring is keyed by host id, so a fresh -mN bucket never
-  sees -mN-1 history; the incarnation filter needs a genuinely reused
-  bucket id; (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
+  SOL Q4 REBUT APPLIED — (h)/(h2) LANDED 2026-10-05 (dd41a9bb, lane
+  lane/f1/surface-remount-trigger): YGGTERM_TEST_SURFACE_REMOUNT_ON_IDLE
+  executes the bridge-ended arms' exit VERBATIM (lease/attach cleanup +
+  arm_remount + break) on the first QUIESCED drain (zero new chunks
+  after applied input — every old chunk acked+pruned; the barrier sol
+  demanded, causally after the last writer enqueue, no timing), ONE-SHOT
+  per process (AtomicBool), loudly traced
+  (test_hook_surface_remount_forced). RIG (remount-hook-rig.sh rebuilt):
+  RED proven on unpatched main (exit 5 twice; the exit-4s are the
+  pre-existing (j) race below), GREEN 3x: forced remount with IMMEDIATE
+  recovery, same session, pty never restarted, ZERO old writer enqueues
+  (per-chunk synthesized_input_chunk_enqueued window — the
+  writer-enqueue granularity sol demanded), exactly-once new chunks,
+  fresh input incarnation 2->3, verified synthesis after the forced
+  line. TWO BARS CORRECTED BY MEASUREMENT: (1) the watchdog remount
+  REUSES the mount epoch, so "higher mount epoch" is not a valid
+  discriminator — the fresh INCARNATION is (and the epoch-reuse means
+  the host id — and the page ring bucket keyed by it — is ALWAYS the
+  same key across remounts: every plain-pass remount IS sol's
+  bucket-reuse case, proven by baseline continuation 1->3 + zero old
+  enqueues; the separate bare-id reuse hook was REMOVED — redundant and
+  it collides with the -m host-id prefix parser); (2) the drain script's
+  STALE branch is unreachable through a quiesced death BY DESIGN — the
+  baseline seal (ids below stamp-time nextId predate the mount) swallows
+  pre-stamp chunks via the acked path; the stale branch's live entry is
+  the old-drain-crossing case = (f2).
+  ⭐ THE ARMED-REmount DEAD-LETTER FIX (the real find of the unit): the
+  epoch-in-identity remount could NEVER fire for an ever-ready host —
+  measured: reveal_served landed 4 ms after
+  terminal_mount_task_remount_armed, serving the DEAD host on its
+  still-fresh heartbeat (<60 s) and permanently consuming the schedule
+  candidate (the raise's latch never re-arms). This broke [11.187]'s
+  "instant recovery" for every bridge death on an attached row — the
+  same class as the owner's recurring "switch away and back does not
+  fix it". FIX (same commit): the drop guard PUNCHES the heartbeat on
+  armed death (remove_terminal_loop_heartbeat) and the reveal-raise
+  predicate refuses an ABSENT heartbeat (matching the reparent gate's
+  existing match-shape); recovery is now immediate (the punch's state
+  write re-renders the canvas at once — measured). Unit locks updated
+  (a ready host models its beating loop; a_silent_or_stale_loop_never_
+  reveals added; suite 2213/0).
+  RIG LAWS (measured, both cost hours): (L1) the falsifier binary MUST
+  be a FULL-WORKSPACE release build (cargo build --release, deploy
+  shape) — a `-p yggterm --bin yggterm` build changes workspace feature
+  unification and DETERMINISTICALLY loses pre-flight to the (j) race;
+  dev-profile builds shift timing the same way; (L2) the rig teardown
+  must REAP ITS SCRATCH DAEMON by YGGTERM_HOME environ match — pkill -x
+  yggterm does not kill yggterm-headless, 13 daemons accumulated across
+  ~10 runs, and their CPU flipped the (j) race.
+  (j) THE +6s BACKGROUND-SNAPSHOT SUPERSEDE RACE (NEW, FILED — the next
+  fresh-spawn-blank mechanism): ~6 s after row creation an
+  interactive/background snapshot cycle re-issues a bootstrap for the
+  active session; when the fresh mount's attach_ready has not fired
+  yet, the pre-select owner check supersedes the LIVE loop
+  (bootstrap_owner_superseded_during_loop -> drop with remount_armed
+  FALSE — a successor is presumed), and in the measured failing runs NO
+  successor mounted: attach_ready 0, row left mountless (blank,
+  input-dead). PRE-EXISTING on main (deployed 1e689841 measured both
+  outcomes tonight), flaky and load-correlated (3/10 runs). ATTACK:
+  identify the +6 s requester (the snapshot apply's re-issue path),
+  then either suppress the re-issue while a mount task holds the
+  bootstrap lease, or make the supersede verify the successor actually
+  began before the old loop stands down. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
   run 3; sol Q3): a row demoted from active before its synthesis
   completes cannot re-latch input focus under total bridge suppression
   (probe-type refuses terminal_input_not_focused), while a row
