@@ -65,6 +65,31 @@ witness that contradicts both daemons; wants its own sub-item under (a).
 Workaround that heals (handed to the owner): epoch-bumping refocus —
 switch to another row and back.
 
+UPDATE 2026-10-05 ~08:5x IST (root-cause fix; zcode on jojo, board plan
+ACK-83e4dc7e04): THE OWNER'S RECURRENCE EXPOSED THE FAMILY'S IMMORTALITY
+ROOT — and the refocus workaround is FALSIFIED (the owner switched; still
+blank): the switch-back logged mount_epoch_reused on the SAME host
+(-m1, epoch 1) both at birth and at refocus, so no reveal path ever
+bumped the epoch on this flow. MEASURED ROOT: the client buffer for the
+row held 63 rows of BLANK (read-buffer nonblank 0) while the transport
+accounted 2,244 "meaningful" bytes — a PAINT-ZOMBIE host ([11.178]'s
+wedge: the eval answers, the mount script never constructed a terminal,
+every write vanishes) — and the ready_on_inactive_cancel_host_already_live
+latch then marked that never-painted host READY on transport evidence
+alone, after which retained-live revealed the same dead host forever.
+FIX LANDED (lane/integration/11229-paint-zombie): a shell-level sticky
+PAINT witness (terminal_sessions_painted, recorded at the terminal loop's
+first paint, cleared on every epoch bump and render-state drop) is now
+REQUIRED by the ready-by-cancel latch and honored by reveal-reuse — a
+never-painted host cancels honestly and the resolver cold-remounts (fresh
+eval context, which clears the [11.178] wedge) instead of revealing a
+blank. The 2026-08-29 hot class is preserved (that host had painted);
+trade-off in-code: a slow first paint past cancel time costs one cold
+remount instead of a false hot reveal. Shape-locked 3 ways + full shell
+2205/0. REMAINERS (a)/(c)/(d) as filed stand for their own scopes; the
+absent-declaration loop is now expected to stand down on a healthy fresh
+mount (its sub-item stays until measured).
+
 (d) REMOVE-VS-KEEPALIVE RACE: `session remove` answered
   verified:true / remote_runtime_after:ConfirmedGone while the runtime
   RESURRECTED within seconds (spawn pid changed under the verdict) —
