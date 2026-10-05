@@ -37,13 +37,29 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   terminal called ready. MEMBERS: [11.178]'s residual stall (its "phantom
   eval" framing is dead; the "vanish" was this shed window), the [11.217]
   half-handshake site, [11.229](a)+(c) blank shapes, the first-spawn-blank
-  readings beside [11.226]. ATTACK: synthesize the FULL bridge contract on
-  posted-proof (drive what mount_open arms; trace synthesized_mount_open);
-  falsifier = rig 0/6 wedges, 6/6 painted WITH content. OPEN SUB-Q: the
+  readings beside [11.226]. ATTACK: LANDED 2026-10-05 (3042a0d6, lane
+  lane/f1/synthesize-full-contract) — on matched-stage-posted the FULL
+  contract now rides the ONE transport measured alive through the shed
+  window (fresh document::eval + return): off-loop daemon screen snapshot
+  seed, one-shot proof eval (seed the empty term painted-guarded, await
+  xterm's write callback, return constructed/screen/rows/cols/painted),
+  geometry + paint witnesses set from the PROOF (never assumed),
+  attach_ready fires through the normal gate, and BOTH mainline write
+  sites route through the page host-registry write eval for that mount's
+  lifetime. FALSIFIER MET (hermetic rig, exe-proofed): 6/6 painted WITH
+  content, 0 wedges; 5/5 proofs constructed+screen+106x48+painted+
+  wrote_seed=63; healthy bridge row unchanged (790 ms). REMAINDERS:
+  (a) [11.231]-adjacent rig law — always override XDG_DATA_HOME and
+  assert the served exe; (b) INPUT LEG STILL DEAD: keystrokes ride
+  kind:"input" over the dead per-eval leg — a synthesized mount is
+  painted-but-input-dead until the input dual-leg lands (page ring +
+  monotonic ids, exactly-once across legs) — THE NEXT UNIT; (c) the
   stale-receiver WHY (sol ranked-attack #3) — page-side send ring +
-  IPC-ingress stamps decide it. LONG-TERM: sol's owner-backed attach
-  transaction (ContentReady only on a JS ack of applied cursor+buffer;
-  one bounded reconstruction then an explicit failure surface).
+  IPC-ingress stamps decide it; (d) the healthy row's page→Rust ytrace
+  still rides the dead leg (cosmetic, trace-only). LONG-TERM: sol's
+  owner-backed attach transaction (ContentReady only on a JS ack of
+  applied cursor+buffer; one bounded reconstruction then an explicit
+  failure surface).
 - **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
@@ -76,6 +92,24 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   bar, [11.172] switch remount cost (FIXED in code — proof owed), the
   close/teardown family. Re-derive this family's shape after F1 lands
   (the wedge contaminated spawn-latency baselines).
+
+## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
+
+**Status:** OPEN
+
+Fixed in code with live rig proof (3042a0d6); the entry stays open as
+the LAW record for every future rig.
+`tools/uxspeed/warmmount-rig.sh` — XDG_DATA_HOME=$SCRATCH/xdg-share + an
+EXE PROOF readout that greps the served `executable_path` from the
+scratch trace's register event and refuses to claim OK on a mismatch.
+THE LAW GENERALIZES: every rig/probe that launches a worktree or
+non-installed yggterm binary MUST redirect XDG_DATA_HOME into its scratch
+and assert the served exe from the run's own trace — the binary hands
+off to `~/.local/share/yggterm/direct/builds/<sha>` when the real user
+state is visible, silently, with the same UX and the same trace schema.
+Symptom signature to remember: patched-code trace events stay at ZERO
+while known-main events fire — before suspecting the patch, read the
+register event's executable_path.
 
 ## ⛔ [11.230] DELETING A MERGED LANE'S REMOTE BRANCH WEDGES ITS CI SUBSCRIPTION FOREVER — THE WATCHER COUNTS A SUB WHOSE BRANCH IS GONE AS A CONFLICT AND EVERY TICK REPORTS merged=0 (measured live 2026-10-05 11:20-11:45 IST, five stale subs, conflicts=5 × six ticks)
 
@@ -1148,6 +1182,11 @@ warm_eval_vanish_redo_cold on the reused path — or the refusing arm named.
 ## ⛔ [11.178] THE WARM MOUNT EVAL CAN WEDGE: THE VERSION PROBE ANSWERS, THE ~1 KB SCRIPT NEVER EXECUTES (root cause OPEN at the WebKitGTK layer — spawn cost FIXED IN CODE by the warm-eval liveness gate; rig recipe + dispatch-stamp recipe included)
 
 **Status:** OPEN
+
+The paint-zombie half is CLOSED in code (F1 landing 3042a0d6, 2026-10-05,
+falsifier bar met: 6/6 painted with content). Still open: the stall-queue
+WHY (F1 sub-Q c), the stale-receiver WHY (F1 sub-Q b), and the
+double-mount race residue below.
 
 Root cause OPEN but REFRAMED 2026-09-29 (eval-wedge-webkit-why lane, claim
 ACK-bddb4ba4c8): the WebKitGTK-phantom mechanism below is **FALSIFIED** — the
