@@ -8141,6 +8141,23 @@ fn TerminalCanvas(
                                     terminal_geometry_ready =
                                         terminal_geometry_ready || geometry_usable;
                                     if !terminal_paint_seen {
+                                        // [11.229] First paint of this host:
+                                        // record the shell-level PAINT witness
+                                        // the ready-by-cancel latch and the
+                                        // reveal-reuse predicates require —
+                                        // forwarded bytes alone prove nothing
+                                        // about the surface (the measured
+                                        // paint-zombie had meaningful output
+                                        // over a blank buffer).
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_first_paint_witness",
+                                            |shell| {
+                                                shell.note_terminal_session_painted(
+                                                    &session_path,
+                                                );
+                                            },
+                                        );
                                         append_trace_event(
                                             &trace_home,
                                             "ui",

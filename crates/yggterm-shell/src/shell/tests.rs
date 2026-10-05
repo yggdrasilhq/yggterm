@@ -42004,6 +42004,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // The host record exists: the mount epoch was assigned (the mount_open
         // had succeeded by the time the cancel fired in the measured trace).
         shell.bump_terminal_mount_epoch_for_session(session_path, "test");
+        // [11.229] The measured host had mounted and painted ~400 ms in — the
+        // ready-by-cancel latch requires the paint witness (forwarded output
+        // alone proved nothing; see the 2026-10-05 blank-viewport incident).
+        shell.note_terminal_session_painted(session_path);
         let attempt_id =
             shell.begin_terminal_open_attempt(session_path, "req-live-host", 4, "startup_restore");
         // Real session content arrived through the daemon's forward, but the
@@ -42058,6 +42062,91 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(
             shell.terminal_session_is_retained_live(session_path),
             "clause C must see host + was_ever_ready + daemon ownership: no remount"
+        );
+    }
+
+    /// [11.229] The measured 2026-10-05 blank-viewport row: a host whose eval
+    /// answered while its mount script never constructed a terminal. The
+    /// daemon forwarded 2,244 "meaningful" bytes; the client buffer held 63
+    /// blank rows; the ready-by-cancel latch marked the paint-zombie ready and
+    /// every later switch revealed the same dead host (mount_epoch_reused,
+    /// epoch 1, at birth AND at the owner's refocus). A NEVER-PAINTED host
+    /// must NOT latch ready — it cancels honestly, and the next open
+    /// cold-remounts (epoch bump) instead of revealing a blank forever.
+    #[test]
+    fn a_never_painted_host_does_not_latch_ready_on_cancel_and_cold_remounts() {
+        let other_active_path = "local://zombie-cancel-active";
+        let session_path = "local://zombie-cancel";
+        let bootstrap = test_shell_bootstrap_with_active_session(other_active_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "test");
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-zombie", 4, "startup_restore");
+        // Transport-liveness only: forwarded bytes count, the surface never
+        // painted (no note_terminal_session_painted call — the wedge).
+        shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
+            session_path,
+            "daemon_output",
+            false,
+            false,
+        );
+
+        let cancelled = shell.cancel_terminal_open_attempt_for_inactive_session(
+            session_path,
+            "the reveal was cancelled: this session stopped being the active terminal",
+        );
+        assert!(
+            cancelled,
+            "a never-painted host must cancel, not latch ready — forwarded bytes \
+             prove the transport, never the surface"
+        );
+        let attempt = shell.terminal_open_attempts.get(&attempt_id).expect("attempt");
+        assert!(
+            attempt.ready_at_ms.is_none()
+                && matches!(attempt.state, TerminalOpenAttemptState::Cancelled),
+            "the paint-zombie's attempt must stand down honestly"
+        );
+        assert!(
+            !shell.terminal_session_was_ever_ready(session_path),
+            "no ready proof may survive for a host that never painted"
+        );
+
+        // The user switches back: the retained path must NOT be revealed on
+        // the dead host — the resolver falls through to a cold remount.
+        shell.note_terminal_activation_mru(session_path);
+        shell.retain_terminal_session_path(session_path);
+        assert!(
+            !shell.terminal_session_is_retained_live(session_path),
+            "retained-live must not honor a host with no paint witness"
+        );
+        let (epoch, reused, settled_futile) =
+            shell.resolve_active_open_mount_epoch(session_path, current_millis());
+        assert!(
+            !reused && !settled_futile && epoch >= 1,
+            "the resolver must bump (fresh host) instead of revealing the zombie"
+        );
+        assert!(
+            !shell.terminal_session_host_has_painted(session_path),
+            "the bump clears any stale witness; the fresh host re-earns paint"
+        );
+    }
+
+    /// [11.229] The witness is per-HOST: an epoch bump (a fresh surface) clears
+    /// it, so a dead host's paint history can never vouch for its successor.
+    #[test]
+    fn an_epoch_bump_clears_the_paint_witness() {
+        let other_active_path = "local://witness-bump-active";
+        let session_path = "local://witness-bump";
+        let bootstrap = test_shell_bootstrap_with_active_session(other_active_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.bump_terminal_mount_epoch_for_session(session_path, "first");
+        shell.note_terminal_session_painted(session_path);
+        assert!(shell.terminal_session_host_has_painted(session_path));
+        shell.bump_terminal_mount_epoch_for_session(session_path, "second");
+        assert!(
+            !shell.terminal_session_host_has_painted(session_path),
+            "a fresh host starts with an empty paint witness"
         );
     }
 
