@@ -961,6 +961,17 @@ pub(crate) fn terminal_loop_heartbeat_age_ms(session_path: &str) -> Option<u64> 
     Some(wall_now_ms().saturating_sub(*at))
 }
 
+/// (j) True while a mount loop for the session is ALIVE — a fresh heartbeat.
+/// `None` (never mounted, or punched out by the armed-death drop guard) and
+/// stale beats are dead loops; the reveal-raise and reparent gates already
+/// trust this same signal for the same meaning.
+pub(crate) fn terminal_loop_is_live(session_path: &str) -> bool {
+    matches!(
+        terminal_loop_heartbeat_age_ms(session_path),
+        Some(age) if age < TERMINAL_LOOP_STALE_MS
+    )
+}
+
 /// [11.179] Wall-ms of the session's last SUCCESSFUL bridge read — the
 /// REMOTE runtime's ownership proof. A retained remote host trickle-reads
 /// every `TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS` while hidden, and
@@ -33457,23 +33468,59 @@ impl ShellState {
             .cloned()
             .collect::<HashSet<_>>();
         let mut removed_paths = Vec::new();
+        let mut deferred_live_loops = Vec::new();
         self.terminal_attach_in_flight.retain(|session_path| {
             let foreground_attach = active_path.as_deref() == Some(session_path.as_str())
                 || active_terminal_request_path.as_deref() == Some(session_path.as_str());
             let keep = foreground_attach
                 && retained_paths.contains(session_path)
                 && !ready_paths.contains(session_path);
+            if !keep && terminal_loop_is_live(session_path) {
+                // (j) THE LIVE-TASK GUARD: "attempt ready" does not mean
+                // "attach done" — the reveal/warm-alive path marks the open
+                // attempt ready LONG before the mount task's attach_ready
+                // fires, so this prune used to evict the marker AND the
+                // bootstrap owner+lease out from under the LIVE loop at the
+                // first background snapshot (+5.7 s measured): the loop then
+                // read itself superseded (registry_owner null), dropped
+                // WITHOUT arming a remount, and no successor ever spawned —
+                // the row stayed mountless (blank, input-dead). A fresh loop
+                // heartbeat is the dead/live truth; the live task clears
+                // its own marker and finishes its own surface request at
+                // attach_ready. A dead loop's heartbeat is absent (the drop
+                // guard punches it) or stale, so the leak-GC this prune was
+                // built for still runs — at most one
+                // TERMINAL_LOOP_STALE_MS later.
+                deferred_live_loops.push(session_path.clone());
+                return true;
+            }
             if !keep {
                 removed_paths.push(session_path.clone());
             }
             keep
         });
-        for session_path in removed_paths {
+        for session_path in &removed_paths {
             self.terminal_bootstrap_owner_by_session
-                .remove(&session_path);
+                .remove(session_path);
             self.terminal_bootstrap_lease_by_session
-                .remove(&session_path);
-            self.maybe_finish_terminal_surface_request_for_session(&session_path);
+                .remove(session_path);
+            self.maybe_finish_terminal_surface_request_for_session(session_path);
+        }
+        // (j) instrument: the guarded deferrals are the fix's positive
+        // signal — one line per apply that WOULD have killed a live mount.
+        if !deferred_live_loops.is_empty() || !removed_paths.is_empty() {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "terminal_mount",
+                    "attach_marker_prune_verdict",
+                    json!({
+                        "evicted": removed_paths,
+                        "deferred_live_loops": deferred_live_loops,
+                    }),
+                );
+            }
         }
     }
     fn prune_terminal_resume_ready_paths(&mut self) {
@@ -33509,10 +33556,42 @@ impl ShellState {
     }
     fn prune_terminal_bootstrap_owners(&mut self) {
         let keep_paths = self.terminal_snapshot_prune_keep_paths();
+        // (j) instrument: a prune that drops a LIVE session's owner kills its
+        // in-flight mount task (superseded-without-successor, the +6s blank).
+        // Trace every removal with the keep-set that failed to hold it.
+        let live_paths: std::collections::HashSet<String> = self
+            .server
+            .live_sessions()
+            .into_iter()
+            .map(|session| session.session_path.clone())
+            .collect();
+        let mut pruned_owners: Vec<(String, bool)> = Vec::new();
         self.terminal_bootstrap_owner_by_session
-            .retain(|session_path, _| keep_paths.contains(session_path));
+            .retain(|session_path, _| {
+                let keep = keep_paths.contains(session_path);
+                if !keep {
+                    pruned_owners
+                        .push((session_path.clone(), live_paths.contains(session_path)));
+                }
+                keep
+            });
         self.terminal_bootstrap_lease_by_session
             .retain(|session_path, _| keep_paths.contains(session_path));
+        if !pruned_owners.is_empty() {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "terminal_mount",
+                    "bootstrap_owner_pruned_by_snapshot",
+                    json!({
+                        "pruned": pruned_owners,
+                        "active": self.server.active_session_path(),
+                        "retained_count": self.retained_terminal_session_paths.len(),
+                    }),
+                );
+            }
+        }
     }
     fn ensure_active_session_expanded(&mut self) {
         let remote_paths = self
@@ -92337,6 +92416,7 @@ fn preserve_client_focus_for_background_snapshot(
     shell: &ShellState,
     snapshot: &mut ServerUiSnapshot,
 ) {
+    let incoming_active_path = snapshot.active_session_path.clone();
     let fallback_active_path = shell.server.active_session_path();
     let (preserved_view_mode, preserved_active_path) =
         if let Some(request) = shell.active_surface_requests.get(&YggSurface::Terminal) {
@@ -92415,6 +92495,24 @@ fn preserve_client_focus_for_background_snapshot(
             .find(|session| session.session_path == preserved_session.session_path)
         {
             *live = preserved_session;
+        }
+    }
+    // (j) instrument: the stamp decides what the apply legs (and the
+    // bootstrap-owner prune) see as active. Divergence from the daemon's
+    // incoming pointer is the suspected stale-request shape.
+    if incoming_active_path != preserved_active_path {
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "app_control",
+                "background_snapshot_focus_restamped",
+                json!({
+                    "incoming_active": incoming_active_path,
+                    "preserved_active": preserved_active_path,
+                    "server_active": fallback_active_path,
+                }),
+            );
         }
     }
 }

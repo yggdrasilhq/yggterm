@@ -176,20 +176,50 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   must REAP ITS SCRATCH DAEMON by YGGTERM_HOME environ match — pkill -x
   yggterm does not kill yggterm-headless, 13 daemons accumulated across
   ~10 runs, and their CPU flipped the (j) race.
-  (j) THE +6s BACKGROUND-SNAPSHOT SUPERSEDE RACE (NEW, FILED — the next
-  fresh-spawn-blank mechanism): ~6 s after row creation an
-  interactive/background snapshot cycle re-issues a bootstrap for the
-  active session; when the fresh mount's attach_ready has not fired
-  yet, the pre-select owner check supersedes the LIVE loop
-  (bootstrap_owner_superseded_during_loop -> drop with remount_armed
-  FALSE — a successor is presumed), and in the measured failing runs NO
-  successor mounted: attach_ready 0, row left mountless (blank,
-  input-dead). PRE-EXISTING on main (deployed 1e689841 measured both
-  outcomes tonight), flaky and load-correlated (3/10 runs). ATTACK:
-  identify the +6 s requester (the snapshot apply's re-issue path),
-  then either suppress the re-issue while a mount task holds the
-  bootstrap lease, or make the supersede verify the successor actually
-  began before the old loop stands down. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
+  (j) THE +6s SNAPSHOT-PRUNE LIVE-MOUNT KILL — ROOT MEASURED + LANDED
+  2026-10-06 (sitting 8, lane lane/f1/snapshot-supersede-race): the kill
+  is NOT a re-issue/supersede handshake at all — there is no requester
+  and no successor. The background_live_session_snapshot apply's leg-10
+  `prune_terminal_attach_in_flight` evicted any attach_in_flight marker
+  whose open attempt was already READY — and on eviction it ALSO removed
+  the bootstrap owner+lease. But "attempt ready" != "attach done": the
+  reveal/warm-alive path marks the attempt ready ~5s BEFORE the mount
+  task's attach_ready fires, so the first background snapshot (~6s
+  cadence) that lands inside that window nukes the owner out from under
+  the LIVE loop. Measured chain (instrumented RED run 1791235339, rig
+  exit 4): apply legs -> 62 ms -> bootstrap_owner_superseded_during_loop
+  {registry_owner: NULL} -> terminal_mount_task_dropped {remount_armed:
+  false} -> attach_ready 0 for the whole run, row mountless (blank,
+  input-dead). The dead "re-issue requester" framing is killed: no
+  bootstrap_spawn_scheduled ever follows (acquire-without-spawn is
+  structurally impossible), the owner-prune leg-12 and
+  preserve_client_focus instruments both stayed silent in RED runs —
+  the removal was leg-10's eviction loop. FIX: the eviction now carries
+  a LIVE-TASK GUARD — `terminal_loop_is_live` (fresh mount-loop
+  heartbeat, the same signal the reveal-raise and reparent gates trust)
+  defers marker+owner+lease for a live loop (the task clears its own at
+  attach_ready); a dead loop's heartbeat is absent (drop guard punches
+  it) or stale, so the leak-GC this prune was built for still runs, at
+  most one TERMINAL_LOOP_STALE_MS (60s) later. INSTRUMENTS that landed
+  with it: the supersede event carries `registry_owner` (Some=overwrite
+  / null=prune — the discriminator this diagnosis needed); leg-12's
+  owner prune traces `bootstrap_owner_pruned_by_snapshot` on every
+  removal with the keep-set; leg-10 traces
+  `attach_marker_prune_verdict {deferred_live_loops, evicted}` (the
+  fix's positive signal — it fired in every GREEN run);
+  preserve_client_focus traces divergence as
+  `background_snapshot_focus_restamped`. PROOFS: 2 new unit locks
+  (live-loop+ready-attempt marker is SPARED with owner+lease;
+  dead/absent-heartbeat ready-marker still evicted), suite 2215/0; rig
+  RED (exit 4, attach_ready 0, superseded 1) on instrumented-unfixed
+  build vs GREEN x3 on the fixed build (attach_ready all rows,
+  superseded 0, deferred_live_loops named the live row every time).
+  REMAINDERS: (r-j1) the supersede path itself still presumes a
+  successor without verifying one began — hardening (verify-or-rearm on
+  drop) stays filed for the NEXT kill site of this shape, not this one;
+  (r-j2) post-kill recovery depends on the render latch
+  (bootstrap_task_identity) — a user re-select is still the only
+  re-schedule trigger after any genuine supersede. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
   run 3; sol Q3): a row demoted from active before its synthesis
   completes cannot re-latch input focus under total bridge suppression
   (probe-type refuses terminal_input_not_focused), while a row
