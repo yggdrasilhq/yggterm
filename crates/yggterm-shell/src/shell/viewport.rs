@@ -3578,6 +3578,16 @@ struct InputRingDrainResponse {
     /// requesting mount's or the whole answer is stale (sol Q-B).
     #[serde(default)]
     inc: Option<u64>,
+    /// [F1-(f2)] The bucket's OWNING incarnation (the stamp script's
+    /// field, echoed by the ownership gate): when it is not ours the
+    /// bucket belongs to a host-reusing newer mount, and nothing in this
+    /// answer may steer this mount — chunks, baseline, overflow alike.
+    #[serde(default)]
+    bucket_inc: Option<u64>,
+    /// [F1-(f2)] The ownership gate's verdict — a foreign bucket was
+    /// neither read nor pruned by the (stale) drain that answered.
+    #[serde(default)]
+    foreign_bucket: bool,
     /// The bucket's nextId at THIS mount's stamp — everything below it
     /// predates the mount (sol Q-A's baseline).
     #[serde(default)]
@@ -12557,6 +12567,34 @@ fn TerminalCanvas(
                                     "session_path": session_path.clone(),
                                     "host_id": host_id.clone(),
                                     "answer_inc": drained.inc,
+                                    "mount_inc": input_ring_incarnation,
+                                }),
+                            );
+                            continue;
+                        }
+                        // [F1-(f2)] A foreign bucket never steers this
+                        // mount: the ownership gate held the stale drain's
+                        // page-side hands (nothing read, nothing pruned),
+                        // so the answer speaks for the OWNING mount's
+                        // bucket, not ours — chunks, baseline, and overflow
+                        // are all the new mount's business. Belt-and-braces:
+                        // a bucket_inc that contradicts the flag discards
+                        // too — Rust never trusts a bucket it does not own
+                        // (sol Q2 find).
+                        if drained.foreign_bucket
+                            || drained
+                                .bucket_inc
+                                .is_some_and(|bucket_inc| bucket_inc != input_ring_incarnation)
+                        {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "synthesized_input_foreign_bucket",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "host_id": host_id.clone(),
+                                    "bucket_inc": drained.bucket_inc,
                                     "mount_inc": input_ring_incarnation,
                                 }),
                             );

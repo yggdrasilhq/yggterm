@@ -409,7 +409,7 @@ __b.baseline = __b.nextId;"#
 /// [F1-(f)] Drain the page-side input ring for a synthesized mount — the
 /// sol-Q4/Q5 rework of the input dual-leg's second half. The keystrokes the
 /// page recorded (per-mount monotonic ids) come back over the eval-return
-/// leg, the one transport alive through the shed window. Three laws changed
+/// leg, the one transport alive through the shed window. Four laws changed
 /// from the first cut:
 ///   · NON-DESTRUCTIVE: chunks are READ here, never spliced — a lost eval
 ///     return must not lose input (splice-before-ack was sol Q4's first
@@ -417,6 +417,13 @@ __b.baseline = __b.nextId;"#
 ///     prunes the prefix the writer already accepted, and any chunk whose
 ///     attempt stamp names a superseded mount is pruned as stale — a host
 ///     reused by a fresh mount can never replay the old mount's history.
+///   · OWNERSHIP (f2): the bucket's inc stamp gates EVERY read and prune
+///     here — a bucket restamped by a host-reusing newer mount (or born
+///     before any stamp) is foreign to this drain: reading it would
+///     misclassify the new mount's chunks as stale, and pruning them
+///     page-side is exactly the destruction the Rust return guard cannot
+///     undo (sol Q2's prune race — the guard sees only our ANSWER, after
+///     the script has returned).
 ///   · INCARNATION: chunks carry the mount attempt that typed them, so the
 ///     filter above is the replay kill-switch; ids themselves stay
 ///     monotonic across mounts for the Rust-side contiguous cursor.
@@ -438,7 +445,16 @@ const __bucket = (window.__yggtermInputRing || {{}})[__h] || null;
 let __out = [];
 let __pruned = 0;
 let __stale = 0;
-if (__bucket && __bucket.chunks && __bucket.chunks.length) {{
+const __bucketInc = (__bucket && typeof __bucket.inc === "number") ? __bucket.inc : null;
+// [F1-(f2)] BUCKET-OWNERSHIP GATE (sol Q2 find): the bucket's inc stamp
+// is written by the OWNING mount's stamp script — a bucket whose inc is
+// not ours belongs to a host-reusing newer mount (or predates every
+// stamp). This drain is then the stale crosser, and the Rust return
+// guard acts only on our ANSWER, AFTER we return: pruning here would
+// destroy the new mount's chunks where no guard can ever undo it. Read
+// nothing, mutate nothing — the owning mount's own drain prunes.
+const __foreign = __bucket ? __bucketInc !== __inc : false;
+if (__bucket && !__foreign && __bucket.chunks && __bucket.chunks.length) {{
     const __kept = [];
     for (const __c of __bucket.chunks) {{
         // [F1-(f) Q-B] stale = recorded under ANOTHER mount's incarnation
@@ -462,10 +478,12 @@ if (__bucket && __bucket.chunks && __bucket.chunks.length) {{
 return JSON.stringify({{
     chunks: __out,
     inc: __inc,
-    baseline: (__bucket && typeof __bucket.baseline === "number") ? __bucket.baseline : 1,
+    bucket_inc: __bucketInc,
+    foreign_bucket: !!__foreign,
+    baseline: (__bucket && !__foreign && typeof __bucket.baseline === "number") ? __bucket.baseline : null,
     pruned: __pruned,
     stale: __stale,
-    overflowed: __bucket ? !!__bucket.overflowed : false,
+    overflowed: (__bucket && !__foreign) ? !!__bucket.overflowed : false,
 }});"#
     )
 }
