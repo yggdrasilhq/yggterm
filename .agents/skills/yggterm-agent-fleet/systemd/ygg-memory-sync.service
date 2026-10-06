@@ -1,0 +1,9 @@
+[Unit]
+Description=Yggterm semantic memory convergence across native CLIs and fleet hosts
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ygg-memory-tick
+Nice=10
+IOSchedulingClass=idle

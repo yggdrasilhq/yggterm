@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Recovery convergence: native -> hub, fleet object/event exchange, hub -> native.
+# Repo-homed (lane/memory/tooling-home + mem-dream): this file's SSOT is
+# .agents/skills/yggterm-agent-fleet/ygg-memory-tick in the yggterm repo;
+# bootstrap.sh refreshes the installed copy. The dream leg is config-gated
+# (create ~/.yggterm/config/dream/enabled on exactly ONE host — the primary
+# dreamer — to arm it) and can never fail the tick.
+
+set -u
+
+cfg="$HOME/.config/ygg-fleet/memory-sync.conf"
+harnesses="claude,codex,antigravity,grok,muse,qwen,opencode,pi,kimi,gemini"
+if [ -f "$cfg" ]; then
+  configured="$(sed -n 's/^harnesses=//p' "$cfg" | tail -n 1)"
+  [ -z "$configured" ] || harnesses="$configured"
+fi
+IFS=, read -r -a selected <<< "$harnesses"
+failed=0
+
+sync_native() {
+  local harness
+  for harness in "${selected[@]}"; do
+    [ -z "$harness" ] && continue
+    "$HOME/.local/bin/ygg-memory" sync-harness --harness "$harness" --all || failed=1
+  done
+}
+
+sync_native
+if [ -s "$HOME/.config/ygg-fleet/mesh" ]; then
+  "$HOME/.local/bin/ygg-memory" sync-fleet || failed=1
+fi
+sync_native
+
+# --- [mem-dream] the AUTO leg: config-gated, single-host, non-blocking ----------
+# Arming: `mkdir -p ~/.yggterm/config/dream && touch ~/.yggterm/config/dream/enabled`
+# on exactly one host (multi-host arming = redundant composer spend; the
+# per-namespace watermarks keep even that correct). The verb's own gates
+# (quiescence, cooldown, delta, read-version fence) are the safety envelope.
+if [ -f "$HOME/.yggterm/config/dream/enabled" ] && [ -x "$HOME/.local/bin/ygg-memory" ]; then
+  exec 8>"$HOME/.yggterm/config/dream/.lock"
+  if flock -n 8 2>/dev/null; then
+    timeout 960 "$HOME/.local/bin/ygg-memory" dream --auto --quiet >/dev/null 2>&1 || true
+    flock -u 8 2>/dev/null
+  fi
+fi
+
+# --- [mem-dream] the canary: deterministic probes, failures logged with a stamp.
+if [ -x "$HOME/.local/bin/ygg-memory" ]; then
+  if ! "$HOME/.local/bin/ygg-memory" canary --json >/dev/null 2>&1; then
+    {
+      printf '[%s] ' "$(date -Is)"
+      "$HOME/.local/bin/ygg-memory" canary 2>&1
+    } >> "$HOME/.yggterm/memory/canary.log" 2>/dev/null || true
+  fi
+fi
+
+exit "$failed"
