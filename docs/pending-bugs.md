@@ -346,7 +346,29 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   invalidation trigger; slice 3 H_vocab phase telemetry + scoped lore
   activation; slice 4 Hebbian decay + canary probes. The owner now
   steers generically ("continue the yggterm work") — orientation speed
-  IS the product.
+  IS the product. SLICE 1 LANDED + APPLIED + MEASURED 2026-10-06
+  (sitting 10, main 90aedce70758, lane lane/memory/index-tiering
+  589ba67c): classifier + tiered rebuild + shelve-archives verb +
+  test_memory_index_tiering.py; live-store result on jojo: MEMORY.md
+  906 lines/176.7KB → 293 lines/33KB (5.4x cut, loader truncation
+  dead), 561 docs shelved into archive/, ARCHIVE-INDEX.md generated
+  (never auto-loaded), 545 legacy top-level sittings migrated, 544+46
+  byte-identical re-delivery duplicates deduped (identical rm,
+  newer-wins). ⛔ [11.236] INCIDENT (same sitting, RECOVERED): the
+  runner self-disperse REGRESSED — after ygg-memory's own sync-fleet
+  updated jojo+oc runners to 90aedce7, a long `sync-harness --all`
+  re-delivered ~500 hub _global mirrors into the native top level AND
+  left the OLD runner bytes installed (verb vanished; the old rglob
+  rebuilt a 1413-line index). Recovery: runner re-copied from the repo
+  SSOT, hub reconciliation completed (1034 journaled deletes, then
+  0/0/0), dupes deduped, index re-tiered. OWED: probe WHICH byte-source
+  overwrote the runner (peer mesh pull vs hub-tracked runner doors) —
+  the dispersal one-owner law vs version skew; a merge that touches
+  the runner pair must pin runners to the repo SSOT post-merge (the
+  [11.227] "pushed is a claim" class). SLICE 2 NEXT (the dream verb —
+  composer on sol/GLM per the model ruling, NOW.md, per-claim as-of,
+  critic gate, contradiction trigger, search verb + owner-now door per
+  the owner's 2026-10-06 JIT steer).
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
