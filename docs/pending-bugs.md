@@ -366,11 +366,21 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   rj1-rig green; workspace suite per-target green. REMAINDERS:
   (i-r1) name the silent exit arm exactly (add branch guards to the
   uninstrumented select arms; exit_hint currently bottoms out at
-  pre_select); (i-r2) the deeper policy question — should retained
-  hosts keep their loop alive (the BackgroundTrickle design says yes,
-  the silent demotion death says no; with the punch, re-activation
-  self-heals via bootstrap, so this is a perf question: each switch to
-  a loop-dead row pays the ~1.3s bootstrap instead of the fast raise);
+  pre_select). MEASURED SHARPENER (healthy-mode d-rig, sitting 15, the
+  fixed build, NO suppression — tools/uxspeed/demote-rig-healthy.sh):
+  the silent loop death is NOT plain demotion — a row demoted while
+  QUIESCENT (already attach_ready, no concurrent churn) KEEPS its loop,
+  gets the fast reveal-raise (served=1) and delivers typing green; the
+  row demoted DURING another row's CREATION churn (snapshot apply +
+  bootstrap re-key, the bootstrap_reset + spawn_skipped_inactive pair)
+  is the one whose loop dies (exit_hint=pre_select, remount_armed:
+  false). Post-punch that row refuses the raise, bootstraps a fresh
+  loop, and delivers typing green — so the punch did NOT regress the
+  common quiescent switch (fast raise intact), and both healthy input
+  paths deliver; (i-r2) narrowed accordingly: keep-alive applies to the
+  creation-churn window only (a row demoted by a sibling's creation
+  loses its loop's read trickle + pays the bootstrap on re-select —
+  the BackgroundTrickle intent is violated exactly there);
   (i-r3) LONG-TERM: sol's owner-backed attach transaction (ContentReady
   only on a JS ack of applied cursor+buffer; one bounded reconstruction
   then an explicit failure surface). RIG LAWS (measured this sitting):
