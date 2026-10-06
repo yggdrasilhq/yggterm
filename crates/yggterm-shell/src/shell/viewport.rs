@@ -5750,6 +5750,10 @@ fn TerminalCanvas(
                 "has_host_epoch": raise_has_host,
                 "was_ever_ready": raise_was_ready,
                 "daemon_owns_runtime": raise_daemon_owns,
+                // [F1-(i) 2026-10-06] the corpse discriminator: a refused
+                // raise with a live-looking canvas but loop_live=false is
+                // the dead-loop refusal this fix exists to produce.
+                "loop_live": terminal_loop_is_live(&session_path),
                 // [11.179] the remote arm's evidence: how old the row's last
                 // full-chain read answer is (None = never under this build).
                 "remote_read_age_ms": terminal_remote_runtime_read_age_ms(&session_path),
@@ -19494,6 +19498,11 @@ struct TerminalMountTaskDropGuard {
 
 impl Drop for TerminalMountTaskDropGuard {
     fn drop(&mut self) {
+        // [F1-(i) 2026-10-06] Name the exit arm: the silent demotion drop
+        // ended a loop with no named exit (the drop witness carried only
+        // remount_armed:false); the last select branch the loop entered is
+        // the discriminator the next diagnosis reads.
+        let exit_hint = terminal_loop_last_branch(&self.session_path);
         append_trace_event(
             &self.trace_home,
             "ui",
@@ -19502,18 +19511,25 @@ impl Drop for TerminalMountTaskDropGuard {
             json!({
                 "session_path": self.session_path,
                 "remount_armed": self.arm_remount.get(),
+                "exit_hint": exit_hint,
             }),
         );
+        // [F1-(i)/11.187-class 2026-10-06] PUNCH ON EVERY DROP, not only the
+        // armed deaths. Measured (d-rig, unfixed main): a mount task dropped
+        // silently on demotion and its <60 s heartbeat read FRESH at the very
+        // next re-activation — the reveal-raise served the corpse, and the
+        // row kept its painted host with NO read cadence and NO input drain:
+        // keystrokes on a synthesized mount pushed ring chunks nobody ever
+        // drained, so typing on the row was dead forever while every "is it
+        // focused" bit read healthy. A dropped task is a dead loop regardless
+        // of why it ended. A successor loop re-bumps within its first
+        // iteration, so this punch can cost at most one conservative
+        // bootstrap — never another corpse serve.
+        remove_terminal_loop_heartbeat(&self.session_path);
         if self.arm_remount.get() && terminal_loop_remount_budget_allows(&self.session_path) {
             let epoch = self
                 .state
                 .with_mut_counted(|shell| shell.bump_terminal_watchdog_remount_epoch(&self.session_path));
-            // [F1-(h2)/11.187] Punch the heartbeat: a fresh-looking beat on
-            // a dead loop made the reveal-raise serve this corpse and
-            // swallow the armed candidate forever (measured 2026-10-05).
-            // Absent => the raise refuses => the candidate reaches the
-            // bootstrap path on the next render.
-            remove_terminal_loop_heartbeat(&self.session_path);
             append_trace_event(
                 &self.trace_home,
                 "ui",
@@ -19566,6 +19582,7 @@ fn ensure_loop_branch_share_flusher() {
 impl TerminalLoopBranchGuard {
     fn new(branch: &'static str, session_path: &str) -> Self {
         ensure_loop_branch_share_flusher();
+        note_terminal_loop_branch(session_path, branch);
         Self {
             branch,
             session_path: session_path.to_string(),

@@ -953,6 +953,30 @@ pub(crate) fn remove_terminal_loop_heartbeat(session_path: &str) {
     }
 }
 
+/// [F1-(i) 2026-10-06] The last select branch a session's mount loop ENTERED.
+/// The silent demotion drop ended a loop with NO named exit arm — the drop
+/// witness said `remount_armed:false` and nothing else; this map is the
+/// discriminator the next diagnosis reads (the drop guard traces it as
+/// `exit_hint`). Updated by `TerminalLoopBranchGuard::new`, so every select
+/// arm that already funnels through the branch guard reports for free.
+static TERMINAL_LOOP_LAST_BRANCH: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub(crate) fn note_terminal_loop_branch(session_path: &str, branch: &'static str) {
+    if let Ok(mut branches) = TERMINAL_LOOP_LAST_BRANCH.lock() {
+        branches.insert(session_path.to_string(), branch);
+    }
+}
+
+pub(crate) fn terminal_loop_last_branch(session_path: &str) -> Option<&'static str> {
+    TERMINAL_LOOP_LAST_BRANCH
+        .lock()
+        .ok()?
+        .get(session_path)
+        .copied()
+}
+
 /// Age of the session's mount-loop heartbeat, in ms. `None` = never mounted
 /// under a build that carries the heartbeat (nothing to judge).
 pub(crate) fn terminal_loop_heartbeat_age_ms(session_path: &str) -> Option<u64> {

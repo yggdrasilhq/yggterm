@@ -17730,6 +17730,38 @@ console.log('ok');
                 .is_some(),
             "the drop guard must punch the heartbeat when it arms the remount"
         );
+        // [F1-(i) 2026-10-06] the punch must be UNCONDITIONAL: a silent
+        // demotion drop left a fresh (<60 s) beat behind and the next
+        // re-activation's reveal-raise served the corpse — no reads, no
+        // input drain, typing dead forever (d-rig measured). The punch text
+        // must sit BEFORE the armed-remount `if`, outside it.
+        let punch_at = viewport
+            .find("remove_terminal_loop_heartbeat(&self.session_path);")
+            .expect("heartbeat punch must exist");
+        let armed_if_at = viewport
+            .find("if self.arm_remount.get() && terminal_loop_remount_budget_allows")
+            .expect("the armed-remount arm must exist");
+        assert!(
+            punch_at < armed_if_at,
+            "the drop guard must punch the heartbeat on EVERY drop, not only \
+             armed deaths — a fresh beat on a silently-dropped loop is the \
+             corpse serve itself"
+        );
+        assert!(
+            viewport.find("\"exit_hint\": exit_hint,").is_some(),
+            "the drop witness must name the exit arm (last select branch) — \
+             the silent demotion drop had no named exit"
+        );
+        assert!(
+            viewport.find("\"loop_live\": terminal_loop_is_live(&session_path),").is_some(),
+            "the refused-raise trace must carry the corpse discriminator"
+        );
+        assert!(
+            state.find("fn note_terminal_loop_branch").is_some()
+                && state.find("fn terminal_loop_last_branch").is_some(),
+            "the last-branch map must exist — the drop witness's exit_hint \
+             reads it"
+        );
     }
 
     #[test]

@@ -329,18 +329,58 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   lane; suite 2227/0 with 3 new locks.
   (r-j2) post-kill recovery depends on the render latch
   (bootstrap_task_identity) — a user re-select is still the only
-  re-schedule trigger after any genuine supersede. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
-  run 3; sol Q3): a row demoted from active before its synthesis
-  completes cannot re-latch input focus under total bridge suppression
-  (probe-type refuses terminal_input_not_focused), while a row
-  synthesized while active keeps input across later switches. SCOPE
-  DISCIPLINE: the refusal is a POST-DISPATCH classification, not proven
-  dispatch refusal; Rust→page set_input_enabled and policy evals still
-  run. Reproduce, record host_stdin_enabled/effective focus/ring
-  additions/writer enqueues/PTY receipt, restore delivery, test
-  recovery. LONG-TERM: sol's owner-backed attach transaction
-  (ContentReady only on a JS ack of applied cursor+buffer; one bounded
-  reconstruction then an explicit failure surface).
+  re-schedule trigger after any genuine supersede. (i) THE SWITCH-KILLS-INPUT CORPSE SERVE — ROOT MEASURED + LANDED
+  2026-10-06 (sitting 15, d-rig falsifier tools/uxspeed/demote-rig.sh;
+  the filed "pre-synthesis demotion" framing was TOO NARROW and its
+  "synthesized-while-active keeps input across later switches" control
+  claim was measured with the focus verb, WHICH NEVER SWITCHES — see the
+  rig law below). MECHANISM (measured end-to-end, RED on unfixed main
+  745269ff, exe-proofed): when a row is demoted, its mount task exits
+  SILENTLY (terminal_mount_task_dropped remount_armed:false, no named
+  exit arm — the drop witness was the only trace); because the armed-
+  death heartbeat punch did not fire for silent drops, the dead loop's
+  <60s heartbeat read FRESH at the very next re-activation, and the
+  reveal-raise predicate (which already refuses stale/absent beats)
+  served the CORPSE: reveal_served + mount_epoch_reused{reused_live_
+  host:true} on a painted host with NO loop behind it — no read cadence
+  (the daemon_declare_absent spam for such rows is the same corpse) and
+  NO input drain: on a synthesized mount, typed chunks pile into the
+  page ring with no drainer, so typing is dead FOREVER while every
+  "is it focused" bit reads healthy. The probe makes it worse: probe-
+  type falls back to the xterm core trigger and can ACCEPT (counters
+  path) with zero PTY delivery — rig bars must read `server screen`
+  ground truth plus the verdict's used_core_trigger/used_term_input.
+  FIX: the drop guard punches the heartbeat on EVERY drop (a dropped
+  task is a dead loop; a successor re-bumps within its first iteration,
+  so the punch costs at most one conservative bootstrap); the refused
+  raise now traces loop_live (the corpse discriminator); the drop
+  witness carries exit_hint (the last instrumented select branch —
+  "pre_select" for the silent demotion death; the exact uninstrumented
+  exit arm stays unnamed, follow-up below). PROOFS: d-rig all-bars
+  GREEN x2 on the lane (baseline + the switch-away/back control + the
+  demoted-mid-synthesis arm + the pointer-ladder arm, all painted via
+  daemon screen; RED on main: control refused, zero ring drains post-
+  switch, core-trigger fallback acceptance), the refused-raise-
+  loop_live=false signal present in the GREEN trace; remount-hook-rig
+  green (one (e-r1)-class double-paint flake, rerun green — see (e-r1));
+  rj1-rig green; workspace suite per-target green. REMAINDERS:
+  (i-r1) name the silent exit arm exactly (add branch guards to the
+  uninstrumented select arms; exit_hint currently bottoms out at
+  pre_select); (i-r2) the deeper policy question — should retained
+  hosts keep their loop alive (the BackgroundTrickle design says yes,
+  the silent demotion death says no; with the punch, re-activation
+  self-heals via bootstrap, so this is a perf question: each switch to
+  a loop-dead row pays the ~1.3s bootstrap instead of the fast raise);
+  (i-r3) LONG-TERM: sol's owner-backed attach transaction (ContentReady
+  only on a JS ack of applied cursor+buffer; one bounded reconstruction
+  then an explicit failure surface). RIG LAWS (measured this sitting):
+  the `server app terminal focus` verb (ReclaimTerminalFocus) NEVER
+  switches the active row — it syncs policy only if the row is already
+  active; a rig that needs a REAL switch must use `server app open
+  <path> --view terminal` (the OpenPath activation path). Sitting-7's
+  BAR A "focus away+back retains the host" evidence was therefore
+  vacuous (no switch happened); the retained-host claim itself is
+  re-proven by d-rig's control arm.
 - **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
