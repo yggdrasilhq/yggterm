@@ -12168,6 +12168,13 @@ fn TerminalCanvas(
                                 let snap_session = runtime_session_path.clone();
                                 let snap_trace_home = trace_home.clone();
                                 let snap_tx = synth_snapshot_tx.clone();
+                                let snap_trace_session = session_path.clone();
+                                let snap_stall_ms = std::env::var(
+                                    "YGGTERM_TEST_STALL_SNAPSHOT_FETCH_MS",
+                                )
+                                .ok()
+                                .and_then(|value| value.parse::<u64>().ok())
+                                .unwrap_or(0);
                                 tokio::spawn(async move {
                                     let seed = terminal_snapshot_async(
                                         snap_endpoint,
@@ -12179,6 +12186,27 @@ fn TerminalCanvas(
                                         sanitize_terminal_replay_payload(&answer.text)
                                     })
                                     .unwrap_or_default();
+                                    // [F1-(e)] TEST HOOK (groundwork sitting 8;
+                                    // sol Q1 falsifier): stall the seed DELIVERY,
+                                    // not the capture — the content stays the T0
+                                    // daemon state while its application is held
+                                    // `ms` out, the deterministic wide form of the
+                                    // production race (fetch outstanding while
+                                    // differentials flow to the page).
+                                    if snap_stall_ms > 0 {
+                                        append_trace_event(
+                                            &snap_trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "test_hook_snapshot_fetch_stalled",
+                                            json!({
+                                                "session_path": snap_trace_session,
+                                                "ms": snap_stall_ms,
+                                            }),
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(snap_stall_ms))
+                                            .await;
+                                    }
                                     let _ = snap_tx.send(seed).await;
                                 });
                             }
