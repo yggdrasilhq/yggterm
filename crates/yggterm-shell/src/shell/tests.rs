@@ -72345,4 +72345,92 @@ mod web_surface_immersion_locks {
         assert!(!cursor.begin(Some(13)));
         assert_eq!(cursor.watermark(), 14);
     }
+
+    /// [F1-(f2)] sol Q2 find: the drain script must gate EVERY page-side
+    /// read and prune on bucket ownership — the bucket's inc stamp must
+    /// match the requesting mount's BEFORE the prune mutation can run,
+    /// because the Rust return guard acts only on the ANSWER, after the
+    /// script has already returned. An old-incarnation drain executing
+    /// after a host-reusing remount restamped the bucket must read
+    /// nothing and prune nothing: its "stale" classification of the new
+    /// mount's chunks is exactly the destruction the guard cannot undo.
+    /// Lock the ORDER — the gate text precedes the mutation text.
+    #[test]
+    fn input_ring_drain_script_gates_page_side_mutation_on_bucket_ownership() {
+        use super::seam_contains;
+        use super::terminal_input_ring_drain_script;
+
+        let script = terminal_input_ring_drain_script("host-x", 7, 42);
+        let gate = script
+            .find("__bucketInc !== __inc")
+            .expect("the ownership gate must exist");
+        let mutation = script
+            .find("__bucket.chunks = __kept")
+            .expect("the prune mutation must exist");
+        assert!(
+            gate < mutation,
+            "the bucket-ownership gate must precede the page-side prune — \
+             a drain whose bucket was restamped by a newer mount must \
+             never reach the mutation (sol Q2)"
+        );
+        assert!(
+            seam_contains(
+                &script,
+                "const __foreign = __bucket ? __bucketInc !== __inc : false;"
+            ),
+            "an unstamped or restamped bucket is foreign — never ours by default"
+        );
+        assert!(
+            seam_contains(&script, "if (__bucket && !__foreign && __bucket.chunks"),
+            "the classification loop runs only for an OWNED bucket"
+        );
+        assert!(
+            seam_contains(&script, "foreign_bucket: !!__foreign"),
+            "the ownership verdict must ride the answer for Rust to discard on"
+        );
+        assert!(
+            seam_contains(&script, "bucket_inc: __bucketInc"),
+            "the bucket's owning incarnation must ride the answer"
+        );
+        assert!(
+            seam_contains(
+                &script,
+                "baseline: (__bucket && !__foreign && typeof __bucket.baseline === \"number\") ? __bucket.baseline : null"
+            ),
+            "a foreign bucket's baseline must never ride the answer — it is the new mount's"
+        );
+        assert!(
+            seam_contains(
+                &script,
+                "overflowed: (__bucket && !__foreign) ? !!__bucket.overflowed : false"
+            ),
+            "a foreign bucket's overflow flag must never ride the answer"
+        );
+    }
+
+    /// [F1-(f2)] The Rust half of the ownership gate: a foreign-bucket
+    /// answer is discarded whole (chunks, baseline, overflow alike) —
+    /// and the page's discriminators must reach the guard's fields.
+    #[test]
+    fn input_ring_drain_answer_foreign_bucket_discriminators_deserialize() {
+        use super::InputRingDrainResponse;
+
+        let answer = serde_json::from_str::<InputRingDrainResponse>(
+            r#"{"chunks":[],"inc":42,"bucket_inc":43,"foreign_bucket":true,"baseline":null,"pruned":0,"stale":0,"overflowed":false}"#,
+        )
+        .expect("the foreign-bucket answer shape must deserialize");
+        assert_eq!(answer.inc, Some(42));
+        assert_eq!(answer.bucket_inc, Some(43));
+        assert!(answer.foreign_bucket);
+        assert_eq!(answer.baseline, None, "a foreign bucket's baseline must not ride");
+        // The pre-(f2) answer (no discriminators) still deserializes —
+        // serde defaults keep an old page talking to new Rust.
+        let legacy = serde_json::from_str::<InputRingDrainResponse>(
+            r#"{"chunks":[],"inc":42,"baseline":58,"pruned":0,"stale":0,"overflowed":false}"#,
+        )
+        .expect("the legacy answer shape must keep deserializing");
+        assert!(!legacy.foreign_bucket);
+        assert_eq!(legacy.bucket_inc, None);
+        assert_eq!(legacy.baseline, Some(58));
+    }
 }
