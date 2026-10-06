@@ -4253,6 +4253,7 @@ def main():
     dream_actions.add_argument("--apply", action="store_true", help="validate + land pending/RESPONSE.md (+CRITIC.md) through the journaled publish path")
     dream_actions.add_argument("--run", action="store_true", help="prepare + compose via codex (sol) + critic + apply in one shot")
     dream_actions.add_argument("--status", action="store_true", help="dream watermark, pending state, recent dreams")
+    dream_actions.add_argument("--auto", action="store_true", help="the auto-dreamer: pick the hungriest eligible namespace (delta-sorted, cooldown + quiescence filtered) and run prepare->compose->critic->apply; never raises (tick-safe)")
     p_dream.add_argument("--phase", default="synthesis", help="phase schema for the composer: recon|synthesis (declared; H_vocab auto-proposal is slice 3)")
     p_dream.add_argument("--extra-input", action="append", default=[], metavar="PATH", help="stage an extra raw input (board dump, ci.log tail); repeatable")
     p_dream.add_argument("--budget", type=int, default=None, help=f"delta input budget in bytes (default {DREAM_INPUT_BUDGET_BYTES})")
@@ -4265,11 +4266,6 @@ def main():
         "--force",
         action="store_true",
         help="override the quiescence gate (owner-directed testing only)",
-    )
-    p_dream.add_argument(
-        "--auto",
-        action="store_true",
-        help="the auto-dreamer: pick the hungriest eligible namespace (delta-sorted, cooldown + quiescence filtered) and run prepare->compose->critic->apply; never raises (tick-safe)",
     )
     p_dream.add_argument("--quiet", action="store_true", help="suppress informational output")
     p_canary = subparsers.add_parser(
