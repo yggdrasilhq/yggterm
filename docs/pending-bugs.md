@@ -358,10 +358,16 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   path, so the restored ACTIVE row after GUI relaunch over a live daemon
   hung mountless under the shed window; gate + redo now path-independent
   + the deferred trace rate-limited (f3-rig falsifier, rj1-rig
-  regression-green). REMAINDERS: [11.229](b) LIVE-GUI frozen-buffer arm
-  (runtime_spawn_id invalidation — the runtime replaced UNDER a mounted
-  client, not across GUI death; a different mechanism, still open),
-  (d) remove-vs-keepalive race.
+  regression-green). THE (b) LIVE-GUI ARM'S IDENTITY SIGNAL LANDED
+  (sitting 14, 2026-10-06, lane lane/rt/stream-spawn-id 65a87e59):
+  TerminalStream carries runtime_spawn_id + the mounted client
+  reconciles on an identity change (the same recovery as a cursor
+  rewind); rt-rig measured plain + grid-divergence arms already healing
+  on unfixed main via the rewind, so the id signal covers the NO-REWIND
+  arms (busy replacement outrunning the cursor, forwarded rewind loss) —
+  fake-id isolation arm GREEN on the lane. REMAINDERS under (b): the
+  mount-loop-DEAD arm ([11.187] territory) and error-not-answer shapes;
+  then (d) remove-vs-keepalive race.
 - **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
   [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
   auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
@@ -518,9 +524,38 @@ CLIENT halves that still recur on healthy rows.
   GUI-RELAUNCH arm of (b) is ROOT-FIXED — a relaunched GUI now re-binds
   retained rows through the F1 synthesis contract even inside the shed
   window (cold-first-mount hole; see F3 family + the r-j1 entry for the
-  measurement). The LIVE-GUI arm stands OPEN as filed: a runtime
-  replaced while the client stays mounted still needs the
-  `runtime_spawn_id` invalidation above.
+  measurement).
+  UPDATE 2026-10-06 ~22:0x IST (sitting 14, rt-rig + lane
+  lane/rt/stream-spawn-id 65a87e59): the LIVE-GUI arm's identity fix
+  LANDED — TerminalStream answers now carry `runtime_spawn_id` (own +
+  both forwarded read paths + the proxy read task + the recovery wrapper;
+  serde-default 0 keeps cross-version safety, strip-field lock pinned),
+  and the mounted client reconciles on an identity CHANGE between two
+  known ids (edge-triggered; fires `terminal_stream_runtime_replaced`
+  and takes the SAME recovery as a cursor rewind: host reset + replay +
+  grid re-assert — the rehydrate read also now seeds the vacuum guard
+  with the REAL id instead of the always-0 placeholder). MEASURED with
+  tools/uxspeed/rt-rig.sh (real-IPC boot, CAP=2 dummy-first, painted
+  gate, exe-proof, raw_decode window): on UNFIXED main 4a3cc33e6172 both
+  constructible local arms were already GREEN — plain daemon-side
+  restart AND restart-with-grid-divergence (CLI resize to 240x50 = the
+  [11.228] poisoning vector) heal via terminal_stream_cursor_rewound ->
+  startup resize repair -> reveal_screen_reconcile -> frame_hash_
+  reconcile_applied, grid converging to the CLIENT's truth (169 cols).
+  So the rewind already covers every replacement whose fresh ring starts
+  below the client cursor; the surviving freeze surface is the NO-REWIND
+  arms — a busy replacement (re-resume seed + TUI repaint) outrunning
+  the client cursor into mid-stream consume, and remote/forwarded
+  rewind loss. The identity signal covers exactly those: the RT_FAKE_ID
+  arm (YGGTERM_TEST_STREAM_SPAWN_ID_FILE hook flips the reported id with
+  NO restart — cursor continuity untouched, rewind impossible) fired
+  terminal_stream_runtime_replaced + recovered + painted RTNEW on the
+  lane, and is invisible-by-construction on unfixed main. Remaining
+  (b) surface after this lands: the mount-loop-DEAD arm (no stream
+  answers at all — [11.187] territory, owned by the mount guard
+  machinery, not this signal) and any owner-flip shape where reads
+  ERROR rather than answer (unreproducible locally; watch for
+  terminal_stream_runtime_replaced in the wild as the detector).
 - (c) REVEAL DEADLINE → PERMANENT BLANK: `reveal_cover_released
   reason:deadline bytes:0` when a cold transcript re-render outruns the
   cover deadline — the cover drops to a blank viewport that never
