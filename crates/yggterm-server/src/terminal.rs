@@ -6327,13 +6327,20 @@ mod tests {
     /// watched "Connecting" over a live, healthy RDP session.
     #[test]
     fn a_registered_apps_row_mints_web_surfaces_and_a_shell_row_does_not() {
+        // Both fixtures derive from the same runtime home so the full-path
+        // token compare holds on every host without a hardcoded layout.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
         let apps = vec![
-            app("yrdp", "/home/user/.local/bin/yrdp"),
-            app("ychrome", "/home/user/.local/bin/ychrome"),
+            app("yrdp", &format!("{home}/.local/bin/yrdp")),
+            app("ychrome", &format!("{home}/.local/bin/ychrome")),
         ];
-        // The exact launch command from the live incident (claim 11.181).
-        let yrdp_row = "/home/user/.local/bin/yrdp pick; exec \"${SHELL:-/bin/bash}\" -i";
-        assert!(launch_command_invokes_registered_app(yrdp_row, &apps));
+        // The exact launch command from the live incident (claim 11.181):
+        // same runtime home as the apps above — the second assertion reads
+        // the PROCESS-GLOBAL registry (whose scanned binaries live under
+        // $HOME), so a hardcoded literal coupled the test to one host's
+        // layout AND leaked it into a public repo.
+        let yrdp_row = format!("{home}/.local/bin/yrdp pick; exec \"${{SHELL:-/bin/bash}}\" -i");
+        assert!(launch_command_invokes_registered_app(&yrdp_row, &apps));
         // Bare and quoted basenames launch the app just as well.
         assert!(launch_command_invokes_registered_app("yrdp pick", &apps));
         assert!(launch_command_invokes_registered_app("sh -c 'yrdp pick'", &apps));
@@ -6354,7 +6361,7 @@ mod tests {
         ));
         // The pilot clause is unchanged, registry or no registry.
         assert!(launch_command_declares_web_surfaces("ychrome --profile temp"));
-        assert!(launch_command_declares_web_surfaces(yrdp_row));
+        assert!(launch_command_declares_web_surfaces(&yrdp_row));
         assert!(!launch_command_declares_web_surfaces("bash"));
         assert!(!launch_command_invokes_registered_app("", &apps));
     }

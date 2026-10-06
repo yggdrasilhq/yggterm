@@ -45941,8 +45941,8 @@ mod tests {
         // `cargo check --tests` compiles the law, it never RUNS it. This
         // commit re-arms the stamp at the shipped truth; the NEXT shape
         // change must bump the version and this hash in its own commit.
-        const STAMPED_AT_VERSION: &str = "3.2.116";
-        const STAMPED_SHAPE_HASH: u64 = 0xd2c47821980429bc;
+        const STAMPED_AT_VERSION: &str = "3.2.117";
+        const STAMPED_SHAPE_HASH: u64 = 0xb747ba0e7c68ac22;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
