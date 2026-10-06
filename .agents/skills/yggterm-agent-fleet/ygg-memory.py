@@ -3560,6 +3560,59 @@ support the text. Respond in EXACTLY this format (no code fences):
  "<direct quote from the raw deltas, or null>"}]"""
 
 
+DREAM_SUMMARY_PREFIXES = ("dream ", "owner-now update")
+DREAM_QUIESCENCE_SECONDS = 15 * 60
+
+
+def dream_live_activity(root: Path, ns: str) -> list:
+    """Non-dream journal records for THIS ns (plus _global, which the
+    dreamer also writes) — the quiescence and fencing input. The dream's
+    own records are excluded so a dream never blocks or fences itself."""
+    entries = list(read_journal_entries(root, namespace=ns))
+    if ns != "_global":
+        entries += read_journal_entries(root, namespace="_global")
+    live = [
+        rec
+        for rec in entries
+        if not str(rec.get("summary", "")).startswith(DREAM_SUMMARY_PREFIXES)
+    ]
+    live.sort(key=lambda rec: rec.get("ts", 0))
+    return live
+
+
+def dream_quiescence_violation(root: Path, ns: str) -> str:
+    """Gate 3 (round-3 consult): the dreamer never competes with an active
+    writer — a journal write inside the cooldown window defers the dream."""
+    live = dream_live_activity(root, ns)
+    if not live:
+        return ""
+    age = time.time() - float(live[-1].get("ts", 0))
+    if age < DREAM_QUIESCENCE_SECONDS:
+        return (
+            f"ns {ns} is ACTIVE (last non-dream write {int(age)}s ago, "
+            f"< {DREAM_QUIESCENCE_SECONDS}s quiescence) — dream deferred"
+        )
+    return ""
+
+
+def dream_fence_violation(root: Path, ns: str, captured_seq: int) -> str:
+    """Gate 4 (round-3 consult): read-version fencing — the composer thinks
+    for tens of seconds; if the journal moved past the prepare watermark in
+    that window, the dream's factual foundation is stale and the apply is
+    refused (re-prepare). Dream-origin records never fence a dream."""
+    advanced = [
+        rec
+        for rec in dream_live_activity(root, ns)
+        if rec.get("seq", 0) > captured_seq
+    ]
+    if advanced:
+        return (
+            f"journal advanced since prepare ({len(advanced)} record(s) after "
+            f"seq {captured_seq}) — re-prepare before apply"
+        )
+    return ""
+
+
 def cmd_dream(args):
     root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
     harness = detect_harness(args.harness)
@@ -3584,6 +3637,10 @@ def cmd_dream(args):
         return
 
     if args.prepare or args.run:
+        if not getattr(args, "force", False):
+            violation = dream_quiescence_violation(root, ns)
+            if violation:
+                raise SystemExit(f"dream: REFUSED — {violation}")
         staged = prepare_dream(
             root, ns, args.phase, args.extra_input, args.budget or DREAM_INPUT_BUDGET_BYTES
         )
@@ -3624,6 +3681,9 @@ def cmd_dream(args):
         if not manifest_path.is_file() or not response_path.is_file():
             raise SystemExit(f"dream: no pending dream in {pending} (run --prepare, compose RESPONSE.md first)")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        fence = dream_fence_violation(root, ns, manifest.get("captured_seq", 0))
+        if fence:
+            raise SystemExit(f"dream: REFUSED — {fence}")
         try:
             parsed = parse_dream_response(response_path.read_text(encoding="utf-8"))
             critic_path = pending / "CRITIC.md"
@@ -3989,6 +4049,11 @@ def main():
     p_dream.add_argument("--model", default="gpt-6.1-sol", help="composer model for --run")
     p_dream.add_argument("--effort", default="high", help="composer reasoning effort for --run")
     p_dream.add_argument("--codex-bin", default=None, help="explicit codex binary path for --run")
+    p_dream.add_argument(
+        "--force",
+        action="store_true",
+        help="override the quiescence gate (owner-directed testing only)",
+    )
 
     # search [mem-dream slice 2]
     p_search = subparsers.add_parser(
