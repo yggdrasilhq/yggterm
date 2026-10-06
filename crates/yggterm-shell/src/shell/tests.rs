@@ -70101,6 +70101,66 @@ mod browser_tree_refresh_skip_tests {
     }
 }
 
+// ── [F1-(e)] the synthesis output fence ───────────────────────────────────
+
+#[test]
+fn synth_output_fence_retains_in_order_until_the_byte_bound() {
+    let mut fence = SynthOutputFence::new(1_000);
+    assert!(fence.retain("alpha"));
+    assert!(fence.retain("beta"));
+    assert_eq!(fence.retained, vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(fence.retained_bytes, "alpha".len() + "beta".len());
+    assert!(!fence.deadline_expired(1_000 + SYNTH_OUTPUT_FENCE_DEADLINE_MS));
+}
+
+#[test]
+fn synth_output_fence_refuses_past_the_byte_bound() {
+    let mut fence = SynthOutputFence::new(0);
+    let exact = "x".repeat(SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES);
+    assert!(fence.retain(&exact));
+    assert!(!fence.retain("y"));
+    // the refused batch was not half-recorded
+    assert_eq!(fence.retained.len(), 1);
+    assert_eq!(fence.retained_bytes, SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES);
+}
+
+#[test]
+fn synth_output_fence_deadline_expires() {
+    let fence = SynthOutputFence::new(1_000);
+    assert!(!fence.deadline_expired(1_000 + SYNTH_OUTPUT_FENCE_DEADLINE_MS));
+    assert!(fence.deadline_expired(1_000 + SYNTH_OUTPUT_FENCE_DEADLINE_MS + 1));
+}
+
+#[test]
+fn synthesized_mount_open_script_shape_locks_the_fence_wiring() {
+    let fenced =
+        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), true);
+    let unfenced =
+        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), false);
+    // the repaint branch is compiled with the mode literals and the
+    // home+clear prefix; the bool literal is the runtime gate
+    assert!(fenced.contains("if (true)"));
+    assert!(unfenced.contains("if (false)"));
+    for script in [&fenced, &unfenced] {
+        assert!(script.contains("'\\x1b[H\\x1b[2J' + __seed"));
+        assert!(script.contains("'fenced_repaint'"));
+        assert!(script.contains("'guarded_append'"));
+        assert!(script.contains("seed_mode: __mode"));
+        assert!(script.contains("await new Promise((resolve) => __t.write('', resolve))"));
+    }
+    // the guarded append still defers to the painted heuristic unfenced
+    assert!(unfenced.contains("} else if (!__painted(__t)) {"));
+}
+
+#[test]
+fn frame_hash_sync_script_pairs_the_daemon_hash_with_the_page_probe() {
+    let script = terminal_frame_hash_sync_script("host-m1", "fnv32:0a0b0c0d");
+    assert!(script.contains("fnv32:0a0b0c0d"));
+    assert!(script.contains("__yggtermFrameHash.frameHashOf"));
+    assert!(script.contains("at_bottom"));
+    assert!(script.contains("return JSON.stringify"));
+}
+
 #[cfg(test)]
 mod web_surface_immersion_locks {
     use super::*;

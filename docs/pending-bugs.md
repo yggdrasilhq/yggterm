@@ -60,13 +60,41 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   F1LEG4 / F1LEG4" painted on screen); (c) the
   stale-receiver WHY (sol ranked-attack #3) — page-side send ring +
   IPC-ingress stamps decide it; (d) the healthy row's page→Rust ytrace
-  still rides the dead leg (cosmetic, trace-only); (e) THE OUTPUT FENCE
-  (sol patch-review Q1+Q2, node
-  lores/chain-of-thought/2026-10-05-yggterm-f1-sol-patch-review.md): the
-  painted-guard does not order the seed against in-flight differentials,
-  and frame-hash reconcile itself rides the dead leg — install the
-  authoritative screen with an output watermark, ack after xterm's write
-  callback, retain unacked batches, or move reconcile onto fresh evals;
+  still rides the dead leg (cosmetic, trace-only); (e) THE OUTPUT FENCE — LANDED 2026-10-06 ([11.233], sitting 9, lane
+  lane/f1/output-fence): the painted-guard could NOT order the
+  synthesized seed against in-flight differentials, and the mechanism is
+  now precise: a differential whose parsed state parks the cursor on the
+  HOME CELL (baseY/cursorY/cursorX all 0 with a NON-EMPTY buffer) reads
+  __painted FALSE, so the stale T0 seed APPENDS over live output; a
+  queued-but-unparsed write is the same hole at tighter timing. FIX: the
+  fence arms with the snapshot request; all three synthesized write
+  sites RETAIN batches while it holds (512 KiB bound; 30s deadline
+  enforced on traffic; either breach releases live with the
+  guarded-append backstop for the late seed); the seed installs the
+  authoritative screen as a FORMATTED REPAINT (ESC[H ESC[2J + screen
+  text, always writes fenced) awaiting xterm's write callback inside the
+  proof; the retained differentials flush IN ORDER the moment the proof
+  returns (the proof IS the ack). Q2 closed in the same unit: the
+  synthesized frame-hash pairing left the dead per-eval leg — a
+  fresh-eval probe (terminal_frame_hash_sync_script, the same
+  frameHashOf the settle probe JS uses) returns match/at_bottom over
+  eval-return, and an at-bottom mismatch corrects via the app-control
+  replay primitive under the SHARED churn gates
+  (screen_text_shows_agent_working + screen_reconcile_should_write —
+  shared handlers, not a fork). FALSIFIER tools/uxspeed/fence-rig.sh
+  (exe-proofed, hermetic scratch, healthy second-boot control):
+  YGGTERM_TEST_STALL_SNAPSHOT_FETCH_MS captures T0 and delivers +stall;
+  the repaint differential parks the cursor home with the marker on row
+  2 and the shell held busy (rig law L3). RED on hook-only e74a67de:
+  page marker 0 (seed appended over it). GREEN on 012e199d: page marker
+  exactly 1, seed_mode=fenced_repaint, fence flushed 2 batches, healthy
+  control row mounted and painted with ZERO fence events. REMAINDERS:
+  (e-r1) the snapshot answer carries NO output watermark — the fence's
+  split point is the REQUEST instant, so a differential already in
+  flight at request time can duplicate snapshot content on replay
+  (rare append class; the daemon stream-cursor stamp is the fix if it
+  ever bites); (e-r2) repaint cursor restoration is end-of-content only
+  (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
   lane/f1/ring-watermark; sol correction round applied same sitting, node
   lores/chain-of-thought/2026-10-05-yggterm-f1-ring-rework-sol-review.md):
@@ -175,7 +203,27 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   dev-profile builds shift timing the same way; (L2) the rig teardown
   must REAP ITS SCRATCH DAEMON by YGGTERM_HOME environ match — pkill -x
   yggterm does not kill yggterm-headless, 13 daemons accumulated across
-  ~10 runs, and their CPU flipped the (j) race.
+  (L2) the rig teardown
+  must REAP ITS SCRATCH DAEMON by YGGTERM_HOME environ match — pkill -x
+  yggterm does not kill yggterm-headless, 13 daemons accumulated across
+  ~10 runs, and their CPU flipped the (j) race. FENCE-RIG LAWS (sitting 9,
+  [11.233]): (L3) a repaint differential that parks the cursor ON THE
+  MARKER ROW is ERASED BY BASH'S OWN NEXT PROMPT (self-erasing
+  falsifier) — and one that leaves the cursor home but lets the prompt
+  print after leaves cursorX>0 and the painted-guard rightly blocks the
+  seed (vacuously green): the marker goes on row 2+ AND the shell is held
+  busy (trailing `; sleep N`) so NOTHING prints after the homing;
+  (L4) a SINGLE test row under YGGTERM_HOT_PREMOUNT_CAP=8 never armed in
+  two boots (45s patience) while the remount rig's dummy-row-first +
+  test-row-second shape under CAP=2 arms deterministically — copy that
+  row shape; (L5) typing DURING the synthesis window DELIVERS (input
+  drain + writer alive: chunks applied ~+355ms, echo back ~+8ms) — the
+  window is not input-gated. (L6) tests.rs placement law: new tests go
+  ABOVE the last `#[cfg(test)] mod` — the immersion module must remain
+  the FILE's last item with its attribute ADJACENT (product_lines skips
+  by attribute-then-mod adjacency; a block wedged between them
+  un-skips the module and three scan locks trip at once — measured
+  sitting 9).
   (j) THE +6s SNAPSHOT-PRUNE LIVE-MOUNT KILL — ROOT MEASURED + LANDED
   2026-10-06 (sitting 8, lane lane/f1/snapshot-supersede-race): the kill
   is NOT a re-issue/supersede handshake at all — there is no requester
@@ -216,7 +264,12 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   superseded 0, deferred_live_loops named the live row every time).
   REMAINDERS: (r-j1) the supersede path itself still presumes a
   successor without verifying one began — hardening (verify-or-rearm on
-  drop) stays filed for the NEXT kill site of this shape, not this one;
+  drop) stays filed for the NEXT kill site of this shape, not this one —
+  and the SECOND kill site is already measured (sitting 9, fence-rig
+  boot 1): startup_terminal_restore_recover_watch fired ~22s after
+  daemon-ready and superseded BOTH live pre-attach_ready loops
+  (registry_owner null, nothing followed — row left mountless until
+  teardown); any rig row created inside the restore window eats this;
   (r-j2) post-kill recovery depends on the render latch
   (bootstrap_task_identity) — a user re-select is still the only
   re-schedule trigger after any genuine supersede. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig

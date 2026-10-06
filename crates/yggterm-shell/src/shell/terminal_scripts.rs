@@ -349,6 +349,38 @@ if (__t && typeof __t.write === 'function') {{
     )
 }
 
+/// [F1-(e) Q2] The synthesized mount's frame-hash probe over a FRESH
+/// eval: pair the daemon's authoritative-grid hash (same `fnv32:%08x`
+/// canonical form both sides — frame_hash_probe.js and the daemon twin
+/// cannot drift without the shared test vector going red) against the
+/// page's applied frame, using the SAME `frameHashOf` the settle-time
+/// probe JS uses, and return the verdict — a one-shot value-carrying eval
+/// (⛔ top-level `return` — the eval bridge shape law). The correction on
+/// mismatch lives in `synth_frame_hash_reconcile` (viewport.rs).
+pub(crate) fn terminal_frame_hash_sync_script(host_id: &str, daemon_hash: &str) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
+    let daemon = serde_json::to_string(daemon_hash).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"const __h = {host};
+const __daemon = {daemon};
+const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
+const __t = __e && __e.term ? __e.term : null;
+let __verdict = {{ match: null, client_hash: null, at_bottom: null }};
+try {{
+    if (__t && window.__yggtermFrameHash
+        && typeof window.__yggtermFrameHash.frameHashOf === 'function') {{
+        const __f = window.__yggtermFrameHash.frameHashOf(__t);
+        if (__f) {{
+            __verdict.client_hash = String(__f.hash);
+            __verdict.at_bottom = Boolean(__f.atBottom);
+            __verdict.match = String(__f.hash) === __daemon;
+        }}
+    }}
+}} catch (_error) {{}}
+return JSON.stringify(__verdict);"#
+    )
+}
+
 /// [F1-(f) Q-B] Stamp this mount's Rust-owned ring incarnation into the
 /// page, ONCE, at mount start. The stamp owns two things the send path and
 /// the drain both lean on:
@@ -448,12 +480,14 @@ return JSON.stringify({{
 pub(crate) fn terminal_synthesized_mount_open_script(
     host_id: &str,
     seed: Option<&str>,
+    fenced: bool,
 ) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     let seed_lit = match seed.filter(|text| !text.trim().is_empty()) {
         Some(text) => serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
         None => "null".to_string(),
     };
+    let fenced = if fenced { "true" } else { "false" };
     format!(
         r#"const __h = {host};
 const __seed = {seed_lit};
@@ -470,10 +504,28 @@ const __painted = (t) => {{
     }}
 }};
 let __wrote = 0;
-if (__t && typeof __t.write === 'function' && __seed && !__painted(__t)) {{
-    __t.write(__seed);
-    await new Promise((resolve) => __t.write('', resolve));
-    __wrote = __seed.length;
+let __mode = 'skipped';
+if (__t && typeof __t.write === 'function' && __seed) {{
+    if ({fenced}) {{
+        // [F1-(e)] THE FENCED REPAINT (sol Q1): the authoritative screen
+        // installs as a formatted full-frame repaint — home + clear + the
+        // daemon's screen text — NOT an append. The painted-guard could
+        // not order the seed against in-flight differentials: a queued-
+        // but-unparsed write, or a repaint that parks the cursor on the
+        // home cell, reads unpainted and the stale T0 seed appends over
+        // live output. Fenced, the seed REPLACES the frame; the
+        // differentials retained behind the fence replay past it when
+        // this proof returns (the write callback below IS the ack).
+        __t.write('\x1b[H\x1b[2J' + __seed);
+        await new Promise((resolve) => __t.write('', resolve));
+        __wrote = __seed.length;
+        __mode = 'fenced_repaint';
+    }} else if (!__painted(__t)) {{
+        __t.write(__seed);
+        await new Promise((resolve) => __t.write('', resolve));
+        __wrote = __seed.length;
+        __mode = 'guarded_append';
+    }}
 }}
 return JSON.stringify({{
     constructed: Boolean(__t),
@@ -482,6 +534,7 @@ return JSON.stringify({{
     cols: Number((__t && __t.cols) || 0),
     painted: __painted(__t),
     wrote_seed: __wrote,
+    seed_mode: __mode,
 }});"#
     )
 }
