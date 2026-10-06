@@ -33126,6 +33126,37 @@ impl ShellState {
         if !self.startup_terminal_restore_should_recover(active_session_path, now_ms) {
             return false;
         }
+        // (r-j1) THE LIVE-TASK GUARD — the second kill site of the (j)
+        // class ([11.232]): a stale ATTEMPT does not mean a dead MOUNT.
+        // The mount loop pumps its heartbeat from its FIRST iteration,
+        // long before attach_ready, and under boot churn a live loop can
+        // sit pre-attach_ready well past
+        // STARTUP_TERMINAL_RESTORE_RECOVERY_MS — measured 2026-10-06,
+        // fence-rig boot 1: this recovery superseded BOTH live
+        // pre-attach_ready loops (registry_owner NULL, no successor
+        // spawned, rows mountless until teardown). A fresh heartbeat is
+        // the dead/live truth the reveal-raise, reparent, and (j) prune
+        // gates already trust; the live task reaches attach_ready and
+        // clears its own marker. A dead loop's heartbeat is absent
+        // (punched by the armed-death drop guard) or stale, so the fault
+        // recovery this watch exists for still runs — at most one
+        // TERMINAL_LOOP_STALE_MS later. Placed AFTER should_recover so
+        // the deferral trace fires only where the kill would have.
+        if terminal_loop_is_live(active_session_path) {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "terminal_mount",
+                    "startup_restore_recover_deferred_live_loop",
+                    json!({
+                        "session_path": active_session_path,
+                        "heartbeat_age_ms": terminal_loop_heartbeat_age_ms(active_session_path),
+                    }),
+                );
+            }
+            return false;
+        }
         *self
             .startup_restore_recover_streak
             .entry(active_session_path.to_string())
