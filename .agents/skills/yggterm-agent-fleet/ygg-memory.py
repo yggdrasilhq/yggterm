@@ -3000,6 +3000,741 @@ def cmd_shelve_archives(args):
         print(json.dumps({"harness": harness, "candidates": total_candidates, "moved": total_moved}))
 
 
+# -----------------------------------------------------------------------------
+# [mem-dream slice 2] dream verb + search verb
+#
+# Design door: memory-dreaming-design (default zcode project). The dream is a
+# deterministic bookend pair around a pluggable composer — `--prepare` stages
+# the raw-delta brief, an LLM composes (sol subprocess via --run, or the GLM
+# seat reading the staged brief), `--apply` validates and lands the result
+# through the journaled publish path. The composer NEVER writes frontmatter,
+# doors, or indexes directly: apply mints metadata, enforces the per-claim
+# as-of/proof stamps, and the adversarial critic verdicts are mandatory when
+# claims exist. Ingestion isolation: the collector never reads dreamer-origin
+# events or the dreamer-owned doors (NOW.md / owner-now.md), so the dreamer
+# cannot consolidate its own output.
+# -----------------------------------------------------------------------------
+
+DREAM_ORIGIN = "dreamer"
+DREAM_OWNED_BASENAMES = {"NOW.md", "owner-now.md"}
+DREAM_NOW_MAX_BYTES = 2600
+DREAM_OWNER_NOW_MAX_BYTES = 1100
+DREAM_INPUT_BUDGET_BYTES = 160_000
+DREAM_PER_FILE_BYTES = 22_000
+DREAM_EXTRA_INPUT_BYTES = 32_000
+DREAM_MAX_OPS = 3
+DREAM_OP_ENTRY_MAX = 400
+NOW_REQUIRED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS", "§POINTERS")
+NOW_STAMPED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS")
+DREAM_PROOF_VOCAB = ("deployed", "suite", "measured-live", "claimed")
+
+DREAM_CONTRACT = """You are the DREAM COMPOSER for this namespace. Produce a
+response in EXACTLY this machine-parsed marker format (plain markers, no code
+fences around the NOW.MD block):
+
+=== NOW.MD ===
+<markdown body ONLY — no frontmatter, at most 2600 bytes, exactly these four
+section headings: `## §CURRENT_STATUS`, `## §NEXT_UNITS`, `## §ACTIVE_TRAPS`,
+`## §POINTERS`. EVERY bullet line under the first three sections ends with an
+inline stamp `[as-of: YYYY-MM-DD; proof: <deployed|suite|measured-live|claimed>]`
+taken from the raw deltas — never invent a stamp or a date. Proof vocabulary:
+deployed = landed + deployed + read-back verified; suite = tests green only;
+measured-live = instrumented live evidence in the deltas; claimed = stated by
+a seat but unproven. NOW.md wholly REPLACES the previous rollup: carry forward
+still-true claims (re-verify against the deltas), prune dead ones, and when a
+newer delta CONTRADICTS an old claim keep the falsification visible under
+§ACTIVE_TRAPS with a `[FALSIFIED by seq#N/<file>]` stamp. §POINTERS cites door
+filenames and board ACKs (citations, not claims — no stamps needed).>
+=== OPS ===
+<JSON array, possibly []. Each element is either
+  {"op": "append-section", "file": "<door filename>", "section": "<section
+   marker exactly as it appears in that door, e.g. §GOTCHAS>", "entry": "<one
+   markdown bullet starting with '- ', at most 400 chars>", "reason": "<why>"}
+or {"op": "propose-tombstone", "file": "<door filename>", "reason": "<why>"}.
+At most 3 ops. These are the ONLY op types: never rewrite door bodies, never
+touch indexes, never delete.>
+=== CLAIMS ===
+<JSON array with one entry per stamped bullet in NOW.MD:
+  {"claim_id": "c1", "text": "<the bullet without its stamp>", "as_of":
+   "YYYY-MM-DD", "proof": "<vocab word>", "source_refs": ["seq#N/<file>", ...]}.
+source_refs must cite deltas that exist below.>
+=== OWNER-NOW ===
+<JSON object {"body": "<markdown, at most 1100 bytes, the owner's fast-rotting
+context: mood/energy, location/travel, active commitments, working hours,
+communication shape — each line stamped [as-of: YYYY-MM-DD]; include only what
+the deltas EVIDENCE>", "evidence": ["seq#N/<file>", ...]} — or the single word
+null when the deltas contain no owner-state evidence.>"""
+
+
+def get_dream_dir(root: Path, ns: str, create: bool = True) -> Path:
+    ns = validate_namespace(ns)
+    d = root / "dream" / ns
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def load_dream_watermark(root: Path, ns: str) -> dict:
+    p = get_dream_dir(root, ns, create=False) / "watermark.json"
+    default = {"ns": ns, "last_seq": 0, "last_dream_ts": None, "dreams": []}
+    if not p.is_file():
+        return default
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_dream_watermark(root: Path, ns: str, watermark: dict) -> None:
+    d = get_dream_dir(root, ns)
+    p = d / "watermark.json"
+    temp = p.with_suffix(".tmp")
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(watermark, f, indent=2)
+    temp.replace(p)
+
+
+def _dream_slice(text: str, cap: int) -> str:
+    if len(text.encode("utf-8")) <= cap:
+        return text
+    head = 2000
+    tail = max(0, cap - head - 200)
+    return (
+        text[:head]
+        + "\n…[dream: middle truncated, head+tail slice only]…\n"
+        + (text[-tail:] if tail else "")
+    )
+
+
+def collect_dream_deltas(root: Path, ns: str, after_seq: int) -> tuple[list[dict], int]:
+    """Latest content per door since ``after_seq``, ingestion-isolated.
+
+    Walks ns journal events in seq order: a delete drops the door, a content
+    event (create/update/resolve) records it — so the collector returns the
+    CURRENT text of every door that changed, not an event stream. Dreamer
+    output (origin or owned basenames) never enters the input set.
+    """
+    state: dict[str, dict] = {}
+    captured = after_seq
+    for rec in sorted(read_journal_entries(root, after_seq=after_seq, namespace=ns), key=lambda r: r.get("seq", 0)):
+        captured = max(captured, rec.get("seq", 0))
+        fname = rec.get("file") or ""
+        if not fname or Path(fname).name in DREAM_OWNED_BASENAMES:
+            continue
+        if rec.get("origin") == DREAM_ORIGIN:
+            continue
+        if rec.get("action") == "delete":
+            state.pop(fname, None)
+            continue
+        if not rec.get("digest"):
+            continue
+        state[fname] = rec
+    deltas = []
+    for fname, rec in state.items():
+        op = object_path(root, rec["digest"])
+        if op.is_file():
+            content = op.read_text(encoding="utf-8", errors="replace")
+        else:
+            content = f"(content object {rec['digest'][:12]} missing from store)"
+        deltas.append(
+            {
+                "file": fname,
+                "seq": rec.get("seq", 0),
+                "iso": rec.get("iso", ""),
+                "action": rec.get("action", ""),
+                "kind": rec.get("kind", ""),
+                "content": _dream_slice(content, DREAM_PER_FILE_BYTES),
+            }
+        )
+    deltas.sort(key=lambda d: d["seq"], reverse=True)
+    return deltas, captured
+
+
+def prepare_dream(
+    root: Path,
+    ns: str,
+    phase: str,
+    extra_inputs: list[str],
+    budget: int,
+) -> tuple[Path, dict] | None:
+    """Stage pending/BRIEF.md + MANIFEST.json. None on a clean tick."""
+    watermark = load_dream_watermark(root, ns)
+    deltas, captured = collect_dream_deltas(root, ns, watermark["last_seq"])
+    extras = []
+    for raw in extra_inputs or []:
+        path = Path(raw).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(f"dream: --extra-input not a file: {path}")
+        extras.append(
+            {
+                "path": str(path),
+                "content": _dream_slice(
+                    path.read_text(encoding="utf-8", errors="replace"), DREAM_EXTRA_INPUT_BYTES
+                ),
+            }
+        )
+    if not deltas and not extras:
+        return None
+
+    kept, used, dropped = [], 0, 0
+    for delta in deltas:
+        size = len(delta["content"].encode("utf-8"))
+        if used + size > budget:
+            dropped += 1
+            continue
+        kept.append(delta)
+        used += size
+
+    now_path = get_namespace_dir(root, ns, create=False) / "NOW.md"
+    current_now = now_path.read_text(encoding="utf-8", errors="replace") if now_path.is_file() else "(none — first dream)"
+
+    pending = get_dream_dir(root, ns) / "pending"
+    if pending.exists():
+        shutil.rmtree(pending)
+    pending.mkdir(parents=True)
+
+    lines = [
+        f"# DREAM BRIEF — {ns} — phase {phase} — prepared {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+        "",
+        "## CONTRACT",
+        "",
+        DREAM_CONTRACT,
+        "",
+        "## CURRENT ROLLUP (previous NOW.md — REPLACE semantics; prune contradicted claims)",
+        "",
+        current_now,
+        "",
+        "## RAW DELTAS (newest first; provenance = journal seq / door / action / ts)",
+        "",
+    ]
+    for delta in kept:
+        lines.append(f"### [seq #{delta['seq']} | {delta['file']} | {delta['action']} | {delta['iso']}]")
+        lines.append(delta["content"])
+        lines.append("")
+    if dropped:
+        lines.append(f"(input budget: {dropped} oldest delta(s) DROPPED for budget — the rollup may miss them)")
+        lines.append("")
+    if extras:
+        lines.append("## EXTRA INPUTS (staged by the seat; provenance = path)")
+        lines.append("")
+        for extra in extras:
+            lines.append(f"### [{extra['path']}]")
+            lines.append(extra["content"])
+            lines.append("")
+    lines.append(
+        f"## GATE — dream watermark seq {watermark['last_seq']} → captured seq {captured}; "
+        f"{len(kept)} delta door(s), {used} bytes; extra inputs: {len(extras)}"
+    )
+    brief_path = pending / "BRIEF.md"
+    brief_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    manifest = {
+        "ns": ns,
+        "phase": phase,
+        "prepared_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "watermark_seq": watermark["last_seq"],
+        "captured_seq": captured,
+        "delta_count": len(kept),
+        "delta_files": [d["file"] for d in kept],
+        "dropped_for_budget": dropped,
+        "extra_inputs": [e["path"] for e in extras],
+        "budget": budget,
+        "brief_bytes": brief_path.stat().st_size,
+    }
+    (pending / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return brief_path, manifest
+
+
+def _dream_json_block(raw: str) -> str:
+    return re.sub(r"```[a-zA-Z]*\n?|```", "", raw).strip()
+
+
+def parse_dream_response(text: str) -> dict:
+    def between(start: str, end: str | None) -> str:
+        pattern = re.escape(start) + r"\s*\n(.*?)(?=\n=== |\Z)"
+        match = re.search(pattern, text, re.DOTALL)
+        if not match:
+            raise ValueError(f"response is missing the {start} marker block")
+        return match.group(1).strip()
+
+    now_md = between("=== NOW.MD ===", "=== OPS ===")
+    ops_raw = _dream_json_block(between("=== OPS ===", "=== CLAIMS ==="))
+    claims_raw = _dream_json_block(between("=== CLAIMS ===", "=== OWNER-NOW ==="))
+    owner_raw = _dream_json_block(between("=== OWNER-NOW ===", None))
+    return {
+        "now_md": now_md,
+        "ops": json.loads(ops_raw) if ops_raw else [],
+        "claims": json.loads(claims_raw) if claims_raw else [],
+        "owner_now": json.loads(owner_raw) if owner_raw else None,
+    }
+
+
+def parse_critic_verdicts(text: str) -> list[dict]:
+    match = re.search(r"=== VERDICTS ===\s*\n(.*?)(?=\n=== |\Z)", text, re.DOTALL)
+    if not match:
+        raise ValueError("critic output is missing the === VERDICTS === marker block")
+    verdicts = json.loads(_dream_json_block(match.group(1)))
+    if not isinstance(verdicts, list):
+        raise ValueError("critic VERDICTS block is not a JSON array")
+    return verdicts
+
+
+def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) -> list[str]:
+    errors: list[str] = []
+    now_md = parsed["now_md"]
+    if now_md.startswith("---"):
+        errors.append("NOW.MD block must not carry frontmatter — apply mints it deterministically")
+    if len(now_md.encode("utf-8")) > DREAM_NOW_MAX_BYTES:
+        errors.append(f"NOW.MD block is {len(now_md.encode('utf-8'))} bytes > {DREAM_NOW_MAX_BYTES}")
+    for section in NOW_REQUIRED_SECTIONS:
+        if section not in now_md:
+            errors.append(f"NOW.MD is missing section {section}")
+
+    current_section = None
+    stamped_bullets = 0
+    for line in now_md.splitlines():
+        stripped = line.strip()
+        for section in NOW_REQUIRED_SECTIONS:
+            if section in stripped and (stripped.startswith("#") or stripped.startswith("§")):
+                current_section = section
+        if re.match(r"^(-|\*|\d+\.)\s", stripped):
+            if current_section in NOW_STAMPED_SECTIONS:
+                stamped_bullets += 1
+                if "[as-of:" not in stripped:
+                    errors.append(f"unstamped bullet in {current_section}: {stripped[:70]}")
+                else:
+                    stamp = re.search(r"\[as-of:\s*([^\];]+)[;]?\s*proof:\s*([^\]]+)\]", stripped)
+                    if not stamp:
+                        errors.append(f"malformed stamp on: {stripped[:70]}")
+                    elif stamp.group(2).strip() not in DREAM_PROOF_VOCAB:
+                        errors.append(
+                            f"proof '{stamp.group(2).strip()}' not in vocabulary {DREAM_PROOF_VOCAB}: {stripped[:70]}"
+                        )
+    if stamped_bullets == 0:
+        errors.append("NOW.MD carries no stamped claim bullets — a rollup with no claims is not a rollup")
+
+    claim_ids = set()
+    for claim in parsed["claims"]:
+        cid = claim.get("claim_id")
+        if not cid or cid in claim_ids:
+            errors.append(f"claim entry missing/dupe claim_id: {json.dumps(claim)[:80]}")
+            continue
+        claim_ids.add(cid)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(claim.get("as_of", ""))):
+            errors.append(f"claim {cid} as_of is not YYYY-MM-DD")
+        if claim.get("proof") not in DREAM_PROOF_VOCAB:
+            errors.append(f"claim {cid} proof not in vocabulary: {claim.get('proof')!r}")
+        if not claim.get("text"):
+            errors.append(f"claim {cid} has empty text")
+        if not claim.get("source_refs"):
+            errors.append(f"claim {cid} cites no source_refs")
+
+    if parsed["claims"] and not verdicts:
+        errors.append("CRITIC.md verdicts missing — the adversarial critic gate is mandatory when claims exist")
+    verdict_map = {v.get("claim_id"): v for v in verdicts if isinstance(v, dict)}
+    for cid in claim_ids:
+        verdict = verdict_map.get(cid)
+        if verdict is None:
+            errors.append(f"claim {cid} has no critic verdict")
+        elif verdict.get("verdict") not in ("upheld", "contested"):
+            errors.append(f"claim {cid} verdict not upheld|contested: {verdict.get('verdict')!r}")
+    # A contested claim may survive ONLY visibly demoted in the rollup.
+    for claim in parsed["claims"]:
+        verdict = verdict_map.get(claim.get("claim_id"))
+        if verdict and verdict.get("verdict") == "contested":
+            fragment = (claim.get("text") or "")[:40]
+            if fragment:
+                for line in now_md.splitlines():
+                    if fragment in line and "[CONTESTED" not in line and "[FALSIFIED" not in line:
+                        errors.append(f"contested claim left undemoted: {fragment}")
+
+    ops = parsed["ops"]
+    if len(ops) > DREAM_MAX_OPS:
+        errors.append(f"{len(ops)} ops > {DREAM_MAX_OPS}")
+    for op in ops:
+        kind = op.get("op")
+        door = ns_dir / str(op.get("file", ""))
+        if not op.get("reason"):
+            errors.append(f"op {kind} on {op.get('file')!r} has no reason")
+        if kind == "append-section":
+            if not door.is_file():
+                errors.append(f"append-section target door does not exist: {op.get('file')!r}")
+                continue
+            entry = str(op.get("entry", ""))
+            if not entry.startswith("- "):
+                errors.append(f"append-section entry must be a '- ' bullet: {entry[:60]}")
+            if len(entry) > DREAM_OP_ENTRY_MAX:
+                errors.append(f"append-section entry > {DREAM_OP_ENTRY_MAX} chars")
+            section = str(op.get("section", ""))
+            if not section or section not in door.read_text(encoding="utf-8", errors="replace"):
+                errors.append(f"append-section marker {section!r} not found in {op.get('file')!r}")
+        elif kind == "propose-tombstone":
+            if not door.is_file():
+                errors.append(f"propose-tombstone target door does not exist: {op.get('file')!r}")
+        else:
+            errors.append(f"unknown op type: {kind!r}")
+
+    owner_now = parsed["owner_now"]
+    if owner_now:
+        body = str(owner_now.get("body", ""))
+        if len(body.encode("utf-8")) > DREAM_OWNER_NOW_MAX_BYTES:
+            errors.append(f"owner-now body > {DREAM_OWNER_NOW_MAX_BYTES} bytes")
+        if not owner_now.get("evidence"):
+            errors.append("owner-now carries no evidence refs")
+    return errors
+
+
+def _dream_first_claim_line(now_md: str) -> str:
+    for line in now_md.splitlines():
+        stripped = line.strip()
+        if re.match(r"^(-|\*)\s", stripped) and "[as-of:" in stripped:
+            text = re.sub(r"\s*\[[^\]]*\]\s*$", "", stripped).lstrip("-* ").strip()
+            return text[:110]
+    return ""
+
+
+def _upsert_ns_index_line(ns_dir: Path, filename: str, hook: str) -> None:
+    """Mirror of publish's index upsert for dreamer-owned doors."""
+    try:
+        memory_index = ns_dir / "MEMORY.md"
+        index_line = f"- [{Path(filename).stem}]({filename}) — {hook}"
+        if memory_index.exists():
+            idx_content = memory_index.read_text(encoding="utf-8")
+            if f"]({filename})" not in idx_content:
+                if "UNIFIED FLEET MEMORY" not in idx_content:
+                    idx_content = STEERING_HEADER + "\n" + idx_content
+                if not idx_content.endswith("\n"):
+                    idx_content += "\n"
+                memory_index.write_text(idx_content + index_line + "\n", encoding="utf-8")
+        else:
+            memory_index.write_text(
+                STEERING_HEADER + f"\n## Doors\n\n{index_line}\n", encoding="utf-8"
+            )
+    except OSError as index_error:
+        print(f"ygg-memory: index line not updated: {index_error}", file=sys.stderr)
+
+
+def _dream_publish_door(
+    root: Path,
+    ns: str,
+    filename: str,
+    content: str,
+    harness: str,
+    kind: str,
+    summary: str,
+) -> dict:
+    ns_dir = get_namespace_dir(root, ns)
+    dest = ns_dir / filename
+    dest.write_text(content, encoding="utf-8")
+    record = append_journal_entry(
+        root, ns, filename, kind, "create" if not _door_existed(root, ns, filename) else "update",
+        harness, summary, origin=DREAM_ORIGIN,
+    )
+    return record
+
+
+def _door_existed(root: Path, ns: str, filename: str) -> bool:
+    return any(r.get("file") == filename for r in read_journal_entries(root, namespace=ns))
+
+
+def _dream_append_section(door_path: Path, section: str, entry: str) -> None:
+    lines = door_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    header_idx = next((i for i, line in enumerate(lines) if section in line), None)
+    if header_idx is None:
+        raise ValueError(f"section marker {section!r} vanished from {door_path.name}")
+    next_idx = len(lines)
+    for i in range(header_idx + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped.startswith("#") or (stripped.startswith("§") and section not in stripped):
+            next_idx = i
+            break
+    insert_at = next_idx
+    while insert_at > header_idx + 1 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    lines.insert(insert_at, "")
+    lines.insert(insert_at + 1, entry)
+    door_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _resolve_codex_bin(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    candidate = Path.home() / ".yggterm" / "ynpm" / "bin" / "codex"
+    if candidate.is_file():
+        return str(candidate)
+    found = shutil.which("codex")
+    if found:
+        return found
+    raise SystemExit("dream: no codex binary found (pass --codex-bin)")
+
+
+def _codex_exec(codex_bin: str, model: str, effort: str, prompt: str, timeout: int = 900) -> str:
+    cmd = [
+        codex_bin, "exec", "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-m", model, "-c", f'model_reasoning_effort="{effort}"', prompt,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd="/tmp")
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"dream: composer timed out after {timeout}s")
+    if result.returncode != 0:
+        tail = (result.stdout or "")[-400:] + (result.stderr or "")[-400:]
+        raise SystemExit(f"dream: composer exited {result.returncode}: …{tail}")
+    return result.stdout or ""
+
+
+CRITIC_INSTRUCTIONS = """You are the ADVERSARIAL CRITIC for a dream rollup.
+Below are the RAW DELTAS the composer drew from, the composer's CLAIMS, and
+the drafted NOW.MD. For EVERY claim: try to falsify it against the raw
+deltas — find an empirical counter-example, a contradicting measurement, a
+newer fact that supersedes it, or a source_ref that does not actually
+support the text. Respond in EXACTLY this format (no code fences):
+
+=== VERDICTS ===
+[{"claim_id": "<id>", "verdict": "upheld|contested", "counter_example":
+ "<direct quote from the raw deltas, or null>"}]"""
+
+
+def cmd_dream(args):
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    harness = detect_harness(args.harness)
+    ns = detect_namespace(override=getattr(args, "ns", None))
+    if not ns:
+        raise SystemExit("dream: --ns is required")
+
+    if args.status:
+        watermark = load_dream_watermark(root, ns)
+        pending = get_dream_dir(root, ns, create=False) / "pending"
+        state = {
+            "ns": ns,
+            "dream_watermark_seq": watermark.get("last_seq", 0),
+            "last_dream_ts": watermark.get("last_dream_ts"),
+            "pending_brief": (pending / "BRIEF.md").is_file(),
+            "last_dreams": watermark.get("dreams", [])[-3:],
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(state))
+        else:
+            print(json.dumps(state, indent=2))
+        return
+
+    if args.prepare or args.run:
+        staged = prepare_dream(
+            root, ns, args.phase, args.extra_input, args.budget or DREAM_INPUT_BUDGET_BYTES
+        )
+        if staged is None:
+            message = f"dream: no delta since seq {load_dream_watermark(root, ns)['last_seq']} — clean tick, no brief written"
+            if getattr(args, "json", False):
+                print(json.dumps({"status": "clean-tick"}))
+            else:
+                print(message)
+            if not args.run:
+                return
+            raise SystemExit("dream --run: nothing to dream (clean tick)")
+
+    if args.run:
+        pending = get_dream_dir(root, ns) / "pending"
+        brief = (pending / "BRIEF.md").read_text(encoding="utf-8")
+        codex_bin = _resolve_codex_bin(args.codex_bin)
+        print(f"dream: composer pass ({args.model}, effort {args.effort})…")
+        response = _codex_exec(codex_bin, args.model, args.effort, brief + "\n\nProduce the response now.")
+        (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
+        print("dream: critic pass…")
+        critic_prompt = (
+            brief
+            + "\n\n===== COMPOSER OUTPUT =====\n"
+            + response
+            + "\n\n"
+            + CRITIC_INSTRUCTIONS
+        )
+        critic = _codex_exec(codex_bin, args.model, args.effort, critic_prompt)
+        (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
+        args.apply = True
+
+    if args.apply:
+        dream_dir = get_dream_dir(root, ns, create=False)
+        pending = dream_dir / "pending"
+        manifest_path = pending / "MANIFEST.json"
+        response_path = pending / "RESPONSE.md"
+        if not manifest_path.is_file() or not response_path.is_file():
+            raise SystemExit(f"dream: no pending dream in {pending} (run --prepare, compose RESPONSE.md first)")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        try:
+            parsed = parse_dream_response(response_path.read_text(encoding="utf-8"))
+            critic_path = pending / "CRITIC.md"
+            verdicts = parse_critic_verdicts(critic_path.read_text(encoding="utf-8")) if critic_path.is_file() else []
+        except ValueError as error:
+            print(f"dream: REFUSED — {error}", file=sys.stderr)
+            raise SystemExit(2)
+        ns_dir = get_namespace_dir(root, ns, create=False)
+        errors = validate_dream_response(parsed, verdicts, ns_dir)
+        if errors:
+            print(f"dream: REFUSED — {len(errors)} validation error(s):", file=sys.stderr)
+            for error in errors:
+                print(f"  - {error}", file=sys.stderr)
+            raise SystemExit(2)
+
+        contested = sum(1 for v in verdicts if v.get("verdict") == "contested")
+        if getattr(args, "dry_run", False):
+            plan = {
+                "dry_run": True,
+                "now_md_bytes": len(parsed["now_md"].encode("utf-8")),
+                "claims": len(parsed["claims"]),
+                "contested": contested,
+                "ops": parsed["ops"],
+                "owner_now": bool(parsed["owner_now"]),
+            }
+            print(json.dumps(plan, indent=2))
+            return
+
+        lock = _flock_open(root / ".ygg-memory.lock")
+        try:
+            today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+            description = _dream_first_claim_line(parsed["now_md"]) or "ns rollup"
+            now_content = (
+                "---\n"
+                "name: NOW\n"
+                f"description: {description}\n"
+                "metadata:\n"
+                "  type: now\n"
+                f"  origin: {DREAM_ORIGIN}\n"
+                f"  as_of: {today}\n"
+                f"  phase: {manifest['phase']}\n"
+                "---\n\n"
+                + parsed["now_md"]
+                + "\n"
+            )
+            record = _dream_publish_door(
+                root, ns, "NOW.md", now_content, harness, "now",
+                f"dream rollup {today} (phase {manifest['phase']}, {len(parsed['claims'])} claims, {contested} contested)",
+            )
+            _upsert_ns_index_line(ns_dir, "NOW.md", description)
+
+            if parsed["owner_now"]:
+                owner = parsed["owner_now"]
+                owner_content = (
+                    "---\n"
+                    "name: owner-now\n"
+                    "description: fast-rotting owner context (dreamer-maintained)\n"
+                    "metadata:\n"
+                    "  type: owner-now\n"
+                    f"  origin: {DREAM_ORIGIN}\n"
+                    f"  as_of: {today}\n"
+                    "---\n\n"
+                    + owner["body"]
+                    + "\n"
+                )
+                _dream_publish_door(
+                    root, "_global", "owner-now.md", owner_content, harness, "owner-now",
+                    f"owner-now update {today} (evidence: {', '.join(owner.get('evidence', [])[:3])})",
+                )
+                _upsert_ns_index_line(get_namespace_dir(root, "_global"), "owner-now.md", "fast-rotting owner context (dreamer-maintained)")
+
+            applied_ops = []
+            for op in parsed["ops"]:
+                if op["op"] == "append-section":
+                    door_path = ns_dir / op["file"]
+                    _dream_append_section(door_path, op["section"], op["entry"])
+                    _dream_publish_door(
+                        root, ns, op["file"], door_path.read_text(encoding="utf-8"), harness, "door",
+                        f"dream op: append {op['section']} ({op['reason'][:80]})",
+                    )
+                    applied_ops.append({**op, "applied": True})
+                else:
+                    applied_ops.append({**op, "applied": False, "note": "proposal logged only"})
+        finally:
+            _flock_close(lock)
+
+        watermark = load_dream_watermark(root, ns)
+        dream_record = {
+            "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "captured_seq": manifest["captured_seq"],
+            "deltas": manifest["delta_count"],
+            "now_bytes": len(parsed["now_md"].encode("utf-8")),
+            "claims": len(parsed["claims"]),
+            "contested": contested,
+            "ops": len(parsed["ops"]),
+            "journal_seq": record["seq"],
+        }
+        watermark["last_seq"] = manifest["captured_seq"]
+        watermark["last_dream_ts"] = dream_record["applied_at"]
+        watermark.setdefault("dreams", []).append(dream_record)
+        watermark["dreams"] = watermark["dreams"][-20:]
+        save_dream_watermark(root, ns, watermark)
+
+        done = dream_dir / "done" / f"{dream_record['applied_at'].replace(':', '').replace('-', '')[:15]}-seq{manifest['captured_seq']}"
+        done.mkdir(parents=True, exist_ok=True)
+        oplog = [
+            f"# DREAM OPLOG — {ns} — {dream_record['applied_at']}",
+            "",
+            f"manifest: {json.dumps(manifest)}",
+            f"watermark: seq {manifest['watermark_seq']} → {manifest['captured_seq']}",
+            f"brief sha256: {file_sha256(pending / 'BRIEF.md')}",
+            f"response sha256: {file_sha256(response_path)}",
+            f"critic sha256: {file_sha256(critic_path)}" if critic_path.is_file() else "critic: (none — zero claims)",
+            f"verdicts: {json.dumps(verdicts)}",
+            f"ops: {json.dumps(applied_ops, indent=2)}",
+            f"dream record: {json.dumps(dream_record)}",
+        ]
+        (done / "OPLOG.md").write_text("\n".join(oplog) + "\n", encoding="utf-8")
+        for name in ("BRIEF.md", "MANIFEST.json", "RESPONSE.md", "CRITIC.md"):
+            source = pending / name
+            if source.is_file():
+                shutil.move(str(source), str(done / name))
+        shutil.rmtree(pending, ignore_errors=True)
+
+        print(
+            f"dream: applied — NOW.md {dream_record['now_bytes']}B, {dream_record['claims']} claims "
+            f"({contested} contested), {len(applied_ops)} op(s); watermark → seq {watermark['last_seq']}; "
+            f"oplog {done / 'OPLOG.md'}"
+        )
+        print("dream: run `ygg-memory sync-harness --all` to propagate NOW.md into native stores")
+
+
+def cmd_search(args):
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    explicit_ns = getattr(args, "ns", None)
+    if args.all or not explicit_ns:
+        namespaces_root = root / "namespaces"
+        if not namespaces_root.is_dir():
+            print(f"search: no namespaces under {root}")
+            return
+        targets = sorted(d.name for d in namespaces_root.iterdir() if d.is_dir())
+        if explicit_ns and not args.all:
+            targets = [explicit_ns]
+    else:
+        targets = [explicit_ns]
+    flags = re.IGNORECASE if args.ignore_case else 0
+    try:
+        pattern = re.compile(args.pattern, flags)
+    except re.error as error:
+        raise SystemExit(f"search: invalid regex: {error}")
+    hits = 0
+    for ns in targets:
+        ns_dir = root / "namespaces" / ns
+        if not ns_dir.is_dir():
+            print(f"search: namespace not found: {ns}", file=sys.stderr)
+            continue
+        for md in sorted(ns_dir.rglob("*.md")):
+            rel = md.relative_to(ns_dir)
+            marker = " [index]" if md.name == "MEMORY.md" else ""
+            try:
+                text_lines = md.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for lineno, line in enumerate(text_lines, 1):
+                if pattern.search(line):
+                    print(f"{ns}/{rel}:{lineno}{marker}: {line.strip()[:200]}")
+                    hits += 1
+                    if hits >= args.max_lines:
+                        print(f"search: capped at {args.max_lines} matching lines (raise --max-lines)")
+                        return
+    if hits == 0:
+        print(f"search: no matches for /{args.pattern}/")
+
+
 def _sync_adapter_once(root: Path, harness: str) -> tuple[int, int, int, int]:
     adapter = get_harness_adapter(harness, cwd=Path.cwd())
     lock = _flock_open(root / ".ygg-memory.lock")
@@ -3131,6 +3866,37 @@ def main():
     )
     p_shelve.add_argument("--apply", action="store_true", help="perform the moves (default: dry-run report)")
 
+    # dream [mem-dream slice 2]
+    p_dream = subparsers.add_parser(
+        "dream",
+        parents=[common_parser],
+        help="Consolidate a namespace: prepare a raw-delta brief, compose (sol or seat), apply the validated rollup",
+    )
+    dream_actions = p_dream.add_mutually_exclusive_group(required=True)
+    dream_actions.add_argument("--prepare", action="store_true", help="stage pending/BRIEF.md + MANIFEST.json from journal deltas (clean tick if nothing new)")
+    dream_actions.add_argument("--apply", action="store_true", help="validate + land pending/RESPONSE.md (+CRITIC.md) through the journaled publish path")
+    dream_actions.add_argument("--run", action="store_true", help="prepare + compose via codex (sol) + critic + apply in one shot")
+    dream_actions.add_argument("--status", action="store_true", help="dream watermark, pending state, recent dreams")
+    p_dream.add_argument("--phase", default="synthesis", help="phase schema for the composer: recon|synthesis (declared; H_vocab auto-proposal is slice 3)")
+    p_dream.add_argument("--extra-input", action="append", default=[], metavar="PATH", help="stage an extra raw input (board dump, ci.log tail); repeatable")
+    p_dream.add_argument("--budget", type=int, default=None, help=f"delta input budget in bytes (default {DREAM_INPUT_BUDGET_BYTES})")
+    p_dream.add_argument("--dry-run", action="store_true", help="with --apply: validate and print the plan without writing")
+    p_dream.add_argument("--composer", default="sol", help="composer transport for --run (sol; the seat-composer path is prepare/apply by hand)")
+    p_dream.add_argument("--model", default="gpt-6.1-sol", help="composer model for --run")
+    p_dream.add_argument("--effort", default="high", help="composer reasoning effort for --run")
+    p_dream.add_argument("--codex-bin", default=None, help="explicit codex binary path for --run")
+
+    # search [mem-dream slice 2]
+    p_search = subparsers.add_parser(
+        "search",
+        parents=[common_parser],
+        help="Grep hub doors with provenance (JIT retrieval when the door name is unknown)",
+    )
+    p_search.add_argument("pattern", help="regex to match")
+    p_search.add_argument("--all", action="store_true", help="search every namespace (default when --ns is omitted)")
+    p_search.add_argument("-i", "--ignore-case", action="store_true")
+    p_search.add_argument("--max-lines", type=int, default=50)
+
     args = parser.parse_args()
 
     if args.subcommand == "status":
@@ -3161,6 +3927,10 @@ def main():
         cmd_startup(args)
     elif args.subcommand == "shelve-archives":
         cmd_shelve_archives(args)
+    elif args.subcommand == "dream":
+        cmd_dream(args)
+    elif args.subcommand == "search":
+        cmd_search(args)
     else:
         parser.print_help()
 
