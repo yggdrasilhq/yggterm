@@ -198,7 +198,7 @@ fi
 # ⛔⛔ CORRECTED 2026-08-21 20:55 — THIS CHECK WAS REPORTING ITSELF. It derived the
 # file from the matched process's CWD, on the stated belief that the watcher is
 # invoked by a RELATIVE path. The live watcher's argv is ABSOLUTE
-# (`python3 /home/pi/gh/<tree>/.agents/skills/.../ygg-booter.py watch …`), so cwd
+# (`python3 /home/user/gh/<tree>/.agents/skills/.../ygg-booter.py watch …`), so cwd
 # decided nothing — and worse, `pgrep -f "ygg-booter.py watch"` matches any shell
 # whose COMMAND STRING contains that text, which includes THIS HOOK'S OWN
 # `bash -lc` subshell. So the probe found its own session, read that session's

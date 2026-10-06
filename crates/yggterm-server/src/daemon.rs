@@ -9345,7 +9345,7 @@ impl DaemonRuntime {
         else {
             return;
         };
-        // THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, jojo row
+        // THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, GUI-host row
         // 6778336d — the owner's ACTIVE row): a fresh peer-missing verdict
         // already names this row's runtime gone, yet every GUI recovery
         // re-mount re-ran the whole ssh ladder against the corpse — 5
@@ -11060,7 +11060,7 @@ impl DaemonRuntime {
             // per-generation: each spawn mints a fresh ring, the reader's
             // injected contract line dies with the generation it answered,
             // and the refused CLI LINGERS past its own refusal (measured on
-            // the owner's medgraph row: wrapper + child alive minutes after
+            // the owner's health-data row: wrapper + child alive minutes after
             // `session_not_found`, runtime reading `running`, plane claiming
             // `idle · Kept alive`). So the learn arm ALSO consults the
             // translate-time marker the reader recorded on this runtime —
@@ -32602,7 +32602,7 @@ mod tests {
 
     #[test]
     fn the_learn_arm_stamps_from_the_translate_marker_and_tears_down_a_lingering_runtime() {
-        // [11.162] stamp leg, measured on the owner's medgraph row: the ring
+        // [11.162] stamp leg, measured on the owner's health-data row: the ring
         // is per-generation (the injected contract line dies with the
         // generation it answered) and the refused CLI LINGERS past its own
         // refusal, so the ring-only, dead-only learn arm never fires — the
@@ -46408,7 +46408,7 @@ terminal session not found: codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c
 
     #[test]
     fn a_busy_peers_read_timeout_is_retriable_not_terminal() {
-        // [11.228], verbatim production string (jojo event-trace, 2026-10-04
+        // [11.228], verbatim production string (GUI-host event-trace, 2026-10-04
         // 00:22): the heal forward for the owner's squished Claude row died
         // on the read-timeout spelling eleven times overnight while dev's
         // daemon ground its rotation re-resume storm — the remote PTY kept
@@ -46430,7 +46430,7 @@ reading daemon response\n\nCaused by:\n    Resource temporarily unavailable (os 
         assert_eq!(
             classify_remote_resize_not_found(
                 "remote yggterm command failed for dev: Error: connecting to \
-/home/pi/.yggterm/server-3-2-115.sock\n\nCaused by:\n    Connection refused (os error 111)",
+/home/user/.yggterm/server-3-2-115.sock\n\nCaused by:\n    Connection refused (os error 111)",
                 None,
                 false
             ),

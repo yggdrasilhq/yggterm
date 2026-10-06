@@ -2173,9 +2173,9 @@ mod tests {
         let (event, payload) = effective_version_drift_event(
             "opencode2",
             "2.0.18",
-            Path::new("/home/pi/.yggterm/ynpm/bin/opencode2"),
+            Path::new("/home/user/.yggterm/ynpm/bin/opencode2"),
             Some((
-                "/home/pi/.local/bin/opencode2".to_string(),
+                "/home/user/.local/bin/opencode2".to_string(),
                 Some("2.0.3".to_string()),
             )),
             "after_install",
@@ -2185,9 +2185,9 @@ mod tests {
         assert_eq!(event, "effective_cli_version_drift");
         assert_eq!(payload["tool"], "opencode2");
         assert_eq!(payload["managed_version"], "2.0.18");
-        assert_eq!(payload["managed_path"], "/home/pi/.yggterm/ynpm/bin/opencode2");
+        assert_eq!(payload["managed_path"], "/home/user/.yggterm/ynpm/bin/opencode2");
         assert_eq!(payload["effective_version"], "2.0.3");
-        assert_eq!(payload["effective_path"], "/home/pi/.local/bin/opencode2");
+        assert_eq!(payload["effective_path"], "/home/user/.local/bin/opencode2");
         assert_eq!(payload["probe_basis"], "after_install");
     }
 
@@ -2197,9 +2197,9 @@ mod tests {
             effective_version_drift_event(
                 "codex",
                 "0.157.1",
-                Path::new("/home/pi/.yggterm/ynpm/bin/codex"),
+                Path::new("/home/user/.yggterm/ynpm/bin/codex"),
                 Some((
-                    "/home/pi/.yggterm/ynpm/bin/codex".to_string(),
+                    "/home/user/.yggterm/ynpm/bin/codex".to_string(),
                     Some("0.157.1".to_string())
                 )),
                 "after_install",
@@ -2216,7 +2216,7 @@ mod tests {
         let (event, payload) = effective_version_drift_event(
             "muse",
             "1.2.1",
-            Path::new("/home/pi/.yggterm/ynpm/bin/muse"),
+            Path::new("/home/user/.yggterm/ynpm/bin/muse"),
             Some(("/usr/local/bin/muse".to_string(), None)),
             "deferred_no_install",
         )
@@ -2232,7 +2232,7 @@ mod tests {
         let (event, payload) = effective_version_drift_event(
             "kimi",
             "2.1.1",
-            Path::new("/home/pi/.yggterm/ynpm/bin/kimi"),
+            Path::new("/home/user/.yggterm/ynpm/bin/kimi"),
             None,
             "ttl_skipped_no_install",
         )
@@ -2240,7 +2240,7 @@ mod tests {
 
         assert_eq!(event, "effective_cli_unresolvable");
         assert_eq!(payload["managed_version"], "2.1.1");
-        assert_eq!(payload["managed_path"], "/home/pi/.yggterm/ynpm/bin/kimi");
+        assert_eq!(payload["managed_path"], "/home/user/.yggterm/ynpm/bin/kimi");
         assert_eq!(payload["probe_basis"], "ttl_skipped_no_install");
     }
 

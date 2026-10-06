@@ -226,7 +226,7 @@ mod handoff_target_tests {
     /// same-version deploy behind — exactly the shape where the
     /// version-compare handoff guard is blind (both builds read the same
     /// version, and a `builds/<sha>` path declares none). Measured
-    /// 2026-10-03 on jojo: a bare launch of the b9c6e0c3 build exec'd the
+    /// 2026-10-03 on the GUI host: a bare launch of the b9c6e0c3 build exec'd the
     /// previous deploy's binary for both GUI and daemon. The finder must
     /// answer the canonical build; only a canonical record naming a
     /// MISSING executable may fall through to the mirror.
@@ -650,7 +650,7 @@ fn find_direct_install_state_with_roots(
     // mirror exists only "to prevent an older launcher from routing into a
     // dead or stale generation" (mirror_legacy_compatibility_state) — but
     // deploys flip ONLY the canonical state, so on a host carrying both
-    // files the mirror is the stale one. Measured 2026-10-03 on jojo: the
+    // files the mirror is the stale one. Measured 2026-10-03 on the GUI host: the
     // canonical state named b9c6e0c3251a while the legacy mirror still
     // named the previous same-version deploy, and every BARE `yggterm`
     // launch handed the new build's invocation down to the old binary —

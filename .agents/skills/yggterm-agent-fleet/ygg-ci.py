@@ -1643,7 +1643,7 @@ def main():
     s.add_argument("--step-heartbeat", type=int, help="ci.log heartbeat interval while a named step runs, seconds (default 120, 0 disables)")
 
     s = sub.add_parser("cache", help="per-host compile-cache health + recent build verdicts (spec-ygg-ci.md §4)")
-    s.add_argument("--host", help="comma-separated hosts (default dev,oc,jojo,practice)")
+    s.add_argument("--host", help="comma-separated hosts (default: every fleet host)")
     s.add_argument("--tail", type=int, default=10, help="last N build records to digest (default 10)")
     s.add_argument("--json", action="store_true")
 

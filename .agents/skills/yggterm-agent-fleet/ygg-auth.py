@@ -308,7 +308,7 @@ def get_writer(harness, slug):
 
 
 # Self-learning ssh destinations — dream ACK-62a8b4abe4. Hosts disagree about
-# who an alias is (oc: dev=root, jojo: dev=pi); remember per host which
+# who an alias is (one host: root, another: pi); remember per host which
 # destination actually reached a store, and try memories before the raw alias.
 def load_ssh_dests():
     try:

@@ -6328,11 +6328,11 @@ mod tests {
     #[test]
     fn a_registered_apps_row_mints_web_surfaces_and_a_shell_row_does_not() {
         let apps = vec![
-            app("yrdp", "/home/pi/.local/bin/yrdp"),
-            app("ychrome", "/home/pi/.local/bin/ychrome"),
+            app("yrdp", "/home/user/.local/bin/yrdp"),
+            app("ychrome", "/home/user/.local/bin/ychrome"),
         ];
         // The exact launch command from the live incident (claim 11.181).
-        let yrdp_row = "/home/pi/.local/bin/yrdp pick; exec \"${SHELL:-/bin/bash}\" -i";
+        let yrdp_row = "/home/user/.local/bin/yrdp pick; exec \"${SHELL:-/bin/bash}\" -i";
         assert!(launch_command_invokes_registered_app(yrdp_row, &apps));
         // Bare and quoted basenames launch the app just as well.
         assert!(launch_command_invokes_registered_app("yrdp pick", &apps));
