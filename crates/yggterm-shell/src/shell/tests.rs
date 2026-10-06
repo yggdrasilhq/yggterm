@@ -5320,24 +5320,44 @@ JSON.stringify({{
         let bootstrap = test_shell_bootstrap_with_active_session("local://a");
         let shell = ShellState::new(bootstrap);
         menu_dismissal_locks::with_live_shell(shell, |state| {
-            describe_app_rows_snapshot_cached(&state);
-            let after_first = builds();
-            describe_app_rows_snapshot_cached(&state);
-            assert_eq!(
-                builds(),
-                after_first,
-                "a second rows probe against an unchanged shell rebuilt the world — \
-                 the serve is the UI thread's most expensive read and the fleet \
-                 probes it nine times a minute"
-            );
-            // One counted write invalidates: the NEXT probe must rebuild, or a
-            // probe would answer about a shell that has moved on.
-            SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
-            describe_app_rows_snapshot_cached(&state);
-            assert!(
-                builds() > after_first,
-                "a state write did not invalidate the rows cache — the next probe \
-                 would answer from before the write"
+            // The cache keys on the GLOBAL SHELLSTATE_MUT_TOTAL epoch, so any
+            // PARALLEL test's counted write between the two serves makes the
+            // second serve legitimately rebuild — a global-counter assert is
+            // racy under the parallel harness (measured 2026-10-06: 1-of-5
+            // runs red with two added sibling tests, 4/4 green without; only
+            // this test serves rows, so concurrent SERVES do not exist).
+            // Retry inside a bounded patience until the epoch holds still
+            // across the quiet window; the invalidate half below is exact.
+            for _ in 0..64 {
+                let epoch_before = SHELLSTATE_MUT_TOTAL.load(Ordering::Relaxed);
+                describe_app_rows_snapshot_cached(&state);
+                let after_first = builds();
+                describe_app_rows_snapshot_cached(&state);
+                let epoch_after = SHELLSTATE_MUT_TOTAL.load(Ordering::Relaxed);
+                if epoch_before != epoch_after {
+                    continue; // a parallel test wrote — not a quiet window
+                }
+                assert_eq!(
+                    builds(),
+                    after_first,
+                    "a second rows probe against an unchanged shell rebuilt the world — \
+                     the serve is the UI thread's most expensive read and the fleet \
+                     probes it nine times a minute"
+                );
+                // One counted write invalidates: the NEXT probe must rebuild, or a
+                // probe would answer about a shell that has moved on.
+                SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                describe_app_rows_snapshot_cached(&state);
+                assert!(
+                    builds() > after_first,
+                    "a state write did not invalidate the rows cache — the next probe \
+                     would answer from before the write"
+                );
+                return;
+            }
+            panic!(
+                "the rows-serve quiet window never held still for 64 tries — \
+                 suspicious write pressure in the parallel suite"
             );
         });
     }
@@ -40871,6 +40891,111 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(
             shell.recover_startup_terminal_restore(active_session_path, current_millis()),
             "reaching Ready must reset the futile-recovery streak"
+        );
+    }
+
+    #[test]
+    fn startup_restore_recovery_spares_a_live_pre_attach_mount_loop() {
+        // (r-j1) The second (j)-class kill site: the recovery watch fires
+        // while the mount loop is still pre-attach_ready (stale attempt,
+        // live loop). Teardown there orphans the live task
+        // (registry_owner null, no successor) — the row stays mountless.
+        // A fresh heartbeat must defer; a dead loop must still recover.
+        let active_session_path = "local://test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner-test".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease-test".to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-test",
+            1,
+            "startup_restore",
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms =
+                current_millis().saturating_sub(STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1);
+        }
+        assert!(
+            shell.startup_terminal_restore_should_recover(active_session_path, current_millis()),
+            "baseline: the attempt alone reads stale-recoverable"
+        );
+        bump_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            !shell.recover_startup_terminal_restore(active_session_path, current_millis()),
+            "a live mount loop must be spared by the recovery watch"
+        );
+        assert!(
+            shell.terminal_attach_in_flight.contains(active_session_path),
+            "the spared live loop keeps its in-flight marker"
+        );
+        assert!(
+            shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key(active_session_path)
+                && shell
+                    .terminal_bootstrap_lease_by_session
+                    .contains_key(active_session_path),
+            "the spared live loop keeps its bootstrap owner + lease"
+        );
+        remove_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            shell.recover_startup_terminal_restore(active_session_path, current_millis()),
+            "once the loop is dead (heartbeat punched by its drop guard), recovery runs"
+        );
+        assert!(
+            !shell.terminal_attach_in_flight.contains(active_session_path)
+                && !shell
+                    .terminal_bootstrap_owner_by_session
+                    .contains_key(active_session_path)
+                && !shell
+                    .terminal_bootstrap_lease_by_session
+                    .contains_key(active_session_path),
+            "dead-loop recovery still tears down the marker + owner + lease"
+        );
+    }
+    #[test]
+    fn startup_restore_recovery_still_runs_on_a_stale_heartbeat() {
+        // A beat older than TERMINAL_LOOP_STALE_MS is a dead loop — the
+        // recovery must not defer forever on a corpse's last beat.
+        let active_session_path = "local://test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-test",
+            1,
+            "startup_restore",
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms =
+                current_millis().saturating_sub(STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1);
+        }
+        super::TERMINAL_LOOP_HEARTBEATS
+            .lock()
+            .unwrap()
+            .insert(active_session_path.to_string(), 1);
+        assert!(
+            shell.recover_startup_terminal_restore(active_session_path, current_millis()),
+            "a stale heartbeat is a dead loop: recovery must still run"
+        );
+        assert!(
+            !shell.terminal_attach_in_flight.contains(active_session_path),
+            "the stale-beat recovery still tears the marker down"
         );
     }
     #[test]
