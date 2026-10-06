@@ -151,7 +151,18 @@ print("armed at trace line %d" % armed[-1][0])
 
 # BAR 1: the repaint differential at armed+50ms — ends with cursor HOME.
 time.sleep(0.05)
-repaint_cmd = "printf '\\033[2J\\033[HF1EMARK\\033[H'"
+# marker on ROW 2 with the cursor parked HOME: the guard still reads
+# unpainted (baseY/cursorX/cursorY all 0) but bash's next prompt lands on
+# row 1 and cannot overwrite the marker (the v1 command homed the cursor
+# ON the marker row and the prompt erased it — the marker must survive
+# its own shell's prompt to be assertable).
+# the trailing sleep keeps the shell BUSY so nothing (no next
+# prompt) prints after the homing — at seed time the cursor sits at
+# (0,0) with a non-empty buffer, which is exactly the painted-guard
+# hole (measured: without it bash's own next prompt leaves cursorX>0
+# and the guard rightly blocks the stale seed — the falsifier goes
+# vacuously green).
+repaint_cmd = "printf '\\033[2J\\033[H\\033[BF1EMARK\\033[H'; sleep 6"
 out = verb("server", "app", "terminal", "probe-type", s, "--data", repaint_cmd, "--enter", "--mode", "xterm")
 print("probe-type -> %s" % (out.stdout or out.stderr)[:120].replace("\n", " "))
 
@@ -262,7 +273,7 @@ synth_names = [nm for _, nm, p in read_events()
                if ("synth" in nm or "fence" in nm or nm.startswith("test_hook"))
                and p.get("session_path") == s]
 print("VERDICT HEALTHY-CONTROL: HCGOOD painted=%d synth/fence/hook events=%d %s" % (
-    painted, len(synth_names), synth_names[:4] if synth_names ""))
+    painted, len(synth_names), (synth_names[:4] if synth_names else "")))
 if not (painted >= 1 and not synth_names):
     print("HEALTHY CONTROL FAIL — the fence leaked into a healthy mount")
     raise SystemExit(7)
