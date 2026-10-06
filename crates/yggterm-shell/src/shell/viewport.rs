@@ -6982,20 +6982,21 @@ fn TerminalCanvas(
             // path was taken; the cold installer is built up front so the
             // vanish arm below can re-dispatch it without touching the
             // ensure/read channels it races.
-            let mut cold_fallback_script = if mount_fn_installed {
-                Some(terminal_eval_script_with_pinned_grid_seeded(
-                    &host_id,
-                    &theme,
-                    initial_input_focus,
-                    pinned_grid,
-                    initial_grid,
-                    yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
-                    yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
-                    initial_buffer_kind.as_deref(),
-                ))
-            } else {
-                None
-            };
+            // [F3] The redo script is path-independent: a COLD-dispatched
+            // mount whose liveness record never appears (the eval itself was
+            // dropped) redoes the install — the same installer the warm
+            // path's redo runs. The gate below arms for cold dispatches too,
+            // so `eval_lost` must stay actionable on both paths.
+            let mut cold_fallback_script = Some(terminal_eval_script_with_pinned_grid_seeded(
+                &host_id,
+                &theme,
+                initial_input_focus,
+                pinned_grid,
+                initial_grid,
+                yggterm_core::agent_cli::suppresses_mouse_tracking(session.kind),
+                yggterm_core::agent_cli::alternate_scroll_keys(session.kind),
+                initial_buffer_kind.as_deref(),
+            ));
             // [11.178] Adaptive warm-eval gate state. The first deadline
             // (T0+PROBE_DISPATCH) only DISPATCHES the trivial pipeline probe;
             // later fires DECIDE: probe answered while the mount is still
@@ -7003,12 +7004,23 @@ fn TerminalCanvas(
             // => the page is stalled, keep waiting + re-probe; MAX_WAIT caps
             // the stall wait. The [11.176] streak ladder stays the outer
             // bound behind this.
-            let mut warm_gate_deadline = if mount_fn_installed {
-                Some(tokio::time::Instant::now() + Duration::from_millis(TERMINAL_WARM_EVAL_PROBE_DISPATCH_MS))
-            } else {
-                None
-            };
-            let warm_gate_t0_ms = if mount_fn_installed { current_millis() } else { 0 };
+            // [F3] THE GATE ARMS FOR COLD-DISPATCHED MOUNTS TOO — the
+            // [11.229](b) relaunch root fix. On GUI relaunch over a live
+            // daemon the restored ACTIVE row is the FIRST mount in the fresh
+            // page: a cold install. Arming only on the warm path left a cold
+            // mount under the production shed window (page→Rust bridge dead,
+            // eval-return alive) waiting on bridge events forever — no poll,
+            // no stage-posted proof, no synthesis, the row mountless
+            // (measured f3-rig 2026-10-06: zero attach signals in 80 s,
+            // 54,685 deferred-live recoveries). The cold installer stamps
+            // the SAME attempt fields and the body posts the SAME liveness
+            // record, so the poll's evidence is path-independent; a healthy
+            // mount still disarms on its first bridge event or eval result.
+            let mut warm_gate_deadline = Some(
+                tokio::time::Instant::now()
+                    + Duration::from_millis(TERMINAL_WARM_EVAL_PROBE_DISPATCH_MS),
+            );
+            let warm_gate_t0_ms = current_millis();
             let mut warm_probe_dispatched = false;
             // The probe's own join future, held in loop state and polled from
             // its select arm: Eval is not Send (no task spawn), and the

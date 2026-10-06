@@ -18871,6 +18871,12 @@ struct ShellState {
     // it is remounted (dead PTY, or an app surface covering the viewport).
     // Reset on Ready and on any user-driven open.
     startup_restore_recover_streak: HashMap<String, u32>,
+    /// [F3] Last epoch-ms the live-loop deferral traced, per session — the
+    /// render pass re-drives the recovery check every frame, so an
+    /// indefinitely-deferred (live but not completing) loop traced
+    /// `startup_restore_recover_deferred_live_loop` ~680×/s (54,685 events
+    /// in an 80 s rig window). One trace per second keeps the signal.
+    startup_restore_deferred_trace_ms: HashMap<String, u64>,
     // Active click-grid overlay params (docs/yggui-click-grid.md). Geometry is
     // recomputed in JS from these params at click time — never cached as rects
     // — so window resizes between show and click cannot skew the target.
@@ -21404,6 +21410,7 @@ impl ShellState {
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
             terminal_cold_remount_count: HashMap::new(),
             startup_restore_recover_streak: HashMap::new(),
+            startup_restore_deferred_trace_ms: HashMap::new(),
             click_grid: None,
             agent_presence: AgentPresence::default(),
             terminal_cold_remount_since_ms: HashMap::new(),
@@ -28582,6 +28589,7 @@ impl ShellState {
             // A user-driven open is fresh intent — re-open the startup-restore
             // recovery budget for this session.
             self.startup_restore_recover_streak.remove(session_path);
+            self.startup_restore_deferred_trace_ms.remove(session_path);
         }
         // Arm the RetainedFaultRecoveryLoop gate. A non-RFR open is the
         // start of a fresh user-felt loop, so when the next RFR attempt
@@ -29294,6 +29302,7 @@ impl ShellState {
         // Reaching Ready proves recovery isn't futile — re-open the
         // startup-restore recovery budget.
         self.startup_restore_recover_streak.remove(session_path);
+        self.startup_restore_deferred_trace_ms.remove(session_path);
         let mut ready_snapshot = None;
         let mut first_ready_for_reveal_log = false;
         if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
@@ -33143,17 +33152,32 @@ impl ShellState {
         // TERMINAL_LOOP_STALE_MS later. Placed AFTER should_recover so
         // the deferral trace fires only where the kill would have.
         if terminal_loop_is_live(active_session_path) {
-            if let Ok(home) = resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "terminal_mount",
-                    "startup_restore_recover_deferred_live_loop",
-                    json!({
-                        "session_path": active_session_path,
-                        "heartbeat_age_ms": terminal_loop_heartbeat_age_ms(active_session_path),
-                    }),
-                );
+            // [F3] Rate-limit the deferral trace to 1/s: the render pass
+            // re-checks every frame, and an indefinitely-deferred loop
+            // flooded the trace (~680/s). The dedup key is per-session
+            // wall time, NOT a heartbeat-age bucket — a live loop's
+            // heartbeat age stays near zero, so bucketing would not dedup.
+            let now_epoch_ms = current_millis();
+            let last = self
+                .startup_restore_deferred_trace_ms
+                .get(active_session_path)
+                .copied()
+                .unwrap_or(0);
+            if now_epoch_ms.saturating_sub(last) >= 1_000 {
+                self.startup_restore_deferred_trace_ms
+                    .insert(active_session_path.to_string(), now_epoch_ms);
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "ui",
+                        "terminal_mount",
+                        "startup_restore_recover_deferred_live_loop",
+                        json!({
+                            "session_path": active_session_path,
+                            "heartbeat_age_ms": terminal_loop_heartbeat_age_ms(active_session_path),
+                        }),
+                    );
+                }
             }
             return false;
         }
