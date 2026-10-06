@@ -2701,6 +2701,30 @@ def _fleet_ssh_command(connect_timeout: int) -> list[str]:
     ]
 
 
+def _self_disperse_source(module_path: Path, home: Path | None = None) -> Path | None:
+    """[11.236] The runner self-dispersal may push bytes only from the repo SSOT.
+
+    ``_run_fleet_sync`` scps ``ygg-memory(.py)`` from the RUNNING module's
+    directory to every peer — unguarded, that is a last-writer-wins fleet
+    re-stale: a host whose installed copy lags (or a seat running sync-fleet
+    from a worktree module) silently overwrites newer runners everywhere,
+    exactly the 2026-10-06 [11.236] regression. Returns the directory to
+    disperse from, or None to SKIP dispersal loudly (the sanctioned installer
+    is ``ygg-disperse install --fleet``). A missing SSOT keeps the legacy
+    behavior — nothing better to compare against.
+    """
+    base = (home or Path.home()).resolve()
+    ssot_dir = base / "gh/yggterm/.agents/skills/yggterm-agent-fleet"
+    if module_path.parent == ssot_dir:
+        return module_path.parent
+    ssot_file = ssot_dir / "ygg-memory.py"
+    if not ssot_file.is_file():
+        return module_path.parent
+    if ssot_file.read_bytes() == module_path.read_bytes():
+        return module_path.parent
+    return None
+
+
 def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
     """Exchange immutable objects + event IDs; namespace files never rsync."""
     local_host = socket.gethostname()
@@ -2735,7 +2759,14 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
         _flock_close(local_lock)
     (root / "objects").mkdir(parents=True, exist_ok=True)
     journal_file = get_journal_path(root)
-    script_dir = Path(__file__).resolve().parent
+    script_dir = _self_disperse_source(Path(__file__).resolve())
+    if script_dir is None:
+        print(
+            "ygg-memory: sync-fleet runner self-dispersal SKIPPED — the running "
+            "module is not the repo SSOT (stale install or worktree copy); run "
+            "'ygg-disperse install --fleet' to install current runners",
+            file=sys.stderr,
+        )
     failures = []
 
     if not quick:
@@ -2753,7 +2784,7 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
             )
             if prepared.returncode != 0:
                 failures.append(f"{peer}:prepare")
-            for destination in (".local/bin", ".yggterm/bin"):
+            for destination in (() if script_dir is None else (".local/bin", ".yggterm/bin")):
                 copied = subprocess.run(
                     [
                         "scp",
