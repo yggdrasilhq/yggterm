@@ -275,14 +275,42 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   RED (exit 4, attach_ready 0, superseded 1) on instrumented-unfixed
   build vs GREEN x3 on the fixed build (attach_ready all rows,
   superseded 0, deferred_live_loops named the live row every time).
-  REMAINDERS: (r-j1) the supersede path itself still presumes a
-  successor without verifying one began — hardening (verify-or-rearm on
-  drop) stays filed for the NEXT kill site of this shape, not this one —
-  and the SECOND kill site is already measured (sitting 9, fence-rig
-  boot 1): startup_terminal_restore_recover_watch fired ~22s after
-  daemon-ready and superseded BOTH live pre-attach_ready loops
-  (registry_owner null, nothing followed — row left mountless until
-  teardown); any rig row created inside the restore window eats this;
+  REMAINDERS: (r-j1) SECOND KILL SITE FIXED IN CODE 2026-10-06
+  (sitting 12, lane lane/f1/restore-recover-live-guard): BOTH call
+  sites of the sitting-9 measurement — the async
+  startup_terminal_restore_recover_watch (+5.25s) AND the synchronous
+  render pass (viewport.rs recover block, event
+  startup_terminal_restore_recover, 5s cadence) — funnel through
+  recover_startup_terminal_restore, which tore attach_in_flight +
+  bootstrap owner + lease out from under any loop whose ATTEMPT read
+  stale. FIX: the (j) live-task guard at the shared fn — a fresh
+  TERMINAL_LOOP_HEARTBEATS beat (pumped from the mount loop's FIRST
+  iteration, pre-attach_ready) defers the recovery; dead loops
+  (absent/stale beat) still recover, at most one
+  TERMINAL_LOOP_STALE_MS later. CONSTRUCTION-PROVEN per the (f2)/(h2)
+  precedent — the live crossing needs a slow-proof window that the
+  ready-marking now closes early (MEASURED sitting 12: 10
+  mark-ready call sites fire pre-attach even under synthesis+8s
+  snapshot stall, so no rig can hold an attempt Pending past the
+  staleness threshold while its loop completes; sitting-9's RED was on
+  pre-fence e74a67de where the seed bug kept attempts pending). Bar:
+  unit locks (live pre-attach loop spared with owner+lease; stale-beat
+  loop still recovers) + tools/uxspeed/rj1-rig.sh — the SURVIVAL rig
+  (sitting-9 law "rig rows must outlive the restore window"),
+  exe-proofed, PASS on main AND the lane build; production
+  discriminator startup_restore_recover_deferred_live_loop fires the
+  moment the crossing recurs. SAME LANE also fixed the pre-existing
+  racy assert in a_quiet_shell_serves_the_memoized_rows_snapshot
+  (global SHELLSTATE_MUT_TOTAL epoch compared across a parallel-harness
+  window; retry-until-quiet-window). STILL OPEN under r-j1: the
+  verify-or-rearm hardening (the DEAD-loop teardown still presumes a
+  successor — same line as (r-j2)'s render latch). NEW F3 LEAD
+  (measured in the rj1-rig iteration, GUI-relaunch shape): on GUI
+  relaunch over a live daemon, the retained host never posts its page
+  stage (no synthesis arming, reveal_raise_refused
+  daemon_owns_runtime:True) while the render-site recovery re-drives
+  every 5s and burns the futile streak — rows churn mountless; that is
+  the [11.229](b) replaced-runtime family, NOT this fix's scope;
   (r-j2) post-kill recovery depends on the render latch
   (bootstrap_task_identity) — a user re-select is still the only
   re-schedule trigger after any genuine supersede. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
