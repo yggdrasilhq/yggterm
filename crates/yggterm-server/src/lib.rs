@@ -28044,7 +28044,7 @@ fn terminal_read_with_local_daemon_recovery(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool, Option<String>)>
+) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool, Option<String>, u64)>
 {
     let mut last_error = None::<anyhow::Error>;
     for attempt in 0..=5_u64 {
@@ -28235,6 +28235,9 @@ fn bridge_remote_runtime_session_stdio(
             // The frame-hash probe's daemon half; the raw bridge does not pair
             // frames (it has no xterm buffer), so it carries nothing.
             _screen_hash,
+            // [11.229](b)] The runtime identity — the raw bridge keeps no host
+            // state, so it carries nothing.
+            _runtime_spawn_id,
         ) = terminal_read_with_local_daemon_recovery(endpoint, path, cursor)?;
         let chunks_have_visible_text = chunks
             .iter()
