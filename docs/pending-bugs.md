@@ -368,7 +368,35 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   [11.227] "pushed is a claim" class). SLICE 2 NEXT (the dream verb —
   composer on sol/GLM per the model ruling, NOW.md, per-claim as-of,
   critic gate, contradiction trigger, search verb + owner-now door per
-  the owner's 2026-10-06 JIT steer). SLICE 2 LANDED 2026-10-06 (sitting 11, lane lane/memory/dream-verb): the `dream` verb (--prepare/--apply/--run/--status: journal-delta collector with dreamer ingestion isolation + per-ns dream watermark + input budget, machine-parsed composer contract, MANDATORY adversarial-critic verdicts, per-claim [as-of; proof] stamps over a closed vocabulary, append-section/propose-tombstone ops whitelist, ns-level NOW.md + _global owner-now.md landed through journaled origin=dreamer publishes, per-dream OPLOG) + the `search` verb (regex across hub doors, provenance per hit) + tests/test_memory_dream_verb.py (green: isolation, budget, refusals x10, watermark, ops, owner-now, search). FIRST REAL DREAM applied live on -home-pi-gh-yggterm via the seat-composer path (sol transport built but juju-capped to Oct 10 3:54 AM): NOW.md 2309B/9 claims/0 contested AFTER the critic pass contested three generator claims (a stale 33KB figure copied from the door, an unsourced watcher count, an unevidenced 'sittings 1-10') — the adversarial gate measured working on its first live run. owner-now.md live in _global and pinned into every zcode project. Remaining for F8: slices 3-4 (H_vocab phase telemetry, Hebbian decay/canaries) + the [11.236] byte-source probe + the per-host ns-index gap (a peer host never learns a new door's hub-ns MEMORY.md line — the index is per-host publish-time state; NOW.md is read by `get`, so orientation works, but the index drift is a dream-grade gap).
+  the owner's 2026-10-06 JIT steer). SLICE 1.1 LANDED 2026-10-06
+  (sitting 10 tail, lane lane/memory/archive-relocation): the shelve
+  verb targets <project>/memory-archive/ OUTSIDE the scanned tree
+  (codifying the hand-relocation; legacy in-tree archive/ migrates
+  whole in the same apply; ARCHIVE-INDEX.md points at the external
+  archive with its doc count) + the pin-runners verb (explicit runner
+  deploy from a repo SSOT — the [11.236] recovery as a one-liner;
+  complements the landed self-disperse guard: guard refuses unknown
+  sources, pin-runners performs good pins). ROUND-3 CONSULT
+  (gemini fault-tolerance, node
+  2026-10-06-yggterm-memory-dreaming-round3-fault-tolerance.md; GLM
+  verdicts): the incident = control-plane contamination + zombie
+  resurrection + lock false-panic; MINIMAL REMAINING HARDENING = (a)
+  remote busy-lock returns DEFER exit-0 like the local path, (b)
+  skip-if-same-bytes CAS on every delivery leg, (c) deletes stay
+  explicit journal ops — mirror re-delivery must never treat native
+  absence as needs-delivery (the D1 ordering fix); KILLED: runner-skew
+  sync-refusal (data partition) — deploy verbs only; DEFERRED: epoch
+  manifest, conflict bulk CLI, index canary header (the relocation
+  made client regeneration harmless by construction). SLICE-2 AUDIT
+  OWED (the four dream gates, BEFORE any LLM write is trusted):
+  (1) write-domain partition — dreamer touches ONLY NOW.md + proposal
+  streams, never doors/§STATE/MEMORY.md; (2) deterministic validator
+  fence — no raw LLM bytes to the journal (schema, <=150 lines,
+  proof-status, pointers; failures quarantine); (3) quiescence gate —
+  no active sitting in the ns + ~15min journal cooldown; (4)
+  read-version fencing — seq_start == seq_now at commit or abort.
+  Composer transport must follow the model ruling (sol/GLM; gemini
+  knowledge/creativity only). SLICE 2 LANDED 2026-10-06 (sitting 11, lane lane/memory/dream-verb): the `dream` verb (--prepare/--apply/--run/--status: journal-delta collector with dreamer ingestion isolation + per-ns dream watermark + input budget, machine-parsed composer contract, MANDATORY adversarial-critic verdicts, per-claim [as-of; proof] stamps over a closed vocabulary, append-section/propose-tombstone ops whitelist, ns-level NOW.md + _global owner-now.md landed through journaled origin=dreamer publishes, per-dream OPLOG) + the `search` verb (regex across hub doors, provenance per hit) + tests/test_memory_dream_verb.py (green: isolation, budget, refusals x10, watermark, ops, owner-now, search). FIRST REAL DREAM applied live on -home-pi-gh-yggterm via the seat-composer path (sol transport built but juju-capped to Oct 10 3:54 AM): NOW.md 2309B/9 claims/0 contested AFTER the critic pass contested three generator claims (a stale 33KB figure copied from the door, an unsourced watcher count, an unevidenced 'sittings 1-10') — the adversarial gate measured working on its first live run. owner-now.md live in _global and pinned into every zcode project. Remaining for F8: slices 3-4 (H_vocab phase telemetry, Hebbian decay/canaries) + the [11.236] byte-source probe + the per-host ns-index gap (a peer host never learns a new door's hub-ns MEMORY.md line — the index is per-host publish-time state; NOW.md is read by `get`, so orientation works, but the index drift is a dream-grade gap).
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
