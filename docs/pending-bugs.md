@@ -129,13 +129,26 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   loss through a teardown-race remount — the [11.229] family's arm, not
   this unit's);
   (g) flush_due routing (Q3) — LANDED with its lane; (f2) THE PAGE-SIDE
-  PRUNE RACE (sol code-review find, 2026-10-05, node
+  PRUNE RACE — LANDED 2026-10-06 as [11.234] (sitting 10, lane
+  lane/f1/bucket-ownership-gate; sol Q2 find, node
   lores/chain-of-thought/2026-10-05-yggterm-f1h-remount-hook-sol-review.md):
-  an old-incarnation drain EXECUTING after a reused bucket is restamped
-  classifies the NEW chunks as stale and prunes them page-side BEFORE Rust
-  checks the answer's echo — the Rust return guard cannot undo page-side
-  pruning. Wants a bucket-incarnation check BEFORE mutation in the drain
-  script + a test of that ordering; (h) THE SYNTHESIZED-REMOUNT TEST HOOK
+  the drain script now gates EVERY page-side read/prune on bucket
+  OWNERSHIP — `__bucket.inc` (the stamp script's field) must equal the
+  requesting mount's incarnation BEFORE the classification loop; a
+  foreign bucket (restamped by a host-reusing remount, or born before
+  any stamp) is neither read nor mutated, so a stale drain can no longer
+  classify the NEW mount's chunks as stale and destroy them where the
+  Rust return guard cannot undo it. The answer carries `bucket_inc` +
+  `foreign_bucket`, and a foreign bucket's baseline/overflow never ride
+  it; Rust discards the whole answer BEFORE baseline/chunks/overflow
+  touch the cursor (traced `synthesized_input_foreign_bucket`; a
+  contradicting bucket_inc discards too). Ordering locked by test (the
+  gate text precedes the mutation text) + discriminator/deserialize
+  locks; own-bucket behavior unchanged (every pre-existing drain shape
+  lock holds verbatim). Bar: construction-proven like the (h2) replay
+  defect — the stale branch's live entry IS this crossing, unreachable
+  through a quiesced death by design; no GUI RED owed; (h) THE
+  SYNTHESIZED-REMOUNT TEST HOOK
   — INFRASTRUCTURE LANDED 2026-10-05 (068a94c4, lane/f1/remount-hook):
   YGGTERM_TEST_SUPPRESS_MOUNT_IPC gates the WHOLE bridge-event select arm
   per mount loop — Ready-only suppression would close the warm gate via
