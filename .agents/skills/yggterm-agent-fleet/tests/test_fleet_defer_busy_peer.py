@@ -41,7 +41,7 @@ def main() -> int:
     print("[1] the busy-lock classifier")
     check(
         module._peer_busy_lock(
-            "RuntimeError: Lock held by another process: /home/pi/.yggterm/memory/.ygg-memory.lock (waited 60s)"
+            "RuntimeError: Lock held by another process: /home/user/.yggterm/memory/.ygg-memory.lock (waited 60s)"
         ),
         "the peer's lock-held RuntimeError classifies as busy",
     )

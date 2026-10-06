@@ -58,10 +58,10 @@ def main() -> int:
         write_journal(
             root,
             [
-                {"seq": 10, "ts": time.time() - 4000, "ns": "ns-x", "file": "door.md", "origin": "jojo", "summary": "sitting write"},
+                {"seq": 10, "ts": time.time() - 4000, "ns": "ns-x", "file": "door.md", "origin": "host-a", "summary": "sitting write"},
                 {"seq": 11, "ts": time.time() - 3900, "ns": "ns-x", "file": "NOW.md", "origin": "dreamer", "summary": "dream rollup [consumed seq 9]"},
                 {"seq": 12, "ts": time.time() - 3800, "ns": "other", "file": "NOW.md", "origin": "dreamer", "summary": "foreign ns dream"},
-                {"seq": 13, "ts": time.time() - 3700, "ns": "ns-x", "file": "door.md", "origin": "jojo", "summary": "later non-dream write"},
+                {"seq": 13, "ts": time.time() - 3700, "ns": "ns-x", "file": "door.md", "origin": "host-a", "summary": "later non-dream write"},
             ],
         )
         watermark = module.load_dream_watermark(root, "ns-x")
@@ -78,7 +78,7 @@ def main() -> int:
             json.dumps({"ns": "ns-hot", "last_seq": 5, "last_dream_ts": None, "dreams": []}),
             encoding="utf-8",
         )
-        write_journal(root, [{"seq": 6, "ts": time.time() - 3600, "ns": "ns-hot", "file": "d.md", "origin": "jojo", "summary": "write"}])
+        write_journal(root, [{"seq": 6, "ts": time.time() - 3600, "ns": "ns-hot", "file": "d.md", "origin": "host-a", "summary": "write"}])
 
         class Args:
             model = "gpt-6.1-sol"
@@ -125,12 +125,12 @@ def main() -> int:
             json.dumps({"ns": "ns-hot", "last_seq": 5, "last_dream_ts": None, "dreams": []}),
             encoding="utf-8",
         )
-        write_journal(root, [{"seq": 7, "ts": time.time() - 30, "ns": "ns-hot", "file": "d.md", "origin": "jojo", "summary": "live write"}])
+        write_journal(root, [{"seq": 7, "ts": time.time() - 30, "ns": "ns-hot", "file": "d.md", "origin": "host-a", "summary": "live write"}])
         message = module._dream_auto(root, "", Args())
         check("no candidate" in message, "a live write inside quiescence defers candidacy")
         # Pending manifest: a staged dream belongs to its stager.
         (root / "dream" / "auto-backoff.json").unlink(missing_ok=True)
-        write_journal(root, [{"seq": 8, "ts": time.time() - 3600, "ns": "ns-hot", "file": "d.md", "origin": "jojo", "summary": "older write"}])
+        write_journal(root, [{"seq": 8, "ts": time.time() - 3600, "ns": "ns-hot", "file": "d.md", "origin": "host-a", "summary": "older write"}])
         (dream_dir / "pending").mkdir(exist_ok=True)
         (dream_dir / "pending" / "MANIFEST.json").write_text("{}", encoding="utf-8")
         message = module._dream_auto(root, "", Args())

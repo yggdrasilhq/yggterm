@@ -358,10 +358,16 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   path, so the restored ACTIVE row after GUI relaunch over a live daemon
   hung mountless under the shed window; gate + redo now path-independent
   + the deferred trace rate-limited (f3-rig falsifier, rj1-rig
-  regression-green). REMAINDERS: [11.229](b) LIVE-GUI frozen-buffer arm
-  (runtime_spawn_id invalidation — the runtime replaced UNDER a mounted
-  client, not across GUI death; a different mechanism, still open),
-  (d) remove-vs-keepalive race.
+  regression-green). THE (b) LIVE-GUI ARM'S IDENTITY SIGNAL LANDED
+  (sitting 14, 2026-10-06, lane lane/rt/stream-spawn-id 65a87e59):
+  TerminalStream carries runtime_spawn_id + the mounted client
+  reconciles on an identity change (the same recovery as a cursor
+  rewind); rt-rig measured plain + grid-divergence arms already healing
+  on unfixed main via the rewind, so the id signal covers the NO-REWIND
+  arms (busy replacement outrunning the cursor, forwarded rewind loss) —
+  fake-id isolation arm GREEN on the lane. REMAINDERS under (b): the
+  mount-loop-DEAD arm ([11.187] territory) and error-not-answer shapes;
+  then (d) remove-vs-keepalive race.
 - **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
   [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
   auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
@@ -450,6 +456,46 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   Composer transport must follow the model ruling (sol/GLM; gemini
   knowledge/creativity only). SLICE 2 LANDED 2026-10-06 (sitting 11, lane lane/memory/dream-verb): the `dream` verb (--prepare/--apply/--run/--status: journal-delta collector with dreamer ingestion isolation + per-ns dream watermark + input budget, machine-parsed composer contract, MANDATORY adversarial-critic verdicts, per-claim [as-of; proof] stamps over a closed vocabulary, append-section/propose-tombstone ops whitelist, ns-level NOW.md + _global owner-now.md landed through journaled origin=dreamer publishes, per-dream OPLOG) + the `search` verb (regex across hub doors, provenance per hit) + tests/test_memory_dream_verb.py (green: isolation, budget, refusals x10, watermark, ops, owner-now, search). FIRST REAL DREAM applied live on -home-pi-gh-yggterm via the seat-composer path (sol transport built but juju-capped to Oct 10 3:54 AM): NOW.md 2309B/9 claims/0 contested AFTER the critic pass contested three generator claims (a stale 33KB figure copied from the door, an unsourced watcher count, an unevidenced 'sittings 1-10') — the adversarial gate measured working on its first live run. owner-now.md live in _global and pinned into every zcode project. Remaining for F8: slices 3-4 (H_vocab phase telemetry, Hebbian decay/canaries) + the [11.236] byte-source probe + the per-host ns-index gap (a peer host never learns a new door's hub-ns MEMORY.md line — the index is per-host publish-time state; NOW.md is read by `get`, so orientation works, but the index drift is a dream-grade gap).
 
+## ⛔ [11.237] THE PRIVACY CHECKER'S PER-TERM HEAD-CAP HIDES CAMPAIGN-SCALE PRIVATE-NAME DEBT — EVERY "GREEN-LOOKING" RUN JUST PEELED THE NEXT SIX HITS, AND THE FULL INVENTORY IS ~1,400 HOME-PATH GREP HITS + 139 SHARED-LIST HITS OF ACCUMULATED LEAKAGE (measured 2026-10-06, sitting 14's full-suite gate)
+
+**Status:** OPEN
+
+Filed 2026-10-06 ~23:0x IST by the campaign seat (board interim
+ACK-486d8f30ff). The [11.229](b) lane's full-workspace-suite gate surfaced
+the privacy test RED on unfixed main — and fixing it peeled layer after
+layer: scripts/check-privacy.sh prints at most 6 hits per private term
+(12 for home paths), so each run "finds" only the next batch and the
+depth was invisible. THE MEASURED INVENTORY (uncapped greps, sitting 14):
+the home-path pattern alone matches ~1,393 lines repo-wide (the checker's
+scoped tracked-files subset is smaller but the same order); the shared
+guard list (~/.config/ygg-privacy/private-terms.txt) matches 139 lines;
+one encoded in-repo term still matches 12. Oldest layers predate 2026-09
+(the [11.183] fixtures, the [11.57]/[11.162] tombstone comments, the
+[11.228] verbatim trace strings); the newest is the same week (the
+dream-auto test fixtures, 2026-10-06).
+
+WHY IT MATTERS: this repo is public; a term withheld from the checker's
+output is still PUBLISHED in the repo bytes. The layered cap is a guard
+that reports "6 left" forever — the same class as the [11.231]
+exe-mismatch lie (an instrument that under-reports its own subject).
+
+FIX SHAPE (two arms):
+1. THE CHECKER: report the TOTAL count per term alongside the sample
+   (and exit nonzero while any remain) — the cap can stay for output
+   noise, never for truth. One-line-class change to scripts/check-
+   privacy.sh.
+2. THE DEBT: a scripted, reviewable bulk migration (each class has a
+   mechanical transform: /home/<user> -> /home/user in fixtures/comments;
+   private host names -> invented labels; real session titles -> invented
+   titles), run per-file with the suite green after each batch. ~50
+   sites already fixed in the [11.229](b) lane (2026-10-06) — every
+   individually verified; the pattern is established and safe.
+
+ATTACK ORDER: the checker arm first (it makes every later run honest),
+then the debt in file-batches (crates/ tests -> docs/pending-bugs
+historical entries -> tools/ -> .agents/skills), suite green between
+batches.
+
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
@@ -518,9 +564,38 @@ CLIENT halves that still recur on healthy rows.
   GUI-RELAUNCH arm of (b) is ROOT-FIXED — a relaunched GUI now re-binds
   retained rows through the F1 synthesis contract even inside the shed
   window (cold-first-mount hole; see F3 family + the r-j1 entry for the
-  measurement). The LIVE-GUI arm stands OPEN as filed: a runtime
-  replaced while the client stays mounted still needs the
-  `runtime_spawn_id` invalidation above.
+  measurement).
+  UPDATE 2026-10-06 ~22:0x IST (sitting 14, rt-rig + lane
+  lane/rt/stream-spawn-id 65a87e59): the LIVE-GUI arm's identity fix
+  LANDED — TerminalStream answers now carry `runtime_spawn_id` (own +
+  both forwarded read paths + the proxy read task + the recovery wrapper;
+  serde-default 0 keeps cross-version safety, strip-field lock pinned),
+  and the mounted client reconciles on an identity CHANGE between two
+  known ids (edge-triggered; fires `terminal_stream_runtime_replaced`
+  and takes the SAME recovery as a cursor rewind: host reset + replay +
+  grid re-assert — the rehydrate read also now seeds the vacuum guard
+  with the REAL id instead of the always-0 placeholder). MEASURED with
+  tools/uxspeed/rt-rig.sh (real-IPC boot, CAP=2 dummy-first, painted
+  gate, exe-proof, raw_decode window): on UNFIXED main 4a3cc33e6172 both
+  constructible local arms were already GREEN — plain daemon-side
+  restart AND restart-with-grid-divergence (CLI resize to 240x50 = the
+  [11.228] poisoning vector) heal via terminal_stream_cursor_rewound ->
+  startup resize repair -> reveal_screen_reconcile -> frame_hash_
+  reconcile_applied, grid converging to the CLIENT's truth (169 cols).
+  So the rewind already covers every replacement whose fresh ring starts
+  below the client cursor; the surviving freeze surface is the NO-REWIND
+  arms — a busy replacement (re-resume seed + TUI repaint) outrunning
+  the client cursor into mid-stream consume, and remote/forwarded
+  rewind loss. The identity signal covers exactly those: the RT_FAKE_ID
+  arm (YGGTERM_TEST_STREAM_SPAWN_ID_FILE hook flips the reported id with
+  NO restart — cursor continuity untouched, rewind impossible) fired
+  terminal_stream_runtime_replaced + recovered + painted RTNEW on the
+  lane, and is invisible-by-construction on unfixed main. Remaining
+  (b) surface after this lands: the mount-loop-DEAD arm (no stream
+  answers at all — [11.187] territory, owned by the mount guard
+  machinery, not this signal) and any owner-flip shape where reads
+  ERROR rather than answer (unreproducible locally; watch for
+  terminal_stream_runtime_replaced in the wild as the detector).
 - (c) REVEAL DEADLINE → PERMANENT BLANK: `reveal_cover_released
   reason:deadline bytes:0` when a cold transcript re-render outruns the
   cover deadline — the cover drops to a blank viewport that never
@@ -32317,7 +32392,7 @@ THE TWO DEFECTS IN ONE: (1) the row's output pump (and its write-coupled frame-h
 
 CONFIRMED LIVE AGAIN 2026-09-28 ~11:25-11:32 IST on the OWNER'S ACTIVE ROW (remote-agy://dev/41e5733d): the stream died at 11:25:35 mid-TYPING (three frame_hash_probes with consecutive_mismatch=1, backed_off=false, then silence — same signature as birth), his keystrokes reached the daemon PTY until 11:26:34 (typing into the void — the draft sat unsent at the CLI), and the CLI side stayed state=ready with a CURRENT daemon screen while the row looked input-blocked. THE DEAD THING IS THE PER-SESSION TERMINAL LOOP TASK ITSELF: the per-branch loop_share flusher (pre_select count 624/window) went silent at 11:26:50 and never returned — a silent tokio-task death (GUI stderr is /dev/null, so the panic is invisible). The daemon-side composer polls, the GUI process, and the input policy (allow_input=true) all continued around the corpse.
 
-FIX MAP (scouted 2026-09-28, the 11.188 lane): the recovery lever is a RETAIN-HOST LIVENESS GATE at re-bootstrap — the [11.178] phantom-eval pattern applied to the `daemon_retained_replay` eval (viewport.rs, the replay task: `document::eval(&terminal_replay_retained_data_script_for_session(...))` must be joined and its result checked; null/timeout = the phantom-complete class = the host JS is dead) followed by a `shell.terminal_mount_epochs[path] += 1` bump so the keyed element `{path}:{epoch}` recreates TerminalCanvas fresh (state.rs:18460; the fold at 19776 manages entries — verify the bump survives the next snapshot fold). The decision site is `terminal_session_should_bootstrap_host` (viewport.rs:2091) + the skip branch at 5429. ⚠ Mount-storm risk: the replay has retry budgets — bound the bump by them. WORKAROUND (until the fix lands): a frozen row recovers by CLOSING and RE-OPENING the row — the [11.183] vouch ladder reconnects the conversation on the fresh mount (proven 2026-09-27 on the medgraph row); the unsent draft at the dead CLI's composer is lost, so copy it first. Toggling the row's view mode is worth a try first (cheaper) but re-mounts only if the view path does not reuse the retained host.
+FIX MAP (scouted 2026-09-28, the 11.188 lane): the recovery lever is a RETAIN-HOST LIVENESS GATE at re-bootstrap — the [11.178] phantom-eval pattern applied to the `daemon_retained_replay` eval (viewport.rs, the replay task: `document::eval(&terminal_replay_retained_data_script_for_session(...))` must be joined and its result checked; null/timeout = the phantom-complete class = the host JS is dead) followed by a `shell.terminal_mount_epochs[path] += 1` bump so the keyed element `{path}:{epoch}` recreates TerminalCanvas fresh (state.rs:18460; the fold at 19776 manages entries — verify the bump survives the next snapshot fold). The decision site is `terminal_session_should_bootstrap_host` (viewport.rs:2091) + the skip branch at 5429. ⚠ Mount-storm risk: the replay has retry budgets — bound the bump by them. WORKAROUND (until the fix lands): a frozen row recovers by CLOSING and RE-OPENING the row — the [11.183] vouch ladder reconnects the conversation on the fresh mount (proven 2026-09-27 on a private health-data row); the unsent draft at the dead CLI's composer is lost, so copy it first. Toggling the row's view mode is worth a try first (cheaper) but re-mounts only if the view path does not reuse the retained host.
 
 UPDATE 2026-10-03 ~10:0x IST (queue-completion seat, zcode sess_654d9543 on
 jojo, work FROM dev): FIVE DAYS DEPLOYED, ZERO NATURAL FREEZES — the watchdog

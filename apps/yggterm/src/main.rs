@@ -1016,6 +1016,21 @@ fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Re
 }
 
 fn main() -> Result<()> {
+    // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
+    // D-Bus session bus, because GLib autolaunches a PRIVATE one the moment
+    // anything in this process touches GTK without an address to inherit, and
+    // that bus plus its activated portal/secrets/a11y daemons then outlive us
+    // forever. 4,574 MB across 243 such orphans on 43 buses was measured on the
+    // live host (2026-07-30). Every child we spawn inherits this answer, which is
+    // why it belongs here and not at the spawn sites — the sites that leaked were
+    // exactly the ones nobody remembered.
+    //
+    // Must run before any thread exists (`set_var` is unsound afterwards) and
+    // before GLib caches the address on first use. The [11.187] panic witness
+    // below once sat here FIRST (72fc8c07, 2026-09-28) and silently broke this
+    // law for eight days — the source test in session_bus.rs is what names it.
+    let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
+
     // ⭐ THE [11.187] PANIC WITNESS: the GUI's stderr lands in /dev/null on
     // fleet hosts, so a panicked task — the per-session terminal loop among
     // them — died INVISIBLE: the row froze mid-paint with the input policy
@@ -1023,7 +1038,9 @@ fn main() -> Result<()> {
     // (three live occurrences 2026-09-27/28). The hook makes every panic
     // NAME ITSELF in the trace plane — location plus message — while keeping
     // the default stderr behavior for local runs. The hook body must not
-    // panic: unwrap-free, and the trace write is best-effort.
+    // panic: unwrap-free, and the trace write is best-effort. SECOND after
+    // the bus resolve: it installs no thread and touches no GLib, but the
+    // bus law is absolute about being first.
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -1052,19 +1069,6 @@ fn main() -> Result<()> {
             default_hook(info);
         }));
     }
-
-    // ⭐ BEFORE EVERYTHING, including the GL probe and the supervisor: resolve the
-    // D-Bus session bus, because GLib autolaunches a PRIVATE one the moment
-    // anything in this process touches GTK without an address to inherit, and
-    // that bus plus its activated portal/secrets/a11y daemons then outlive us
-    // forever. 4,574 MB across 243 such orphans on 43 buses was measured on the
-    // live host (2026-07-30). Every child we spawn inherits this answer, which is
-    // why it belongs here and not at the spawn sites — the sites that leaked were
-    // exactly the ones nobody remembered.
-    //
-    // Must run before any thread exists (`set_var` is unsound afterwards) and
-    // before GLib caches the address on first use.
-    let _session_bus = yggterm_core::session_bus::adopt_or_refuse_session_bus();
 
     // Hand this build's identity to the library crates that answer questions
     // about a RUNNING process — the daemon's status and this window's client

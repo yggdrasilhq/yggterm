@@ -89,7 +89,11 @@ def check_doc_cross_links() -> None:
             fail(f"docs/architecture-audit-2026-05-16.md: missing {heading}")
     for path in [
         "AGENTS.md",
-        "DESIGN.md",
+        # The design/ 1.0.0 restructure (cd7389e8) made DESIGN.md a pointer
+        # page; the audit pointer lives in the overlay book that holds the
+        # content now. DESIGN.md itself is a doors list — contracts follow
+        # the content, not the pointer.
+        "design/11-yggterm-overlay.md",
         "docs/xterm.md",
         "docs/protocol.md",
         "docs/sessions.md",
@@ -226,7 +230,7 @@ def check_no_release_terminal_overlay_substitution() -> None:
         "terminal overlay prohibition must stay documented",
     )
     require_contains(
-        "DESIGN.md",
+        "design/11-yggterm-overlay.md",
         "Do not cover terminal defects with Yggterm-owned decorative layers",
         "design law must reject screenshot repair",
     )

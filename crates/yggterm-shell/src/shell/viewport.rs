@@ -4971,6 +4971,7 @@ fn TerminalCanvas(
                         _last_resize_seq,
                         _resync_required,
                         _screen_hash,
+                        runtime_spawn_id,
                     )| {
                         (
                             chunks
@@ -4979,9 +4980,11 @@ fn TerminalCanvas(
                                 .collect::<String>(),
                             "daemon_terminal_read",
                             None,
-                            // The read path carries no runtime spawn id; the vacuum
-                            // guard fails OPEN (never arms) on 0.
-                            0u64,
+                            // [11.229](b)] The read path NOW carries the runtime
+                            // spawn id — the rehydrate seeds the vacuum guard
+                            // (and the mount's known id) with the REAL identity
+                            // instead of the always-0 fail-open placeholder.
+                            runtime_spawn_id,
                         )
                     },
                 ),
@@ -6719,6 +6722,8 @@ fn TerminalCanvas(
                     u64,
                     bool,
                     Option<String>,
+                    // [11.229](b)] The runtime identity this read came from.
+                    u64,
                 )>,
             )>(2);
             let mut terminal_read_in_flight = false;
@@ -6837,6 +6842,12 @@ fn TerminalCanvas(
             // window/resized -> xterm_resize -> xterm_paint/resize_repaint.
             let mut resize_repaint_last_grid: Option<(u16, u16)> = None;
             let mut cursor = 0u64;
+            // [11.229](b)] The runtime identity this host's painted state
+            // was seeded from — adopted from the first stream answer,
+            // compared against every later one. A CHANGE means the daemon
+            // replaced the runtime underneath the mount; `0` = unknown (an
+            // older daemon not sending the field) and never triggers.
+            let mut known_runtime_spawn_id = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
                 TERMINAL_REMOTE_RESUME_READ_POLL_MS
             } else {
@@ -10275,7 +10286,7 @@ fn TerminalCanvas(
                                         )
                                         .await
                                         {
-                                            Ok((_, _, _, _, _, _, _, _, Some(fresh))) => {
+                                            Ok((_, _, _, _, _, _, _, _, Some(fresh), _)) => {
                                                 let _ = hash_tx.send(
                                                     OffLoopTerminalRpcResult::FrameHashFresh {
                                                         hash: Some(fresh),
@@ -13141,6 +13152,7 @@ fn TerminalCanvas(
                                 last_resize_seq,
                                 resync_required,
                                 screen_hash,
+                                runtime_spawn_id,
                             )) => {
                                 // [11.179] A read that ANSWERED is the remote
                                 // runtime's positive liveness proof — the full
@@ -13149,6 +13161,31 @@ fn TerminalCanvas(
                                 // so a later raise can serve a retained remote
                                 // host on this evidence instead of remounting.
                                 record_terminal_remote_runtime_read_ok(&session_path);
+                                // [11.229](b)] Runtime-identity change: the
+                                // daemon replaced the runtime under this mount.
+                                // Edge-triggered (two KNOWN ids differing), so
+                                // a fresh mount or an older daemon answering
+                                // without the field can never fire it.
+                                let runtime_replaced = terminal_stream_runtime_replaced(
+                                    known_runtime_spawn_id,
+                                    runtime_spawn_id,
+                                );
+                                if runtime_replaced {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "terminal_stream_runtime_replaced",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "known_runtime_spawn_id": known_runtime_spawn_id,
+                                            "answer_runtime_spawn_id": runtime_spawn_id,
+                                            "cursor": cursor,
+                                            "next_cursor": next_cursor,
+                                        }),
+                                    );
+                                }
+                                known_runtime_spawn_id = runtime_spawn_id;
                                 // [11.167] A runtime START under this watch is a
                                 // replacement: the child the watch accumulated its
                                 // hard-fail evidence against is gone. Re-arm the
@@ -13318,8 +13355,15 @@ fn TerminalCanvas(
                                         }),
                                     );
                                 }
-                                let cursor_rewound =
-                                    terminal_read_cursor_rewound(cursor, next_cursor);
+                                // [11.229](b)] A runtime-identity change takes the
+                                // SAME recovery as a rewound cursor: the host's
+                                // painted state belongs to a DEAD runtime — reset
+                                // + replay + grid re-assert below. The rewind
+                                // alone misses a replacement whose fresh ring
+                                // outruns the client's cursor (mid-stream
+                                // consume with no rewind).
+                                let cursor_rewound = terminal_read_cursor_rewound(cursor, next_cursor)
+                                    || runtime_replaced;
                                 if cursor_rewound {
                                     append_trace_event(
                                         &trace_home,
@@ -13331,6 +13375,12 @@ fn TerminalCanvas(
                                             "previous_cursor": cursor,
                                             "next_cursor": next_cursor,
                                             "chunk_count": chunks.len(),
+                                            // [11.229](b)] The recovery now runs for
+                                            // EITHER trigger; this field discriminates
+                                            // a real rewind from an identity change
+                                            // (whose cursor continuity is untouched —
+                                            // previous_cursor == next_cursor there).
+                                            "runtime_replaced": runtime_replaced,
                                         }),
                                     );
                                     let _ = eval.send(terminal_reset_command(&title, &theme));
@@ -20067,6 +20117,9 @@ async fn terminal_read_async(
     // authoritative-grid hash, forwarded to the client half for the
     // flush-settle pairing. `None` = this daemon does not answer the probe.
     Option<String>,
+    // [11.229](b)] The runtime identity this stream was read from — the
+    // replaced-runtime signal for a mounted client.
+    u64,
 )> {
     run_dedicated_terminal_io("terminal_read", trace_home, move || {
         terminal_read(&endpoint, &session_path, cursor)
@@ -22732,6 +22785,18 @@ fn current_millis() -> u64 {
 }
 fn terminal_read_cursor_rewound(previous_cursor: u64, next_cursor: u64) -> bool {
     previous_cursor > 0 && next_cursor < previous_cursor
+}
+/// [11.229](b)] Edge-triggered runtime-identity change detector: the stream
+/// answer's `runtime_spawn_id` differs from the id this host was seeded with
+/// — the daemon replaced the runtime underneath the mount (restart/rotation
+/// re-spawn, daemon-restart re-resume), so the host's painted state belongs
+/// to a dead runtime and the cursor-rewind recovery must run (host reset +
+/// replay + grid re-assert). `0` = unknown (an older daemon not sending the
+/// field, or the pre-adoption state): ADOPT, never trigger — the signal is a
+/// CHANGE between two KNOWN ids, so a fresh mount or a cross-version peer
+/// can never fire it spuriously.
+fn terminal_stream_runtime_replaced(known_spawn_id: u64, answer_spawn_id: u64) -> bool {
+    known_spawn_id != 0 && answer_spawn_id != 0 && answer_spawn_id != known_spawn_id
 }
 fn notification_delivery_mode(settings: &AppSettings) -> NotificationDeliveryMode {
     match (settings.in_app_notifications, settings.system_notifications) {

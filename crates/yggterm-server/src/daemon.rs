@@ -4767,6 +4767,19 @@ pub enum ServerResponse {
         /// lock failure), never an empty hash.
         #[serde(default)]
         screen_hash: Option<String>,
+        // [11.229](b)] The identity of the runtime this stream was read
+        // from — it CHANGES when the daemon replaced the runtime under this
+        // key (restart/rotation re-spawn, daemon-restart re-resume). A
+        // mounted client compares it against the id its host was seeded
+        // with and re-reconciles on a change — the cursor-rewind signal
+        // only fires when the fresh ring starts BELOW the client's cursor,
+        // which a busy replacement (re-resume seed + TUI repaint) can
+        // outrun, leaving the host consuming mid-stream chunks off a dead
+        // runtime's painted state. `serde(default)` keeps it cross-version
+        // safe: an older daemon deserializes as `0`, and `0` never
+        // triggers on the client.
+        #[serde(default)]
+        runtime_spawn_id: u64,
     },
     TerminalSnapshot {
         text: String,
@@ -9332,7 +9345,7 @@ impl DaemonRuntime {
         else {
             return;
         };
-        // THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, jojo row
+        // THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, GUI-host row
         // 6778336d — the owner's ACTIVE row): a fresh peer-missing verdict
         // already names this row's runtime gone, yet every GUI recovery
         // re-mount re-ran the whole ssh ladder against the corpse — 5
@@ -11047,7 +11060,7 @@ impl DaemonRuntime {
             // per-generation: each spawn mints a fresh ring, the reader's
             // injected contract line dies with the generation it answered,
             // and the refused CLI LINGERS past its own refusal (measured on
-            // the owner's medgraph row: wrapper + child alive minutes after
+            // the owner's health-data row: wrapper + child alive minutes after
             // `session_not_found`, runtime reading `running`, plane claiming
             // `idle · Kept alive`). So the learn arm ALSO consults the
             // translate-time marker the reader recorded on this runtime —
@@ -14456,6 +14469,7 @@ impl DaemonRuntime {
                             last_resize_seq,
                             resync_required,
                             screen_hash,
+                            runtime_spawn_id,
                         )) => {
                             return Ok(ServerResponse::TerminalStream {
                                 cursor,
@@ -14467,6 +14481,7 @@ impl DaemonRuntime {
                                 last_resize_seq,
                                 resync_required,
                                 screen_hash,
+                                runtime_spawn_id,
                             });
                         }
                         Err(error) => {
@@ -14537,6 +14552,10 @@ impl DaemonRuntime {
                     last_resize_seq: stream.last_resize_seq,
                     resync_required: stream.resync_required,
                     screen_hash: stream.screen_hash,
+                    runtime_spawn_id: test_stream_spawn_id_override()
+                        .unwrap_or_else(|| {
+                            self.terminals.session_runtime_spawn_id(&runtime_path)
+                        }),
                 }
             }
             ServerRequest::TerminalSnapshot { path } => {
@@ -24127,6 +24146,22 @@ pub fn terminal_ensure(endpoint: &ServerEndpoint, path: &str) -> Result<Option<S
     )?)
 }
 
+/// [11.229](b)] TEST HOOK (rig-only): when `YGGTERM_TEST_STREAM_SPAWN_ID_FILE`
+/// is set and the file it names carries a parseable id, TerminalRead answers
+/// carry THAT id instead of the real one — lets the rt-rig flip the reported
+/// runtime identity WITHOUT any restart, isolating the client's replacement
+/// signal from the cursor-rewind signal (a restart rewinds the cursor too, so
+/// the two can never be isolated any other way). Unset/unparseable/absent
+/// answers None; production never sets the env var.
+fn test_stream_spawn_id_override() -> Option<u64> {
+    let path = std::env::var("YGGTERM_TEST_STREAM_SPAWN_ID_FILE").ok()?;
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 pub fn terminal_read(
     endpoint: &ServerEndpoint,
     path: &str,
@@ -24141,6 +24176,9 @@ pub fn terminal_read(
     u64,
     bool,
     Option<String>,
+    // [11.229](b)] The runtime identity the OWNER read from — forwarded so
+    // a proxying daemon's client sees the replacement signal too.
+    u64,
 )> {
     match send_request(
         endpoint,
@@ -24159,6 +24197,7 @@ pub fn terminal_read(
             last_resize_seq,
             resync_required,
             screen_hash,
+            runtime_spawn_id,
         } => Ok((
             cursor,
             chunks,
@@ -24169,6 +24208,7 @@ pub fn terminal_read(
             last_resize_seq,
             resync_required,
             screen_hash,
+            runtime_spawn_id,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal stream response: {:?}", other),
@@ -29724,6 +29764,7 @@ fn daemon_request_response(
                     last_resize_seq,
                     resync_required,
                     screen_hash,
+                    runtime_spawn_id,
                 )) => {
                     return ServerResponse::TerminalStream {
                         cursor,
@@ -29735,6 +29776,7 @@ fn daemon_request_response(
                         last_resize_seq,
                         resync_required,
                         screen_hash,
+                        runtime_spawn_id,
                     };
                 }
                 Err(error) => {
@@ -32560,7 +32602,7 @@ mod tests {
 
     #[test]
     fn the_learn_arm_stamps_from_the_translate_marker_and_tears_down_a_lingering_runtime() {
-        // [11.162] stamp leg, measured on the owner's medgraph row: the ring
+        // [11.162] stamp leg, measured on the owner's health-data row: the ring
         // is per-generation (the injected contract line dies with the
         // generation it answered) and the refused CLI LINGERS past its own
         // refusal, so the ring-only, dead-only learn arm never fires — the
@@ -45929,7 +45971,59 @@ mod tests {
     /// confident `false` that would steer the wheel gate's seed with an
     /// invention.
     #[test]
-    fn a_terminal_snapshot_answer_carries_the_alternate_screen_truth_across_versions() {
+    #[test]
+    fn a_terminal_stream_answer_carries_the_runtime_identity_across_versions() {
+        use crate::ServerResponse;
+        // [11.229](b)] The replaced-runtime signal rides TerminalStream. An
+        // OLDER daemon that never sent the field must deserialize as `0`
+        // (= unknown), which the client ADOPTS without triggering — the
+        // cross-version law the snapshot fields above already follow.
+        let written = serde_json::to_value(ServerResponse::TerminalStream {
+            cursor: 42,
+            chunks: vec![],
+            running: true,
+            runtime_output_seen: true,
+            eof_without_output: false,
+            post_resize_output_seen: false,
+            last_resize_seq: 0,
+            resync_required: false,
+            screen_hash: None,
+            runtime_spawn_id: 1791299780008,
+        })
+        .expect("serializes");
+        let mut stripped = written.clone();
+        let strip_field = |value: &mut serde_json::Value| {
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("runtime_spawn_id");
+            }
+        };
+        if stripped.is_object() && stripped.as_object().unwrap().len() != 1 {
+            strip_field(&mut stripped);
+        } else if stripped.is_object() {
+            if let Some(inner) = stripped.as_object_mut().unwrap().values_mut().next() {
+                strip_field(inner);
+            }
+        }
+        let parsed: ServerResponse =
+            serde_json::from_value(stripped).expect("old shape parses");
+        match parsed {
+            ServerResponse::TerminalStream {
+                runtime_spawn_id, ..
+            } => assert_eq!(
+                runtime_spawn_id, 0,
+                "an absent runtime identity must deserialize as unknown (0), never a guess"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match serde_json::from_value::<ServerResponse>(written).expect("new shape parses") {
+            ServerResponse::TerminalStream {
+                runtime_spawn_id, ..
+            } => assert_eq!(runtime_spawn_id, 1791299780008),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+        fn a_terminal_snapshot_answer_carries_the_alternate_screen_truth_across_versions() {
         use crate::daemon::ServerResponse;
         let answer = ServerResponse::TerminalSnapshot {
             text: "screen".to_string(),
@@ -46314,7 +46408,7 @@ terminal session not found: codex-runtime://01a0bf3b-a7e7-7673-a74c-3347f7c4971c
 
     #[test]
     fn a_busy_peers_read_timeout_is_retriable_not_terminal() {
-        // [11.228], verbatim production string (jojo event-trace, 2026-10-04
+        // [11.228], verbatim production string (GUI-host event-trace, 2026-10-04
         // 00:22): the heal forward for the owner's squished Claude row died
         // on the read-timeout spelling eleven times overnight while dev's
         // daemon ground its rotation re-resume storm — the remote PTY kept
@@ -46336,7 +46430,7 @@ reading daemon response\n\nCaused by:\n    Resource temporarily unavailable (os 
         assert_eq!(
             classify_remote_resize_not_found(
                 "remote yggterm command failed for dev: Error: connecting to \
-/home/pi/.yggterm/server-3-2-115.sock\n\nCaused by:\n    Connection refused (os error 111)",
+/home/user/.yggterm/server-3-2-115.sock\n\nCaused by:\n    Connection refused (os error 111)",
                 None,
                 false
             ),

@@ -7,8 +7,8 @@
 # on oc reaches dev via this host in one run.
 #
 # WHY: skills are shared fleet knowledge exactly like memory (data-fabric,
-# dossiergraph), and they were drifting silently — the dossiergraph skill lived
-# on two hosts but never reached the third, so a session there ran the dossierGraph
+# an evidentiary-graph skill), and they were drifting silently — that skill
+# lived on two hosts but never reached the third, so a session there ran the
 # campaign without its own doctrine.
 #
 # WHAT IS NOT SYNCED: anything gstack owns. `gstack-upgrade` installs one dir
@@ -131,7 +131,7 @@ pulled=0
 for peer in "${LIVE[@]}"; do
   $SSH_OPTS "$peer" 'mkdir -p ~/.claude/skills' 2>/dev/null
   n=$(rsync -az -u --itemize-changes "${EXCL[@]}" -e "$SSH_OPTS" \
-    "$peer:/home/pi/.claude/skills/" "$SKILLS/" 2>/dev/null | grep -c '^[<>]')
+    "$peer:/home/user/.claude/skills/" "$SKILLS/" 2>/dev/null | grep -c '^[<>]')
   pulled=$((pulled + n))
 done
 
@@ -139,7 +139,7 @@ done
 pushed=0
 for peer in "${LIVE[@]}"; do
   n=$(rsync -az -u --itemize-changes "${EXCL[@]}" -e "$SSH_OPTS" \
-    "$SKILLS/" "$peer:/home/pi/.claude/skills/" 2>/dev/null | grep -c '^[<>]')
+    "$SKILLS/" "$peer:/home/user/.claude/skills/" 2>/dev/null | grep -c '^[<>]')
   pushed=$((pushed + n))
 done
 

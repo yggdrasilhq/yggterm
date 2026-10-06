@@ -1131,7 +1131,7 @@ last turn — and not the next human to notice.
 
 ## 3c. ygg-ci — the fleet SINGLE-BUILD plane (like booter/monitor)
 
-**Build-plane behavior contract + compile-optimization techniques: `docs/spec-ygg-ci.md`** — the recipe schema, the per-host compile-cache recipe (landed on dev/oc/jojo/practice 2026-09-18), and what ygg-ci itself owes for cache telemetry. §3c owns the verbs; the spec owns the behavior.
+**Build-plane behavior contract + compile-optimization techniques: `docs/spec-ygg-ci.md`** — the recipe schema, the per-host compile-cache recipe (landed on every fleet host 2026-09-18), and what ygg-ci itself owes for cache telemetry. §3c owns the verbs; the spec owns the behavior.
 
 `ygg-ci.py` is the detached build watcher, same shape as `ygg-booter.py` and
 `ygg-monitor.py`: a subscription lives outside the session that asked for it,

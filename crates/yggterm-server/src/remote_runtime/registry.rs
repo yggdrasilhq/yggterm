@@ -475,7 +475,7 @@ impl RemoteRuntimeRegistry {
     /// pre-interactive states is a stuck attach, and nothing aged it out —
     /// measured 2026-09-29: dev held 14 antigravity rows at `attaching_pty`
     /// (their `last_transition_at` frozen at the register+15ms mark), and
-    /// jojo held a codex row there SINCE 2026-04-15. The keeper's re-register
+    /// the GUI host held a codex row there SINCE 2026-04-15. The keeper's re-register
     /// and re-transition refresh `updated_at`/`last_transition_at` on every
     /// pass, so age reads `created_at` — the one timestamp no churn rewrites.
     /// Aged rows transition to `Failed` (the same verdict the bridge serve

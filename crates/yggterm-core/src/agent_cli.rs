@@ -5744,8 +5744,8 @@ pub fn store_candidate_session_for_directory(
         }
         // agy's summaries db: workspace_uris is a JSON list of `file://` roots.
         // ⛔ THE [11.183] TIGHTENING (measured on dev 2026-09-27): the old
-        // substring `LIKE %cwd%` let a `/home/pi` row vouch a
-        // `/home/pi/sol-correction/...` conversation — a subdirectory
+        // substring `LIKE %cwd%` let a `/home/user` row vouch a
+        // `/home/user/sol-correction/...` conversation — a subdirectory
         // conversation is NOT this row's, and the store's newest-modified row
         // was exactly such an interloper. The JSON array is probed for the
         // EXACT quoted `"file://<cwd>"` element, killed conversations are
@@ -12854,13 +12854,13 @@ mod agy_store_candidate_tests {
         }
     }
 
-    const PELVIC: &str = "79189666-62c6-4837-ac04-f823775ae528";
+    const HEALTHNOTE: &str = "79189666-62c6-4837-ac04-f823775ae528";
     const REPAIR: &str = "e7693814-4f1d-41b8-90d9-3459d394acbe";
 
     #[test]
     fn an_exact_workspace_match_beats_a_newer_subdirectory_interloper() {
-        // THE [11.183] MEASURED SHAPE (dev 2026-09-27): the /home/pi row must
-        // land on the /home/pi conversation even though the subdirectory
+        // THE [11.183] MEASURED SHAPE (2026-09-27): the /home/user row must
+        // land on the /home/user conversation even though the subdirectory
         // conversation was modified LATER — the old substring LIKE arm picked
         // the interloper.
         let home = temp_home("exact");
@@ -12870,15 +12870,15 @@ mod agy_store_candidate_tests {
                 (
                     REPAIR,
                     "Repair JSON Math Formatting",
-                    "[\"file:///home/pi/sol-correction/work-wave2-fixed-income\"]",
+                    "[\"file:///home/user/sol-correction/work-wave2-fixed-income\"]",
                     "2026-09-27 01:52:15.245484935+00:00",
                     "0001-01-01 00:00:00+00:00",
                     "0",
                 ),
                 (
-                    PELVIC,
-                    "Pelvic Pain And Bridge Exercise",
-                    "[\"file:///home/pi\"]",
+                    HEALTHNOTE,
+                    "Evening Stretch And Rest Notes",
+                    "[\"file:///home/user\"]",
                     "2026-09-26 11:39:00.000000000+00:00",
                     "2026-09-26 11:32:00.000000000+00:00",
                     "0",
@@ -12886,10 +12886,10 @@ mod agy_store_candidate_tests {
             ],
         );
         let (id, title) =
-            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/home/pi")
+            store_candidate_session_for_directory(&home, SessionKind::Antigravity, "/home/user")
                 .expect("candidate");
-        assert_eq!(id, PELVIC);
-        assert_eq!(title.as_deref(), Some("Pelvic Pain And Bridge Exercise"));
+        assert_eq!(id, HEALTHNOTE);
+        assert_eq!(title.as_deref(), Some("Evening Stretch And Rest Notes"));
     }
 
     #[test]

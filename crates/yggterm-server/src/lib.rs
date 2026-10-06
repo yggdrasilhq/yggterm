@@ -12904,7 +12904,7 @@ impl YggtermServer {
         // (owner screenshots 2026-09-27 19:41) while the real conversation
         // sat intact in the peer store (measured: row 845ddc17 ↔ db
         // 79189666 "Pelvic Pain And Bridge Exercise", exact workspace
-        // `file:///home/pi`, last user input minutes before the report).
+        // `file:///home/user`, last user input minutes before the report).
         // The store is the last witness left, and the conversation with the
         // most recent USER INPUT for the row's own cwd is what "the human's
         // conversation" means at this tier. Runs ONLY on a definitive miss
@@ -19271,7 +19271,7 @@ fn refresh_restored_remote_runtime_codex_launch_command_in(
                 // re-run inside every launch request
                 // (request_terminal_launch_for_resolved_path, LiveLocal arm)
                 // — resumed the dead id straight over the minted compose
-                // (measured live on jojo, build bfe5ed19: session_not_found
+                // (measured live on the GUI host, build bfe5ed19: session_not_found
                 // painted on the PTY, rows show still wearing the absent
                 // id). The doctrine is already written at the predicate: THE
                 // DEFINITIVE-MISS GATES LIVE AT THE CONSUMERS. This consumer
@@ -19328,7 +19328,7 @@ fn refresh_restored_remote_runtime_codex_launch_command_in(
         // probe forever, so the birth arm re-normalized and re-armed a record
         // whose conversation the CLI's own store no longer holds on EVERY
         // sweep (`restored_codex_runtime_launch_repaired`, measured twice
-        // across peer rotations on the [11.162] medgraph row) — the engine
+        // across peer rotations on the [11.162] health-data row) — the engine
         // that kept a dead runtime record answering the peer's ensure ask and
         // feeding the CLI-worded refusal loop. The vouch is three-valued and
         // this repair is local-only by construction (remote-agent schemes are
@@ -28044,7 +28044,7 @@ fn terminal_read_with_local_daemon_recovery(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool, Option<String>)>
+) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool, Option<String>, u64)>
 {
     let mut last_error = None::<anyhow::Error>;
     for attempt in 0..=5_u64 {
@@ -28235,6 +28235,9 @@ fn bridge_remote_runtime_session_stdio(
             // The frame-hash probe's daemon half; the raw bridge does not pair
             // frames (it has no xterm buffer), so it carries nothing.
             _screen_hash,
+            // [11.229](b)] The runtime identity — the raw bridge keeps no host
+            // state, so it carries nothing.
+            _runtime_spawn_id,
         ) = terminal_read_with_local_daemon_recovery(endpoint, path, cursor)?;
         let chunks_have_visible_text = chunks
             .iter()
@@ -40331,7 +40334,7 @@ mod tests {
         // remote-runtime ensure recomposes before any spawn.
         let command = stored_session_launch_command_from_vouch(
             SessionKind::SshShell,
-            "/home/pi",
+            "/home/user",
             "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
             false,
             Some("dev"),
@@ -40350,7 +40353,7 @@ mod tests {
                 "server",
                 "attach",
                 "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
-                "/home/pi",
+                "/home/user",
                 crate::attach::PLAIN_SHELL_FALLBACK_FLAG,
             ],
         );
@@ -40368,7 +40371,7 @@ mod tests {
         // still never resurrect the fossil.
         let command = stored_session_launch_command_from_vouch(
             SessionKind::SshShell,
-            "/home/pi",
+            "/home/user",
             "0e96c07d-cc0e-45ec-b04a-5da4186752a5",
             false,
             None,
@@ -40747,7 +40750,7 @@ mod tests {
         );
     }
 
-    /// ⛔ THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, jojo row
+    /// ⛔ THE [11.57] VERDICT TOMBSTONE (measured live 2026-09-29, GUI-host row
     /// 6778336d): the memo existed and the [11.153] ensure gate spent it,
     /// but the resize forward never read its own memo — every GUI recovery
     /// re-mount replayed the full 5-retry ssh ladder against a runtime the
@@ -55040,7 +55043,7 @@ terminal_window_id: None,
             id,
             SessionKind::Antigravity,
             &crate::local_session_target(SessionKind::Antigravity, Some("/home/user/proj")),
-            Some("New jojo Antigravity".to_string()),
+            Some("New atelier Antigravity".to_string()),
             false,
             false,
         );

@@ -240,7 +240,7 @@ pub fn relay_peer_anomaly(home_dir: &Path, machine_key: &str, notice: &AnomalyNo
 /// ⛔ THE ANTI-STORM CONTRACT: only ORIGIN notices (relayed_from empty) come
 /// back. A notice that is itself a relay MUST NOT cross another host, or the
 /// pair of daemons each pulling the other's status mints
-/// `jojo/dev/X`, then `dev/jojo/dev/X`, … — unbounded id growth that the
+/// `alpha/dev/X`, then `dev/alpha/dev/X`, … — unbounded id growth that the
 /// file latch can never catch, one rung per relay tick. A relayed notice is
 /// already on its way to a GUI; relaying a relay is the storm.
 pub fn anomalies_from_status_json(payload: &str) -> Vec<AnomalyNotice> {
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].kind, "ledger_growth");
         // A RELAYED notice never crosses another host — the anti-storm
-        // contract (jojo/dev/X must not become dev/jojo/dev/X).
+        // contract (alpha/dev/X must not become dev/alpha/dev/X).
         let relayed = json!({ "anomalies": [json!({
             "id": "dev/bridge_rss_high:1", "kind": "k", "severity": "warning",
             "title": "t", "detail": "", "first_seen_ms": 1, "seen": false,

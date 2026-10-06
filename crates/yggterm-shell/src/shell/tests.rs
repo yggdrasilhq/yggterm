@@ -36596,6 +36596,19 @@ Status as of `2026-05-07 15:42 IST`: - The live batch itself is progressing.\n\
     }
 
     #[test]
+    fn terminal_stream_runtime_replaced_requires_two_known_distinct_ids() {
+        // [11.229](b)] The signal is a CHANGE between two KNOWN ids: unknown
+        // past (pre-adoption) ADOPTS, unknown answer (older daemon, field
+        // absent -> serde default 0) ADOPTS, same id is the normal reveal.
+        assert!(!terminal_stream_runtime_replaced(0, 5));
+        assert!(!terminal_stream_runtime_replaced(5, 0));
+        assert!(!terminal_stream_runtime_replaced(0, 0));
+        assert!(!terminal_stream_runtime_replaced(5, 5));
+        assert!(terminal_stream_runtime_replaced(5, 9001));
+        assert!(terminal_stream_runtime_replaced(9001, 5));
+    }
+
+    #[test]
     fn preserved_handoff_pre_resize_replay_requires_matching_runtime_key() {
         let mut status = runtime_status_for_test(env!("CARGO_PKG_VERSION"), 1, 42);
         status.preserved_terminal_owner_count = 1;

@@ -86,7 +86,7 @@ pub const TOMBSTONE_TTL_SECS: u64 = 3 * 24 * 60 * 60;
 /// TTL). Renewal exists because some offerers are ETERNAL: a daemonized
 /// opencode `serve --service` re-projects every session its store holds on
 /// every mirror tick, forever, so a bare 3-day tombstone against it is a
-/// scheduled resurrection — jojo 2026-09-19 19:34 IST, the 09-16 ghost
+/// scheduled resurrection — the GUI host 2026-09-19 19:34 IST, the 09-16 ghost
 /// despawns' tombstones expired at the same wall-clock minute and six rows
 /// walked back in through the lawful restore/import doors. Renewing at
 /// half-life keeps writes rare (one per half-age per refused row, not one per
