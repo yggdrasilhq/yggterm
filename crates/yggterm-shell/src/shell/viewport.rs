@@ -7083,6 +7083,9 @@ fn TerminalCanvas(
             let (synth_snapshot_tx, mut synth_snapshot_rx) =
                 tokio::sync::mpsc::channel::<String>(1);
             let mut synth_snapshot_requested = false;
+            // [F1-(e)] the synthesis output fence: Some while the seed
+            // snapshot is outstanding — see SynthOutputFence.
+            let mut synth_output_fence: Option<SynthOutputFence> = None;
             let mut synth_proof_eval: Option<
                 std::pin::Pin<
                     Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
@@ -7103,6 +7106,17 @@ fn TerminalCanvas(
                     Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
                 >,
             > = None;
+            // [F1-(e) Q2] The synthesized frame-hash probe (fresh eval +
+            // return): armed when a chunk-less read carries a CHANGED daemon
+            // hash on a synthesized mount; the arm below awaits the verdict
+            // and corrects on a at-bottom mismatch. One probe in flight at
+            // a time — the changed-hash gate upstream dedupes the rest.
+            let mut synth_hash_probe_eval: Option<
+                std::pin::Pin<
+                    Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
+                >,
+            > = None;
+            let mut synth_hash_probe_pending: Option<String> = None;
             // [F1-(f)] SHARED apply handler (sol Q5: the drain leg must not
             // fork the healthy leg's bookkeeping). Expands to a block ending
             // in the writer-enqueue result — exactly-once ENQUEUE is the
@@ -7335,7 +7349,19 @@ fn TerminalCanvas(
                     // channel on a synthesized mount — same routing as the
                     // two mainline sites.
                     if js_ready_synthesized {
-                        let _ = document::eval(&terminal_page_write_script(&host_id, &data));
+                        // [F1-(e)] the output fence owns ordering while the
+                        // seed is outstanding — a retained batch returns
+                        // here and is NOT written live.
+                        if !synth_output_fence_stage(
+                            &mut synth_output_fence,
+                            &host_id,
+                            &data,
+                            &session_path,
+                            &trace_home,
+                            current_millis(),
+                        ) {
+                            let _ = document::eval(&terminal_page_write_script(&host_id, &data));
+                        }
                     } else {
                         let _ = eval.send(TerminalJsCommand::Write {
                             data,
@@ -12153,6 +12179,21 @@ fn TerminalCanvas(
                             }
                             if !synth_snapshot_requested {
                                 synth_snapshot_requested = true;
+                                // [F1-(e)] THE FENCE ARMS with the fetch:
+                                // every page write from this instant is
+                                // retained until the seed's proof returns.
+                                synth_output_fence =
+                                    Some(SynthOutputFence::new(current_millis()));
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "synth_output_fence_armed",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                    }),
+                                );
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -12229,6 +12270,17 @@ fn TerminalCanvas(
                                 "seed_bytes": seed_bytes,
                             }),
                         );
+                        // [F1-(e)] The seed rides the fence when one
+                        // still holds: the script then installs the
+                        // authoritative screen as a formatted REPAINT (home
+                        // + clear + the daemon screen) instead of the
+                        // painted-guarded append — the guard cannot order
+                        // the seed against in-flight differentials (sol
+                        // Q1). A fence that already released (overflow or
+                        // deadline) falls back to the guarded append:
+                        // writes have flowed live again and the seed must
+                        // not clobber them.
+                        let synth_seed_fenced = synth_output_fence.is_some();
                         synth_proof_eval = Some(Box::pin(
                             document::eval(&terminal_synthesized_mount_open_script(
                                 &host_id,
@@ -12237,6 +12289,7 @@ fn TerminalCanvas(
                                 } else {
                                     Some(&synth_seed_text)
                                 },
+                                synth_seed_fenced,
                             ))
                             .join::<Value>(),
                         ));
@@ -12282,6 +12335,11 @@ fn TerminalCanvas(
                                     .get("wrote_seed")
                                     .and_then(Value::as_u64)
                                     .unwrap_or(0);
+                                let seed_mode = proof
+                                    .get("seed_mode")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                                    .to_string();
                                 let geometry_usable = screen_in_host
                                     && terminal_geometry_is_usable(
                                         cols_value as u16,
@@ -12316,6 +12374,7 @@ fn TerminalCanvas(
                                     "cols": cols_value,
                                     "painted": painted,
                                     "wrote_seed": wrote_seed,
+                                    "seed_mode": seed_mode,
                                     "geometry_usable": geometry_usable,
                                     "surface_painted": surface_painted,
                                 });
@@ -12332,6 +12391,34 @@ fn TerminalCanvas(
                                     "synthesized_mount_open",
                                     payload,
                                 );
+                                // [F1-(e)] THE FENCE FLUSH: the proof's
+                                // return IS the application ack — the seed
+                                // script awaits xterm's write callback
+                                // before returning — so the authoritative
+                                // screen is IN and the retained
+                                // differentials replay past it, in order,
+                                // through the same page write eval the
+                                // live sites use.
+                                if let Some(fence) = synth_output_fence.take() {
+                                    for batch in &fence.retained {
+                                        let _ = document::eval(
+                                            &terminal_page_write_script(&host_id, batch),
+                                        );
+                                    }
+                                    if !fence.retained.is_empty() {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "synth_output_fence_flushed",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "batches": fence.retained.len(),
+                                                "bytes": fence.retained_bytes,
+                                            }),
+                                        );
+                                    }
+                                }
                             }
                             None => {
                                 append_trace_event(
@@ -12346,6 +12433,87 @@ fn TerminalCanvas(
                                 );
                             }
                         }
+                    }
+                    synth_hash_probe_answer = async {
+                        synth_hash_probe_eval
+                            .as_mut()
+                            .expect("synth hash probe armed")
+                            .await
+                    },
+                        if synth_hash_probe_eval.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "synth_hash_probe",
+                            &session_path,
+                        );
+                        synth_hash_probe_eval = None;
+                        let daemon_hash = synth_hash_probe_pending.take().unwrap_or_default();
+                        let verdict = match synth_hash_probe_answer {
+                            Ok(value) => value
+                                .as_str()
+                                .and_then(|body| serde_json::from_str::<Value>(body).ok()),
+                            Err(_error) => None,
+                        }
+                        .unwrap_or_else(|| json!({ "match": null }));
+                        let client_hash =
+                            verdict.get("client_hash").cloned().unwrap_or(Value::Null);
+                        let mismatch = verdict.get("match") == Some(&Value::Bool(false))
+                            && verdict.get("at_bottom") == Some(&Value::Bool(true));
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "frame_hash_probe_sync",
+                            json!({
+                                "session_path": session_path.clone(),
+                                "daemon_hash": daemon_hash,
+                                "client_hash": client_hash,
+                                "mismatch": mismatch,
+                            }),
+                        );
+                        if !mismatch {
+                            continue;
+                        }
+                        // [F1-(e) Q2] correct from the daemon's authoritative
+                        // screen via the SAME replay primitive the app-control
+                        // reconcile uses, gated by the shared churn gates —
+                        // never vacuum a screen an agent is working on, never
+                        // write a screen the reconcile policy refuses.
+                        let screen = match terminal_snapshot_async(
+                            endpoint.clone(),
+                            session_path.clone(),
+                            &trace_home,
+                        )
+                        .await
+                        {
+                            Ok(answer) => answer.text,
+                            Err(_error) => continue,
+                        };
+                        if screen.trim().is_empty()
+                            || !screen_reconcile_should_write(&screen)
+                            || yggterm_core::screen_text_shows_agent_working(&screen)
+                        {
+                            continue;
+                        }
+                        let _ = document::eval(
+                            &terminal_replay_retained_data_script_for_session(
+                                &session_path,
+                                &screen,
+                                "frame_hash_reconcile_synthesized",
+                                0,
+                            ),
+                        );
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "frame_hash_reconcile_applied",
+                            json!({
+                                "session_path": session_path.clone(),
+                                "bytes": screen.len(),
+                                "source": "fresh_eval",
+                            }),
+                        );
                     }
                     synth_input_drain_answer = async {
                         synth_input_drain_eval
@@ -13020,9 +13188,30 @@ fn TerminalCanvas(
                                         != Some(hash.as_str())
                                 {
                                     last_forwarded_screen_hash = Some(hash.clone());
-                                    let _ = eval.send(TerminalJsCommand::FrameHash {
-                                        hash: hash.clone(),
-                                    });
+                                    // [F1-(e) Q2] On a synthesized mount the
+                                    // per-eval command leg is dead — the
+                                    // frame-hash pairing AND its correction
+                                    // must ride fresh eval/return (sol Q2:
+                                    // a reconcile that cannot speak covers
+                                    // no silent write loss).
+                                    if js_ready_synthesized {
+                                        if synth_hash_probe_eval.is_none() {
+                                            synth_hash_probe_pending = Some(hash.clone());
+                                            synth_hash_probe_eval = Some(Box::pin(
+                                                document::eval(
+                                                    &terminal_frame_hash_sync_script(
+                                                        &host_id,
+                                                        hash,
+                                                    ),
+                                                )
+                                                .join::<Value>(),
+                                            ));
+                                        }
+                                    } else {
+                                        let _ = eval.send(TerminalJsCommand::FrameHash {
+                                            hash: hash.clone(),
+                                        });
+                                    }
                                 }
                                 // Cold-reveal backlog drain telemetry: a single
                                 // read that returns a large accumulated backlog
@@ -14147,7 +14336,20 @@ fn TerminalCanvas(
                                                         // registry via a fresh eval, the transport measured
                                                         // alive through the shed window. Healthy mounts keep
                                                         // eval.send unchanged.
-                                                        let write_sent_ok = if js_ready_synthesized {
+                                                        // [F1-(e)] the fence check comes first:
+                                                        // a retained batch is already ordered
+                                                        // behind the seed and must not go live
+                                                        // (the fence owns its delivery).
+                                                        let write_sent_ok = if js_ready_synthesized
+                                                            && !synth_output_fence_stage(
+                                                                &mut synth_output_fence,
+                                                                &host_id,
+                                                                &write,
+                                                                &session_path,
+                                                                &trace_home,
+                                                                current_millis(),
+                                                            )
+                                                        {
                                                             let _ = document::eval(
                                                                 &terminal_page_write_script(
                                                                     &host_id,
@@ -14155,12 +14357,14 @@ fn TerminalCanvas(
                                                                 ),
                                                             );
                                                             true
-                                                        } else {
+                                                        } else if !js_ready_synthesized {
                                                             eval.send(TerminalJsCommand::Write {
                                                                 data: write,
                                                                 protocol_only: forward_terminal_protocol_only_output,
                                                             })
                                                             .is_ok()
+                                                        } else {
+                                                            true
                                                         };
                                                         if !write_sent_ok {
                                                             trace_terminal_write_send_failure(
@@ -14331,7 +14535,18 @@ fn TerminalCanvas(
                                                     // [F1] Same synthesized-leg routing as the mainline
                                                     // write site — this mount's per-eval channel is
                                                     // dead both ways.
-                                                    let write_sent_ok = if js_ready_synthesized {
+                                                    // [F1-(e)] same fence-first check as the
+                                                    // other mainline site.
+                                                    let write_sent_ok = if js_ready_synthesized
+                                                        && !synth_output_fence_stage(
+                                                            &mut synth_output_fence,
+                                                            &host_id,
+                                                            &write,
+                                                            &session_path,
+                                                            &trace_home,
+                                                            current_millis(),
+                                                        )
+                                                    {
                                                         let _ = document::eval(
                                                             &terminal_page_write_script(
                                                                 &host_id,
@@ -14339,12 +14554,14 @@ fn TerminalCanvas(
                                                             ),
                                                         );
                                                         true
-                                                    } else {
+                                                    } else if !js_ready_synthesized {
                                                         eval.send(TerminalJsCommand::Write {
                                                             data: write,
                                                             protocol_only: forward_terminal_protocol_only_output,
                                                         })
                                                         .is_ok()
+                                                    } else {
+                                                        true
                                                     };
                                                     if !write_sent_ok {
                                                         trace_terminal_write_send_failure(
@@ -20463,6 +20680,115 @@ fn spawn_screen_reconcile_fetch(
             fetched,
         ));
     });
+}
+
+/// [F1-(e)] THE SYNTHESIS OUTPUT FENCE (sol Q1, node
+/// lores/chain-of-thought/2026-10-05-yggterm-f1-sol-patch-review.md): while
+/// a synthesized mount's seed snapshot is outstanding, page writes are
+/// RETAINED instead of eval'd; the seed installs the authoritative screen
+/// as a formatted repaint when it lands (awaiting xterm's write callback
+/// inside the proof), and only then do the retained differentials replay,
+/// in order, past that point. The painted-guard append it replaces could
+/// not order the seed against in-flight differentials: a queued-but-
+/// unparsed write, or a full-frame repaint that parks the cursor on the
+/// home cell, reads `__painted` false and the stale T0 seed appends over
+/// live output (measured: fence-rig RED — the marker erased).
+const SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES: usize = 512 * 1024;
+const SYNTH_OUTPUT_FENCE_DEADLINE_MS: u64 = 30_000;
+
+#[derive(Debug, Default)]
+struct SynthOutputFence {
+    retained: Vec<String>,
+    retained_bytes: usize,
+    armed_at_ms: u64,
+}
+
+impl SynthOutputFence {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            retained: Vec::new(),
+            retained_bytes: 0,
+            armed_at_ms: now_ms,
+        }
+    }
+
+    /// Retain one write batch. False = the byte bound is hit: the caller
+    /// must release the fence live (ordering is broken, but no batch is
+    /// dropped — the late seed then falls back to the guarded append
+    /// instead of the repaint).
+    fn retain(&mut self, data: &str) -> bool {
+        let next = self.retained_bytes.saturating_add(data.len());
+        if next > SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES {
+            return false;
+        }
+        self.retained_bytes = next;
+        self.retained.push(data.to_string());
+        true
+    }
+
+    fn deadline_expired(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.armed_at_ms) > SYNTH_OUTPUT_FENCE_DEADLINE_MS
+    }
+}
+
+/// One write batch's fence decision at a synthesized output site. True =
+/// retained (the caller MUST NOT write it live — the flush after the
+/// seed's proof will). False = write it live NOW: no fence was up, or the
+/// fence just released (deadline/overflow) AFTER flushing everything it
+/// held, in order, ahead of this batch. The deadline is enforced on
+/// traffic only: an idle fence holds nothing, and the seed channel always
+/// answers (Ok and Err both send), so an unpolled deadline cannot strand
+/// data.
+fn synth_output_fence_stage(
+    fence: &mut Option<SynthOutputFence>,
+    host_id: &str,
+    data: &str,
+    session_path: &str,
+    trace_home: &Path,
+    now_ms: u64,
+) -> bool {
+    let expired = fence
+        .as_ref()
+        .is_some_and(|current| current.deadline_expired(now_ms));
+    let retained_ok =
+        !expired && fence.as_mut().is_some_and(|current| current.retain(data));
+    if retained_ok {
+        append_trace_event(
+            trace_home,
+            "ui",
+            "terminal_mount",
+            "synth_output_fence_retained",
+            json!({
+                "session_path": session_path,
+                "bytes": data.len(),
+            }),
+        );
+        return true;
+    }
+    if fence.is_some() {
+        // Release-live: deadline or overflow. The retained batches flush
+        // through the same page write eval ahead of this batch; a seed that
+        // lands after this uses the guarded-append backstop (its rx reads
+        // the fence as already down).
+        if let Some(current) = fence.take() {
+            for batch in &current.retained {
+                let _ = document::eval(&terminal_page_write_script(host_id, batch));
+            }
+            append_trace_event(
+                trace_home,
+                "ui",
+                "terminal_mount",
+                "synth_output_fence_released_live",
+                json!({
+                    "session_path": session_path,
+                    "reason": if expired { "deadline" } else { "overflow" },
+                    "batches": current.retained.len(),
+                    "bytes": current.retained_bytes,
+                }),
+            );
+        }
+    }
+    false
 }
 
 async fn terminal_snapshot_async(

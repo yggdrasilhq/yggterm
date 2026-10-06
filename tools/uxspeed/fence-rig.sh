@@ -45,7 +45,7 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
     dbus-run-session -- bash -c "
       export DISPLAY=:78 GDK_BACKEND=x11 YGGTERM_FORCE_X11_BACKEND=1 RUST_BACKTRACE=1
       export YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
-      export YGGTERM_TEST_SUPPRESS_MOUNT_IPC=1 YGGTERM_HOT_PREMOUNT_CAP=8
+      export YGGTERM_TEST_SUPPRESS_MOUNT_IPC=1 YGGTERM_HOT_PREMOUNT_CAP=2
       export YGGTERM_TEST_STALL_SNAPSHOT_FETCH_MS=$STALL
       exec $BIN > /tmp/f1e2-gui.log 2>&1
     " >/dev/null 2>&1 </dev/null &
@@ -132,13 +132,18 @@ def page_screen_count(session, marker):
 def daemon_screen_count(session, marker):
     return (verb("server", "screen", session).stdout or "").count(marker)
 
+# ⛔ ROW SHAPE (measured this sitting): a SINGLE row under CAP=8 never
+# armed — the remount rig's proven shape is a dummy first row + the test
+# row second under CAP=2; startup-restore churn outlives the 60s patience
+# either way, so no watch barrier is needed.
+_a = row_session(0)
 s = row_session(1)
 if not s:
     print("FAIL: could not create row"); raise SystemExit(2)
-print("row=%s stall=%dms" % (s, STALL))
+print("rows: a=%s s=%s stall=%dms" % (_a, s, STALL))
 
 ok, armed = wait_for(
-    lambda ev: session_events(ev, s, "synthesized_mount_open_armed"), 25, "synthesized_mount_open_armed")
+    lambda ev: session_events(ev, s, "synthesized_mount_open_armed"), 60, "synthesized_mount_open_armed")
 if not ok:
     print("PRE-FLIGHT FAIL: mount never armed the seed fetch — synthesis did not fire")
     raise SystemExit(4)
