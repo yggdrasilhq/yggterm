@@ -304,13 +304,29 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (global SHELLSTATE_MUT_TOTAL epoch compared across a parallel-harness
   window; retry-until-quiet-window). STILL OPEN under r-j1: the
   verify-or-rearm hardening (the DEAD-loop teardown still presumes a
-  successor — same line as (r-j2)'s render latch). NEW F3 LEAD
-  (measured in the rj1-rig iteration, GUI-relaunch shape): on GUI
-  relaunch over a live daemon, the retained host never posts its page
-  stage (no synthesis arming, reveal_raise_refused
-  daemon_owns_runtime:True) while the render-site recovery re-drives
-  every 5s and burns the futile streak — rows churn mountless; that is
-  the [11.229](b) replaced-runtime family, NOT this fix's scope;
+  successor — same line as (r-j2)'s render latch). THE F3 LEAD IS
+  ROOT-CAUSED AND FIXED (sitting 13, 2026-10-06, main 264d848563c0,
+  lane lane/f3/cold-mount-synthesis a92cf00c): the relaunch shape's
+  mountless row was the COLD-FIRST-MOUNT hole — the adaptive warm-eval
+  gate armed only on the warm path (probe finds a pre-existing mount
+  fn), so the restored ACTIVE row (the FIRST mount in a fresh page, a
+  cold install) had no liveness poll, no stage-posted proof, and no
+  synthesis under the shed window; with this sitting-12 live-guard
+  landed, the pre-guard churn had become an ETERNAL live-deferral
+  (f3-rig measured: 0 attach signals in 80 s, 54,685 deferred
+  recoveries ≈680/s trace flood; read-buffer "client" reads were
+  daemon-fallback lies). FIX: the gate + the redo script are now
+  PATH-INDEPENDENT (the cold installer already stamps the same attempt
+  fields and the body posts the same liveness record — the poll's
+  evidence was path-independent all along; healthy mounts still disarm
+  on the first bridge event) and the deferred trace is rate-limited to
+  1/s per session. Rig: tools/uxspeed/f3-rig.sh — boot-1 real IPC +
+  GUI-only kill + boot-2 over the live daemon, exe-proofed (F3_BOOT2_
+  SUPPRESS=1 selects the shed variant); real-IPC control GREEN on
+  unfixed main, suppressed boot-2 RED on main / GREEN on the lane
+  (poll read stage "posted" → fence → synthesized_mount_open → js_ready
+  → attach_ready, typed input delivered); rj1-rig re-run GREEN on the
+  lane; suite 2227/0 with 3 new locks.
   (r-j2) post-kill recovery depends on the render latch
   (bootstrap_task_identity) — a user re-select is still the only
   re-schedule trigger after any genuine supersede. (i) THE PRE-SYNTHESIS-DEMOTION INPUT REFUSAL (measured rig
@@ -335,9 +351,17 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   leg is healthy — the divergence compounds with F1. MEMBERS: [11.32],
   the [11.229] absent-declaration sub-item.
 - **F3 — HOST-LIFECYCLE IMMORTALITY**: a bad host must be replaced, never
-  revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71).
-  REMAINDERS: [11.229](b) replaced-runtime frozen buffer, (d)
-  remove-vs-keepalive race.
+  revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71);
+  THE RELAUNCH/RE-BIND ARM ROOT-FIXED (sitting 13, 2026-10-06, main
+  264d848563c0): the cold-first-mount synthesis hole — the warm-eval
+  gate (poll → stage-posted proof → F1 synthesis) armed only on the warm
+  path, so the restored ACTIVE row after GUI relaunch over a live daemon
+  hung mountless under the shed window; gate + redo now path-independent
+  + the deferred trace rate-limited (f3-rig falsifier, rj1-rig
+  regression-green). REMAINDERS: [11.229](b) LIVE-GUI frozen-buffer arm
+  (runtime_spawn_id invalidation — the runtime replaced UNDER a mounted
+  client, not across GUI death; a different mechanism, still open),
+  (d) remove-vs-keepalive race.
 - **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
   [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
   auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
@@ -490,6 +514,13 @@ CLIENT halves that still recur on healthy rows.
   or GUI restart heals. FIX SHAPE: the client must invalidate its host
   when the stream reports a new `runtime_spawn_id`, and re-reconcile
   from the daemon screen.
+  UPDATE 2026-10-06 (sitting 13, f3-rig + main 264d848563c0): the
+  GUI-RELAUNCH arm of (b) is ROOT-FIXED — a relaunched GUI now re-binds
+  retained rows through the F1 synthesis contract even inside the shed
+  window (cold-first-mount hole; see F3 family + the r-j1 entry for the
+  measurement). The LIVE-GUI arm stands OPEN as filed: a runtime
+  replaced while the client stays mounted still needs the
+  `runtime_spawn_id` invalidation above.
 - (c) REVEAL DEADLINE → PERMANENT BLANK: `reveal_cover_released
   reason:deadline bytes:0` when a cold transcript re-render outruns the
   cover deadline — the cover drops to a blank viewport that never
