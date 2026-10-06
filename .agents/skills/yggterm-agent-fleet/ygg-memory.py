@@ -914,6 +914,32 @@ class QwenMemoryAdapter(HarnessMemoryAdapter):
         return len(pairs) + 1, ingested + i0 + i2 + i3, delivered + o0 + o2 + o3, deleted + d0 + d2 + d3
 
 
+# ⛔ [mem-dream slice 1, 2026-10-06] THE INDEX IS A DOOR, AND THE DOOR WAS
+# BRICKED: the zcode index rebuilt from EVERY *.md under the memory tree, so
+# ~550 legacy per-sitting archive files (dated/sitting/session/wave-N/
+# delivery/-history names — most written top-level before the archive/
+# convention existed) made MEMORY.md 906 lines / 176.7KB, past the harness
+# loader's partial-load cut: index lines past the cut NEVER loaded and their
+# doors were unreachable through the index while fully present on disk.
+# Shelving is now ONE classifier shared by the index split and the
+# shelve-archives verb (never a second encoding): shelved docs leave the
+# injected MEMORY.md for ARCHIVE-INDEX.md (never auto-loaded); living doors
+# keep the byte-identical line format.
+_SHELVED_DOC_TYPES = {"sitting-archive", "archive"}
+_SHELVED_NAME_RE = re.compile(r"(sitting|session|wave-\d+|delivery|-history)", re.IGNORECASE)
+_DATED_NAME_RE = re.compile(r"-20\d{2}-\d{2}-\d{2}")
+
+
+def _is_shelved_doc(relative_parts, name: str, doc_type: str) -> bool:
+    if "archive" in relative_parts:
+        return True
+    if doc_type.strip().lower() in _SHELVED_DOC_TYPES:
+        return True
+    if _SHELVED_NAME_RE.search(name):
+        return True
+    return bool(_DATED_NAME_RE.search(name))
+
+
 class ZcodeMemoryAdapter(HarnessMemoryAdapter):
     """Zcode auto-memory under ``~/.zcode/cli/memories/projects`` plus an AGENTS.md bridge.
 
@@ -969,9 +995,10 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
 
     def _rebuild_index(self, memory_dir: Path) -> None:
         memory_dir.mkdir(parents=True, exist_ok=True)
-        lines = ["# Memory index", ""]
+        living = ["# Memory index", ""]
+        shelved = ["# Archive index — shelved docs, never auto-loaded", ""]
         for doc in sorted(memory_dir.rglob("*.md")):
-            if doc.name == "MEMORY.md":
+            if doc.name in ("MEMORY.md", "ARCHIVE-INDEX.md"):
                 continue
             content = doc.read_text(encoding="utf-8", errors="replace")
             if not content.startswith("---\n"):
@@ -980,11 +1007,23 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
             description = self._meta(content, "description") or title
             rel = urllib.parse.quote(doc.relative_to(memory_dir).as_posix(), safe="/._~-")
             line = f"- [{title}]({rel}) — {description}".replace("\n", " ")
-            lines.append(line[:199] + "…" if len(line) > 200 else line)
-        rendered = "\n".join(lines) + "\n"
+            line = line[:199] + "…" if len(line) > 200 else line
+            if _is_shelved_doc(
+                doc.relative_to(memory_dir).parts, doc.name, self._meta(content, "type")
+            ):
+                shelved.append(line)
+            else:
+                living.append(line)
+        rendered = "\n".join(living) + "\n"
         index = memory_dir / "MEMORY.md"
         if not index.is_file() or index.read_text(encoding="utf-8") != rendered:
             index.write_text(rendered, encoding="utf-8")
+        archive_index = memory_dir / "ARCHIVE-INDEX.md"
+        archive_rendered = "\n".join(shelved) + "\n"
+        if not archive_index.is_file() or archive_index.read_text(
+            encoding="utf-8"
+        ) != archive_rendered:
+            archive_index.write_text(archive_rendered, encoding="utf-8")
 
     def _project(self, root: Path, harness: str, memory_dir: Path) -> tuple:
         ns_dir = get_namespace_dir(root, GLOBAL_NAMESPACE)
@@ -1015,7 +1054,8 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
             memory_dir,
             "memory",
             target_harness="all",
-            exclude=lambda relative: relative.name == "MEMORY.md"
+            exclude=lambda relative: relative.name in ("MEMORY.md", "ARCHIVE-INDEX.md")
+            or "archive" in relative.parts
             or relative.parts[:2] == ("pinned", "yggterm"),
         )
         self._rebuild_index(memory_dir)
@@ -2901,6 +2941,65 @@ def cmd_migrate(args):
         _flock_close(lock)
 
 
+def shelve_legacy_archives(adapter, memory_dir: Path, apply: bool) -> tuple:
+    """[mem-dream slice 1] Move top-level shelved-class docs into archive/.
+
+    Returns ``(candidates, moved)``. Dry-run reports candidates and moves
+    nothing; apply moves (skip-on-collision, per-move log to the caller) and
+    the caller rebuilds the tiered indexes. Sitting archives become native
+    per-host history: the next sync-harness journaled-deletes their hub
+    mirrors (recoverable by design) — doors remain the cross-host SSOT.
+    """
+    candidates = []
+    for doc in sorted(memory_dir.glob("*.md")):
+        if doc.name in ("MEMORY.md", "ARCHIVE-INDEX.md"):
+            continue
+        content = doc.read_text(encoding="utf-8", errors="replace")
+        if not content.startswith("---\n"):
+            continue
+        if _is_shelved_doc((), doc.name, adapter._meta(content, "type")):
+            candidates.append(doc)
+    moved = 0
+    if apply and candidates:
+        archive_dir = memory_dir / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for doc in candidates:
+            dest = archive_dir / doc.name
+            if dest.exists():
+                print(f"  skip (exists in archive/): {doc.name}")
+                continue
+            doc.rename(dest)
+            moved += 1
+    return candidates, moved
+
+
+def cmd_shelve_archives(args):
+    """[mem-dream slice 1] Tier the native store: dry-run by default."""
+    harness = detect_harness(args.harness)
+    adapter = get_harness_adapter(harness, cwd=Path.cwd())
+    if not isinstance(adapter, ZcodeMemoryAdapter):
+        print(f"shelve-archives: harness {harness} has no tiered index; nothing to do")
+        return
+    total_candidates = total_moved = 0
+    for memory_dir in adapter.memory_dirs():
+        candidates, moved = shelve_legacy_archives(adapter, memory_dir, args.apply)
+        total_candidates += len(candidates)
+        total_moved += moved
+        if not candidates:
+            continue
+        print(f"{memory_dir}: {len(candidates)} shelved-class top-level docs")
+        for doc in candidates[:3]:
+            print(f"  e.g. {doc.name}")
+        if args.apply:
+            adapter._rebuild_index(memory_dir)
+        else:
+            print("  (dry-run — pass --apply to move)")
+    if args.apply:
+        print(f"shelve-archives: moved {total_moved} docs into archive/; indexes rebuilt")
+    if getattr(args, "json", False):
+        print(json.dumps({"harness": harness, "candidates": total_candidates, "moved": total_moved}))
+
+
 def _sync_adapter_once(root: Path, harness: str) -> tuple[int, int, int, int]:
     adapter = get_harness_adapter(harness, cwd=Path.cwd())
     lock = _flock_open(root / ".ygg-memory.lock")
@@ -3025,6 +3124,12 @@ def main():
     # startup: yggterm-managed, bounded pre-launch convergence.
     p_startup = subparsers.add_parser("startup", parents=[common_parser], help="Converge fleet + native memory before CLI launch")
     p_startup.add_argument("--mesh", default=None, help="Optional fleet roster override")
+    p_shelve = subparsers.add_parser(
+        "shelve-archives",
+        parents=[common_parser],
+        help="Tier the native store: move legacy top-level sitting archives into archive/ and rebuild the tiered indexes (dry-run by default)",
+    )
+    p_shelve.add_argument("--apply", action="store_true", help="perform the moves (default: dry-run report)")
 
     args = parser.parse_args()
 
@@ -3054,6 +3159,8 @@ def main():
         cmd_migrate(args)
     elif args.subcommand == "startup":
         cmd_startup(args)
+    elif args.subcommand == "shelve-archives":
+        cmd_shelve_archives(args)
     else:
         parser.print_help()
 
