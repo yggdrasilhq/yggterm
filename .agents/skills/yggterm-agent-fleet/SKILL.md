@@ -324,11 +324,11 @@ turn returned **"Prompt is too long"** — unrecoverable, no compaction armed. I
 had this section available and never ran it, because the check below costs a
 round trip, can stall your own loop, and must be **remembered**.
 
-⇒ **`~/.claude/hooks/context-relay-gauge.py`, wired as a `UserPromptSubmit` hook,
+⇒ **`~/.local/bin/context-relay-gauge.py`, wired as a `UserPromptSubmit` hook,
 fires on EVERY prompt** — including the booter's, the caller with no judgement of
 its own. Silent under 55%; **NOTICE 55%** (open no new plane of work), **LAND 70%**
 (commit → update door + queue → spawn successor → unsubscribe → retire),
-**CRITICAL 85%**. On demand: `python3 ~/.claude/hooks/context-relay-gauge.py --report`.
+**CRITICAL 85%**. On demand: `python3 ~/.local/bin/context-relay-gauge.py --report`.
 ⭐ It publishes `~/.claude/context-gauge/<session_id>.json`
 (`pct`/`used`/`window`/`verdict`/`dead`) — **a watchdog cannot see a token count**,
 which is why `ygg-babysit` used to infer liveness from file mtimes, and why a corpse
@@ -368,7 +368,7 @@ failing in opposite directions.
    draft** — a handover must lose no typed text, and neither may a probe (§8(f)).
 3. **A gauge and the instrument disagreeing means the GAUGE is wrong** — fix it in the same
    session (stale-doc law; an instrument that lies is a stale doc with a trigger). The
-   window table lives in `~/.claude/hooks/context-relay-gauge.py`; Fable is natively 1M with
+   window table lives in `~/.local/bin/context-relay-gauge.py`; Fable is natively 1M with
    no `[1m]` suffix anywhere, which is exactly the case the old table missed.
 4. **When in doubt, assume you have MORE context than you feel.** The documented bias runs
    one way: sessions under-estimate their remaining window and land too early, shredding
@@ -380,7 +380,7 @@ Codex writes one rollout JSONL under `~/.codex/sessions/` for each session. Run 
 shared gauge with the exact rollout session id:
 
 ```sh
-python3 ~/.claude/hooks/context-relay-gauge.py \
+python3 ~/.local/bin/context-relay-gauge.py \
   --cli codex --session <codex-session-id> --report
 ```
 
