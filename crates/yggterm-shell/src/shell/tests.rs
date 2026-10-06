@@ -72246,6 +72246,79 @@ mod web_surface_immersion_locks {
         }
     }
 
+    // ------------------------------------------------------------------
+    // [F3] THE RELAUNCH COLD-MOUNT ROOT FIX ([11.229](b), f3-rig
+    // 2026-10-06). On GUI relaunch over a live daemon the restored ACTIVE
+    // row is the FIRST mount in the fresh page — a cold install. The
+    // adaptive warm-eval gate used to arm only on the warm path, so a cold
+    // mount under the production shed window waited on bridge events
+    // forever: no poll, no stage-posted proof, no synthesis — the row
+    // mountless (measured: zero attach signals in 80 s, 54,685
+    // deferred-live recoveries). These locks pin that the gate is
+    // PATH-INDEPENDENT, the redo stays actionable, and the cold installer
+    // stamps the same record the poll matches.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_warm_gate_arms_for_cold_dispatched_mounts() {
+        let viewport = include_str!("viewport.rs");
+        assert!(
+            !viewport.contains("warm_gate_deadline = if mount_fn_installed"),
+            "the adaptive warm-eval gate must not condition on the warm path — \
+             a cold-dispatched mount under the shed window has no poll, no \
+             proof, no synthesis, and hangs forever (the F3 relaunch root)"
+        );
+        assert!(
+            viewport.contains("let mut warm_gate_deadline = Some("),
+            "the gate must arm unconditionally at mount dispatch"
+        );
+        assert!(
+            !viewport.contains("cold_fallback_script = if mount_fn_installed"),
+            "the redo script must exist for cold dispatches too — eval_lost \
+             must stay actionable on both paths"
+        );
+        assert!(
+            viewport.contains("let mut cold_fallback_script = Some(terminal_eval_script_with_pinned_grid_seeded("),
+            "the cold fallback is the same installer on both paths"
+        );
+    }
+
+    #[test]
+    fn the_cold_installer_stamps_the_record_the_poll_matches() {
+        let scripts = include_str!("terminal_scripts.rs");
+        // The poll matches `__r.attempt === __yggtermMountDispatchedAttempt`
+        // — BOTH dispatch shapes (the ~1 KB warm invoke AND the cold
+        // installer's tail) must stamp the dispatched attempt, or a cold
+        // mount reads unmatched and the gate redoes instead of synthesizing.
+        assert_eq!(
+            scripts.matches("window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;").count(),
+            2,
+            "exactly the warm invoke and the cold installer tail stamp the \
+             dispatched attempt"
+        );
+        assert_eq!(
+            scripts.matches("await window.__yggtermMountFn(window.__yggtermMountAttempt);").count(),
+            2,
+            "both dispatch shapes invoke the shared body with the stamped \
+             attempt"
+        );
+    }
+
+    #[test]
+    fn the_deferred_live_loop_trace_is_rate_limited() {
+        let state = include_str!("state.rs");
+        assert!(
+            state.contains("startup_restore_deferred_trace_ms"),
+            "the live-loop deferral trace needs per-session rate state — the \
+             render pass re-drives the check every frame and flooded the \
+             trace at ~680/s"
+        );
+        assert!(
+            state.contains(">= 1_000"),
+            "the deferral trace fires at most once per second per session"
+        );
+    }
+
     #[test]
     fn reparent_verdict_one_retained_in_place_serves_the_pane() {
         let viewport = include_str!("viewport.rs");
