@@ -2737,6 +2737,26 @@ def _self_disperse_source(module_path: Path, home: Path | None = None) -> Path |
     return None
 
 
+def _peer_busy_lock(stderr_text: str) -> bool:
+    """A peer whose hub lock is busy is DEFERRING, not diverging — the same
+    law cmd_sync_fleet applies to the local lock (measured 2026-10-06:
+    'did not converge: failed=dev:migrate' while dev's own tick held its
+    lock past the 60s patience; the catch-up tick re-runs the exchange)."""
+    return "Lock held by another process" in str(stderr_text or "")
+
+
+def _fleet_outcome(unreachable: list, failures: list) -> str:
+    """The convergence detail line, or '' when the run converged (a run with
+    only busy-peer deferrals converges — the deferred peers are simply not
+    exchanged this round)."""
+    details = []
+    if unreachable:
+        details.append("unreachable=" + ",".join(unreachable))
+    if failures:
+        details.append("failed=" + ",".join(failures))
+    return "; ".join(details)
+
+
 def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
     """Exchange immutable objects + event IDs; namespace files never rsync."""
     local_host = socket.gethostname()
@@ -2780,6 +2800,7 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
             file=sys.stderr,
         )
     failures = []
+    deferrals = []
 
     if not quick:
         for peer in live_peers:
@@ -2833,6 +2854,8 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
         )
         if migrated.returncode == 0:
             ready_peers.append(peer)
+        elif _peer_busy_lock(migrated.stderr):
+            deferrals.append(f"{peer}:migrate-busy")
         else:
             failures.append(f"{peer}:migrate")
     live_peers = ready_peers
@@ -2904,20 +2927,20 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
             text=True,
         )
         if imported.returncode != 0:
-            failures.append(f"{peer}:import-journal")
+            if _peer_busy_lock(imported.stderr):
+                deferrals.append(f"{peer}:import-busy")
+            else:
+                failures.append(f"{peer}:import-journal")
     if materialized.get("conflicts"):
         failures.append(f"{materialized['conflicts']}-preserved-conflict(s)")
     if materialized.get("missing_objects"):
         failures.append(f"{materialized['missing_objects']}-missing-object(s)")
-    if unreachable or failures:
-        details = []
-        if unreachable:
-            details.append("unreachable=" + ",".join(unreachable))
-        if failures:
-            details.append("failed=" + ",".join(failures))
-        raise RuntimeError("fleet memory did not converge: " + "; ".join(details))
+    detail = _fleet_outcome(unreachable, failures)
+    if detail:
+        raise RuntimeError("fleet memory did not converge: " + detail)
     return {
         "peers": live_peers,
+        **({"deferred": deferrals} if deferrals else {}),
         "pulled_objects": pulled_objects,
         "pushed_objects": pushed_objects,
         **materialized,
