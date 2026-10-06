@@ -329,6 +329,24 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   bar, [11.172] switch remount cost (FIXED in code — proof owed), the
   close/teardown family. Re-derive this family's shape after F1 lands
   (the wedge contaminated spawn-latency baselines).
+- **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
+  2026-10-06)**: capture is law-complete but NOTHING consolidates — the
+  zcode index rebuilt from every *.md (906 lines/176.7KB, past the
+  loader's partial-load cut: doors unreachable through the index while
+  present on disk), boards graduate only by seat discipline, no
+  merge/compress/forget ever. Designs: board ACK-2a4274f90f +
+  ACK-bab67ca690; consults lores/chain-of-thought/
+  2026-10-06-yggterm-memory-dreaming-{gemini-consult,round2-timing}.md;
+  design door memory-dreaming-design (default zcode project). ATTACK:
+  slice 1 [11.235] deterministic index tiering (classifier + tiered
+  indexes + shelve-archives verb); slice 2 the `dream` verb —
+  phase-SCHEMA-aware composer on sol/GLM (owner model ruling 2026-10-06:
+  gemini = knowledge/creativity ONLY), adversarial-critic pattern gate,
+  ns-level NOW.md rollup with per-claim as-of stamps, contradiction
+  invalidation trigger; slice 3 H_vocab phase telemetry + scoped lore
+  activation; slice 4 Hebbian decay + canary probes. The owner now
+  steers generically ("continue the yggterm work") — orientation speed
+  IS the product.
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
