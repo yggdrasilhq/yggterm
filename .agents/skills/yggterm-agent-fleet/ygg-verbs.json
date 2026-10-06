@@ -13,7 +13,11 @@
     "ygg-auth.py",
     "ygg-board.py",
     "ygg-procfind.sh",
-    "repo-doctor.py"
+    "repo-doctor.py",
+    "context-relay-gauge.py",
+    "fleet-skill-sync.sh",
+    "fleet-binary-sync.sh",
+    "yggterm-socket-sweep.sh"
   ],
   "owner_managed": [
     "ygg-memory",
@@ -68,6 +72,10 @@
     "ygg-booter.py",
     "ygg-monitor.py",
     "ygg-ci.py",
-    "bootstrap.sh"
+    "bootstrap.sh",
+    "context-relay-gauge.py",
+    "fleet-skill-sync.sh",
+    "fleet-binary-sync.sh",
+    "yggterm-socket-sweep.sh"
   ]
 }
