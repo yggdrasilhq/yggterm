@@ -3161,15 +3161,52 @@ def get_dream_dir(root: Path, ns: str, create: bool = True) -> Path:
 
 
 def load_dream_watermark(root: Path, ns: str) -> dict:
+    """Scratch cache FIRST, journal floor SECOND (round-4: amnesiac
+    watermarks). The scratch file is per-host; the journal is the fleet
+    truth. When any host dreamed this ns, its NOW.md publish (origin
+    dreamer) is in the journal at a seq >= what was consumed — deriving
+    the floor from it means a foreign-host dream never re-collects from
+    seq 0. The floor is conservative by construction (a few records
+    re-read at most; latest-content dedup makes that harmless)."""
     p = get_dream_dir(root, ns, create=False) / "watermark.json"
     default = {"ns": ns, "last_seq": 0, "last_dream_ts": None, "dreams": []}
-    if not p.is_file():
-        return default
+    watermark = dict(default)
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            watermark.update(loaded)
     except Exception:
-        return default
+        pass
+    floor = 0
+    jpath = get_journal_path(root)
+    if jpath.exists():
+        with open(jpath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if (
+                    rec.get("ns") == ns
+                    and rec.get("file") == "NOW.md"
+                    and rec.get("origin") == DREAM_ORIGIN
+                ):
+                    # The publish event fires a few records AFTER the dream
+                    # consumed its deltas; the EXACT consumed floor rides the
+                    # summary marker so nothing is skipped and nothing is
+                    # re-collected beyond the dream's own watermark.
+                    marker = re.search(
+                        r"\[consumed seq (\d+)\]", str(rec.get("summary", ""))
+                    )
+                    if marker:
+                        floor = max(floor, int(marker.group(1)))
+    if floor > watermark.get("last_seq", 0):
+        watermark["last_seq"] = floor
+    return watermark
 
 
 def save_dream_watermark(root: Path, ns: str, watermark: dict) -> None:
@@ -3636,12 +3673,164 @@ def dream_fence_violation(root: Path, ns: str, captured_seq: int) -> str:
     return ""
 
 
+DREAM_AUTO_COOLDOWN_S = 2 * 60 * 60
+DREAM_AUTO_BACKOFF_S = 60 * 60
+CANARY_MEMORY_MAX_LINES = 400
+
+
+def _dream_auto_backoff(root: Path, reason: str) -> None:
+    stamp_dir = root / "dream"
+    stamp_dir.mkdir(parents=True, exist_ok=True)
+    (stamp_dir / "auto-backoff.json").write_text(
+        json.dumps({"ts": time.time(), "reason": reason[:300]}), encoding="utf-8"
+    )
+
+
+def _dream_auto(root: Path, ns_filter: str, args) -> str:
+    """The auto-dreamer (round-4 design): activity-driven, ONE namespace per
+    invocation, cooldown + quiescence + pending-manifest filters, a 1h
+    backoff stamp on any composer/apply failure, and it NEVER raises — the
+    tick calls it. Composer failures during a quota cap are the designed
+    sleep (round-4 Q3: never stage briefs across a long cap window — the
+    read-version fence would refuse them anyway)."""
+    backoff = root / "dream" / "auto-backoff.json"
+    if backoff.is_file():
+        try:
+            stamp = json.loads(backoff.read_text(encoding="utf-8"))
+            if time.time() - float(stamp.get("ts", 0)) < DREAM_AUTO_BACKOFF_S:
+                return f"auto-dream: backing off ({str(stamp.get('reason', '?'))[:80]})"
+        except Exception:
+            pass
+    candidates = []
+    dream_root = root / "dream"
+    if dream_root.is_dir():
+        for ns_dir in sorted(dream_root.iterdir()):
+            if not ns_dir.is_dir():
+                continue
+            ns = ns_dir.name
+            if ns_filter and ns_filter != "_global" and ns != ns_filter:
+                continue
+            watermark = load_dream_watermark(root, ns)
+            last_ts = watermark.get("last_dream_ts")
+            if last_ts:
+                try:
+                    if (
+                        time.time()
+                        - datetime.datetime.fromisoformat(str(last_ts)).timestamp()
+                        < DREAM_AUTO_COOLDOWN_S
+                    ):
+                        continue
+                except Exception:
+                    pass
+            if dream_quiescence_violation(root, ns):
+                continue
+            if (ns_dir / "pending" / "MANIFEST.json").is_file():
+                continue
+            consumed = watermark.get("last_seq", 0)
+            delta = sum(
+                1 for rec in dream_live_activity(root, ns) if rec.get("seq", 0) > consumed
+            )
+            if delta <= 0:
+                continue
+            candidates.append((delta, ns))
+    if not candidates:
+        return "auto-dream: no candidate (clean tick)"
+    candidates.sort(reverse=True)
+    _, ns = candidates[0]
+    base = [sys.executable, str(Path(__file__).resolve()), "--root", str(root), "--ns", ns]
+    try:
+        run_ = subprocess.run(
+            base
+            + [
+                "dream",
+                "--run",
+                "--model",
+                getattr(args, "model", "gpt-6.1-sol"),
+                "--effort",
+                getattr(args, "effort", "high"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        _dream_auto_backoff(root, "composer timeout")
+        return "auto-dream: composer timed out; 1h backoff stamped"
+    if run_.returncode != 0:
+        detail = (run_.stderr or run_.stdout or "").strip().splitlines()
+        _dream_auto_backoff(root, detail[-1] if detail else "composer failed")
+        return "auto-dream: composer failed; 1h backoff stamped"
+    lines = (run_.stdout or "").strip().splitlines()
+    return f"auto-dream[{ns}]: {lines[-1] if lines else 'dreamed'}"
+
+
+def cmd_canary(args):
+    """[mem-dream 3/4] Deterministic health probes, zero LLM: the index
+    line budget (a client regenerator re-bloating MEMORY.md cannot recur
+    silently), the archive pointer, NOW.md size, and dream-watermark
+    monotonicity. Exit 1 names every violation; the tick logs failures."""
+    violations = []
+    home = Path.home()
+    projects_root = home / ".zcode" / "cli" / "memories" / "projects"
+    if projects_root.is_dir():
+        for memory_dir in sorted(projects_root.glob("*/memory")):
+            index = memory_dir / "MEMORY.md"
+            if index.is_file():
+                lines = sum(1 for _ in index.open(encoding="utf-8", errors="replace"))
+                if lines > CANARY_MEMORY_MAX_LINES:
+                    violations.append(
+                        f"{memory_dir}: MEMORY.md {lines} lines > {CANARY_MEMORY_MAX_LINES} — a regenerator re-bloated the index?"
+                    )
+            if (memory_dir.parent / "memory-archive").is_dir() and not (
+                memory_dir / "ARCHIVE-INDEX.md"
+            ).is_file():
+                violations.append(
+                    f"{memory_dir}: memory-archive/ exists but the ARCHIVE-INDEX.md pointer is missing"
+                )
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    namespaces = root / "namespaces"
+    if namespaces.is_dir():
+        for ns_dir in sorted(namespaces.glob("*")):
+            now = ns_dir / "NOW.md"
+            if now.is_file() and now.stat().st_size > DREAM_NOW_MAX_BYTES + 512:
+                violations.append(
+                    f"{ns_dir.name}: NOW.md {now.stat().st_size}B over budget"
+                )
+    dream_root = root / "dream"
+    if dream_root.is_dir():
+        for ns_dir in sorted(dream_root.glob("*/")):
+            try:
+                watermark = json.loads((ns_dir / "watermark.json").read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            seqs = [
+                entry.get("seq")
+                for entry in watermark.get("dreams", [])
+                if isinstance(entry, dict) and entry.get("seq") is not None
+            ]
+            if any(later < earlier for earlier, later in zip(seqs, seqs[1:])):
+                violations.append(f"{ns_dir.name}: dream watermark seqs not monotonic")
+    if violations:
+        for violation in violations:
+            print(f"canary: {violation}", file=sys.stderr)
+        raise SystemExit(1)
+    print("canary: all green" if not getattr(args, "json", False) else json.dumps({"status": "ok"}))
+
+
 def cmd_dream(args):
     root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
     harness = detect_harness(args.harness)
     ns = detect_namespace(override=getattr(args, "ns", None))
     if not ns:
         raise SystemExit("dream: --ns is required")
+
+    if getattr(args, "auto", False):
+        message = _dream_auto(root, getattr(args, "ns", None), args)
+        if getattr(args, "json", False):
+            print(json.dumps({"status": message}))
+        elif not getattr(args, "quiet", False):
+            print(message)
+        return
 
     if args.status:
         watermark = load_dream_watermark(root, ns)
@@ -3754,7 +3943,7 @@ def cmd_dream(args):
             )
             record = _dream_publish_door(
                 root, ns, "NOW.md", now_content, harness, "now",
-                f"dream rollup {today} (phase {manifest['phase']}, {len(parsed['claims'])} claims, {contested} contested)",
+                f"dream rollup {today} (phase {manifest['phase']}, {len(parsed['claims'])} claims, {contested} contested) [consumed seq {manifest['captured_seq']}]",
             )
             _upsert_ns_index_line(ns_dir, "NOW.md", description)
 
@@ -4077,6 +4266,17 @@ def main():
         action="store_true",
         help="override the quiescence gate (owner-directed testing only)",
     )
+    p_dream.add_argument(
+        "--auto",
+        action="store_true",
+        help="the auto-dreamer: pick the hungriest eligible namespace (delta-sorted, cooldown + quiescence filtered) and run prepare->compose->critic->apply; never raises (tick-safe)",
+    )
+    p_dream.add_argument("--quiet", action="store_true", help="suppress informational output")
+    p_canary = subparsers.add_parser(
+        "canary",
+        parents=[common_parser],
+        help="Deterministic memory health probes: index line budget, archive pointer, NOW.md size, watermark monotonicity (zero LLM)",
+    )
 
     # search [mem-dream slice 2]
     p_search = subparsers.add_parser(
@@ -4121,6 +4321,8 @@ def main():
         cmd_shelve_archives(args)
     elif args.subcommand == "pin-runners":
         cmd_pin_runners(args)
+    elif args.subcommand == "canary":
+        cmd_canary(args)
     elif args.subcommand == "dream":
         cmd_dream(args)
     elif args.subcommand == "search":

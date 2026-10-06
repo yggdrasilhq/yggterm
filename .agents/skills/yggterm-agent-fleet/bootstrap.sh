@@ -142,8 +142,21 @@ if [ -f "$SCRIPT_DIR/ygg-memory" ]; then
   cp "$SCRIPT_DIR/ygg-memory" "$HOME/.local/bin/ygg-memory" 2>/dev/null || true
   cp "$SCRIPT_DIR/ygg-memory.py" "$HOME/.local/bin/ygg-memory.py" 2>/dev/null || true
   cp "$SCRIPT_DIR/ygg-memory-sync" "$HOME/.local/bin/ygg-memory-sync" 2>/dev/null || true
-  chmod +x "$HOME/.local/bin/ygg-memory"* 2>/dev/null || true
-  note "installed/refreshed ygg-memory to ~/.local/bin"
+  # The tick is repo-homed tooling too (mem-dream): its SSOT is this dir, and
+  # the dream leg + canary ride it. Units install only when absent (tuned
+  # timers are never clobbered — the idempotency law at the top of this file).
+  cp "$SCRIPT_DIR/ygg-memory-tick" "$HOME/.local/bin/ygg-memory-tick" 2>/dev/null || true
+  chmod +x "$HOME/.local/bin/ygg-memory" "$HOME/.local/bin/ygg-memory-tick" 2>/dev/null || true
+  if [ -d "$SCRIPT_DIR/systemd" ] && command -v systemctl >/dev/null 2>&1; then
+    mkdir -p "$HOME/.config/systemd/user"
+    for unit in "$SCRIPT_DIR/systemd"/*; do
+      name="$(basename "$unit")"
+      [ -f "$HOME/.config/systemd/user/$name" ] || cp "$unit" "$HOME/.config/systemd/user/$name"
+    done
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable --now ygg-memory-sync.timer >/dev/null 2>&1 || true
+  fi
+  note "installed/refreshed ygg-memory + tick to ~/.local/bin"
 fi
 
 # Backfill Muse/Gemini/Codex from unified if they are empty (new user with only Claude)

@@ -17,7 +17,9 @@
     "context-relay-gauge.py",
     "fleet-skill-sync.sh",
     "fleet-binary-sync.sh",
-    "yggterm-socket-sweep.sh"
+    "yggterm-socket-sweep.sh",
+    "ygg-memory-tick",
+    "fleet-daemon-audit.sh"
   ],
   "owner_managed": [
     "ygg-memory",
@@ -76,6 +78,8 @@
     "context-relay-gauge.py",
     "fleet-skill-sync.sh",
     "fleet-binary-sync.sh",
-    "yggterm-socket-sweep.sh"
+    "yggterm-socket-sweep.sh",
+    "ygg-memory-tick",
+    "fleet-daemon-audit.sh"
   ]
 }
