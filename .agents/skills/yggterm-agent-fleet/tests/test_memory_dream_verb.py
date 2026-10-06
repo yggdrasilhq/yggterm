@@ -334,7 +334,7 @@ def test_self_disperse_guard(module, failures):
         stale = worktree / "ygg-memory.py"
         stale.write_text("STALE BYTES\n", encoding="utf-8")
         fresh_copy = home / ".local/bin"
-        fresh_copy.mkdir()
+        fresh_copy.mkdir(parents=True)
         twin = fresh_copy / "ygg-memory.py"
         twin.write_text("SSOT BYTES\n", encoding="utf-8")
 
