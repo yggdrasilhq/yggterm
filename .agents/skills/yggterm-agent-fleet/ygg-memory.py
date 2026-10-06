@@ -931,6 +931,11 @@ _DATED_NAME_RE = re.compile(r"-20\d{2}-\d{2}-\d{2}")
 
 
 def _is_shelved_doc(relative_parts, name: str, doc_type: str) -> bool:
+    # archive-in-parts is a STRAY catcher: the canonical home is
+    # <project>/memory-archive/ OUTSIDE the scanned memory tree (the zcode
+    # client regenerates MEMORY.md with rglob-all on its own schedule —
+    # measured 2026-10-06 — so anything in-tree re-enters the index no
+    # matter what this tool does).
     if "archive" in relative_parts:
         return True
     if doc_type.strip().lower() in _SHELVED_DOC_TYPES:
@@ -1018,6 +1023,13 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
         index = memory_dir / "MEMORY.md"
         if not index.is_file() or index.read_text(encoding="utf-8") != rendered:
             index.write_text(rendered, encoding="utf-8")
+        external_archive = memory_dir.parent / "memory-archive"
+        if external_archive.is_dir():
+            count = sum(1 for _ in external_archive.glob("*.md"))
+            shelved.append(
+                f"- [shelved archives](../memory-archive/) — {count} docs, "
+                "per-host native history, never synced, never auto-loaded"
+            )
         archive_index = memory_dir / "ARCHIVE-INDEX.md"
         archive_rendered = "\n".join(shelved) + "\n"
         if not archive_index.is_file() or archive_index.read_text(
@@ -2978,8 +2990,12 @@ def shelve_legacy_archives(adapter, memory_dir: Path, apply: bool) -> tuple:
     Returns ``(candidates, moved)``. Dry-run reports candidates and moves
     nothing; apply moves (skip-on-collision, per-move log to the caller) and
     the caller rebuilds the tiered indexes. Sitting archives become native
-    per-host history: the next sync-harness journaled-deletes their hub
-    mirrors (recoverable by design) — doors remain the cross-host SSOT.
+    per-host history at <project>/memory-archive/ — OUTSIDE the scanned
+    memory tree, invisible to client-side index regenerators and to native
+    sync; the next sync-harness journaled-deletes their hub mirrors
+    (recoverable by design) — doors remain the cross-host SSOT. A legacy
+    in-tree archive/ directory (the pre-1.1 scheme) is migrated into
+    memory-archive/ whole.
     """
     candidates = []
     for doc in sorted(memory_dir.glob("*.md")):
@@ -2991,13 +3007,29 @@ def shelve_legacy_archives(adapter, memory_dir: Path, apply: bool) -> tuple:
         if _is_shelved_doc((), doc.name, adapter._meta(content, "type")):
             candidates.append(doc)
     moved = 0
-    if apply and candidates:
-        archive_dir = memory_dir / "archive"
+    if apply:
+        archive_dir = memory_dir.parent / "memory-archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
+        # Legacy in-tree archive/ (pre-1.1): migrate residents whole.
+        legacy_dir = memory_dir / "archive"
+        if legacy_dir.is_dir():
+            for doc in sorted(legacy_dir.glob("*.md")):
+                dest = archive_dir / doc.name
+                if dest.exists():
+                    if doc.read_bytes() == dest.read_bytes():
+                        doc.unlink()
+                        moved += 1
+                    else:
+                        print(f"  skip (differs in memory-archive/): {doc.name}")
+                    continue
+                doc.rename(dest)
+                moved += 1
+            if not any(legacy_dir.iterdir()):
+                legacy_dir.rmdir()
         for doc in candidates:
             dest = archive_dir / doc.name
             if dest.exists():
-                print(f"  skip (exists in archive/): {doc.name}")
+                print(f"  skip (exists in memory-archive/): {doc.name}")
                 continue
             doc.rename(dest)
             moved += 1
@@ -3766,6 +3798,41 @@ def cmd_search(args):
         print(f"search: no matches for /{args.pattern}/")
 
 
+def cmd_pin_runners(args):
+    """[11.236] Pin the owner-managed ygg-memory runners to a repo SSOT.
+
+    The verb dispersal plane deliberately never touches the ygg-memory
+    runner pair (owner_managed) — the tool self-disperses to PEERS via
+    sync-fleet, which leaves the LOCAL installed copies stale and once
+    reinstalled OLD bytes mid-churn (measured 2026-10-06). After any
+    merge touching the runner pair, run this from (or pointing at) an
+    up-to-date checkout on EVERY host and read the report back.
+    """
+    repo = Path(args.repo).expanduser()
+    source = repo / ".agents" / "skills" / "yggterm-agent-fleet" / "ygg-memory.py"
+    if not source.is_file():
+        print(f"pin-runners: no runner at {source} — pass --repo <yggterm checkout>")
+        return
+    source_bytes = source.read_bytes()
+    targets = [
+        Path.home() / ".local" / "bin" / "ygg-memory.py",
+        Path.home() / ".yggterm" / "bin" / "ygg-memory.py",
+    ]
+    pinned = 0
+    for target in targets:
+        if target.parent.is_dir() or target.parent.name == "bin":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.is_file() or target.read_bytes() != source_bytes:
+                target.write_bytes(source_bytes)
+                pinned += 1
+                print(f"  pinned: {target}")
+            else:
+                print(f"  current: {target}")
+    if getattr(args, "json", False):
+        print(json.dumps({"pinned": pinned}))
+    print(f"pin-runners: {pinned} copies updated; verify with a read-back grep")
+
+
 def _sync_adapter_once(root: Path, harness: str) -> tuple[int, int, int, int]:
     adapter = get_harness_adapter(harness, cwd=Path.cwd())
     lock = _flock_open(root / ".ygg-memory.lock")
@@ -3896,6 +3963,12 @@ def main():
         help="Tier the native store: move legacy top-level sitting archives into archive/ and rebuild the tiered indexes (dry-run by default)",
     )
     p_shelve.add_argument("--apply", action="store_true", help="perform the moves (default: dry-run report)")
+    p_pin = subparsers.add_parser(
+        "pin-runners",
+        parents=[common_parser],
+        help="Pin the owner-managed ygg-memory runner to a repo SSOT (run on every host after a merge touching it; [11.236])",
+    )
+    p_pin.add_argument("--repo", default=str(Path.home() / "gh" / "yggterm"), help="yggterm checkout to pin from")
 
     # dream [mem-dream slice 2]
     p_dream = subparsers.add_parser(
@@ -3958,6 +4031,8 @@ def main():
         cmd_startup(args)
     elif args.subcommand == "shelve-archives":
         cmd_shelve_archives(args)
+    elif args.subcommand == "pin-runners":
+        cmd_pin_runners(args)
     elif args.subcommand == "dream":
         cmd_dream(args)
     elif args.subcommand == "search":

@@ -138,18 +138,38 @@ def main() -> int:
         ], "dry-run finds exactly the three top-level shelved docs")
         check(moved == 0 and (memory_dir / "topic-history.md").is_file(), "dry-run moves nothing")
         candidates, moved = module.shelve_legacy_archives(adapter, memory_dir, apply=True)
-        check(moved == 3, "apply moves all three")
+        check(moved == 4, "apply moves all three candidates + migrates the legacy in-tree archive resident")
+        archive_dir = memory_dir.parent / "memory-archive"
         check(
-            (memory_dir / "archive" / "topic-history.md").is_file()
-            and (memory_dir / "archive" / "explicit-shelved.md").is_file()
-            and (memory_dir / "archive" / "campaign-x-sitting1-landed-2026-10-06.md").is_file(),
-            "moved docs land in archive/ under their own names",
+            (archive_dir / "topic-history.md").is_file()
+            and (archive_dir / "explicit-shelved.md").is_file()
+            and (archive_dir / "campaign-x-sitting1-landed-2026-10-06.md").is_file(),
+            "moved docs land in ../memory-archive/ (OUTSIDE the scanned tree) under their own names",
+        )
+        check(
+            not (memory_dir / "archive").exists(),
+            "legacy in-tree archive/ dir is migrated and removed in the same apply",
         )
         adapter._rebuild_index(memory_dir)
         index = (memory_dir / "MEMORY.md").read_text(encoding="utf-8")
         check("living-door" in index and "topic-history" not in index, "index reflects the shelve")
         candidates, moved = module.shelve_legacy_archives(adapter, memory_dir, apply=True)
-        check(not candidates and moved == 0, "second apply is a no-op (idempotent)")
+        check(
+            not candidates and moved == 0 and not (memory_dir / "archive").is_dir(),
+            "second apply is a no-op once candidates and legacy are gone",
+        )
+        check(
+            (archive_dir / "already-archived.md").is_file(),
+            "legacy in-tree archive resident migrated into memory-archive/",
+        )
+        adapter._rebuild_index(memory_dir)
+        archive_index = (memory_dir / "ARCHIVE-INDEX.md").read_text(encoding="utf-8")
+        check(
+            "../memory-archive/" in archive_index and "4 docs" in archive_index,
+            "ARCHIVE-INDEX.md points at the external archive with its doc count",
+        )
+        candidates, moved = module.shelve_legacy_archives(adapter, memory_dir, apply=True)
+        check(not candidates and moved == 0, "third apply is a no-op (idempotent)")
 
     if failures:
         print(f"\n{len(failures)} FAILURES")
