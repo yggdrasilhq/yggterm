@@ -497,8 +497,10 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   the client grid, PTY converges, healthy-reuse bounce control clean,
   exe-proofed). REMAINDERS under (b): the
   mount-loop-DEAD arm ([11.187] territory) and error-not-answer shapes;
-  then (c) reveal-deadline blank (still under F1), then (d)
-  remove-vs-keepalive race.
+  then (c) reveal-deadline blank (still under F1); (d)
+  remove-vs-keepalive CLOSED IN CODE 2026-10-07 (sitting 20: the
+  terminate's preventive tombstone + the start door's 120s fresh-close
+  veto — see the (d) block).
 - **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
   [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
   auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
@@ -811,11 +813,45 @@ remount instead of a false hot reveal. Shape-locked 3 ways + full shell
 absent-declaration loop is now expected to stand down on a healthy fresh
 mount (its sub-item stays until measured).
 
-(d) REMOVE-VS-KEEPALIVE RACE: `session remove` answered
-  verified:true / remote_runtime_after:ConfirmedGone while the runtime
-  RESURRECTED within seconds (spawn pid changed under the verdict) —
-  the removal needs a post-reap verification window or the keep-alive
-  must observe the tombstone before re-spawning.
+(d) REMOVE-VS-KEEPALIVE RACE — LANDED IN CODE 2026-10-07 (sitting 20,
+  lane lane/11229d/remove-vs-keepalive d0c64adc): REPRODUCED LIVE ON MAIN
+  FIRST (rig on dev, deployed 765dd6a87df1) — the exact raced shape: the
+  client GUI's remote-row launch machinery retried `server remote
+  start-codex` while the remove ran; the terminate found NO row to remove
+  (the runtime was never born, so no tombstone was possible), the probe
+  answered alive:false ⇒ ConfirmedGone ⇒ verified:true, and the QUEUED ask
+  landed 91 SECONDS UNDER THE VERDICT: live_session_birth (origin_site
+  start_remote_runtime_agent_session_new) → server spawn 106×48 →
+  first_bytes (trace-captured; the rig's cleanup terminated it 15s later).
+  Doors probed clean beside it: no spontaneous respawn (120s), the resume
+  door already refuses remembered closes by the ensure gate ([11.184]'s
+  named refusal), rotation does NOT relaunch dead persisted rows, and a
+  row-backed terminate's re-create is already tombstone-gated — the hole
+  was exactly the NOT-YET-BORN shape. FIX (the filed second arm, at the
+  door): (1) run_remote_terminate_agent records the close for the runtime
+  key EVEN WITH NO ROW TO REMOVE (record_remote_agent_terminate_tombstone,
+  trace remote_agent_terminate_tombstoned_runtime_key — the plane's shared
+  read-modify-write, TTL and re-entry clear intact); (2)
+  start_remote_runtime_agent_session refuses to re-mint a key whose close
+  is fresher than 120s (REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS — covers
+  the 91s measured queue latency and the wild seconds; far under the
+  plane's 3-day import veto), ONLY for keys this daemon does not already
+  hold (a held row's restart is not a resurrection); named refusal + trace
+  remote_agent_start_refused_recent_close = the production detector.
+  Deliberate re-opens unharmed: only a FRESH close refuses (stale passes —
+  locked). PROOF LEVEL: live RED on main (the trace above) + three
+  door-level locks (a_terminate_with_no_row_still_tombstones_and_the_
+  start_door_refuses — the raced shape end-to-end at the door incl. the
+  held-row pass; a_stale_close_does_not_refuse_the_start_door; the
+  tombstone window edges) + suite server-lib 1668/0 no-fail-fast. OWED:
+  the full client-flow rig replay against a FIXED destination (needs the
+  machine's remote_binary_expr redirected to a lane-build scratch daemon —
+  construction bar per (c)/(f2)/(h2)); watch the detector in the wild.
+  The post-reap client window (the filed first arm) deliberately NOT
+  taken: both doors now observe the close, and a synchronous window would
+  tax every remote remove with seconds of latency — if the wild ever
+  shows a resurrection past the 120s veto, the constant is the tuning
+  knob.
 
 ## ⛔ [11.228] THE REMOTE-PTY RESIZE HEAL FORWARD DROPS TRANSIENT-IO FAILURES — A DAEMON-BUSY READ TIMEOUT ("reading daemon response / Resource temporarily unavailable (os error 11)" — WouldBlock under set_read_timeout) KILLED EVERY HEAL FOR AN IDEMPOTENT RESIZE, SO THE OWNER'S CLAUDE ROW SAT AT THE 120×36 SPAWN DEFAULT UNDER A 170×63 CLIENT FOR SEVEN HOURS — "THE ACTIVE VIEWPORT IS SQUISHED" (measured live 2026-10-04 ~07:3x IST, guihost GUI + dev PTY, the unattended night after three fleet deploys)
 
