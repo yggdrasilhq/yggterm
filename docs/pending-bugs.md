@@ -199,7 +199,45 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   shed_hook), zero false delivery claims, the unapplied explicit
   failure intact; loss/order+healthy/dup regressions all GREEN on the
   same build (the s21 loss bar now delivers through the ACKED flush,
-  marker at the first transient sample). RESIDUE (next on this line,
+  marker at the first transient sample). THREE more sol rounds on the
+  lane (node lores/chain-of-thought/2026-10-07-yggterm-s22-ackflush-
+  sol-rounds.md, /tmp/s22-sol2-consult ANSWER*.md): R3 — the ack
+  callback rides the DATA write itself (Q1 refinement), and Q3's
+  REBUT: a timed-out eval can still execute late and mutate the
+  repainted screen; R4 — sol checked the dioxus 0.7.10 source (Eval is
+  Copy, no drop cancellation) killing the drop-abort theory, CAUGHT a
+  lane defect (the release branch future took the fence out before
+  awaiting — a select cancellation would drop it: the staged future
+  now persists in a loop local, borrow-and-poll, removed only on
+  completion), and required the SUPERSESSION EPOCH (landed:
+  SYNTH_FLUSH_SUPERSESSION — the flush script carries the epoch at its
+  build; the recovery repaint stamps entry.flushSupersession at its
+  execution; a late continuation rejects its own write,
+  reason 'superseded') plus honest failure reasons (no_host / throw /
+  bridge_error / ack_timeout / superseded / bad_answer — one
+  ack_timeout label had been hiding the first from every reader);
+  R5 — the exact-count bars (every dense sample == 1, repaint == 1,
+  reconcile_applied == 1 — a vanished marker no longer passes a
+  max()>1 predicate; latecontrol classifies suppression only after
+  validity) and honest labels ("no late mutation observed" — guard-off
+  runs were also clean, so the guard never demonstrably rejected
+  anything; the source reading and the behavioral observation are
+  stated separately). THE PAIRED MEASUREMENT (fence-rig
+  MODE=latecontrol, the drop-suppression arm): a RETAINED future
+  (10s ack timeout, guard off) demonstrably performs the delayed
+  write at +5s (acked 204B — the continuation mechanism is live; the
+  inline branch holds the loop so it delivered as the sole writer);
+  a DROPPED future (3s timeout, guard off, repaint landed first) does
+  NOT write post-drop (count exactly 1 through the dense window, no
+  second heal — measured twice). Exit 5 = suppressed (measured, this
+  bridge; not a cancellation guarantee), exit 0 = duplication proven
+  (a bridge upgrade that starts executing dropped scripts flips this
+  arm — and the epoch guard then covers it). The release-path
+  acked flush rides its own SELECT BRANCH (the pre_select body may
+  not await — the input-starvation lock convicted the inline await;
+  the eval future is !Send so no tokio::spawn: staging extracted to
+  stage_synth_release_flush so the region carries no .await text).
+  RESIDUE (next on this line,
   sol Q7): the full Q7 binding — CONTENT-READY + painted-state
   promotion to an owner/session/runtime/mount-generation-qualified
   application ack; the flush acks are per-batch DELIVERY acks, not the
