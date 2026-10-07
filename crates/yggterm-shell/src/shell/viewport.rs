@@ -7223,6 +7223,12 @@ fn TerminalCanvas(
             // [F1-(e)] the synthesis output fence: Some while the seed
             // snapshot is outstanding — see SynthOutputFence.
             let mut synth_output_fence: Option<SynthOutputFence> = None;
+            // [F1-(e-r1)-R2] a fence released by the PRE_SELECT write site
+            // waits here for its ack-carrying flush on the loop's own
+            // release-flush branch (with the batch that broke it — that
+            // batch writes live only AFTER the released batches).
+            let mut synth_release_flush: Option<SynthOutputFence> = None;
+            let mut synth_release_flush_batch: Option<String> = None;
             // [F1-(e-r1)] The seed's stream-cursor stamp, OUTLIVING the
             // fence: chunks at or below it are inside the seeded screen
             // forever on this mount, so a round that resolves after the
@@ -7533,31 +7539,15 @@ fn TerminalCanvas(
                         // AHEAD of this batch, each delivery acknowledged —
                         // but this site lives in the PRE_SELECT body (the
                         // input-starvation lock: no round trip may be
-                        // awaited here), so the ack-carrying flush AND this
-                        // batch's live write run sequenced on a spawned
-                        // task (release precedes the batch that broke the
-                        // fence; concurrent release flushes are impossible
-                        // by construction — one fence, one release, one
-                        // task).
+                        // awaited here) and the eval future is !Send (no
+                        // tokio::spawn), so the release STAGES here and the
+                        // ack-carrying flush + this batch's live write ride
+                        // the synth_release_flush select branch (release
+                        // precedes the batch that broke the fence; one
+                        // fence, one release, one staged flush).
                         if let Some(fence) = released_fence.take() {
-                            let flush_host = host_id.clone();
-                            let flush_session = session_path.clone();
-                            let flush_trace = trace_home.to_path_buf();
-                            let flush_batch = data.clone();
-                            tokio::spawn(async move {
-                                flush_synth_output_fence_live(
-                                    fence,
-                                    &flush_host,
-                                    &flush_session,
-                                    &flush_trace,
-                                    "release",
-                                )
-                                .await;
-                                let _ = document::eval(&terminal_page_write_script(
-                                    &flush_host,
-                                    &flush_batch,
-                                ));
-                            });
+                            synth_release_flush = Some(fence);
+                            synth_release_flush_batch = Some(data.clone());
                         } else if !retained_now {
                             let _ = document::eval(&terminal_page_write_script(&host_id, &data));
                         }
@@ -12834,6 +12824,36 @@ fn TerminalCanvas(
                             }
                         }
                     }
+                    // [F1-(e-r1)-R2] the staged release flush: the fence a
+                    // pre_select write site released. The ack-carrying
+                    // flush CANNOT run there (input-starvation lock) nor on
+                    // a spawned task (the eval future is !Send) — it runs
+                    // HERE: every retained batch out, acknowledged or
+                    // explicitly named undelivered, then the batch that
+                    // broke the fence writes live.
+                    synth_release_flush_done = async {
+                        let fence = synth_release_flush
+                            .take()
+                            .expect("release flush armed");
+                        flush_synth_output_fence_live(
+                            fence,
+                            &host_id,
+                            &session_path,
+                            &trace_home,
+                            "release",
+                        )
+                        .await;
+                        if let Some(batch) = synth_release_flush_batch.take() {
+                            let _ = document::eval(&terminal_page_write_script(
+                                &host_id,
+                                &batch,
+                            ));
+                        }
+                    },
+                        if synth_release_flush.is_some() =>
+                    {
+                        let _release_flush_done = synth_release_flush_done;
+                    },
                     synth_hash_probe_answer = async {
                         synth_hash_probe_eval
                             .as_mut()
