@@ -7223,11 +7223,15 @@ fn TerminalCanvas(
             // [F1-(e)] the synthesis output fence: Some while the seed
             // snapshot is outstanding — see SynthOutputFence.
             let mut synth_output_fence: Option<SynthOutputFence> = None;
-            // [F1-(e-r1)-R2] a fence released by the PRE_SELECT write site
-            // waits here for its ack-carrying flush on the loop's own
-            // release-flush branch (with the batch that broke it — that
-            // batch writes live only AFTER the released batches).
-            let mut synth_release_flush: Option<SynthOutputFence> = None;
+            // [F1-(e-r1)-R2 sol r4] a fence released by the PRE_SELECT
+            // write site stages its ack-carrying flush HERE as a pinned,
+            // owned future polled by the release-flush select branch —
+            // persistent across select cancellations (removed only on
+            // completion), with the batch that broke it (that batch
+            // writes live only AFTER the released batches).
+            let mut synth_release_flush_future: Option<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+            > = None;
             let mut synth_release_flush_batch: Option<String> = None;
             // [F1-(e-r1)] The seed's stream-cursor stamp, OUTLIVING the
             // fence: chunks at or below it are inside the seeded screen
@@ -7540,13 +7544,25 @@ fn TerminalCanvas(
                         // but this site lives in the PRE_SELECT body (the
                         // input-starvation lock: no round trip may be
                         // awaited here) and the eval future is !Send (no
-                        // tokio::spawn), so the release STAGES here and the
-                        // ack-carrying flush + this batch's live write ride
-                        // the synth_release_flush select branch (release
-                        // precedes the batch that broke the fence; one
-                        // fence, one release, one staged flush).
+                        // tokio::spawn), so the release STAGES here as an
+                        // owned pinned future for the synth_release_flush
+                        // select branch (release precedes the batch that
+                        // broke the fence; one fence, one release, one
+                        // staged flush).
                         if let Some(fence) = released_fence.take() {
-                            synth_release_flush = Some(fence);
+                            let flush_host = host_id.clone();
+                            let flush_session = session_path.clone();
+                            let flush_trace = trace_home.to_path_buf();
+                            synth_release_flush_future = Some(Box::pin(async move {
+                                flush_synth_output_fence_live(
+                                    fence,
+                                    &flush_host,
+                                    &flush_session,
+                                    &flush_trace,
+                                    "release",
+                                )
+                                .await;
+                            }));
                             synth_release_flush_batch = Some(data.clone());
                         } else if !retained_now {
                             let _ = document::eval(&terminal_page_write_script(&host_id, &data));
@@ -12824,35 +12840,28 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    // [F1-(e-r1)-R2] the staged release flush: the fence a
-                    // pre_select write site released. The ack-carrying
-                    // flush CANNOT run there (input-starvation lock) nor on
-                    // a spawned task (the eval future is !Send) — it runs
-                    // HERE: every retained batch out, acknowledged or
-                    // explicitly named undelivered, then the batch that
-                    // broke the fence writes live.
+                    // [F1-(e-r1)-R2 sol r4] the staged release flush: the
+                    // future PERSISTS in the loop local across select
+                    // cancellations (a take() inside the branch future
+                    // loses the fence the moment another branch wins —
+                    // sol's round-4 catch); it is removed ONLY on
+                    // completion, then the batch that broke the fence
+                    // writes live.
                     synth_release_flush_done = async {
-                        let fence = synth_release_flush
-                            .take()
-                            .expect("release flush armed");
-                        flush_synth_output_fence_live(
-                            fence,
-                            &host_id,
-                            &session_path,
-                            &trace_home,
-                            "release",
-                        )
-                        .await;
+                        synth_release_flush_future
+                            .as_mut()
+                            .expect("release flush armed")
+                            .await
+                    },
+                        if synth_release_flush_future.is_some() =>
+                    {
+                        synth_release_flush_future = None;
                         if let Some(batch) = synth_release_flush_batch.take() {
                             let _ = document::eval(&terminal_page_write_script(
                                 &host_id,
                                 &batch,
                             ));
                         }
-                    },
-                        if synth_release_flush.is_some() =>
-                    {
-                        let _release_flush_done = synth_release_flush_done;
                     },
                     synth_hash_probe_answer = async {
                         synth_hash_probe_eval
@@ -21407,6 +21416,16 @@ fn synth_fence_flush_eval_shed() -> bool {
         .unwrap_or(false)
 }
 
+/// [F1-(e-r1)-R2 sol r4] the ack-timeout bound, overridable for the
+/// rig's positive-control arm (a RETAINED future must outlive the
+/// delayed execution to prove the continuation mechanism).
+fn synth_fence_flush_ack_timeout_ms() -> u64 {
+    std::env::var("YGGTERM_TEST_FLUSH_ACK_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SYNTH_OUTPUT_FENCE_FLUSH_ACK_TIMEOUT_MS)
+}
+
 /// [F1-(e-r1)-R2] (sol Q1) One flush batch's delivery verdict.
 enum FenceFlushDelivery {
     Acked,
@@ -21427,29 +21446,38 @@ async fn fence_page_write_eval_acked(host_id: &str, batch: &str) -> FenceFlushDe
     }
     let eval = document::eval(&terminal_page_write_acked_script(host_id, batch));
     let answer = tokio::time::timeout(
-        std::time::Duration::from_millis(SYNTH_OUTPUT_FENCE_FLUSH_ACK_TIMEOUT_MS),
+        std::time::Duration::from_millis(synth_fence_flush_ack_timeout_ms()),
         eval,
     )
     .await;
+    // [sol r4] reason honesty: the timeout, a bridge error, and a
+    // malformed answer are DIFFERENT failures — one ack_timeout label
+    // for all three hid the first from every trace reader.
     let verdict = match answer {
         Ok(Ok(value)) => value
             .as_str()
             .and_then(|body| serde_json::from_str::<Value>(body).ok()),
-        _ => None,
+        Ok(Err(_error)) => Some(json!({ "ok": false, "reason": "bridge_error" })),
+        Err(_elapsed) => Some(json!({ "ok": false, "reason": "ack_timeout" })),
     };
     match verdict
         .as_ref()
         .and_then(|body| body.get("ok").and_then(Value::as_bool))
     {
         Some(true) => FenceFlushDelivery::Acked,
-        Some(false) | None => match verdict
-            .as_ref()
-            .and_then(|body| body.get("reason").and_then(Value::as_str))
-        {
-            Some("no_host") => FenceFlushDelivery::Undelivered("no_host"),
-            Some("throw") => FenceFlushDelivery::Undelivered("throw"),
-            _ => FenceFlushDelivery::Undelivered("ack_timeout"),
-        },
+        Some(false) | None => {
+            let reason = verdict
+                .as_ref()
+                .and_then(|body| body.get("reason").and_then(Value::as_str));
+            match reason {
+                Some("no_host") => FenceFlushDelivery::Undelivered("no_host"),
+                Some("throw") => FenceFlushDelivery::Undelivered("throw"),
+                Some("bridge_error") => FenceFlushDelivery::Undelivered("bridge_error"),
+                Some("ack_timeout") => FenceFlushDelivery::Undelivered("ack_timeout"),
+                Some("superseded") => FenceFlushDelivery::Undelivered("superseded"),
+                _ => FenceFlushDelivery::Undelivered("bad_answer"),
+            }
+        }
     }
 }
 

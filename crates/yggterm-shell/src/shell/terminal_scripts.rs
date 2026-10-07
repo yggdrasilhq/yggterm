@@ -382,21 +382,42 @@ if (__t && typeof __t.write === 'function') {{
 /// top-level `return` — the eval bridge shape law). ok:false names the
 /// transport verdict (no_host / throw); a hung bridge is bounded by the
 /// caller's Rust-side timeout.
+/// [F1-(e-r1)-R2 sol Q3, rounds 3+4] The flush SUPERSESSION epoch: a
+/// Rust-side monotonic counter read at every acked-flush script BUILD
+/// (the carried token) and bumped at every recovery-repaint script
+/// BUILD; the repaint script stamps the greater value onto the page
+/// host entry (entry.flushSupersession) at its execution. A flush
+/// script that executes AFTER a repaint submitted behind it reads the
+/// stamped epoch above its carried token and REJECTS ITS OWN WRITE —
+/// the timed-out late continuation (dioxus does NOT cancel eval
+/// scripts on future drop; measured + the round-4 source check) can
+/// no longer mutate a screen the recovery already repainted.
+pub(crate) static SYNTH_FLUSH_SUPERSESSION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn terminal_page_write_acked_script(host_id: &str, data: &str) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     let data = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
     // [F1-(e-r1)-R2 sol Q1] the callback rides the DATA write itself —
     // it acknowledges the batch's own parse completion (xterm's FIFO
     // write queue), not a second empty enqueue.
-    // [sol Q3] TEST HOOK: a delayed EXECUTION (the eval resolves after
-    // the caller's timeout already declared the batch undelivered) for
-    // the rig's lateflush bar — the exact late-mutation hazard Q3
-    // convicted.
+    // [sol Q3] TEST HOOKS: a delayed EXECUTION (the eval runs past the
+    // caller's timeout — the exact late-mutation hazard Q3 convicted)
+    // and a guard OFF switch (the rig's positive-control arm must
+    // demonstrate the delayed write fires when unguarded).
     let exec_delay_ms: u64 = std::env::var("YGGTERM_TEST_FLUSH_EXEC_DELAY_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     let exec_delay = serde_json::to_string(&exec_delay_ms).unwrap_or_else(|_| "0".to_string());
+    let guard_off = std::env::var("YGGTERM_TEST_FLUSH_SUPERSESSION_OFF")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let carried = if guard_off {
+        u64::MAX
+    } else {
+        SYNTH_FLUSH_SUPERSESSION.load(std::sync::atomic::Ordering::Relaxed)
+    };
     format!(
         r#"const __h = {host};
 const __e = (window.__yggtermXtermHosts || {{}})[__h];
@@ -406,6 +427,9 @@ if (!(__t && typeof __t.write === 'function')) {{
 }}
 if ({exec_delay} > 0) {{
     await new Promise((resolve) => setTimeout(resolve, {exec_delay}));
+}}
+if (Number(__e.flushSupersession || 0) > {carried}) {{
+    return JSON.stringify({{ ok: false, reason: 'superseded' }});
 }}
 try {{
     await new Promise((resolve) => __t.write({data}, resolve));
@@ -14756,6 +14780,13 @@ fn terminal_replay_retained_data_script_for_session(
     source: &str,
     runtime_spawn_id: u64,
 ) -> String {
+    // [F1-(e-r1)-R2 sol Q3] this recovery repaint SUPERSEDES every
+    // flush script built before it: the stamp below rides both write
+    // arms, and a late flush continuation rejects its own write
+    // against it (see SYNTH_FLUSH_SUPERSESSION).
+    let supersession = SYNTH_FLUSH_SUPERSESSION
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     let session_path = serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
     let data = sanitize_terminal_replay_payload(data);
     let data = serde_json::to_string(&data).unwrap_or_else(|_| "\"\"".to_string());
@@ -15338,6 +15369,7 @@ fn terminal_replay_retained_data_script_for_session(
               // XTERM-BUG: cold-reveal-bulk-write-freeze — raise the bulk-write
               // in-flight signal so the per-line onScroll heavy tail is skipped
               // during this replay parse (same skip as bridge write flushes).
+              entry.flushSupersession = Math.max(Number(entry.flushSupersession || 0), {supersession});
               entry.writeBridgeInFlight = true;
               entry.lastWriteFlushStartedAtMs = Date.now();
               // ⭐ THE HALF THE GHOST-FRAME ENTRY SUSPECTS. The daemon serves a
@@ -15638,6 +15670,7 @@ fn terminal_replay_retained_data_script_for_session(
               // XTERM-BUG: cold-reveal-bulk-write-freeze — raise the bulk-write
               // in-flight signal so the per-line onScroll heavy tail is skipped
               // during this replay parse (same skip as bridge write flushes).
+              entry.flushSupersession = Math.max(Number(entry.flushSupersession || 0), {supersession});
               entry.writeBridgeInFlight = true;
               entry.lastWriteFlushStartedAtMs = Date.now();
               if (window.__yggtermTrace && window.__yggtermTrace.captureStream) {{
@@ -15710,6 +15743,7 @@ fn terminal_replay_retained_data_script_for_session(
         session_path = session_path,
         data = data,
         source = source,
+        supersession = supersession,
     )
 }
 fn terminal_set_input_policy_script_for_active_session(

@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ]; then echo "MODE must be order|dup|loss|flushshed|lateflush"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -81,6 +81,9 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   fi
   if [ "$MODE" = lateflush ]; then
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000;"
+  fi
+  if [ "$MODE" = latecontrol ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000 YGGTERM_TEST_FLUSH_ACK_TIMEOUT_MS=10000 YGGTERM_TEST_FLUSH_SUPERSESSION_OFF=1;"
   fi
   if [ "$SYNTH" = 1 ]; then
     dbus-run-session -- bash -c "
@@ -415,6 +418,60 @@ if MODE == "lateflush":
         raise SystemExit(fail_rc)
     print("RIG PASS — the late mutation REJECTED: page exactly the repaint's one copy, the timeout reported undelivered")
     raise SystemExit(0)
+
+if MODE == "latecontrol":
+    # (e-r1)-R2 BAR 8 — THE POSITIVE CONTROL (sol r4): the delayed
+    # flush continuation, with the future RETAINED (a 10s ack timeout)
+    # and the supersession guard OFF, MUST demonstrably perform the
+    # delayed write over the repaint — proving the continuation
+    # mechanism is live (and therefore that the lateflush bar's safety
+    # is attributable to the GUARD, not to any drop-abort folklore).
+    # PASS = duplication observed (page count >1 in the dense window OR
+    # a second reconcile heal) AND the late ack recorded (the batch
+    # acked at ~+5s); FAIL = the mechanism did not reproduce.
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    deadline = time.time() + 12
+    repainted = 0
+    while time.time() < deadline:
+        c, _ = page_screen_count(s, "E1RMARK")
+        if c >= 1:
+            repainted = c
+            break
+        time.sleep(0.3)
+    print("repaint landed: page=%d" % repainted)
+    if repainted < 1:
+        print("PRE-FLIGHT FAIL: the reconcile repaint never landed inside 12s")
+        raise SystemExit(4)
+    # the delayed write fires at ~flush+5s; the re-heal ~2s later —
+    # dense sampling INSIDE that window (masked-at-rest law)
+    time.sleep(3.0)
+    counts = []
+    for _ in range(8):
+        c, _ = page_screen_count(s, "E1RMARK")
+        counts.append(c)
+        time.sleep(0.25)
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    acked_total = sum(int(p.get("acked_bytes") or 0) for _, p in flush_events)
+    reconcile_applied = len(
+        [1 for _, name, p in events
+         if name == "frame_hash_reconcile_applied" and p.get("session_path") == s])
+    print("VERDICT FENCE-LATECONTROL: repaint=%d dense counts=%s reconcile_applied=%d acked=%dB" % (
+        repainted, counts, reconcile_applied, acked_total))
+    if max(counts) > 1 or repainted > 1 or reconcile_applied > 1:
+        if acked_total >= 9:
+            print("RIG PASS — the delayed continuation DEMONSTRABLY writes over the repaint (duplication observed) and acks late (%dB): the mechanism is live, the lateflush bar's safety is the GUARD's" % acked_total)
+            raise SystemExit(0)
+        print("VERDICT PARTIAL: duplication observed but the late ack is missing (acked=%dB) — control incomplete" % acked_total)
+        raise SystemExit(6)
+    print("VERDICT CONTROL FAIL: no duplication in the dense window and no second heal — the delayed write did NOT fire; the hazard mechanism did not reproduce (re-examine before relying on the guard)")
+    raise SystemExit(6)
 
 # (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
 # a duplicated frame within ~2s of the proof (measured RED run 4: flush
