@@ -354,6 +354,27 @@ impl LiveRowTombstones {
         })
     }
 
+    /// Was `identity`'s close recorded within `window_secs` of `now`? The
+    /// freshness question the remote-agent START door asks ([11.229](d)): a
+    /// deliberate close races the client's own queued start asks, and the door
+    /// must refuse to re-mint a key whose close is that fresh — while a
+    /// deliberate re-open minutes later, and the plane's own import veto,
+    /// keep their existing semantics untouched. Read-only, fresh-load, exactly
+    /// like [`Self::blocks`]: the shared file may have been written by a peer
+    /// after this process booted.
+    pub fn close_recorded_within(
+        home_dir: &Path,
+        identity: &str,
+        window_secs: u64,
+        now: u64,
+    ) -> bool {
+        let loaded = Self::load(home_dir, now);
+        loaded
+            .entries
+            .get(identity)
+            .is_some_and(|recorded| now.saturating_sub(*recorded) <= window_secs)
+    }
+
     /// Re-arm a close that just REFUSED an automatic offer — the write-side
     /// twin of the read door [`crate::live_row_closes_remembered_among`].
     /// [`Self::record_close`] deliberately never refreshes (the original
@@ -612,6 +633,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_fresh_close_is_within_the_window_and_a_stale_one_is_not() {
+        // [11.229](d) The start-door veto's question: only a FRESH close
+        // refuses a late start; a stale one (outside the window) and an
+        // absent one never do, so deliberate re-opens wait out at most the
+        // window.
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-fresh-close-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let now = 1_000_000_u64;
+        LiveRowTombstones::default()
+            .record_close(&home, "id::gone-recently", now)
+            .expect("record a fresh close");
+        LiveRowTombstones::default()
+            .record_close(&home, "id::gone-long-ago", now - 10_000)
+            .expect("record a stale close");
+        assert!(LiveRowTombstones::close_recorded_within(
+            &home,
+            "id::gone-recently",
+            120,
+            now
+        ));
+        assert!(!LiveRowTombstones::close_recorded_within(
+            &home,
+            "id::gone-long-ago",
+            120,
+            now
+        ));
+        assert!(!LiveRowTombstones::close_recorded_within(
+            &home,
+            "id::never-closed",
+            120,
+            now
+        ));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     fn a_recorded_close_blocks_until_the_ttl_expires() {
         let mut tombstones = LiveRowTombstones::default();
         assert!(tombstones.record("id::dead-shell", 1_000));
