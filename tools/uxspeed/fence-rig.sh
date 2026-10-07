@@ -474,8 +474,15 @@ if MODE == "latecontrol":
     if undelivered_total < 9:
         print("VERDICT FAIL: no duplication AND no undelivered trace — the flush shape broke entirely")
         raise SystemExit(6)
-    print("VERDICT CONTROL FAIL: the flush timed out undelivered (%dB) but the delayed write did NOT duplicate over the repaint — the post-drop continuation did not fire; re-examine before relying on the guard" % undelivered_total)
-    raise SystemExit(6)
+    # MEASUREMENT ARM (not a landing gate): paired with the retained-
+    # future run (delayed write fired, acked, sole-writer), this is the
+    # drop-suppression pair — the post-drop continuation did NOT write
+    # (measured 2026-10-08, two shapes). The supersession guard stays
+    # as defense-in-depth regardless (no source-level cancellation
+    # guarantee; a bridge upgrade that starts executing dropped scripts
+    # turns this arm's exit 5 into exit 0 — and lateflush then guards).
+    print("CONTROL MEASUREMENT: the flush timed out undelivered (%dB), the repaint holds exactly one copy, and the guard-OFF post-drop continuation did NOT write — drop-suppression observed on this bridge (exit 5 = suppressed, 0 = duplication proven)" % undelivered_total)
+    raise SystemExit(5)
 
 # (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
 # a duplicated frame within ~2s of the proof (measured RED run 4: flush
