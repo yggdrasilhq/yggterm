@@ -7218,7 +7218,7 @@ fn TerminalCanvas(
             // mount's read-pump writes through the page host registry for the
             // rest of its life.
             let (synth_snapshot_tx, mut synth_snapshot_rx) =
-                tokio::sync::mpsc::channel::<(String, u64)>(1);
+                tokio::sync::mpsc::channel::<(String, u64, u64)>(1);
             let mut synth_snapshot_requested = false;
             // [F1-(e)] the synthesis output fence: Some while the seed
             // snapshot is outstanding — see SynthOutputFence.
@@ -7227,9 +7227,20 @@ fn TerminalCanvas(
             // fence: chunks at or below it are inside the seeded screen
             // forever on this mount, so a round that resolves after the
             // proof (fence long down) must still not paint them twice.
-            // Zeroed on runtime replacement (a new runtime mints seqs from
-            // 0 — the old stamp would drop FRESH chunks) and on rewind.
+            // COMMITTED only by the seed's application ack (R1), and
+            // zeroed on runtime replacement (a new runtime mints seqs from
+            // 0 — the old stamp would drop FRESH chunks) and on rewind
+            // (a continuity break — fail open).
             let mut synth_seed_stamp: u64 = 0;
+            // [F1-(e-r1)-R1] The PROVISIONAL stamp a seed arrival carries;
+            // it commits to synth_seed_stamp only when the proof acks the
+            // application (wrote_seed>0 — xterm's write callback fired).
+            // Zero = nothing pending.
+            let mut synth_pending_seed_seq: u64 = 0;
+            // [F1-(e-r1)-R2] (sol Q3): the daemon CAPTURE-TIME runtime id
+            // the seed carried — 0 (an old daemon) means continuity is
+            // UNKNOWN, which may render but never commits a coverage drop.
+            let mut synth_pending_seed_runtime: u64 = 0;
             let mut synth_proof_eval: Option<
                 std::pin::Pin<
                     Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
@@ -12418,6 +12429,15 @@ fn TerminalCanvas(
                                         (
                                             sanitize_terminal_replay_payload(&answer.text),
                                             answer.output_seq,
+                                            // [F1-(e-r1)-R2] (sol Q3): the
+                                            // daemon's CAPTURE-TIME runtime
+                                            // identity — already on the wire
+                                            // ([11.229](b)) — qualifies the
+                                            // seed's seq space at the
+                                            // source, independent of what
+                                            // the client has polled by the
+                                            // time the answer lands.
+                                            answer.runtime_spawn_id,
                                         )
                                     })
                                     .unwrap_or_default();
@@ -12447,45 +12467,68 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    Some((synth_seed_text, synth_seed_output_seq)) =
+                    Some((synth_seed_text, synth_seed_output_seq, synth_seed_runtime)) =
                         synth_snapshot_rx.recv() =>
                     {
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "synth_seed",
                             &session_path,
                         );
-                        let seed_bytes = synth_seed_text.len();
-                        // [F1-(e-r1)] THE SEED'S STREAM-CURSOR STAMP: the
-                        // answer carries the daemon seq the seeded screen
-                        // renders. A retained batch whose round's daemon
-                        // cursor is at or below the stamp is ALREADY IN the
-                        // seed — flushing it would duplicate its content
-                        // onto the viewport (the rare append class; the
-                        // sitting-15 remount-rig double-paint flake). Drop
-                        // the provably covered batches here, before the
-                        // proof; survivors flush in order as before.
-                        if synth_seed_output_seq > 0 {
-                            synth_seed_stamp = synth_seed_output_seq;
-                        }
-                        if let Some(fence) = synth_output_fence.as_mut()
-                            && synth_seed_output_seq > 0
+                        // [F1-(e-r1)-R2] RUNTIME-QUALIFIED SEED: the fetch
+                        // carries the daemon's CAPTURE-TIME runtime id. A
+                        // KNOWN capture id that no longer matches the
+                        // client's CURRENT knowledge means the runtime was
+                        // replaced while the seed was outstanding — its seq
+                        // stamp would classify NEW-runtime batches under
+                        // OLD-runtime coverage. Discard it and fail
+                        // explicitly (flush everything live); an unknown
+                        // capture id (0 — an old daemon) fails OPEN for
+                        // rendering but can never commit a drop.
+                        if synth_seed_runtime != 0
+                            && known_runtime_spawn_id != 0
+                            && synth_seed_runtime != known_runtime_spawn_id
                         {
-                            fence.seed_output_seq = synth_seed_output_seq;
-                            let (dropped_batches, dropped_bytes) =
-                                fence.drop_seed_covered(synth_seed_output_seq);
-                            if dropped_batches > 0 {
-                                append_trace_event(
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "synth_seed_discarded_stale_runtime",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "requested_runtime_spawn_id": synth_seed_runtime,
+                                    "known_runtime_spawn_id": known_runtime_spawn_id,
+                                    "seed_output_seq": synth_seed_output_seq,
+                                }),
+                            );
+                            synth_pending_seed_seq = 0;
+                            synth_pending_seed_runtime = 0;
+                            if let Some(fence) = synth_output_fence.take() {
+                                flush_synth_output_fence_live(
+                                    fence,
+                                    &host_id,
+                                    &session_path,
                                     &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "synth_output_fence_seed_covered_drop",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "seed_output_seq": synth_seed_output_seq,
-                                        "dropped_batches": dropped_batches,
-                                        "dropped_bytes": dropped_bytes,
-                                    }),
+                                    "stale_runtime",
                                 );
+                            }
+                        } else {
+                        let seed_bytes = synth_seed_text.len();
+                        // [F1-(e-r1)-R1] THE STAMP IS PROVISIONAL: the
+                        // answer carries the daemon seq the seeded screen
+                        // renders — a retained batch whose round's daemon
+                        // cursor is at or below it is provably covered —
+                        // but coverage COMMITS only on the seed's
+                        // application ack (the proof's wrote_seed>0:
+                        // xterm's write callback fired). Destroying
+                        // batches at arrival, while the seed can still
+                        // skip (missing host / empty text) or fail to
+                        // prove, is the data-loss dual of the duplication
+                        // this fence was built to kill (sol R1).
+                        if synth_seed_output_seq > 0 {
+                            synth_pending_seed_seq = synth_seed_output_seq;
+                            synth_pending_seed_runtime = synth_seed_runtime;
+                            if let Some(fence) = synth_output_fence.as_mut() {
+                                fence.seed_output_seq = synth_seed_output_seq;
                             }
                         }
                         append_trace_event(
@@ -12510,18 +12553,35 @@ fn TerminalCanvas(
                         // writes have flowed live again and the seed must
                         // not clobber them.
                         let synth_seed_fenced = synth_output_fence.is_some();
+                        // [F1-(e-r1)-R1] TEST HOOK: the forced no-ack shape
+                        // for the rig's loss bar (MODE=loss) — the proof
+                        // answers skipped before any seed write.
+                        let synth_seed_forced_skip = std::env::var(
+                            "YGGTERM_TEST_SEED_FORCED_SKIP",
+                        )
+                        .map(|value| value == "1")
+                        .unwrap_or(false);
                         synth_proof_eval = Some(Box::pin(
                             document::eval(&terminal_synthesized_mount_open_script(
                                 &host_id,
-                                if synth_seed_text.trim().is_empty() {
+                                // [F1-(e-r1)-R1] (sol Q2): blank text
+                                // WITH a stamp is a VALID blank screen —
+                                // it must apply as an empty repaint, not
+                                // skip; only blank AND seq 0 (the fetch
+                                // failed / old daemon) is a None seed.
+                                if synth_seed_text.trim().is_empty()
+                                    && synth_seed_output_seq == 0
+                                {
                                     None
                                 } else {
                                     Some(&synth_seed_text)
                                 },
                                 synth_seed_fenced,
+                                synth_seed_forced_skip,
                             ))
                             .join::<Value>(),
                         ));
+                        }
                     }
                     synth_proof_answer = async {
                         synth_proof_eval
@@ -12569,6 +12629,11 @@ fn TerminalCanvas(
                                     .and_then(Value::as_str)
                                     .unwrap_or("unknown")
                                     .to_string();
+                                // [F1-(e-r1)-R1] the application ack
+                                // discriminator — see
+                                // synth_seed_application_acked.
+                                let seed_applied =
+                                    synth_seed_application_acked(&proof);
                                 let geometry_usable = screen_in_host
                                     && terminal_geometry_is_usable(
                                         cols_value as u16,
@@ -12620,33 +12685,90 @@ fn TerminalCanvas(
                                     "synthesized_mount_open",
                                     payload,
                                 );
-                                // [F1-(e)] THE FENCE FLUSH: the proof's
-                                // return IS the application ack — the seed
-                                // script awaits xterm's write callback
-                                // before returning — so the authoritative
-                                // screen is IN and the retained
-                                // differentials replay past it, in order,
-                                // through the same page write eval the
-                                // live sites use.
+                                // [F1-(e-r1)-R1] THE ACK COMMITS: only a
+                                // seed that actually WROTE (wrote_seed>0
+                                // through one of the two write arms —
+                                // xterm's write callback fired inside the
+                                // script) proves the covered batches are
+                                // now duplicated bytes; that is the moment
+                                // the stamp and the drop may commit. A
+                                // PARSED proof that wrote nothing (skipped:
+                                // missing host / empty text) is NOT an ack
+                                // — the explicit failure below flushes
+                                // everything live instead of silently
+                                // destroying coverage.
+                                if synth_pending_seed_seq > 0 && !seed_applied {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "synth_output_fence_seed_unapplied",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "reason": seed_mode,
+                                            "wrote_seed": wrote_seed,
+                                            "pending_seed_seq": synth_pending_seed_seq,
+                                        }),
+                                    );
+                                } else if synth_pending_seed_seq > 0
+                                    && seed_applied
+                                    && synth_pending_seed_runtime == 0
+                                {
+                                    // [F1-(e-r1)-R2] (sol Q3): the seed
+                                    // applied (it renders above) but its
+                                    // capture-time runtime id is UNKNOWN
+                                    // (an old daemon never sent one) — the
+                                    // stamp's seq space is unproven, so
+                                    // the dedupe stays disarmed.
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "synth_seed_unknown_runtime_no_commit",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "pending_seed_seq": synth_pending_seed_seq,
+                                        }),
+                                    );
+                                } else if synth_pending_seed_seq > 0 && seed_applied {
+                                    synth_seed_stamp = synth_pending_seed_seq;
+                                    if let Some(fence) = synth_output_fence.as_mut() {
+                                        let (dropped_batches, dropped_bytes) = fence
+                                            .drop_seed_covered(synth_pending_seed_seq);
+                                        if dropped_batches > 0 {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "synth_output_fence_seed_covered_drop",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "seed_output_seq": synth_pending_seed_seq,
+                                                    "dropped_batches": dropped_batches,
+                                                    "dropped_bytes": dropped_bytes,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
+                                synth_pending_seed_seq = 0;
+                                synth_pending_seed_runtime = 0;
+                                // [F1-(e)] THE FENCE FLUSH: on an ack, the
+                                // authoritative screen is IN and the
+                                // surviving differentials replay past it,
+                                // in order, through the same page write
+                                // eval the live sites use; without one,
+                                // this same flush is the explicit failure —
+                                // every retained byte goes out live (order
+                                // may be imperfect, no byte is lost).
                                 if let Some(fence) = synth_output_fence.take() {
-                                    for (batch, _) in &fence.retained {
-                                        let _ = document::eval(
-                                            &terminal_page_write_script(&host_id, batch),
-                                        );
-                                    }
-                                    if !fence.retained.is_empty() {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "synth_output_fence_flushed",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "batches": fence.retained.len(),
-                                                "bytes": fence.retained_bytes,
-                                            }),
-                                        );
-                                    }
+                                    flush_synth_output_fence_live(
+                                        fence,
+                                        &host_id,
+                                        &session_path,
+                                        &trace_home,
+                                        if seed_applied { "seed_ack" } else { "seed_unapplied" },
+                                    );
                                 }
                             }
                             None => {
@@ -12660,6 +12782,20 @@ fn TerminalCanvas(
                                         "host_id": host_id.clone(),
                                     }),
                                 );
+                                // [F1-(e-r1)-R1] An unreadable proof is NO
+                                // ack either: the stamp never committed, so
+                                // nothing covers the retained bytes — flush
+                                // everything live, explicitly.
+                                synth_pending_seed_seq = 0;
+                                if let Some(fence) = synth_output_fence.take() {
+                                    flush_synth_output_fence_live(
+                                        fence,
+                                        &host_id,
+                                        &session_path,
+                                        &trace_home,
+                                        "proof_unreadable",
+                                    );
+                                }
                             }
                         }
                     }
@@ -13386,8 +13522,13 @@ fn TerminalCanvas(
                                     // chunk seqs from zero — the old seed's
                                     // stamp would license dropping FRESH
                                     // chunks. The dedupe stands down until
-                                    // a new seed re-stamps.
+                                    // a new seed re-stamps (R2: a stampable
+                                    // seed still outstanding is void too —
+                                    // its arrival is discarded by the
+                                    // runtime qualification).
                                     synth_seed_stamp = 0;
+                                    synth_pending_seed_seq = 0;
+                                    synth_pending_seed_runtime = 0;
                                 }
                                 known_runtime_spawn_id = runtime_spawn_id;
                                 // [11.167] A runtime START under this watch is a
@@ -13587,6 +13728,19 @@ fn TerminalCanvas(
                                             "runtime_replaced": runtime_replaced,
                                         }),
                                     );
+                                    // [F1-(e-r1)-R2] A rewind is a
+                                    // continuity break: the daemon replays
+                                    // a stream range the seed's seq stamp
+                                    // may no longer describe. Fail OPEN —
+                                    // clear the stamp (its comment has
+                                    // claimed this since sitting 18) AND
+                                    // any still-pending provisional seed:
+                                    // an outstanding proof must not commit
+                                    // coverage the rewind invalidated
+                                    // (sol Q4).
+                                    synth_seed_stamp = 0;
+                                    synth_pending_seed_seq = 0;
+                                    synth_pending_seed_runtime = 0;
                                     let _ = eval.send(terminal_reset_command(&title, &theme));
                                     let _ = eval.send(TerminalJsCommand::SetInputEnabled {
                                         enabled: false,
@@ -21211,6 +21365,62 @@ impl SynthOutputFence {
             before_batches.saturating_sub(self.retained.len()),
             before_bytes.saturating_sub(self.retained_bytes),
         )
+    }
+}
+
+/// [F1-(e-r1)-R1] The seed's APPLICATION ACK: the proof parsed, the seed
+/// actually WROTE bytes, and the mode is one of the two write arms — the
+/// script only sets wrote_seed after xterm's write callback fired, so
+/// this is the moment the seeded screen is IN the term. Anything else
+/// (skipped: a missing host / an empty text; painted-only; a foreign
+/// mode) is NOT an ack: coverage must not commit against it.
+fn synth_seed_application_acked(proof: &Value) -> bool {
+    let wrote_seed = proof
+        .get("wrote_seed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let seed_mode = proof
+        .get("seed_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    wrote_seed > 0 && (seed_mode == "fenced_repaint" || seed_mode == "guarded_append")
+}
+
+/// [F1-(e-r1)-R1] The fence's EXPLICIT FAILURE path: the application ack
+/// never came (seed skipped, proof unreadable, or the seed belonged to a
+/// replaced runtime). Nothing covers the retained bytes, so they all
+/// flush LIVE, in order, through the same page-write eval the live sites
+/// use — ordering against the page may be imperfect, but no retained
+/// byte is lost.
+fn flush_synth_output_fence_live(
+    fence: SynthOutputFence,
+    host_id: &str,
+    session_path: &str,
+    trace_home: &Path,
+    reason: &str,
+) {
+    for (batch, _) in &fence.retained {
+        let _ = document::eval(&terminal_page_write_script(host_id, batch));
+    }
+    if !fence.retained.is_empty() {
+        append_trace_event(
+            trace_home,
+            "ui",
+            "terminal_mount",
+            "synth_output_fence_flushed",
+            json!({
+                "session_path": session_path,
+                "batches": fence.retained.len(),
+                "bytes": fence.retained_bytes,
+                "reason": reason,
+                // [F1-(e-r1)-R1] (sol Q1): these writes are fire-and-
+                // forget evals — the flush PRESERVES the bytes but their
+                // DELIVERY is unacknowledged (a missing host consumes
+                // them silently). An ack-carrying flush (write callbacks
+                // per batch) is the filed next unit on this line.
+                "delivery_acked": false,
+            }),
+        );
     }
 }
 

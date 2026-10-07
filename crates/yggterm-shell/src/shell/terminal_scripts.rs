@@ -525,6 +525,7 @@ pub(crate) fn terminal_synthesized_mount_open_script(
     host_id: &str,
     seed: Option<&str>,
     fenced: bool,
+    forced_skip: bool,
 ) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     let seed_lit = match seed.filter(|text| !text.trim().is_empty()) {
@@ -549,6 +550,22 @@ const __painted = (t) => {{
 }};
 let __wrote = 0;
 let __mode = 'skipped';
+if ({forced_skip}) {{
+    // [F1-(e-r1)-R1] TEST HOOK (fence-rig MODE=loss): the deterministic
+    // no-ack shape — the proof fails BEFORE the first page seed write
+    // (production: a missing host or an empty seed text). The surface
+    // still reports honestly; wrote_seed stays 0 so coverage can never
+    // commit against this proof.
+    return JSON.stringify({{
+        constructed: Boolean(__t),
+        screen_in_host: Boolean(__screen),
+        rows: Number((__t && __t.rows) || 0),
+        cols: Number((__t && __t.cols) || 0),
+        painted: __painted(__t),
+        wrote_seed: 0,
+        seed_mode: 'test_forced_skip',
+    }});
+}}
 if (__t && typeof __t.write === 'function' && __seed) {{
     if ({fenced}) {{
         // [F1-(e)] THE FENCED REPAINT (sol Q1): the authoritative screen
@@ -560,9 +577,15 @@ if (__t && typeof __t.write === 'function' && __seed) {{
         // live output. Fenced, the seed REPLACES the frame; the
         // differentials retained behind the fence replay past it when
         // this proof returns (the write callback below IS the ack).
+        // [F1-(e-r1)-R1] (sol Q2): a VALID BLANK seed (empty text with a
+        // stamped seq — the daemon answered an empty screen) acks too:
+        // the repaint's own control bytes are the write, so the clear
+        // the blank represents is APPLIED and coverage may commit
+        // against it (replaying pre-blank retained bytes over an
+        // unacked blank would resurrect erased content).
         __t.write('\x1b[H\x1b[2J' + __seed);
         await new Promise((resolve) => __t.write('', resolve));
-        __wrote = __seed.length;
+        __wrote = '\x1b[H\x1b[2J'.length + __seed.length;
         __mode = 'fenced_repaint';
     }} else if (!__painted(__t)) {{
         __t.write(__seed);

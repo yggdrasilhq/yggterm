@@ -36,6 +36,19 @@
 #          marker count doubles — rc 9, THE RED); a fixed build drops it
 #          as seed-covered (page count stays at exactly the seed's one
 #          copy) AND traces the drop. Exit 9 = the duplication RED.
+#   BAR 5 (loss mode only, sitting 21): the [F1-(e-r1)-R1] DATA-LOSS
+#          falsifier (sol's ONE NEXT MEASUREMENT from the s18 consult) —
+#          MODE=loss adds YGGTERM_TEST_SEED_FORCED_SKIP=1 on top of the
+#          dup machinery: the proof is forced to skip BEFORE the first
+#          page seed write, so applied-seed acks are ZERO by construction
+#          while the daemon ring+screen carry the marker and the fence
+#          retained its covered batch. An unfixed build DESTROYS the
+#          covered batch at seed arrival (drop trace) — the marker
+#          reaches the page nowhere except via the daemon-side reconcile
+#          replay (the heal — a mask, not delivery; exit 10, THE RED). A
+#          fixed build drops nothing, traces the explicit unapplied
+#          failure, and flushes EVERYTHING live — the marker is delivered
+#          by the fence's own write path inside the transient window.
 # Usage: tools/uxspeed/fence-rig.sh [worktree] [binary] [stall_ms] [mode]
 #   ⛔ BUILD LAW (measured sitting 7): FULL-WORKSPACE release build — a
 #   -p yggterm build changes feature unification and shifts timing.
@@ -48,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ]; then echo "MODE must be order|dup"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ]; then echo "MODE must be order|dup|loss"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -57,8 +70,11 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
   CAPT_EXPORT=""
-  if [ "$MODE" = dup ]; then
+  if [ "$MODE" = dup ] || [ "$MODE" = loss ]; then
     CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
+  fi
+  if [ "$MODE" = loss ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SEED_FORCED_SKIP=1;"
   fi
   if [ "$SYNTH" = 1 ]; then
     dbus-run-session -- bash -c "
@@ -200,6 +216,61 @@ print("stall_hook_traced=%s proof_seen=%s" % (ok_stall, ok))
 if not ok_stall:
     print("PRE-FLIGHT FAIL: the stall hook never traced — rig invalid (hook missing from build?)")
     raise SystemExit(2)
+
+if MODE == "loss":
+    # (e-r1)-R1 BAR 5 — THE ACK-GATED COVERAGE BAR (sitting 21): acks are
+    # ZERO by construction (forced skip before the first seed write). RED =
+    # covered batches DESTROYED with no ack (drop trace; the page gets the
+    # marker only via the reconcile heal, if at all). GREEN = no drop, the
+    # explicit unapplied failure traced, everything flushed LIVE (the
+    # marker delivered by the fence's own write path, first sample).
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    samples = []
+    for delay in (0.15, 0.5, 1.0):
+        time.sleep(delay)
+        c, _ = page_screen_count(s, "E1RMARK")
+        samples.append(c)
+    time.sleep(4)
+    page_count, page_tail = page_screen_count(s, "E1RMARK")
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    drop_events = (session_events(events, s, "synth_output_fence_seed_covered_drop")
+                   + session_events(events, s, "synth_output_fence_poll_filtered"))
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    retained_events = session_events(events, s, "synth_output_fence_retained")
+    unapplied_events = session_events(events, s, "synth_output_fence_seed_unapplied")
+    retained_total = sum(int(p.get("bytes") or 0) for _, p in retained_events)
+    flushed_total = sum(int(p.get("bytes") or 0) for _, p in flush_events)
+    dropped_batches = sum(int(p.get("dropped_batches") or 0) for _, p in drop_events)
+    print("VERDICT FENCE-LOSS: page E1RMARK=%d (daemon=%d) samples=%s" % (page_count, daemon_count, samples))
+    print("   fence: retained=%dB/%d flush=%dB/%d drop_traces=%d dropped_batches=%d unapplied=%d" % (
+        retained_total, len(retained_events), flushed_total, len(flush_events), len(drop_events), dropped_batches, len(unapplied_events)))
+    print("   page tail: %r" % page_tail[-160:])
+    fail_rc = 0
+    if dropped_batches >= 1:
+        print("VERDICT RED CONFIRMED: seed-covered batches (%d) DESTROYED with ZERO application acks — the (e-r1) DATA-LOSS shape (page marker only via the reconcile heal, if at all: samples=%s final=%d)" % (dropped_batches, samples, page_count))
+        fail_rc = fail_rc or 10
+    elif not unapplied_events:
+        print("VERDICT FAIL: no drop and no unapplied trace either — rig shape broke (a fixed build must trace the explicit failure)")
+        fail_rc = fail_rc or 6
+    elif not flush_events or flushed_total < 9:
+        print("VERDICT FAIL: unapplied traced but nothing flushed live (flush=%dB retained=%dB)" % (flushed_total, retained_total))
+        fail_rc = fail_rc or 6
+    elif samples[0] < 1 or page_count < 1:
+        print("VERDICT PAGE FAIL: marker not delivered in the transient window (samples=%s final=%d want first-sample >=1)" % (samples, page_count))
+        fail_rc = fail_rc or 6
+    else:
+        print("   unapplied evidence: %s" % json.dumps({k: unapplied_events[-1][1].get(k) for k in ("reason", "wrote_seed", "pending_seed_seq")}))
+    if fail_rc:
+        print("RIG FAIL rc=%d — verdicts above" % fail_rc)
+        raise SystemExit(fail_rc)
+    print("RIG PASS — no ack, no drop: the unapplied seed preserved and delivered every retained byte live")
+    raise SystemExit(0)
 
 # (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
 # a duplicated frame within ~2s of the proof (measured RED run 4: flush
