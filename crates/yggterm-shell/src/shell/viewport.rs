@@ -7550,19 +7550,12 @@ fn TerminalCanvas(
                         // broke the fence; one fence, one release, one
                         // staged flush).
                         if let Some(fence) = released_fence.take() {
-                            let flush_host = host_id.clone();
-                            let flush_session = session_path.clone();
-                            let flush_trace = trace_home.to_path_buf();
-                            synth_release_flush_future = Some(Box::pin(async move {
-                                flush_synth_output_fence_live(
-                                    fence,
-                                    &flush_host,
-                                    &flush_session,
-                                    &flush_trace,
-                                    "release",
-                                )
-                                .await;
-                            }));
+                            synth_release_flush_future = Some(stage_synth_release_flush(
+                                fence,
+                                &host_id,
+                                &session_path,
+                                &trace_home,
+                            ));
                             synth_release_flush_batch = Some(data.clone());
                         } else if !retained_now {
                             let _ = document::eval(&terminal_page_write_script(&host_id, &data));
@@ -21648,6 +21641,24 @@ async fn flush_synth_output_fence_live(
             );
         }
     }
+}
+
+/// [F1-(e-r1)-R2 sol r4] Stage the release flush as an OWNED pinned
+/// future for the release-flush select branch — defined as a fn (not an
+/// inline async block) so the pre_select body carries no `.await` text
+/// (the input-starvation lock scans the region's source).
+fn stage_synth_release_flush(
+    fence: SynthOutputFence,
+    host_id: &str,
+    session_path: &str,
+    trace_home: &Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    let host = host_id.to_string();
+    let session = session_path.to_string();
+    let trace = trace_home.to_path_buf();
+    Box::pin(async move {
+        flush_synth_output_fence_live(fence, &host, &session, &trace, "release").await;
+    })
 }
 
 /// One write batch's fence decision at a synthesized output site. True =

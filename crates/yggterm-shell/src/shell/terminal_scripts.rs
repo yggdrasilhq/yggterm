@@ -389,9 +389,13 @@ if (__t && typeof __t.write === 'function') {{
 /// host entry (entry.flushSupersession) at its execution. A flush
 /// script that executes AFTER a repaint submitted behind it reads the
 /// stamped epoch above its carried token and REJECTS ITS OWN WRITE —
-/// the timed-out late continuation (dioxus does NOT cancel eval
-/// scripts on future drop; measured + the round-4 source check) can
-/// no longer mutate a screen the recovery already repainted.
+/// the timed-out late continuation can no longer mutate a screen the
+/// recovery already repainted. The dioxus desktop bridge carries NO
+/// source-level cancellation guarantee (the round-4 source check);
+/// post-drop continuations were BEHAVIORALLY suppressed in every rig
+/// run to date (the latecontrol pairing) — the guard stands
+/// regardless, so a bridge that starts executing dropped scripts is
+/// already covered.
 pub(crate) static SYNTH_FLUSH_SUPERSESSION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

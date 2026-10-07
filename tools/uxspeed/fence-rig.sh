@@ -408,15 +408,18 @@ if MODE == "lateflush":
     elif false_ack:
         print("VERDICT FAIL: a flush event claims delivery_acked:true while every await timed out")
         fail_rc = fail_rc or 6
-    elif max(counts) > 1 or repainted > 1 or reconcile_applied > 1:
-        print("VERDICT RED CONFIRMED: the LATE flush script MUTATED the repainted screen — marker counts %s (repaint=%d) or %d reconcile heals after the repaint (the stale write appended after the recovery, healed or not; sol Q3's late-mutation duplication)" % (counts, repainted, reconcile_applied))
+    elif repainted != 1 or any(c != 1 for c in counts) or reconcile_applied != 1:
+        # [sol r5] EXACT-COUNT bar: disappearance (0), duplication (>1),
+        # and extra heals are ALL failures — max()>1 accepted a vanished
+        # marker.
+        print("VERDICT RED CONFIRMED: the late window is not exactly the repaint's one copy — counts=%s repaint=%d reconcile_applied=%d (disappearance, duplication, or an extra heal; sol Q3's late-mutation family)" % (counts, repainted, reconcile_applied))
         fail_rc = fail_rc or 12
     else:
         print("   honest accounting: undelivered %dB named; the page holds exactly the repaint's copy" % undelivered_total)
     if fail_rc:
         print("RIG FAIL rc=%d — verdicts above" % fail_rc)
         raise SystemExit(fail_rc)
-    print("RIG PASS — the late mutation REJECTED: page exactly the repaint's one copy, the timeout reported undelivered")
+    print("RIG PASS — no late mutation observed: page exactly the repaint's one copy at every dense sample, the timeout reported undelivered")
     raise SystemExit(0)
 
 if MODE == "latecontrol":
@@ -473,6 +476,12 @@ if MODE == "latecontrol":
         raise SystemExit(0)
     if undelivered_total < 9:
         print("VERDICT FAIL: no duplication AND no undelivered trace — the flush shape broke entirely")
+        raise SystemExit(6)
+    # [sol r5] validity before classifying suppression: the recovery must
+    # be on record (exactly one repaint, a heal applied) and every dense
+    # sample exactly 1 — otherwise this is a broken shape, not evidence.
+    if repainted != 1 or reconcile_applied < 1 or any(c != 1 for c in counts):
+        print("VERDICT FAIL: cannot classify — recovery not on record or the window is not exactly one copy (repaint=%d reconcile_applied=%d counts=%s)" % (repainted, reconcile_applied, counts))
         raise SystemExit(6)
     # MEASUREMENT ARM (not a landing gate): paired with the retained-
     # future run (delayed write fired, acked, sole-writer), this is the
