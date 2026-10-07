@@ -29421,6 +29421,27 @@ impl ShellState {
     fn note_terminal_session_painted(&mut self, session_path: &str) {
         self.terminal_sessions_painted.insert(session_path.to_string());
     }
+    /// [Q7] The EPOCH-QUALIFIED paint note: the caller carries the mount
+    /// epoch its application evidence was earned under — if the session's
+    /// mount has since moved (a remount bumped the epoch), the evidence
+    /// belongs to a dead incarnation and the witness must NOT advance
+    /// (sol s18-Q7: a painted inherited buffer is not THIS host's paint).
+    /// Returns whether the witness advanced.
+    fn note_terminal_session_painted_for_mount_epoch(
+        &mut self,
+        session_path: &str,
+        mount_epoch: u64,
+    ) -> bool {
+        let epoch_current = self
+            .terminal_mount_epochs
+            .get(session_path)
+            .is_some_and(|current| *current == mount_epoch);
+        if !epoch_current {
+            return false;
+        }
+        self.terminal_sessions_painted.insert(session_path.to_string());
+        true
+    }
     fn terminal_session_host_has_painted(&self, session_path: &str) -> bool {
         self.terminal_sessions_painted.contains(session_path)
     }

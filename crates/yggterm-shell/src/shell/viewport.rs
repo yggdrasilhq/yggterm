@@ -7555,6 +7555,17 @@ fn TerminalCanvas(
                                 &host_id,
                                 &session_path,
                                 &trace_home,
+                                AppliedContentReceiptSpec {
+                                    session_path: session_path.clone(),
+                                    mount_epoch,
+                                    // 0 = runtime not yet named by an answer
+                                    // (the seed channel has not landed): the
+                                    // epoch + session qualifiers still bind the
+                                    // receipt to THIS mount.
+                                    runtime_spawn_id: synth_pending_seed_runtime,
+                                    supersession: SYNTH_FLUSH_SUPERSESSION
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                },
                             ));
                             synth_release_flush_batch = Some(data.clone());
                         } else if !retained_now {
@@ -12540,6 +12551,13 @@ fn TerminalCanvas(
                                     &session_path,
                                     &trace_home,
                                     "stale_runtime",
+                                    &AppliedContentReceiptSpec {
+                                        session_path: session_path.clone(),
+                                        mount_epoch,
+                                        runtime_spawn_id: synth_pending_seed_runtime,
+                                        supersession: SYNTH_FLUSH_SUPERSESSION
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                    },
                                 )
                                 .await;
                             }
@@ -12610,6 +12628,18 @@ fn TerminalCanvas(
                                 },
                                 synth_seed_fenced,
                                 synth_seed_forced_skip,
+                                // [Q7] the application receipt's
+                                // qualification tuple: the promotion must
+                                // match THIS mount epoch, THIS session,
+                                // and the runtime the daemon's answer
+                                // named at capture time.
+                                &AppliedContentReceiptSpec {
+                                    session_path: session_path.clone(),
+                                    mount_epoch,
+                                    runtime_spawn_id: synth_pending_seed_runtime,
+                                    supersession: SYNTH_FLUSH_SUPERSESSION
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                },
                             ))
                             .join::<Value>(),
                         ));
@@ -12664,8 +12694,22 @@ fn TerminalCanvas(
                                 // [F1-(e-r1)-R1] the application ack
                                 // discriminator — see
                                 // synth_seed_application_acked.
+                                // [Q7] ...AND the receipt must qualify:
+                                // the proof's application evidence is
+                                // only promotable when the page published
+                                // the qualified receipt for THIS mount
+                                // (entry identity + supersession held at
+                                // publish, tuple stamped on the entry) —
+                                // a painted inherited buffer or a bare
+                                // wrote_seed>0 from a superseded write is
+                                // NOT application (the s18-Q7 invariant:
+                                // painted, ready, fresh, claimed and
+                                // applied are DIFFERENT facts).
+                                let receipt_qualifies =
+                                    synth_applied_receipt_qualifies(&proof);
                                 let seed_applied =
-                                    synth_seed_application_acked(&proof);
+                                    synth_seed_application_acked(&proof)
+                                        && receipt_qualifies;
                                 let geometry_usable = screen_in_host
                                     && terminal_geometry_is_usable(
                                         cols_value as u16,
@@ -12677,7 +12721,13 @@ fn TerminalCanvas(
                                     current_terminal_cols = cols_value as u16;
                                     current_terminal_rows = rows_value as u16;
                                 }
-                                let surface_painted = painted || wrote_seed > 0;
+                                // [Q7] painted-state promotion binds to
+                                // the qualified ack — the old
+                                // `painted || wrote_seed > 0` bypass let
+                                // a forced-skip proof with a painted
+                                // inherited buffer promote the shell
+                                // paint witness without ANY application.
+                                let surface_painted = seed_applied;
                                 if surface_painted {
                                     terminal_paint_seen = true;
                                     if !terminal_host_painted() {
@@ -12687,7 +12737,10 @@ fn TerminalCanvas(
                                         state,
                                         "synthesized_mount_open_painted",
                                         |shell| {
-                                            shell.note_terminal_session_painted(&session_path);
+                                            shell.note_terminal_session_painted_for_mount_epoch(
+                                                &session_path,
+                                                mount_epoch,
+                                            );
                                         },
                                     );
                                 }
@@ -12703,6 +12756,12 @@ fn TerminalCanvas(
                                     "seed_mode": seed_mode,
                                     "geometry_usable": geometry_usable,
                                     "surface_painted": surface_painted,
+                                    "receipt_qualifies": receipt_qualifies,
+                                    "seed_applied": seed_applied,
+                                    "blank": proof
+                                        .get("blank")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
                                 });
                                 append_trace_event(
                                     &trace_home,
@@ -12800,6 +12859,13 @@ fn TerminalCanvas(
                                         &session_path,
                                         &trace_home,
                                         if seed_applied { "seed_ack" } else { "seed_unapplied" },
+                                        &AppliedContentReceiptSpec {
+                                            session_path: session_path.clone(),
+                                            mount_epoch,
+                                            runtime_spawn_id: synth_pending_seed_runtime,
+                                            supersession: SYNTH_FLUSH_SUPERSESSION
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        },
                                     )
                                     .await;
                                 }
@@ -12827,6 +12893,13 @@ fn TerminalCanvas(
                                         &session_path,
                                         &trace_home,
                                         "proof_unreadable",
+                                        &AppliedContentReceiptSpec {
+                                            session_path: session_path.clone(),
+                                            mount_epoch,
+                                            runtime_spawn_id: synth_pending_seed_runtime,
+                                            supersession: SYNTH_FLUSH_SUPERSESSION
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        },
                                     )
                                     .await;
                                 }
@@ -14915,6 +14988,13 @@ fn TerminalCanvas(
                                                                     &session_path,
                                                                     &trace_home,
                                                                     "release",
+                                                                    &AppliedContentReceiptSpec {
+                                                                        session_path: session_path.clone(),
+                                                                        mount_epoch,
+                                                                        runtime_spawn_id: synth_pending_seed_runtime,
+                                                                        supersession: SYNTH_FLUSH_SUPERSESSION
+                                                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                                                    },
                                                                 )
                                                                 .await;
                                                             }
@@ -15130,6 +15210,13 @@ fn TerminalCanvas(
                                                                 &session_path,
                                                                 &trace_home,
                                                                 "release",
+                                                                &AppliedContentReceiptSpec {
+                                                                    session_path: session_path.clone(),
+                                                                    mount_epoch,
+                                                                    runtime_spawn_id: synth_pending_seed_runtime,
+                                                                    supersession: SYNTH_FLUSH_SUPERSESSION
+                                                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                                                },
                                                             )
                                                             .await;
                                                         }
@@ -21433,11 +21520,15 @@ enum FenceFlushDelivery {
 /// Undelivered names the transport verdict (the rig's shed hook, a
 /// missing host, a thrown write, or the bounded await expiring — a dead
 /// bridge must never wedge the mount loop).
-async fn fence_page_write_eval_acked(host_id: &str, batch: &str) -> FenceFlushDelivery {
+async fn fence_page_write_eval_acked(
+    host_id: &str,
+    batch: &str,
+    receipt: &AppliedContentReceiptSpec,
+) -> FenceFlushDelivery {
     if synth_fence_flush_eval_shed() {
         return FenceFlushDelivery::Undelivered("shed_hook");
     }
-    let eval = document::eval(&terminal_page_write_acked_script(host_id, batch));
+    let eval = document::eval(&terminal_page_write_acked_script(host_id, batch, receipt));
     let answer = tokio::time::timeout(
         std::time::Duration::from_millis(synth_fence_flush_ack_timeout_ms()),
         eval,
@@ -21560,6 +21651,29 @@ fn synth_seed_application_acked(proof: &Value) -> bool {
     wrote_seed > 0 && (seed_mode == "fenced_repaint" || seed_mode == "guarded_append")
 }
 
+/// [Q7] The receipt half of the application ack: the proof's write may
+/// have completed, but the PROMOTION (and the coverage commit) ride the
+/// page-published APPLICATION RECEIPT — the page revalidated entry
+/// identity + supersession AFTER the write's callback and stamped the
+/// qualified tuple on the current host entry. The returned `applied`
+/// object proves the publish happened for THIS script's tuple (the page
+/// echoes the stamp's ts/gen; the session/epoch/runtime travelled inside
+/// the script literal THIS mount effect built, so only this eval's own
+/// answer can present them — the runtime-replacement and epoch checks
+/// that catch a moved mount live at their own gates: the stale-runtime
+/// flush before the consumer, the epoch-qualified paint note after it).
+/// A receipt that failed to publish — entry replaced mid-write (remount
+/// restamp), superseded by a recovery repaint, or the forced-skip hook —
+/// does NOT qualify.
+fn synth_applied_receipt_qualifies(proof: &Value) -> bool {
+    let Some(applied) = proof.get("applied") else {
+        return false;
+    };
+    applied.get("published").and_then(Value::as_bool).unwrap_or(false)
+        && applied.get("ts").and_then(Value::as_u64).unwrap_or(0) > 0
+        && applied.get("gen").is_some()
+}
+
 /// [F1-(e-r1)-R1] The fence's EXPLICIT FAILURE path: the application ack
 /// never came (seed skipped, proof unreadable, or the seed belonged to a
 /// replaced runtime). Nothing covers the retained bytes, so they all
@@ -21577,6 +21691,7 @@ async fn flush_synth_output_fence_live(
     session_path: &str,
     trace_home: &Path,
     reason: &str,
+    receipt: &AppliedContentReceiptSpec,
 ) {
     let mut acked_batches = 0usize;
     let mut acked_bytes = 0usize;
@@ -21593,7 +21708,7 @@ async fn flush_synth_output_fence_live(
             undelivered_bytes += batch.len();
             continue;
         }
-        match fence_page_write_eval_acked(host_id, batch).await {
+        match fence_page_write_eval_acked(host_id, batch, receipt).await {
             FenceFlushDelivery::Acked => {
                 acked_batches += 1;
                 acked_bytes += batch.len();
@@ -21652,12 +21767,13 @@ fn stage_synth_release_flush(
     host_id: &str,
     session_path: &str,
     trace_home: &Path,
+    receipt: AppliedContentReceiptSpec,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
     let host = host_id.to_string();
     let session = session_path.to_string();
     let trace = trace_home.to_path_buf();
     Box::pin(async move {
-        flush_synth_output_fence_live(fence, &host, &session, &trace, "release").await;
+        flush_synth_output_fence_live(fence, &host, &session, &trace, "release", &receipt).await;
     })
 }
 

@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -70,8 +70,11 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
   CAPT_EXPORT=""
-  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ]; then
+  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ] || [ "$MODE" = blank ]; then
     CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
+  fi
+  if [ "$MODE" = blank ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SNAPSHOT_CAPTURE_RING_ONLY=1;"
   fi
   if [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ]; then
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SEED_FORCED_SKIP=1;"
@@ -225,6 +228,77 @@ print("stall_hook_traced=%s proof_seen=%s" % (ok_stall, ok))
 if not ok_stall:
     print("PRE-FLIGHT FAIL: the stall hook never traced — rig invalid (hook missing from build?)")
     raise SystemExit(2)
+
+if MODE == "blank":
+    # [Q7] BAR 7 — THE VALID-BLANK FALSIFIER (sitting 23, sol round 1 R5):
+    # the capture hook injects the marker into the RING ONLY and the
+    # snapshot answers the AUTHORITATIVE BLANK (empty text, post-injection
+    # stamp). The seed MUST ack as an empty repaint — its own control
+    # bytes are the write — and drop the marker batch as seed-covered.
+    # RED (the unfixed blank filter): Some("") becomes JS null before the
+    # write arm — mode 'skipped', wrote_seed 0, NO ack — so coverage
+    # never commits and the retained marker batch flushes LIVE over the
+    # blank page: ERASED CONTENT RESURRECTED (exit 12). GREEN: blank
+    # acked (fenced_repaint, wrote_seed=7, blank=true, receipt), the
+    # covered drop traced, the page stays marker-free through every
+    # transient sample.
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    ring_only_hook = bool(wait_for(
+        lambda ev: any(e[2].get("injected_seq") is not None for e in ev
+                       if e[1] == "test_hook_snapshot_capture_ring_only"), 10, "ring-only hook")[0])
+    print("ring_only_hook=%s seed_mode=%s wrote_seed=%s blank=%s" % (
+        ring_only_hook, proof_payload.get("seed_mode"), proof_payload.get("wrote_seed"), proof_payload.get("blank")))
+    if not ring_only_hook:
+        print("PRE-FLIGHT FAIL: ring-only hook never traced — rig invalid (hook missing from build?)")
+        raise SystemExit(2)
+    if proof_payload.get("seed_mode") == "test_forced_skip":
+        print("PRE-FLIGHT FAIL: forced-skip env leaked into blank mode")
+        raise SystemExit(4)
+    samples = []
+    for delay in (0.15, 0.5, 1.0):
+        time.sleep(delay)
+        c, _ = page_screen_count(s, "E1RMARK")
+        samples.append(c)
+    time.sleep(4)
+    page_count, page_tail = page_screen_count(s, "E1RMARK")
+    events = read_events()
+    drop_events = (session_events(events, s, "synth_output_fence_seed_covered_drop")
+                   + session_events(events, s, "synth_output_fence_poll_filtered"))
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    retained_events = session_events(events, s, "synth_output_fence_retained")
+    dropped_batches = sum(int(p.get("dropped_batches") or 0) for _, p in drop_events)
+    flushed_bytes = sum(int(p.get("bytes") or 0) for _, p in flush_events)
+    retained_bytes_total = sum(int(p.get("bytes") or 0) for _, p in retained_events)
+    print("VERDICT FENCE-BLANK: page E1RMARK=%d samples=%s (want all 0 — the blank stays blank)" % (page_count, samples))
+    print("   proof: mode=%s wrote=%s blank=%s receipt=%s applied=%s" % (
+        proof_payload.get("seed_mode"), proof_payload.get("wrote_seed"), proof_payload.get("blank"),
+        proof_payload.get("receipt_qualifies"), proof_payload.get("seed_applied")))
+    print("   fence: retained=%dB/%d flushed=%dB/%d dropped_batches=%d" % (
+        retained_bytes_total, len(retained_events), flushed_bytes, len(flush_events), dropped_batches))
+    print("   page tail: %r" % page_tail[-160:])
+    fail_rc = 0
+    seed_mode = proof_payload.get("seed_mode")
+    wrote = int(proof_payload.get("wrote_seed") or 0)
+    if seed_mode != "fenced_repaint" or wrote != 7 or proof_payload.get("blank") is not True:
+        print("VERDICT RED CONFIRMED: the valid blank did NOT ack (mode=%s wrote=%s blank=%s) — the blank filter made the s21 ruling unreachable and the retained marker flushed over the authoritative blank (samples=%s final=%d)" % (
+            seed_mode, wrote, proof_payload.get("blank"), samples, page_count))
+        fail_rc = fail_rc or 12
+    elif not proof_payload.get("receipt_qualifies"):
+        print("VERDICT FAIL: blank acked but the receipt did not qualify — rig shape broke")
+        fail_rc = fail_rc or 6
+    elif page_count > 0 or max(samples) > 0:
+        print("VERDICT PAGE FAIL: erased content resurrected over the acked blank (samples=%s final=%d)" % (samples, page_count))
+        fail_rc = fail_rc or 12
+    elif dropped_batches < 1:
+        print("VERDICT FAIL: blank acked but no covered drop traced — the marker batch's fate is unaccounted")
+        fail_rc = fail_rc or 6
+    else:
+        print("   drop evidence: %s" % json.dumps({k: drop_events[-1][1].get(k) for k in ("dropped_batches", "dropped_bytes", "seed_output_seq")}))
+    if fail_rc:
+        print("RIG FAIL rc=%d — verdicts above" % fail_rc)
+        raise SystemExit(fail_rc)
+    print("RIG PASS — the valid blank acked as an empty repaint and coverage committed: erased content stayed erased")
+    raise SystemExit(0)
 
 if MODE == "loss":
     # (e-r1)-R1 BAR 5 — THE ACK-GATED COVERAGE BAR (sitting 21): acks are

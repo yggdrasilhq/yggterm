@@ -70642,10 +70642,26 @@ fn synth_output_fence_deadline_expires() {
 
 #[test]
 fn synthesized_mount_open_script_shape_locks_the_fence_wiring() {
-    let fenced =
-        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), true, false);
-    let unfenced =
-        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), false, false);
+    let receipt = AppliedContentReceiptSpec {
+        session_path: "/sessions/m1".to_string(),
+        mount_epoch: 7,
+        runtime_spawn_id: 44,
+        supersession: 3,
+    };
+    let fenced = terminal_synthesized_mount_open_script(
+        "host-m1",
+        Some("line one\r\nline two"),
+        true,
+        false,
+        &receipt,
+    );
+    let unfenced = terminal_synthesized_mount_open_script(
+        "host-m1",
+        Some("line one\r\nline two"),
+        false,
+        false,
+        &receipt,
+    );
     // the repaint branch is compiled with the mode literals and the
     // home+clear prefix; the bool literal is the runtime gate
     assert!(fenced.contains("if (true)"));
@@ -70655,7 +70671,11 @@ fn synthesized_mount_open_script_shape_locks_the_fence_wiring() {
         assert!(script.contains("'fenced_repaint'"));
         assert!(script.contains("'guarded_append'"));
         assert!(script.contains("seed_mode: __mode"));
-        assert!(script.contains("await new Promise((resolve) => __t.write('', resolve))"));
+        // [Q7] the ack rides the DATA write's own callback (the s22 flush
+        // law) — an empty trailing enqueue acknowledges nothing
+        assert!(script.contains("__t.write('\\x1b[H\\x1b[2J' + __seed, resolve)"));
+        assert!(script.contains("__t.write(__seed, resolve)"));
+        assert!(!script.contains("__t.write('', resolve)"));
     }
     // the guarded append still defers to the painted heuristic unfenced
     assert!(unfenced.contains("} else if (!__painted(__t)) {"));
@@ -70666,10 +70686,19 @@ fn a_forced_skip_seed_script_returns_before_any_write() {
     // [F1-(e-r1)-R1] the rig's loss injection: the hook branch returns the
     // no-ack proof BEFORE the write branch can run, and reports
     // wrote_seed 0 with its own mode literal.
+    let receipt = AppliedContentReceiptSpec {
+        session_path: "/sessions/m1".to_string(),
+        mount_epoch: 7,
+        runtime_spawn_id: 44,
+        supersession: 3,
+    };
     let script =
-        terminal_synthesized_mount_open_script("host-m1", Some("seed"), true, true);
+        terminal_synthesized_mount_open_script("host-m1", Some("seed"), true, true, &receipt);
     assert!(script.contains("'test_forced_skip'"));
     assert!(script.contains("wrote_seed: 0"));
+    // [Q7] the hook return carries NO receipt — the promotion cannot ride
+    // a forced-skip proof even when the inherited buffer reads painted
+    assert!(script.contains("applied: null"));
     assert!(
         script.find("'test_forced_skip'").unwrap()
             < script.find("'fenced_repaint'").unwrap(),
@@ -70680,6 +70709,107 @@ fn a_forced_skip_seed_script_returns_before_any_write() {
             < script.find("__t.write(").unwrap(),
         "the hook branch is the first conditional — no write can precede it"
     );
+}
+
+// ============================================================================
+// [Q7] THE APPLICATION RECEIPT + THE VALID BLANK — unit locks for the s23
+// binding. sol round 1 (2026-10-07): the old `.trim().is_empty()` filter
+// made the s21 valid-blank ruling UNREACHABLE (a blank-with-stamp seed
+// became JS null before the write arm), and the promotion must ride the
+// page-published qualified receipt, never `painted || wrote_seed > 0`.
+// ============================================================================
+
+fn q7_test_receipt_spec() -> AppliedContentReceiptSpec {
+    AppliedContentReceiptSpec {
+        session_path: "/sessions/m1".to_string(),
+        mount_epoch: 7,
+        runtime_spawn_id: 44,
+        supersession: 3,
+    }
+}
+
+#[test]
+fn a_valid_blank_seed_reaches_the_fenced_repaint() {
+    // [Q7-R5] PRESENCE, not truthiness: an empty (or whitespace-only)
+    // seed WITH a stamp is a real seed — the fenced clear runs and acks
+    // its control bytes. The old filter converted it to null: wrote_seed
+    // stayed 0, mode stayed 'skipped', and the resurrection hazard the
+    // s21 valid-blank ruling closed was still open.
+    let receipt = q7_test_receipt_spec();
+    for blank_seed in ["", "   "] {
+        let script = terminal_synthesized_mount_open_script(
+            "host-m1",
+            Some(blank_seed),
+            true,
+            false,
+            &receipt,
+        );
+        assert!(
+            script.contains("const __seedPresent = true;"),
+            "a present blank seed must compile to a PRESENT literal"
+        );
+        assert!(
+            !script.contains("const __seed = null;"),
+            "the blank filter that made the valid-blank arm unreachable must be gone"
+        );
+        assert!(script.contains("__blank = __seed.length === 0;"));
+    }
+    // the None seed (fetch failed / old daemon) is still a skip
+    let none_script = terminal_synthesized_mount_open_script(
+        "host-m1",
+        None,
+        true,
+        false,
+        &receipt,
+    );
+    assert!(none_script.contains("const __seedPresent = false;"));
+    assert!(none_script.contains("const __seed = null;"));
+    assert!(none_script.contains("if (__t && typeof __t.write === 'function' && __seedPresent)"));
+}
+
+#[test]
+fn the_seed_receipt_publish_revalidates_entry_identity_and_supersession() {
+    // [Q7] the page-side publish is a TRANSACTION, not a stamp: after the
+    // write's callback the script must re-check that the registry still
+    // maps the host to the SAME entry object (a remount restamped it) and
+    // that the recovery repaint has not superseded this build — only then
+    // does appliedContent land and the proof echo `applied`.
+    let receipt = q7_test_receipt_spec();
+    let script = terminal_synthesized_mount_open_script(
+        "host-m1",
+        Some("seed"),
+        true,
+        false,
+        &receipt,
+    );
+    assert!(script.contains("(window.__yggtermXtermHosts || {})[__h] === __e"));
+    assert!(script.contains("__e.flushSupersession || 0) > 3"));
+    assert!(script.contains("__e.appliedContent = {"));
+    assert!(script.contains("session: \"/sessions/m1\""));
+    assert!(script.contains("epoch: 7"));
+    assert!(script.contains("runtime: 44"));
+    assert!(script.contains("gen: Number(window.__yggtermMountAttempt || 0)"));
+    assert!(script.contains("applied: __applied"));
+    // the publish gate is AFTER the write arms (a receipt can only follow
+    // an application, never precede it)
+    assert!(
+        script.find("__mode = 'fenced_repaint';").unwrap()
+            < script.find("__e.appliedContent = {").unwrap()
+    );
+}
+
+#[test]
+fn the_acked_page_write_publishes_the_receipt_after_its_callback() {
+    let receipt = q7_test_receipt_spec();
+    let script =
+        terminal_page_write_acked_script("host-m1", "batch-bytes", &receipt);
+    assert!(script.contains("__t.write(__batch, resolve)"));
+    assert!(script.contains("(window.__yggtermXtermHosts || {})[__h] === __e"));
+    assert!(script.contains("__e.appliedContent = {"));
+    assert!(script.contains("wrote: __batch.length"));
+    // delivery accounting and application evidence stay distinct fields
+    assert!(script.contains("ok: true, applied:"));
+    assert!(script.contains("ok: true, applied: null"));
 }
 
 #[test]
