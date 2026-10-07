@@ -1143,6 +1143,75 @@ pub(crate) fn normalized_live_row_identity(key: &str) -> String {
 /// The identity fold is [`normalized_live_row_identity`], applied here so no
 /// caller re-spells it — a row must not slip past its own tombstone by being
 /// asked about under an equivalent runtime key.
+/// How long after a deliberate close the remote-agent START door refuses to
+/// re-mint the same runtime key ([11.229](d)). The raced resurrection was
+/// measured at 91s under the removal verdict (a queued start ask landing on a
+/// busy daemon), and the wild incident at seconds — 120s covers both while
+/// staying far under the tombstone plane's own 3-day import veto.
+pub(crate) const REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS: u64 = 120;
+
+/// [11.229](d) THE RESURRECTION VETO's read door: was THIS runtime key's close
+/// recorded within [`REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS`]? Same fold and
+/// fresh-load discipline as [`live_row_close_is_remembered`] — callers never
+/// re-spell the identity.
+pub(crate) fn live_row_close_is_fresh(
+    home_dir: &std::path::Path,
+    session_path: &str,
+    window_secs: u64,
+) -> bool {
+    let now = crate::live_row_tombstones::now_secs();
+    crate::live_row_tombstones::LiveRowTombstones::close_recorded_within(
+        home_dir,
+        &normalized_live_row_identity(session_path),
+        window_secs,
+        now,
+    )
+}
+
+/// [11.229](d) The terminate's PREVENTIVE tombstone, as a helper so the raced
+/// no-row shape is testable without a live daemon landscape: the close of a
+/// remote agent runtime must be remembered EVEN WHEN no row existed to remove,
+/// because the resurrection lands as a LATE queued start ask that re-mints the
+/// key fresh. Shared read-modify-write through the plane's own record door;
+/// the TTL and the re-entry clear keep their existing semantics.
+fn record_remote_agent_terminate_tombstone(
+    home: &std::path::Path,
+    runtime_key: &str,
+    session_id: &str,
+    kind: SessionKind,
+) {
+    let identity = normalized_live_row_identity(runtime_key);
+    let now = crate::live_row_tombstones::now_secs();
+    match crate::live_row_tombstones::LiveRowTombstones::default().record_close(home, &identity, now)
+    {
+        Ok(_) => append_trace_event(
+            home,
+            "remote",
+            "terminate_agent",
+            "remote_agent_terminate_tombstoned_runtime_key",
+            json!({
+                "session_id": session_id,
+                "kind": format!("{kind:?}"),
+                "runtime_key": runtime_key,
+                "identity": identity,
+                "policy": "the close outlives any queued start ask ([11.229](d))",
+            }),
+        ),
+        Err(error) => append_trace_event(
+            home,
+            "remote",
+            "terminate_agent",
+            "remote_agent_terminate_tombstone_failed",
+            json!({
+                "session_id": session_id,
+                "kind": format!("{kind:?}"),
+                "runtime_key": runtime_key,
+                "error": error.to_string(),
+            }),
+        ),
+    }
+}
+
 pub fn live_row_close_is_remembered(home_dir: &std::path::Path, session_path: &str) -> bool {
     !live_row_closes_remembered_among(home_dir, [session_path]).is_empty()
 }
@@ -13709,6 +13778,50 @@ impl YggtermServer {
         let display = remote_runtime_agent_display(kind);
         let key = remote_runtime_agent_session_key(kind, session_id)
             .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
+        // ⛔ [11.229](d) THE RESURRECTION VETO. A remote row's close races the
+        // client's own launch retries: the terminate can land while a queued
+        // start ask is still inbound, the removal then verifies ConfirmedGone
+        // against a runtime that was never born, and the LATE ask re-mints the
+        // key fresh — measured 91s under the verdict (sitting 20 rig, trace
+        // start_remote_runtime_agent_session_new after the verdict). A
+        // terminate now records the close even with no row to remove, and THIS
+        // door refuses to re-mint a key whose close is that fresh. Deliberate
+        // re-opens are not harmed: the window (120s) is far under the
+        // tombstone plane's own import veto, and a row this daemon already
+        // holds never sees this arm.
+        if !self.sessions.contains_key(&key) {
+            let veto_home = self
+                .yggterm_home
+                .clone()
+                .or_else(|| resolve_yggterm_home().ok());
+            if let Some(home) = veto_home
+                && live_row_close_is_fresh(
+                    &home,
+                    &key,
+                    REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS,
+                )
+            {
+                append_trace_event(
+                    &home,
+                    "remote",
+                    "start_agent",
+                    "remote_agent_start_refused_recent_close",
+                    json!({
+                        "key": key,
+                        "session_id": session_id,
+                        "kind": format!("{kind:?}"),
+                        "window_secs": REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS,
+                        "policy": "a late queued start cannot resurrect a just-closed runtime ([11.229](d))",
+                    }),
+                );
+                anyhow::bail!(
+                    "{} session {} was closed moments ago — a late or queued start cannot                      resurrect it; retry after {}s if that close was a mistake",
+                    display,
+                    session_id,
+                    REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS
+                );
+            }
+        }
         let legacy_local_key = local_live_runtime_key(session_id);
         if legacy_local_key != key {
             self.sessions.remove(&legacy_local_key);
@@ -29232,6 +29345,16 @@ pub fn run_remote_terminate_agent(session_id: &str, kind: SessionKind) -> anyhow
             );
             let _ = registry.delete_session(session_id)?;
         }
+    }
+    // ⛔ [11.229](d) THE PREVENTIVE TOMBSTONE. remove_session above tombstones
+    // the rows that EXISTED; the raced shape has none yet — the terminate
+    // lands while the client's queued start ask is still inbound, the removal
+    // verifies ConfirmedGone against a runtime that was never born, and the
+    // late ask re-mints the key fresh. Recording the close for the runtime key
+    // EVEN WITH NO ROW gives the start door the memory it needs to refuse
+    // that ask.
+    if let Ok(home) = resolve_yggterm_home() {
+        record_remote_agent_terminate_tombstone(&home, &runtime_key, session_id, kind);
     }
     let terminated_bridge_count = terminate_remote_agent_bridge_processes(session_id, kind);
     if terminated_bridge_count > 0
@@ -53050,6 +53173,140 @@ terminal_window_id: None,
             start.contains("managed_cli_shell_command_configured_with_identity("),
             "the start recompose must compose through the carried-identity twin"
         );
+    }
+
+    #[test]
+    fn a_terminate_with_no_row_still_tombstones_and_the_start_door_refuses() {
+        // [11.229](d) THE RACED SHAPE, end to end at the unit level: the
+        // terminate finds NO row anywhere (the runtime was never born), yet
+        // the close must be remembered — and the LATE start ask that lands
+        // under the removal verdict must be refused at this door.
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-11229d-veto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let runtime_key = "codex-runtime://late-queued-start".to_string();
+        record_remote_agent_terminate_tombstone(
+            &home,
+            &runtime_key,
+            "late-queued-start",
+            SessionKind::Codex,
+        );
+        assert!(
+            crate::live_row_tombstones::LiveRowTombstones::close_recorded_within(
+                &home,
+                &crate::normalized_live_row_identity(&runtime_key),
+                REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS,
+                crate::live_row_tombstones::now_secs(),
+            ),
+            "the terminate must remember the close even with no row to remove"
+        );
+
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.yggterm_home = Some(home.clone());
+        let refused = server.start_remote_runtime_agent_session(
+            SessionKind::Codex,
+            "late-queued-start",
+            Some("/tmp"),
+            None,
+            &AgentLaunchOptions::default(),
+            None,
+        );
+        assert!(
+            refused.is_err(),
+            "a start ask for a freshly closed runtime key must be refused at the door"
+        );
+        let message = refused.err().map(|error| format!("{error:#}")).unwrap_or_default();
+        assert!(
+            message.contains("closed moments ago"),
+            "the refusal must be named, not a generic failure: {message}"
+        );
+
+        // A row this daemon already holds is a restart, not a resurrection —
+        // the veto must stand down for it.
+        server.sessions.insert(
+            runtime_key.clone(),
+            build_session(
+                SessionKind::Codex,
+                &runtime_key,
+                Some("late-queued-start"),
+                Some("/tmp"),
+                Some("Held"),
+                None,
+                server.backend,
+                server.theme,
+                server.ghostty_host.bridge_enabled,
+                StoredPreviewHydrationMode::Deferred,
+            ),
+        );
+        let held = server.start_remote_runtime_agent_session(
+            SessionKind::Codex,
+            "late-queued-start",
+            Some("/tmp"),
+            None,
+            &AgentLaunchOptions::default(),
+            None,
+        );
+        assert!(
+            held.is_ok(),
+            "a held row's restart must pass the veto: {:?}",
+            held.err().map(|e| format!("{e:#}"))
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_stale_close_does_not_refuse_the_start_door() {
+        // [11.229](d) The window is what keeps deliberate re-opens working: a
+        // close older than the veto window must not refuse a start.
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-11229d-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let runtime_key = "codex-runtime://reopened-on-purpose".to_string();
+        let stale = crate::live_row_tombstones::now_secs()
+            .saturating_sub(REMOTE_AGENT_START_FRESH_CLOSE_VETO_SECS + 60);
+        crate::live_row_tombstones::LiveRowTombstones::default()
+            .record_close(
+                &home,
+                &crate::normalized_live_row_identity(&runtime_key),
+                stale,
+            )
+            .expect("record the stale close");
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.yggterm_home = Some(home.clone());
+        let started = server.start_remote_runtime_agent_session(
+            SessionKind::Codex,
+            "reopened-on-purpose",
+            Some("/tmp"),
+            None,
+            &AgentLaunchOptions::default(),
+            None,
+        );
+        assert!(
+            started.is_ok(),
+            "a stale close must not refuse a deliberate start: {:?}",
+            started.err().map(|e| format!("{e:#}"))
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
