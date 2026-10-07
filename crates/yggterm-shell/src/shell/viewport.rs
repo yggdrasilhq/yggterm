@@ -7218,11 +7218,18 @@ fn TerminalCanvas(
             // mount's read-pump writes through the page host registry for the
             // rest of its life.
             let (synth_snapshot_tx, mut synth_snapshot_rx) =
-                tokio::sync::mpsc::channel::<String>(1);
+                tokio::sync::mpsc::channel::<(String, u64)>(1);
             let mut synth_snapshot_requested = false;
             // [F1-(e)] the synthesis output fence: Some while the seed
             // snapshot is outstanding — see SynthOutputFence.
             let mut synth_output_fence: Option<SynthOutputFence> = None;
+            // [F1-(e-r1)] The seed's stream-cursor stamp, OUTLIVING the
+            // fence: chunks at or below it are inside the seeded screen
+            // forever on this mount, so a round that resolves after the
+            // proof (fence long down) must still not paint them twice.
+            // Zeroed on runtime replacement (a new runtime mints seqs from
+            // 0 — the old stamp would drop FRESH chunks) and on rewind.
+            let mut synth_seed_stamp: u64 = 0;
             let mut synth_proof_eval: Option<
                 std::pin::Pin<
                     Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
@@ -7506,6 +7513,7 @@ fn TerminalCanvas(
                             &data,
                             &session_path,
                             &trace_home,
+                            cursor,
                             current_millis(),
                         ) {
                             let _ = document::eval(&terminal_page_write_script(&host_id, &data));
@@ -12372,7 +12380,10 @@ fn TerminalCanvas(
                                     )
                                     .await
                                     .map(|answer| {
-                                        sanitize_terminal_replay_payload(&answer.text)
+                                        (
+                                            sanitize_terminal_replay_payload(&answer.text),
+                                            answer.output_seq,
+                                        )
                                     })
                                     .unwrap_or_default();
                                     // [F1-(e)] TEST HOOK (groundwork sitting 8;
@@ -12401,12 +12412,47 @@ fn TerminalCanvas(
                             }
                         }
                     }
-                    Some(synth_seed_text) = synth_snapshot_rx.recv() => {
+                    Some((synth_seed_text, synth_seed_output_seq)) =
+                        synth_snapshot_rx.recv() =>
+                    {
                         let _loop_branch = TerminalLoopBranchGuard::new(
                             "synth_seed",
                             &session_path,
                         );
                         let seed_bytes = synth_seed_text.len();
+                        // [F1-(e-r1)] THE SEED'S STREAM-CURSOR STAMP: the
+                        // answer carries the daemon seq the seeded screen
+                        // renders. A retained batch whose round's daemon
+                        // cursor is at or below the stamp is ALREADY IN the
+                        // seed — flushing it would duplicate its content
+                        // onto the viewport (the rare append class; the
+                        // sitting-15 remount-rig double-paint flake). Drop
+                        // the provably covered batches here, before the
+                        // proof; survivors flush in order as before.
+                        if synth_seed_output_seq > 0 {
+                            synth_seed_stamp = synth_seed_output_seq;
+                        }
+                        if let Some(fence) = synth_output_fence.as_mut()
+                            && synth_seed_output_seq > 0
+                        {
+                            fence.seed_output_seq = synth_seed_output_seq;
+                            let (dropped_batches, dropped_bytes) =
+                                fence.drop_seed_covered(synth_seed_output_seq);
+                            if dropped_batches > 0 {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "synth_output_fence_seed_covered_drop",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "seed_output_seq": synth_seed_output_seq,
+                                        "dropped_batches": dropped_batches,
+                                        "dropped_bytes": dropped_bytes,
+                                    }),
+                                );
+                            }
+                        }
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -12548,7 +12594,7 @@ fn TerminalCanvas(
                                 // through the same page write eval the
                                 // live sites use.
                                 if let Some(fence) = synth_output_fence.take() {
-                                    for batch in &fence.retained {
+                                    for (batch, _) in &fence.retained {
                                         let _ = document::eval(
                                             &terminal_page_write_script(&host_id, batch),
                                         );
@@ -13300,6 +13346,14 @@ fn TerminalCanvas(
                                         }),
                                     );
                                 }
+                                if runtime_replaced {
+                                    // [F1-(e-r1)] a replaced runtime mints
+                                    // chunk seqs from zero — the old seed's
+                                    // stamp would license dropping FRESH
+                                    // chunks. The dedupe stands down until
+                                    // a new seed re-stamps.
+                                    synth_seed_stamp = 0;
+                                }
                                 known_runtime_spawn_id = runtime_spawn_id;
                                 // [11.167] A runtime START under this watch is a
                                 // replacement: the child the watch accumulated its
@@ -13679,6 +13733,41 @@ fn TerminalCanvas(
                                 }
                                 if post_resize_output_seen || !chunks.is_empty() {
                                     filtered_pre_resize_without_post_resize_seen = false;
+                                }
+                                // [F1-(e-r1)] Post-seed dedupe: once the
+                                // seed's stamp is known, every chunk at or
+                                // below it is already inside the seeded
+                                // screen — dropping such chunks here keeps
+                                // the fence (and every later live write)
+                                // free of seed-covered bytes. Mid-stream
+                                // rounds only: a cursor-0 replay round
+                                // carries the daemon's own synthetic
+                                // snapshot / attach-ready chunks whose seqs
+                                // are not plain ring positions, and
+                                // resync/rewind arms must replay
+                                // everything they carry.
+                                if synth_seed_stamp > 0
+                                    && read_issued_at_cursor > 0
+                                    && !resync_required
+                                    && !cursor_rewound
+                                {
+                                    let before_chunks = chunks.len();
+                                    chunks.retain(|chunk| chunk.seq > synth_seed_stamp);
+                                    let dropped_chunks = before_chunks - chunks.len();
+                                    if dropped_chunks > 0 {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "synth_output_fence_poll_filtered",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "seed_output_seq": synth_seed_stamp,
+                                                "dropped_chunks": dropped_chunks,
+                                                "kept_chunks": chunks.len(),
+                                            }),
+                                        );
+                                    }
                                 }
                                 cursor = next_cursor;
                                 last_runtime_running = runtime_running;
@@ -14562,6 +14651,7 @@ fn TerminalCanvas(
                                                                 &write,
                                                                 &session_path,
                                                                 &trace_home,
+                                                                cursor,
                                                                 current_millis(),
                                                             )
                                                         {
@@ -14759,6 +14849,7 @@ fn TerminalCanvas(
                                                             &write,
                                                             &session_path,
                                                             &trace_home,
+                                                            cursor,
                                                             current_millis(),
                                                         )
                                                     {
@@ -21026,9 +21117,17 @@ const SYNTH_OUTPUT_FENCE_DEADLINE_MS: u64 = 30_000;
 
 #[derive(Debug, Default)]
 struct SynthOutputFence {
-    retained: Vec<String>,
+    /// Each retained batch plus the daemon stream cursor the poll loop
+    /// had already advanced past when the batch was retained — the
+    /// batch's bytes are all at or below that seq, which is (e-r1)'s
+    /// covered-through proof.
+    retained: Vec<(String, u64)>,
     retained_bytes: usize,
     armed_at_ms: u64,
+    /// The seed answer's stream-cursor stamp: every chunk at or below it
+    /// is already inside the seeded screen. Zero = seed not arrived (or
+    /// an old daemon that cannot answer) — dedupe fails open.
+    seed_output_seq: u64,
 }
 
 impl SynthOutputFence {
@@ -21037,6 +21136,7 @@ impl SynthOutputFence {
             retained: Vec::new(),
             retained_bytes: 0,
             armed_at_ms: now_ms,
+            seed_output_seq: 0,
         }
     }
 
@@ -21044,18 +21144,38 @@ impl SynthOutputFence {
     /// must release the fence live (ordering is broken, but no batch is
     /// dropped — the late seed then falls back to the guarded append
     /// instead of the repaint).
-    fn retain(&mut self, data: &str) -> bool {
+    fn retain(&mut self, data: &str, covered_through: u64) -> bool {
         let next = self.retained_bytes.saturating_add(data.len());
         if next > SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES {
             return false;
         }
         self.retained_bytes = next;
-        self.retained.push(data.to_string());
+        self.retained.push((data.to_string(), covered_through));
         true
     }
 
     fn deadline_expired(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.armed_at_ms) > SYNTH_OUTPUT_FENCE_DEADLINE_MS
+    }
+
+    /// [F1-(e-r1)] Drop retained batches the seeded screen provably
+    /// contains — a batch is provably covered when the daemon cursor its
+    /// round had already reached is at or below the seed's stamp (every
+    /// byte in the batch is then at or below that stamp too; for
+    /// bridge-flushed batches the recorded cursor is a conservative
+    /// upper bound, so an over-estimate only keeps a batch, never drops
+    /// one it should have kept). Returns (dropped_batches,
+    /// dropped_bytes).
+    fn drop_seed_covered(&mut self, seed_output_seq: u64) -> (usize, usize) {
+        let before_batches = self.retained.len();
+        let before_bytes = self.retained_bytes;
+        self.retained
+            .retain(|(_, covered_through)| *covered_through > seed_output_seq);
+        self.retained_bytes = self.retained.iter().map(|(data, _)| data.len()).sum();
+        (
+            before_batches.saturating_sub(self.retained.len()),
+            before_bytes.saturating_sub(self.retained_bytes),
+        )
     }
 }
 
@@ -21073,13 +21193,16 @@ fn synth_output_fence_stage(
     data: &str,
     session_path: &str,
     trace_home: &Path,
+    daemon_cursor_now: u64,
     now_ms: u64,
 ) -> bool {
     let expired = fence
         .as_ref()
         .is_some_and(|current| current.deadline_expired(now_ms));
-    let retained_ok =
-        !expired && fence.as_mut().is_some_and(|current| current.retain(data));
+    let retained_ok = !expired
+        && fence
+            .as_mut()
+            .is_some_and(|current| current.retain(data, daemon_cursor_now));
     if retained_ok {
         append_trace_event(
             trace_home,
@@ -21099,7 +21222,7 @@ fn synth_output_fence_stage(
         // lands after this uses the guarded-append backstop (its rx reads
         // the fence as already down).
         if let Some(current) = fence.take() {
-            for batch in &current.retained {
+            for (batch, _) in &current.retained {
                 let _ = document::eval(&terminal_page_write_script(host_id, batch));
             }
             append_trace_event(

@@ -35377,6 +35377,10 @@ pub fn run_app_control_read_terminal_buffer(
                 .map(|(text, running, seen, post, seq, spawn)| {
                     daemon::TerminalSnapshotAnswer {
                         text,
+                        // Read-buffer fallback, not a mount seed — the
+                        // stamp is unknown here and nothing dedupes
+                        // against this answer ([F1-(e-r1)]).
+                        output_seq: 0,
                         running,
                         runtime_output_seen: seen,
                         post_resize_output_seen: post,
