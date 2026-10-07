@@ -122,6 +122,63 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   STRADDLING pre-seed batch (capture lands mid-round) keeps its covered
   prefix — per-chunk boundaries are lost through the write bridge's
   frame-splitting, and a conservative keep is the safe side;
+  (e-r1) REOPENED then LANDED + DEPLOYED 2026-10-07 (sitting 21, lane
+  lane/11229er1/ack-gated-drop aaf0b422): the sitting-18 commit
+  destroyed seed-covered retained batches at seed ARRIVAL while the
+  application ack is only the proof's return — sol's s18 review R1 (a
+  seed that can still skip — missing host / empty text — or fail to
+  prove left the bytes destroyed with NO ack; the flush arm accepted
+  any parsed proof; the unreadable arm restored nothing; the arrival
+  stamp licensed the poll filter too) and R2 (no runtime identity on
+  the seed channel; rewind never cleared the stamp its comment claimed
+  cleared). MEASURED (fence-rig MODE=loss, the new forced-skip
+  injection YGGTERM_TEST_SEED_FORCED_SKIP=1 — the proof fails BEFORE
+  the first page seed write, acks ZERO by construction): RED rc10 on
+  hook-only main — the covered batch (204B) dropped at arrival, flush
+  0B, the marker NOWHERE on the page (samples 0/0/0, final 0, daemon
+  ring+screen carried it — the blank-viewport family at delivery
+  level; even the reconcile could not recover it). FIX (fix-shape
+  consult sol HIGH round 2, verdicts Q1-Q4 rebut all applied): the
+  arrival stages only the PROVISIONAL stamp (synth_pending_seed_seq +
+  the seed's runtime id); the stamp + drop_seed_covered COMMIT in the
+  proof arm only when synth_seed_application_acked (parsed +
+  wrote_seed>0 through fenced_repaint|guarded_append — xterm's write
+  callback); a VALID BLANK stamped seed passes through and acks as an
+  empty repaint (the repaint counts its own control bytes — replaying
+  pre-blank retained bytes over an unacked blank resurrects erased
+  content); skipped/unreadable/stale seeds preserve every byte and
+  FAIL EXPLICITLY (flush_synth_output_fence_live — everything retained
+  goes out through the ordinary page-write path in order, traced
+  synth_output_fence_seed_unapplied with reason/wrote_seed/pending
+  seq); the seed is runtime-qualified by the daemon's CAPTURE-TIME
+  runtime id — already on the wire as
+  TerminalSnapshotAnswer::runtime_spawn_id ([11.229](b)), no protocol
+  change: a KNOWN capture id that no longer matches the client's
+  current knowledge is discarded live
+  (synth_seed_discarded_stale_runtime), and the commit additionally
+  requires the capture id KNOWN (an old daemon's 0 renders but never
+  commits — synth_seed_unknown_runtime_no_commit; measured en route:
+  backing this gate with the CLIENT's request-time id instead
+  disarmed the dedupe on every fresh spawn — dup RED rc9, 195B flushed
+  over the seed — because no stream answer has landed at seed-request
+  time there); rewind clears the stamp AND voids the pending
+  provisional seed (an outstanding proof can no longer commit
+  coverage a rewind invalidated), runtime replacement likewise. GREEN
+  on the final build: loss (no drop, unapplied traced, 204/204
+  flushed live, marker on the page at the first transient sample) +
+  dup (the drop commits AT the ack — 204B, page exactly 1 through
+  transients) + order (wrote_seed=67 = 7 control + 60 seed bytes) +
+  healthy controls; suites shell-lib 2243/0 + server-lib 1668/0
+  no-fail-fast. Locks: the_application_ack_requires_a_seed_write +
+  the_covered_drop_commits_only_at_the_ack_source_law +
+  a_forced_skip_seed_script_returns_before_any_write; MODE=loss is
+  the family's permanent loss falsifier. RESIDUE (filed next on this
+  line, sol Q1/Q3a): the fence flushes — ack path and explicit-failure
+  path alike — through fire-and-forget evals (delivery_acked:false in
+  the flush trace); an ack-carrying flush (write callbacks per batch)
+  and the full Q7 binding (CONTENT-READY + painted-state promotion to
+  an owner/session/runtime/mount-generation-qualified application
+  ack) are the next units.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
