@@ -105,6 +105,16 @@ This skill is an agent's "human eye + keyboard/mouse" for a **Dioxus desktop UX*
 
 - **Two capture layers** (both faithful as of 2.8.0): **app-level** via `app screenshot` (the yggui/webview surface) and **OS-level** via the compositor (on KDE Wayland, Spectacle — see `finding-app-screenshot-unfaithful-on-wayland` in memory; the capture force-activates yggterm and refuses to capture any other window).
 - **Web UX is OUT of scope.** Driving a web app (e.g. samplers / samplenotes-webapp running in Chrome) is the job of the **separate agent-browser CLI skill**, not this one. Clear lanes: this skill = Dioxus desktop; browser skill = web.
+
+> **⚠ 2026-10-07 manin OOM tragedy — read before agent-browser.** Leaked
+> agent-browser chromium trees (~1.1GB each, never terminated) exhausted
+> manin's 512GB RAM; the kernel OOM-killed the host and the fleet lost SSH
+> (dev/practice/oc down at the banner). **Prefer ychrome** for web automation.
+> If agent-browser is pragmatically required: the session is not done until
+> the browser is DEAD and VERIFIED — terminate, then `pgrep -c chromium` on
+> the host must return to its pre-session baseline. Full story: msggraph
+> `infra/meta` "TRAGEDY: agent-browser chromium leak OOM-killed manin"
+> (2026-10-07); also recorded in the data-fabric skill.
 - **Today this drives yggterm.** It generalizes to any Dioxus desktop app only once app-control is extracted into a reusable crate (`finding-yggui-app-control-not-reusable` in memory) — relevant when samplers / samplenotes-webapp ship desktop builds, not now (they're webapp + Android in the current prototyping phase).
 
 ## Notifications and audio alerts — `server app notify` (WIRED 2026-08-03 · `--session` + honest bars 2026-08-06)
