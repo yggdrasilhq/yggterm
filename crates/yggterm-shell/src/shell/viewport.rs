@@ -21304,6 +21304,29 @@ fn spawn_screen_reconcile_fetch(
 const SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES: usize = 512 * 1024;
 const SYNTH_OUTPUT_FENCE_DEADLINE_MS: u64 = 30_000;
 
+/// [F1-(e-r1)-R2] TEST HOOK (rig MODE=flushshed): drops the fence's
+/// flush page-write eval at the transport choke — the deterministic
+/// form of the production shed (a missing host / dead bridge consuming
+/// the flush silently). Mirrors YGGTERM_TEST_SEED_FORCED_SKIP semantics.
+fn synth_fence_flush_eval_shed() -> bool {
+    std::env::var("YGGTERM_TEST_FLUSH_EVAL_DROP")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// [F1-(e-r1)-R2] (sol Q1 remainder) The single transport choke for the
+/// fence's flush writes — BOTH flush paths (the explicit-failure live
+/// flush and the deadline/overflow release) write through here. Today
+/// the write is fire-and-forget: delivery is unacknowledged and a shed
+/// transport consumes retained bytes silently (the flushed trace's
+/// delivery_acked:false is the honest stopgap, not a delivery proof).
+fn fence_page_write_eval(host_id: &str, batch: &str) {
+    if synth_fence_flush_eval_shed() {
+        return;
+    }
+    let _ = document::eval(&terminal_page_write_script(host_id, batch));
+}
+
 #[derive(Debug, Default)]
 struct SynthOutputFence {
     /// Each retained batch plus the daemon stream cursor the poll loop
@@ -21400,7 +21423,7 @@ fn flush_synth_output_fence_live(
     reason: &str,
 ) {
     for (batch, _) in &fence.retained {
-        let _ = document::eval(&terminal_page_write_script(host_id, batch));
+        fence_page_write_eval(host_id, batch);
     }
     if !fence.retained.is_empty() {
         append_trace_event(
@@ -21468,7 +21491,7 @@ fn synth_output_fence_stage(
         // the fence as already down).
         if let Some(current) = fence.take() {
             for (batch, _) in &current.retained {
-                let _ = document::eval(&terminal_page_write_script(host_id, batch));
+                fence_page_write_eval(host_id, batch);
             }
             append_trace_event(
                 trace_home,

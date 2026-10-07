@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ]; then echo "MODE must be order|dup|loss"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ]; then echo "MODE must be order|dup|loss|flushshed"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -70,11 +70,14 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
   CAPT_EXPORT=""
-  if [ "$MODE" = dup ] || [ "$MODE" = loss ]; then
+  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ]; then
     CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
   fi
-  if [ "$MODE" = loss ]; then
+  if [ "$MODE" = loss ] || [ "$MODE" = flushshed ]; then
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SEED_FORCED_SKIP=1;"
+  fi
+  if [ "$MODE" = flushshed ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EVAL_DROP=1;"
   fi
   if [ "$SYNTH" = 1 ]; then
     dbus-run-session -- bash -c "
@@ -270,6 +273,62 @@ if MODE == "loss":
         print("RIG FAIL rc=%d — verdicts above" % fail_rc)
         raise SystemExit(fail_rc)
     print("RIG PASS — no ack, no drop: the unapplied seed preserved and delivered every retained byte live")
+    raise SystemExit(0)
+
+if MODE == "flushshed":
+    # (e-r1)-R2 BAR 6 — THE DELIVERY-HONESTY BAR (sitting 22, sol Q1
+    # remainder): the flush TRANSPORT is shed by the choke hook
+    # (YGGTERM_TEST_FLUSH_EVAL_DROP — the deterministic missing-host /
+    # dead-bridge shape) while the fence holds the marker batch. The
+    # bytes CANNOT reach the page through the write path; the bar is
+    # whether the build TELLS THE TRUTH about that. RED (fire-and-forget
+    # flush): the flushed event claims batches/bytes and NOTHING names
+    # the loss — a silent data-loss surface (exit 11). GREEN
+    # (ack-carrying flush): synth_output_fence_flush_undelivered names
+    # every undelivered batch/byte and no flush event claims
+    # delivery_acked:true.
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    samples = []
+    for delay in (0.15, 0.5, 1.0):
+        time.sleep(delay)
+        c, _ = page_screen_count(s, "E1RMARK")
+        samples.append(c)
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    undelivered_events = session_events(events, s, "synth_output_fence_flush_undelivered")
+    unapplied_events = session_events(events, s, "synth_output_fence_seed_unapplied")
+    flushed_total = sum(int(p.get("bytes") or 0) for _, p in flush_events)
+    flushed_acked = sum(int(p.get("acked_bytes") or 0) for _, p in flush_events)
+    undelivered_total = sum(int(p.get("bytes") or 0) for _, p in undelivered_events)
+    false_ack = [p for _, p in flush_events if p.get("delivery_acked") is True]
+    print("VERDICT FENCE-FLUSHSHED: samples=%s daemon=%d (marker reaches the page only via the reconcile heal, if at all)" % (samples, daemon_count))
+    print("   flush=%dB/%d acked=%dB undelivered=%dB/%d unapplied=%d false_ack=%d" % (
+        flushed_total, len(flush_events), flushed_acked, undelivered_total, len(undelivered_events), len(unapplied_events), len(false_ack)))
+    fail_rc = 0
+    if not unapplied_events:
+        print("VERDICT FAIL: unapplied trace missing — rig shape broke (a shed transport must still trace the explicit failure)")
+        fail_rc = fail_rc or 6
+    elif not flush_events or flushed_total < 9:
+        print("VERDICT FAIL: the fence never flushed through the choke (flush=%dB)" % flushed_total)
+        fail_rc = fail_rc or 6
+    elif not undelivered_events or undelivered_total < 9:
+        print("VERDICT RED CONFIRMED: the flushed transport was SHED (%dB claimed flushed, %d acked) and NOTHING names the loss — the fire-and-forget flush consumes retained bytes silently (the s21 delivery_acked:false was the honest stopgap, not a delivery proof)" % (flushed_total, flushed_acked))
+        fail_rc = fail_rc or 11
+    elif false_ack:
+        print("VERDICT FAIL: a flush event claims delivery_acked:true while the transport was shed")
+        fail_rc = fail_rc or 6
+    else:
+        print("   undelivered evidence: %s" % json.dumps({k: undelivered_events[-1][1].get(k) for k in ("batches", "bytes", "first_reason")}))
+    if fail_rc:
+        print("RIG FAIL rc=%d — verdicts above" % fail_rc)
+        raise SystemExit(fail_rc)
+    print("RIG PASS — the shed flush is NAMED: every undelivered batch/byte traced, no false delivery claim")
     raise SystemExit(0)
 
 # (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
