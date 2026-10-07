@@ -70747,6 +70747,73 @@ fn an_unknown_seed_stamp_keeps_every_retained_batch() {
     assert_eq!(fence.retained.len(), 1);
 }
 
+#[test]
+fn the_application_ack_requires_a_seed_write() {
+    // [F1-(e-r1)-R1] sol's R1: a PARSED proof is not an ack — only a seed
+    // that wrote bytes through one of the two write arms commits
+    // coverage. Skipped / painted-only / zero-write / foreign modes all
+    // fail, and so does a proof that carries nothing at all.
+    assert!(synth_seed_application_acked(&serde_json::json!({
+        "wrote_seed": 149,
+        "seed_mode": "fenced_repaint",
+    })));
+    assert!(synth_seed_application_acked(&serde_json::json!({
+        "wrote_seed": 12,
+        "seed_mode": "guarded_append",
+    })));
+    assert!(!synth_seed_application_acked(&serde_json::json!({
+        "wrote_seed": 0,
+        "seed_mode": "skipped",
+    })));
+    assert!(!synth_seed_application_acked(&serde_json::json!({
+        "wrote_seed": 0,
+        "seed_mode": "test_forced_skip",
+    })));
+    assert!(!synth_seed_application_acked(&serde_json::json!({
+        "wrote_seed": 0,
+        "seed_mode": "fenced_repaint",
+    })));
+    assert!(!synth_seed_application_acked(&serde_json::json!({
+        "painted": true,
+        "seed_mode": "skipped",
+    })));
+    assert!(!synth_seed_application_acked(&serde_json::json!({})));
+}
+
+#[test]
+fn the_covered_drop_commits_only_at_the_ack_source_law() {
+    // [F1-(e-r1)-R1] source law (the rig's MODE=loss bar proves the same
+    // predicate live): the arrival arm must NOT commit the stamp nor
+    // destroy covered batches — it only stages the PROVISIONAL seq, and
+    // the destructive drop lives in the proof arm AFTER the unapplied
+    // branch (so a no-ack proof can never have destroyed anything).
+    let source = include_str!("viewport.rs");
+    assert!(
+        !source.contains("synth_seed_stamp = synth_seed_output_seq"),
+        "the arrival arm must not commit the stamp directly"
+    );
+    let arrival = source
+        .find("synthesized_mount_open_seed")
+        .expect("seed arrival trace");
+    let unapplied = source
+        .find("synth_output_fence_seed_unapplied")
+        .expect("unapplied trace");
+    let drop_call = source.find(".drop_seed_covered(").expect("covered drop call");
+    assert!(
+        arrival < unapplied && unapplied < drop_call,
+        "arrival ({arrival}) < unapplied ({unapplied}) < covered drop ({drop_call})"
+    );
+    // R2 wiring: the runtime qualification and the rewind clear.
+    assert!(source.contains("synth_seed_discarded_stale_runtime"));
+    let rewound = source
+        .find("terminal_stream_cursor_rewound")
+        .expect("rewound trace");
+    let rewind_clear = source
+        .find("// [F1-(e-r1)-R2] A rewind is a")
+        .expect("rewind clear comment");
+    assert!(rewound < rewind_clear);
+}
+
 #[cfg(test)]
 mod web_surface_immersion_locks {
     use super::*;
