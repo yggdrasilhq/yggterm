@@ -365,39 +365,48 @@ if MODE == "lateflush":
     if repainted < 1:
         print("PRE-FLIGHT FAIL: the reconcile repaint never landed inside 12s — the recovery path did not fire")
         raise SystemExit(4)
-    # the late flush executes at flush-start+5000ms (~proof+5s; the
-    # repaint lands ~proof+2s) — sleep through the late window, then
-    # sample for the duplication
-    time.sleep(4.5)
+    # the late flush would execute at flush-start+5000ms (~proof+5s; the
+    # repaint lands ~proof+2s). ⛔ MASKED-AT-REST LAW (sitting 18): a
+    # duplication re-heals within ~2s — sampling AFTER the re-heal is a
+    # vacuous pass. Sample DENSELY inside the post-late-write window
+    # (repaint+3.2s ≈ the late write + margin, then every 300ms) and
+    # count the reconcile-applied events too: a second applied event =
+    # the late write corrupted and healed = still a late mutation.
+    time.sleep(3.2)
     counts = []
-    for delay in (0.5, 1.0, 1.5):
-        time.sleep(delay)
+    for _ in range(9):
         c, _ = page_screen_count(s, "E1RMARK")
         counts.append(c)
+        time.sleep(0.3)
     daemon_count = daemon_screen_count(s, "E1RMARK")
     assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
     events = read_events()
     flush_events = session_events(events, s, "synth_output_fence_flushed")
     undelivered_events = session_events(events, s, "synth_output_fence_flush_undelivered")
     unapplied_events = session_events(events, s, "synth_output_fence_seed_unapplied")
+    reconcile_applied = len(
+        [1 for _, name, p in events
+         if name == "frame_hash_reconcile_applied" and p.get("session_path") == s])
     flushed_total = sum(int(p.get("bytes") or 0) for _, p in flush_events)
     undelivered_total = sum(int(p.get("bytes") or 0) for _, p in undelivered_events)
     false_ack = [p for _, p in flush_events if p.get("delivery_acked") is True]
-    print("VERDICT FENCE-LATEFLUSH: repaint=%d late-window counts=%s daemon=%d" % (repainted, counts, daemon_count))
+    first_reason = undelivered_events[-1][1].get("first_reason") if undelivered_events else None
+    print("VERDICT FENCE-LATEFLUSH: repaint=%d late-window counts=%s daemon=%d reconcile_applied=%d first_reason=%s" % (
+        repainted, counts, daemon_count, reconcile_applied, first_reason))
     print("   flush=%dB/%d undelivered=%dB/%d unapplied=%d false_ack=%d" % (
         flushed_total, len(flush_events), undelivered_total, len(undelivered_events), len(unapplied_events), len(false_ack)))
     fail_rc = 0
     if not unapplied_events:
         print("VERDICT FAIL: unapplied trace missing — rig shape broke")
         fail_rc = fail_rc or 6
-    elif not undelivered_events or undelivered_total < 9:
-        print("VERDICT FAIL: the timed-out flush never reported undelivered (undelivered=%dB)" % undelivered_total)
+    elif not undelivered_events or undelivered_total < 9 or first_reason != "ack_timeout":
+        print("VERDICT FAIL: the timed-out flush never reported undelivered with ack_timeout (undelivered=%dB first_reason=%s)" % (undelivered_total, first_reason))
         fail_rc = fail_rc or 6
     elif false_ack:
         print("VERDICT FAIL: a flush event claims delivery_acked:true while every await timed out")
         fail_rc = fail_rc or 6
-    elif max(counts) > 1 or repainted > 1:
-        print("VERDICT RED CONFIRMED: the LATE flush script MUTATED the repainted screen — marker count %s over the repaint's 1 (the stale write appended after the recovery; sol Q3's late-mutation duplication)" % (counts + [repainted]))
+    elif max(counts) > 1 or repainted > 1 or reconcile_applied > 1:
+        print("VERDICT RED CONFIRMED: the LATE flush script MUTATED the repainted screen — marker counts %s (repaint=%d) or %d reconcile heals after the repaint (the stale write appended after the recovery, healed or not; sol Q3's late-mutation duplication)" % (counts, repainted, reconcile_applied))
         fail_rc = fail_rc or 12
     else:
         print("   honest accounting: undelivered %dB named; the page holds exactly the repaint's copy" % undelivered_total)
