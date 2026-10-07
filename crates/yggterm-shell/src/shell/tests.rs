@@ -191,6 +191,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_deadline_expired_cover_with_no_buffered_bytes_rearms_the_screen_reconcile() {
+        // [11.229](c) The permanent-blank shape: a cover deadline that
+        // expires with ZERO buffered bytes used to just drop the cover —
+        // the canvas underneath was never painted and nothing later owned
+        // the repaint (the loop believes the reveal completed; an idle row
+        // never self-heals). The release arm must re-arm the daemon-screen
+        // reconcile — the authoritative vt100 frame repaints the viewport
+        // through the same guarded write the bootstrap reconcile uses,
+        // with a FRESH unwritable-retry budget and defer chain.
+        let source = SHELL_SOURCE;
+        let arm_start = source
+            .find("OffLoopTerminalRpcResult::RevealCoverRelease { generation } =>")
+            .expect("the reveal cover release arm must exist");
+        let arm = &source[arm_start..arm_start + 4_500];
+        assert!(
+            arm.contains("reveal_cover_deadline_reconcile_armed"),
+            "the empty-flush deadline arm must trace the reconcile re-arm \
+             (the production detector — no hermetic rig can construct the \
+             remote-LiveSsh reveal shape)"
+        );
+        assert!(
+            arm.contains("screen_reconcile_due_at_ms = current_millis()"),
+            "the re-arm must set the reconcile due stamp NOW"
+        );
+        assert!(
+            arm.contains("screen_reconcile_unwritable_retries = 0"),
+            "the re-arm must refresh the unwritable-retry budget"
+        );
+        assert!(
+            arm.contains("screen_reconcile_reason = \"reveal_screen_reconcile\""),
+            "the re-arm must use the reveal reason so the reveal_incomplete \
+             quiet-gate bypass applies to the blank canvas"
+        );
+    }
+
     fn every_resume_recovery_call_runs_off_the_terminal_loop() {
         let source = SHELL_SOURCE;
         let mut calls = 0;

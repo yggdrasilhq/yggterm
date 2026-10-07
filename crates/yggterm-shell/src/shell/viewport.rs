@@ -12177,6 +12177,41 @@ fn TerminalCanvas(
                                     );
                                     if !flushed.is_empty() {
                                         let _ = eval.send(TerminalJsCommand::Write { data: flushed, protocol_only: false });
+                                    } else {
+                                        // [11.229](c) THE PERMANENT-BLANK SHAPE:
+                                        // the deadline expired with NOTHING
+                                        // buffered — the cover drops to a
+                                        // canvas the reveal never painted,
+                                        // and no later trigger owns the
+                                        // repaint (the loop believes the
+                                        // reveal completed; an idle row
+                                        // never self-heals). Re-arm the
+                                        // daemon-screen reconcile as the
+                                        // reveal reason: the authoritative
+                                        // vt100 frame repaints the viewport
+                                        // through the same guarded write the
+                                        // bootstrap reconcile uses (the
+                                        // reveal_incomplete bypass applies —
+                                        // a near-empty client buffer has
+                                        // nothing good to tear). The
+                                        // unwritable-retry budget stays
+                                        // fresh so a still-bootstrapping
+                                        // remote gets its retries.
+                                        screen_reconcile_reason = "reveal_screen_reconcile";
+                                        screen_reconcile_due_at_ms = current_millis();
+                                        screen_reconcile_defer_chain_began_ms = 0;
+                                        screen_reconcile_defer_chain_depth = 0;
+                                        screen_reconcile_unwritable_retries = 0;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "reveal_cover_deadline_reconcile_armed",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "generation": generation,
+                                            }),
+                                        );
                                     }
                                 }
                             }
