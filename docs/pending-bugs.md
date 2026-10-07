@@ -539,53 +539,36 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   Composer transport must follow the model ruling (sol/GLM; gemini
   knowledge/creativity only). SLICE 2 LANDED 2026-10-06 (sitting 11, lane lane/memory/dream-verb): the `dream` verb (--prepare/--apply/--run/--status: journal-delta collector with dreamer ingestion isolation + per-ns dream watermark + input budget, machine-parsed composer contract, MANDATORY adversarial-critic verdicts, per-claim [as-of; proof] stamps over a closed vocabulary, append-section/propose-tombstone ops whitelist, ns-level NOW.md + _global owner-now.md landed through journaled origin=dreamer publishes, per-dream OPLOG) + the `search` verb (regex across hub doors, provenance per hit) + tests/test_memory_dream_verb.py (green: isolation, budget, refusals x10, watermark, ops, owner-now, search). FIRST REAL DREAM applied live on -home-pi-gh-yggterm via the seat-composer path (sol transport built but juju-capped to Oct 10 3:54 AM): NOW.md 2309B/9 claims/0 contested AFTER the critic pass contested three generator claims (a stale 33KB figure copied from the door, an unsourced watcher count, an unevidenced 'sittings 1-10') — the adversarial gate measured working on its first live run. owner-now.md live in _global and pinned into every zcode project. Remaining for F8: slices 3-4 (H_vocab phase telemetry, Hebbian decay/canaries) + the [11.236] byte-source probe + the per-host ns-index gap (a peer host never learns a new door's hub-ns MEMORY.md line — the index is per-host publish-time state; NOW.md is read by `get`, so orientation works, but the index drift is a dream-grade gap).
 
-## ⛔ [11.237] THE PRIVACY CHECKER'S PER-TERM HEAD-CAP HIDES CAMPAIGN-SCALE PRIVATE-NAME DEBT — EVERY "GREEN-LOOKING" RUN JUST PEELED THE NEXT SIX HITS, AND THE FULL INVENTORY IS ~1,400 HOME-PATH GREP HITS + 139 SHARED-LIST HITS OF ACCUMULATED LEAKAGE (measured 2026-10-06, sitting 14's full-suite gate)
+## ⛔ [11.238] TWO FLEET-SKILL TESTS ARE RED ON CLEAN MAIN — ygg-auth's ROTATION SCORING RANKS A FULL ACCOUNT FIRST ("headroom did not lead": acct-full > acct-good > acct-dead) AND THE SANDBOX-AIM TEST'S REMOTE ARM NEVER MAKES ITS SSH HOP (measured 2026-10-07, both rc=1 identically on main e1b99812 and on the [11.237] arm-2 lane — PRE-EXISTING, surfaced by arm 2's skill-suite gate)
 
 **Status:** OPEN
 
-Filed 2026-10-06 ~23:0x IST by the campaign seat (board interim
-ACK-486d8f30ff). The [11.229](b) lane's full-workspace-suite gate surfaced
-the privacy test RED on unfixed main — and fixing it peeled layer after
-layer: scripts/check-privacy.sh prints at most 6 hits per private term
-(12 for home paths), so each run "finds" only the next batch and the
-depth was invisible. THE MEASURED INVENTORY (uncapped greps, sitting 14):
-the home-path pattern alone matches ~1,393 lines repo-wide (the checker's
-scoped tracked-files subset is smaller but the same order); the shared
-guard list (~/.config/ygg-privacy/private-terms.txt) matches 139 lines;
-one encoded in-repo term still matches 12. Oldest layers predate 2026-09
-(the [11.183] fixtures, the [11.57]/[11.162] tombstone comments, the
-[11.228] verbatim trace strings); the newest is the same week (the
-dream-auto test fixtures, 2026-10-06).
+Filed 2026-10-07 by the [11.237] arm-2 sitting (board ACK-da8179c1e1's
+outcome). The migration's gate ran the whole
+.agents/skills/yggterm-agent-fleet/tests/ battery; 22 green, 2 red — and
+both reproduce BYTE-IDENTICALLY on the clean main checkout, so they are
+not the migration's regressions:
 
-WHY IT MATTERS: this repo is public; a term withheld from the checker's
-output is still PUBLISHED in the repo bytes. The layered cap is a guard
-that reports "6 left" forever — the same class as the [11.231]
-exe-mismatch lie (an instrument that under-reports its own subject).
+1. `tests/test_ygg_auth_rotation.py` — unit arm: "convert_flat + rotate
+   scoring rank measured headroom first: ranked ['acct-full', 'acct-good',
+   'acct-dead'] — headroom did not lead". A LOGIC-shape failure (the
+   rotation picker is supposed to prefer headroom; a full account winning
+   the ranking is either a real scoring bug or a stale test encoding an
+   older policy — the deterministic-auth-homes law of 2026-09-30 rewrote
+   rotation, and this test may predate it). No privacy interplay.
+2. `tests/test_the_fleet_verbs_can_be_aimed_at_a_sandbox.py` — "ygg-spawn:
+   never reached `terminal new` through the aimed binary" + "remote arm:
+   ygg-deliver made no ssh hop at all … no row matches <uuid>". Smells
+   ENVIRONMENTAL on dev (a sandbox daemon spawn under a host that already
+   runs the live watcher), but it is unproven which leg dies — needs its
+   own probe before "environmental" is allowed to stand (the anti-lying
+   law).
 
-FIX SHAPE (two arms):
-1. THE CHECKER: LANDED 2026-10-07 (sitting 16, main a6048f792d64) — every
-   class reports its TOTAL unique offending-line count alongside the
-   capped sample (`sample()` helper; the cap is display-only, never
-   truth; exit semantics unchanged). THE HONEST SCOPED INVENTORY it
-   reported on landing: home paths 12 unique lines; shared guard list
-   136 unique lines (one withheld term; concentrated in comments/tests
-   naming one private host). The filed ~1,400 figure was REPO-WIDE grep
-   including the checker's EXCLUDED trees (docs/archive, vendored,
-   assets) — the checker-scope debt is ~148 lines, still all of it
-   published bytes; arm 2 owns it.
-2. THE DEBT: a scripted, reviewable bulk migration (each class has a
-   mechanical transform: /home/<user> -> /home/user in fixtures/comments;
-   private host names -> invented labels; real session titles -> invented
-   titles), run per-file with the suite green after each batch. ~50
-   sites already fixed in the [11.229](b) lane (2026-10-06) — every
-   individually verified; the pattern is established and safe. The
-   checker-scope remainder is now enumerated honestly: 12 home-path
-   unique lines + 136 shared-list unique lines (one withheld term).
-
-ATTACK ORDER: the checker arm first (it makes every later run honest),
-then the debt in file-batches (crates/ tests -> docs/pending-bugs
-historical entries -> tools/ -> .agents/skills), suite green between
-batches.
+ATTACK: rerun both in isolation; for (1) read ygg-auth.py's scoring order
+against the test's expectation and decide bug-vs-stale-test with the
+owner's rotation laws (ygg-auth skill); for (2) trace the aimed sandbox
+spawn's own log — the test prints the sandbox dir; check whether the
+headless binary registered rows at all.
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
