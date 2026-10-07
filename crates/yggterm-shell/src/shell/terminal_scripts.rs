@@ -385,6 +385,18 @@ if (__t && typeof __t.write === 'function') {{
 pub(crate) fn terminal_page_write_acked_script(host_id: &str, data: &str) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     let data = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
+    // [F1-(e-r1)-R2 sol Q1] the callback rides the DATA write itself —
+    // it acknowledges the batch's own parse completion (xterm's FIFO
+    // write queue), not a second empty enqueue.
+    // [sol Q3] TEST HOOK: a delayed EXECUTION (the eval resolves after
+    // the caller's timeout already declared the batch undelivered) for
+    // the rig's lateflush bar — the exact late-mutation hazard Q3
+    // convicted.
+    let exec_delay_ms: u64 = std::env::var("YGGTERM_TEST_FLUSH_EXEC_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let exec_delay = serde_json::to_string(&exec_delay_ms).unwrap_or_else(|_| "0".to_string());
     format!(
         r#"const __h = {host};
 const __e = (window.__yggtermXtermHosts || {{}})[__h];
@@ -392,9 +404,11 @@ const __t = __e && __e.term ? __e.term : null;
 if (!(__t && typeof __t.write === 'function')) {{
     return JSON.stringify({{ ok: false, reason: 'no_host' }});
 }}
+if ({exec_delay} > 0) {{
+    await new Promise((resolve) => setTimeout(resolve, {exec_delay}));
+}}
 try {{
-    __t.write({data});
-    await new Promise((resolve) => __t.write('', resolve));
+    await new Promise((resolve) => __t.write({data}, resolve));
     return JSON.stringify({{ ok: true }});
 }} catch (_error) {{
     return JSON.stringify({{ ok: false, reason: 'throw' }});

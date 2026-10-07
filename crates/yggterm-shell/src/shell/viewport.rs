@@ -7530,18 +7530,35 @@ fn TerminalCanvas(
                             &mut released_fence,
                         );
                         // [F1-(e-r1)-R2] a released fence's batches flush
-                        // AHEAD of this batch, each delivery acknowledged.
+                        // AHEAD of this batch, each delivery acknowledged —
+                        // but this site lives in the PRE_SELECT body (the
+                        // input-starvation lock: no round trip may be
+                        // awaited here), so the ack-carrying flush AND this
+                        // batch's live write run sequenced on a spawned
+                        // task (release precedes the batch that broke the
+                        // fence; concurrent release flushes are impossible
+                        // by construction — one fence, one release, one
+                        // task).
                         if let Some(fence) = released_fence.take() {
-                            flush_synth_output_fence_live(
-                                fence,
-                                &host_id,
-                                &session_path,
-                                &trace_home,
-                                "release",
-                            )
-                            .await;
-                        }
-                        if !retained_now {
+                            let flush_host = host_id.clone();
+                            let flush_session = session_path.clone();
+                            let flush_trace = trace_home.to_path_buf();
+                            let flush_batch = data.clone();
+                            tokio::spawn(async move {
+                                flush_synth_output_fence_live(
+                                    fence,
+                                    &flush_host,
+                                    &flush_session,
+                                    &flush_trace,
+                                    "release",
+                                )
+                                .await;
+                                let _ = document::eval(&terminal_page_write_script(
+                                    &flush_host,
+                                    &flush_batch,
+                                ));
+                            });
+                        } else if !retained_now {
                             let _ = document::eval(&terminal_page_write_script(&host_id, &data));
                         }
                     } else {
@@ -21506,13 +21523,13 @@ fn synth_seed_application_acked(proof: &Value) -> bool {
 /// never came (seed skipped, proof unreadable, or the seed belonged to a
 /// replaced runtime). Nothing covers the retained bytes, so they all
 /// flush LIVE, in order, through the same page-write eval the live sites
-/// use — ordering against the page may be imperfect, but no retained
-/// byte is lost.
+/// use — ordering against the page may be imperfect.
 /// [F1-(e-r1)-R2] (sol Q1) every flushed batch now carries a page-write
-/// ACK (the write callback the seed's proof uses): an undelivered batch
-/// is NAMED (synth_output_fence_flush_undelivered), never silently
-/// consumed — the daemon ring+screen keep every byte and the reconciles
-/// remain the recovery path.
+/// ACK (the write callback the seed's proof uses): every retained byte
+/// is either DELIVERY-ACKNOWLEDGED or EXPLICITLY reported undelivered
+/// (synth_output_fence_flush_undelivered) — never silently consumed; the
+/// daemon ring+screen keep every byte and the reconciles remain the
+/// recovery path.
 async fn flush_synth_output_fence_live(
     fence: SynthOutputFence,
     host_id: &str,
