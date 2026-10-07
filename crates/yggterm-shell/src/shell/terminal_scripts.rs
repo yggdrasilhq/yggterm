@@ -179,6 +179,32 @@ fn initial_terminal_grid_for_mount(shell: &ShellState, session_path: &str) -> Op
 fn terminal_grid_is_usable_cells(cols: u64, rows: u64) -> bool {
     cols >= 20 && rows >= 4
 }
+/// [11.229](a) The live CLIENT grid of the newest mounted host for
+/// `session_path`, as a JSON string for the eval bridge. The reused host's
+/// own xterm is the client-side grid SSOT: the daemon's "PTY size" metadata
+/// may be the diverged value the reuse repair exists to heal, so the grid
+/// must come from the page, never from the daemon.
+fn terminal_reused_host_grid_script(session_path: &str) -> String {
+    format!(
+        r#"
+        // ⛔ top-level `return` — the ONLY shape whose value crosses the
+        // eval bridge (an IIFE's return is dropped; see
+        // preview_find_script / terminal_mount_fn_probe_script).
+        return (() => {{
+          const sessionPath = {session_path:?};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entries = Object.values(registry)
+            .filter((entry) => entry && entry.sessionPath === sessionPath && entry.term)
+            .sort((a, b) => (b.mountedAtMs || 0) - (a.mountedAtMs || 0));
+          const term = entries.length ? entries[0].term : null;
+          const cols = Number((term && term.cols) || 0);
+          const rows = Number((term && term.rows) || 0);
+          return JSON.stringify({{ found: Boolean(term), cols, rows }});
+        }})();
+        "#,
+        session_path = session_path,
+    )
+}
 /// [11.172] The page-cached mount function's version. The mount body is
 /// ~500 KB of JS; re-evaluating the rendered script on every activation
 /// RE-PARSES it on the web process' main thread — measured 2026-09-27 as the
