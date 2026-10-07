@@ -399,7 +399,11 @@ if (__t && typeof __t.write === 'function') {{
 pub(crate) static SYNTH_FLUSH_SUPERSESSION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn terminal_page_write_acked_script(host_id: &str, data: &str) -> String {
+pub(crate) fn terminal_page_write_acked_script(
+    host_id: &str,
+    data: &str,
+    receipt: &AppliedContentReceiptSpec,
+) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     let data = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
     // [F1-(e-r1)-R2 sol Q1] the callback rides the DATA write itself —
@@ -422,8 +426,10 @@ pub(crate) fn terminal_page_write_acked_script(host_id: &str, data: &str) -> Str
     } else {
         SYNTH_FLUSH_SUPERSESSION.load(std::sync::atomic::Ordering::Relaxed)
     };
+    let receipt_js = receipt.publish_script_fragment("__batch.length", "false");
     format!(
         r#"const __h = {host};
+const __batch = {data};
 const __e = (window.__yggtermXtermHosts || {{}})[__h];
 const __t = __e && __e.term ? __e.term : null;
 if (!(__t && typeof __t.write === 'function')) {{
@@ -436,8 +442,19 @@ if (Number(__e.flushSupersession || 0) > {carried}) {{
     return JSON.stringify({{ ok: false, reason: 'superseded' }});
 }}
 try {{
-    await new Promise((resolve) => __t.write({data}, resolve));
-    return JSON.stringify({{ ok: true }});
+    await new Promise((resolve) => __t.write(__batch, resolve));
+    // [Q7] post-callback REVALIDATION before the receipt: the pre-write
+    // supersession guard above is what protects content; this check only
+    // governs the APPLICATION RECEIPT — a recovery repaint that executed
+    // between this write's guard and its callback owns the screen now,
+    // so this batch earns delivery (ok) but not application evidence.
+    const __entryCurrent = (window.__yggtermXtermHosts || {{}})[__h] === __e;
+    const __superStillOk = !(Number(__e.flushSupersession || 0) > {carried});
+    if (__entryCurrent && __superStillOk) {{
+        {receipt_js}
+        return JSON.stringify({{ ok: true, applied: {{ published: true, ts: __e.appliedContent.ts, gen: __e.appliedContent.gen }} }});
+    }}
+    return JSON.stringify({{ ok: true, applied: null }});
 }} catch (_error) {{
     return JSON.stringify({{ ok: false, reason: 'throw' }});
 }}"#
@@ -583,6 +600,44 @@ return JSON.stringify({{
     )
 }
 
+/// [Q7] THE APPLICATION RECEIPT's qualification tuple (sol s18-Q7 /
+/// s21-Q5, landed s23): attempt-Ready, host-painted, heartbeat-fresh,
+/// owner-claim, and applied-content-cursor are DIFFERENT facts — the
+/// qualified application receipt is the ONE transaction a CONTENT-READY
+/// or painted-state promotion must match. The tuple rides every
+/// content-applying page write; the page-side publish revalidates entry
+/// identity + supersession AFTER the write's callback, and the Rust-side
+/// consumer re-validates the returned tuple against its current state
+/// before any promotion.
+pub(crate) struct AppliedContentReceiptSpec {
+    pub(crate) session_path: String,
+    pub(crate) mount_epoch: u64,
+    pub(crate) runtime_spawn_id: u64,
+    /// The flush SUPERSESSION epoch carried at script BUILD — the publish
+    /// refuses to stamp an entry a recovery repaint has already
+    /// superseded (the s22 law, now protecting the seed too).
+    pub(crate) supersession: u64,
+}
+
+impl AppliedContentReceiptSpec {
+    /// The page-side publish. Assumes the caller has ALREADY revalidated
+    /// that `__e` is the registry's CURRENT entry for the host and that
+    /// `__e.flushSupersession` has not passed the carried token; the
+    /// fragment stamps the qualified receipt on the entry.
+    pub(crate) fn publish_script_fragment(
+        &self,
+        wrote_expr: &str,
+        blank_expr: &str,
+    ) -> String {
+        let session = serde_json::to_string(&self.session_path)
+            .unwrap_or_else(|_| "\"\"".to_string());
+        format!(
+            "__e.appliedContent = {{ session: {session}, epoch: {}, runtime: {}, wrote: {wrote_expr}, blank: {blank_expr}, ts: Date.now(), gen: Number(window.__yggtermMountAttempt || 0) }};",
+            self.mount_epoch, self.runtime_spawn_id
+        )
+    }
+}
+
 /// [F1] The full-contract synthesis probe for a warm mount whose bridge was
 /// shed: a single value-carrying one-shot eval (⛔ top-level `return` — the
 /// eval bridge shape law) that (a) seeds the daemon's screen snapshot into
@@ -595,16 +650,28 @@ pub(crate) fn terminal_synthesized_mount_open_script(
     seed: Option<&str>,
     fenced: bool,
     forced_skip: bool,
+    receipt: &AppliedContentReceiptSpec,
 ) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
-    let seed_lit = match seed.filter(|text| !text.trim().is_empty()) {
+    // [Q7-R5] PRESENCE, not truthiness: a valid BLANK seed (empty or
+    // whitespace-only text WITH a stamped seq — the daemon authoritatively
+    // answered an empty screen) is a real seed. The old `.trim().is_empty()`
+    // filter converted it to JS `null` before the write arm, so the fenced
+    // clear could never run: wrote_seed stayed 0, mode stayed 'skipped',
+    // and the s21 valid-blank ruling was UNREACHABLE (sol s23 round 1 —
+    // the resurrection hazard it was meant to close was still open).
+    let seed_present = seed.is_some();
+    let seed_lit = match seed {
         Some(text) => serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
         None => "null".to_string(),
     };
     let fenced = if fenced { "true" } else { "false" };
+    let receipt_supersession = receipt.supersession;
+    let receipt_js = receipt.publish_script_fragment("__wrote", "__blank");
     format!(
         r#"const __h = {host};
 const __seed = {seed_lit};
+const __seedPresent = {seed_present};
 const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
 const __t = __e && __e.term ? __e.term : null;
 const __hostEl = document.getElementById(__h);
@@ -619,12 +686,16 @@ const __painted = (t) => {{
 }};
 let __wrote = 0;
 let __mode = 'skipped';
+let __blank = false;
+let __applied = null;
 if ({forced_skip}) {{
     // [F1-(e-r1)-R1] TEST HOOK (fence-rig MODE=loss): the deterministic
     // no-ack shape — the proof fails BEFORE the first page seed write
     // (production: a missing host or an empty seed text). The surface
     // still reports honestly; wrote_seed stays 0 so coverage can never
-    // commit against this proof.
+    // commit against this proof, and NO receipt is published or returned
+    // ([Q7] the promotion cannot ride a forced-skip proof even when the
+    // inherited buffer reads painted).
     return JSON.stringify({{
         constructed: Boolean(__t),
         screen_in_host: Boolean(__screen),
@@ -633,9 +704,11 @@ if ({forced_skip}) {{
         painted: __painted(__t),
         wrote_seed: 0,
         seed_mode: 'test_forced_skip',
+        blank: false,
+        applied: null,
     }});
 }}
-if (__t && typeof __t.write === 'function' && __seed) {{
+if (__t && typeof __t.write === 'function' && __seedPresent) {{
     if ({fenced}) {{
         // [F1-(e)] THE FENCED REPAINT (sol Q1): the authoritative screen
         // installs as a formatted full-frame repaint — home + clear + the
@@ -645,22 +718,36 @@ if (__t && typeof __t.write === 'function' && __seed) {{
         // home cell, reads unpainted and the stale T0 seed appends over
         // live output. Fenced, the seed REPLACES the frame; the
         // differentials retained behind the fence replay past it when
-        // this proof returns (the write callback below IS the ack).
-        // [F1-(e-r1)-R1] (sol Q2): a VALID BLANK seed (empty text with a
-        // stamped seq — the daemon answered an empty screen) acks too:
-        // the repaint's own control bytes are the write, so the clear
-        // the blank represents is APPLIED and coverage may commit
-        // against it (replaying pre-blank retained bytes over an
-        // unacked blank would resurrect erased content).
-        __t.write('\x1b[H\x1b[2J' + __seed);
-        await new Promise((resolve) => __t.write('', resolve));
+        // this proof returns.
+        // [F1-(e-r1)-R1] (sol Q2): a VALID BLANK seed acks too: the
+        // repaint's own control bytes ARE the write, so the clear the
+        // blank represents is APPLIED and coverage may commit against
+        // it (replaying pre-blank retained bytes over an unacked blank
+        // would resurrect erased content). [Q7-R5] reachable at last:
+        // the ack rides the DATA write's own callback (the s22 flush
+        // law — an empty trailing enqueue acknowledges nothing).
+        await new Promise((resolve) => __t.write('\x1b[H\x1b[2J' + __seed, resolve));
         __wrote = '\x1b[H\x1b[2J'.length + __seed.length;
+        __blank = __seed.length === 0;
         __mode = 'fenced_repaint';
     }} else if (!__painted(__t)) {{
-        __t.write(__seed);
-        await new Promise((resolve) => __t.write('', resolve));
+        await new Promise((resolve) => __t.write(__seed, resolve));
         __wrote = __seed.length;
         __mode = 'guarded_append';
+    }}
+}}
+if (__wrote > 0) {{
+    // [Q7] THE APPLICATION RECEIPT: ownership is not application. After
+    // the write's callback, REVALIDATE that the registry still maps this
+    // host to the SAME entry object (a remount restamps the key — the
+    // (f2) bucket-ownership discipline) and that the recovery repaint has
+    // not superseded this write; only then publish the qualified stamp
+    // the Rust-side promotion must match.
+    const __entryCurrent = (window.__yggtermXtermHosts || {{}})[__h] === __e;
+    const __superOk = !(__e && Number(__e.flushSupersession || 0) > {receipt_supersession});
+    if (__entryCurrent && __superOk) {{
+        {receipt_js}
+        __applied = {{ published: true, ts: __e.appliedContent.ts, gen: __e.appliedContent.gen }};
     }}
 }}
 return JSON.stringify({{
@@ -671,6 +758,8 @@ return JSON.stringify({{
     painted: __painted(__t),
     wrote_seed: __wrote,
     seed_mode: __mode,
+    blank: __blank,
+    applied: __applied,
 }});"#
     )
 }

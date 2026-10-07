@@ -1521,11 +1521,12 @@ impl TerminalManager {
     }
 
     /// [F1-(e-r1)] TEST-ONLY rig hook — see
-    /// [`PtySessionRuntime::debug_inject_ring_marker_once`].
-    pub fn debug_inject_ring_marker_once(&self, key: &str, data: &str) -> bool {
+    /// [`PtySessionRuntime::debug_inject_ring_marker_once`]. Returns the
+    /// minted chunk seq when this call performed the injection.
+    pub fn debug_inject_ring_marker_once(&self, key: &str, data: &str, ring_only: bool) -> Option<u64> {
         self.sessions
             .get(key)
-            .is_some_and(|session| session.debug_inject_ring_marker_once(data))
+            .and_then(|session| session.debug_inject_ring_marker_once(data, ring_only))
     }
 
     /// The latest complete OSC 0/2 window title this session's PTY emitted —
@@ -4105,16 +4106,24 @@ impl PtySessionRuntime {
     /// an in-flight differential — the duplication falsifier needs no
     /// verb-timing luck. Returns false when this session was already
     /// marked.
-    fn debug_inject_ring_marker_once(&self, data: &str) -> bool {
+    fn debug_inject_ring_marker_once(&self, data: &str, ring_only: bool) -> Option<u64> {
         if self
             .debug_marker_injected
             .swap(true, Ordering::SeqCst)
         {
-            return false;
+            return None;
         }
         let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
-        if let Ok(mut screen_state) = self.screen_state.lock() {
-            screen_state.process(data.as_bytes());
+        // [Q7 MODE=blank] ring_only: the marker lands in the RING but the
+        // vt100 screen never parses it — the authoritative screen stays
+        // blank while the marker rides as an in-flight differential whose
+        // bytes the seed's stamp must cover (the valid-blank falsifier:
+        // replaying pre-blank bytes over an unacked blank resurrects
+        // erased content).
+        if !ring_only {
+            if let Ok(mut screen_state) = self.screen_state.lock() {
+                screen_state.process(data.as_bytes());
+            }
         }
         let seq_value = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let mut retained = self.retained_bytes.load(Ordering::SeqCst);
@@ -4125,7 +4134,7 @@ impl PtySessionRuntime {
         retained = retained.saturating_add(data.len());
         trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
         self.retained_bytes.store(retained, Ordering::SeqCst);
-        true
+        Some(seq_value)
     }
 
     /// [F1-(e-r1)] The screen text plus its stream-cursor stamp — the

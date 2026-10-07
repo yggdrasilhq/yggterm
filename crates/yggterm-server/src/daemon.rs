@@ -14612,11 +14612,63 @@ impl DaemonRuntime {
                 // construction while the client's polls still return its
                 // chunk as an in-flight differential inside the fence
                 // window. No verb-timing luck.
+                // [Q7 MODE=blank] RING_ONLY: the marker lands in the ring
+                // ONLY and the answer is the AUTHORITATIVE BLANK — empty
+                // text carrying the post-injection stamp. The valid-blank
+                // falsifier's deterministic shape: the seed MUST ack as an
+                // empty repaint (its control bytes) and drop the marker
+                // batch as covered; a build that skips the blank flushes
+                // the marker over it — resurrecting content the
+                // authoritative screen says was erased.
                 if let Some(ms) = test_snapshot_capture_stall_ms() {
-                    let _ = self
-                        .terminals
-                        .debug_inject_ring_marker_once(&runtime_path, "E1RMARK\r\n");
+                    let ring_only = std::env::var("YGGTERM_TEST_SNAPSHOT_CAPTURE_RING_ONLY")
+                        .map(|value| value == "1")
+                        .unwrap_or(false);
+                    let injected_seq = self.terminals.debug_inject_ring_marker_once(
+                        &runtime_path,
+                        "E1RMARK\r\n",
+                        ring_only,
+                    );
+                    if ring_only {
+                        if let Ok(home) = crate::resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "server",
+                                "terminal_runtime",
+                                "test_hook_snapshot_capture_ring_only",
+                                serde_json::json!({
+                                    "injected_seq": injected_seq,
+                                }),
+                            );
+                        }
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(ms));
+                    if ring_only && injected_seq.is_some() {
+                        return Ok(ServerResponse::TerminalSnapshot {
+                            text: String::new(),
+                            output_seq: injected_seq.unwrap_or_default(),
+                            running: self.terminals.session_is_running(&runtime_path),
+                            runtime_output_seen: self
+                                .terminals
+                                .session_has_runtime_output(&runtime_path),
+                            post_resize_output_seen: self
+                                .terminals
+                                .session_post_resize_output_seen(&runtime_path),
+                            last_resize_seq: self
+                                .terminals
+                                .session_last_resize_seq(&runtime_path),
+                            runtime_spawn_id: self
+                                .terminals
+                                .session_runtime_spawn_id(&runtime_path),
+                            composer_holds_draft: self.terminals.session_composer_holds_draft(
+                                &runtime_path,
+                                self.server.live_session_kind(&runtime_path),
+                            ),
+                            pty_in_alternate_screen: self
+                                .terminals
+                                .session_in_alternate_screen(&runtime_path),
+                        });
+                    }
                 }
                 let (text, output_seq) = self
                     .terminals
