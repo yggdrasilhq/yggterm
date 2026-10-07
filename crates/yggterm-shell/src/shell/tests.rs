@@ -70527,9 +70527,17 @@ mod browser_tree_refresh_skip_tests {
 #[test]
 fn synth_output_fence_retains_in_order_until_the_byte_bound() {
     let mut fence = SynthOutputFence::new(1_000);
-    assert!(fence.retain("alpha"));
-    assert!(fence.retain("beta"));
-    assert_eq!(fence.retained, vec!["alpha".to_string(), "beta".to_string()]);
+    // [F1-(e-r1)] each batch also records the daemon cursor its round had
+    // reached — the covered-through proof the seed drop keys on.
+    assert!(fence.retain("alpha", 4));
+    assert!(fence.retain("beta", 9));
+    assert_eq!(
+        fence.retained,
+        vec![
+            ("alpha".to_string(), 4),
+            ("beta".to_string(), 9),
+        ],
+    );
     assert_eq!(fence.retained_bytes, "alpha".len() + "beta".len());
     assert!(!fence.deadline_expired(1_000 + SYNTH_OUTPUT_FENCE_DEADLINE_MS));
 }
@@ -70538,8 +70546,8 @@ fn synth_output_fence_retains_in_order_until_the_byte_bound() {
 fn synth_output_fence_refuses_past_the_byte_bound() {
     let mut fence = SynthOutputFence::new(0);
     let exact = "x".repeat(SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES);
-    assert!(fence.retain(&exact));
-    assert!(!fence.retain("y"));
+    assert!(fence.retain(&exact, 1));
+    assert!(!fence.retain("y", 2));
     // the refused batch was not half-recorded
     assert_eq!(fence.retained.len(), 1);
     assert_eq!(fence.retained_bytes, SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES);
@@ -70580,6 +70588,62 @@ fn frame_hash_sync_script_pairs_the_daemon_hash_with_the_page_probe() {
     assert!(script.contains("__yggtermFrameHash.frameHashOf"));
     assert!(script.contains("at_bottom"));
     assert!(script.contains("return JSON.stringify"));
+}
+
+
+// ============================================================================
+// [F1-(e-r1)] THE SEED'S STREAM-CURSOR STAMP — unit locks for the fence's
+// covered-drop. The rig (tools/uxspeed/fence-rig.sh MODE=dup) proves the
+// same predicate end-to-end on a live synthesized mount.
+// ============================================================================
+
+#[test]
+fn a_seed_stamp_drops_only_fully_covered_retained_batches() {
+    let mut fence = SynthOutputFence::new(0);
+    assert!(fence.retain("covered-batch", 7));
+    assert!(fence.retain("straddling-batch", 12));
+    assert!(fence.retain("fresh-batch", 15));
+    fence.seed_output_seq = 7;
+    let (dropped_batches, dropped_bytes) = fence.drop_seed_covered(7);
+    // At-or-below the stamp is covered: the batch whose round ended at 7 is
+    // already inside the seeded screen; the straddler (12) and the fresh
+    // batch (15) are not provably covered, so they stay (the straddler's
+    // covered prefix is the documented narrow residue).
+    assert_eq!(dropped_batches, 1);
+    assert_eq!(dropped_bytes, "covered-batch".len());
+    assert_eq!(
+        fence
+            .retained
+            .iter()
+            .map(|(data, _)| data.as_str())
+            .collect::<Vec<_>>(),
+        vec!["straddling-batch", "fresh-batch"],
+    );
+    assert_eq!(
+        fence.retained_bytes,
+        "straddling-batch".len() + "fresh-batch".len(),
+    );
+    // The byte accounting survives the drop (an overflow re-check reads a
+    // true bound, not the pre-drop one).
+    assert!(fence.retain("after-drop", 16));
+    assert_eq!(
+        fence.retained_bytes,
+        "straddling-batch".len() + "fresh-batch".len() + "after-drop".len(),
+    );
+}
+
+#[test]
+fn an_unknown_seed_stamp_keeps_every_retained_batch() {
+    // 0 = the seed never answered with a stamp (old daemon, or the answer
+    // errored): the dedupe fails OPEN — every batch flushes, exactly the
+    // pre-(e-r1) behavior.
+    let mut fence = SynthOutputFence::new(0);
+    assert!(fence.retain("batch", 3));
+    fence.seed_output_seq = 0;
+    let (dropped_batches, dropped_bytes) = fence.drop_seed_covered(0);
+    assert_eq!(dropped_batches, 0);
+    assert_eq!(dropped_bytes, 0);
+    assert_eq!(fence.retained.len(), 1);
 }
 
 #[cfg(test)]

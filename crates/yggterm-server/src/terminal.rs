@@ -1511,6 +1511,23 @@ impl TerminalManager {
             .map(|session| session.screen_snapshot())
     }
 
+    /// [F1-(e-r1)] The screen text plus its stream-cursor stamp — the
+    /// pair a synthesized-mount seed needs so the client can tell which
+    /// already-streamed differentials the seeded screen contains.
+    pub fn session_screen_snapshot_stamped(&self, key: &str) -> Option<(String, u64)> {
+        self.sessions
+            .get(key)
+            .map(|session| session.screen_snapshot_stamped())
+    }
+
+    /// [F1-(e-r1)] TEST-ONLY rig hook — see
+    /// [`PtySessionRuntime::debug_inject_ring_marker_once`].
+    pub fn debug_inject_ring_marker_once(&self, key: &str, data: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.debug_inject_ring_marker_once(data))
+    }
+
     /// The latest complete OSC 0/2 window title this session's PTY emitted —
     /// the per-TUI identity plane (Issue Heading 34). `None` = nothing
     /// captured (no title sequence yet, or an empty one).
@@ -2383,6 +2400,27 @@ pub enum SubmitIffLineVerdict {
     NotOwned,
 }
 
+/// Keep `injected_ring_floor` at the LOWEST injected-not-screened seq.
+fn cap_injected_ring_floor(floor: &AtomicU64, seq: u64) {
+    let mut current = floor.load(Ordering::SeqCst);
+    while current == 0 || seq < current {
+        match floor.compare_exchange(current, seq, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// The snapshot stamp's floor rule: an injected contract line with seq F
+/// is in the ring but not in the screen, so a stamp must stay below F.
+fn capped_seed_stamp(output_seq: u64, injected_floor: u64) -> u64 {
+    if injected_floor > 0 {
+        output_seq.min(injected_floor - 1)
+    } else {
+        output_seq
+    }
+}
+
 struct PtySessionRuntime {
     key: String,
     // Unique per PTY spawn (across daemon restarts too — time-based). The
@@ -2403,6 +2441,18 @@ struct PtySessionRuntime {
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     retained_bytes: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
+    /// [F1-(e-r1)] TEST-ONLY: the rig's deterministic marker has been
+    /// injected into this runtime's ring (once per session — the capture
+    /// hook fires for more than one snapshot request).
+    debug_marker_injected: Arc<AtomicBool>,
+    /// The LOWEST seq of an agent-error CONTRACT line that
+    /// entered the chunk ring WITHOUT entering this daemon's vt100 screen
+    /// (the reader injects the translated line for clients; the screen
+    /// parsed the PTY's raw bytes, never the translation). Zero = none.
+    /// The snapshot stamp is capped below this floor so a client deduping
+    /// against the stamp can never drop a contract chunk the seeded
+    /// screen does not actually carry.
+    injected_ring_floor: Arc<AtomicU64>,
     started_at_ms: u64,
     last_activity_ms: Arc<AtomicU64>,
     /// When the CHILD last produced output — stamped only on the reader side.
@@ -3214,6 +3264,8 @@ impl PtySessionRuntime {
         let chunks = Arc::new(Mutex::new(VecDeque::new()));
         let retained_bytes = Arc::new(AtomicUsize::new(0));
         let seq = Arc::new(AtomicU64::new(0));
+        let injected_ring_floor = Arc::new(AtomicU64::new(0));
+        let debug_marker_injected = Arc::new(AtomicBool::new(false));
         let started_at_ms = now_millis();
         let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
         let last_output_ms = Arc::new(AtomicU64::new(started_at_ms));
@@ -3251,6 +3303,7 @@ impl PtySessionRuntime {
         let reader_chunks = Arc::clone(&chunks);
         let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
+        let reader_injected_floor = Arc::clone(&injected_ring_floor);
         let reader_activity = Arc::clone(&last_activity_ms);
         let reader_output = Arc::clone(&last_output_ms);
         let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
@@ -3381,6 +3434,10 @@ impl PtySessionRuntime {
                                         }
                                         let contract_seq =
                                             reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                        cap_injected_ring_floor(
+                                            &reader_injected_floor,
+                                            contract_seq,
+                                        );
                                         let mut retained =
                                             reader_retained_bytes.load(Ordering::SeqCst);
                                         chunks.push_back(TerminalChunk {
@@ -3523,6 +3580,7 @@ impl PtySessionRuntime {
                                         *slot = Some(contract_line.clone());
                                     }
                                     let contract_seq = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                    cap_injected_ring_floor(&reader_injected_floor, contract_seq);
                                     let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
                                     chunks.push_back(TerminalChunk {
                                         seq: contract_seq,
@@ -3655,6 +3713,8 @@ impl PtySessionRuntime {
             chunks,
             retained_bytes,
             seq,
+            injected_ring_floor,
+            debug_marker_injected,
             started_at_ms,
             last_activity_ms,
             last_output_ms,
@@ -4032,11 +4092,62 @@ impl PtySessionRuntime {
     /// through. Clipping HERE (the one place the screen is served) covers every
     /// client path at once, rather than each replay call site remembering to.
     fn screen_snapshot(&self) -> String {
+        self.screen_snapshot_stamped().0
+    }
+
+    /// [F1-(e-r1)] TEST-ONLY, rig determinism: inject one marker chunk
+    /// into the ring AND the vt100 screen, ONCE per session, under the
+    /// reader's exact lock discipline (screen process → seq mint → ring
+    /// push, all under the chunks lock) so the screen/chunk invariant the
+    /// stamp relies on holds for the injected bytes too. The capture hook
+    /// calls this BEFORE its stall: the seeded screen then contains the
+    /// marker by construction while the client's polls still return it as
+    /// an in-flight differential — the duplication falsifier needs no
+    /// verb-timing luck. Returns false when this session was already
+    /// marked.
+    fn debug_inject_ring_marker_once(&self, data: &str) -> bool {
+        if self
+            .debug_marker_injected
+            .swap(true, Ordering::SeqCst)
+        {
+            return false;
+        }
+        let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
+        if let Ok(mut screen_state) = self.screen_state.lock() {
+            screen_state.process(data.as_bytes());
+        }
+        let seq_value = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut retained = self.retained_bytes.load(Ordering::SeqCst);
+        chunks.push_back(TerminalChunk {
+            seq: seq_value,
+            data: data.to_string(),
+        });
+        retained = retained.saturating_add(data.len());
+        trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
+        self.retained_bytes.store(retained, Ordering::SeqCst);
+        true
+    }
+
+    /// [F1-(e-r1)] The screen text plus its stream-cursor stamp — the
+    /// call, off the same memo. The stamp is the memo key's own
+    /// `output_seq` — the exact chunk version the returned text renders.
+    /// The reader processes the vt100 screen BEFORE minting the chunk's
+    /// seq under the same chunks lock, so "screen reflects chunks
+    /// 1..=stamp" holds by construction for real PTY chunks; the
+    /// injected-ring floor keeps it true for the rare daemon-authored
+    /// contract line the ring carries but the screen never parsed (and a
+    /// key/render race can only make the stamp UNDERclaim — the client
+    /// then keeps a duplicate, never loses a byte).
+    fn screen_snapshot_stamped(&self) -> (String, u64) {
         // Three hot callers ask for this on every snapshot response, every
         // working-flags poll and every chore tick, and between two asks the
         // answer is usually byte-identical: the format walk plus the clip
         // rewrite run over the whole screen each time for nothing.
         let key = self.screen_snapshot_key();
+        let stamp = capped_seed_stamp(
+            key.output_seq,
+            self.injected_ring_floor.load(Ordering::SeqCst),
+        );
         if let Some((memo_key, memo)) = self
             .screen_snapshot_memo
             .lock()
@@ -4044,15 +4155,14 @@ impl PtySessionRuntime {
             .as_ref()
             && *memo_key == key
         {
-            return memo.to_string();
+            return (memo.to_string(), stamp);
         }
         let snapshot = self.render_screen_snapshot(key.pty_cols);
         *self
             .screen_snapshot_memo
             .lock()
-            .expect("pty screen snapshot memo lock poisoned") =
-            Some((key, Arc::from(snapshot.as_str())));
-        snapshot
+            .expect("pty screen snapshot memo lock poisoned") = Some((key, Arc::from(snapshot.as_str())));
+        (snapshot, stamp)
     }
 
     fn screen_snapshot_key(&self) -> ScreenSnapshotKey {
@@ -6306,6 +6416,31 @@ mod screen_width_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_snapshot_stamp_never_claims_an_unscreened_contract_line() {
+        // No floor: the stamp is the memo key's own seq.
+        assert_eq!(capped_seed_stamp(12, 0), 12);
+        assert_eq!(capped_seed_stamp(0, 0), 0);
+        // A floor at 9 means chunk 9 entered the ring WITHOUT entering the
+        // screen — the stamp must stay strictly below it.
+        assert_eq!(capped_seed_stamp(12, 9), 8);
+        // The floor binds even when the seq has moved far past it.
+        assert_eq!(capped_seed_stamp(120, 9), 8);
+        // A floor at 1 caps to zero = unknown (dedupe fails open).
+        assert_eq!(capped_seed_stamp(5, 1), 0);
+    }
+
+    #[test]
+    fn the_injected_ring_floor_keeps_the_lowest_seq() {
+        let floor = AtomicU64::new(0);
+        cap_injected_ring_floor(&floor, 30);
+        assert_eq!(floor.load(Ordering::SeqCst), 30);
+        cap_injected_ring_floor(&floor, 12);
+        assert_eq!(floor.load(Ordering::SeqCst), 12);
+        cap_injected_ring_floor(&floor, 40);
+        assert_eq!(floor.load(Ordering::SeqCst), 12);
+    }
+
     use super::*;
     use base64::Engine as _;
     use std::io;

@@ -26,7 +26,17 @@
 # FAILED VERDICTS EXIT NONZERO AFTER ALL ARMS: 2=rows/hook, 4=pre-flight,
 # 5=marker lost (THE RED), 6=not exactly-once / wrong mode, 7=healthy
 # control, 8=exe mismatch (wrapper).
-# Usage: tools/uxspeed/fence-rig.sh [worktree] [binary] [stall_ms]
+#   BAR 4 (dup mode only, sitting 18): the [F1-(e-r1)] duplication
+#          falsifier — MODE=dup adds the daemon-side capture-stall hook
+#          (YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS, hook-carrying builds
+#          only): the snapshot's CAPTURE is held open so the echo marker
+#          is deterministically INSIDE the seeded screen while its chunk
+#          still resolves at a client poll inside the fence window. An
+#          unfixed build flushes the retained chunk over the seed (page
+#          marker count doubles — rc 9, THE RED); a fixed build drops it
+#          as seed-covered (page count stays at exactly the seed's one
+#          copy) AND traces the drop. Exit 9 = the duplication RED.
+# Usage: tools/uxspeed/fence-rig.sh [worktree] [binary] [stall_ms] [mode]
 #   ⛔ BUILD LAW (measured sitting 7): FULL-WORKSPACE release build — a
 #   -p yggterm build changes feature unification and shifts timing.
 #   Runs on dev's Xvfb :78 — guihost untouched.
@@ -34,19 +44,29 @@ set -u
 WT=${1:-$HOME/gh/yggterm}
 BIN=${2:-$WT/target/release/yggterm}
 STALL=${3:-500}
+MODE=${4:-order}
+# dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
+# marker must land in (arm, capture); seed delivery at capture+STALL.
+CAPTURE_STALL=${CAPTURE_STALL:-2000}
+if [ "$MODE" != order ] && [ "$MODE" != dup ]; then echo "MODE must be order|dup"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
-export BIN STALL
+export BIN STALL MODE CAPTURE_STALL
 
 run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pid
   local SCRATCH=$1 SYNTH=$2
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
+  CAPT_EXPORT=""
+  if [ "$MODE" = dup ]; then
+    CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
+  fi
   if [ "$SYNTH" = 1 ]; then
     dbus-run-session -- bash -c "
       export DISPLAY=:78 GDK_BACKEND=x11 YGGTERM_FORCE_X11_BACKEND=1 RUST_BACKTRACE=1
       export YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
       export YGGTERM_TEST_SUPPRESS_MOUNT_IPC=1 YGGTERM_HOT_PREMOUNT_CAP=2
       export YGGTERM_TEST_STALL_SNAPSHOT_FETCH_MS=$STALL
+      $CAPT_EXPORT
       exec $BIN > /tmp/f1e2-gui.log 2>&1
     " >/dev/null 2>&1 </dev/null &
   else
@@ -78,6 +98,7 @@ import json, subprocess, time, os
 
 bin_path = os.environ["BIN"]
 STALL = int(os.environ.get("STALL", "500"))
+MODE = os.environ.get("MODE", "order")
 TRACE = os.environ["SCRATCH"] + "/event-trace.jsonl"
 
 def verb(*args, timeout=60):
@@ -149,7 +170,11 @@ if not ok:
     raise SystemExit(4)
 print("armed at trace line %d" % armed[-1][0])
 
-# BAR 1: the repaint differential at armed+50ms — ends with cursor HOME.
+# BAR 1 (order) / BAR 4 (dup): the differential leg.
+# order: the repaint differential at armed+50ms — ends with cursor HOME.
+# dup: NO verb leg at all — the daemon-side capture hook injects the
+# marker into the ring+screen BEFORE its stall, by construction inside
+# the seed and still in flight at the client's polls.
 time.sleep(0.05)
 # marker on ROW 2 with the cursor parked HOME: the guard still reads
 # unpainted (baseY/cursorX/cursorY all 0) but bash's next prompt lands on
@@ -162,9 +187,10 @@ time.sleep(0.05)
 # hole (measured: without it bash's own next prompt leaves cursorX>0
 # and the guard rightly blocks the stale seed — the falsifier goes
 # vacuously green).
-repaint_cmd = "printf '\\033[2J\\033[H\\033[BF1EMARK\\033[H'; sleep 6"
-out = verb("server", "app", "terminal", "probe-type", s, "--data", repaint_cmd, "--enter", "--mode", "xterm")
-print("probe-type -> %s" % (out.stdout or out.stderr)[:120].replace("\n", " "))
+if MODE == "order":
+    repaint_cmd = "printf '\\033[2J\\033[H\\033[BF1EMARK\\033[H'; sleep 6"
+    out = verb("server", "app", "terminal", "probe-type", s, "--data", repaint_cmd, "--enter", "--mode", "xterm")
+    print("probe-type -> %s" % (out.stdout or out.stderr)[:120].replace("\n", " "))
 
 ok, proof = wait_for(
     lambda ev: session_events(ev, s, "synthesized_mount_open"), 30, "synthesized_mount_open proof")
@@ -175,7 +201,76 @@ if not ok_stall:
     print("PRE-FLIGHT FAIL: the stall hook never traced — rig invalid (hook missing from build?)")
     raise SystemExit(2)
 
+# (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
+# a duplicated frame within ~2s of the proof (measured RED run 4: flush
+# at proof+1ms, reveal_screen_reconcile at proof+2.0s) — the defect's
+# user-visible surface is the TRANSIENT double-paint between the flush
+# and that heal, so the page is sampled INSIDE the window.
+dup_transient_max = 0
+if MODE == "dup":
+    for delay in (0.15, 0.5, 1.0):
+        time.sleep(delay)
+        c, _ = page_screen_count(s, "E1RMARK")
+        dup_transient_max = max(dup_transient_max, c)
+        raw = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
+        rows = [r for r in raw.splitlines() if "E1RMARK" in r or "text" in r or "nonblank" in r or "char_count" in r]
+        print("   transient sample +%0.2fs: page=%d %s" % (delay, c, rows[:2]))
+
 time.sleep(4)  # settle: the proof arm completes; the fence flush (if any) rides it
+
+if MODE == "dup":
+    # (e-r1) BAR 4 — THE DELIVERY BAR. The at-rest page cannot show the
+    # duplication in this rig shape: the flushed covered bytes re-render
+    # identically over the seed (measured: char_count constant through
+    # the transient window; the order-mode control on the same build
+    # proves the flush mechanism itself lands), and a DIFFERING frame is
+    # healed by the frame-hash/reveal reconciles within ~2s. The honest
+    # bars: RED = the fence DELIVERED seed-covered bytes to the viewport
+    # after the seed (retained inside the window + flushed over it);
+    # GREEN = the stamp DROPPED them before delivery (drop trace fired,
+    # page stays exactly the seed's one copy through every transient
+    # sample).
+    page_count, page_tail = page_screen_count(s, "E1RMARK")
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    proof_payload = (session_events(events, s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    drop_events = (session_events(events, s, "synth_output_fence_seed_covered_drop")
+                   + session_events(events, s, "synth_output_fence_poll_filtered"))
+    retained_events = session_events(events, s, "synth_output_fence_retained")
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    retained_total = sum(int(p.get("bytes") or 0) for _, p in retained_events)
+    flushed_total = sum(int(p.get("bytes") or 0) for _, p in flush_events)
+    print("VERDICT FENCE-DUPLICATION: transient_max=%d final page E1RMARK=%d (daemon=%d) seed_mode=%s drop_traces=%d" % (
+        dup_transient_max, page_count, daemon_count, proof_payload.get("seed_mode"), len(drop_events)))
+    print("   fence: retained=%dB/%d flush=%dB/%d" % (retained_total, len(retained_events), flushed_total, len(flush_events)))
+    print("   page tail: %r" % page_tail[-160:])
+    fail_rc = 0
+    if page_count < 1:
+        print("PRE-FLIGHT FAIL: the seed never painted the marker (page=%d, want 1)" % page_count)
+        fail_rc = 4
+    elif not drop_events:
+        if flush_events and flushed_total >= 9:
+            print("VERDICT RED CONFIRMED: seed-covered bytes (%d of %d retained) were FLUSHED over the seeded screen — the (e-r1) duplication DELIVERED (unfixed build; masked at rest by identical re-render + the reconcile heal, both measured this sitting)" % (flushed_total, retained_total))
+            fail_rc = fail_rc or 9
+        else:
+            print("VERDICT FAIL: no drop trace and no covered flush either — rig shape broke (retained=%d flushed=%d)" % (retained_total, flushed_total))
+            fail_rc = fail_rc or 6
+    else:
+        dropped_batches = sum(int(p.get("dropped_batches") or 0) for _, p in drop_events)
+        if dropped_batches < 1:
+            print("VERDICT DROP-EVIDENCE FAIL: drop traces fired but dropped zero batches")
+            fail_rc = fail_rc or 6
+        elif page_count != 1 or dup_transient_max > 1:
+            print("VERDICT PAGE FAIL: page=%d transient_max=%d (want exactly 1 and 1)" % (page_count, dup_transient_max))
+            fail_rc = fail_rc or 6
+        else:
+            print("   drop evidence: %s" % json.dumps({k: drop_events[-1][1].get(k) for k in ("dropped_batches", "dropped_bytes", "seed_output_seq")}))
+    if fail_rc:
+        print("RIG FAIL rc=%d — verdicts above" % fail_rc)
+        raise SystemExit(fail_rc)
+    print("RIG PASS — the seed stamp dropped the covered differential before delivery (marker exactly the seed's one copy)")
+    raise SystemExit(0)
 
 page_count, page_tail = page_screen_count(s, "F1EMARK")
 daemon_count = daemon_screen_count(s, "F1EMARK")

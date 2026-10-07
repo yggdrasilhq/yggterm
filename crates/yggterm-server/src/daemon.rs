@@ -4783,6 +4783,13 @@ pub enum ServerResponse {
     },
     TerminalSnapshot {
         text: String,
+        // [F1-(e-r1)] The stream-cursor stamp of this snapshot's text —
+        // chunks at or below it are already inside `text`. `serde(default)`
+        // keeps it cross-version safe: an older owner daemon deserializes
+        // as 0 = unknown, and the client's dedupe fails OPEN (keeps every
+        // batch) on 0.
+        #[serde(default)]
+        output_seq: u64,
         running: bool,
         runtime_output_seen: bool,
         #[serde(default)]
@@ -14575,6 +14582,7 @@ impl DaemonRuntime {
                             Ok(answer) => {
                                 return Ok(ServerResponse::TerminalSnapshot {
                                     text: answer.text,
+                                    output_seq: answer.output_seq,
                                     running: answer.running,
                                     runtime_output_seen: answer.runtime_output_seen,
                                     post_resize_output_seen: answer.post_resize_output_seen,
@@ -14598,12 +14606,25 @@ impl DaemonRuntime {
                         }
                     }
                 }
-                let text = self
+                // [F1-(e-r1)] TEST HOOK: inject the rig's marker INTO the
+                // ring and the vt100 screen (once per session), THEN stall
+                // the CAPTURE — the seeded screen contains the marker by
+                // construction while the client's polls still return its
+                // chunk as an in-flight differential inside the fence
+                // window. No verb-timing luck.
+                if let Some(ms) = test_snapshot_capture_stall_ms() {
+                    let _ = self
+                        .terminals
+                        .debug_inject_ring_marker_once(&runtime_path, "E1RMARK\r\n");
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                let (text, output_seq) = self
                     .terminals
-                    .session_screen_snapshot(&runtime_path)
+                    .session_screen_snapshot_stamped(&runtime_path)
                     .unwrap_or_default();
                 ServerResponse::TerminalSnapshot {
                     text,
+                    output_seq,
                     running: self.terminals.session_is_running(&runtime_path),
                     runtime_output_seen: self.terminals.session_has_runtime_output(&runtime_path),
                     post_resize_output_seen: self
@@ -24229,6 +24250,11 @@ pub fn terminal_read(
 #[derive(Debug, Clone)]
 pub struct TerminalSnapshotAnswer {
     pub text: String,
+    /// [F1-(e-r1)] The stream-cursor stamp: the daemon chunk seq this
+    /// text renders. Chunks at or below it are already inside `text`, so
+    /// a client holding in-flight differentials can drop exactly those
+    /// instead of double-painting them over the seed.
+    pub output_seq: u64,
     pub running: bool,
     pub runtime_output_seen: bool,
     pub post_resize_output_seen: bool,
@@ -24244,6 +24270,7 @@ fn terminal_snapshot_answer_from_response(response: ServerResponse) -> Result<Te
     match response {
         ServerResponse::TerminalSnapshot {
             text,
+            output_seq,
             running,
             runtime_output_seen,
             post_resize_output_seen,
@@ -24253,6 +24280,7 @@ fn terminal_snapshot_answer_from_response(response: ServerResponse) -> Result<Te
             pty_in_alternate_screen,
         } => Ok(TerminalSnapshotAnswer {
             text,
+            output_seq,
             running,
             runtime_output_seen,
             post_resize_output_seen,
@@ -24264,6 +24292,23 @@ fn terminal_snapshot_answer_from_response(response: ServerResponse) -> Result<Te
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
     }
+}
+
+/// [F1-(e-r1)] Test-only capture stall (see the TerminalSnapshot handler).
+fn test_snapshot_capture_stall_ms() -> Option<u64> {
+    let ms = std::env::var("YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())?;
+    if let Ok(home) = crate::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "terminal_runtime",
+            "test_hook_snapshot_capture_stalled",
+            serde_json::json!({ "ms": ms }),
+        );
+    }
+    Some(ms)
 }
 
 pub fn terminal_snapshot(
@@ -45941,8 +45986,14 @@ mod tests {
         // `cargo check --tests` compiles the law, it never RUNS it. This
         // commit re-arms the stamp at the shipped truth; the NEXT shape
         // change must bump the version and this hash in its own commit.
-        const STAMPED_AT_VERSION: &str = "3.2.117";
-        const STAMPED_SHAPE_HASH: u64 = 0xb747ba0e7c68ac22;
+        // Re-cut for 3.2.118 (lane f1/snapshot-output-stamp): `TerminalSnapshot`
+        // gained `output_seq` — the [F1-(e-r1)] stream-cursor stamp, the
+        // daemon-side half of the synthesized-mount seed dedupe.
+        // `#[serde(default)]`, so an older daemon's absence deserializes as
+        // 0 = unknown and the client's dedupe fails open; an older client
+        // ignores the field.
+        const STAMPED_AT_VERSION: &str = "3.2.118";
+        const STAMPED_SHAPE_HASH: u64 = 0x3ddb6bb1cff9058b;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
@@ -46027,6 +46078,7 @@ mod tests {
         use crate::daemon::ServerResponse;
         let answer = ServerResponse::TerminalSnapshot {
             text: "screen".to_string(),
+            output_seq: 44,
             running: true,
             runtime_output_seen: true,
             post_resize_output_seen: false,
@@ -46043,8 +46095,13 @@ mod tests {
         match parsed {
             ServerResponse::TerminalSnapshot {
                 pty_in_alternate_screen,
+                output_seq,
                 ..
-            } => assert_eq!(pty_in_alternate_screen, Some(true)),
+            } => {
+                assert_eq!(pty_in_alternate_screen, Some(true));
+                // [F1-(e-r1)] the stream-cursor stamp rides the answer.
+                assert_eq!(output_seq, 44);
+            }
             other => panic!("wrong variant: {other:?}"),
         }
 
@@ -46054,6 +46111,7 @@ mod tests {
         let strip_field = |value: &mut serde_json::Value| {
             if let Some(obj) = value.as_object_mut() {
                 obj.remove("pty_in_alternate_screen");
+                obj.remove("output_seq");
             }
         };
         if stripped.is_object() && stripped.as_object().unwrap().len() != 1 {
@@ -46068,11 +46126,21 @@ mod tests {
         match parsed {
             ServerResponse::TerminalSnapshot {
                 pty_in_alternate_screen,
+                output_seq,
                 ..
-            } => assert_eq!(
-                pty_in_alternate_screen, None,
-                "an absent verdict must deserialize as unknown, never false"
-            ),
+            } => {
+                assert_eq!(
+                    pty_in_alternate_screen, None,
+                    "an absent verdict must deserialize as unknown, never false"
+                );
+                // [F1-(e-r1)] an absent stamp must deserialize as 0 =
+                // unknown, so the client's dedupe fails OPEN (keeps every
+                // batch) against an older daemon.
+                assert_eq!(
+                    output_seq, 0,
+                    "an absent stamp must deserialize as unknown (0), never a guess"
+                );
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
@@ -46340,6 +46408,7 @@ mod terminal_snapshot_answer_tests {
         let answer =
             terminal_snapshot_answer_from_response(ServerResponse::TerminalSnapshot {
                 text: "screen".to_string(),
+                output_seq: 44,
                 running: true,
                 runtime_output_seen: true,
                 post_resize_output_seen: false,
@@ -46351,6 +46420,7 @@ mod terminal_snapshot_answer_tests {
             .expect("the snapshot answer maps");
         assert_eq!(answer.composer_holds_draft, Some(false));
         assert_eq!(answer.pty_in_alternate_screen, Some(true));
+        assert_eq!(answer.output_seq, 44);
     }
     #[test]
     fn a_refused_key_that_differs_from_the_asked_key_is_never_peer_gone_evidence() {
