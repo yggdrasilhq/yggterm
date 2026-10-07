@@ -302,9 +302,41 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   moment the crossing recurs. SAME LANE also fixed the pre-existing
   racy assert in a_quiet_shell_serves_the_memoized_rows_snapshot
   (global SHELLSTATE_MUT_TOTAL epoch compared across a parallel-harness
-  window; retry-until-quiet-window). STILL OPEN under r-j1: the
-  verify-or-rearm hardening (the DEAD-loop teardown still presumes a
-  successor — same line as (r-j2)'s render latch). THE F3 LEAD IS
+  window; retry-until-quiet-window). THE r-j1/r-j2 VERIFY-OR-REARM ARM IS
+  LANDED (2026-10-07 sitting 16, lane lane/rj/verify-or-rearm b27ddae9 → main 72ebcd57d5a0
+  main; rig tools/uxspeed/rj2-rig.sh in-tree with the
+  YGGTERM_TEST_SILENT_LOOP_DEATHS_FILE deterministic silent-death hook).
+  The rj2-rig measured the strand BROADER than filed — it does NOT need a
+  recovery first: a READY row whose mount loop dies strands, and the user
+  re-select itself lease-skips. Three stacked defects, all fixed: (1) the
+  loop-stale watchdog judged only AGED beats, so sitting-15's beat-removal
+  punch made every dropped loop read "never mounted, not judged" — the drop
+  guard now stamps a WITNESSED DEATH (a successor's first beat cancels it)
+  and the watchdog's stale set gains the witnessed-death arm (state-known
+  sessions only, so a removed row's stamp cannot churn); (2) the watchdog
+  task itself DIED at every relaunch — component-scoped spawn dropped by
+  the restore tree rebuild while the spawn-once bool stayed set (proven by
+  the new first-tick trace never firing in boot-2) — the latch is now
+  LIVENESS-AWARE (tick clock stamped at birth + per tick; any render
+  re-arms a stale clock, traced
+  terminal_loop_watchdog_rearmed_after_scope_death) and the loop body
+  reads state through the panic-catching safe_shell_read; (3) the dead
+  task's bootstrap owner+lease made every successor
+  terminal_bootstrap_existing_lease_skip (which even re-marks the attempt
+  Ready on a reusable-looking host — the corpse feed; the stale-lease
+  reclaim never applies to a Ready attempt) — the drop guard now releases
+  its OWN claim (remove-if-own, unit-locked). SAME LANE: the async
+  recovery watch's latch clear never matched the combined
+  `identity:open_request` key (the filed r-j2 shape — a genuine recovery
+  on that path left the latch set); both clears use the prefix form now,
+  and a post-recovery verify-or-rearm watch
+  (rearm_startup_terminal_restore_no_successor) tears a dead successor's
+  bookkeeping down after a full window, sharing the recovery's futile
+  budget. PROOFS: rig RED x2 on hook-only main (rc 5: mounted row, silent
+  drop, typing never delivered 80s) / GREEN x2 on the lane (rc 0: chain
+  stamp → stale_detected → remount_armed → refused-reveal → fresh mount
+  ~6s → typed marker on the daemon screen), exe-proofed both; rj1-rig
+  PASS; demote-rig all bars GREEN; suite 2236/0 with 8 new locks. THE F3 LEAD IS
   ROOT-CAUSED AND FIXED (sitting 13, 2026-10-06, main 264d848563c0,
   lane lane/f3/cold-mount-synthesis a92cf00c): the relaunch shape's
   mountless row was the COLD-FIRST-MOUNT hole — the adaptive warm-eval
@@ -327,9 +359,10 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (poll read stage "posted" → fence → synthesized_mount_open → js_ready
   → attach_ready, typed input delivered); rj1-rig re-run GREEN on the
   lane; suite 2227/0 with 3 new locks.
-  (r-j2) post-kill recovery depends on the render latch
-  (bootstrap_task_identity) — a user re-select is still the only
-  re-schedule trigger after any genuine supersede. (i) THE SWITCH-KILLS-INPUT CORPSE SERVE — ROOT MEASURED + LANDED
+  (r-j2) CLOSED by the sitting-16 verify-or-rearm arm (see r-j1 above):
+  the latch-equality bug, the blind+scope-dead watchdog, and the dead
+  claim are all fixed and rig-proven; the render latch no longer needs a
+  user re-select on any measured death shape. (i) THE SWITCH-KILLS-INPUT CORPSE SERVE — ROOT MEASURED + LANDED
   2026-10-06 (sitting 15, d-rig falsifier tools/uxspeed/demote-rig.sh;
   the filed "pre-synthesis demotion" framing was TOO NARROW and its
   "synthesized-while-active keeps input across later switches" control
@@ -530,16 +563,24 @@ that reports "6 left" forever — the same class as the [11.231]
 exe-mismatch lie (an instrument that under-reports its own subject).
 
 FIX SHAPE (two arms):
-1. THE CHECKER: report the TOTAL count per term alongside the sample
-   (and exit nonzero while any remain) — the cap can stay for output
-   noise, never for truth. One-line-class change to scripts/check-
-   privacy.sh.
+1. THE CHECKER: LANDED 2026-10-07 (sitting 16, main a6048f792d64) — every
+   class reports its TOTAL unique offending-line count alongside the
+   capped sample (`sample()` helper; the cap is display-only, never
+   truth; exit semantics unchanged). THE HONEST SCOPED INVENTORY it
+   reported on landing: home paths 12 unique lines; shared guard list
+   136 unique lines (one withheld term; concentrated in comments/tests
+   naming one private host). The filed ~1,400 figure was REPO-WIDE grep
+   including the checker's EXCLUDED trees (docs/archive, vendored,
+   assets) — the checker-scope debt is ~148 lines, still all of it
+   published bytes; arm 2 owns it.
 2. THE DEBT: a scripted, reviewable bulk migration (each class has a
    mechanical transform: /home/<user> -> /home/user in fixtures/comments;
    private host names -> invented labels; real session titles -> invented
    titles), run per-file with the suite green after each batch. ~50
    sites already fixed in the [11.229](b) lane (2026-10-06) — every
-   individually verified; the pattern is established and safe.
+   individually verified; the pattern is established and safe. The
+   checker-scope remainder is now enumerated honestly: 12 home-path
+   unique lines + 136 shared-list unique lines (one withheld term).
 
 ATTACK ORDER: the checker arm first (it makes every later run honest),
 then the debt in file-batches (crates/ tests -> docs/pending-bugs
