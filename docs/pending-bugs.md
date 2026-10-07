@@ -172,13 +172,38 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   no-fail-fast. Locks: the_application_ack_requires_a_seed_write +
   the_covered_drop_commits_only_at_the_ack_source_law +
   a_forced_skip_seed_script_returns_before_any_write; MODE=loss is
-  the family's permanent loss falsifier. RESIDUE (filed next on this
-  line, sol Q1/Q3a): the fence flushes — ack path and explicit-failure
-  path alike — through fire-and-forget evals (delivery_acked:false in
-  the flush trace); an ack-carrying flush (write callbacks per batch)
-  and the full Q7 binding (CONTENT-READY + painted-state promotion to
-  an owner/session/runtime/mount-generation-qualified application
-  ack) are the next units.
+  the family's permanent loss falsifier. (e-r1)-R2 LANDED + DEPLOYED
+  2026-10-07 (sitting 22, lane lane/11229er2/ack-carrying-flush): the
+  ACK-CARRYING FLUSH — both flush paths (the explicit-failure live
+  flush AND the deadline/overflow release, now handed to the three
+  async write-site callers AHEAD of the releasing batch's live write)
+  write ONE eval per retained batch whose script awaits the term's
+  write callback (the same ack the seed's proof uses) and returns
+  {ok, reason} across the bridge; the Rust await is bounded (3s — a
+  dead bridge must never wedge the mount loop); first-failure bail
+  marks the remainder undelivered without re-attempting (a no-host /
+  timeout verdict is page-global — bounded stall, honest accounting).
+  The flushed trace carries acked/undelivered batches+bytes with
+  delivery_acked:true only when every batch acknowledged, and a NEW
+  detector synth_output_fence_flush_undelivered names every
+  undelivered batch/byte + first_reason. NO retry by design (sol Q1's
+  "OR report an explicit undelivered failure"): the daemon ring+screen
+  keep every byte and the frame-hash/reveal reconciles remain the
+  recovery path. MEASURED (fence-rig MODE=flushshed, the new
+  YGGTERM_TEST_FLUSH_EVAL_DROP choke hook — both flush paths route
+  through one transport choke): RED rc11 on hook-only main — the shed
+  transport consumed 371B of retained bytes with NOTHING naming the
+  loss (page samples 0/0/0, daemon 1, the flushed event claimed the
+  bytes; delivery_acked:false was a stopgap, not a delivery proof);
+  GREEN on the fix — undelivered 204B/1 named (first_reason
+  shed_hook), zero false delivery claims, the unapplied explicit
+  failure intact; loss/order+healthy/dup regressions all GREEN on the
+  same build (the s21 loss bar now delivers through the ACKED flush,
+  marker at the first transient sample). RESIDUE (next on this line,
+  sol Q7): the full Q7 binding — CONTENT-READY + painted-state
+  promotion to an owner/session/runtime/mount-generation-qualified
+  application ack; the flush acks are per-batch DELIVERY acks, not the
+  mount-generation-qualified application ack that binding requires.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
