@@ -12510,6 +12510,14 @@ fn TerminalCanvas(
                         // writes have flowed live again and the seed must
                         // not clobber them.
                         let synth_seed_fenced = synth_output_fence.is_some();
+                        // [F1-(e-r1)-R1] TEST HOOK: the forced no-ack shape
+                        // for the rig's loss bar (MODE=loss) — the proof
+                        // answers skipped before any seed write.
+                        let synth_seed_forced_skip = std::env::var(
+                            "YGGTERM_TEST_SEED_FORCED_SKIP",
+                        )
+                        .map(|value| value == "1")
+                        .unwrap_or(false);
                         synth_proof_eval = Some(Box::pin(
                             document::eval(&terminal_synthesized_mount_open_script(
                                 &host_id,
@@ -12519,6 +12527,7 @@ fn TerminalCanvas(
                                     Some(&synth_seed_text)
                                 },
                                 synth_seed_fenced,
+                                synth_seed_forced_skip,
                             ))
                             .join::<Value>(),
                         ));

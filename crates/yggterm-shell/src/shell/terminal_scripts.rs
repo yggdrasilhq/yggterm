@@ -525,6 +525,7 @@ pub(crate) fn terminal_synthesized_mount_open_script(
     host_id: &str,
     seed: Option<&str>,
     fenced: bool,
+    forced_skip: bool,
 ) -> String {
     let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
     let seed_lit = match seed.filter(|text| !text.trim().is_empty()) {
@@ -549,6 +550,22 @@ const __painted = (t) => {{
 }};
 let __wrote = 0;
 let __mode = 'skipped';
+if ({forced_skip}) {{
+    // [F1-(e-r1)-R1] TEST HOOK (fence-rig MODE=loss): the deterministic
+    // no-ack shape — the proof fails BEFORE the first page seed write
+    // (production: a missing host or an empty seed text). The surface
+    // still reports honestly; wrote_seed stays 0 so coverage can never
+    // commit against this proof.
+    return JSON.stringify({{
+        constructed: Boolean(__t),
+        screen_in_host: Boolean(__screen),
+        rows: Number((__t && __t.rows) || 0),
+        cols: Number((__t && __t.cols) || 0),
+        painted: __painted(__t),
+        wrote_seed: 0,
+        seed_mode: 'test_forced_skip',
+    }});
+}}
 if (__t && typeof __t.write === 'function' && __seed) {{
     if ({fenced}) {{
         // [F1-(e)] THE FENCED REPAINT (sol Q1): the authoritative screen

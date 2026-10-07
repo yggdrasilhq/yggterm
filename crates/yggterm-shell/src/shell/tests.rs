@@ -70643,9 +70643,9 @@ fn synth_output_fence_deadline_expires() {
 #[test]
 fn synthesized_mount_open_script_shape_locks_the_fence_wiring() {
     let fenced =
-        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), true);
+        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), true, false);
     let unfenced =
-        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), false);
+        terminal_synthesized_mount_open_script("host-m1", Some("line one\r\nline two"), false, false);
     // the repaint branch is compiled with the mode literals and the
     // home+clear prefix; the bool literal is the runtime gate
     assert!(fenced.contains("if (true)"));
@@ -70659,6 +70659,27 @@ fn synthesized_mount_open_script_shape_locks_the_fence_wiring() {
     }
     // the guarded append still defers to the painted heuristic unfenced
     assert!(unfenced.contains("} else if (!__painted(__t)) {"));
+}
+
+#[test]
+fn a_forced_skip_seed_script_returns_before_any_write() {
+    // [F1-(e-r1)-R1] the rig's loss injection: the hook branch returns the
+    // no-ack proof BEFORE the write branch can run, and reports
+    // wrote_seed 0 with its own mode literal.
+    let script =
+        terminal_synthesized_mount_open_script("host-m1", Some("seed"), true, true);
+    assert!(script.contains("'test_forced_skip'"));
+    assert!(script.contains("wrote_seed: 0"));
+    assert!(
+        script.find("'test_forced_skip'").unwrap()
+            < script.find("'fenced_repaint'").unwrap(),
+        "the forced-skip return must precede the write arms"
+    );
+    assert!(
+        script.find("if (true) {").unwrap()
+            < script.find("__t.write(").unwrap(),
+        "the hook branch is the first conditional — no write can precede it"
+    );
 }
 
 #[test]
