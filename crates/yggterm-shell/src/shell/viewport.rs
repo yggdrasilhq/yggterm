@@ -21923,7 +21923,7 @@ fn spawn_terminal_startup_resize_repair(
         match terminal_resize_repaint_async(endpoint, runtime_session_path, cols, rows).await {
             Ok(ack_message) => {
                 // THE [11.57] DIVORCE, NOW REACHABLE (measured live
-                // 2026-09-29, jojo row 6778336d): the forwarded failure can
+                // 2026-09-29, guihost row 6778336d): the forwarded failure can
                 // never take the Err arm — the verb answers Ok for the LOCAL
                 // half while the remote half fails inside the fire-and-forget
                 // re-queue, so this classifier sat dead on the exact path it

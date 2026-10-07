@@ -29,7 +29,7 @@
 # Usage: tools/uxspeed/fence-rig.sh [worktree] [binary] [stall_ms]
 #   ⛔ BUILD LAW (measured sitting 7): FULL-WORKSPACE release build — a
 #   -p yggterm build changes feature unification and shifts timing.
-#   Runs on dev's Xvfb :78 — jojo untouched.
+#   Runs on dev's Xvfb :78 — guihost untouched.
 set -u
 WT=${1:-$HOME/gh/yggterm}
 BIN=${2:-$WT/target/release/yggterm}

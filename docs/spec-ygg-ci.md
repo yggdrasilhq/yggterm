@@ -1,7 +1,7 @@
 # Spec: ygg-ci — the fleet single-build plane & compile optimization
 
 **Status:** COMPILE-CACHE + CACHE TELEMETRY LANDED 2026-09-18 (all four build hosts wired, measured; ygg-ci carries the telemetry)
-**Directive:** owner, 2026-09-18 — *"write these optimization techniques in docs/ ygg-ci spec in yggterm repo; the ygg onboarding skill should steer the agent to create optimization techniques based on the ci spec of their own; wire dev first, then jojo, oc, practice, jyas-webapp"*
+**Directive:** owner, 2026-09-18 — *"write these optimization techniques in docs/ ygg-ci spec in yggterm repo; the ygg onboarding skill should steer the agent to create optimization techniques based on the ci spec of their own; wire dev first, then guihost, oc, practice, jyas-webapp"*
 **Owner surfaces:** `.agents/skills/yggterm-agent-fleet/ygg-ci.py` + SKILL.md §3c (how to DRIVE it — verbs, subscribe, conflicts), `~/.yggterm/relay/ci/ci.json` (the recipes), this file (the build-plane BEHAVIOR contract + the optimization techniques).
 
 Per the docs-ssot law, the neighbors:
@@ -32,23 +32,23 @@ One entry per project; picked up on the next tick (≤300s) without restarting t
 
 **The law: compile caching is wired PER HOST, once, at the toolchain layer — never per project, never per worktree, never in a recipe.** Every cargo project that builds on that host (current and future) inherits it with zero configuration.
 
-### 2.1 The deployed fleet recipe (2026-09-18 — dev, oc, jojo, practice)
+### 2.1 The deployed fleet recipe (2026-09-18 — dev, oc, guihost, practice)
 
 sccache v0.18.0, upstream static musl binary (checksum-verified at install; **prefer this over apt** — distro packages lag rustc flag support and silently stop caching):
 
-1. **Binary location:** `/usr/local/bin/sccache` on dev/oc/practice (sudo hosts; `/usr/local/bin` is on even the barest PATH there). jojo has no sudo from agent seats → `~/.local/bin/sccache`.
+1. **Binary location:** `/usr/local/bin/sccache` on dev/oc/practice (sudo hosts; `/usr/local/bin` is on even the barest PATH there). guihost has no sudo from agent seats → `~/.local/bin/sccache`.
 2. **The wire is `~/.cargo/config.toml`, NOT an environment variable:**
    ```toml
    [build]
    rustc-wrapper = "/usr/local/bin/sccache"   # absolute path — see below
    ```
    Cargo reads this file itself on every invocation, so interactive shells, non-interactive ssh, systemd services (`cargo run`), dx and cargo-ndk are all covered by one per-user file. **The path must be ABSOLUTE**: `practice`'s non-interactive PATH is `/usr/local/bin:/usr/bin:/bin` and any other host may differ; a bare `sccache` that fails to resolve is a hard build error, not a fallback.
-3. **`SCCACHE_BASEDIR="/home/pi"` in `/etc/environment`** — guards cache keys against worktree absolute-path leakage. sshd applies `/etc/environment` via pam_env to non-interactive command sessions too (verified: `ssh dev "env | grep SCCACHE"` shows it). Keep `RUSTC_WRAPPER` OUT of `/etc/environment` — the cargo-config wire above makes it redundant, and env vars leak into every process. On jojo (no sudo): `SCCACHE_BASEDIR` exported in `~/.bashrc` + `~/.profile` instead — known gap: non-interactive ssh INTO jojo misses it; acceptable, jojo builds run in seat shells.
+3. **`SCCACHE_BASEDIR="/home/user"` in `/etc/environment`** — guards cache keys against worktree absolute-path leakage. sshd applies `/etc/environment` via pam_env to non-interactive command sessions too (verified: `ssh dev "env | grep SCCACHE"` shows it). Keep `RUSTC_WRAPPER` OUT of `/etc/environment` — the cargo-config wire above makes it redundant, and env vars leak into every process. On guihost (no sudo): `SCCACHE_BASEDIR` exported in `~/.bashrc` + `~/.profile` instead — known gap: non-interactive ssh INTO guihost misses it; acceptable, guihost builds run in seat shells.
 4. **Cache size via `~/.config/sccache/config`** (v0.18 removed the `--cache-size` CLI flag):
    ```toml
    [cache.disk]
-   dir = "/home/pi/.cache/sccache"
-   size = 53687091200        # 50 GiB — dev, oc, jojo
+   dir = "/home/user/.cache/sccache"
+   size = 53687091200        # 50 GiB — dev, oc, guihost
    ```
    practice gets `107374182400` (100 GiB) — it builds four target matrices (host debug/release, wasm32, aarch64-android) and a smaller LRU would thrash during active waves. (Optionally also `SCCACHE_CACHE_SIZE` in `/etc/environment`; the config file alone is sufficient and env-free.)
 5. **`sccache --start-server` once at provisioning** — avoids a daemon-spawn stampede when N parallel cold builds race, and pre-answers the service-cgroup case: a daemon spawned under `practice-rs-api.service` dies with that unit's cgroup on restart (graceful — clients fall back — but pre-starting keeps the server warm).
@@ -90,5 +90,5 @@ An agent onboarding ANY project derives its plan from this section, in order:
 sccache fails silently into un-cached builds (daemon death, unparseable flags) — without instrumentation a dead cache is invisible. All four mechanisms below are in `ygg-ci.py`:
 
 1. **Delta verdict per build.** `builds/<project>--<ts>--<sha>.json` records (success AND failure) carry a `sccache` block: `{verdict, requests, hits, misses, hit_rate}` where verdict is `ok` (cache served the compiles), `idle` (nothing compiled — docs-only ticks), `STALE` (cargo printed `Compiling` but the cache saw zero requests — bypassed or broken wire; this also fires a `cache_stale` CI event), or `absent` (no readable sccache on the build host). Deltas come from `--show-stats` snapshots before/after the build — never `--zero-stats`, which would stomp parallel seats sharing the host cache.
-2. **`ygg-ci.py cache [--host h1,h2] [--tail N] [--json]`** — per-host cache health (counters, hit rate, size, location) plus the verdict digest of the last N build records. Hosts default to dev, oc, jojo, practice; remote probes run over ssh. Note: cumulative counters reset when the idle sccache server restarts — per-build deltas are the truth; the verb's value is the digest and the absent/size check.
+2. **`ygg-ci.py cache [--host h1,h2] [--tail N] [--json]`** — per-host cache health (counters, hit rate, size, location) plus the verdict digest of the last N build records. Hosts default to dev, oc, guihost, practice; remote probes run over ssh. Note: cumulative counters reset when the idle sccache server restarts — per-build deltas are the truth; the verb's value is the digest and the absent/size check.
 3. **`tune`-time provisioning check** — after any `ygg-ci.py tune`, the target host is probed for the §2.1 wire (`rustc-wrapper` in `~/.cargo/config.toml`, sccache binary reachable); an incomplete wire logs a warning naming §2.1. A MISSING BINARY with the wrapper line present is a hard build failure for wrapped builds, so it warns loudly.

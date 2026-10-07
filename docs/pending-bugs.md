@@ -490,14 +490,14 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   IS the product. SLICE 1 LANDED + APPLIED + MEASURED 2026-10-06
   (sitting 10, main 90aedce70758, lane lane/memory/index-tiering
   589ba67c): classifier + tiered rebuild + shelve-archives verb +
-  test_memory_index_tiering.py; live-store result on jojo: MEMORY.md
+  test_memory_index_tiering.py; live-store result on guihost: MEMORY.md
   906 lines/176.7KB → 293 lines/33KB (5.4x cut, loader truncation
   dead), 561 docs shelved into archive/, ARCHIVE-INDEX.md generated
   (never auto-loaded), 545 legacy top-level sittings migrated, 544+46
   byte-identical re-delivery duplicates deduped (identical rm,
   newer-wins). ⛔ [11.236] INCIDENT (same sitting, RECOVERED): the
   runner self-disperse REGRESSED — after ygg-memory's own sync-fleet
-  updated jojo+oc runners to 90aedce7, a long `sync-harness --all`
+  updated guihost+oc runners to 90aedce7, a long `sync-harness --all`
   re-delivered ~500 hub _global mirrors into the native top level AND
   left the OLD runner bytes installed (verb vanished; the old rglob
   rebuilt a 1413-line index). Recovery: runner re-copied from the repo
@@ -694,7 +694,7 @@ CLIENT halves that still recur on healthy rows.
   reconcile instead of dropping the cover empty.
 - UPDATE 2026-10-05 ~08:2x IST (recurrence, owner-reported live; board
 ACK-d3e73eac18): a FRESH agy row (remote-agy://dev/4314d6ee…, born
-08:19:59 on dev, cwd /home/pi) sat BLANK in the owner's active viewport
+08:19:59 on dev, cwd /home/user) sat BLANK in the owner's active viewport
 with the (a) signature verbatim — mount_epoch_reused reused_live_host:true
 without the startup repair at 08:19:52, then
 screen_reconcile_skipped_unwritable (reason:reveal_screen_reconcile) ×3
@@ -709,7 +709,7 @@ witness that contradicts both daemons; wants its own sub-item under (a).
 Workaround that heals (handed to the owner): epoch-bumping refocus —
 switch to another row and back.
 
-UPDATE 2026-10-05 ~08:5x IST (root-cause fix; zcode on jojo, board plan
+UPDATE 2026-10-05 ~08:5x IST (root-cause fix; zcode on guihost, board plan
 ACK-83e4dc7e04): THE OWNER'S RECURRENCE EXPOSED THE FAMILY'S IMMORTALITY
 ROOT — and the refocus workaround is FALSIFIED (the owner switched; still
 blank): the switch-back logged mount_epoch_reused on the SAME host
@@ -740,19 +740,19 @@ mount (its sub-item stays until measured).
   the removal needs a post-reap verification window or the keep-alive
   must observe the tombstone before re-spawning.
 
-## ⛔ [11.228] THE REMOTE-PTY RESIZE HEAL FORWARD DROPS TRANSIENT-IO FAILURES — A DAEMON-BUSY READ TIMEOUT ("reading daemon response / Resource temporarily unavailable (os error 11)" — WouldBlock under set_read_timeout) KILLED EVERY HEAL FOR AN IDEMPOTENT RESIZE, SO THE OWNER'S CLAUDE ROW SAT AT THE 120×36 SPAWN DEFAULT UNDER A 170×63 CLIENT FOR SEVEN HOURS — "THE ACTIVE VIEWPORT IS SQUISHED" (measured live 2026-10-04 ~07:3x IST, jojo GUI + dev PTY, the unattended night after three fleet deploys)
+## ⛔ [11.228] THE REMOTE-PTY RESIZE HEAL FORWARD DROPS TRANSIENT-IO FAILURES — A DAEMON-BUSY READ TIMEOUT ("reading daemon response / Resource temporarily unavailable (os error 11)" — WouldBlock under set_read_timeout) KILLED EVERY HEAL FOR AN IDEMPOTENT RESIZE, SO THE OWNER'S CLAUDE ROW SAT AT THE 120×36 SPAWN DEFAULT UNDER A 170×63 CLIENT FOR SEVEN HOURS — "THE ACTIVE VIEWPORT IS SQUISHED" (measured live 2026-10-04 ~07:3x IST, guihost GUI + dev PTY, the unattended night after three fleet deploys)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-Filed 2026-10-04 ~07:5x IST by the squish root-cause seat (zcode on jojo;
+Filed 2026-10-04 ~07:5x IST by the squish root-cause seat (zcode on guihost;
 board plan ACK-c9797f023b). The owner returned to a squished active
 viewport after an unattended night (daemon uptime 7h25m; only agent work
 ran: deploys 22:29 / 23:36 / 00:16 + ~21 probe rows).
 
 THE MEASURED CHAIN:
 - SPLIT-BRAIN GRID: dev's daemon (the PTY owner) reported pty 120×36
-  while the jojo client grid was 170×63 everywhere (xterm 170×63, PTY
-  170×63 on the jojo view, no view-contract violations). Claude Code
+  while the guihost client grid was 170×63 everywhere (xterm 170×63, PTY
+  170×63 on the guihost view, no view-contract violations). Claude Code
   laid out at 119-120 cols inside a 170-col viewport — content stopped
   at x≈1230 of a 273..1633 viewport box (pixel-measured), the right
   ~400 px blank. NOT a glyph/font defect: cell 8.0 px layout vs 8.4 px
@@ -809,28 +809,28 @@ client grid — a trace scan for remote_pty_resize_forwarded with
 cols≠client-grid following an ensure is the red; and a stale record can
 no longer self-sustain. (B) and the blank family are filed as [11.229].
 
-TWO ADJACENT FACTS RECORDED, NOT FIXED HERE: (1) jojo's serving daemon
+TWO ADJACENT FACTS RECORDED, NOT FIXED HERE: (1) guihost's serving daemon
 is 4f80c66d-dirty (born 00:06:11) holding the default endpoint while
 the ea4ea567 successor LINGERS on server-3-2-116-linger-2112851.sock —
-the 00:16 deploy's handover never completed on jojo ([11.225] family,
+the 00:16 deploy's handover never completed on guihost ([11.225] family,
 directions (a)/(c)); the owner's GUI rode the older bits all night.
 (2) The re-resume could inherit the session's last-known client grid
 instead of the 120×36 default — a direction, not coded (the forward is
 the architecture's chosen heal; make it reliable first).
 
-## ⛔ [11.226] THE agy 1.2.16 SELF-UPDATE PAINTS A FOLDER-TRUST GATE THE ROW CANNOT ANSWER AND THE E2E PROBE CANNOT SEE — FRESH-CWD agy ROWS SIT AT "Do you trust the contents of this project?" FOREVER, THE PROBE'S CLI MARKER MATCHES THE GATE TEXT ITSELF, AND THE 19:0x [11.225] FALSIFIER LEG'S "painted its CLI" WAS THE GATE (measured 2026-10-03 ~21:37-22:0x IST, jojo + dev, agy 1.2.16 md5-identical on both)
+## ⛔ [11.226] THE agy 1.2.16 SELF-UPDATE PAINTS A FOLDER-TRUST GATE THE ROW CANNOT ANSWER AND THE E2E PROBE CANNOT SEE — FRESH-CWD agy ROWS SIT AT "Do you trust the contents of this project?" FOREVER, THE PROBE'S CLI MARKER MATCHES THE GATE TEXT ITSELF, AND THE 19:0x [11.225] FALSIFIER LEG'S "painted its CLI" WAS THE GATE (measured 2026-10-03 ~21:37-22:0x IST, guihost + dev, agy 1.2.16 md5-identical on both)
 
 **Status:** OPEN
 
-Filed 2026-10-03 ~22:0x IST by the proof-collection seat (zcode on jojo,
+Filed 2026-10-03 ~22:0x IST by the proof-collection seat (zcode on guihost,
 work FROM dev; board outcome ACK pending). Found collecting the [11.225]
 production falsifier: the E2E connection probe's fresh_start_connects
 returned a row born-but-blank (0 chars, 150 s) on dev while the [11.218]
-hunt's defmiss scenarios on jojo "passed" with 818 chars minutes apart —
+hunt's defmiss scenarios on guihost "passed" with 818 chars minutes apart —
 the two contradictory readings forced the dig.
 
 THE MEASUREMENT (agy 1.2.16, self-updated under the descriptor 2026-10-03
-~10:10 dev / ~10:58 jojo, md5 56361e4b… IDENTICAL on both hosts — the
+~10:10 dev / ~10:58 guihost, md5 56361e4b… IDENTICAL on both hosts — the
 [11.175] drift class for provenance):
 - A daemon-minted agy row in a FRESH cwd paints the folder-trust gate:
   "Accessing workspace: <cwd> / Do you trust the contents of this project?
@@ -862,10 +862,10 @@ THE MEASUREMENT (agy 1.2.16, self-updated under the descriptor 2026-10-03
   verb minted, the row ran — the plane was up); the "CLI painted" leg was
   the gate. Recorded here so no future audit re-uses that leg as
   signed-in-TUI evidence.
-- THE dev/jojo VARIANCE IS REAL AND UNEXPLAINED: same binary, but dev's
+- THE dev/guihost VARIANCE IS REAL AND UNEXPLAINED: same binary, but dev's
   fresh_start row painted NOTHING at all in 150 s (not even the gate —
-  empty screen, running:true) while jojo's painted the gate in ~30 s. A
-  standalone PTY run on jojo (no daemon, TERM=xterm-256color) also paints
+  empty screen, running:true) while guihost's painted the gate in ~30 s. A
+  standalone PTY run on guihost (no daemon, TERM=xterm-256color) also paints
   nothing for 5+ minutes and logged a crash at ~3 min
   (crashes/crash_1981227_*.log, empty). Print mode is healthy on both
   hosts (`--print` round-trips in seconds) — auth/model/network are fine;
@@ -881,8 +881,8 @@ spawn-time `--trust-folder`-style flag if agy grows one, or manual
 viewport confirmation per fresh project; (3) the unanswerable-from-slave
 input finding wants the row-mounted `terminal send` path re-verified once
 a gated row is mounted (suspect: send to unmounted rows silently no-ops).
-UPDATE 2026-10-03 ~23:1x IST (the continuation seat, zcode on jojo, work
-FROM dev; board plan ACK-c62c39ea56): THE dev/jojo VARIANCE IS ROOT-CAUSED
+UPDATE 2026-10-03 ~23:1x IST (the continuation seat, zcode on guihost, work
+FROM dev; board plan ACK-c62c39ea56): THE dev/guihost VARIANCE IS ROOT-CAUSED
 — it was never agy being flaky. agy 1.2.16 gates its whole TUI startup on
 a DA2 handshake (`ESC[>c` — secondary device attributes): measured
 standalone on dev (fresh cwd, TERM=xterm-256color, real PTY), agy emits
@@ -890,9 +890,9 @@ exactly 53 bytes — the `ESC[>c` query — then paints NOTHING past a 75 s
 kill. The daemon's terminal protocol filter answered CPR (`ESC[6n`), DSR
 (`ESC[5n`) and DA-primary (`ESC[c`) but NOT DA2, so an UNMOUNTED row's
 agy blocked forever on the unanswered query: dev's probe-minted
-(headless, unmounted) row zero-painted 150 s, while jojo's gated row was
+(headless, unmounted) row zero-painted 150 s, while guihost's gated row was
 MOUNTED and its xterm.js viewport answered DA2 itself (`ESC[>0;277;0c`)
-— gate painted ~30 s. The jojo standalone zero-paint + ~3-min crash log
+— gate painted ~30 s. The guihost standalone zero-paint + ~3-min crash log
 is the same nobody-answered class. FIXED IN CODE this sitting: the daemon
 filter now answers `ESC[>c`/`ESC[>0c` with `ESC[>0;277;0c` (xterm.js
 parity — an unmounted row now behaves like a mounted one at the protocol
@@ -907,7 +907,7 @@ zero-paint), and the probe must fail it as `[startup_gate painted…]`.
 
 **Status:** OPEN
 
-Filed 2026-10-03 ~23:4x IST by the proof-collection seat (zcode on jojo,
+Filed 2026-10-03 ~23:4x IST by the proof-collection seat (zcode on guihost,
 work FROM dev). Found landing the [11.224] falsifier-note lane.
 
 THE MEASURED CHAIN (dev, ci.log + git state):
@@ -957,7 +957,7 @@ verify before reset).
 **Status:** OPEN
 
 Filed 2026-10-03 ~18:1x IST by the queue-completion seat (zcode sess_813045b5
-on jojo, work FROM dev; board plan ACK-4e4b35fc52). Found reading [11.182]'s
+on guihost, work FROM dev; board plan ACK-4e4b35fc52). Found reading [11.182]'s
 post-fix production evidence for its close audit — the close audit FAILED and
 this is why.
 
@@ -1009,7 +1009,7 @@ of 15 min × every walk). Until one lands, the fleet pays a ≥15-min toolchain
 write-lock every refresh cycle and any agy/kimi/muse row born in that window
 goes amber/blank.
 
-UPDATE 2026-10-03 ~20:0x IST (root-cause sitting; zcode on jojo, work FROM
+UPDATE 2026-10-03 ~20:0x IST (root-cause sitting; zcode on guihost, work FROM
 dev; board ACK-bdf73d5680): BOTH ROOT CAUSES MEASURED.
 
 **(1) mimo: `mimo upgrade` ALWAYS paints an interactive "Install anyways?"
@@ -1107,17 +1107,17 @@ yggterm--20261003-125014--102d200cf8f6, and the live falsifier was met on all
 three hosts the same sitting — one `ynpm sync --integrated` per host reaped the
 four managed-bin links plus every state-less dev generation (trace
 `yggterm.dev.reap`), leaving the row-facing `ynpm` resolving the roll-refreshed
-3.2.116 with the refusal literal on dev, jojo and oc). OWNER CALLS: (1)
+3.2.116 with the refusal literal on dev, guihost and oc). OWNER CALLS: (1)
 restore/rotate NPM_TOKEN in the publishing path; (2) after the secret is
 restored, whether the production handback (`ynpm prod @avikalpa/zcode-tui` per
 host) runs seat-side or owner-side.
 
-## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd jojo daemon, freshly started, 17 restored live sessions)
+## ⛔ [11.218] THE defmiss CLOSE OCCASIONALLY LEAVES ONE LIVE CLI HOLDER PAST THE 5s SETTLE WINDOW — 2/11 RUNS, BOTH INSIDE THE DAEMON'S FIRST ~25 MINUTES, THE SURVIVOR NEVER IDENTIFIED (measured 2026-10-02, probe `defmiss_fresh_start_mint` on the 23aaa3dd guihost daemon, freshly started, 17 restored live sessions)
 
 **Status:** OPEN
 
 Filed 2026-10-02 by the [11.213]/[11.165] green-closeout seat (zcode on
-jojo, work FROM dev). The [11.195] no-live-holder-survives-into-the-resume
+guihost, work FROM dev). The [11.195] no-live-holder-survives-into-the-resume
 law, asserted by the probe's reap(): `server remove` answered rc=0,
 `removed:true`, `closed terminal runtime` — and ONE pid whose cwd was the
 row's mint dir was still alive after the 5s settle window ([891566] then
@@ -1147,7 +1147,7 @@ holder is a wrapper the close never owned, the law's scan is over-broad
 and the law needs narrowing instead.
 
 UPDATE 2026-10-03 ~00:28-01:30 IST (the convict-naming + hunt sitting; zcode
-on jojo, work FROM dev): reap() now names the holder BEFORE the escalation
+on guihost, work FROM dev): reap() now names the holder BEFORE the escalation
 kill (holder_identity: cmdline+state+ppid read while the holder lives — the
 first capture attempt read /proc AFTER the kill and could only ever say
 "gone at evidence time"; merged 7905b520). Hunt: 31 green runs across two
@@ -1169,7 +1169,7 @@ young daemon (headless windows produced 0 perturbations in 29 runs; the
 one capture rode GUI attach churn); sequence hunts AFTER deploys (a lane
 deploy rotates the daemon mid-hunt and invalidates the run).
 
-UPDATE 2026-10-03 ~02:5x IST (arm-naming seat, zcode on jojo, work FROM
+UPDATE 2026-10-03 ~02:5x IST (arm-naming seat, zcode on guihost, work FROM
 dev; lane/integration/111218-arm-naming): the probe's mint-leg failure
 verdict now carries the trace window's own account — window_arms=[every
 event name that mentioned the scenario's id since the scenario's offset,
@@ -1180,7 +1180,7 @@ PROC side — the two together pin the race. The GUI-ATTACHED young-daemon
 hunt and the AFTER-deploys sequencing remain the next seat's run.
 
 UPDATE 2026-10-03 ~07:1x IST (falsifier sitting; zcode sess_b85fd20c on
-jojo, work FROM dev): the GUI-ATTACHED young-daemon hunt RAN and was CLEAN
+guihost, work FROM dev): the GUI-ATTACHED young-daemon hunt RAN and was CLEAN
 — the 03:00-03:30 seat's rig (real-store daemon born 02:59 + Xvfb GUI on
 the deployed build, i.e. post-deploy sequencing held) looped 27/27
 defmiss_fresh_start_mint PASS (hunt-030015.log, window closed 03:30:48) —
@@ -1193,25 +1193,25 @@ owner's own GUI rotations, names its arm from both sides. The entry stays
 OPEN as the rare-race watcher: no fix exists to verify; a failing run's
 two-sided evidence is the conviction the fix direction waits on. ALSO
 this sitting: [11.220] found — the bare-launch handoff was executing the
-03:54 build on jojo (every rig launch this window rode 87237c338787, not
+03:54 build on guihost (every rig launch this window rode 87237c338787, not
 b9c6e0c3); all hunts above predate the divergence and their builds carry
 the instruments, so they stand.
 
-UPDATE 2026-10-03 ~16:3x IST (post-[11.223]-deploy hunts; zcode on jojo,
+UPDATE 2026-10-03 ~16:3x IST (post-[11.223]-deploy hunts; zcode on guihost,
 work FROM dev): two young-window hunts on the 43ca1f00 and 765cd7c5
 daemons (harness rebuilt at /tmp/yggterm-218-hunt; hunt-direct.sh arms on
 any daemon pid) took 7 PASS / 0 FAIL defmiss_fresh_start_mint samples —
-both hunts cut short by deploy rotations (docs landings rotate jojo within
+both hunts cut short by deploy rotations (docs landings rotate guihost within
 minutes; a full 31-min window needs a rotation-quiet period). Cumulative
 91+ green runs across headless, GUI-attached, and post-deploy windows;
 zero holder-survivors and zero mint perturbations since the original
 2/11. The rotation-armed wrapper (hunt-daemon-change.sh — fires on the
 next daemon rotation, then samples every 75 s through the 31-min window)
-is LIVE on jojo and completes the owed full window the moment the fleet
+is LIVE on guihost and completes the owed full window the moment the fleet
 goes quiet; no human re-arm needed.
 
 
-UPDATE 2026-10-03 17:35 IST (zcode on jojo, work FROM dev): hunt-170610.log
+UPDATE 2026-10-03 17:35 IST (zcode on guihost, work FROM dev): hunt-170610.log
 on the fresh post-deploy daemon 1786239 (born ~17:04, build 19651489,
 armed 17:06:10 after the sitting's last deploy) ran the FULL young window
 — WINDOW CLOSED (age 31m) at 17:35:12, 12 PASS / 0 FAIL
@@ -1227,7 +1227,7 @@ two-sided evidence (holder_identity + window_arms, both live in
 production) is the conviction the fix direction waits on.
 
 UPDATE 2026-10-03 20:29:23 IST (the repaired rotation-armed hunt on the
-20:02 jojo rotation to dcc8cdc5, daemon born 20:02:23): CATCH #3 — the
+20:02 guihost rotation to dcc8cdc5, daemon born 20:02:23): CATCH #3 — the
 first 12 runs (daemon ages ~3-25 m) PASSED; the run at daemon age 26 m
 (20:29:23) FAILED: the close of `agy-runtime://04f0baac…` left live CLI
 holder 1913464 past the FULL 5 s settle window (a live cwd match — not a
@@ -1245,7 +1245,7 @@ now distinguishes `state=Z` (a reap-gap convict — adjacent to [11.126]'s
 unreaped-children leak) from a true (gone). The hunt stays armed; the
 next catch names its convict.
 
-## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated jojo 8e712270cd71, the split-commit-render-span lane)
+## ⛔ [11.217] SPLIT CREATE REFLOWS ONLY THE FOCUSED MEMBER — THE CO-VISIBLE PANE GETS NO FIT, NO REFRESH, NO REPAINT, AND THE SPLIT HEAL NEVER LANDS ONE (measured 2026-09-29 ~19:4x-20:2x IST, rotated guihost 8e712270cd71, the split-commit-render-span lane)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
@@ -1258,7 +1258,7 @@ it: on the owner live GUI, a split create shows BOTH panes reflowed and
 painted (both members render_span within ~2 frames, the pre-split
 content marker visible in both panes, 5/5, 0 rows behind).
 
-Filed 2026-09-29 by zcode sess_16f52090-3bc4-42c4-8c4c-597ffe928092 on jojo,
+Filed 2026-09-29 by zcode sess_16f52090-3bc4-42c4-8c4c-597ffe928092 on guihost,
 work FROM dev; claim ACK-2785828b63. The accuracy twin of the [11.215]/[11.216]
 speed work: the split create's DOM lands atomically in ~130 ms, but only pane
 0 (the focused member) ever reflows its terminal content.
@@ -1298,7 +1298,7 @@ commit promotes member 2 to visible — the mount decision should see that
 (before the skip), or the heal's forced refresh must fire for the co-visible
 member (today: for neither).
 
-UPDATE 2026-10-03 ~08:2x IST (second-gate sitting; zcode on jojo, work
+UPDATE 2026-10-03 ~08:2x IST (second-gate sitting; zcode on guihost, work
 FROM dev): THE OWNER-GUI FALSIFIER WAS RUN — RED 5/5, AND THIS TIME IT
 CONVICTS. uxprobe --actions split --iters 5 on the LIVE Wayland GUI
 (daemon 859d783f, post-[11.220] restart): 5/5 creates, the co-visible
@@ -1329,10 +1329,10 @@ remote co-visible member's in-flight attach may face the same erase; and
 the superseded-during-loop break still arms no remount (its [11.139]
 watchdog covers remote attaches only) — both recorded for the next
 wedge-class sitting. The live falsifier re-run on the deployed fix stays
-OWED (the jojo GUI was quit by the owner mid-sitting; daemon headless).
+OWED (the guihost GUI was quit by the owner mid-sitting; daemon headless).
 
 UPDATE 2026-10-03 ~07:0x IST (falsifier sitting; zcode sess_b85fd20c on
-jojo, work FROM dev): the falsifier battery was RUN on the deployed build
+guihost, work FROM dev): the falsifier battery was RUN on the deployed build
 (87237c338787 — predates the 04:03/04:10 deploys per [11.220], but CARRIES
 the 8bd618a2 fix) via an Xvfb rig GUI on the REAL store: uxprobe
 --actions split --iters 5, twice (daemon age ~3 m and ~13 m). BOTH RUNS
@@ -1358,7 +1358,7 @@ Instrument note: the probe's daemon-screen marker read (read-buffer
 runs) — that leg is unreliable on this rig; the pane-content assert (the
 live xterm buffer) is the authoritative one.
 
-UPDATE-2 2026-10-03 ~08:0x IST (the repair sitting; zcode on jojo, work FROM
+UPDATE-2 2026-10-03 ~08:0x IST (the repair sitting; zcode on guihost, work FROM
 dev, lane/integration/11217-split-repair): the owner-GUI conviction post
 (02:02Z) named three death points; the LIVE TRACE names the one that kills.
 Re-derived from the conviction window itself (create group ...-5, M1
@@ -1439,7 +1439,7 @@ refused. Evidence: /tmp/11217-rig-home/ytrace.jsonl (dev), iteration-2
 window of the 5-iter run; the superseded trace now carries its arm
 diagnostics. Owner-GUI falsifier stays the close bar.
 
-UPDATE 2026-10-03 ~09:5x IST (posted-proof sitting; zcode on jojo, work
+UPDATE 2026-10-03 ~09:5x IST (posted-proof sitting; zcode on guihost, work
 FROM dev; lane/integration/11217-rearm-remount): THE SUPERSEDE-WITHOUT-
 SUCCESSOR DEATH, ROOT-CAUSED FROM THE ADDENDUM'S OWN TRACE AND FIXED —
 BOTH named directions were wrong-side; the real kill is upstream of both.
@@ -1500,7 +1500,7 @@ cannot distinguish a worktree-dirty from a same-commit deploy.
 
 
 UPDATE 2026-10-03 ~13:3x-14:2x IST (the falsifier re-run sitting; zcode on
-jojo, work FROM dev): TWO production-build re-runs of the armed falsifier
+guihost, work FROM dev): TWO production-build re-runs of the armed falsifier
 (uxprobe --actions split --iters 5, on build 8c9c7433 carrying all three fix
 lanes, GUI /proc/exe-verified each time, stable single-GUI windows for both
 runs). VERDICT: NOT closable today — but the LIVE TRACE CARRIES THE FIX
@@ -1532,11 +1532,11 @@ clear the block (measured directly on a live shell row this sitting; filed
 as [11.223]). Both probe legs need the [11.223] resolution before any
 re-run can convict or clear.
 
-## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live jojo GUI 3.2.115, the split-create-appear lane)
+## ⛔ [11.215] THE SPLIT-CREATE APPEAR HOLDS ~1.6-2.4× OVER THE ≤100 ms BAR (DOM p50 164 ms, FIRST FRAME +~78 ms AFTER THE STAMP) — AND THE CAMPAIGN'S OWN TWO-PHASE PROBE WAS INFLATING IT 3-6× (measured 2026-09-29 ~16:2x-16:5x IST, live guihost GUI 3.2.115, the split-create-appear lane)
 
 **Status:** OPEN
 
-Filed 2026-09-29 by zcode sess_5f387fca-ac93-45a4-b57a-f070398d001f on jojo,
+Filed 2026-09-29 by zcode sess_5f387fca-ac93-45a4-b57a-f070398d001f on guihost,
 work FROM dev; claim ACK-aa075a6276. Scratch pair, menu origin, quiet floors
 (cli 58-63, gui 159-163, drift ≤+5), 5/5 accuracy every run, 0 rows left
 behind.
@@ -1612,7 +1612,7 @@ first-raf ≤+20 ms after the stamp, 5/5 accuracy, 0 rows left behind — or the
 second-owner bump named to its exact call site with an A/B proving its
 removal moves the stamp.
 UPDATE 2026-09-29 ~13:5x UTC (split-appear-focus-churn lane, claim
-ACK-5a502e66bb; zcode sess_f0693c80 on jojo, work FROM dev): THE FOCUS-TAIL
+ACK-5a502e66bb; zcode sess_f0693c80 on guihost, work FROM dev): THE FOCUS-TAIL
 HALF DISCHARGED — fix LANDED as [11.216] (lane/uxspeed/split-appear-focus-
 churn ba7e06de, ygg-ci merged 1daa1c13, deployed + GUI rotated 18:41 IST,
 live-proven on 1daa1c13758b): (1) the focus tail no longer re-runs the
@@ -1641,7 +1641,7 @@ trace around the split commit naming the compound re-render's legs (the
 [11.172]/[11.173] retention makes the member's pane re-mount hot; the
 reclaim is already out of the window — the re-render is not).
 UPDATE 2 2026-09-29 ~20:3x IST (split-commit-render-span lane, claim
-ACK-2785828b63; zcode sess_16f52090 on jojo, work FROM dev): THE NAMED NEXT
+ACK-2785828b63; zcode sess_16f52090 on guihost, work FROM dev): THE NAMED NEXT
 LEVER DISCHARGED — the render-span trace around the split commit LANDED
 (lane/uxspeed/split-commit-render-span d4f33fa9, ygg-ci merged 8e712270,
 deployed + GUI rotated 19:4x IST): `split/render_span
@@ -1675,7 +1675,7 @@ surface is live — the split restructure should re-parent + fit, not remount.
 
 
 UPDATE 3 2026-10-03 ~01:4x-02:5x IST (epoch-reuse-remount-skip takeover, claim
-ACK-ab23022682; zcode on jojo, work FROM dev): THE NAMED LEVER LANDED IN CODE
+ACK-ab23022682; zcode on guihost, work FROM dev): THE NAMED LEVER LANDED IN CODE
 (lane/uxspeed/epoch-reuse-remount-skip e313f97c + 4c9c2323) — the RE-PARENT
 RAISE, a third arm between the reveal raise and the lease. Measured first on
 a dev Xvfb split rig (3 rows x 3 creates): every reveal_raise_refused on the
@@ -1756,7 +1756,7 @@ web-process kill — none reproduces the phantom; kill answers 601).
 
 Root cause open; the FELT SYMPTOM is defused on `lane/uxspeed/spawn-screen-fix`.
 
-Filed 2026-09-27 on `lane/uxspeed/spawn-screen-fix` (zcode sess_04fb9058 on jojo,
+Filed 2026-09-27 on `lane/uxspeed/spawn-screen-fix` (zcode sess_04fb9058 on guihost,
 work FROM dev) while fixing [11.176]. The [11.172/11.173] warm mount path dispatches
 `terminal_document.eval(warm_script)` after a version probe that RESOLVED true in the
 same document milliseconds earlier — and the warm script then never executes at all:
@@ -1793,7 +1793,7 @@ run_javascript callback, dioxus-desktop `query.rs` new_query(), and a `launch.rs
 arm. Rebuild them in minutes when chasing the webkit why.
 
 
-LIVE-PROVEN 2026-09-27 ~11:20 IST on rotated jojo (d96c246121f5): uxprobe spawn
+LIVE-PROVEN 2026-09-27 ~11:20 IST on rotated guihost (d96c246121f5): uxprobe spawn
 4/4 painted (8.2-10.3 s, the warm-stall -> recover -> cold -> first_frame ladder),
 0 rows left behind, no permanent blanks. RESIDUAL (owned here): every fresh row's
 FIRST mount still pays the warm-stall + ~5 s recover + cold-paint tail — the fast
@@ -1810,14 +1810,14 @@ mounts in ~150 ms (mount_open +152 ms, first_frame +366 ms after the gate),
 ~6.6 s residual is the rig daemon-bootstrap+prompt floor, a different cost center). FALSIFIER for
 the gate: a spawn whose warm eval vanishes and still pays the recover ladder
 (`startup_terminal_restore_recover` present on a spawn path), or a permanent blank after a
-`warm_eval_vanish_redo_cold` trace event. LIVE-PROVEN 2026-09-27 ~13:05 IST on rotated jojo
+`warm_eval_vanish_redo_cold` trace event. LIVE-PROVEN 2026-09-27 ~13:05 IST on rotated guihost
 (91bfe727e697): uxprobe spawn 3/3 painted 2.0-2.3 s, `warm_eval_vanish_redo_cold` x3 on the spawn
 paths, `startup_terminal_restore_recover` x0, 0 rows left behind. Scope note: the
 gate arms on the WARM path only; a vanished COLD first mount (seen once in the rig) stays bounded
 by the [11.176] streak ladder.
 
 MEASURED-AND-PARTLY-FALSIFIED 2026-09-29 ~09:15-10:20 IST (lane/uxspeed/warmmount-gate-fix, zcode
-sess_9a200386 on jojo, work FROM dev; merged main 28c8dfec, revert tip = the lane):
+sess_9a200386 on guihost, work FROM dev; merged main 28c8dfec, revert tip = the lane):
 - The STALL DISTRIBUTION is now measured on three planes and it is LOAD-DEPENDENT, so the fix
   direction's "deadline outside the stall tail" arm has NO constant answer: debug rig quiet
   (fresh page, first spawn) ~0.7 s and the warm mount COMPLETES un-gated; debug rig under build
@@ -1825,7 +1825,7 @@ sess_9a200386 on jojo, work FROM dev; merged main 28c8dfec, revert tip = the lan
   (quiet 61 ms floors) ~2.9 s consistently (mount_begin->mount_open 2913/2982/2936/2933 ms,
   4/4 iterations — the gap is exactly the 2.5 s deadline + the ~0.45 s redo parse+open).
 - The 2.5 s arm was TRIED IN MAIN (28c8dfec) and FALSIFIED by live A/B: uxprobe spawn on the
-  rotated jojo GUI, quiet floors, spawn_to_paint 4292/3609/3325/3329 ms (p50 3.3 s) vs the
+  rotated guihost GUI, quiet floors, spawn_to_paint 4292/3609/3325/3329 ms (p50 3.3 s) vs the
   2.0-2.3 s baselines at the 1.0 s gate — every gated spawn paid deadline+redo. REVERTED to
   1.0 s (same lane, same day); 1.0 s + redo (~1.5 s total) remains the measured good path.
 - KEPT (merged in the same lane): the `__yggtermMountAttempt` invoke-stamp guard
@@ -1849,8 +1849,8 @@ sess_9a200386 on jojo, work FROM dev; merged main 28c8dfec, revert tip = the lan
   /tmp/warmmount-home-*/ytrace.jsonl; live report /tmp/live-spawn-postfix.json.
 
 FIXED-ADAPTIVE 2026-09-29 ~11:40-12:10 IST (lane/uxspeed/warmmount-adaptive-gate, zcode
-sess_625432ec on jojo, work FROM dev; board claim ACK-88d595b856; merged main a030694a1262
-via ygg-ci 11:51, jojo GUI+daemon rotated): the entry's NAMED NEXT STEP — the gate is
+sess_625432ec on guihost, work FROM dev; board claim ACK-88d595b856; merged main a030694a1262
+via ygg-ci 11:51, guihost GUI+daemon rotated): the entry's NAMED NEXT STEP — the gate is
 ADAPTIVE. The fixed 1.0 s deadline is replaced by a trivial-eval pipeline probe
 (`return 1 + 1`, terminal_mount_pipeline_probe_script) dispatched at
 T0+TERMINAL_WARM_EVAL_PROBE_DISPATCH_MS (350) whose join future is held in the mount loop
@@ -1885,7 +1885,7 @@ the bridge POST path, not the eval dispatch path.
 
 ROOT CAUSE NAMED 2026-10-03 ~00:35-01:05 IST (diag lane
 lane/integration/11178-warm-ladder, NOT merged — diagnostic stamps; zcode on
-jojo, work FROM dev; the five-stamp ladder rig). A page-side timing ladder
+guihost, work FROM dev; the five-stamp ladder rig). A page-side timing ladder
 (t1 warm-IIFE start · t2 fn entry · t2a/t2b/t2c after the three inlined
 chunks · the bootstrap post's own postNow · t5 cold-redo IIFE · t_probe_exec
 inside the pipeline probe; read out of the bootstrap/t2c debug messages in
@@ -1948,7 +1948,7 @@ one path that delivers; the remount-storm reduction ([11.215]) remains the
 load-bearing companion.
 
 GATE-C2 LANDED (2026-10-03 ~02:35-03:1x IST, lane/uxspeed/warmmount-eval-liveness,
-zcode on jojo, work FROM dev; claim ACK-3887477f63): the entry's c2 arm — mount
+zcode on guihost, work FROM dev; claim ACK-3887477f63): the entry's c2 arm — mount
 liveness POLLED VIA EVAL RETURNS. The mount fn (TERMINAL_MOUNT_FN_VERSION 2→3)
 advances a page-side record `window.__yggtermMountAlive[host] = {attempt, stage,
 pageTs}` at every guarded stage (entry / host_ready / pre_construct / posted) and
@@ -1987,12 +1987,12 @@ The ladder stamps: window.__yggWarmLadder pushes in terminal_scripts.rs
 probe) + the bootstrap message carries ladder+postNow — rebuild them from
 lane/integration/11178-warm-ladder (diagnostic-only, not merged).
 
-## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live jojo desktop)
+## ⛔ [11.172] THE FELT SWITCH REMOUNTS AN ALREADY-MOUNTED SURFACE — A ROW-TO-ROW SWITCH PAYS A FULL MOUNT (the JS wait alone ≈0.9 s) PLUS A SETTLE TAIL, p50 1.34 s CLICK→FIRST GLYPH (measured 2026-09-27 ~01:05 IST, uxprobe `switch` on rotated build 58999b0b, live guihost desktop)
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-09-27 on `lane/uxspeed/switch-paint-marker` (zcode
-sess_1cbee766-d95d-455a-b83d-995b87c7050f on jojo, work FROM dev) — the lane
+sess_1cbee766-d95d-455a-b83d-995b87c7050f on guihost, work FROM dev) — the lane
 that landed [11.171]'s end marker. [11.171] is CLOSED with that proof per the
 verified-fix law (git remembers: 9ad18b4d put `session_path` on the whole
 `xterm_paint` family and taught uxprobe `switch` to pair
@@ -2092,7 +2092,7 @@ PROOF OWED) and [11.93] (the per-CLI audit, OPEN).
 | 11.6.8 | grok | C | RE-MEASURED 1.0.30 live (suites/grok.js LANDED 2026-09-15, 8/8): 09-11 needle surgery HOLDS (spinner line + [stop] + Ctrl+c swap); post-turn `ctrl+b:send to bg` MEASURED GONE (bg-hint table emptied) and idle chrome re-measured (Shift+Tab:mode \| Ctrl+x:shortcuts); tenancy registry re-verified incl. stale-entry-after-kill; events.jsonl event-fed classifier OPEN |
 | 11.6.9 | pi | C | OPEN |
 | 11.6.10 | codex-litellm | A | OPEN |
-| 11.6.11 | zcode-tui | B | ANNOUNCE-WIRE LIVE PROOF DELIVERED 2026-09-29 (zcode sess_92e413de on jojo, claim ACK-3cf847476a): a real 0.6.79 row born through the remote wrapper (`server remote resume-zcode-tui sess_9ddad3db…`, the store's oldest session) announced StartupGate → Idle-with-identity → 5s heartbeats (OSC 7717, seq monotonic), the daemon parsed+retained the records (`terminal app-declares` readback, running:true), and a `terminal restart --force-remote` rotation (`replaced_existing=true`) re-armed the wire (fresh seq, fresh ts_ms, identity re-claimed) — the family's live-proof debt is PAID for the wire half (screen side was already delivered 09-14). ⛔ CAVEAT: the proof ran on a lane-tip 0.6.79 build (dist sha 441656002eb1c129…) pointed at `~/.local/bin/zcode-tui` for the sitting; the DEPLOYED 0.6.14 generation (dev-1789647702345) is announce-DEAD — zero 7717 bytes in 40s+ pty captures, no heartbeat (the wire restored somewhere in 0.6.15..0.6.79; main 0.6.38 build emits; announce.ts itself is untouched since 0bd590f, so the death is renderer/stdout plumbing) — fleet rows stay wire-less until a bin re-point. 0.6.x DELTA DRIVE OPEN: chrome drift measured (ZCODE banner, ▌-box composer, rotating example placeholder, `Build · <model> · <effort>` status line, footer `shift+tab agents · ctrl+p commands · <version>`; the declared `i to type`/`zcode-tui` footer hints are 0.5.9-facts). ⭐ TURN LEG CRACKED + FIXED + LIVE-PROVEN same day (zcode sess_1a2697d6, claim ACK-9f3576105b): the six negative falsifiers were never key-parse — an env-gated keylog build caught `session/create` rejecting the composer's payload `Invalid params — model: Unrecognized key: "variant"` on EVERY fresh-birth submit since d6737ec (0.6.11; the app-server strict schema is `options.reasoningLevel`, `variant` is output-echo vocabulary), plus a second layer (hardcoded allowlist advertising registry-absent models). FIX on zcode-tui `probe/composer-submit-pty` (636ea08, on the ux-parity lane tip): options.reasoningLevel at create+setModel, bare create + setModel reconcile with honest degrade. LIVE PROOF on the fixed build: create ok → turn-start → turn-end tokens=46707 (~14.8s), announce StartupGate → Idle(identity) → **Working ×4** → Idle ×3 — the Working-phase announce DELIVERED; resume-submit leg proven too. The §9 suite was RE-PINNED to the 0.6.x chrome (2026-09-29, three 6/6 greens vs the main candidate — see the re-pin section below). ⭐ PORT TO MAIN LANDED + LIVE-PROVEN same day late (zcode sess_f5366892 on jojo, claim ACK-e94a9ef35c): the owner-GO lane merge (ee9714a) had put the dead submit on MAIN — zcode-tui `lane/zcode-tui/composer-submit-main` 24cc1ef ports the fix with a THIRD poisoned site the lane fix missed (effort-switch setModel ~2278, sitting under a "setModel accepts model.variant, measured live 2026-09-16" comment the backend bundle FALSIFIES — vGt/Pu both .strict(), setModel rejects variant too); probe-branch residuals fixed same day (5eee97d residual + e0c4ceb dup-import typecheck repair); LIVE PROOF on the main build (0.6.38+fix, dist sha f669b941f4ce2b7b…, jojo pty): fresh hello<CR> → create ok sess_02e01101 → StartupGate/Idle(identity) → Working ×3 → Idle heartbeats, zero error markers; resume leg Working ×7 → Idle → QuestionPrompt (the pending-ask arm observed live). Re-point of the deployed 0.6.14 generation is the remaining owner call — the main candidate is now clean |
+| 11.6.11 | zcode-tui | B | ANNOUNCE-WIRE LIVE PROOF DELIVERED 2026-09-29 (zcode sess_92e413de on guihost, claim ACK-3cf847476a): a real 0.6.79 row born through the remote wrapper (`server remote resume-zcode-tui sess_9ddad3db…`, the store's oldest session) announced StartupGate → Idle-with-identity → 5s heartbeats (OSC 7717, seq monotonic), the daemon parsed+retained the records (`terminal app-declares` readback, running:true), and a `terminal restart --force-remote` rotation (`replaced_existing=true`) re-armed the wire (fresh seq, fresh ts_ms, identity re-claimed) — the family's live-proof debt is PAID for the wire half (screen side was already delivered 09-14). ⛔ CAVEAT: the proof ran on a lane-tip 0.6.79 build (dist sha 441656002eb1c129…) pointed at `~/.local/bin/zcode-tui` for the sitting; the DEPLOYED 0.6.14 generation (dev-1789647702345) is announce-DEAD — zero 7717 bytes in 40s+ pty captures, no heartbeat (the wire restored somewhere in 0.6.15..0.6.79; main 0.6.38 build emits; announce.ts itself is untouched since 0bd590f, so the death is renderer/stdout plumbing) — fleet rows stay wire-less until a bin re-point. 0.6.x DELTA DRIVE OPEN: chrome drift measured (ZCODE banner, ▌-box composer, rotating example placeholder, `Build · <model> · <effort>` status line, footer `shift+tab agents · ctrl+p commands · <version>`; the declared `i to type`/`zcode-tui` footer hints are 0.5.9-facts). ⭐ TURN LEG CRACKED + FIXED + LIVE-PROVEN same day (zcode sess_1a2697d6, claim ACK-9f3576105b): the six negative falsifiers were never key-parse — an env-gated keylog build caught `session/create` rejecting the composer's payload `Invalid params — model: Unrecognized key: "variant"` on EVERY fresh-birth submit since d6737ec (0.6.11; the app-server strict schema is `options.reasoningLevel`, `variant` is output-echo vocabulary), plus a second layer (hardcoded allowlist advertising registry-absent models). FIX on zcode-tui `probe/composer-submit-pty` (636ea08, on the ux-parity lane tip): options.reasoningLevel at create+setModel, bare create + setModel reconcile with honest degrade. LIVE PROOF on the fixed build: create ok → turn-start → turn-end tokens=46707 (~14.8s), announce StartupGate → Idle(identity) → **Working ×4** → Idle ×3 — the Working-phase announce DELIVERED; resume-submit leg proven too. The §9 suite was RE-PINNED to the 0.6.x chrome (2026-09-29, three 6/6 greens vs the main candidate — see the re-pin section below). ⭐ PORT TO MAIN LANDED + LIVE-PROVEN same day late (zcode sess_f5366892 on guihost, claim ACK-e94a9ef35c): the owner-GO lane merge (ee9714a) had put the dead submit on MAIN — zcode-tui `lane/zcode-tui/composer-submit-main` 24cc1ef ports the fix with a THIRD poisoned site the lane fix missed (effort-switch setModel ~2278, sitting under a "setModel accepts model.variant, measured live 2026-09-16" comment the backend bundle FALSIFIES — vGt/Pu both .strict(), setModel rejects variant too); probe-branch residuals fixed same day (5eee97d residual + e0c4ceb dup-import typecheck repair); LIVE PROOF on the main build (0.6.38+fix, dist sha f669b941f4ce2b7b…, guihost pty): fresh hello<CR> → create ok sess_02e01101 → StartupGate/Idle(identity) → Working ×3 → Idle heartbeats, zero error markers; resume leg Working ×7 → Idle → QuestionPrompt (the pending-ask arm observed live). Re-point of the deployed 0.6.14 generation is the remaining owner call — the main candidate is now clean |
 | 11.6.12 | devin | C | MEASURED 2026-09-16 (lane/integration/devin-battery — the first measurement pass the registration owed; a zcode seat on the muse lab host, devin 3000.10.27 the only fleet install, auth LIVE via the owner's 2026-09-15 login): suites/devin.js 8/8 TWICE live — trust gate measured BOTH ways (`✓ Do you trust the authors of this directory?` / `Yes, trust` / `No, exit` on a fresh cwd; Enter grants; the grant is durable in `~/.local/share/devin/cli/trusted_workspaces.json`; a trusted cwd never sees the gate; print mode REFUSES an untrusted workspace by name: `Error: Refusing to run in an untrusted workspace: <path>`); composer glyph **U+276D `❭`** read off the RENDERED buffer — the registered U+276F was a placeholder, one codepoint off; working line `⣠⠀ Thinking · <N>s (esc twice to interrupt)` (braille = spinner frames, muse lesson) with the composer placeholder swapping to `❭ Guide Devin while it works` mid-turn; the interrupt is TWO DISTINCT esc presses (a single `\x1b\x1b` write reads as one event — measured, the turn kept running); footer `SWE-1.6 Slow` + `ctrl+v to paste image in clipboard`; STORE = ONE sqlite db `~/.local/share/devin/cli/sessions.db` (WAL; sessions/prompt_history/message_nodes/rendered_commits/tool_call_state/subagent_heads/app_state) — session ids are word-word SLUGS (scythe-snowplow), `title` = the first prompt (eager self-titling — codex law, third instance), a row is written only on a COMPLETED turn (a turnless/interrupted session leaves session_locks/<slug>.lock = the pid; locks persist after exit, NOT a live registry); resume rederive PROVEN (`devin -r <slug>` repaints the history; ctrl+d exits rc 0 with the farewell naming `devin -r <slug>`); `devin list --format json` cwd-scoped machine surface; `--permission-mode` MEASURED `auto|accept-edits|smart|dangerous` (default auto, env DEVIN_PERMISSION_MODE) — the registration's docs-sourced `normal|dangerous|bypass` is DEAD on the binary; OSC title `devin: <cwd-basename>`. DESCRIPTOR FILLED WHERE MEASURED: screen tables, U+276D, permission modes + measured presets (smart rides as a preset — no enum slot), `content_rederives_on_resume: true`, store declared (durable_store_files sessions.db, scan_gap CLOSED, opencode posture: empty globs BY SHAPE + dedicated scanner `scan_devin_sessions`), title reader + membership probe + newest-for-directory arm + remote title probe wired. Core lib delta vs clean main = 0 new reds; arm matrix 10/10. WRAPPER-LEVEL LIVE-ROW PROOF RAN 2026-09-18 (the muse lab host, daemon 7e816ff3): the gate leg PROVEN (`startup_gate` classification + the NAMED `startup_gate_shown_refusal` — [11.107]'s naming half on a second CLI) and the turn leg FOUND [11.140] — every wrapper send refused `pending_draft` because the placeholder sits on the ❭ glyph row; FIXED IN CODE (composer_placeholder_needles declared, both measured forms; fixture-locked); the rotation then arrived and the guard half proved LIVE on clean composers; the delivery leg RAN 2026-09-19 and a wrapper path DELIVERS A REAL TURN — prompt without the trailing newline, then a submit-only send: reply verbatim, composer back to idle, context meter moved, a sessions.db row written for the probe cwd ([11.140] and [11.141] deleted with that proof per the verified-fix law). RESIDUAL [11.142] CLOSED 2026-09-19 — decode-confirmed submit + probe posture LIVE-PROVEN on the rotated build (b530cd958516, the muse lab host): the one-shot text+CR contract send started a REAL turn (working line painted, composer back to idle, context meter 18k/200k, sessions.db row steep-saver titled with the one-shot prompt, accepted:true honest), and input-check AND terminal submit on a healthy draft-holding row answer the DRAFT refusal by name (wedged:false, composer_held_draft:true, remedy:null, no probe typed) — entry deleted per the verified-fix law, git remembers. Measured drift: devin self-updated to v3000.10.31, footer `ctrl+v…` → `alt+m to switch` (suite paired). CORRECTION (2026-09-19, the devin-repair seat, b98cc431): the ctrl+v hint is NOT dead — the footer right side is CONTEXTUAL: `ctrl+v to paste image in clipboard` paints whenever the composer HOLDS TEXT, the `alt+m` variant paints on the EMPTY idle composer; and esc closes overlays but does NOT clear composer text (typed text concatenates — probe hazard, measured). The [11.142] close’s owed suite placeholder re-pair is MEASURED NOT NEEDED — 8/8 twice live on b98cc431; the [11.140] pairing (242d87d2) already carries the grown idle-ask form in both the suite constant and the descriptor needles. Still open: cloud `/handoff` unprobed; model-surface MEASURED 2026-09-19 (`/model` = inline autocomplete, `Interactively choose a model, or specify one directly`, hint names `claude-opus-5|claude-sonnet-5|…`; `/fusion` = `Choose a Fusion model (same as /model fusion)`; alt+m = the searchable model picker overlay — pricing panel, `✑ New ✑ Promotion ✑ Beta` tags, footer `↑↓ select · ↵ confirm · esc cancel`; banner carries plan + quota `Free plan · use /upgrade · 98% remaining (resets in …)`); `smart` mode has no AgentPermissionMode slot (preset only); independently corroborated the same night by a second seat on a second fresh trusted-cwd row (one-shot text+CR delivered BANANA-1142 verbatim, context meter 18k/200k, sessions.db row colossal-bait; a cold-host one-shot answered the NAMED refused_render with Enter withheld and left a clean composer; the draft-holding probe answered evidence, never WEDGED); follow-up residual filed [11.143]; the registration's shell-arm gap (daemon arms without shell arms — `every_registered_cli_has_both_shell_arms` red on main) was FILLED 2026-09-19 in the [11.145] red sweep: Local + remote-devin:// shell rows with the standard axes, fixture id slug-shaped per the sessions.db law |
 | 11.6.13 | mimo | C | REGISTERED MEASURED-PARTIAL 2026-09-26 (lane/integration/mimo-intake, owner-directed "Add the MIMO Code as another CLI"; Xiaomi's MiMo Code — the `mimo` command, npm `@mimo-ai/cli`, MIT, an OpenCode fork with a diverged surface: `serve`/`attach`, `session list`, `db`, `export`/`import`, `providers`; installed on the muse lab host 0.1.15 via ynpm). MEASURED WITHOUT AUTH: trust gate = a RADIO prompt `Quick safety check: Is this a project you created or one you trust?` / `● Yes, I trust this folder` (Enter grants; `--trust` skips BY FLAG; a resumed `-s <id>` arms the SAME gate on the session's directory before any rederive); composer = the OPENCODE `┃`-BOX (U+2503 gutter, mode row INSIDE the box `Build · MiMo Auto (MiMo-V2.5)`, placeholder `Type your message... (type / for commands)` — the [11.133] shape, second CLI); idle footer `tab switch mode · ctrl+p settings · @ attach file · $ subagent · / commands` (tab cycles Build/Plan/Compose); version stamp bottom-right; launch flags TOP-LEVEL: `-m/--model provider/model`, `-s/--session <id>`, `-c/--continue`, `--fork`, `--yolo`=`--dangerously-skip-permissions`, `--never-ask` (distinct measured mode, no enum slot — unwired); STORE = ONE sqlite db `~/.local/share/mimocode/mimocode.db` (WAL; session/project/permission/permission_grant/account/claude_import/… tables), ids `ses_…` (the opencode law, THIRD instance; suffix mixed hex/base62), `title` + `title_source` ('fallback'\|'generated'\|'user') + `title_revision` FIRST-CLASS columns, rows SELF-TITLE at creation (title = the prompt text, 'fallback' — codex eager-titling law), EPOCH-MS timestamps; a row is written at first prompt SUBMISSION (a `mimo run` that then fails auth STILL writes its row — and exits rc 0, a lying rc), a turnless TUI launch writes NONE; locks live OUTSIDE the db: `~/.local/state/mimocode/locks/<sha1>.lock/` (heartbeat + meta.json, hash-NOT-slug-named). ⛔ STORE HAZARD: FIRST LAUNCH auto-imports Claude Code sessions (the `claude_import` table; `mimo session import-claude` is the manual twin) — the store holds `ses_` rows mimo NEVER RAN; recency keeps the title reader import-safe (imports keep their original epoch), any future cold-restore consumer must filter by provenance. MODELS answer WITHOUT auth (`mimo models`: mimo/mimo-auto, xiaomi/mimo-v2.5 … v2.6-pro-ultraspeed, 1M/1.05M windows, compaction 900K/944K). CREDENTIAL-GATED (owner action: Xiaomi API key via `mimo providers`): real turns (`mimo run` → `Error: Invalid API Key`) — working phrases, resume rederive, submit contract, mid-turn chrome stay honest nulls. LANDED IN CODE same commit: SessionKind::MimoCode + descriptor (measured fields filled; install `Npm("@mimo-ai/cli")`, update `SelfCommand("upgrade")`, menu_hint `i`, glyph `MC_`, brand `#9a3412` AA-darkened from the raw #ff6a00; title Store with reader + membership index + remote title probe shipped SAME COMMIT) + `remote-mimo://`/`mimo-runtime://` schemes + daemon + shell arm matrices (the devin [11.145] lesson paid forward: shell arms land WITH the intake) + managed_cli row + `scan_mimo_sessions` + cli-stores.json row + `suites/mimo.js` (intake posture). Gates: core 737/1 + server 1581/1 + shell 2149/0 — the 1+1 are the KNOWN pre-existing reds ([11.54] install-promote, [11.145] protocol stamp); `an_ssh_stored_open_launches_the_attach…` flaked ONCE under full-suite parallel load and passed on rerun + isolation (environment-sensitive, unowned). OWED by the first authed seat (credential-gated): working needles, resume rederive after the gate, submit contract ([11.141] holds the bar), titling-live proof |
 
@@ -2136,7 +2136,7 @@ the live PTY proof (a real remote zcode-tui row resumed through the
 wrapper) stays with the family's live-proof debt.
 
 
-#### 11.6.11 announce-wire live proof (2026-09-29, sess_92e413de on jojo — the wrapper/rotation half)
+#### 11.6.11 announce-wire live proof (2026-09-29, sess_92e413de on guihost — the wrapper/rotation half)
 
 The owed "real zcode-tui row resumed through the remote wrapper across a rotation" ran on a
 lane-tip 0.6.79 build (bun-compiled from `~/gh/zcode-tui--ux-parity` f3bf6b2, sha
@@ -2167,7 +2167,7 @@ the open blocker, ACK-812707d0ef), and the daemon-PROCESS rotation (the row-leve
 `terminal restart` rotation stands in; the GUI-hosted daemon was not restarted under the
 owner's live desktop).
 
-#### 11.6.11 composer-submit turn leg (2026-09-29, sess_1a2697d6 on jojo — the schema crack)
+#### 11.6.11 composer-submit turn leg (2026-09-29, sess_1a2697d6 on guihost — the schema crack)
 
 The morning sitting's six negative falsifiers were never a key-parse problem. A probe-branch
 keylog build (`probe/composer-submit-pty`, `ZCODE_TUI_KEYLOG` env-gated — commit bdac31e) shows
@@ -2184,7 +2184,7 @@ keylog build (`probe/composer-submit-pty`, `ZCODE_TUI_KEYLOG` env-gated — comm
    chrome (`Build · <model> · <effort>`) may not render at all — the falsifiers' screen-watch for
    "create failed" was watching a possibly-dead channel.
 2. **REGISTRY DRIFT**: the hardcoded `ALLOWED_MODELS` can advertise models the backend registry
-   lacks (jojo: `zai/GLM-5.3` absent → create died `Provider Registry 中不存在 Model: zai/GLM-5.3`
+   lacks (guihost: `zai/GLM-5.3` absent → create died `Provider Registry 中不存在 Model: zai/GLM-5.3`
    once the schema error was fixed).
 
 **FIX** (`probe/composer-submit-pty` 636ea08, bun-compiled sha adb5b1fbe72e2f7d, on the ux-parity
@@ -2208,7 +2208,7 @@ half MOVED 2026-09-29 late: main now carries the fix on zcode-tui
 owner-gated is only the deployed-generation re-point (0.6.14 announce-dead, and 0.6.14 also
 predates the composer fix).
 
-#### 11.6.11 composer-submit PORT TO MAIN (2026-09-29 late, sess_f5366892 on jojo — main carries the fix)
+#### 11.6.11 composer-submit PORT TO MAIN (2026-09-29 late, sess_f5366892 on guihost — main carries the fix)
 
 The owner-GO ux-parity merge (ee9714a, 0.6.23-0.6.38) had landed the dead submit on MAIN with
 THREE poisoned input sites — picker `session/setModel` (~1442), `session/create` (~1857), and
@@ -2227,7 +2227,7 @@ shape — bare create + setModel reconcile with honest-degrade toast, `options.r
 BOTH setModel sites, falsified comment rewritten. Typecheck green; build dist sha
 f669b941f4ce2b7bf536f6282aa486aca4eabe1e2ae0c1668637255cfa0516d6.
 
-**LIVE PROOF on the main build** (jojo pty drive, bin exec'd directly from /tmp — the as-found
+**LIVE PROOF on the main build** (guihost pty drive, bin exec'd directly from /tmp — the as-found
 0.6.14 `~/.local/bin` symlink never touched): fresh birth `hello`+`\r` → create ok
 (`sess_02e01101…`), announce StartupGate → Idle(identity) → **Working ×3** → Idle 5s heartbeats,
 ZERO error markers (no Invalid params, no registry-absent-model string); resume-submit leg
@@ -2235,7 +2235,7 @@ ZERO error markers (no Invalid params, no registry-absent-model string); resume-
 heartbeats — the pending-ask announce arm observed live on a main build for the first time.
 Both legs PASS.
 
-#### 11.6.11 §9 suite RE-PINNED to the 0.6.x chrome (2026-09-29, sess_b54c26bb on jojo — the suite gates the generation again)
+#### 11.6.11 §9 suite RE-PINNED to the 0.6.x chrome (2026-09-29, sess_b54c26bb on guihost — the suite gates the generation again)
 
 The §9 battery suite (`tools/probe-battery/suites/zcode-tui.js`) had been proven 6/6 only against
 a true-main 0.5.9 binary (5b97267, the [11.111] era) — every chrome needle was a 0.5.9-fact while
@@ -28224,7 +28224,7 @@ running window.
 present/total counts the modal renders.
 
 
-UPDATE 2026-10-03 ~12:0x IST (the [11.123] close-out sitting, zcode on jojo, work
+UPDATE 2026-10-03 ~12:0x IST (the [11.123] close-out sitting, zcode on guihost, work
 FROM dev): the LOCAL-column half of this family landed 2026-08-27 with the
 cli-install-ux lane — `local_cli_presence` answers the modal's local row the way a
 launch resolves, replacing the render-path `PATH` probe. The projection gap is the
@@ -28282,7 +28282,7 @@ own the session says exactly that instead of returning an empty screen.
 holds sessions, or a redirected screen read that reports "not my session" rather than an
 empty one.
 
-UPDATE 2026-10-03 ~12:0x IST (same sitting): re-measured on jojo after the day's
+UPDATE 2026-10-03 ~12:0x IST (same sitting): re-measured on guihost after the day's
 rotations — the symlink write is unchanged (every `server-2-10-*.sock` points at
 `server-3-2-116.sock`), but predecessors are now REAPED at rotation (exactly one
 daemon alive after three rolls), so the live-owner window this entry names is the
@@ -30843,7 +30843,7 @@ asserts on app-state truth because the trace pairs do not exist.
 > identity in `input/keystroke` (half 3) and `first_frame` never firing for
 > idle shells + settle as the documented paint marker (half 4).
 >
-> **LIVE-PROVEN (2026-09-26 ~22:50-23:00 IST, jojo GUI rotated onto a build
+> **LIVE-PROVEN (2026-09-26 ~22:50-23:00 IST, guihost GUI rotated onto a build
 > containing this lane):** uxprobe menu 5 iterations on a fresh activated
 > scratch row — 4/5 `accepted:true` with `menu_wait_ms` 81/93/87/249 ms
 > (right-click → menu observed in DOM, the paint-truth marker) and
@@ -30892,7 +30892,7 @@ asserts on app-state truth because the trace pairs do not exist.
 
 > **RE-VERIFIED + CLOSED (2026-09-26, lane/uxspeed/first-frame-idle — the
 > HALF-4 arm):** the 09-14 "first_frame never fires for idle shells (0/2)"
-> reading does NOT reproduce on current main. Live on jojo (direct build
+> reading does NOT reproduce on current main. Live on guihost (direct build
 > e76fa55c ≈ origin/main tip), uxprobe spawn ×6 on bare-prompt scratch rows:
 > 5/6 emitted `first_frame` as the paint marker (open_to_write 447-949 ms,
 > write_to_frame 26-164 ms, blank_frames_before_write 2-6), and their settle
@@ -30962,7 +30962,7 @@ mount_open vs 0.6-1.0 s warm). The seconds live in UI-plane congestion
 daemon. The original queued-gap reading above is superseded by this
 paragraph.
 
-> **SPAWN BASELINE ADDENDUM (2026-09-26 ~23:15-23:35 IST, jojo, direct build
+> **SPAWN BASELINE ADDENDUM (2026-09-26 ~23:15-23:35 IST, guihost, direct build
 > e76fa55c ≈ origin/main tip, LOADED desktop — cli floor 118 ms, two other
 > ux-speed seats probing concurrently — compare like-for-like):** uxprobe
 > spawn ×6 bare-prompt scratch rows: verb→paint (`first_frame`) p50 2719 ms
@@ -31136,7 +31136,7 @@ WebKitWebProcess capture during a uxprobe switch window re-reads the same
 pipeline at ~40% of webproc cycles (22.65% `_copy_to_user` + 7.11%
 `entry_SYSRETQ_unsafe_stack` + 3.13% `read_hpet` + vDSO/syscall/SRSO
 machinery), consistent with the ~25% reading above at a busier mix; data
-`~/.cache/uxspeed-stage/perf-webproc.data` (jojo, fp — user frames stub in
+`~/.cache/uxspeed-stage/perf-webproc.data` (guihost, fp — user frames stub in
 libwebkit, the LBR capture here remains the caller evidence). The boot log
 adds one fact: the CURRENT boot (2026-09-26 17:26) failed the TSC sync
 check AGAIN ("Marking TSC unstable due to check_tsc_sync_source failed") —
@@ -31229,9 +31229,9 @@ span's `witness` map). It has never appeared in a single event:
   `origin/main` AND in the 3.2.113 release tree (bea49768) — `git show
   bea49768:...ui_block.rs | grep -c ui_thread_wait` → 3.
 - The shipped binaries disagree: byte-search (`find(b'ui_thread_wait')`)
-  on BOTH `/home/pi/.local/share/yggterm/direct/versions/3.2.113/yggterm`
+  on BOTH `/home/user/.local/share/yggterm/direct/versions/3.2.113/yggterm`
   (the build the GUI actually runs, app_version 3.2.113) AND the freshest
-  deploy `/home/pi/.local/bin/yggterm` (ygg-ci 20260915-005119) → **absent
+  deploy `/home/user/.local/bin/yggterm` (ygg-ci 20260915-005119) → **absent
   (-1)**, while literals from the SAME file that predate fdf45fbb
   (`yggterm-ui-block-watchdog`, `blocks_per_min`) ARE present, and —
   the impossibility — the events at runtime DO carry `witness` objects
@@ -31289,12 +31289,12 @@ carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 > install was invisible to the staleness report on exactly the host [11.121]
 > is about. Sandbox-tested end-to-end (flip semantics, field preservation,
 > KEEP sentinel, corrupt-state failure, sed read-back) and dry-run-proven
-> against dev (release arm) and jojo (rebuild arm). The staged builds prune to
+> against dev (release arm) and guihost (rebuild arm). The staged builds prune to
 > the newest three, never the active one.
 >
 > **FIRST ROLL LIVE 2026-09-15 10:52** (main edfbbf713fc6): the deploy
 > staged dev's frozen channel through the release arm (3.2.105 ->
-> versions/3.2.113, full flip) and jojo's through the rebuild arm
+> versions/3.2.113, full flip) and guihost's through the rebuild arm
 > (builds/edfbbf713fc6 + active_executable flip, on-disk verified), then
 > fired the restart door unforced — and the live GUI RECEIVED and
 > ANSWERED it (trace: request f387e39c, has_error false). The restart
@@ -31308,7 +31308,7 @@ carries `witness.ui_thread_wait.wchan`, and that wchan matches a live
 > completes the adoption.
 >
 > **DAEMON HALF, 2026-09-15 ~14:40:** the GUI half closed at 12:32; the
-> daemon never followed — jojo's daemon is still the Sep-11 build through
+> daemon never followed — guihost's daemon is still the Sep-11 build through
 > four days of rolls, because nothing ever TRIGGERED its rotation
 > (`prepare_update_restart` at 12:32 only wrote its protected snapshot; the
 > pin flip only gave it eyes). dev's daemon churns only because CI restarts
@@ -31375,7 +31375,7 @@ today it does not, and no restart door fires.
 
 > **ROOT CAUSE 2026-09-15 ~12:40:** the live stack never read the file the
 > [11.121] deploy flips. `/proc/<pid>/environ` of BOTH live planes (GUI
-> 3059999, daemon 11310) carries `YGGTERM_DIRECT_INSTALL_ROOT=/home/pi/.yggterm`
+> 3059999, daemon 11310) carries `YGGTERM_DIRECT_INSTALL_ROOT=/home/user/.yggterm`
 > + `YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1` + `YGGTERM_SUPERVISED=1` — and
 > `direct_install_state_for_executable` checks that env var BEFORE the
 > ancestry walk, so every install-state read inside the pinned processes
@@ -31514,7 +31514,7 @@ reported 0/4 order accuracy at 17:07 while drops demonstrably apply — its
 poll) inside a 5 s budget, so the check can time out purely on poll cost;
 the diagnostic rerun passed 4/4 on first polls. The probe's accuracy check
 needs a cheaper order read (or a longer budget) — instrument fix owed in the
-[11.113] family. Filed 2026-09-15 by zcode sess_1e4cd6d6 on jojo, lane
+[11.113] family. Filed 2026-09-15 by zcode sess_1e4cd6d6 on guihost, lane
 lane/uxspeed/drag-cold-residual (claim ACK-c90c5895cf).
 
 **LIVE-PROVEN 2026-09-15 ~18:05 IST** (main 95b2cb6c, GUI rotated onto
@@ -31535,11 +31535,11 @@ rows. Falsifier satisfied.
 > vocabulary correction 2026-09-15 ~18:50: the status line must be a bare
 > vocabulary word; the proof text lives here in the body.)
 
-## ⛔ [11.126] THE DAEMON LEAKS UNREAPED ssh CHILDREN — 265 `ssh <defunct>` CORPSES ALL PARENTED TO yggterm-headless, THE OLDEST AS OLD AS THE DAEMON (measured 2026-09-15 ~18:10 IST, GUI host, jojo)
+## ⛔ [11.126] THE DAEMON LEAKS UNREAPED ssh CHILDREN — 265 `ssh <defunct>` CORPSES ALL PARENTED TO yggterm-headless, THE OLDEST AS OLD AS THE DAEMON (measured 2026-09-15 ~18:10 IST, GUI host, guihost)
 
 **Status:** OPEN
 
-`ps -eo ppid,stat,comm` on jojo: every zombie on the box (265) has ppid
+`ps -eo ppid,stat,comm` on guihost: every zombie on the box (265) has ppid
 11310 (yggterm-headless, up 3.8 days), comm `ssh`, and the oldest carries
 etimes 326578 s — the daemon's exact lifetime. Bursts of ~2.9/hour match a
 scan/projection cadence, not user traffic. Exactly 4 live `ssh -tt`
@@ -31564,7 +31564,7 @@ daemon retires, its 265 zombies reparent to init and vanish — count after
 rotation is the new baseline, not zero-evidence.
 
 Impact: pid-table pressure and a forensic smell (265 fake ssh processes in
-every `ps`), not CPU — noticed while attributing "why is jojo hot" (it
+every `ps`), not CPU — noticed while attributing "why is guihost hot" (it
 isn't yggterm's heat; the ZCode desktop app's zygote is spinning 0.4-1.1
 cores since 12:09). Filed by zcode sess_1e4cd6d6, lane
 lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
@@ -31586,7 +31586,7 @@ lane/daemon/ssh-reaper; strace evidence to be appended same-entry.
 > spawn-and-reap primitive stays as a dream (dreams/features
 > ACK-02191b62c8): one abandoned Child on a bad day re-opens this.
 
-## ⛔ [11.213] THE REORDER SEAT GATE REFUSED A HEALTHY FRESH LIVE BIRTH — a 21-second-old `local://` row, drawn in the live region with a `live_session_birth` trace, was skipped by BOTH the client's optimistic apply and the daemon's `ReorderLiveSessions` handler as `SKIPPED_NOT_A_LIVE_ROW`, so a set drop anchored on it landed the block but not relative to its target (measured 2026-09-29 ~14:3x UTC, the [11.174]-uxspeed shiftdrag falsifier run 1, iteration 2, live jojo desktop, build 9bf0346113c4)
+## ⛔ [11.213] THE REORDER SEAT GATE REFUSED A HEALTHY FRESH LIVE BIRTH — a 21-second-old `local://` row, drawn in the live region with a `live_session_birth` trace, was skipped by BOTH the client's optimistic apply and the daemon's `ReorderLiveSessions` handler as `SKIPPED_NOT_A_LIVE_ROW`, so a set drop anchored on it landed the block but not relative to its target (measured 2026-09-29 ~14:3x UTC, the [11.174]-uxspeed shiftdrag falsifier run 1, iteration 2, live guihost desktop, build 9bf0346113c4)
 
 **Status:** OPEN
 
@@ -31621,7 +31621,7 @@ build reports zero `live_session_reorder_skipped_rows` with a fresh-batch
 target, and a targeted repro (spawn → drop anchored on the newborn within
 30 s, 10 iterations) never skips.
 
-Filed 2026-09-29 by zcode sess_a7becfa0 on jojo, lane
+Filed 2026-09-29 by zcode sess_a7becfa0 on guihost, lane
 lane/uxspeed/shiftdrag-set-drop (claim ACK-ea58099047).
 
 ## ⛔ [11.134] OPENCODE 2.0.3 SILENTLY FALLS BACK TO THE LATEST SESSION ON AN UNKNOWN `--session` ID — THE BETA-ERA OUTRIGHT REFUSAL IS GONE, SO A CALLER THAT MINTS IDS OUT-OF-BAND CAN BIND THE WRONG SESSION AND NEVER LEARN IT (measured 2026-09-15, the opencode battery lane, 2.0.3 on the muse lab host)
@@ -31749,13 +31749,13 @@ still answer 0.6.6 afterwards — trace shows `install.downgrade_refused` or
 
 > ⚠ ID COLLISION (its host entry [11.130] was VERIFIED AND DELETED 2026-09-26, the ux-speed felt-drop-accuracy lane): [11.133] and [11.134] were already on main from the opencode battery lane (78384f8e, 2026-09-16 ~00:53 IST — the composer marker + the --session fallback, each at its own heading above). These tombstone/server-state entries filed the same ids ~15h later and are unrenamed; per the defect-id law the LATER filing renumbers. The renumber belongs to the trace-fixing campaign (its [11.133]-[11.137] block cross-references internally). Until it lands, the bare id names TWO defects — grep both headings.
 
-## ⛔ [11.133] COLD RESTORE NEVER ASKS THE TOMBSTONE PLANE — EVERY DELETED ROW A STALE server-state.json HOLDS COMES BACK AT EVERY DAEMON/GUI BIRTH, AND ITS RE-ENTRY CLEARS ITS OWN TOMBSTONE (measured live on jojo 2026-09-15 ~22:30-23:25 IST, the trace-fixing campaign; owner symptom: "on restart my row setup is nuked to an old form — I delete rows, launch a ychrome row, restart, and the old set comes back")
+## ⛔ [11.133] COLD RESTORE NEVER ASKS THE TOMBSTONE PLANE — EVERY DELETED ROW A STALE server-state.json HOLDS COMES BACK AT EVERY DAEMON/GUI BIRTH, AND ITS RE-ENTRY CLEARS ITS OWN TOMBSTONE (measured live on guihost 2026-09-15 ~22:30-23:25 IST, the trace-fixing campaign; owner symptom: "on restart my row setup is nuked to an old form — I delete rows, launch a ychrome row, restart, and the old set comes back")
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-09-15 ~23:45.
 
-**Measured, all from one evening on jojo (ytrace.jsonl + the state files):**
+**Measured, all from one evening on guihost (ytrace.jsonl + the state files):**
 
 - The owner deleted rows in bursts (22:29:49, 22:44-22:47, 23:15) served by the
   canonical daemon 3491650 (`yggterm-headless server daemon`, owner of
@@ -31797,7 +31797,7 @@ stale files; it cannot make NEW rows survive a stale file that predates them.
 
 > ⚠ ID COLLISION — see the banner on the [11.133] tombstone entry above: this id was already on main from the opencode battery lane (the --session silent fallback).
 
-## ⛔ [11.134] server-state.json HAS SEVERAL WRITERS WITH STALE VIEWS — LAST WRITER WINS, SO NEW ROWS MADE AFTER A WRITER'S VIEW FROZE ARE LOST AT THE NEXT RESTORE, AND ONE RE-ENTRY VECTOR THAT CLEARS TOMBSTONES IS STILL UNNAMED (measured live on jojo 2026-09-15, same sitting as [11.133]; this is the writer-law half of the owner's "row setup is hard locked to an old form")
+## ⛔ [11.134] server-state.json HAS SEVERAL WRITERS WITH STALE VIEWS — LAST WRITER WINS, SO NEW ROWS MADE AFTER A WRITER'S VIEW FROZE ARE LOST AT THE NEXT RESTORE, AND ONE RE-ENTRY VECTOR THAT CLEARS TOMBSTONES IS STILL UNNAMED (measured live on guihost 2026-09-15, same sitting as [11.133]; this is the writer-law half of the owner's "row setup is hard locked to an old form")
 
 **Status:** OPEN
 
@@ -31846,7 +31846,7 @@ and fixed as [11.135] (the owned-runtime recovery sweep + the preserved-owner
 adoption walk birthing closed rows back). The writer-law half above stays
 open.
 
-## ⛔ [11.135] THE OWNED-RUNTIME RECOVERY SWEEP AND THE PRESERVED-OWNER ADOPTION WALK RE-BIRTH ROWS THE USER DELETED WITHOUT ASKING THE TOMBSTONE PLANE — THE GHOST FACTORY (caught live on jojo 2026-09-16 15:33+15:44, the trace-fixing campaign; owner confirm after the [11.133] deploy: "nuking stopped, ghost dead rows coming alive")
+## ⛔ [11.135] THE OWNED-RUNTIME RECOVERY SWEEP AND THE PRESERVED-OWNER ADOPTION WALK RE-BIRTH ROWS THE USER DELETED WITHOUT ASKING THE TOMBSTONE PLANE — THE GHOST FACTORY (caught live on guihost 2026-09-16 15:33+15:44, the trace-fixing campaign; owner confirm after the [11.133] deploy: "nuking stopped, ghost dead rows coming alive")
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
@@ -31895,13 +31895,13 @@ the spawn loop, traced as `spawn_vetoed_closed_rows`), lock
 `tombstoned_opencode_mirror_spawns_blocks_the_closed_tab_only` +
 `apply_opencode_tab_mirror_asks_the_tombstone_plane_before_spawning`.
 
-## ⛔ [11.136] THE HOT-RESTART GATE DEFERS ON ANY WORKING AGENT ROW, AND THIS FLEET'S AGENT ROWS ARE ALWAYS WORKING — DAEMON-SIDE FIXES SIT DEPLOYED-BUT-UNEXECUTED FOR HOURS (measured on jojo 2026-09-16 16:2x-17:0x, the trace-fixing campaign; the reason the [11.133]/[11.135] fixes were "deployed" while the ghost rows kept winning)
+## ⛔ [11.136] THE HOT-RESTART GATE DEFERS ON ANY WORKING AGENT ROW, AND THIS FLEET'S AGENT ROWS ARE ALWAYS WORKING — DAEMON-SIDE FIXES SIT DEPLOYED-BUT-UNEXECUTED FOR HOURS (measured on guihost 2026-09-16 16:2x-17:0x, the trace-fixing campaign; the reason the [11.133]/[11.135] fixes were "deployed" while the ghost rows kept winning)
 
 **Status:** AWAITING A DECISION
 
 Filed 2026-09-16 ~17:15.
 
-**Measured:** jojo's daemon (pid 4044535, born 15:26 on build b0aafc158b88)
+**Measured:** guihost's daemon (pid 4044535, born 15:26 on build b0aafc158b88)
 survived FOUR deploy rotations (16:21, 16:35, 16:45 GUI relaunches, each
 firing prepare_update_restart + hot_restart ~780 ms) and never handed over.
 `server status` names the blocker:
@@ -31935,13 +31935,13 @@ old → owner still sees the bug → report). This strengthens the starvation
 bound: politeness toward fleet seats must not starve the fleet own fixes;
 the fix shapes above stand, with (b) as the likely answer.
 
-## ⛔ [11.137] THE HOT-RESTART GATE DEFERS ON REMOTE-BRIDGED AGENT ROWS WHOSE TURNS LIVE ON THE REMOTE HOST AND SURVIVE EVERY LOCAL SWAP — AND `working` IS EXEMPT FROM THE 30-MINUTE FORCED-SWAP DEADLINE, SO ONE ENDLESS REMOTE TURN STOPS EVERY DAEMON-SIDE FIX FLEET-WIDE (measured on jojo 2026-09-16 15:26→19:00, the trace-fixing campaign; the reason the owner kept seeing ghost rows "fixed" bugs all afternoon)
+## ⛔ [11.137] THE HOT-RESTART GATE DEFERS ON REMOTE-BRIDGED AGENT ROWS WHOSE TURNS LIVE ON THE REMOTE HOST AND SURVIVE EVERY LOCAL SWAP — AND `working` IS EXEMPT FROM THE 30-MINUTE FORCED-SWAP DEADLINE, SO ONE ENDLESS REMOTE TURN STOPS EVERY DAEMON-SIDE FIX FLEET-WIDE (measured on guihost 2026-09-16 15:26→19:00, the trace-fixing campaign; the reason the owner kept seeing ghost rows "fixed" bugs all afternoon)
 
 **Status:** OPEN
 
 Filed 2026-09-16 ~19:05.
 
-**Measured:** jojo's daemon (born 15:26 on b0aafc158b88) did not rotate past
+**Measured:** guihost's daemon (born 15:26 on b0aafc158b88) did not rotate past
 four+ deploy rotations (16:21, 16:35, 16:45, 18:41 GUI relaunches each firing
 prepare_update_restart + hot_restart). `server status` names the single
 blocker: `remote-session://dev/f9850…` kind `working`. `server gate-screen`
@@ -32164,17 +32164,17 @@ FIXED IN CODE 2026-09-20 (the muse lab host seat, work FROM dev): (1) THE REMOTE
 
 LIVE-MEASURED 2026-09-20 on the deployed build (the muse lab host, probe rows against dev): (a) THE START-BORN WINDOW IS NOW OWNED AND HONEST — a row opened while the peer binary is held aside gets the [11.153] peer-missing memo stamp within ~12s and the [11.158] start-born compound CLOSE by ~24s (departure reason `peer-session-gone`, twice measured) — the persistent raw-paint loop and the lying running-idle plane of the owner report no longer persist anywhere; the raw frame, if painted at all, lives seconds. (b) THE GATE/LEARN/HEAL PLANES ARE DEPLOYED for the surviving-row surfaces (fresh peer-answered negative before any spawn; the learn arm for bound-row frames; the heal clear) but their END-TO-END DRIVE IS STILL OWED — the instrument gap: binding a session needs a submitted turn, and the probe composer submit was blocked by the byte-tracker-vs-screen divergence (the [11.144] family: the atomic submit refused with `holds 0 bytes` while the screen held the line). The next seat: bind via a real turn (any submit instrument that clears the tracker divergence), then hold the generation binary aside (the provisioner self-heals the hold within one hop — time-box ~90s), kill the peer TUI vendor binary (NOT terminal restart — its teardown makes the peer answer `terminal session not found` and the [11.153] memo shadows the learn arm), and connect-tick until the stamp lands. ⚠ the [11.153] stamp TEXT (`peer session gone`) mis-names the binary-missing cause for the memo arm — the evidence half carries the truth; filing the re-naming as a residual.
 
-DRIVE-ATTEMPTED 2026-09-25 (the muse lab host seat, zcode on jojo, work FROM dev; board ACK-b61a4f19b9) — the recipe's first half EXECUTED, the end-to-end stamp did NOT land, and the drive MEASURED WHY: (1) THE BIND NOW WORKS — a start-born probe row (app terminal new --machine-key dev --kind codex, scratch cwd), trust gate cleared interactively, then the [11.144]-era byte-tracker divergence REPRODUCED on the one-shot: `text+\r` placed the line on screen but `--submit-iff-line-equals` answered `holds 0 bytes, expected 48`, and app-control send answered `pending_draft_refusal` with `held_len:0` — the tracker loses the count when the `\r` rides in the same write; RECOVERY MEASURED: a 50-backspace run clears the composer (codex ignores raw Ctrl+U), then write-without-CR + `--submit-iff-line-equals` submits TRUE and the session binds (dev rollout on disk, row storage_path names it, peer store titles it). (2) THE HOLD PERSISTED — holding the GENERATION dir aside was NOT self-healed by the provisioner in 25+ minutes (the "~90s window" is conditional on a launch attempt existing; the fleet sweep did not reinstall a held generation); restore by hand at drive end, host verified healthy. (3) NO AUTOMATIC ENSURE EXISTS for a bound keep-alive row whose TUI died: ~25 min of `daemon_declare_absent` batches, zero ensure attempts — the hot warmer is GUI-FOCUS-GATED (unfocused window returns empty; `app force-foreground on` did not help because the row reads daemon-owned/already-attached), `server connect` only focuses a live row, writes succeed into the dead bridge so the write-failure relaunch never fires, and the reuse-check funnel runs only inside ensure-class verbs. (4) THE WINDOW IS DEFEATED BY THE IDENTITY FAMILY: minutes after the TUI kill the recency arm traced `agent_identity_reset_to_birth {because: dead_id}` — the row's bound rollout id was reset to the BIRTH id — and the next client-driven ensure (activation toggling) ran the [11.155] peer-close gate with the birth id: confident store NO → `remote_saved_session_peer_close_learned` ×2 → the row CLOSED as `peer-session-gone`. The binary-missing learn arm never got a tick: the store-miss-on-birth-id close fires first. The conversation itself sat in the peer store the whole time (rollout + eager title), so the closure story is wrong in both halves (the session is NOT gone; the cause was NOT the store). (5) THE RESTART WARNING EXTENDS TO THE PLAIN FORM: `terminal restart` (no --force-remote) teardown ran `terminate-codex` on the peer (explicit-close + tombstone on dev) and left a degraded row pair — a Shell row adopting the session-path key (`local://remote-session://…`, "New jojo Terminal") beside the codex row at holder:gone — the [11.156] re-birth class. NEXT SEAT UPDATE 2026-09-25 (the [11.166] close seat): blocker (a) is GONE — the identity strip is FIXED and LIVE-PROVEN (lane/integration/11166-birthid 7ed3aec6 → main 4c5cedc9, deployed fleet; entry [11.166] deleted per the verified-fix law): the reset now asks the peer store the same structured question the [11.155] gate trusts and REFUSES a held id — measured live on jojo: bound codex row, TUI killed with a healthy peer, exhaustion tick traced `agent_identity_reset_refused {reason: store_holds_id, held_id: <rollout id>}`, activation toggle produced ZERO peer-close events, row alive with its conversation; the pre-fix chain (reset `dead_id` then peer-session-gone ×2) is on record in the same morning trace for row 2cde78a5/from 01a0d579. The binary-missing learn arms window now EXISTS. Remaining [11.160] live-proof blockers are the drives OWN findings (2) no unconditional generation self-heal and (3) no focus-independent ensure for a dead keep-alive row; ensure-trigger advice stands: `app force-foreground on` + activation toggle AFTER unbinding the daemon-owned read, drive on a row the focused GUI can warm.
+DRIVE-ATTEMPTED 2026-09-25 (the muse lab host seat, zcode on guihost, work FROM dev; board ACK-b61a4f19b9) — the recipe's first half EXECUTED, the end-to-end stamp did NOT land, and the drive MEASURED WHY: (1) THE BIND NOW WORKS — a start-born probe row (app terminal new --machine-key dev --kind codex, scratch cwd), trust gate cleared interactively, then the [11.144]-era byte-tracker divergence REPRODUCED on the one-shot: `text+\r` placed the line on screen but `--submit-iff-line-equals` answered `holds 0 bytes, expected 48`, and app-control send answered `pending_draft_refusal` with `held_len:0` — the tracker loses the count when the `\r` rides in the same write; RECOVERY MEASURED: a 50-backspace run clears the composer (codex ignores raw Ctrl+U), then write-without-CR + `--submit-iff-line-equals` submits TRUE and the session binds (dev rollout on disk, row storage_path names it, peer store titles it). (2) THE HOLD PERSISTED — holding the GENERATION dir aside was NOT self-healed by the provisioner in 25+ minutes (the "~90s window" is conditional on a launch attempt existing; the fleet sweep did not reinstall a held generation); restore by hand at drive end, host verified healthy. (3) NO AUTOMATIC ENSURE EXISTS for a bound keep-alive row whose TUI died: ~25 min of `daemon_declare_absent` batches, zero ensure attempts — the hot warmer is GUI-FOCUS-GATED (unfocused window returns empty; `app force-foreground on` did not help because the row reads daemon-owned/already-attached), `server connect` only focuses a live row, writes succeed into the dead bridge so the write-failure relaunch never fires, and the reuse-check funnel runs only inside ensure-class verbs. (4) THE WINDOW IS DEFEATED BY THE IDENTITY FAMILY: minutes after the TUI kill the recency arm traced `agent_identity_reset_to_birth {because: dead_id}` — the row's bound rollout id was reset to the BIRTH id — and the next client-driven ensure (activation toggling) ran the [11.155] peer-close gate with the birth id: confident store NO → `remote_saved_session_peer_close_learned` ×2 → the row CLOSED as `peer-session-gone`. The binary-missing learn arm never got a tick: the store-miss-on-birth-id close fires first. The conversation itself sat in the peer store the whole time (rollout + eager title), so the closure story is wrong in both halves (the session is NOT gone; the cause was NOT the store). (5) THE RESTART WARNING EXTENDS TO THE PLAIN FORM: `terminal restart` (no --force-remote) teardown ran `terminate-codex` on the peer (explicit-close + tombstone on dev) and left a degraded row pair — a Shell row adopting the session-path key (`local://remote-session://…`, "New guihost Terminal") beside the codex row at holder:gone — the [11.156] re-birth class. NEXT SEAT UPDATE 2026-09-25 (the [11.166] close seat): blocker (a) is GONE — the identity strip is FIXED and LIVE-PROVEN (lane/integration/11166-birthid 7ed3aec6 → main 4c5cedc9, deployed fleet; entry [11.166] deleted per the verified-fix law): the reset now asks the peer store the same structured question the [11.155] gate trusts and REFUSES a held id — measured live on guihost: bound codex row, TUI killed with a healthy peer, exhaustion tick traced `agent_identity_reset_refused {reason: store_holds_id, held_id: <rollout id>}`, activation toggle produced ZERO peer-close events, row alive with its conversation; the pre-fix chain (reset `dead_id` then peer-session-gone ×2) is on record in the same morning trace for row 2cde78a5/from 01a0d579. The binary-missing learn arms window now EXISTS. Remaining [11.160] live-proof blockers are the drives OWN findings (2) no unconditional generation self-heal and (3) no focus-independent ensure for a dead keep-alive row; ensure-trigger advice stands: `app force-foreground on` + activation toggle AFTER unbinding the daemon-owned read, drive on a row the focused GUI can warm.
 
 
-DRIVE-2 2026-09-25 (the muse lab host seat, zcode on jojo, work FROM dev; board claim ACK-7b75d83db1, outcome ACK-89ebc57f3 — settled build bc0a2c052c0e with the [11.166] fix deployed): the end-to-end drive RAN on a bound keep-alive codex row and SPLIT THE FALSIFIER. THE [11.166] HALF IS MET: probe row bound by a real turn (DRIVE-1160-BIND verbatim, dev rollout 01a0d5e2, eager title), TUI killed by exact pid, generation dir held aside — `agent_identity_reset_refused {reason: store_holds_id}` fired LIVE, ZERO `agent_identity_reset_to_birth`, ZERO peer-close/peer-session-gone events across the whole drive (~10 ensure attempts); every ensure resumed with the BOUND id; the row survived with identity + conversation. THE STAMP LEG IS MEASURED UNREACHABLE on the keep-alive path — three structural facts: (a) THE ENSURE HOP IS A PROVISIONER: the funnel's first activation kicks `server remote ensure-managed-cli codex` on the peer, which INSTALLS the missing binary back within one hop (measured: fresh 0.156.1 recreated, `action:"installed"`); the measured-absence negative the remote gate refuses on exists only when the install itself fails, so the 2h positive TTL never decays into a refusal window. (b) THE RESUME WRAPPER'S SPAWN FAILURE IS SILENT: `resume-codex --require-existing` with the binary missing paints the rederived transcript and exits rc=0 with NO contract line (measured by hand); the peer resume path skips the local missing-binary gate the start path prints — the [11.160]/[11.162] classifier has no frame to learn, and `remote_launch_refusal_frame_learned` can never fire from this path. (c) THE KEEP-ALIVE PLANE STAYS BLIND: with the binary restored, NO respawn happens (keep-alive runtime protection blocks restart; the dead bridge wrapper stays registered), the viewport keeps the dead TUI's last paint (the raw `Killed` line sitting at the composer), the plane claims `idle · Kept alive`, and writes succeed into the dead bridge — drive-1's finding (3) stands unchanged. The remote gate refusal itself is code-wired (`launch_refused_cli_binary_missing {scope:"remote"}` → restamp → bail) but never fired — no fresh negative ever existed to feed it. FIX DIRECTIONS (owner call): (a) the peer resume wrapper must run the local missing-binary gate BEFORE spawn and print the contract line into the row PTY — one frame arms the entire learn-arm stamp; (b) writes into a dead bridge should fail loudly so the write-failure relaunch can fire; (c) whether a keep-alive row with a dead runtime + a resumable store record should auto-respawn belongs to the [11.147] keep-alive family. Drive gotchas for the next seat: the app-send draft guard false-positives on the codex trust-gate screen (`pending_draft_refusal held_len:0` on the `› 1. Trust and continue` picker row; empty-write carve-out does not clear it — use the headless `server terminal write` path, whose `--refuse-if-draft` is opt-in); `bash -lc codex` is NOT a health probe on this host (the login-shell PATH never carries the managed bin dir — probe `~/.yggterm/ynpm/bin/<cli> --version`); renaming a generation dir aside does NOT defeat the managed resolver (it globs `generations/<pkg>/*` and finds the renamed dir) — the provisioner reinstall is what ends the hold, not the rename. Cleanup: probe + partner rows despawned verified:true, held dir removed, `~/.yggterm/ynpm/bin/codex --version` = 0.156.1, dev healthy.
+DRIVE-2 2026-09-25 (the muse lab host seat, zcode on guihost, work FROM dev; board claim ACK-7b75d83db1, outcome ACK-89ebc57f3 — settled build bc0a2c052c0e with the [11.166] fix deployed): the end-to-end drive RAN on a bound keep-alive codex row and SPLIT THE FALSIFIER. THE [11.166] HALF IS MET: probe row bound by a real turn (DRIVE-1160-BIND verbatim, dev rollout 01a0d5e2, eager title), TUI killed by exact pid, generation dir held aside — `agent_identity_reset_refused {reason: store_holds_id}` fired LIVE, ZERO `agent_identity_reset_to_birth`, ZERO peer-close/peer-session-gone events across the whole drive (~10 ensure attempts); every ensure resumed with the BOUND id; the row survived with identity + conversation. THE STAMP LEG IS MEASURED UNREACHABLE on the keep-alive path — three structural facts: (a) THE ENSURE HOP IS A PROVISIONER: the funnel's first activation kicks `server remote ensure-managed-cli codex` on the peer, which INSTALLS the missing binary back within one hop (measured: fresh 0.156.1 recreated, `action:"installed"`); the measured-absence negative the remote gate refuses on exists only when the install itself fails, so the 2h positive TTL never decays into a refusal window. (b) THE RESUME WRAPPER'S SPAWN FAILURE IS SILENT: `resume-codex --require-existing` with the binary missing paints the rederived transcript and exits rc=0 with NO contract line (measured by hand); the peer resume path skips the local missing-binary gate the start path prints — the [11.160]/[11.162] classifier has no frame to learn, and `remote_launch_refusal_frame_learned` can never fire from this path. (c) THE KEEP-ALIVE PLANE STAYS BLIND: with the binary restored, NO respawn happens (keep-alive runtime protection blocks restart; the dead bridge wrapper stays registered), the viewport keeps the dead TUI's last paint (the raw `Killed` line sitting at the composer), the plane claims `idle · Kept alive`, and writes succeed into the dead bridge — drive-1's finding (3) stands unchanged. The remote gate refusal itself is code-wired (`launch_refused_cli_binary_missing {scope:"remote"}` → restamp → bail) but never fired — no fresh negative ever existed to feed it. FIX DIRECTIONS (owner call): (a) the peer resume wrapper must run the local missing-binary gate BEFORE spawn and print the contract line into the row PTY — one frame arms the entire learn-arm stamp; (b) writes into a dead bridge should fail loudly so the write-failure relaunch can fire; (c) whether a keep-alive row with a dead runtime + a resumable store record should auto-respawn belongs to the [11.147] keep-alive family. Drive gotchas for the next seat: the app-send draft guard false-positives on the codex trust-gate screen (`pending_draft_refusal held_len:0` on the `› 1. Trust and continue` picker row; empty-write carve-out does not clear it — use the headless `server terminal write` path, whose `--refuse-if-draft` is opt-in); `bash -lc codex` is NOT a health probe on this host (the login-shell PATH never carries the managed bin dir — probe `~/.yggterm/ynpm/bin/<cli> --version`); renaming a generation dir aside does NOT defeat the managed resolver (it globs `generations/<pkg>/*` and finds the renamed dir) — the provisioner reinstall is what ends the hold, not the rename. Cleanup: probe + partner rows despawned verified:true, held dir removed, `~/.yggterm/ynpm/bin/codex --version` = 0.156.1, dev healthy.
 
 ## [11.168] TERMINAL IDENTITY IS HOST-GLOBAL AND LAST-WRITER-WINS: ANY CLIENT'S THEME SYNC FLIPS EVERY ROW'S COLOR WORLD MID-LIFE — DARK-ANSWERED CLIS ON A LIGHT RENDERER DRAW ILLEGIBLE GREY (the owner's "ALL light themes" report, measured 2026-09-25)
 
 **Status:** OPEN
 
 Filed 2026-09-25 ~18:00 on `lane/trace/osc11-light-theme` (the muse lab host
-seat, zcode on jojo, work FROM dev; board plan ACK-a3a9028b9b, correction
+seat, zcode on guihost, work FROM dev; board plan ACK-a3a9028b9b, correction
 ACK-82bdd60cf2). The owner: every LIGHT terminal theme renders the CLIs' grey
 meta text ("Thought for …", ASCII diagrams) near-illegible; dark themes are
 fine.
@@ -32229,7 +32229,7 @@ profile like the theme-change path; (c) frontend `onColor` answer as backstop
 for non-daemon-rendered paths; (d) OSC 4 slots 16-255 are never answered.
 
 LEG (d) CLOSED IN CODE 2026-10-03 (lane/trace/11168-osc256 3a7b08cc, zcode on
-jojo work FROM dev): the parser's `slot > 15` refusal meant a 16-255 query
+guihost work FROM dev): the parser's `slot > 15` refusal meant a 16-255 query
 PASSED THROUGH to the webview — normal-buffer rows got NO answer at all (the
 mount script's gated fallback answers only on alternate buffer / hot frame),
 and alternate-buffer answers came from the VIEWING CLIENT's computed palette
@@ -32439,10 +32439,10 @@ FOLLOW-UP 2026-09-28 EVENING (lane/integration/11192-vouch-contention, row 11.19
 SYMPTOM 2 — THE SQUISHED VIEWPORT (OPEN, the mechanism measured): the viewport squish is a LOCAL-FIT vs REMOTE-PTY GEOMETRY FIGHT, traced 15:24:56-15:25:10 on 41e5733d: `terminal_js/xterm_fit` proposes 170x81 → `terminal_startup_resize_repair` forces 170x63 (the remote PTY truth) → bootstrap m2→m3 → fit 81 again → repair 63 again. The renderer ends with fit-81 CELL METRICS on a 63-row grid — the compressed top-left paint in the owner screenshot. THE INVARIANT VIOLATED: `fitTerminalToHost` (terminal_scripts.rs:2919) resizes the LOCAL xterm from `proposedTerminalFitDimensions()` with NO reference to the remote PTY geometry, and the local/remote divergence is never reconciled (the family has history: the 2026-08-10 "squished viewport" comment at :2900 — same family, different trigger). FIX SHAPE: the fit must propose-and-FORWARD, applying locally only on a confirmed remote resize (the resize-forward machinery exists Rust-side: `remote_pty_resize_forwarded ok` — needs a JS↔Rust handshake on the forward result, or the PTY dims carried onto the host element as attributes to clamp the proposal). A GUI lane of its own with the xterm-harness — not rushed into the embedded script. Interim: nudge the window size (forces the reconcile cycle) or restart the row.
 
 UPDATE 2026-10-03 ~18:3x IST (queue-completion seat, zcode sess_813045b5 on
-jojo, work FROM dev): SYMPTOM 1's compose family carries independent
+guihost, work FROM dev): SYMPTOM 1's compose family carries independent
 evidence as of today — the [11.218] full-window hunt ran THIS entry's
 descended defmiss_fresh_start_mint scenario 12/12 PASS through a complete
-31-min young window on jojo's healthy rotated daemon (docs 1b76a310), and
+31-min young window on guihost's healthy rotated daemon (docs 1b76a310), and
 store_absent_no_candidate_refuses PASSED on dev 17:58; the dev-side E2E
 re-run of defmiss itself is deferred to after [11.225] (the dev spawn-plane
 outage fails every start-path spawn, not the compose). SYMPTOM 2 (the
@@ -32455,7 +32455,7 @@ re-verification RAN GREEN on the healed stack (post-[11.225]-rotation
 daemon 3419462, build b8ec32c7): defmiss_fresh_start_mint,
 store_absent_no_candidate_refuses, and the full probe — see the close
 commits for the tally. SYMPTOM 1 is now independently verified from both
-sides (the 12/12 full-window hunt on jojo + the E2E pass on dev). SYMPTOM
+sides (the 12/12 full-window hunt on guihost + the E2E pass on dev). SYMPTOM
 2 (the squished viewport local-fit vs remote-PTY geometry fight) remains
 this entry's open lane with its fix shape unchanged.
 
@@ -32463,16 +32463,16 @@ this entry's open lane with its fix shape unchanged.
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
-LANDED 2026-09-28 NIGHT (zcode sess_30402cb0 on jojo, work FROM dev, lane/integration/11187-two-sided-reconciliation, merged origin/main 87787514be86, fleet-deployed by the watcher). THE WRITE-INDEPENDENT EXCHANGE + THE LOOP-LIVENESS WATCHDOG, three legs in one lane:
+LANDED 2026-09-28 NIGHT (zcode sess_30402cb0 on guihost, work FROM dev, lane/integration/11187-two-sided-reconciliation, merged origin/main 87787514be86, fleet-deployed by the watcher). THE WRITE-INDEPENDENT EXCHANGE + THE LOOP-LIVENESS WATCHDOG, three legs in one lane:
 - **LEG A — the quiet tick (terminal_scripts.rs):** the client half re-runs the SAME pairing every 2.5 s on a QUIET surface — zero PTY writes, so a frozen stream can no longer starve its own witness. The tick's daemon-hash request backs off to 30 s under a standing mismatch (consult correction Q5: a static cadence is an RPC treadmill), and an AGREE heartbeat per 5 min gives the probe a client word for "alive and caught up" (the old build's measured speech gap on the falsifier row: 147 s — the tick closes exactly that).
 - **LEG B — the repair (viewport.rs FrameHash arm):** a standing at-bottom mismatch (consecutive >= 2) from a quiet surface NUDGES the read pump (`next_read_deadline = now`) and arms the EXISTING screen reconcile with `screen_reconcile_defer_chain_began_ms = 0` — a zero chain never ages, so `SCREEN_RECONCILE_DEFER_DEADLINE_MS` can never force the arm's write over live streaming output (consult correction Q1; the arm is traced `frame_hash_mismatch_reconcile_armed`).
 - **LEG C — the watchdog (state.rs + viewport.rs):** a non-reactive per-loop heartbeat (⛔ never in ShellState — a write per iteration re-renders every iteration) + a spawn-once watchdog at 5 s ticks. A heartbeat stale past 60 s (consult correction Q3: clears the 16 s paused poll and the 30 s read-overdue belt) REMOUNTS by EPOCH- IN-IDENTITY: the bump feeds the bootstrap identity (`…:wr<epoch>`), the next render re-schedules, a live successor's acquire no-ops it, and the reveal-raise now REFUSES a heartbeat-stale host (raising on stale Ready truth was the freeze itself). Budget-bounded 3/10 min, then an honest degraded stamp `loop_stale_watchdog_exhausted`. A drop witness (`terminal_mount_task_dropped`) traces task death through the former /dev/null silence and arms the remount on exactly the bridge-death breaks (consult Q4: instant recovery on the deaths we can name).
-- **THE PROBE (tools/e2e/usability_probe.py):** the two-sided `stream_liveness` invariant — the client half's own words from the LIVE ytrace (`ytrace.jsonl` since the 22:34 direct-build plane; the generation files are the dead past — measuring one made the first falsifier run pass VACUOUSLY, which the E2E probe law exists to catch) — plus `--freeze-window-secs` RED-BASELINE mode. LIVE-PROVEN BOTH WAYS on the jojo plane (row 7c2a3aec, the row that froze at 20:43): fresh word → SIGSTOP the GUI → every word stale over 90 s while the daemon stayed answerable (the freeze IS visible) → SIGCONT → a fresh word returns, mismatch=false. Connection probe still 5/5 on the live dev stack.
-- **PROOF OWED (the honest remainder):** the code is in main and deployed to the fleet's daemons/CLI; the JOJO GUI picks it up on its next restart (owner-gated — the direct build predates the lane). The end-to-end HEAL — a freeze that the tick/repair/watchdog reverses without the close+reopen workaround — is owed to the next natural freeze, which the panic witness and the watchdog traces will now NAME. The two pre-existing suite reds (`the_idle_mount_settles_honest…`, `the_paint_coverage_arithmetic…`) fail on CLEAN main too (verified by stash) — not this lane's.
+- **THE PROBE (tools/e2e/usability_probe.py):** the two-sided `stream_liveness` invariant — the client half's own words from the LIVE ytrace (`ytrace.jsonl` since the 22:34 direct-build plane; the generation files are the dead past — measuring one made the first falsifier run pass VACUOUSLY, which the E2E probe law exists to catch) — plus `--freeze-window-secs` RED-BASELINE mode. LIVE-PROVEN BOTH WAYS on the guihost plane (row 7c2a3aec, the row that froze at 20:43): fresh word → SIGSTOP the GUI → every word stale over 90 s while the daemon stayed answerable (the freeze IS visible) → SIGCONT → a fresh word returns, mismatch=false. Connection probe still 5/5 on the live dev stack.
+- **PROOF OWED (the honest remainder):** the code is in main and deployed to the fleet's daemons/CLI; the guihost GUI picks it up on its next restart (owner-gated — the direct build predates the lane). The end-to-end HEAL — a freeze that the tick/repair/watchdog reverses without the close+reopen workaround — is owed to the next natural freeze, which the panic witness and the watchdog traces will now NAME. The two pre-existing suite reds (`the_idle_mount_settles_honest…`, `the_paint_coverage_arithmetic…`) fail on CLEAN main too (verified by stash) — not this lane's.
 
-Filed with the full measured chain (zcode sess_745c8f5c on jojo, work FROM dev, lane/integration/11187-agy-connection-e2e); the E2E probe must learn to DETECT this class before any "fixed" declaration. Landed same-sitting companions: [11.182]/[11.183]/[11.184] all FIXED IN CODE and E2E-proven by `tools/e2e/connection_probe.py` (5/5 on the live fixed stack, 2026-09-27 ~22:2x IST).
+Filed with the full measured chain (zcode sess_745c8f5c on guihost, work FROM dev, lane/integration/11187-agy-connection-e2e); the E2E probe must learn to DETECT this class before any "fixed" declaration. Landed same-sitting companions: [11.182]/[11.183]/[11.184] all FIXED IN CODE and E2E-proven by `tools/e2e/connection_probe.py` (5/5 on the live fixed stack, 2026-09-27 ~22:2x IST).
 
-The chain, from jojo's ytrace for `remote-agy://dev/ce241f2e…` (all timestamps IST):
+The chain, from guihost's ytrace for `remote-agy://dev/ce241f2e…` (all timestamps IST):
 - 19:35:10 birth is HEALTHY: fresh `start-agy` on dev, spawn 170x63, mount m1, first paint, stream samples + frame-hash probes flowing (spinner frames of the agy sign-in TUI arriving).
 - 19:35:12-15: three consecutive `frame_hash_probe` MISMATCHES (client renders the alt-screen TUI faster than the daemon-side snapshot hash turns) — `backed_off: false`, the loop is alive.
 - 19:35:15.110: the LAST probe event of any kind for the row. The stream goes SILENT. Not backoff — `backed_off` was false; the pump simply never fires again.
@@ -32486,9 +32486,9 @@ CONFIRMED LIVE AGAIN 2026-09-28 ~11:25-11:32 IST on the OWNER'S ACTIVE ROW (remo
 FIX MAP (scouted 2026-09-28, the 11.188 lane): the recovery lever is a RETAIN-HOST LIVENESS GATE at re-bootstrap — the [11.178] phantom-eval pattern applied to the `daemon_retained_replay` eval (viewport.rs, the replay task: `document::eval(&terminal_replay_retained_data_script_for_session(...))` must be joined and its result checked; null/timeout = the phantom-complete class = the host JS is dead) followed by a `shell.terminal_mount_epochs[path] += 1` bump so the keyed element `{path}:{epoch}` recreates TerminalCanvas fresh (state.rs:18460; the fold at 19776 manages entries — verify the bump survives the next snapshot fold). The decision site is `terminal_session_should_bootstrap_host` (viewport.rs:2091) + the skip branch at 5429. ⚠ Mount-storm risk: the replay has retry budgets — bound the bump by them. WORKAROUND (until the fix lands): a frozen row recovers by CLOSING and RE-OPENING the row — the [11.183] vouch ladder reconnects the conversation on the fresh mount (proven 2026-09-27 on a private health-data row); the unsent draft at the dead CLI's composer is lost, so copy it first. Toggling the row's view mode is worth a try first (cheaper) but re-mounts only if the view path does not reuse the retained host.
 
 UPDATE 2026-10-03 ~10:0x IST (queue-completion seat, zcode sess_654d9543 on
-jojo, work FROM dev): FIVE DAYS DEPLOYED, ZERO NATURAL FREEZES — the watchdog
+guihost, work FROM dev): FIVE DAYS DEPLOYED, ZERO NATURAL FREEZES — the watchdog
 never fired (no loop-stale remounts, no `loop_stale_watchdog_exhausted` stamps,
-no panic-witness freeze names in the jojo trace plane since the landing), and
+no panic-witness freeze names in the guihost trace plane since the landing), and
 the one standing mismatch examined (`remote-cc://dev/bb64eba2…`, consecutive 44,
 backed off) is EXONERATED as the quiet-divergent class, not the freeze: BOTH
 hashes pinned together (client and daemon constant over the window — the
@@ -32503,19 +32503,19 @@ Falsifier/design direction: a daemon-vs-client screen reconciliation that does N
 
 Context: this sitting's probe (`tools/e2e/connection_probe.py`) covers the CONNECTION chain (spawn/ensure/restore/vouch/refusal) — the freeze is a STREAM-plane defect that survives every connection assertion: the probe's screens were read daemon-side, which is why it cannot see this class yet. Next seat: add the two-sided reconciliation scenario (daemon screen vs GUI-side terminal read, diverged-over-T = FAIL) BEFORE touching the pump.
 
-## ⛔ [11.182] THE SCHEDULED MANAGED-CLI REFRESH HELD THE INSTALL LOCK FOR ~18h — ONE STUCK CHILD (`mimo upgrade`, NO TTY, NO DEADLINE) FROZE EVERY TOOLCHAIN WRITE ON THE HOST, AND EVERY AGY ROW WENT AMBER AFTER THE RESTART (measured 2026-09-27 12:33-12:40 IST, jojo + dev, owner report "all agy clis not connecting after restart; new sessions still amber")
+## ⛔ [11.182] THE SCHEDULED MANAGED-CLI REFRESH HELD THE INSTALL LOCK FOR ~18h — ONE STUCK CHILD (`mimo upgrade`, NO TTY, NO DEADLINE) FROZE EVERY TOOLCHAIN WRITE ON THE HOST, AND EVERY AGY ROW WENT AMBER AFTER THE RESTART (measured 2026-09-27 12:33-12:40 IST, guihost + dev, owner report "all agy clis not connecting after restart; new sessions still amber")
 
 **Status:** FIXED IN CODE — LIVE PROOF OWED
 
 E2E-PROVEN 2026-09-27 ~22:2x IST (the [11.187] sitting): tools/e2e/connection_probe.py scenario `preflight_no_stuck_lock_holder` names any live install-lock holder (flock, not file bytes); on THIS entry's wedge shape it went RED live (walker + stuck child named) before the ops clear. Full probe 5/5 on the live fixed dev stack.
 
-FIXED IN CODE 2026-09-27 evening (zcode sess_745c8f5c on jojo, work FROM dev): (1) THE PER-STEP DEADLINE — `run_provision_command` no longer `.output()`s forever: every provision step gets `MANAGED_CLI_INSTALL_STEP_TIMEOUT_SECS = 900`, runs as a group leader, and a hung child is SIGKILLed WITH ITS PROCESS GROUP (npm/node grandchildren die too) and the step fails BY NAME ("timed out after 900s … the [11.182] no-deadline wedge class"); the stderr pipe is drained by a reader thread WHILE the child runs, or a chatty child wedges itself on its own 64 KB pipe (the [11.181] slow-fuse class, self-inflicted). Regression: `a_hung_chatty_installer_child_is_killed_at_the_deadline_and_named` (a >pipe-buffer writer + eternal sleeper dies at a 3s injected deadline, named). (2) THE LOCK SPAN — `install_latest` no longer holds the install lock across the whole multi-CLI walk; `install_one_step_under_lock`/`install_via_ynpm_publish` take it per step, so a waiter's worst case is one step's deadline, never a walk's. Source-law test: `the_walk_holds_the_lock_per_step_never_for_the_whole_walk`. (3) HOLDER PROVENANCE — the lock file now carries `{pid, acquired_at_ms}` on acquire, and the timed-out refusal NAMES the holder pid instead of an anonymous 300000ms. (4) THE PROBE — `tools/e2e/connection_probe.py` `preflight` tests the FLOCK (not the file bytes: the wedged file sat 0 bytes since Aug 9 while the walker pinned the flock) and names the holder + its children; it went RED on dev live (named pid 1692976 + 1 child) before the ops clear.
+FIXED IN CODE 2026-09-27 evening (zcode sess_745c8f5c on guihost, work FROM dev): (1) THE PER-STEP DEADLINE — `run_provision_command` no longer `.output()`s forever: every provision step gets `MANAGED_CLI_INSTALL_STEP_TIMEOUT_SECS = 900`, runs as a group leader, and a hung child is SIGKILLed WITH ITS PROCESS GROUP (npm/node grandchildren die too) and the step fails BY NAME ("timed out after 900s … the [11.182] no-deadline wedge class"); the stderr pipe is drained by a reader thread WHILE the child runs, or a chatty child wedges itself on its own 64 KB pipe (the [11.181] slow-fuse class, self-inflicted). Regression: `a_hung_chatty_installer_child_is_killed_at_the_deadline_and_named` (a >pipe-buffer writer + eternal sleeper dies at a 3s injected deadline, named). (2) THE LOCK SPAN — `install_latest` no longer holds the install lock across the whole multi-CLI walk; `install_one_step_under_lock`/`install_via_ynpm_publish` take it per step, so a waiter's worst case is one step's deadline, never a walk's. Source-law test: `the_walk_holds_the_lock_per_step_never_for_the_whole_walk`. (3) HOLDER PROVENANCE — the lock file now carries `{pid, acquired_at_ms}` on acquire, and the timed-out refusal NAMES the holder pid instead of an anonymous 300000ms. (4) THE PROBE — `tools/e2e/connection_probe.py` `preflight` tests the FLOCK (not the file bytes: the wedged file sat 0 bytes since Aug 9 while the walker pinned the flock) and names the holder + its children; it went RED on dev live (named pid 1692976 + 1 child) before the ops clear.
 
 RE-OCCURRED LIVE during this very sitting (dev, the ~12:30 reboot walker pid 1692976 + stuck `mimo upgrade` pid 1695729, ~8h in flock): ops-cleared same evening per this entry's remedy; the probe preflight now stands guard.
 
 Remediated live this sitting; the code is unfixed — this WILL recur on the next reboot+hang.
 
-The chain, measured: dev rebooted ~17:35 Sep 26 → boot-spawned `yggterm server remote refresh-managed-cli scheduled` (pid 1532) walked the managed CLIs and hung on its child `node ~/.yggterm/ynpm/bin/mimo upgrade` (pid 2606) — 17h53m in `anon_pipe_read`, child in `do_epoll_wait`, no TTY, no deadline. The refresh held fd 8 = `/home/pi/.yggterm/managed-cli-install.lock` for the whole walk. Every `ensure-managed-cli agy` on dev refused: "another yggterm process has been installing managed CLIs for over 300000ms (lock …); refusing to write the toolchain concurrently" — jojo's daemon logged 22 such refusals; every agy spawn/restore → ensure fails → row sits amber forever ("launch queued", `launch_phase: RemoteBootstrap`). Ops remedy this sitting: TERM 2606 + 1532 (lock dies with the holder), ensure path verified recovered — a fresh remote agy birth spawned and attached end-to-end (probe row, `agy --dangerously-skip-permissions --conversation <uuid>` live on dev, then reaped).
+The chain, measured: dev rebooted ~17:35 Sep 26 → boot-spawned `yggterm server remote refresh-managed-cli scheduled` (pid 1532) walked the managed CLIs and hung on its child `node ~/.yggterm/ynpm/bin/mimo upgrade` (pid 2606) — 17h53m in `anon_pipe_read`, child in `do_epoll_wait`, no TTY, no deadline. The refresh held fd 8 = `/home/user/.yggterm/managed-cli-install.lock` for the whole walk. Every `ensure-managed-cli agy` on dev refused: "another yggterm process has been installing managed CLIs for over 300000ms (lock …); refusing to write the toolchain concurrently" — guihost's daemon logged 22 such refusals; every agy spawn/restore → ensure fails → row sits amber forever ("launch queued", `launch_phase: RemoteBootstrap`). Ops remedy this sitting: TERM 2606 + 1532 (lock dies with the holder), ensure path verified recovered — a fresh remote agy birth spawned and attached end-to-end (probe row, `agy --dangerously-skip-permissions --conversation <uuid>` live on dev, then reaped).
 
 Structural defects, all four needed:
 1. The refresh runs per-CLI upgrades with NO deadline — one hung child (a no-TTY npm upgrade is the measured shape) blocks the whole toolchain forever.
@@ -32526,7 +32526,7 @@ Structural defects, all four needed:
 Fix direction: per-CLI lock span + per-child deadline (kill + continue) + holder-progress escalation (break-after-N-min with /proc evidence) + row stamp naming the ensure failure. Repro instrument: `server monitor --scenario managed-cli-refresh` exists; add a hung-child scenario.
 
 UPDATE 2026-10-03 ~18:1x IST (queue-completion seat, zcode sess_813045b5 on
-jojo, work FROM dev): CLOSE AUDIT FAILED — the fix's machinery is live and
+guihost, work FROM dev): CLOSE AUDIT FAILED — the fix's machinery is live and
 the 18 h wedge class is dead (26 deadline-kills in gen g1791022605539, zero
 unbounded holds, holder provenance names every holder), but the entry cannot
 close on this evidence: (a) the scheduled refresh's mimo step hangs 900 s on

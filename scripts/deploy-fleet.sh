@@ -705,7 +705,7 @@ $open_exe_paths
   # ⛔ THE PARSE IS LOCAL, ON PURPOSE. direct_state is already a shell variable
   # on THIS machine; a `python3 -c` program cannot cross ssh inside "$*" (the
   # remote shell strips its quoting and python reads `import` as the program —
-  # measured: jojo answered "unreadable" while the identical probe in a bare
+  # measured: guihost answered "unreadable" while the identical probe in a bare
   # ssh line matched). Local sed on the flat machine-written JSON, no second
   # round trip.
   dactive=$(printf '%s' "$direct_state" | sed -n 's/.*"active_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
@@ -771,7 +771,7 @@ $open_exe_paths
     # must not silently skip the direct block of every host after it — a
     # per-host local flag decides the skip, FAILED only decides the exit code.
     if [ "$dstage_fail" != 0 ]; then FAILED=1; continue; fi
-    # dnewexe carries an expanded /home/pi path ON PURPOSE: it was read from
+    # dnewexe carries an expanded /home/user path ON PURPOSE: it was read from
     # the host's own install-state-shaped layout and this fleet is single-user
     # — the same expansion the activemd5 probe above already relies on.
     fb64=$(printf '%s' "$FLIP_PY" | base64 | tr -d '\n')
@@ -796,7 +796,7 @@ $open_exe_paths
   # ⛔ [11.220] THE LEGACY-MIRROR RIDE-ALONG. The ynpm promote path mirrors
   # the canonical state into ~/.yggterm/install-state.json for older
   # launchers, but THIS script flips only the canonical file — measured
-  # 2026-10-03 on jojo the mirror sat one same-version deploy behind and
+  # 2026-10-03 on guihost the mirror sat one same-version deploy behind and
   # every BARE `yggterm` launch handed the NEW build's invocation down to
   # the OLD binary (the handoff guard compares versions, not build ids).
   # Refresh the mirror whenever it exists (never create it) so a stale
@@ -903,7 +903,7 @@ $HL_SUM
         # The CLI passes ITS OWN exe as the handoff target, and this is the
         # fresh managed headless this deploy just verified — so a direct-host
         # daemon that has sat on a Sep-class build for days finally rotates.
-        # Measured 2026-09-15: jojo's daemon ignored four days of rolls
+        # Measured 2026-09-15: guihost's daemon ignored four days of rolls
         # (nothing ever triggered its rotation; the [11.122] pin flip only
         # gave it eyes, not a trigger).
         dresp=$(run_on "$host" '"$HOME/.yggterm/bin/yggterm-headless" server daemon restart --reason deploy-roll-daemon-rotation' 2>&1 || true)

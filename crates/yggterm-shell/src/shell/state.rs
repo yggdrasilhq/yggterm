@@ -2426,7 +2426,7 @@ const APP_CONTROL_IDLE_POLL_MS: u64 = 1_000;
 const APP_CONTROL_WATCHDOG_IDLE_POLL_MS: u64 = 15_000;
 /// A mounted terminal only needs this poll at fast cadence while its input gate
 /// is open. Native web surfaces commonly keep the terminal host mounted but
-/// input-disabled; on jojo's HPET clock, polling that idle host every 320 ms is
+/// input-disabled; on guihost's HPET clock, polling that idle host every 320 ms is
 /// needless WebKit/tokio wake pressure.
 const TERMINAL_SESSION_SWITCH_FOCUS_POLL_MS: u64 = 320;
 const TERMINAL_SESSION_SWITCH_FOCUS_IDLE_POLL_MS: u64 = 1_000;
@@ -14651,7 +14651,7 @@ async fn web_surface_native_reconcile_loop(
             let modal_over_viewport = shell_ref.has_modal_over_viewport() && !under_glass;
             // A native page can sit above the shell DOM even while the Yggterm
             // window is unfocused.  That is not an interactive surface: it is
-            // an invisible-to-the-user WebKit workload, and on jojo its timer
+            // an invisible-to-the-user WebKit workload, and on guihost its timer
             // clock reads are HPET-backed.  Treat the focus edge like the other
             // backgrounding gates so WebKit's document/rAF/timer throttling
             // applies until the user returns to this window.
@@ -54922,7 +54922,7 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     ktLastOverlayOpen = open;
   }
   // The bridge used to keep a 90 ms timer alive forever.  That was invisible
-  // on a TSC host, but on jojo every timer wake reaches HPET-backed
+  // on a TSC host, but on guihost every timer wake reaches HPET-backed
   // clock_gettime in WebKit.  Only the open/follow/modal states need the fast
   // cadence; an idle focused window can tolerate a quarter second, and a
   // hidden/unfocused window has no human-visible keytip deadline.

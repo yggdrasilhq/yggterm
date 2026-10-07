@@ -58,7 +58,25 @@ SERVER_STATE = HOME / ".yggterm/server-state.json"
 AGY_STORE = HOME / ".gemini/antigravity-cli/conversation_summaries.db"
 YGGTERM_BIN = None
 
-BIRTH_TITLE_DEFAULTS = ("New dev ", "New jojo ", "New oc ", "New local ")
+def _ssh_config_hosts():
+    """Host aliases from this machine's ssh config — birth titles carry the
+    RUNTIME machine name (`New {machine} {CLI}`), and the GUI host's alias
+    is never spelled in this public repo (ygg-live-host.sh law)."""
+    hosts = []
+    try:
+        with open(os.path.expanduser("~/.ssh/config")) as fh:
+            for line in fh:
+                parts = line.split()
+                if parts and parts[0].lower() == "host":
+                    hosts += [p for p in parts[1:] if "*" not in p and "?" not in p]
+    except OSError:
+        pass
+    return hosts
+
+
+BIRTH_TITLE_DEFAULTS = ("New dev ", "New oc ", "New local ") + tuple(
+    f"New {h} " for h in _ssh_config_hosts()
+)
 BOOTSTRAP_GRACE_S = 600        # a row may bootstrap for ten minutes
 GHOST_GRACE_S = 15 * 60        # an unattached CLI older than this is a ghost
 # [11.197] the tombstone plane, mirrored: TOMBSTONE_TTL_SECS in
@@ -95,7 +113,7 @@ def peer_row_truth(peers):
         try:
             proc = subprocess.run(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", peer,
-                 "/home/pi/.yggterm/bin/yggterm server app rows"],
+                 "$HOME/.yggterm/bin/yggterm server app rows"],
                 capture_output=True, text=True, timeout=30,
             )
             if proc.returncode == 0:
@@ -777,7 +795,7 @@ def main():
     parser.add_argument(
         "--peer", action="append", default=[],
         help="a peer plane whose live rows count as attachment truth (e.g. "
-             "--peer jojo when judging dev): a CLI attached to a row "
+             "--peer guihost when judging dev): a CLI attached to a row "
              "anywhere is not a ghost (the cross-host blindness, [11.197])",
     )
     parser.add_argument(

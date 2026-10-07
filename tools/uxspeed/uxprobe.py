@@ -1187,7 +1187,7 @@ class Probe:
         ct_deadline = start + self.timeout_s
         # The content poll runs with NO trace scanning in the loop: a
         # `ytrace tail` inside a hot generation costs seconds (measured
-        # 5.6 s/call on jojo 2026-09-29) and that cost was landing inside
+        # 5.6 s/call on guihost 2026-09-29) and that cost was landing inside
         # content_first_ms. Milestone offsets are ts_ms-based, so ONE scan
         # after the content leg answers recovers them exactly.
         while content["content_first_ms"] is None and time.time() < ct_deadline:

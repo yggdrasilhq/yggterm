@@ -297,7 +297,43 @@ def _run(cmd, cwd=None, timeout=120, shell=False, label=None, heartbeat_secs=0):
 # guess. Deltas are read from `--show-stats` snapshots — never --zero-stats,
 # which would stomp parallel seats sharing the host cache.
 
-DEFAULT_FLEET_HOSTS = ["dev", "oc", "jojo", "practice"]
+# ⛔ The GUI host is RESOLVED, NEVER SPELLED — its alias is private
+# infrastructure and this repo is public (scripts/ygg-live-host.sh law,
+# the one deploy-fleet.sh obeys). $YGG_GUI_HOST wins; otherwise the repo's
+# resolver is asked when this copy lives inside a checkout. Unresolved, the
+# cache sweep says so loudly rather than silently skipping a fleet host.
+def _gui_host():
+    env = os.environ.get("YGG_GUI_HOST", "").strip()
+    if env:
+        return env
+    for base in Path(__file__).resolve().parents[:4]:
+        cand = base / "scripts" / "ygg-live-host.sh"
+        if cand.is_file():
+            try:
+                out = subprocess.run(
+                    ["bash", str(cand), "--quiet"],
+                    capture_output=True, text=True, timeout=120,
+                ).stdout.strip()
+                if out:
+                    return out.splitlines()[-1].strip()
+            except Exception:
+                pass
+    return ""
+
+DEFAULT_FLEET_HOSTS = ["dev", "oc", "practice"]
+
+def _default_fleet_hosts():
+    hosts = ["dev", "oc"]
+    gui = _gui_host()
+    if gui:
+        hosts.append(gui)
+    else:
+        print("ygg-ci: GUI host unresolved (set $YGG_GUI_HOST or run from a repo "
+              "checkout) — cache sweep covers the static fleet hosts only",
+              file=sys.stderr)
+    hosts.append("practice")
+    return hosts
+
 _SCCACHE_TRIES = ["sccache", "/usr/local/bin/sccache", str(Path.home() / ".local" / "bin" / "sccache")]
 
 def _sccache_cmd(host=None):
@@ -380,7 +416,7 @@ def _cache_wire_probe(host=None):
 
 def cmd_cache(a):
     """Per-host compile-cache health + the verdict digest of recent builds (§4)."""
-    hosts = [h.strip() for h in (a.host.split(",") if a.host else DEFAULT_FLEET_HOSTS)]
+    hosts = [h.strip() for h in (a.host.split(",") if a.host else _default_fleet_hosts())]
     report = {"hosts": {}, "recent_builds": []}
     for h in hosts:
         st = _sccache_stats(h)

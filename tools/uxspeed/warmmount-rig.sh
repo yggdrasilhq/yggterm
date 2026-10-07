@@ -1,7 +1,7 @@
 #!/bin/bash
 # [11.178→F1] THE WARM-MOUNT WEDGE RIG — the campaign's deterministic
 # paint-zombie factory (5/6 fresh spawns wedge on current main, measured
-# 2026-10-05). Runs the GUI on dev's own Xvfb :77 — jojo untouched.
+# 2026-10-05). Runs the GUI on dev's own Xvfb :77 — guihost untouched.
 # Usage: tools/uxspeed/warmmount-rig.sh [worktree-path] [iters]
 #   worktree defaults to ~/gh/yggterm (needs target/debug/yggterm built:
 #   cargo build -p yggterm --bin yggterm).

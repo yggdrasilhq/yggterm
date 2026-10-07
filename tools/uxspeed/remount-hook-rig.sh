@@ -47,7 +47,7 @@
 #   deterministically (supersede race); a dev-profile build shifts timing
 #   the same way.
 #   binary defaults to $worktree/target/debug/yggterm. Runs on dev's Xvfb
-#   :78 — jojo untouched. Input focus latches for the row ACTIVE at
+#   :78 — guihost untouched. Input focus latches for the row ACTIVE at
 #   synthesis: the row under test is created LAST and stays active.
 set -u
 WT=${1:-$HOME/gh/yggterm}

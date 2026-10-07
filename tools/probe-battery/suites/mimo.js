@@ -24,7 +24,7 @@
 //     `--agent`, and the server quartet --port/--hostname/--mdns/--cors.
 //
 //   node run.js --suite suites/mimo.js --cwd /tmp/mimo-suite-ws \
-//        [--suite-arg bin=/home/pi/.local/bin/mimo]
+//        [--suite-arg bin=/home/user/.local/bin/mimo]
 //
 // The suite only READS the store; imported sessions are owner data and are
 // never deleted or modified.
