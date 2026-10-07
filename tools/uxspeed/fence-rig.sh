@@ -224,6 +224,7 @@ if MODE == "loss":
     # marker only via the reconcile heal, if at all). GREEN = no drop, the
     # explicit unapplied failure traced, everything flushed LIVE (the
     # marker delivered by the fence's own write path, first sample).
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
     if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
         print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
             proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
