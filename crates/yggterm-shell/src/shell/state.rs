@@ -636,6 +636,15 @@ const TERMINAL_WARM_EVAL_MAX_WAIT_MS: u64 = 8_000;
 // past this, further remounts are futile churn (see
 // startup_terminal_restore_should_recover).
 const STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES: u32 = 3;
+// (r-j1)/(r-j2) Delay before the post-recovery verify-or-rearm check: the
+// successor bootstrap is scheduled on the next render after the latch clears,
+// and its mount loop pumps the first heartbeat from its FIRST iteration
+// (pre-attach_ready) — inside this window even a churn-stalled mount has
+// declared itself live. Past it, an absent/stale beat is a dead successor and
+// the rearm tears its bookkeeping down. A full recovery window plus the
+// churn margin the healthy-mode demote rig measured for creation-churn mounts.
+pub(crate) const STARTUP_TERMINAL_RESTORE_REARM_VERIFY_MS: u64 =
+    STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 2_500;
 const RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS: u64 = 900;
 // ⛔ THE INPUT GATE HAS ~20 REMOVAL SITES AND HAD NO RELEASE OF ITS OWN.
 // Deleted for ALL-sessions non-blocking fix 2026-08-16: the old LLM gate held
@@ -863,6 +872,36 @@ pub(crate) static TERMINAL_LOOP_HEARTBEATS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// (r-j2 2026-10-07) THE WITNESSED-DEATH STAMP. The drop guard sets it when
+/// a mount task ends; the first heartbeat of a successor clears it. The
+/// loop-stale watchdog keys on it: the sitting-15 punch REMOVES the beat, so
+/// a dropped loop has no aged beat for the old arm to judge — an absent beat
+/// plus an owner entry read as "never mounted, not judged" while the row sat
+/// corpse-shaped forever (rj2-rig, measured on hook-only main: drop + zero
+/// recoveries + zero successors + typing dead; the stale-watch never fired).
+static TERMINAL_LOOP_DEATH_STAMPS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub(crate) fn mark_terminal_loop_dead(session_path: &str) {
+    if let Ok(mut stamps) = TERMINAL_LOOP_DEATH_STAMPS.lock() {
+        stamps.insert(session_path.to_string(), wall_now_ms());
+    }
+}
+
+pub(crate) fn terminal_loop_death_age_ms(session_path: &str) -> Option<u64> {
+    let stamps = TERMINAL_LOOP_DEATH_STAMPS.lock().ok()?;
+    let at = stamps.get(session_path)?;
+    Some(wall_now_ms().saturating_sub(*at))
+}
+
+fn terminal_loop_death_stamped_sessions() -> Vec<String> {
+    TERMINAL_LOOP_DEATH_STAMPS
+        .lock()
+        .map(|stamps| stamps.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 static TERMINAL_LOOP_REMOUNT_SPEND: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (u32, u64)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -937,6 +976,11 @@ pub(crate) fn bump_terminal_loop_heartbeat(session_path: &str) {
     if let Ok(mut beats) = TERMINAL_LOOP_HEARTBEATS.lock() {
         beats.insert(session_path.to_string(), wall_now_ms());
     }
+    // A live successor's first beat cancels the death stamp — the stamp is
+    // "no successor has run since the drop", nothing more.
+    if let Ok(mut stamps) = TERMINAL_LOOP_DEATH_STAMPS.lock() {
+        stamps.remove(session_path);
+    }
 }
 
 /// [F1-(h2)/11.187] Punched by the mount-task drop guard on an ARMED death
@@ -951,6 +995,36 @@ pub(crate) fn remove_terminal_loop_heartbeat(session_path: &str) {
     if let Ok(mut beats) = TERMINAL_LOOP_HEARTBEATS.lock() {
         beats.remove(session_path);
     }
+}
+
+/// (r-j1)/(r-j2) RIG HOOK — deterministic silent mount-loop death for the
+/// verify-or-rearm falsifier (rj2-rig.sh). The env names a file holding
+/// "<marker>\n<count>:<delay_ms>"; an empty marker matches every session.
+/// Each mount-loop task start consumes one token (decrement-and-write) and
+/// arms its own death `delay_ms` after task start — the loop then exits via
+/// a bare `break` with no named exit arm, exactly the creation-churn death
+/// shape the healthy-mode demote rig measured (exit_hint pre_select). The
+/// drop guard's heartbeat punch makes the death read honestly as dead.
+/// Production never sets the env; the rig points it at its scratch.
+pub(crate) fn take_silent_loop_death_token(session_path: &str) -> Option<tokio::time::Instant> {
+    let path = std::env::var("YGGTERM_TEST_SILENT_LOOP_DEATHS_FILE").ok()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let mut lines = raw.split('\n');
+    let marker = lines.next()?.trim();
+    if !marker.is_empty() && !session_path.contains(marker) {
+        return None;
+    }
+    let mut parts = lines.next()?.split(':');
+    let count: u64 = parts.next()?.trim().parse().ok()?;
+    let delay_ms: u64 = parts
+        .next()
+        .and_then(|d| d.trim().parse().ok())
+        .unwrap_or(1_000);
+    if count == 0 || count > 32 {
+        return None;
+    }
+    let _ = std::fs::write(&path, format!("{}\n{}:{}", marker, count - 1, delay_ms));
+    Some(tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms))
 }
 
 /// [F1-(i) 2026-10-06] The last select branch a session's mount loop ENTERED.
@@ -1065,14 +1139,62 @@ impl ShellState {
     /// heartbeat is stale. A heartbeat of `None` is skipped: a session never
     /// mounted under a heartbeat-carrying build is not judged.
     pub(crate) fn terminal_loop_stale_watch_sessions(&self) -> Vec<String> {
-        self.terminal_bootstrap_owner_by_session
-            .keys()
-            .filter(|session| {
-                terminal_loop_heartbeat_age_ms(session)
-                    .is_some_and(|age| age >= TERMINAL_LOOP_STALE_MS)
-            })
-            .cloned()
-            .collect()
+        let mut out: Vec<String> = Vec::new();
+        // THE OLD ARM: an owner entry (a loop that acquired the bootstrap and
+        // never released it — the wedge shape) whose beat is STALE-AGED. An
+        // absent beat does not qualify here: pre-punch that meant "never
+        // mounted under a heartbeat-carrying build"; the witnessed-death arm
+        // below owns exactly those now.
+        for session in self.terminal_bootstrap_owner_by_session.keys() {
+            if matches!(
+                terminal_loop_heartbeat_age_ms(session),
+                Some(age) if age >= TERMINAL_LOOP_STALE_MS
+            ) && !out.contains(session)
+            {
+                out.push(session.clone());
+            }
+        }
+        // (r-j2) THE WITNESSED-DEATH ARM: a mount task dropped (the guard
+        // stamped it) and no successor has bumped since. The punch removed
+        // the beat, so the old arm is blind to exactly these — the measured
+        // Ready-row strand (rj2-rig on hook-only main: one drop, zero
+        // recoveries, the stale-watch silent, typing dead until a re-select
+        // that itself lease-skipped). Bounded to sessions the state still
+        // knows, so a removed row's lingering stamp cannot churn epochs.
+        for session in terminal_loop_death_stamped_sessions() {
+            if self.terminal_open_attempt_by_session.contains_key(&session)
+                && !out.contains(&session)
+            {
+                out.push(session);
+            }
+        }
+        out
+    }
+
+    /// (r-j2) Release a mount task's bootstrap claim AT DEATH. The drop guard
+    /// calls this: a dropped task can never use its owner/lease again, and
+    /// every later bootstrap that finds the lease held SKIPS
+    /// (terminal_bootstrap_existing_lease_skip — which even re-marks the
+    /// attempt Ready on a reusable-looking host, feeding the corpse). The
+    /// stale-lease reclaim does not cover it: a Ready attempt is by
+    /// definition not "never-ready", so the wedge outlives even the user's
+    /// re-select. Remove-if-own only: a successor's fresh claim is never
+    /// stolen.
+    pub(crate) fn release_terminal_bootstrap_claim_if_owned(
+        &mut self,
+        session_path: &str,
+        owner_identity: &str,
+    ) -> bool {
+        let owner_ours = self
+            .terminal_bootstrap_owner_by_session
+            .get(session_path)
+            .map(String::as_str)
+            == Some(owner_identity);
+        if owner_ours {
+            self.terminal_bootstrap_owner_by_session.remove(session_path);
+            self.terminal_bootstrap_lease_by_session.remove(session_path);
+        }
+        owner_ours
     }
 
     /// The epoch-in-identity bump: changes the session's bootstrap identity so
@@ -33232,6 +33354,95 @@ impl ShellState {
                 self.active_terminal_host_id = self.terminal_session_host_id(active_session_path);
             }
         }
+        true
+    }
+    /// (r-j1)/(r-j2) VERIFY-OR-REARM — the post-recovery successor check. A
+    /// genuine recovery tears the dead loop's bookkeeping down and PRESUMES the
+    /// unlatched next render schedules a successor bootstrap. When that
+    /// successor dies too (the creation-churn window kills fresh loops
+    /// silently), nothing guarantees another recovery: should_recover
+    /// permanently refuses a retained host with a non-empty-surface attempt
+    /// (the stable-host gate) and past the futile-recovery cap, so the render
+    /// latch was the last trigger — a user re-select (which changes the
+    /// open-request half of the combined latch key) was the only way out.
+    /// This arm removes that luck: called LATE (a full recovery window after
+    /// the successor had every chance to pump its first pre-attach heartbeat),
+    /// a live loop or a young in-flight attach means a successor exists and
+    /// nothing happens; otherwise the stale marker/owner/lease the dead
+    /// successor left are torn down and the caller unlatches so the next
+    /// render schedules a fresh bootstrap. Heartbeat freshness is trustworthy
+    /// for the verdict: since the drop-guard punch, a dropped task can never
+    /// leave a fresh beat behind. Shares the recovery's futile budget (the
+    /// streak) so a never-Ready row cannot churn forever.
+    fn rearm_startup_terminal_restore_no_successor(
+        &mut self,
+        active_session_path: &str,
+        now_ms: u64,
+    ) -> bool {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal
+            || self.server.active_session_path() != Some(active_session_path)
+        {
+            return false;
+        }
+        // Same deferrals should_recover applies for foreign work: a live web
+        // surface owns the viewport (remounting would storm it), and a busy
+        // server mid-non-terminal request is not the moment to relaunch.
+        if self.has_live_web_surface(active_session_path, now_ms) {
+            return false;
+        }
+        if self.server_busy
+            && !self
+                .terminal_session_has_active_terminal_request(active_session_path)
+        {
+            return false;
+        }
+        if terminal_loop_is_live(active_session_path) {
+            return false;
+        }
+        // An attach still inside its first recovery window gets the benefit
+        // of the doubt: slow mounts pump their first heartbeat late (but
+        // always pre-attach_ready). Past the window with no beat, the attach
+        // is dead bookkeeping, not a bootstrap.
+        if self.terminal_attach_in_flight.contains(active_session_path)
+            && self
+                .latest_terminal_open_attempt_for_path(active_session_path)
+                .is_some_and(|attempt| {
+                    now_ms.saturating_sub(attempt.started_at_ms)
+                        < STARTUP_TERMINAL_RESTORE_RECOVERY_MS
+                })
+        {
+            return false;
+        }
+        // The recovery's futile budget: a row that already burned its
+        // consecutive-recovery cap without reaching Ready must not gain an
+        // unbounded rearm loop through the back door.
+        if self
+            .startup_restore_recover_streak
+            .get(active_session_path)
+            .copied()
+            .unwrap_or(0)
+            >= STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES
+        {
+            return false;
+        }
+        *self
+            .startup_restore_recover_streak
+            .entry(active_session_path.to_string())
+            .or_insert(0) += 1;
+        if let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(active_session_path)
+            .cloned()
+            && let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id)
+        {
+            attempt.state = TerminalOpenAttemptState::Recovering;
+            attempt.started_at_ms = now_ms;
+        }
+        self.terminal_attach_in_flight.remove(active_session_path);
+        self.terminal_bootstrap_owner_by_session
+            .remove(active_session_path);
+        self.terminal_bootstrap_lease_by_session
+            .remove(active_session_path);
         true
     }
     #[cfg(test)]
