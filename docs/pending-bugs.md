@@ -36,8 +36,9 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   content arming, reset seeding) is never synthesized → blank-forever
   terminal called ready. MEMBERS: [11.178]'s residual stall (its "phantom
   eval" framing is dead; the "vanish" was this shed window), the [11.217]
-  half-handshake site, [11.229](a)+(c) blank shapes, the first-spawn-blank
-  readings beside [11.226]. ATTACK: LANDED 2026-10-05 (3042a0d6, lane
+  half-handshake site, the [11.229](c) blank shape, the first-spawn-blank
+  readings beside [11.226]. ((a) left this family 2026-10-07 — measured
+  as the [11.228] grid-divergence reuse arm, closed in F3.) ATTACK: LANDED 2026-10-05 (3042a0d6, lane
   lane/f1/synthesize-full-contract) — on matched-stage-posted the FULL
   contract now rides the ONE transport measured alive through the shed
   window (fresh document::eval + return): off-loop daemon screen snapshot
@@ -476,9 +477,28 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   rewind); rt-rig measured plain + grid-divergence arms already healing
   on unfixed main via the rewind, so the id signal covers the NO-REWIND
   arms (busy replacement outrunning the cursor, forwarded rewind loss) —
-  fake-id isolation arm GREEN on the lane. REMAINDERS under (b): the
+  fake-id isolation arm GREEN on the lane. (a) CLOSED 2026-10-07 (sitting
+  19, lane lane/11229a/reuse-repair f1587b94): the reuse verdict
+  (mount_epoch_reused reused_live_host:true) now fires the startup
+  resize repair with the reused host's LIVE page-grid (read from its own
+  xterm over the eval bridge — the client-grid SSOT, never the daemon's
+  possibly-diverged "PTY size"), AND — the deeper hole the new
+  hook-free reuse-rig exposed at its rc9 iteration — the daemon's
+  TerminalResize repaint arm now REALLY falls through at a diverged
+  grid: the bounce used the session's CURRENT grid regardless of the
+  request (the comment claimed the fall-through for months), so NO
+  repaint caller could ever heal a diverged PTY — it bounced the wrong
+  grid and answered Ok; the bounce is now gated on
+  current==requested, anything else takes the ordinary resize (set +
+  record + persist + remote forward + honest ack), which also hardens
+  the cursor-rewound geometry resync whenever its real re-send loses
+  the race. reuse-rig: RED rc6 on unfixed main (poison 100×30 survives
+  the reuse, stty proves it), GREEN ×2 on the lane (repair traces carry
+  the client grid, PTY converges, healthy-reuse bounce control clean,
+  exe-proofed). REMAINDERS under (b): the
   mount-loop-DEAD arm ([11.187] territory) and error-not-answer shapes;
-  then (d) remove-vs-keepalive race.
+  then (c) reveal-deadline blank (still under F1), then (d)
+  remove-vs-keepalive race.
 - **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
   [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
   auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
@@ -637,7 +657,7 @@ branch is an abandoned lane, not a retryable merge). FALSIFIER: merge a
 lane, delete its remote branch, watch the next tick consume the sub
 instead of reporting conflicts.
 
-## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — A REUSED-HOST MOUNT FIRES NO GRID REPAIR (09:17:45 shape), A RUNTIME REPLACED UNDERNEATH A MOUNTED HOST NEVER RE-BINDS (the frozen-buffer squish that survived every daemon-side heal), THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), AND session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
+## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION, the replaced-runtime NO-REWIND freeze arms, and the absent-declaration sub-item; the reuse-grid arm (a) and (b)'s relaunch/live-GUI arms are closed in the body (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
 
 **Status:** OPEN
 
@@ -654,6 +674,33 @@ CLIENT halves that still recur on healthy rows.
   private; needs pub(crate) + launch-side call with the host grid) on
   reuse; it is a winsize bounce at identical geometry by design, a heal
   at wrong geometry.
+  CLOSED 2026-10-07 (sitting 19, lane lane/11229a/reuse-repair
+  f1587b94): the reuse verdict now spawns the repair with the reused
+  host's LIVE grid read from its own xterm over the eval bridge
+  (terminal_reused_host_grid_script — top-level `return`, the only
+  shape that crosses the bridge; the page is the client-grid SSOT, the
+  daemon's "PTY size" may be the diverged value being healed), source
+  `mount_epoch_reused`; shadows stand down
+  (D8); skips trace `reuse_repair_skipped` (the dead-bridge detector).
+  THE FILED FIX SHAPE ALONE WAS INSUFFICIENT — measured at the rig's
+  rc9 iteration: the daemon's TerminalResize repaint arm bounced the
+  session's CURRENT grid regardless of the requested one (its comment
+  claimed "a different grid falls through to the ordinary resize" — it
+  never did), so the "repaint-safe repair … a heal at wrong geometry"
+  claim was FALSE for every repaint caller; two Ok-traced repairs left
+  the PTY poisoned. The fall-through is now REAL (bounce gated on
+  current==requested; diverged takes the ordinary resize path — set +
+  record + persist + remote forward + honest [11.57] ack), which also
+  hardens the cursor-rewound geometry resync whenever its real re-send
+  loses the race. FALSIFIER tools/uxspeed/reuse-rig.sh (hook-free:
+  poison the PTY via the resize verb while the row is demoted, switch
+  back = the reuse, read `stty size` off the screen): RED rc6 on
+  unfixed main (poison 100×30 survives the reuse — stty prints it),
+  GREEN ×2 on the lane (repair traces carry the client grid 106×48, the
+  PTY converges — stty prints the client grid — healthy-reuse bounce
+  control clean, exe-proofed both runs). Suites shell 2239/0 + server
+  1666/0 no-fail-fast. The absent-declaration sub-item below stays
+  (unmeasured since the paint-zombie fix).
 - (b) REPLACED-RUNTIME FROZEN BUFFER: when the daemon replaces a remote
   runtime (restart/rotation re-spawn), a mounted client host keeps the
   DEAD runtime's last frame forever (measured: client buffer 120-wide
@@ -741,7 +788,8 @@ eval context, which clears the [11.178] wedge) instead of revealing a
 blank. The 2026-08-29 hot class is preserved (that host had painted);
 trade-off in-code: a slow first paint past cancel time costs one cold
 remount instead of a false hot reveal. Shape-locked 3 ways + full shell
-2205/0. REMAINERS (a)/(c)/(d) as filed stand for their own scopes; the
+2205/0. REMAINERS (c)/(d) as filed stand for their own scopes ((a) closed
+2026-10-07, sitting 19 — see the (a) block); the
 absent-declaration loop is now expected to stand down on a healthy fresh
 mount (its sub-item stays until measured).
 
@@ -819,6 +867,10 @@ is how the record gets poisoned). Source-law test pins both laws in
 client grid — a trace scan for remote_pty_resize_forwarded with
 cols≠client-grid following an ensure is the red; and a stale record can
 no longer self-sustain. (B) and the blank family are filed as [11.229].
+(B) — the reuse-without-repair arm — CLOSED 2026-10-07 (sitting 19,
+lane lane/11229a/reuse-repair): the reuse fires the repair, and the
+same lane's daemon repaint fall-through makes repaint-requested heals
+real for this family's whole machinery.
 
 TWO ADJACENT FACTS RECORDED, NOT FIXED HERE: (1) guihost's serving daemon
 is 4f80c66d-dirty (born 00:06:11) holding the default endpoint while
