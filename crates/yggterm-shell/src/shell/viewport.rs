@@ -7223,6 +7223,16 @@ fn TerminalCanvas(
             // [F1-(e)] the synthesis output fence: Some while the seed
             // snapshot is outstanding — see SynthOutputFence.
             let mut synth_output_fence: Option<SynthOutputFence> = None;
+            // [F1-(e-r1)-R2 sol r4] a fence released by the PRE_SELECT
+            // write site stages its ack-carrying flush HERE as a pinned,
+            // owned future polled by the release-flush select branch —
+            // persistent across select cancellations (removed only on
+            // completion), with the batch that broke it (that batch
+            // writes live only AFTER the released batches).
+            let mut synth_release_flush_future: Option<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+            > = None;
+            let mut synth_release_flush_batch: Option<String> = None;
             // [F1-(e-r1)] The seed's stream-cursor stamp, OUTLIVING the
             // fence: chunks at or below it are inside the seeded screen
             // forever on this mount, so a round that resolves after the
@@ -7518,7 +7528,8 @@ fn TerminalCanvas(
                         // [F1-(e)] the output fence owns ordering while the
                         // seed is outstanding — a retained batch returns
                         // here and is NOT written live.
-                        if !synth_output_fence_stage(
+                        let mut released_fence: Option<SynthOutputFence> = None;
+                        let retained_now = synth_output_fence_stage(
                             &mut synth_output_fence,
                             &host_id,
                             &data,
@@ -7526,7 +7537,27 @@ fn TerminalCanvas(
                             &trace_home,
                             cursor,
                             current_millis(),
-                        ) {
+                            &mut released_fence,
+                        );
+                        // [F1-(e-r1)-R2] a released fence's batches flush
+                        // AHEAD of this batch, each delivery acknowledged —
+                        // but this site lives in the PRE_SELECT body (the
+                        // input-starvation lock: no round trip may be
+                        // awaited here) and the eval future is !Send (no
+                        // tokio::spawn), so the release STAGES here as an
+                        // owned pinned future for the synth_release_flush
+                        // select branch (release precedes the batch that
+                        // broke the fence; one fence, one release, one
+                        // staged flush).
+                        if let Some(fence) = released_fence.take() {
+                            synth_release_flush_future = Some(stage_synth_release_flush(
+                                fence,
+                                &host_id,
+                                &session_path,
+                                &trace_home,
+                            ));
+                            synth_release_flush_batch = Some(data.clone());
+                        } else if !retained_now {
                             let _ = document::eval(&terminal_page_write_script(&host_id, &data));
                         }
                     } else {
@@ -12509,7 +12540,8 @@ fn TerminalCanvas(
                                     &session_path,
                                     &trace_home,
                                     "stale_runtime",
-                                );
+                                )
+                                .await;
                             }
                         } else {
                         let seed_bytes = synth_seed_text.len();
@@ -12768,7 +12800,8 @@ fn TerminalCanvas(
                                         &session_path,
                                         &trace_home,
                                         if seed_applied { "seed_ack" } else { "seed_unapplied" },
-                                    );
+                                    )
+                                    .await;
                                 }
                             }
                             None => {
@@ -12794,11 +12827,35 @@ fn TerminalCanvas(
                                         &session_path,
                                         &trace_home,
                                         "proof_unreadable",
-                                    );
+                                    )
+                                    .await;
                                 }
                             }
                         }
                     }
+                    // [F1-(e-r1)-R2 sol r4] the staged release flush: the
+                    // future PERSISTS in the loop local across select
+                    // cancellations (a take() inside the branch future
+                    // loses the fence the moment another branch wins —
+                    // sol's round-4 catch); it is removed ONLY on
+                    // completion, then the batch that broke the fence
+                    // writes live.
+                    synth_release_flush_done = async {
+                        synth_release_flush_future
+                            .as_mut()
+                            .expect("release flush armed")
+                            .await
+                    },
+                        if synth_release_flush_future.is_some() =>
+                    {
+                        synth_release_flush_future = None;
+                        if let Some(batch) = synth_release_flush_batch.take() {
+                            let _ = document::eval(&terminal_page_write_script(
+                                &host_id,
+                                &batch,
+                            ));
+                        }
+                    },
                     synth_hash_probe_answer = async {
                         synth_hash_probe_eval
                             .as_mut()
@@ -14833,8 +14890,12 @@ fn TerminalCanvas(
                                                         // a retained batch is already ordered
                                                         // behind the seed and must not go live
                                                         // (the fence owns its delivery).
-                                                        let write_sent_ok = if js_ready_synthesized
-                                                            && !synth_output_fence_stage(
+                                                        // [F1-(e-r1)-R2] a
+                                                        // released fence's batches flush AHEAD of this
+                                                        // batch, each delivery acknowledged.
+                                                        let mut released_fence: Option<SynthOutputFence> = None;
+                                                        let fence_retained = js_ready_synthesized
+                                                            && synth_output_fence_stage(
                                                                 &mut synth_output_fence,
                                                                 &host_id,
                                                                 &write,
@@ -14842,8 +14903,21 @@ fn TerminalCanvas(
                                                                 &trace_home,
                                                                 cursor,
                                                                 current_millis(),
-                                                            )
+                                                                &mut released_fence,
+                                                            );
+                                                        let write_sent_ok = if js_ready_synthesized
+                                                            && !fence_retained
                                                         {
+                                                            if let Some(fence) = released_fence.take() {
+                                                                flush_synth_output_fence_live(
+                                                                    fence,
+                                                                    &host_id,
+                                                                    &session_path,
+                                                                    &trace_home,
+                                                                    "release",
+                                                                )
+                                                                .await;
+                                                            }
                                                             let _ = document::eval(
                                                                 &terminal_page_write_script(
                                                                     &host_id,
@@ -15031,8 +15105,12 @@ fn TerminalCanvas(
                                                     // dead both ways.
                                                     // [F1-(e)] same fence-first check as the
                                                     // other mainline site.
-                                                    let write_sent_ok = if js_ready_synthesized
-                                                        && !synth_output_fence_stage(
+                                                    // [F1-(e-r1)-R2] a
+                                                    // released fence's batches flush AHEAD of this
+                                                    // batch, each delivery acknowledged.
+                                                    let mut released_fence: Option<SynthOutputFence> = None;
+                                                    let fence_retained = js_ready_synthesized
+                                                        && synth_output_fence_stage(
                                                             &mut synth_output_fence,
                                                             &host_id,
                                                             &write,
@@ -15040,8 +15118,21 @@ fn TerminalCanvas(
                                                             &trace_home,
                                                             cursor,
                                                             current_millis(),
-                                                        )
+                                                            &mut released_fence,
+                                                        );
+                                                    let write_sent_ok = if js_ready_synthesized
+                                                        && !fence_retained
                                                     {
+                                                        if let Some(fence) = released_fence.take() {
+                                                            flush_synth_output_fence_live(
+                                                                fence,
+                                                                &host_id,
+                                                                &session_path,
+                                                                &trace_home,
+                                                                "release",
+                                                            )
+                                                            .await;
+                                                        }
                                                         let _ = document::eval(
                                                             &terminal_page_write_script(
                                                                 &host_id,
@@ -21303,6 +21394,85 @@ fn spawn_screen_reconcile_fetch(
 /// live output (measured: fence-rig RED — the marker erased).
 const SYNTH_OUTPUT_FENCE_MAX_RETAINED_BYTES: usize = 512 * 1024;
 const SYNTH_OUTPUT_FENCE_DEADLINE_MS: u64 = 30_000;
+/// [F1-(e-r1)-R2] The bounded wait for one flush batch's page-write ack:
+/// a dead bridge must never wedge the mount loop, and a healthy ack
+/// answers in milliseconds.
+const SYNTH_OUTPUT_FENCE_FLUSH_ACK_TIMEOUT_MS: u64 = 3_000;
+
+/// [F1-(e-r1)-R2] TEST HOOK (rig MODE=flushshed): drops the fence's
+/// flush page-write eval at the transport choke — the deterministic
+/// form of the production shed (a missing host / dead bridge consuming
+/// the flush silently). Mirrors YGGTERM_TEST_SEED_FORCED_SKIP semantics.
+fn synth_fence_flush_eval_shed() -> bool {
+    std::env::var("YGGTERM_TEST_FLUSH_EVAL_DROP")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// [F1-(e-r1)-R2 sol r4] the ack-timeout bound, overridable for the
+/// rig's positive-control arm (a RETAINED future must outlive the
+/// delayed execution to prove the continuation mechanism).
+fn synth_fence_flush_ack_timeout_ms() -> u64 {
+    std::env::var("YGGTERM_TEST_FLUSH_ACK_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SYNTH_OUTPUT_FENCE_FLUSH_ACK_TIMEOUT_MS)
+}
+
+/// [F1-(e-r1)-R2] (sol Q1) One flush batch's delivery verdict.
+enum FenceFlushDelivery {
+    Acked,
+    Undelivered(&'static str),
+}
+
+/// [F1-(e-r1)-R2] (sol Q1) The fence's flush write transport — BOTH
+/// flush paths (the explicit-failure live flush and the
+/// deadline/overflow release) write through here, one eval per batch
+/// whose script awaits the term's write callback and returns the
+/// verdict across the bridge: "keep bytes until a page-write ack".
+/// Undelivered names the transport verdict (the rig's shed hook, a
+/// missing host, a thrown write, or the bounded await expiring — a dead
+/// bridge must never wedge the mount loop).
+async fn fence_page_write_eval_acked(host_id: &str, batch: &str) -> FenceFlushDelivery {
+    if synth_fence_flush_eval_shed() {
+        return FenceFlushDelivery::Undelivered("shed_hook");
+    }
+    let eval = document::eval(&terminal_page_write_acked_script(host_id, batch));
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_millis(synth_fence_flush_ack_timeout_ms()),
+        eval,
+    )
+    .await;
+    // [sol r4] reason honesty: the timeout, a bridge error, and a
+    // malformed answer are DIFFERENT failures — one ack_timeout label
+    // for all three hid the first from every trace reader.
+    let verdict = match answer {
+        Ok(Ok(value)) => value
+            .as_str()
+            .and_then(|body| serde_json::from_str::<Value>(body).ok()),
+        Ok(Err(_error)) => Some(json!({ "ok": false, "reason": "bridge_error" })),
+        Err(_elapsed) => Some(json!({ "ok": false, "reason": "ack_timeout" })),
+    };
+    match verdict
+        .as_ref()
+        .and_then(|body| body.get("ok").and_then(Value::as_bool))
+    {
+        Some(true) => FenceFlushDelivery::Acked,
+        Some(false) | None => {
+            let reason = verdict
+                .as_ref()
+                .and_then(|body| body.get("reason").and_then(Value::as_str));
+            match reason {
+                Some("no_host") => FenceFlushDelivery::Undelivered("no_host"),
+                Some("throw") => FenceFlushDelivery::Undelivered("throw"),
+                Some("bridge_error") => FenceFlushDelivery::Undelivered("bridge_error"),
+                Some("ack_timeout") => FenceFlushDelivery::Undelivered("ack_timeout"),
+                Some("superseded") => FenceFlushDelivery::Undelivered("superseded"),
+                _ => FenceFlushDelivery::Undelivered("bad_answer"),
+            }
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct SynthOutputFence {
@@ -21317,6 +21487,9 @@ struct SynthOutputFence {
     /// is already inside the seeded screen. Zero = seed not arrived (or
     /// an old daemon that cannot answer) — dedupe fails open.
     seed_output_seq: u64,
+    /// [F1-(e-r1)-R2] Why the fence released ("deadline"/"overflow");
+    /// empty while armed — carried to the caller's ack-carrying flush.
+    release_reason: &'static str,
 }
 
 impl SynthOutputFence {
@@ -21326,6 +21499,7 @@ impl SynthOutputFence {
             retained_bytes: 0,
             armed_at_ms: now_ms,
             seed_output_seq: 0,
+            release_reason: "",
         }
     }
 
@@ -21390,17 +21564,46 @@ fn synth_seed_application_acked(proof: &Value) -> bool {
 /// never came (seed skipped, proof unreadable, or the seed belonged to a
 /// replaced runtime). Nothing covers the retained bytes, so they all
 /// flush LIVE, in order, through the same page-write eval the live sites
-/// use — ordering against the page may be imperfect, but no retained
-/// byte is lost.
-fn flush_synth_output_fence_live(
+/// use — ordering against the page may be imperfect.
+/// [F1-(e-r1)-R2] (sol Q1) every flushed batch now carries a page-write
+/// ACK (the write callback the seed's proof uses): every retained byte
+/// is either DELIVERY-ACKNOWLEDGED or EXPLICITLY reported undelivered
+/// (synth_output_fence_flush_undelivered) — never silently consumed; the
+/// daemon ring+screen keep every byte and the reconciles remain the
+/// recovery path.
+async fn flush_synth_output_fence_live(
     fence: SynthOutputFence,
     host_id: &str,
     session_path: &str,
     trace_home: &Path,
     reason: &str,
 ) {
+    let mut acked_batches = 0usize;
+    let mut acked_bytes = 0usize;
+    let mut undelivered_batches = 0usize;
+    let mut undelivered_bytes = 0usize;
+    let mut first_reason = "";
     for (batch, _) in &fence.retained {
-        let _ = document::eval(&terminal_page_write_script(host_id, batch));
+        if undelivered_batches > 0 {
+            // [F1-(e-r1)-R2] first-failure bail: a no-host / timeout
+            // verdict is page-global — the remaining batches are marked
+            // undelivered without re-attempting (bounded stall, honest
+            // accounting).
+            undelivered_batches += 1;
+            undelivered_bytes += batch.len();
+            continue;
+        }
+        match fence_page_write_eval_acked(host_id, batch).await {
+            FenceFlushDelivery::Acked => {
+                acked_batches += 1;
+                acked_bytes += batch.len();
+            }
+            FenceFlushDelivery::Undelivered(why) => {
+                first_reason = why;
+                undelivered_batches = 1;
+                undelivered_bytes = batch.len();
+            }
+        }
     }
     if !fence.retained.is_empty() {
         append_trace_event(
@@ -21413,15 +21616,49 @@ fn flush_synth_output_fence_live(
                 "batches": fence.retained.len(),
                 "bytes": fence.retained_bytes,
                 "reason": reason,
-                // [F1-(e-r1)-R1] (sol Q1): these writes are fire-and-
-                // forget evals — the flush PRESERVES the bytes but their
-                // DELIVERY is unacknowledged (a missing host consumes
-                // them silently). An ack-carrying flush (write callbacks
-                // per batch) is the filed next unit on this line.
-                "delivery_acked": false,
+                // [F1-(e-r1)-R2] (sol Q1): delivery_acked:true only
+                // when every retained batch acknowledged.
+                "acked_batches": acked_batches,
+                "acked_bytes": acked_bytes,
+                "undelivered_batches": undelivered_batches,
+                "undelivered_bytes": undelivered_bytes,
+                "delivery_acked": undelivered_batches == 0,
             }),
         );
+        if undelivered_batches > 0 {
+            append_trace_event(
+                trace_home,
+                "ui",
+                "terminal_mount",
+                "synth_output_fence_flush_undelivered",
+                json!({
+                    "session_path": session_path,
+                    "batches": undelivered_batches,
+                    "bytes": undelivered_bytes,
+                    "first_reason": first_reason,
+                    "flush_reason": reason,
+                }),
+            );
+        }
     }
+}
+
+/// [F1-(e-r1)-R2 sol r4] Stage the release flush as an OWNED pinned
+/// future for the release-flush select branch — defined as a fn (not an
+/// inline async block) so the pre_select body carries no `.await` text
+/// (the input-starvation lock scans the region's source).
+fn stage_synth_release_flush(
+    fence: SynthOutputFence,
+    host_id: &str,
+    session_path: &str,
+    trace_home: &Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    let host = host_id.to_string();
+    let session = session_path.to_string();
+    let trace = trace_home.to_path_buf();
+    Box::pin(async move {
+        flush_synth_output_fence_live(fence, &host, &session, &trace, "release").await;
+    })
 }
 
 /// One write batch's fence decision at a synthesized output site. True =
@@ -21440,6 +21677,7 @@ fn synth_output_fence_stage(
     trace_home: &Path,
     daemon_cursor_now: u64,
     now_ms: u64,
+    released: &mut Option<SynthOutputFence>,
 ) -> bool {
     let expired = fence
         .as_ref()
@@ -21466,10 +21704,12 @@ fn synth_output_fence_stage(
         // through the same page write eval ahead of this batch; a seed that
         // lands after this uses the guarded-append backstop (its rx reads
         // the fence as already down).
-        if let Some(current) = fence.take() {
-            for (batch, _) in &current.retained {
-                let _ = document::eval(&terminal_page_write_script(host_id, batch));
-            }
+        // [F1-(e-r1)-R2] the release's flush itself is handed to the
+        // CALLER: the release write is now ack-carrying and must run in
+        // the loop's async context, AHEAD of this batch's live write —
+        // the fence (with its release reason) rides `released`.
+        if let Some(mut current) = fence.take() {
+            current.release_reason = if expired { "deadline" } else { "overflow" };
             append_trace_event(
                 trace_home,
                 "ui",
@@ -21477,11 +21717,12 @@ fn synth_output_fence_stage(
                 "synth_output_fence_released_live",
                 json!({
                     "session_path": session_path,
-                    "reason": if expired { "deadline" } else { "overflow" },
+                    "reason": current.release_reason,
                     "batches": current.retained.len(),
                     "bytes": current.retained_bytes,
                 }),
             );
+            *released = Some(current);
         }
     }
     false

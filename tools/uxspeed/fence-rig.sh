@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ]; then echo "MODE must be order|dup|loss"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -70,11 +70,20 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
   CAPT_EXPORT=""
-  if [ "$MODE" = dup ] || [ "$MODE" = loss ]; then
+  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ]; then
     CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
   fi
-  if [ "$MODE" = loss ]; then
+  if [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ]; then
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SEED_FORCED_SKIP=1;"
+  fi
+  if [ "$MODE" = flushshed ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EVAL_DROP=1;"
+  fi
+  if [ "$MODE" = lateflush ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000;"
+  fi
+  if [ "$MODE" = latecontrol ]; then
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000 YGGTERM_TEST_FLUSH_SUPERSESSION_OFF=1;"
   fi
   if [ "$SYNTH" = 1 ]; then
     dbus-run-session -- bash -c "
@@ -271,6 +280,218 @@ if MODE == "loss":
         raise SystemExit(fail_rc)
     print("RIG PASS — no ack, no drop: the unapplied seed preserved and delivered every retained byte live")
     raise SystemExit(0)
+
+if MODE == "flushshed":
+    # (e-r1)-R2 BAR 6 — THE DELIVERY-HONESTY BAR (sitting 22, sol Q1
+    # remainder): the flush TRANSPORT is shed by the choke hook
+    # (YGGTERM_TEST_FLUSH_EVAL_DROP — the deterministic missing-host /
+    # dead-bridge shape) while the fence holds the marker batch. The
+    # bytes CANNOT reach the page through the write path; the bar is
+    # whether the build TELLS THE TRUTH about that. RED (fire-and-forget
+    # flush): the flushed event claims batches/bytes and NOTHING names
+    # the loss — a silent data-loss surface (exit 11). GREEN
+    # (ack-carrying flush): synth_output_fence_flush_undelivered names
+    # every undelivered batch/byte and no flush event claims
+    # delivery_acked:true.
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    samples = []
+    for delay in (0.15, 0.5, 1.0):
+        time.sleep(delay)
+        c, _ = page_screen_count(s, "E1RMARK")
+        samples.append(c)
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    undelivered_events = session_events(events, s, "synth_output_fence_flush_undelivered")
+    unapplied_events = session_events(events, s, "synth_output_fence_seed_unapplied")
+    flushed_total = sum(int(p.get("bytes") or 0) for _, p in flush_events)
+    flushed_acked = sum(int(p.get("acked_bytes") or 0) for _, p in flush_events)
+    undelivered_total = sum(int(p.get("bytes") or 0) for _, p in undelivered_events)
+    false_ack = [p for _, p in flush_events if p.get("delivery_acked") is True]
+    print("VERDICT FENCE-FLUSHSHED: samples=%s daemon=%d (marker reaches the page only via the reconcile heal, if at all)" % (samples, daemon_count))
+    print("   flush=%dB/%d acked=%dB undelivered=%dB/%d unapplied=%d false_ack=%d" % (
+        flushed_total, len(flush_events), flushed_acked, undelivered_total, len(undelivered_events), len(unapplied_events), len(false_ack)))
+    fail_rc = 0
+    if not unapplied_events:
+        print("VERDICT FAIL: unapplied trace missing — rig shape broke (a shed transport must still trace the explicit failure)")
+        fail_rc = fail_rc or 6
+    elif not flush_events or flushed_total < 9:
+        print("VERDICT FAIL: the fence never flushed through the choke (flush=%dB)" % flushed_total)
+        fail_rc = fail_rc or 6
+    elif not undelivered_events or undelivered_total < 9:
+        print("VERDICT RED CONFIRMED: the flushed transport was SHED (%dB claimed flushed, %d acked) and NOTHING names the loss — the fire-and-forget flush consumes retained bytes silently (the s21 delivery_acked:false was the honest stopgap, not a delivery proof)" % (flushed_total, flushed_acked))
+        fail_rc = fail_rc or 11
+    elif false_ack:
+        print("VERDICT FAIL: a flush event claims delivery_acked:true while the transport was shed")
+        fail_rc = fail_rc or 6
+    else:
+        print("   undelivered evidence: %s" % json.dumps({k: undelivered_events[-1][1].get(k) for k in ("batches", "bytes", "first_reason")}))
+    if fail_rc:
+        print("RIG FAIL rc=%d — verdicts above" % fail_rc)
+        raise SystemExit(fail_rc)
+    print("RIG PASS — the shed flush is NAMED: every undelivered batch/byte traced, no false delivery claim")
+    raise SystemExit(0)
+
+if MODE == "lateflush":
+    # (e-r1)-R2 BAR 7 — THE LATE-MUTATION BAR (sol Q3, round 3): the
+    # flush evals EXECUTE past the caller's 3s ack timeout (the
+    # delayed-exec hook YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000) while the
+    # frame-hash/reveal reconcile repaint — which already contains the
+    # retained bytes — lands first. The caller declared the batches
+    # undelivered at the timeout; the surviving scripts are STALE
+    # MUTATIONS. RED (no supersession guard): the late script appends
+    # the retained bytes over the repainted screen (page marker count
+    # DOUBLES — exit 12, the late-mutation duplication). GREEN (the
+    # supersession epoch rejects the stale write page-side): the page
+    # holds exactly the repaint's one copy through the late window.
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    # wait for the reconcile repaint to land (the recovery path the
+    # undelivered bytes ride — the daemon screen contains the marker)
+    deadline = time.time() + 12
+    repainted = 0
+    while time.time() < deadline:
+        c, _ = page_screen_count(s, "E1RMARK")
+        if c >= 1:
+            repainted = c
+            break
+        time.sleep(0.3)
+    print("repaint landed: page=%d" % repainted)
+    if repainted < 1:
+        print("PRE-FLIGHT FAIL: the reconcile repaint never landed inside 12s — the recovery path did not fire")
+        raise SystemExit(4)
+    # the late flush would execute at flush-start+5000ms (~proof+5s; the
+    # repaint lands ~proof+2s). ⛔ MASKED-AT-REST LAW (sitting 18): a
+    # duplication re-heals within ~2s — sampling AFTER the re-heal is a
+    # vacuous pass. Sample DENSELY inside the post-late-write window
+    # (repaint+3.2s ≈ the late write + margin, then every 300ms) and
+    # count the reconcile-applied events too: a second applied event =
+    # the late write corrupted and healed = still a late mutation.
+    time.sleep(3.2)
+    counts = []
+    for _ in range(9):
+        c, _ = page_screen_count(s, "E1RMARK")
+        counts.append(c)
+        time.sleep(0.3)
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    undelivered_events = session_events(events, s, "synth_output_fence_flush_undelivered")
+    unapplied_events = session_events(events, s, "synth_output_fence_seed_unapplied")
+    reconcile_applied = len(
+        [1 for _, name, p in events
+         if name == "frame_hash_reconcile_applied" and p.get("session_path") == s])
+    flushed_total = sum(int(p.get("bytes") or 0) for _, p in flush_events)
+    undelivered_total = sum(int(p.get("bytes") or 0) for _, p in undelivered_events)
+    false_ack = [p for _, p in flush_events if p.get("delivery_acked") is True]
+    first_reason = undelivered_events[-1][1].get("first_reason") if undelivered_events else None
+    print("VERDICT FENCE-LATEFLUSH: repaint=%d late-window counts=%s daemon=%d reconcile_applied=%d first_reason=%s" % (
+        repainted, counts, daemon_count, reconcile_applied, first_reason))
+    print("   flush=%dB/%d undelivered=%dB/%d unapplied=%d false_ack=%d" % (
+        flushed_total, len(flush_events), undelivered_total, len(undelivered_events), len(unapplied_events), len(false_ack)))
+    fail_rc = 0
+    if not unapplied_events:
+        print("VERDICT FAIL: unapplied trace missing — rig shape broke")
+        fail_rc = fail_rc or 6
+    elif not undelivered_events or undelivered_total < 9 or first_reason != "ack_timeout":
+        print("VERDICT FAIL: the timed-out flush never reported undelivered with ack_timeout (undelivered=%dB first_reason=%s)" % (undelivered_total, first_reason))
+        fail_rc = fail_rc or 6
+    elif false_ack:
+        print("VERDICT FAIL: a flush event claims delivery_acked:true while every await timed out")
+        fail_rc = fail_rc or 6
+    elif repainted != 1 or any(c != 1 for c in counts) or reconcile_applied != 1:
+        # [sol r5] EXACT-COUNT bar: disappearance (0), duplication (>1),
+        # and extra heals are ALL failures — max()>1 accepted a vanished
+        # marker.
+        print("VERDICT RED CONFIRMED: the late window is not exactly the repaint's one copy — counts=%s repaint=%d reconcile_applied=%d (disappearance, duplication, or an extra heal; sol Q3's late-mutation family)" % (counts, repainted, reconcile_applied))
+        fail_rc = fail_rc or 12
+    else:
+        print("   honest accounting: undelivered %dB named; the page holds exactly the repaint's copy" % undelivered_total)
+    if fail_rc:
+        print("RIG FAIL rc=%d — verdicts above" % fail_rc)
+        raise SystemExit(fail_rc)
+    print("RIG PASS — no late mutation observed: page exactly the repaint's one copy at every dense sample, the timeout reported undelivered")
+    raise SystemExit(0)
+
+if MODE == "latecontrol":
+    # (e-r1)-R2 BAR 8 — THE POSITIVE CONTROL (sol r4, reshaped by
+    # measurement): the caller times out at the DEFAULT 3s and DROPS
+    # the future — the loop resumes, the reconcile repaints the marker
+    # (~+4s) — and the guard-OFF delayed continuation writes at ~+5s,
+    # OVER the repaint. PASS = the duplication observed (page count >1
+    # in the dense post-late-write window OR a second reconcile heal):
+    # the post-drop continuation mechanism is live, and the lateflush
+    # bar's safety is the GUARD's, not drop-abort folklore. (A RETAINED
+    # 10s future was measured NOT to construct the hazard: the inline
+    # flush branch holds the loop, no repaint precedes the late write,
+    # and it delivers as the sole writer — acked 204B, count 1.)
+    proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    deadline = time.time() + 12
+    repainted = 0
+    while time.time() < deadline:
+        c, _ = page_screen_count(s, "E1RMARK")
+        if c >= 1:
+            repainted = c
+            break
+        time.sleep(0.3)
+    print("repaint landed: page=%d" % repainted)
+    if repainted < 1:
+        print("PRE-FLIGHT FAIL: the reconcile repaint never landed inside 12s")
+        raise SystemExit(4)
+    # the guard-off continuation writes at ~flush+5s (the repaint lands
+    # ~+4s, after the 3s timeout frees the loop); the re-heal follows
+    # ~2s later — dense sampling INSIDE the window (masked-at-rest law)
+    time.sleep(1.0)
+    counts = []
+    for _ in range(10):
+        c, _ = page_screen_count(s, "E1RMARK")
+        counts.append(c)
+        time.sleep(0.3)
+    daemon_count = daemon_screen_count(s, "E1RMARK")
+    assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
+    events = read_events()
+    flush_events = session_events(events, s, "synth_output_fence_flushed")
+    undelivered_events = session_events(events, s, "synth_output_fence_flush_undelivered")
+    undelivered_total = sum(int(p.get("bytes") or 0) for _, p in undelivered_events)
+    reconcile_applied = len(
+        [1 for _, name, p in events
+         if name == "frame_hash_reconcile_applied" and p.get("session_path") == s])
+    print("VERDICT FENCE-LATECONTROL: repaint=%d dense counts=%s reconcile_applied=%d undelivered=%dB" % (
+        repainted, counts, reconcile_applied, undelivered_total))
+    if max(counts) > 1 or repainted > 1 or reconcile_applied > 1:
+        print("RIG PASS — the post-drop continuation DEMONSTRABLY writes over the repaint (duplication observed with the guard OFF): the mechanism is live, the lateflush bar's safety is the GUARD's")
+        raise SystemExit(0)
+    if undelivered_total < 9:
+        print("VERDICT FAIL: no duplication AND no undelivered trace — the flush shape broke entirely")
+        raise SystemExit(6)
+    # [sol r5] validity before classifying suppression: the recovery must
+    # be on record (exactly one repaint, a heal applied) and every dense
+    # sample exactly 1 — otherwise this is a broken shape, not evidence.
+    if repainted != 1 or reconcile_applied < 1 or any(c != 1 for c in counts):
+        print("VERDICT FAIL: cannot classify — recovery not on record or the window is not exactly one copy (repaint=%d reconcile_applied=%d counts=%s)" % (repainted, reconcile_applied, counts))
+        raise SystemExit(6)
+    # MEASUREMENT ARM (not a landing gate): paired with the retained-
+    # future run (delayed write fired, acked, sole-writer), this is the
+    # drop-suppression pair — the post-drop continuation did NOT write
+    # (measured 2026-10-08, two shapes). The supersession guard stays
+    # as defense-in-depth regardless (no source-level cancellation
+    # guarantee; a bridge upgrade that starts executing dropped scripts
+    # turns this arm's exit 5 into exit 0 — and lateflush then guards).
+    print("CONTROL MEASUREMENT: the flush timed out undelivered (%dB), the repaint holds exactly one copy, and the guard-OFF post-drop continuation did NOT write — drop-suppression observed on this bridge (exit 5 = suppressed, 0 = duplication proven)" % undelivered_total)
+    raise SystemExit(5)
 
 # (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
 # a duplicated frame within ~2s of the proof (measured RED run 4: flush
