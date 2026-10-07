@@ -7237,6 +7237,10 @@ fn TerminalCanvas(
             // application (wrote_seed>0 — xterm's write callback fired).
             // Zero = nothing pending.
             let mut synth_pending_seed_seq: u64 = 0;
+            // [F1-(e-r1)-R2] (sol Q3): the daemon CAPTURE-TIME runtime id
+            // the seed carried — 0 (an old daemon) means continuity is
+            // UNKNOWN, which may render but never commits a coverage drop.
+            let mut synth_pending_seed_runtime: u64 = 0;
             let mut synth_proof_eval: Option<
                 std::pin::Pin<
                     Box<dyn Future<Output = Result<Value, dioxus::document::EvalError>>>,
@@ -12408,12 +12412,6 @@ fn TerminalCanvas(
                                 let snap_trace_home = trace_home.clone();
                                 let snap_tx = synth_snapshot_tx.clone();
                                 let snap_trace_session = session_path.clone();
-                                // [F1-(e-r1)-R2] The runtime id known when
-                                // the seed was REQUESTED rides the answer —
-                                // the arrival arm discards a seed whose
-                                // runtime was replaced while it was
-                                // outstanding.
-                                let snap_requested_runtime = known_runtime_spawn_id;
                                 let snap_stall_ms = std::env::var(
                                     "YGGTERM_TEST_STALL_SNAPSHOT_FETCH_MS",
                                 )
@@ -12431,7 +12429,15 @@ fn TerminalCanvas(
                                         (
                                             sanitize_terminal_replay_payload(&answer.text),
                                             answer.output_seq,
-                                            snap_requested_runtime,
+                                            // [F1-(e-r1)-R2] (sol Q3): the
+                                            // daemon's CAPTURE-TIME runtime
+                                            // identity — already on the wire
+                                            // ([11.229](b)) — qualifies the
+                                            // seed's seq space at the
+                                            // source, independent of what
+                                            // the client has polled by the
+                                            // time the answer lands.
+                                            answer.runtime_spawn_id,
                                         )
                                     })
                                     .unwrap_or_default();
@@ -12469,15 +12475,17 @@ fn TerminalCanvas(
                             &session_path,
                         );
                         // [F1-(e-r1)-R2] RUNTIME-QUALIFIED SEED: the fetch
-                        // carried the runtime id known at REQUEST time. A
-                        // KNOWN id that no longer matches means the runtime
-                        // was replaced while the seed was outstanding — its
-                        // seq stamp would classify NEW-runtime batches under
+                        // carries the daemon's CAPTURE-TIME runtime id. A
+                        // KNOWN capture id that no longer matches the
+                        // client's CURRENT knowledge means the runtime was
+                        // replaced while the seed was outstanding — its seq
+                        // stamp would classify NEW-runtime batches under
                         // OLD-runtime coverage. Discard it and fail
-                        // explicitly (flush everything live); an UNKNOWN
-                        // request-time id (0 — no stream answer yet) fails
-                        // OPEN.
+                        // explicitly (flush everything live); an unknown
+                        // capture id (0 — an old daemon) fails OPEN for
+                        // rendering but can never commit a drop.
                         if synth_seed_runtime != 0
+                            && known_runtime_spawn_id != 0
                             && synth_seed_runtime != known_runtime_spawn_id
                         {
                             append_trace_event(
@@ -12493,6 +12501,7 @@ fn TerminalCanvas(
                                 }),
                             );
                             synth_pending_seed_seq = 0;
+                            synth_pending_seed_runtime = 0;
                             if let Some(fence) = synth_output_fence.take() {
                                 flush_synth_output_fence_live(
                                     fence,
@@ -12517,6 +12526,7 @@ fn TerminalCanvas(
                         // this fence was built to kill (sol R1).
                         if synth_seed_output_seq > 0 {
                             synth_pending_seed_seq = synth_seed_output_seq;
+                            synth_pending_seed_runtime = synth_seed_runtime;
                             if let Some(fence) = synth_output_fence.as_mut() {
                                 fence.seed_output_seq = synth_seed_output_seq;
                             }
@@ -12554,7 +12564,14 @@ fn TerminalCanvas(
                         synth_proof_eval = Some(Box::pin(
                             document::eval(&terminal_synthesized_mount_open_script(
                                 &host_id,
-                                if synth_seed_text.trim().is_empty() {
+                                // [F1-(e-r1)-R1] (sol Q2): blank text
+                                // WITH a stamp is a VALID blank screen —
+                                // it must apply as an empty repaint, not
+                                // skip; only blank AND seq 0 (the fetch
+                                // failed / old daemon) is a None seed.
+                                if synth_seed_text.trim().is_empty()
+                                    && synth_seed_output_seq == 0
+                                {
                                     None
                                 } else {
                                     Some(&synth_seed_text)
@@ -12693,6 +12710,26 @@ fn TerminalCanvas(
                                             "pending_seed_seq": synth_pending_seed_seq,
                                         }),
                                     );
+                                } else if synth_pending_seed_seq > 0
+                                    && seed_applied
+                                    && synth_pending_seed_runtime == 0
+                                {
+                                    // [F1-(e-r1)-R2] (sol Q3): the seed
+                                    // applied (it renders above) but its
+                                    // capture-time runtime id is UNKNOWN
+                                    // (an old daemon never sent one) — the
+                                    // stamp's seq space is unproven, so
+                                    // the dedupe stays disarmed.
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "synth_seed_unknown_runtime_no_commit",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "pending_seed_seq": synth_pending_seed_seq,
+                                        }),
+                                    );
                                 } else if synth_pending_seed_seq > 0 && seed_applied {
                                     synth_seed_stamp = synth_pending_seed_seq;
                                     if let Some(fence) = synth_output_fence.as_mut() {
@@ -12715,6 +12752,7 @@ fn TerminalCanvas(
                                     }
                                 }
                                 synth_pending_seed_seq = 0;
+                                synth_pending_seed_runtime = 0;
                                 // [F1-(e)] THE FENCE FLUSH: on an ack, the
                                 // authoritative screen is IN and the
                                 // surviving differentials replay past it,
@@ -13490,6 +13528,7 @@ fn TerminalCanvas(
                                     // runtime qualification).
                                     synth_seed_stamp = 0;
                                     synth_pending_seed_seq = 0;
+                                    synth_pending_seed_runtime = 0;
                                 }
                                 known_runtime_spawn_id = runtime_spawn_id;
                                 // [11.167] A runtime START under this watch is a
@@ -13693,10 +13732,15 @@ fn TerminalCanvas(
                                     // continuity break: the daemon replays
                                     // a stream range the seed's seq stamp
                                     // may no longer describe. Fail OPEN —
-                                    // clear it (the stamp's comment has
-                                    // claimed this since sitting 18); a
-                                    // fresh seed re-stamps at its own ack.
+                                    // clear the stamp (its comment has
+                                    // claimed this since sitting 18) AND
+                                    // any still-pending provisional seed:
+                                    // an outstanding proof must not commit
+                                    // coverage the rewind invalidated
+                                    // (sol Q4).
                                     synth_seed_stamp = 0;
+                                    synth_pending_seed_seq = 0;
+                                    synth_pending_seed_runtime = 0;
                                     let _ = eval.send(terminal_reset_command(&title, &theme));
                                     let _ = eval.send(TerminalJsCommand::SetInputEnabled {
                                         enabled: false,
@@ -21369,6 +21413,12 @@ fn flush_synth_output_fence_live(
                 "batches": fence.retained.len(),
                 "bytes": fence.retained_bytes,
                 "reason": reason,
+                // [F1-(e-r1)-R1] (sol Q1): these writes are fire-and-
+                // forget evals — the flush PRESERVES the bytes but their
+                // DELIVERY is unacknowledged (a missing host consumes
+                // them silently). An ack-carrying flush (write callbacks
+                // per batch) is the filed next unit on this line.
+                "delivery_acked": false,
             }),
         );
     }

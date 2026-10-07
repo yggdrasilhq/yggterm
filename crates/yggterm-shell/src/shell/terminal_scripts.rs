@@ -577,9 +577,15 @@ if (__t && typeof __t.write === 'function' && __seed) {{
         // live output. Fenced, the seed REPLACES the frame; the
         // differentials retained behind the fence replay past it when
         // this proof returns (the write callback below IS the ack).
+        // [F1-(e-r1)-R1] (sol Q2): a VALID BLANK seed (empty text with a
+        // stamped seq — the daemon answered an empty screen) acks too:
+        // the repaint's own control bytes are the write, so the clear
+        // the blank represents is APPLIED and coverage may commit
+        // against it (replaying pre-blank retained bytes over an
+        // unacked blank would resurrect erased content).
         __t.write('\x1b[H\x1b[2J' + __seed);
         await new Promise((resolve) => __t.write('', resolve));
-        __wrote = __seed.length;
+        __wrote = '\x1b[H\x1b[2J'.length + __seed.length;
         __mode = 'fenced_repaint';
     }} else if (!__painted(__t)) {{
         __t.write(__seed);
