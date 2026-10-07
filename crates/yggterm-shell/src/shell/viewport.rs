@@ -2102,6 +2102,15 @@ fn bootstrap_skip_dedup_key(
 ) -> String {
     format!("{prefix}:{bootstrap_identity}:{latest_open_request_id}")
 }
+/// (r-j1)/(r-j2) The render latch holds `identity:open_request_id` since the
+/// repeat-selection fix, so "was the latch set by THIS bootstrap" is a prefix
+/// question, not equality — the async recovery watch's old `latch == identity`
+/// check never matched the combined key again, and a genuine recovery on that
+/// path left the latch set (no successor bootstrap until a user re-select
+/// changed the open-request half). Both latch-clear sites use this.
+fn bootstrap_latch_belongs_to_bootstrap(latch: &str, bootstrap_identity: &str) -> bool {
+    latch == bootstrap_identity || latch.starts_with(&format!("{bootstrap_identity}:"))
+}
 fn terminal_session_should_bootstrap_host(
     shell: &ShellState,
     active_session_path: Option<&str>,
@@ -5687,6 +5696,48 @@ fn TerminalCanvas(
                 "bootstrap_generation": current_bootstrap_generation,
             }),
         );
+        // (r-j1)/(r-j2) VERIFY-OR-REARM — same watch as the async recovery
+        // path: this render already unlatched, so a successor bootstrap is
+        // scheduled next frame; if it dies silently in the creation-churn
+        // window, should_recover's gates (stable retained host, futile cap)
+        // can refuse forever — verify late once and rearm directly.
+        {
+            let rearm_state = state;
+            let rearm_latch = bootstrap_task_identity.clone();
+            let rearm_identity = bootstrap_identity.clone();
+            let rearm_session_path = session_path.clone();
+            let rearm_trace_home = trace_home.clone();
+            spawn(async move {
+                sleep(Duration::from_millis(STARTUP_TERMINAL_RESTORE_REARM_VERIFY_MS)).await;
+                let rearmed = safe_shell_mut(
+                    rearm_state,
+                    "startup_restore_rearm_watch",
+                    |shell| {
+                        shell.rearm_startup_terminal_restore_no_successor(
+                            &rearm_session_path,
+                            current_millis(),
+                        )
+                    },
+                )
+                .unwrap_or(false);
+                if rearmed {
+                    if bootstrap_latch_belongs_to_bootstrap(&rearm_latch.borrow(), &rearm_identity)
+                    {
+                        *rearm_latch.borrow_mut() = String::new();
+                    }
+                    append_trace_event(
+                        &rearm_trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "startup_restore_rearm_no_successor",
+                        json!({
+                            "session_path": rearm_session_path,
+                            "bootstrap_identity": rearm_identity,
+                        }),
+                    );
+                }
+            });
+        }
     }
     let bootstrap_owner_identity =
         format!("{}:{}", bootstrap_identity, bootstrap_owner_instance_id);
@@ -6226,9 +6277,10 @@ fn TerminalCanvas(
                     })
                     .unwrap_or(false);
                 if recovered {
-                    if *delayed_recovery_task_identity.borrow()
-                        == delayed_recovery_bootstrap_identity
-                    {
+                    if bootstrap_latch_belongs_to_bootstrap(
+                        &delayed_recovery_task_identity.borrow(),
+                        &delayed_recovery_bootstrap_identity,
+                    ) {
                         *delayed_recovery_task_identity.borrow_mut() = String::new();
                     }
                     append_trace_event(
@@ -6241,6 +6293,54 @@ fn TerminalCanvas(
                             "bootstrap_identity": delayed_recovery_bootstrap_identity,
                         }),
                     );
+                    // (r-j1)/(r-j2) VERIFY-OR-REARM: the recovery above presumes
+                    // the unlatched next render schedules a successor bootstrap;
+                    // when that successor dies too (creation-churn window),
+                    // should_recover's stable-host/futile-cap gates can refuse
+                    // forever and a user re-select was the only re-trigger.
+                    // Check liveness once, LATE (the successor's loop pumps its
+                    // first heartbeat pre-attach_ready well inside the window);
+                    // no successor ⇒ rearm directly and unlatch again.
+                    let rearm_state = state;
+                    let rearm_latch = delayed_recovery_task_identity.clone();
+                    let rearm_identity = delayed_recovery_bootstrap_identity.clone();
+                    let rearm_session_path = delayed_recovery_session_path.clone();
+                    let rearm_trace_home = delayed_recovery_trace_home.clone();
+                    spawn(async move {
+                        sleep(Duration::from_millis(
+                            STARTUP_TERMINAL_RESTORE_REARM_VERIFY_MS,
+                        ))
+                        .await;
+                        let rearmed = safe_shell_mut(
+                            rearm_state,
+                            "startup_restore_rearm_watch",
+                            |shell| {
+                                shell.rearm_startup_terminal_restore_no_successor(
+                                    &rearm_session_path,
+                                    current_millis(),
+                                )
+                            },
+                        )
+                        .unwrap_or(false);
+                        if rearmed {
+                            if bootstrap_latch_belongs_to_bootstrap(
+                                &rearm_latch.borrow(),
+                                &rearm_identity,
+                            ) {
+                                *rearm_latch.borrow_mut() = String::new();
+                            }
+                            append_trace_event(
+                                &rearm_trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "startup_restore_rearm_no_successor",
+                                json!({
+                                    "session_path": rearm_session_path,
+                                    "bootstrap_identity": rearm_identity,
+                                }),
+                            );
+                        }
+                    });
                 }
             });
         }
@@ -7274,9 +7374,20 @@ fn TerminalCanvas(
                 trace_home: trace_home.clone(),
                 state,
                 arm_remount: std::cell::Cell::new(false),
+                bootstrap_owner_identity: bootstrap_owner_identity.clone(),
             };
+            // (r-j1)/(r-j2) RIG HOOK — armed once per task start; the bare
+            // break below fires on the first iteration wake past the armed
+            // deadline, before any named exit arm: the silent death shape.
+            let silent_death_deadline: Option<tokio::time::Instant> =
+                take_silent_loop_death_token(&session_path);
             loop {
                 bump_terminal_loop_heartbeat(&session_path);
+                if let Some(deadline) = silent_death_deadline
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    break;
+                }
                 // The PRE-SELECT body (focus bookkeeping, bridge flush, screen
                 // reconcile — including a daemon snapshot round trip when a
                 // reconcile is due) runs before any branch can be polled, so a
@@ -19422,16 +19533,85 @@ const TERMINAL_LOOP_WATCHDOG_TICK_MS: u64 = 5_000;
 fn ensure_terminal_loop_watchdog(mut state: Signal<ShellState>) {
     static TERMINAL_LOOP_WATCHDOG_STARTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    if TERMINAL_LOOP_WATCHDOG_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    // (r-j2) ⛔ LIVENESS-WARE LATCH — the bare spawn-once bool above was a
+    // process-lifetime promise a component-scoped task could not keep: the
+    // FIRST TerminalCanvas render spawned the watchdog, the startup-restore
+    // tree rebuild DROPPED that task (measured, rj2-rig boot-2:
+    // terminal_loop_watchdog_first_tick never traced while a death-stamped
+    // corpse sat undetected for 80 s), and the latch stayed set so no later
+    // render could re-arm it. The task now stamps this clock at birth and
+    // on every tick; any render that finds the clock stale re-arms it. A
+    // live task re-arms nothing (its tick keeps the clock fresh); two
+    // tasks cannot accumulate (the stale window is 3 ticks).
+    static TERMINAL_LOOP_WATCHDOG_LAST_TICK_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    const WATCHDOG_STALE_REARM_MS: u64 = 3 * TERMINAL_LOOP_WATCHDOG_TICK_MS;
+    let started = TERMINAL_LOOP_WATCHDOG_STARTED.load(std::sync::atomic::Ordering::SeqCst);
+    let last_tick = TERMINAL_LOOP_WATCHDOG_LAST_TICK_MS.load(std::sync::atomic::Ordering::SeqCst);
+    let now = current_millis();
+    let stale_task = last_tick != 0 && now.saturating_sub(last_tick) > WATCHDOG_STALE_REARM_MS;
+    if started && !stale_task {
         return;
     }
+    TERMINAL_LOOP_WATCHDOG_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if stale_task {
+        let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "terminal_loop_watchdog_rearmed_after_scope_death",
+            json!({ "last_tick_ms": last_tick, "now_ms": now }),
+        );
+    }
     spawn(async move {
+        let mut tick: u64 = 0;
+        TERMINAL_LOOP_WATCHDOG_LAST_TICK_MS.store(current_millis(), std::sync::atomic::Ordering::SeqCst);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(
                 TERMINAL_LOOP_WATCHDOG_TICK_MS,
             ))
             .await;
-            let stale = state.with(|shell| shell.terminal_loop_stale_watch_sessions());
+            tick += 1;
+            TERMINAL_LOOP_WATCHDOG_LAST_TICK_MS.store(current_millis(), std::sync::atomic::Ordering::SeqCst);
+            if tick == 1 {
+                let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "terminal_loop_watchdog_first_tick",
+                    json!({ "tick_ms": TERMINAL_LOOP_WATCHDOG_TICK_MS }),
+                );
+            }
+            // (r-j2) Panic-safe + observable: the OLD body read state with a
+            // bare `.with` — one panic anywhere in the stale-set computation
+            // killed this task for the life of the process while the
+            // spawn-once latch stayed set, and the watchdog silently stopped
+            // existing (measured: the relaunch-shape strand produced a death
+            // stamp + claim release and then NOTHING — no stale detection,
+            // ever). The safe_* helpers catch panics; the env-gated tick
+            // trace makes the liveness question answerable from the trace.
+            let tick_trace = std::env::var("YGGTERM_TEST_WATCHDOG_TICK_TRACE").is_ok();
+            let stale = safe_shell_read(state, "terminal_loop_watchdog", |shell| {
+                let stale = shell.terminal_loop_stale_watch_sessions();
+                if tick_trace {
+                    let trace_home = perf_home_dir(&shell.bootstrap.settings_path);
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "terminal_loop_watchdog_tick",
+                        json!({
+                            "tick": tick,
+                            "stale_count": stale.len(),
+                            "stale": stale,
+                        }),
+                    );
+                }
+                stale
+            })
+            .unwrap_or_default();
             for session_path in stale {
                 let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
                 append_trace_event(
@@ -19494,6 +19674,7 @@ struct TerminalMountTaskDropGuard {
     trace_home: std::path::PathBuf,
     state: Signal<ShellState>,
     arm_remount: std::cell::Cell<bool>,
+    bootstrap_owner_identity: String,
 }
 
 impl Drop for TerminalMountTaskDropGuard {
@@ -19526,6 +19707,33 @@ impl Drop for TerminalMountTaskDropGuard {
         // iteration, so this punch can cost at most one conservative
         // bootstrap — never another corpse serve.
         remove_terminal_loop_heartbeat(&self.session_path);
+        // (r-j2) WITNESS THE DEATH and release the dead task's bootstrap
+        // claim. The stamp makes the loop-stale watchdog see this loop
+        // (the punch above removed its beat, and the watchdog's old arm
+        // only judges AGED beats — the measured Ready-row strand had one
+        // drop, zero recoveries and typing dead while the watchdog stayed
+        // silent); a successor's first heartbeat cancels the stamp. The
+        // claim release unblocks the successor's lease acquisition — a
+        // dropped task can never use its owner/lease again, but every
+        // bootstrap that finds it held skips on the existing lease.
+        mark_terminal_loop_dead(&self.session_path);
+        let claim_released = self.state.with_mut_counted(|shell| {
+            shell.release_terminal_bootstrap_claim_if_owned(
+                &self.session_path,
+                &self.bootstrap_owner_identity,
+            )
+        });
+        if claim_released {
+            append_trace_event(
+                &self.trace_home,
+                "ui",
+                "terminal_mount",
+                "terminal_bootstrap_claim_released_on_drop",
+                json!({
+                    "session_path": self.session_path.clone(),
+                }),
+            );
+        }
         if self.arm_remount.get() && terminal_loop_remount_budget_allows(&self.session_path) {
             let epoch = self
                 .state

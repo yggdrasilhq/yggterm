@@ -41044,6 +41044,257 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
     #[test]
+    fn rearm_startup_terminal_restore_tears_down_a_dead_successor() {
+        // (r-j1)/(r-j2) VERIFY-OR-REARM: after a genuine recovery, a successor
+        // bootstrap that died silently left owner+lease+attach behind and the
+        // stable-host gate blocks should_recover forever — the rearm must tear
+        // the bookkeeping down so the unlatched render can schedule a fresh
+        // bootstrap without a user re-select.
+        let active_session_path = "local://rearm-dead-successor";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "dead-owner".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "dead-lease".to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-rearm",
+            1,
+            "startup_restore",
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms =
+                current_millis().saturating_sub(STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1);
+        }
+        super::remove_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            shell.rearm_startup_terminal_restore_no_successor(
+                active_session_path,
+                current_millis()
+            ),
+            "no live loop, no young attach: the dead successor's bookkeeping must rearm"
+        );
+        assert!(!shell.terminal_attach_in_flight.contains(active_session_path));
+        assert!(!shell
+            .terminal_bootstrap_owner_by_session
+            .contains_key(active_session_path));
+        assert!(!shell
+            .terminal_bootstrap_lease_by_session
+            .contains_key(active_session_path));
+        assert_eq!(
+            shell.startup_restore_recover_streak.get(active_session_path),
+            Some(&1),
+            "the rearm spends the same futile budget as a recovery"
+        );
+    }
+    #[test]
+    fn rearm_startup_terminal_restore_refuses_a_live_successor() {
+        let active_session_path = "local://rearm-live-successor";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        super::bump_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            !shell.rearm_startup_terminal_restore_no_successor(
+                active_session_path,
+                current_millis()
+            ),
+            "a fresh heartbeat is a live successor: the rearm must not touch it"
+        );
+    }
+    #[test]
+    fn rearm_startup_terminal_restore_refuses_a_young_inflight_attach() {
+        let active_session_path = "local://rearm-young-attach";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-rearm",
+            1,
+            "startup_restore",
+        );
+        // attempt.started_at_ms is NOW — a slow mount still inside its first
+        // window gets the benefit of the doubt (heartbeats pump pre-attach).
+        let _ = attempt_id;
+        super::remove_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            !shell.rearm_startup_terminal_restore_no_successor(
+                active_session_path,
+                current_millis()
+            ),
+            "an in-flight attach inside its first window is not dead bookkeeping yet"
+        );
+        assert!(
+            shell.terminal_attach_in_flight.contains(active_session_path),
+            "the young attach must be left untouched"
+        );
+    }
+    #[test]
+    fn rearm_startup_terminal_restore_respects_the_futile_cap() {
+        let active_session_path = "local://rearm-futile-cap";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.startup_restore_recover_streak.insert(
+            active_session_path.to_string(),
+            STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES,
+        );
+        super::remove_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            !shell.rearm_startup_terminal_restore_no_successor(
+                active_session_path,
+                current_millis()
+            ),
+            "a row past its recovery budget must not gain an unbounded rearm loop"
+        );
+    }
+    #[test]
+    fn stale_watch_includes_witnessed_death_and_ignores_absent_beats_without_a_stamp() {
+        // (r-j2) The witnessed-death arm: a DROPPED loop (punched beat, no
+        // aged beat to judge) must reach the stale-watch via its death stamp
+        // while the state still knows the row; a plain absent beat with NO
+        // stamp stays unjudged (never-mounted, the old arm's law).
+        let active_session_path = "local://stale-watch-death";
+        let untouched_session_path = "local://stale-watch-nostamp";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-sw",
+            1,
+            "startup_restore",
+        );
+        let _ = id;
+        shell.begin_terminal_open_attempt(
+            untouched_session_path,
+            "req-sw2",
+            1,
+            "hot_open_row",
+        );
+        super::remove_terminal_loop_heartbeat(active_session_path);
+        super::remove_terminal_loop_heartbeat(untouched_session_path);
+        super::mark_terminal_loop_dead(active_session_path);
+        let stale = shell.terminal_loop_stale_watch_sessions();
+        assert!(
+            stale.contains(&active_session_path.to_string()),
+            "a witnessed death with a live attempt entry must reach the stale-watch: got {:?}",
+            stale
+        );
+        assert!(
+            !stale.contains(&untouched_session_path.to_string()),
+            "an absent beat with NO death stamp is never-mounted, not dead: got {:?}",
+            stale
+        );
+        // a successor's first beat cancels the stamp
+        super::bump_terminal_loop_heartbeat(active_session_path);
+        let stale = shell.terminal_loop_stale_watch_sessions();
+        assert!(
+            !stale.contains(&active_session_path.to_string()),
+            "a live successor's beat must cancel the death stamp: got {:?}",
+            stale
+        );
+        // a removed row's lingering stamp cannot churn: attempt gone, no watch
+        super::mark_terminal_loop_dead(active_session_path);
+        shell.terminal_open_attempt_by_session.remove(active_session_path);
+        let stale = shell.terminal_loop_stale_watch_sessions();
+        assert!(
+            !stale.contains(&active_session_path.to_string()),
+            "a removed row's lingering stamp must not churn epochs: got {:?}",
+            stale
+        );
+    }
+    #[test]
+    fn the_rj2_rearm_machinery_is_present_in_the_ui_source() {
+        // (r-j1)/(r-j2) Source locks for the pieces unit tests cannot reach:
+        // the liveness-aware watchdog latch (a scope death used to leave the
+        // spawn-once bool set with a dead task — rj2-rig boot-2 measured
+        // first_tick NEVER traced), the drop-guard death stamp + claim
+        // release, and the combined-key latch clear.
+        let viewport = include_str!("viewport.rs");
+        assert!(
+            viewport.contains("TERMINAL_LOOP_WATCHDOG_LAST_TICK_MS"),
+            "the watchdog liveness clock must stay: it is what re-arms a scope-killed watchdog"
+        );
+        assert!(
+            viewport.contains("mark_terminal_loop_dead(&self.session_path);"),
+            "the drop guard must witness every death with the stamp"
+        );
+        assert!(
+            viewport.contains("release_terminal_bootstrap_claim_if_owned("),
+            "the drop guard must release the dead task's bootstrap claim"
+        );
+        assert!(
+            viewport.contains("fn bootstrap_latch_belongs_to_bootstrap("),
+            "the combined-key latch clear must keep its prefix form"
+        );
+    }
+    #[test]
+    fn bootstrap_claim_release_is_remove_if_own() {
+        // (r-j2) The dead task's claim release: only the OWNING task's guard
+        // may clear owner+lease — a successor's fresh claim is never stolen.
+        let active_session_path = "local://claim-release";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner-A".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease-A".to_string());
+        assert!(
+            !shell.release_terminal_bootstrap_claim_if_owned(active_session_path, "owner-B"),
+            "a foreign owner must not release the claim"
+        );
+        assert!(shell
+            .terminal_bootstrap_owner_by_session
+            .contains_key(active_session_path));
+        assert!(
+            shell.release_terminal_bootstrap_claim_if_owned(active_session_path, "owner-A"),
+            "the owning task's guard releases its own claim"
+        );
+        assert!(!shell
+            .terminal_bootstrap_owner_by_session
+            .contains_key(active_session_path));
+        assert!(!shell
+            .terminal_bootstrap_lease_by_session
+            .contains_key(active_session_path));
+    }
+    #[test]
+    fn rearm_startup_terminal_restore_requires_the_active_terminal_row() {
+        let active_session_path = "local://rearm-active-only";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+        super::remove_terminal_loop_heartbeat(active_session_path);
+        assert!(
+            !shell.rearm_startup_terminal_restore_no_successor(
+                active_session_path,
+                current_millis()
+            ),
+            "a row outside the terminal view is not ours to relaunch"
+        );
+    }
+    #[test]
     fn terminal_open_begin_clears_stale_active_host_identity_on_switch() {
         let active_session_path = "remote-session://practice/current";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
