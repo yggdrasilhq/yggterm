@@ -83,7 +83,7 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000;"
   fi
   if [ "$MODE" = latecontrol ]; then
-    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000 YGGTERM_TEST_FLUSH_ACK_TIMEOUT_MS=10000 YGGTERM_TEST_FLUSH_SUPERSESSION_OFF=1;"
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_FLUSH_EXEC_DELAY_MS=5000 YGGTERM_TEST_FLUSH_SUPERSESSION_OFF=1;"
   fi
   if [ "$SYNTH" = 1 ]; then
     dbus-run-session -- bash -c "
@@ -420,15 +420,17 @@ if MODE == "lateflush":
     raise SystemExit(0)
 
 if MODE == "latecontrol":
-    # (e-r1)-R2 BAR 8 — THE POSITIVE CONTROL (sol r4): the delayed
-    # flush continuation, with the future RETAINED (a 10s ack timeout)
-    # and the supersession guard OFF, MUST demonstrably perform the
-    # delayed write over the repaint — proving the continuation
-    # mechanism is live (and therefore that the lateflush bar's safety
-    # is attributable to the GUARD, not to any drop-abort folklore).
-    # PASS = duplication observed (page count >1 in the dense window OR
-    # a second reconcile heal) AND the late ack recorded (the batch
-    # acked at ~+5s); FAIL = the mechanism did not reproduce.
+    # (e-r1)-R2 BAR 8 — THE POSITIVE CONTROL (sol r4, reshaped by
+    # measurement): the caller times out at the DEFAULT 3s and DROPS
+    # the future — the loop resumes, the reconcile repaints the marker
+    # (~+4s) — and the guard-OFF delayed continuation writes at ~+5s,
+    # OVER the repaint. PASS = the duplication observed (page count >1
+    # in the dense post-late-write window OR a second reconcile heal):
+    # the post-drop continuation mechanism is live, and the lateflush
+    # bar's safety is the GUARD's, not drop-abort folklore. (A RETAINED
+    # 10s future was measured NOT to construct the hazard: the inline
+    # flush branch holds the loop, no repaint precedes the late write,
+    # and it delivers as the sole writer — acked 204B, count 1.)
     proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
     if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
         print("PRE-FLIGHT FAIL: forced-skip hook did not carry (seed_mode=%s wrote_seed=%s)" % (
@@ -446,31 +448,33 @@ if MODE == "latecontrol":
     if repainted < 1:
         print("PRE-FLIGHT FAIL: the reconcile repaint never landed inside 12s")
         raise SystemExit(4)
-    # the delayed write fires at ~flush+5s; the re-heal ~2s later —
-    # dense sampling INSIDE that window (masked-at-rest law)
-    time.sleep(3.0)
+    # the guard-off continuation writes at ~flush+5s (the repaint lands
+    # ~+4s, after the 3s timeout frees the loop); the re-heal follows
+    # ~2s later — dense sampling INSIDE the window (masked-at-rest law)
+    time.sleep(1.0)
     counts = []
-    for _ in range(8):
+    for _ in range(10):
         c, _ = page_screen_count(s, "E1RMARK")
         counts.append(c)
-        time.sleep(0.25)
+        time.sleep(0.3)
     daemon_count = daemon_screen_count(s, "E1RMARK")
     assert daemon_count == 1, "hook injected %d markers (want exactly 1)" % daemon_count
     events = read_events()
     flush_events = session_events(events, s, "synth_output_fence_flushed")
-    acked_total = sum(int(p.get("acked_bytes") or 0) for _, p in flush_events)
+    undelivered_events = session_events(events, s, "synth_output_fence_flush_undelivered")
+    undelivered_total = sum(int(p.get("bytes") or 0) for _, p in undelivered_events)
     reconcile_applied = len(
         [1 for _, name, p in events
          if name == "frame_hash_reconcile_applied" and p.get("session_path") == s])
-    print("VERDICT FENCE-LATECONTROL: repaint=%d dense counts=%s reconcile_applied=%d acked=%dB" % (
-        repainted, counts, reconcile_applied, acked_total))
+    print("VERDICT FENCE-LATECONTROL: repaint=%d dense counts=%s reconcile_applied=%d undelivered=%dB" % (
+        repainted, counts, reconcile_applied, undelivered_total))
     if max(counts) > 1 or repainted > 1 or reconcile_applied > 1:
-        if acked_total >= 9:
-            print("RIG PASS — the delayed continuation DEMONSTRABLY writes over the repaint (duplication observed) and acks late (%dB): the mechanism is live, the lateflush bar's safety is the GUARD's" % acked_total)
-            raise SystemExit(0)
-        print("VERDICT PARTIAL: duplication observed but the late ack is missing (acked=%dB) — control incomplete" % acked_total)
+        print("RIG PASS — the post-drop continuation DEMONSTRABLY writes over the repaint (duplication observed with the guard OFF): the mechanism is live, the lateflush bar's safety is the GUARD's")
+        raise SystemExit(0)
+    if undelivered_total < 9:
+        print("VERDICT FAIL: no duplication AND no undelivered trace — the flush shape broke entirely")
         raise SystemExit(6)
-    print("VERDICT CONTROL FAIL: no duplication in the dense window and no second heal — the delayed write did NOT fire; the hazard mechanism did not reproduce (re-examine before relying on the guard)")
+    print("VERDICT CONTROL FAIL: the flush timed out undelivered (%dB) but the delayed write did NOT duplicate over the repaint — the post-drop continuation did not fire; re-examine before relying on the guard" % undelivered_total)
     raise SystemExit(6)
 
 # (e-r1) TRANSIENT SAMPLING: the frame-hash and reveal reconciles heal
