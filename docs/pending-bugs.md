@@ -237,11 +237,58 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   not await — the input-starvation lock convicted the inline await;
   the eval future is !Send so no tokio::spawn: staging extracted to
   stage_synth_release_flush so the region carries no .await text).
-  RESIDUE (next on this line,
-  sol Q7): the full Q7 binding — CONTENT-READY + painted-state
-  promotion to an owner/session/runtime/mount-generation-qualified
-  application ack; the flush acks are per-batch DELIVERY acks, not the
-  mount-generation-qualified application ack that binding requires.
+  (e-r3) LANDED + DEPLOYED 2026-10-08 (sitting 23, lane
+  lane/q7/application-ack): THE APPLICATION RECEIPT — the Q7
+  binding's transaction layer + the synthesized-path promotion.
+  sol round 1 (node lores/chain-of-thought/2026-10-08-yggterm-s23-
+  q7-binding-sol-round1.md) verified four claims at source, one a
+  LIVE DEFECT: the seed script's `.trim().is_empty()` filter
+  converted the caller's correct Some("") blank-with-stamp into JS
+  null BEFORE the write arm — the s21 valid-blank ruling was
+  UNREACHABLE (wrote_seed 0, mode 'skipped', coverage never
+  committed, retained pre-blank bytes flushed over the authoritative
+  blank: erased content resurrected). NOW: PRESENCE test (Some vs
+  None); the fenced clear runs for empty strings (blank flag, 7
+  control bytes); both seed write arms ack on the DATA write's own
+  callback (the empty trailing enqueue is gone); and every
+  content-applying page write (seed proof + acked flush) PUBLISHES
+  the qualified receipt __e.appliedContent AFTER the callback with
+  post-callback REVALIDATION (entry identity + supersession) —
+  AppliedContentReceiptSpec {session, mount_epoch, runtime_spawn_id,
+  supersession}; the proof returns {published, ts, gen}. The
+  seed-consumer promotion binds to seed_applied && receipt — the
+  `painted || wrote_seed > 0` bypass (a forced-skip proof with a
+  painted inherited buffer promoted the shell paint witness) is
+  dead — and the paint note is epoch-qualified
+  (note_terminal_session_painted_for_mount_epoch). MEASURED
+  (fence-rig MODE=blank, the daemon ring-only capture hook
+  YGGTERM_TEST_SNAPSHOT_CAPTURE_RING_ONLY + the blanked snapshot
+  answer): RED rc12 on hook-only main (mode=skipped wrote=0
+  blank=None, the retained 195B flushed LIVE over the blank,
+  dropped_batches=0; the page-level marker was masked by the
+  daemon reconcile — the s18 masked-at-rest pattern, the flush IS
+  the resurrection event) → GREEN rc0 on the lane
+  (fenced_repaint, wrote_seed=7, blank=true, receipt qualifies,
+  covered drop 195B/1 batch, page marker 0 through every transient
+  sample); loss/dup/order + healthy regressions GREEN on the same
+  build; shell 2246/0 + server 1668/0 no-fail-fast. RESIDUE (the
+  named next unit, sol's R2/R3/R4 structure): the 17-site
+  CONTENT/DECISION sweep (sol's classification: CONTENT =
+  active_recovery_snapshot_replay, visual_reveal x2,
+  retained_transcript_browser, retained_non_prompt_snapshot_replay,
+  blank_host_snapshot_replay, live_transcript_browser,
+  fresh_remote_codex_start; DECISION/liveness = the other seven
+  reasons), the marker's ONE guarded transaction — a guard inside
+  the Ready marker alone is BYPASSABLE (sites insert
+  terminal_resume_ready_paths BEFORE the marker and
+  terminal_session_has_visual_resume_reveal accepts that set OR
+  any ready attempt, state.rs 32921-32924; the marker credits
+  whichever attempt is current) — the first-live-write receipt
+  (ownership is not application; a one-time callback on the first
+  eligible current-generation live batch; the DOM-presence
+  first-paint branch's `painted` is child_count||xterm||screen||
+  viewport||rows, not buffer content), and the negative-control
+  rig arms (painted-but-unapplied + liveness-signal shapes).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
