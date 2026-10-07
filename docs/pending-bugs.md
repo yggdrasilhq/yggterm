@@ -659,7 +659,7 @@ branch is an abandoned lane, not a retryable merge). FALSIFIER: merge a
 lane, delete its remote branch, watch the next tick consume the sub
 instead of reporting conflicts.
 
-## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION, the replaced-runtime NO-REWIND freeze arms, and the absent-declaration sub-item; the reuse-grid arm (a) CLOSED, (b)'s relaunch/live-GUI arms closed, (c) landed in code, and (d) landed in code — all in the body (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
+## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION, the replaced-runtime NO-REWIND freeze arms, and the absent-declaration sub-item; the reuse-grid arm (a) and (b)'s relaunch/live-GUI arms are closed in the body (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
 
 **Status:** OPEN
 
