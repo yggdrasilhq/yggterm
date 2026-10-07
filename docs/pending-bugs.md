@@ -89,11 +89,39 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   page marker 0 (seed appended over it). GREEN on 012e199d: page marker
   exactly 1, seed_mode=fenced_repaint, fence flushed 2 batches, healthy
   control row mounted and painted with ZERO fence events. REMAINDERS:
-  (e-r1) the snapshot answer carries NO output watermark — the fence's
-  split point is the REQUEST instant, so a differential already in
-  flight at request time can duplicate snapshot content on replay
-  (rare append class; the daemon stream-cursor stamp is the fix if it
-  ever bites); (e-r2) repaint cursor restoration is end-of-content only
+  REMAINDERS:
+  (e-r1) LANDED + DEPLOYED 2026-10-07 (sitting 18, lane
+  lane/f1/snapshot-output-stamp 9a1f3cad → main 11fa8c23): the snapshot
+  answer now carries its stream-cursor stamp (output_seq, serde default
+  0 = unknown, protocol stamp re-cut 3.2.118) — the screen-snapshot memo
+  key's own seq, capped below a new injected_ring_floor so an agent-error
+  contract line that entered the ring WITHOUT entering the vt100 screen
+  can never be stamped as seed-covered; the fence records each retained
+  batch's covered-through daemon cursor and at seed arrival DROPS every
+  provably covered batch, and poll rounds filter chunks at or below a
+  MOUNT-LIFETIME stamp (cursor-0 replay / resync / rewind arms excluded;
+  zeroed on runtime replacement, whose fresh-from-zero seqs would
+  otherwise read as covered; unknown stamp 0 fails open — an old daemon
+  keeps the previous behavior exactly). MEASURED (fence-rig MODE=dup:
+  the capture-stall hook YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS injects
+  the marker into ring+screen, once per session under the reader's lock
+  discipline, BEFORE stalling the capture — the seed provably contains
+  it while its chunk still resolves inside the fence window; no
+  verb-timing luck): the duplication is REAL on the hook-only build —
+  149/149 retained bytes FLUSHED over the seeded screen — but MASKED AT
+  REST by identical re-render and healed within ~2s by the
+  frame-hash/reveal reconciles (the sitting-15 "double-paint flake,
+  rerun green" was exactly this transient; the rig samples the page
+  inside the pre-heal window and the delivery-level bar is the flush
+  itself). GREEN ×2 on the lane: the drop trace fires
+  (dropped_batches=1, dropped_bytes=149, seed_output_seq=2), the flush
+  carries NOTHING covered, the page holds exactly the seed's one copy
+  through every transient sample; order-mode and healthy-control bars
+  unchanged on both builds. RESIDUE (narrow, documented): one
+  STRADDLING pre-seed batch (capture lands mid-round) keeps its covered
+  prefix — per-chunk boundaries are lost through the write bridge's
+  frame-splitting, and a conservative keep is the safe side;
+  (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
   lane/f1/ring-watermark; sol correction round applied same sitting, node
