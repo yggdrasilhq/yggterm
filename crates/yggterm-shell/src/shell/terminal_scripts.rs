@@ -375,6 +375,33 @@ if (__t && typeof __t.write === 'function') {{
     )
 }
 
+/// [F1-(e-r1)-R2] (sol Q1) The ACKNOWLEDGED page write for the fence's
+/// flush: same host-registry transport as the fire-and-forget write, but
+/// the script awaits the term's write callback — the same ack the seed's
+/// proof uses — and returns the verdict across the eval bridge (⛔
+/// top-level `return` — the eval bridge shape law). ok:false names the
+/// transport verdict (no_host / throw); a hung bridge is bounded by the
+/// caller's Rust-side timeout.
+pub(crate) fn terminal_page_write_acked_script(host_id: &str, data: &str) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
+    let data = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"const __h = {host};
+const __e = (window.__yggtermXtermHosts || {{}})[__h];
+const __t = __e && __e.term ? __e.term : null;
+if (!(__t && typeof __t.write === 'function')) {{
+    return JSON.stringify({{ ok: false, reason: 'no_host' }});
+}}
+try {{
+    __t.write({data});
+    await new Promise((resolve) => __t.write('', resolve));
+    return JSON.stringify({{ ok: true }});
+}} catch (_error) {{
+    return JSON.stringify({{ ok: false, reason: 'throw' }});
+}}"#
+    )
+}
+
 /// [F1-(e) Q2] The synthesized mount's frame-hash probe over a FRESH
 /// eval: pair the daemon's authoritative-grid hash (same `fnv32:%08x`
 /// canonical form both sides — frame_hash_probe.js and the daemon twin
