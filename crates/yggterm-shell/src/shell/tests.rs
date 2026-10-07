@@ -135,7 +135,7 @@ mod tests {
             body.contains("repair_error_text.contains(\"terminal session not found\")"),
             "the divorce classification must key on the not-found error class"
         );
-        // THE [11.57] second arm (measured live 2026-09-29, jojo row
+        // THE [11.57] second arm (measured live 2026-09-29, guihost row
         // 6778336d): the FORWARDED failure can never take the Err arm — the
         // verb answers Ok for the local half while the remote half fails in
         // the fire-and-forget re-queue. The repair must also classify from
@@ -11096,7 +11096,7 @@ console.log('ok');
     /// must fire even when there is nothing to paint, reporting `painted:false`
     /// — while `first_frame` stays ABSENT, because "no first_frame" is the
     /// never-painted tell the native side joins on `host_id`
-    /// (docs/observability.md §xterm_paint). Live re-verify 2026-09-26 (jojo,
+    /// (docs/observability.md §xterm_paint). Live re-verify 2026-09-26 (guihost,
     /// direct build e76fa55c): 5/6 bare-prompt uxprobe spawns emitted
     /// `first_frame` and their settles read painted:true / complete:true /
     /// rows_with_content:1 — the 2026-09-14 "0/2 idle spawns" reading does NOT

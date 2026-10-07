@@ -31,7 +31,7 @@
 # 6=neither contract (rig or fix problem), 8=exe mismatch.
 # Usage: tools/uxspeed/rj1-rig.sh [worktree] [binary] [stall_ms]
 #   ⛔ BUILD LAW (sitting 7): FULL-WORKSPACE release build. Runs on dev's
-#   Xvfb :78 — jojo untouched.
+#   Xvfb :78 — guihost untouched.
 set -u
 WT=${1:-$HOME/gh/yggterm}
 BIN=${2:-$WT/target/release/yggterm}

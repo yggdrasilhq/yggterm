@@ -5220,7 +5220,7 @@ fn find_uuid_in_text(text: &str) -> Option<String> {
 /// who execs the real app has crossed from "output" to "running the binary" —
 /// a different, accepted threat.)
 ///
-/// [11.181], measured 2026-09-27 on jojo: "surface app" used to mean ONE
+/// [11.181], measured 2026-09-27 on guihost: "surface app" used to mean ONE
 /// hardcoded name — `contains("ychrome")` — so every other libyggterm app's
 /// web-surface OSC was refused as forged at the ingest plane. yRDP's whole
 /// chooser flow died as `provenance_refused`: the operator clicked connect,

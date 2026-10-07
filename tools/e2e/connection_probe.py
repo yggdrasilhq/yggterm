@@ -141,7 +141,7 @@ def yggterm_detached(args, stderr_path=None):
     tombstone guard) paints nowhere else on the machine — without the
     capture a refused rebirth reads as a silently blank row and the
     scenario misfiles a designed refusal as a dead row (measured 2026-09-29
-    on jojo: rebirth FAILed "no CLI after 150s" on what was the [11.197]
+    on guihost: rebirth FAILed "no CLI after 150s" on what was the [11.197]
     guard's named refusal, written to /dev/null)."""
     err = open(stderr_path, "wb") if stderr_path else subprocess.DEVNULL
     try:
@@ -255,7 +255,7 @@ def holder_identity(pid, attempts=40):
     child each imply a different fix direction).
 
     ⛔ THE DEATH-RACE REPAIR (caught run #3, 2026-10-03 20:29:23 IST, the
-    [11.218] hunt on jojo): pid 1913464 outlived the FULL 5 s settle window
+    [11.218] hunt on guihost): pid 1913464 outlived the FULL 5 s settle window
     (a live cwd match — not a zombie), then exited in the milliseconds
     between the scan and this read, so every /proc open raised OSError and
     printed "(cmdline unreadable)" — the convict died unnamed, the same
@@ -1058,11 +1058,36 @@ def trace_payloads(event_name, since_bytes):
     return out
 
 
+def _ssh_config_hosts():
+    """Host aliases from this machine's ssh config — the fleet's private
+    aliases are infrastructure and are never spelled in this public repo
+    (the scripts/ygg-live-host.sh law)."""
+    hosts = []
+    try:
+        with open(os.path.expanduser("~/.ssh/config")) as fh:
+            for line in fh:
+                parts = line.split()
+                if parts and parts[0].lower() == "host":
+                    hosts += [p for p in parts[1:] if "*" not in p and "?" not in p]
+    except OSError:
+        pass
+    return hosts
+
+
+def fleet_peer_candidates():
+    """Peer aliases worth probing: public fleet names + ssh-config aliases."""
+    seen = []
+    for h in ("oc", "dev", "practice") + tuple(_ssh_config_hosts()):
+        if h not in seen:
+            seen.append(h)
+    return tuple(seen)
+
+
 def scenario_startborn_remote_corpse():
     sc = Scenario("startborn_remote_corpse_refuses_11213")
     this_host = os.uname().nodename
     peer = None
-    for candidate in ("oc", "dev", "jojo", "practice"):
+    for candidate in fleet_peer_candidates():
         if candidate == this_host:
             continue
         capable = ssh_run(
@@ -1395,7 +1420,7 @@ def scenario_stillborn_resume_corpse():
     sc = Scenario("stillborn_resume_corpse_closes_11165")
     this_host = os.uname().nodename
     peer = None
-    for candidate in ("oc", "dev", "jojo", "practice"):
+    for candidate in fleet_peer_candidates():
         if candidate == this_host:
             continue
         capable = ssh_run(

@@ -8,7 +8,7 @@ full eval round trip + a 25 ms poll; the ungroup direction never paid that,
 which is exactly the asymmetry this lane is attributing). Immediately after,
 the ytrace tail names the legs inside [t_click-150, ...].
 
-Run on the GUI host (jojo), probe module shipped beside it:
+Run on the GUI host (guihost), probe module shipped beside it:
     python3 splitcreate_attr.py /tmp/uxprobe-splitcreate.py
 """
 import importlib.util
