@@ -70,10 +70,10 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
   CAPT_EXPORT=""
-  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ]; then
+  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ]; then
     CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
   fi
-  if [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ]; then
+  if [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ]; then
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SEED_FORCED_SKIP=1;"
   fi
   if [ "$MODE" = flushshed ]; then
