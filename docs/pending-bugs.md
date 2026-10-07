@@ -750,6 +750,24 @@ CLIENT halves that still recur on healthy rows.
   cover deadline — the cover drops to a blank viewport that never
   self-heals. FIX SHAPE: on deadline expiry, paint the daemon-screen
   reconcile instead of dropping the cover empty.
+  LANDED IN CODE 2026-10-07 (sitting 19, lane lane/11229c/reveal-deadline
+  59c30fa8) — live proof owed by detector: the empty-flush deadline arm
+  re-arms the screen reconcile as the reveal reason (fresh retry budget
+  + defer chain; the reveal_incomplete quiet-gate bypass applies), and
+  the authoritative vt100 frame repaints the viewport through the same
+  guarded write the bootstrap reconcile uses. Non-empty flushes
+  unchanged. PROOF LEVEL (the (f2)/(h2) construction-bar precedent):
+  no hermetic rig constructs the shape — every cover-arming site gates
+  on is_remote_resume_agent_session (remote agent path +
+  SessionSource::LiveSsh), unreachable for local rig rows; cover-rig
+  measured two variants (plain + snapshot-stalled boot-2) with
+  byte-identical healthy outcomes (local restore takes
+  reuse+rehydrate and paints from the first sample). Detector:
+  `reveal_cover_deadline_reconcile_armed` in the wild = the fix
+  engaging; `reveal_cover_released reason:deadline bytes:0` WITHOUT it
+  following = the old shape on an un-upgraded peer. Shape locked by
+  a_deadline_expired_cover_with_no_buffered_bytes_rearms_the_screen_
+  reconcile; cover-rig lands as the boot-2 reveal-health bar.
 - UPDATE 2026-10-05 ~08:2x IST (recurrence, owner-reported live; board
 ACK-d3e73eac18): a FRESH agy row (remote-agy://dev/4314d6ee…, born
 08:19:59 on dev, cwd /home/user) sat BLANK in the owner's active viewport
