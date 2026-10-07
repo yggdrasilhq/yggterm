@@ -15216,7 +15216,20 @@ impl DaemonRuntime {
                     },
                     client_id: identity.client_id.clone(),
                 };
-                if repaint && self.terminals.has_session(&runtime_path) {
+                // ⛔ THE FALL-THROUGH IS REAL ([11.229](a), measured 2026-10-07
+                // by reuse-rig): the comment below always CLAIMED a different
+                // grid falls through to the ordinary resize, but the code
+                // bounced the session's CURRENT grid regardless — a repaint
+                // request could never heal a diverged PTY (the [11.228]
+                // rotation vector under a reused mount bounced the WRONG grid
+                // and answered Ok). Gate the bounce on the requested grid
+                // actually being current; anything else takes the ordinary
+                // resize path, where the change itself signals the child and
+                // the grid is recorded, persisted, and forwarded.
+                let repaint_bounce_only = repaint
+                    && self.terminals.has_session(&runtime_path)
+                    && self.terminals.session_size(&runtime_path) == Some((cols, rows));
+                if repaint_bounce_only {
                     // ⛔ THE BLANK-REVEAL FIX: an identical-geometry repaint
                     // request bounces the PTY winsize so an idle fullscreen
                     // TUI repaints into the attaching client. A different
@@ -36940,6 +36953,40 @@ mod tests {
         assert!(
             ensure_block.contains("role: \"daemon\""),
             "the daemon-internal grid resync must stamp role \"daemon\", not a client role"
+        );
+    }
+
+    // [11.229](a) THE FALL-THROUGH IS REAL: the repaint arm's bounce must be
+    // gated on the requested grid matching the session's CURRENT grid. The
+    // comment claimed "a different grid falls through to the ordinary
+    // resize" while the code bounced whatever grid the session happened to
+    // hold — a repaint request could never HEAL a diverged PTY (the [11.228]
+    // rotation vector under a reused mount bounced the WRONG grid and
+    // answered Ok; measured by reuse-rig 2026-10-07, rc9 shape).
+    #[test]
+    fn a_repaint_request_at_a_diverged_grid_takes_the_ordinary_resize() {
+        let source = include_str!("daemon.rs");
+        let resize_block = source
+            .split("ServerRequest::TerminalResize {\n                path,\n                cols,\n                rows,\n                repaint,\n            } =>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
+            .expect("TerminalResize handler present");
+        assert!(
+            resize_block
+                .contains("self.terminals.session_size(&runtime_path) == Some((cols, rows))"),
+            "the repaint bounce must be gated on the session's CURRENT grid equaling the \
+             requested grid — otherwise a diverged PTY bounces its wrong grid and the \
+             requested heal never lands"
+        );
+        let bounce_arm = resize_block
+            .split("let repaint_bounce_only =")
+            .nth(1)
+            .and_then(|suffix| suffix.split("} else {").next())
+            .expect("repaint bounce arm present");
+        assert!(
+            bounce_arm
+                .contains("repaint_nudge_session(&runtime_path, Some(&resize_origin))"),
+            "the identical-geometry bounce itself must stay unchanged (the blank-reveal fix)"
         );
     }
 

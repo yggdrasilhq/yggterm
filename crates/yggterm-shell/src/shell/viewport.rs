@@ -22020,7 +22020,7 @@ async fn terminal_resize_repaint_async(
     .await
     .map_err(|error| anyhow!("joining terminal repaint task: {error}"))?
 }
-fn spawn_terminal_startup_resize_repair(
+pub(crate) fn spawn_terminal_startup_resize_repair(
     endpoint: ServerEndpoint,
     runtime_session_path: String,
     visible_session_path: String,

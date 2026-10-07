@@ -147,6 +147,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_reused_mount_fires_the_startup_resize_repair() {
+        // [11.229](a) A reused mount was the ONE mount shape that never
+        // re-asserted the client grid: fresh mounts repair, reuses returned
+        // at the epoch decision ([11.228]'s rotation re-resume vector then
+        // stayed squished until the next cold remount — the 09:17:45
+        // shape). The launch-side reuse branch must read the grid from the
+        // reused host's OWN xterm over the eval bridge (the daemon's
+        // "PTY size" may be the diverged value being healed) and fire the
+        // repaint-safe repair.
+        let source = SHELL_SOURCE;
+        let launch = include_str!("launch.rs");
+        assert!(
+            launch.contains("if reused_live_host && !settled_futile"),
+            "the reuse repair must gate on the reuse verdict, not the bump"
+        );
+        assert!(
+            launch.contains("reuse_repair_skipped"),
+            "the reuse branch must trace its skip reasons (grid read failed / \
+             entry missing / unusable) — the detector for a dead eval bridge"
+        );
+        assert!(
+            launch.contains("spawn_terminal_startup_resize_repair("),
+            "the reuse branch must call the repair spawner itself"
+        );
+        assert!(
+            launch.contains("client_is_shadow_viewer()"),
+            "the reuse repair must stand down for shadow viewers (D8: no \
+             SIGWINCH from a viewer)"
+        );
+        let script_start = source
+            .find("fn terminal_reused_host_grid_script(")
+            .expect("the page-side grid script builder must exist");
+        let script = &source[script_start..script_start + 1_200];
+        assert!(
+            script.contains("entry.sessionPath === sessionPath"),
+            "the grid script must filter the host registry by session path"
+        );
+        assert!(
+            script.contains("JSON.stringify"),
+            "the grid script must return JSON for the eval bridge"
+        );
+    }
+
     fn every_resume_recovery_call_runs_off_the_terminal_loop() {
         let source = SHELL_SOURCE;
         let mut calls = 0;

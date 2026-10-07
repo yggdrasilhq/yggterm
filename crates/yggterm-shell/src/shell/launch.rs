@@ -1788,6 +1788,79 @@ fn app() -> Element {
                 "settled_futile": settled_futile,
             }),
         );
+        if reused_live_host && !settled_futile {
+            // [11.229](a) A reused mount fires no startup repair anywhere
+            // else: the client xterm keeps its grid (no Resize event fires)
+            // and the mount loop's last-sent geometry is stale-equal to the
+            // live grid, so nothing re-asserts the CLIENT grid onto a PTY
+            // that diverged underneath ([11.228]'s rotation re-resume
+            // vector — fresh mounts repair, reuses don't). Read the live
+            // grid from the reused host's own xterm over the eval bridge,
+            // then fire the repaint-safe repair: identical geometry is the
+            // designed-safe winsize bounce (an idle TUI repaints into the
+            // re-attached viewport); a diverged PTY converges to the client
+            // grid. No reveal cover here — the reused surface is already
+            // live-painted, and holding it would blank the viewport.
+            let repair_session_path = active_session_path.clone();
+            let repair_trace_home = trace_home_for_mount_epoch.clone();
+            spawn(async move {
+                if client_is_shadow_viewer() {
+                    return; // D8: a viewer never SIGWINCHes the user's frame.
+                }
+                let skip = |reason: &str| {
+                    append_trace_event(
+                        &repair_trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "reuse_repair_skipped",
+                        json!({
+                            "session_path": repair_session_path,
+                            "reason": reason,
+                        }),
+                    );
+                };
+                let script = terminal_reused_host_grid_script(&repair_session_path);
+                let grid_json = match document::eval(&script).await {
+                    Ok(value) => value.as_str().unwrap_or_default().to_string(),
+                    Err(_error) => {
+                        skip("grid_read_failed");
+                        return;
+                    }
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(&grid_json) {
+                    Ok(parsed) => parsed,
+                    Err(_error) => {
+                        skip("grid_read_unparsable");
+                        return;
+                    }
+                };
+                if !parsed.get("found").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                    skip("host_entry_missing");
+                    return;
+                }
+                let cols = parsed.get("cols").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
+                let rows = parsed.get("rows").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
+                if !terminal_geometry_is_usable(cols, rows) {
+                    skip("grid_not_usable");
+                    return;
+                }
+                let (endpoint, runtime_session_path) = state.with(|shell| {
+                    (
+                        shell.bootstrap.server_endpoint.clone(),
+                        terminal_runtime_session_path(&shell, &repair_session_path),
+                    )
+                });
+                spawn_terminal_startup_resize_repair(
+                    endpoint,
+                    runtime_session_path,
+                    repair_session_path,
+                    cols,
+                    rows,
+                    repair_trace_home,
+                    "mount_epoch_reused",
+                );
+            });
+        }
     });
     let trace_home_for_startup_terminal_restore = trace_home.clone();
     use_effect(move || {
