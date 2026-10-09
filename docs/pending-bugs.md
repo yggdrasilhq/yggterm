@@ -633,9 +633,39 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   loop_live=false signal present in the GREEN trace; remount-hook-rig
   green (one (e-r1)-class double-paint flake, rerun green — see (e-r1));
   rj1-rig green; workspace suite per-target green. REMAINDERS:
-  (i-r1) name the silent exit arm exactly (add branch guards to the
-  uninstrumented select arms; exit_hint currently bottoms out at
-  pre_select). MEASURED SHARPENER (healthy-mode d-rig, sitting 15, the
+  (i-r1) CLOSED (sitting 27, 2026-10-10, lane lane/ir1/exit-arm-names
+  stacked on the unmerged (e-r3) tip — dev still down, the oc pattern;
+  exitarm-rig RED/GREEN + suite lock): every mount-loop select arm now
+  enters under a named TerminalLoopBranchGuard. The four arms measured
+  unguarded at source — eval_result (the bridge-ended EXIT arm: lease
+  release + spawns + traces + break, all invisible to the witness),
+  probe_answer, synth_release_flush_done, applied_content_probe_done (the
+  s22/s26 machinery arms landed without stamps) — now stamp
+  eval_bridge_return / warm_probe_answer / synth_release_flush_apply /
+  applied_content_probe_done; the write arm's unconditional
+  "write_failure" ENTRY stamp (a SUCCESSFUL Completed/CacheFull write
+  lied about where the loop was) is now write_event_apply with nested
+  per-variant stamps (write_failure / write_completed / write_cache_full).
+  The silent-death token grew an optional "@<branch>" AIM (loop-top fires
+  only after the aimed arm stamped; plain tokens keep rj2-rig semantics
+  byte-identical). RIG tools/uxspeed/exitarm-rig.sh (hermetic + exe-proof,
+  healthy bridge path): MODE=aimed RED rc5 on the er3 tip (the token
+  write-back degenerates to '2:1000' — the build cannot aim at a branch;
+  boot drops read pre_select / synth_input_drain_tick) / GREEN rc0 on the
+  lane (4/4 drops exit_hint==read_poll_start exactly, remount loops
+  included, screen corroborated). MODE=close MEASURED on BOTH builds: the
+  session-remove death reads pre_select — remove CANCELS the mount task
+  at the select await; it does NOT flow through the eval arm. CONCLUSION
+  the family carries forward: with every arm stamping and ZERO awaits in
+  the pre-select body, exit_hint=pre_select is now CONCLUSIVE for
+  "cancelled at the await" — the creation-churn silent death is a task
+  drop mid-poll, not an in-arm exit, and (i-r2)'s keep-alive target is
+  exactly that await-cancel window. RIG-CONSTRUCTION LAWS banked: the
+  write arm fires only for remote-resume rows
+  (track_completion=is_remote_resume_session) or post-failure recovery —
+  plain local typing never emits TerminalWriteEvent::Completed; on the
+  suppress path input rides the drain arm and produces no write events at
+  all. MEASURED SHARPENER (healthy-mode d-rig, sitting 15, the
   fixed build, NO suppression — tools/uxspeed/demote-rig-healthy.sh):
   the silent loop death is NOT plain demotion — a row demoted while
   QUIESCENT (already attach_ready, no concurrent churn) KEEPS its loop,
