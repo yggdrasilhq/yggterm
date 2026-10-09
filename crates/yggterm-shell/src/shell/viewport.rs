@@ -4360,9 +4360,13 @@ fn TerminalCanvas(
                     let _ =
                         safe_shell_mut(state, "terminal_resume_gate_ceiling_release", |shell| {
                             shell.retain_terminal_session_path(&session_path);
-                            shell
-                                .terminal_resume_ready_paths
-                                .insert(session_path.clone());
+                            // [Q7-R2] a gate-ceiling release is a
+                            // DECISION: it may end its wait, never open the
+                            // content-qualified latch with zero evidence.
+                            shell.park_terminal_content_claim(
+                                &session_path,
+                                "resume_gate_ceiling_release",
+                            );
                             shell.terminal_attach_in_flight.remove(&session_path);
                             shell.maybe_finish_terminal_surface_request_for_session(&session_path);
                         });
@@ -4434,9 +4438,12 @@ fn TerminalCanvas(
             "terminal_attach_clear_stale_retry_poison_render",
             |shell| {
                 shell.retain_terminal_session_path(&session_path);
-                shell
-                    .terminal_resume_ready_paths
-                    .insert(session_path.clone());
+                // [Q7-R2] a render-path poison clear / clean-surface
+                // release is a DECISION — the latch needs content evidence.
+                shell.park_terminal_content_claim(
+                    &session_path,
+                    "render_path_release",
+                );
                 shell.terminal_attach_in_flight.remove(&session_path);
                 shell.maybe_finish_terminal_surface_request_for_session(&session_path);
             },
@@ -4471,9 +4478,12 @@ fn TerminalCanvas(
             "terminal_attach_sync_clean_ready_attempt_render",
             |shell| {
                 shell.retain_terminal_session_path(&session_path);
-                shell
-                    .terminal_resume_ready_paths
-                    .insert(session_path.clone());
+                // [Q7-R2] a render-path poison clear / clean-surface
+                // release is a DECISION — the latch needs content evidence.
+                shell.park_terminal_content_claim(
+                    &session_path,
+                    "render_path_release",
+                );
                 shell.terminal_attach_in_flight.remove(&session_path);
                 shell.maybe_finish_terminal_surface_request_for_session(&session_path);
             },
@@ -4697,14 +4707,11 @@ fn TerminalCanvas(
                             |shell| {
                                 shell.retain_terminal_session_path(&session_path_for_task);
                                 shell
-                                    .terminal_resume_ready_paths
-                                    .insert(session_path_for_task.clone());
-                                shell
                                     .terminal_attach_in_flight
                                     .remove(&session_path_for_task);
-                                shell.mark_terminal_open_attempt_ready_for_session(
+                                shell.complete_terminal_open_attempt_ready(
                                     &session_path_for_task,
-                                    "active_recovery_snapshot_replay",
+                                    TerminalReadyClaim::Content { reason: "active_recovery_snapshot_replay" },
                                 );
                                 shell.maybe_finish_terminal_surface_request_for_session(
                                     &session_path_for_task,
@@ -5815,9 +5822,9 @@ fn TerminalCanvas(
     if reveal_raise_eligible {
         *bootstrap_task_identity.borrow_mut() = combined_bootstrap_key.clone();
         state.with_mut_counted(|shell| {
-            shell.mark_terminal_open_attempt_ready_for_session(
+            shell.complete_terminal_open_attempt_ready(
                 &session_path,
-                "reveal_retained_host",
+                TerminalReadyClaim::Decision { reason: "reveal_retained_host" },
             );
         });
         append_trace_event(
@@ -5931,9 +5938,9 @@ fn TerminalCanvas(
                 }
                 if served {
                     state.with_mut_counted(|shell| {
-                        shell.mark_terminal_open_attempt_ready_for_session(
+                        shell.complete_terminal_open_attempt_ready(
                             &session_path,
-                            "reparent_retained_host",
+                            TerminalReadyClaim::Decision { reason: "reparent_retained_host" },
                         );
                     });
                     append_trace_event(
@@ -6043,9 +6050,11 @@ fn TerminalCanvas(
                 if shell.terminal_session_host_reusable_for_reveal(&session_path)
                     && shell.remote_resume_input_gate_is_shut(&session_path)
                 {
-                    shell.mark_terminal_open_attempt_ready_for_session(
+                    shell.complete_terminal_open_attempt_ready(
                         &session_path,
-                        "bootstrap_skipped_existing_lease_host_already_live",
+                        TerminalReadyClaim::Decision {
+                            reason: "bootstrap_skipped_existing_lease_host_already_live",
+                        },
                     );
                 }
                 shell.record_terminal_io_telemetry(
@@ -7233,6 +7242,17 @@ fn TerminalCanvas(
                 std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
             > = None;
             let mut synth_release_flush_batch: Option<String> = None;
+            // [Q7-R2] the RE-ATTEST PROBE: a parked CONTENT claim with no
+            // arriving receipt (a retained host whose evidence lives in the
+            // page entry) gets a rate-limited probe future — it reads the
+            // entry's published application receipt back into Rust for
+            // validation. Without it an idle retained host could never
+            // re-attest (sol s23 R2: reuse re-attests existing evidence,
+            // it does not demand fresh spontaneous output).
+            let mut applied_content_probe_future: Option<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+            > = None;
+            let mut applied_content_probe_next_ms: u64 = 0;
             // [F1-(e-r1)] The seed's stream-cursor stamp, OUTLIVING the
             // fence: chunks at or below it are inside the seeded screen
             // forever on this mount, so a round that resolves after the
@@ -7549,6 +7569,25 @@ fn TerminalCanvas(
                         // select branch (release precedes the batch that
                         // broke the fence; one fence, one release, one
                         // staged flush).
+                        // [Q7-R2] re-attest probe staging (rate-limited):
+                        // a parked claim for THIS session with no probe in
+                        // flight gets one.
+                        if applied_content_probe_future.is_none()
+                            && current_millis() >= applied_content_probe_next_ms
+                        {
+                            let parked = state.with(|shell| {
+                                shell.terminal_pending_content_claims.contains_key(&session_path)
+                            });
+                            if parked {
+                                applied_content_probe_next_ms = current_millis() + 2000;
+                                applied_content_probe_future = Some(stage_applied_content_probe(
+                                    state,
+                                    host_id.clone(),
+                                    session_path.clone(),
+                                    trace_home.clone(),
+                                ));
+                            }
+                        }
                         if let Some(fence) = released_fence.take() {
                             synth_release_flush_future = Some(stage_synth_release_flush(
                                 fence,
@@ -8069,7 +8108,9 @@ fn TerminalCanvas(
                                 // spelling is how the two arms drift.
                                 terminal_stage_js_ready(
                                     &eval,
+                                    state,
                                     &session_path,
+                                    mount_epoch,
                                     &host_id,
                                     &title,
                                     &theme,
@@ -8717,13 +8758,33 @@ fn TerminalCanvas(
                                         // about the surface (the measured
                                         // paint-zombie had meaningful output
                                         // over a blank buffer).
+                                        // [Q7-R4] the DOM-presence
+                                        // `painted` (child_count||
+                                        // xterm||screen||viewport||rows)
+                                        // proves STRUCTURE, not content
+                                        // application — an inherited buffer
+                                        // reads painted with zero
+                                        // current-generation application.
+                                        // The witness advances only with a
+                                        // QUALIFIED receipt; without one the
+                                        // paint note waits (the ack-arrival
+                                        // promotion completes it).
+                                        let mut shell_paint_qualified = false;
                                         let _ = safe_shell_mut(
                                             state,
                                             "terminal_first_paint_witness",
                                             |shell| {
-                                                shell.note_terminal_session_painted(
-                                                    &session_path,
-                                                );
+                                                shell_paint_qualified = shell.terminal_session_applied_receipt_qualifies(&session_path);
+                                                if shell_paint_qualified {
+                                                    shell.note_terminal_session_painted_for_mount_epoch(
+                                                        &session_path,
+                                                        mount_epoch,
+                                                    );
+                                                } else {
+                                                    shell.terminal_sessions_paint_pending.insert(
+                                                        session_path.clone(),
+                                                    );
+                                                }
                                             },
                                         );
                                         append_trace_event(
@@ -8742,6 +8803,10 @@ fn TerminalCanvas(
                                                 "cols": cols,
                                                 "rows": rows,
                                                 "geometry_usable": geometry_usable,
+                                                // [Q7-R4] the paint witness's
+                                                // qualification state (rig bar).
+                                                "paint_qualified": shell_paint_qualified,
+                                                "paint_pending": !shell_paint_qualified,
                                             }),
                                         );
                                     }
@@ -8876,14 +8941,12 @@ fn TerminalCanvas(
                                             "terminal_attach_visual_reveal",
                                             |shell| {
                                                 shell.retain_terminal_session_path(&session_path);
-                                                shell.terminal_resume_ready_paths
-                                                    .insert(session_path.clone());
                                                 shell.terminal_attach_in_flight
                                                     .remove(&session_path);
-                                                shell.mark_terminal_open_attempt_ready_for_session(
-                                                    &session_path,
-                                                    "visual_reveal",
-                                                );
+                                                shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "visual_reveal" },
+                                );
                                                 shell.maybe_finish_terminal_surface_request_for_session(
                                                     &session_path,
                                                 );
@@ -8896,6 +8959,60 @@ fn TerminalCanvas(
                                         visual_reveal_output_sample.clear();
                                     }
                                 }
+                            }
+                            Ok(TerminalJsEvent::AppliedContent {
+                                session: applied_session,
+                                epoch: applied_epoch,
+                                runtime: applied_runtime,
+                                wrote: applied_wrote,
+                                blank: applied_blank,
+                                ts: applied_ts,
+                                page_gen: applied_gen,
+                            }) => {
+                                // [Q7-R3] the first-live-write receipt
+                                // arrived: validate the tuple against
+                                // CURRENT state, store it, and promote any
+                                // parked CONTENT claim / pending paint.
+                                let mut promoted = false;
+                                let _ = safe_shell_mut(
+                                    state,
+                                    "terminal_applied_content_promoted",
+                                    |shell| {
+                                        promoted = shell.record_terminal_applied_content(
+                                            &applied_session,
+                                            TerminalAppliedContentRecord {
+                                                mount_epoch: applied_epoch,
+                                                runtime_spawn_id: applied_runtime,
+                                                wrote: applied_wrote,
+                                                blank: applied_blank,
+                                                ts: applied_ts,
+                                                page_gen: applied_gen,
+                                                source: "live_write",
+                                            },
+                                        );
+                                        if promoted {
+                                            shell
+                                                .maybe_finish_terminal_surface_request_for_session(
+                                                    &applied_session,
+                                                );
+                                        }
+                                    },
+                                );
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "applied_content_promoted",
+                                    json!({
+                                        "session_path": applied_session.clone(),
+                                        "epoch": applied_epoch,
+                                        "runtime": applied_runtime,
+                                        "wrote": applied_wrote,
+                                        "blank": applied_blank,
+                                        "promoted": promoted,
+                                        "source": "live_write",
+                                    }),
+                                );
                             }
                             Ok(TerminalJsEvent::Input { data, ring_id }) => {
                                 // [F1-(f)] Dual-leg exactly-once ENQUEUE: the
@@ -9598,10 +9715,10 @@ fn TerminalCanvas(
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "stale_retry_host_health",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Decision { reason: "stale_retry_host_health" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -9663,14 +9780,11 @@ fn TerminalCanvas(
                                         "terminal_attach_clean_ready_attempt_surface",
                                         |shell| {
                                             shell.retain_terminal_session_path(&session_path);
-                                            shell
-                                                .terminal_resume_ready_paths
-                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight.remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "clean_ready_attempt_surface",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Decision { reason: "clean_ready_attempt_surface" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -9724,15 +9838,12 @@ fn TerminalCanvas(
                                         "terminal_attach_retained_transcript_browser_ready",
                                         |shell| {
                                             shell.retain_terminal_session_path(&session_path);
-                                            shell
-                                                .terminal_resume_ready_paths
-                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "retained_transcript_browser",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "retained_transcript_browser" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -9843,14 +9954,11 @@ fn TerminalCanvas(
                                         "terminal_attach_release_non_prompt_wait",
                                         |shell| {
                                             shell.retain_terminal_session_path(&session_path);
-                                            shell
-                                                .terminal_resume_ready_paths
-                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight.remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "non_prompt_wait_ceiling",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Decision { reason: "non_prompt_wait_ceiling" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -11860,16 +11968,12 @@ fn TerminalCanvas(
                                                 |shell| {
                                                     shell
                                                         .retain_terminal_session_path(&session_path);
-                                                    shell
-                                                        .terminal_resume_ready_paths
-                                                        .insert(session_path.clone());
                                                     shell.terminal_attach_in_flight
                                                         .remove(&session_path);
-                                                    shell
-                                                        .mark_terminal_open_attempt_ready_for_session(
-                                                            &session_path,
-                                                            "retained_non_prompt_snapshot_replay",
-                                                        );
+                                                    shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "retained_non_prompt_snapshot_replay" },
+                                );
                                                     shell
                                                         .maybe_finish_terminal_surface_request_for_session(
                                                             &session_path,
@@ -12099,16 +12203,12 @@ fn TerminalCanvas(
                                             |shell| {
                                                 shell
                                                     .retain_terminal_session_path(&session_path);
-                                                shell
-                                                    .terminal_resume_ready_paths
-                                                    .insert(session_path.clone());
                                                 shell.terminal_attach_in_flight
                                                     .remove(&session_path);
-                                                shell
-                                                    .mark_terminal_open_attempt_ready_for_session(
-                                                        &session_path,
-                                                        "blank_host_snapshot_replay",
-                                                    );
+                                                shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "blank_host_snapshot_replay" },
+                                );
                                                 shell
                                                     .maybe_finish_terminal_surface_request_for_session(
                                                         &session_path,
@@ -12370,7 +12470,9 @@ fn TerminalCanvas(
                             js_ready = true;
                             terminal_stage_js_ready(
                                 &eval,
+                                state,
                                 &session_path,
+                                mount_epoch,
                                 &host_id,
                                 &title,
                                 &theme,
@@ -12398,9 +12500,9 @@ fn TerminalCanvas(
                                     state,
                                     "warm_alive_posted_ready",
                                     |shell| {
-                                        shell.mark_terminal_open_attempt_ready_for_session(
+                                        shell.complete_terminal_open_attempt_ready(
                                             &session_path,
-                                            "warm_alive_posted_ready",
+                                            TerminalReadyClaim::Decision { reason: "warm_alive_posted_ready" },
                                         )
                                     },
                                 );
@@ -12737,6 +12839,74 @@ fn TerminalCanvas(
                                         state,
                                         "synthesized_mount_open_painted",
                                         |shell| {
+                                            // [Q7-R3] the qualified seed
+                                            // receipt is also a promotion
+                                            // source: record it so parked
+                                            // CONTENT claims and pending
+                                            // paint complete here too.
+                                            // TEST HOOK: FOREIGN poisons
+                                            // the receipt AT THE RECORD
+                                            // BOUNDARY (epoch+1000) —
+                                            // deterministic through this
+                                            // always-firing path (the
+                                            // page-side live-path poison
+                                            // rides noteAppliedLive; the
+                                            // live path is intermittent
+                                            // on the rig's verb-created
+                                            // row shape).
+                                            let foreign_hook = std::env::var(
+                                                "YGGTERM_TEST_APPLIED_CONTENT_FOREIGN",
+                                            )
+                                            .map(|value| value == "1")
+                                            .unwrap_or(false);
+                                            let record_epoch = if foreign_hook {
+                                                mount_epoch + 1000
+                                            } else {
+                                                mount_epoch
+                                            };
+                                            let record = TerminalAppliedContentRecord {
+                                                mount_epoch: record_epoch,
+                                                runtime_spawn_id: synth_pending_seed_runtime,
+                                                wrote: wrote_seed,
+                                                blank: proof
+                                                    .get("blank")
+                                                    .and_then(Value::as_bool)
+                                                    .unwrap_or(false),
+                                                ts: current_millis(),
+                                                page_gen: 0,
+                                                source: "seed_proof",
+                                            };
+                                            // [Q7-R3] the seed receipt is a
+                                            // promotion SOURCE like the live
+                                            // write — trace it in the same
+                                            // family (source-tagged) so the
+                                            // rig bars and production
+                                            // observability see every
+                                            // application, not only the
+                                            // ack-arrival order.
+                                            let seed_record_promoted = shell
+                                                .record_terminal_applied_content(
+                                                    &session_path,
+                                                    record,
+                                                );
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "applied_content_promoted",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "epoch": record_epoch,
+                                                    "runtime": synth_pending_seed_runtime,
+                                                    "wrote": wrote_seed,
+                                                    "blank": proof
+                                                        .get("blank")
+                                                        .and_then(Value::as_bool)
+                                                        .unwrap_or(false),
+                                                    "promoted": seed_record_promoted,
+                                                    "source": "seed_proof",
+                                                }),
+                                            );
                                             shell.note_terminal_session_painted_for_mount_epoch(
                                                 &session_path,
                                                 mount_epoch,
@@ -12928,6 +13098,18 @@ fn TerminalCanvas(
                                 &batch,
                             ));
                         }
+                    },
+                    // [Q7-R2] the re-attest probe completes: promotion (if
+                    // any) already ran inside the future.
+                    applied_content_probe_done = async {
+                        applied_content_probe_future
+                            .as_mut()
+                            .expect("applied content probe armed")
+                            .await
+                    },
+                        if applied_content_probe_future.is_some() =>
+                    {
+                        applied_content_probe_future = None;
                     },
                     synth_hash_probe_answer = async {
                         synth_hash_probe_eval
@@ -15516,15 +15698,12 @@ fn TerminalCanvas(
                                         "terminal_attach_fresh_remote_codex_start_ready",
                                         |shell| {
                                             shell.retain_terminal_session_path(&session_path);
-                                            shell
-                                                .terminal_resume_ready_paths
-                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "fresh_remote_codex_start",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "fresh_remote_codex_start" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -15568,14 +15747,11 @@ fn TerminalCanvas(
                                         "terminal_attach_live_transcript_browser_ready",
                                         |shell| {
                                             shell.retain_terminal_session_path(&session_path);
-                                            shell
-                                                .terminal_resume_ready_paths
-                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight.remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "live_transcript_browser",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "live_transcript_browser" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -15884,10 +16060,10 @@ fn TerminalCanvas(
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "stale_retry_host_health",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Decision { reason: "stale_retry_host_health" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -15948,10 +16124,10 @@ fn TerminalCanvas(
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "clean_ready_attempt_surface",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Decision { reason: "clean_ready_attempt_surface" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -16029,14 +16205,12 @@ fn TerminalCanvas(
                                         "terminal_attach_visual_reveal_from_read",
                                         |shell| {
                                             shell.retain_terminal_session_path(&session_path);
-                                            shell.terminal_resume_ready_paths
-                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
-                                            shell.mark_terminal_open_attempt_ready_for_session(
-                                                &session_path,
-                                                "visual_reveal",
-                                            );
+                                            shell.complete_terminal_open_attempt_ready(
+                                    &session_path,
+                                    TerminalReadyClaim::Content { reason: "visual_reveal" },
+                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -16901,8 +17075,10 @@ fn TerminalCanvas(
                                             );
                                             shell.retain_terminal_session_path(&session_path);
                                             shell.terminal_attach_in_flight.remove(&session_path);
-                                            shell.terminal_resume_ready_paths
-                                                .insert(session_path.clone());
+                                            shell.park_terminal_content_claim(
+                                                &session_path,
+                                                "attach_complete_latch",
+                                            );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -21762,6 +21938,64 @@ async fn flush_synth_output_fence_live(
 /// future for the release-flush select branch — defined as a fn (not an
 /// inline async block) so the pre_select body carries no `.await` text
 /// (the input-starvation lock scans the region's source).
+/// [Q7-R2] Stage the re-attest probe: eval the entry's published
+/// application receipt back into Rust (validation + promotion inside
+/// record_terminal_applied_content). Fire-and-forget completion; the select
+/// branch clears the slot.
+fn stage_applied_content_probe(
+    state: Signal<ShellState>,
+    host_id: String,
+    session_path: String,
+    trace_home: std::path::PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    Box::pin(async move {
+        let script = terminal_applied_content_probe_script(&host_id);
+        let answer = document::eval(&script).await;
+        let verdict = match answer {
+            Ok(value) => value
+                .as_str()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok()),
+            Err(_error) => None,
+        };
+        let Some(verdict) = verdict else { return };
+        if !verdict.get("entry_live").and_then(Value::as_bool).unwrap_or(false) {
+            return;
+        }
+        let Some(receipt) = verdict.get("receipt") else {
+            return;
+        };
+        let record = TerminalAppliedContentRecord {
+            mount_epoch: receipt.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+            runtime_spawn_id: receipt
+                .get("runtime")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            wrote: receipt.get("wrote").and_then(Value::as_u64).unwrap_or(0),
+            blank: receipt.get("blank").and_then(Value::as_bool).unwrap_or(false),
+            ts: receipt.get("ts").and_then(Value::as_u64).unwrap_or(0),
+            page_gen: receipt.get("gen").and_then(Value::as_u64).unwrap_or(0),
+            source: "reattest_probe",
+        };
+        let mut promoted = false;
+        let _ = safe_shell_mut(state, "terminal_applied_content_reattested", |shell| {
+            promoted = shell.record_terminal_applied_content(&session_path, record.clone());
+            if promoted {
+                shell.maybe_finish_terminal_surface_request_for_session(&session_path);
+            }
+        });
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "applied_content_reattested",
+            json!({
+                "session_path": session_path.clone(),
+                "promoted": promoted,
+            }),
+        );
+    })
+}
+
 fn stage_synth_release_flush(
     fence: SynthOutputFence,
     host_id: &str,
@@ -22878,7 +23112,9 @@ fn terminal_identity_color_profile_from_theme(
 /// ("bridge_event" | "warm_alive_posted").
 fn terminal_stage_js_ready(
     eval: &dioxus::document::Eval,
+    state: Signal<ShellState>,
     session_path: &str,
+    mount_epoch: u64,
     host_id: &str,
     title: &str,
     theme: &TerminalTheme,
@@ -22902,6 +23138,28 @@ fn terminal_stage_js_ready(
             "session_path": session_path,
             "host_id": host_id,
             "source": source,
+        }),
+    );
+    // [Q7-R3] Register the first-live-write receipt EXPECTATION at the
+    // FACTORED completion — both js_ready paths (bridge event + warm
+    // alive-poll) run this code, so every mount registers its generation
+    // exactly once (epoch + session bind; runtime 0 = unnamed yet, the s23
+    // seed-spec convention). The PAGE-side arm is at CONSTRUCTION (the
+    // entry literal in the eval script): a separate fire-and-forget stamp
+    // eval here raced both entry registration and the first live write
+    // (measured s26 — the first write bailed not_eligible and a
+    // single-batch mount never minted a receipt).
+    let _ = safe_shell_mut(state, "terminal_applied_content_armed", |shell| {
+        shell.arm_terminal_applied_content(session_path, mount_epoch, 0);
+    });
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_mount",
+        "applied_content_armed",
+        json!({
+            "session_path": session_path,
+            "epoch": mount_epoch,
         }),
     );
     let _ = eval.send(terminal_reset_command(title, theme));

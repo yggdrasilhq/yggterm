@@ -19055,6 +19055,15 @@ struct ShellState {
     // "meaningful output". A retained host without this witness must never be
     // treated as revealable.
     terminal_sessions_painted: HashSet<String>,
+    /// [Q7-R2/R3] qualified application receipts (page-published,
+    /// Rust-validated) — the evidence CONTENT Ready claims require.
+    terminal_sessions_applied_content: HashMap<String, TerminalAppliedContentRecord>,
+    /// the tuple this mount's live receipt must carry (armed at mount).
+    terminal_expected_applied_tuple: HashMap<String, TerminalExpectedAppliedTuple>,
+    /// CONTENT claims parked pending a receipt (ack-arrival promotion).
+    terminal_pending_content_claims: HashMap<String, &'static str>,
+    /// paint observed but not yet application-qualified (R4).
+    terminal_sessions_paint_pending: HashSet<String>,
     // Bounded history of finished terminal reveals (ready or failed), newest
     // last. Each entry carries timing + the swap snapshot taken at reveal start
     // so a slow reveal is self-diagnosing (swap thrash vs render stall) without
@@ -21299,6 +21308,46 @@ impl TerminalSurfaceStatus {
 // The block runs to ~line 35525 where `launch_shell` (the binary entry) begins.
 // See AGENTS.md for the source-of-truth contract behind each subsystem.
 // ============================================================================
+    /// [Q7-R2/R3] A QUALIFIED application receipt: page-published content
+    /// evidence (seed proof, acked flush, or the first live write), carried
+    /// into Rust and validated against the CURRENT tuple before it may
+    /// promote anything.
+    #[derive(Clone, Debug)]
+    pub(crate) struct TerminalAppliedContentRecord {
+        pub(crate) mount_epoch: u64,
+        pub(crate) runtime_spawn_id: u64,
+        pub(crate) wrote: u64,
+        pub(crate) blank: bool,
+        pub(crate) ts: u64,
+        pub(crate) page_gen: u64,
+        pub(crate) source: &'static str,
+    }
+
+    /// The tuple a receipt must carry for THIS mount (armed at mount time;
+    /// runtime 0 = not yet named — the epoch + session qualifiers bind).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(crate) struct TerminalExpectedAppliedTuple {
+        pub(crate) mount_epoch: u64,
+        pub(crate) runtime_spawn_id: u64,
+    }
+
+    /// [Q7-R2] The typed Ready claim. DECISION/liveness completions may end
+    /// their own wait — they never insert the content-qualified resume latch
+    /// and never complete a reveal. CONTENT completions require a qualified
+    /// application receipt matching the current tuple; without one they PARK
+    /// pending (sol s23 R2's classification).
+    pub(crate) enum TerminalReadyClaim {
+        Decision { reason: &'static str },
+        Content { reason: &'static str },
+    }
+
+    pub(crate) enum TerminalReadyOutcome {
+        NoAttempt,
+        DecisionCompleted,
+        ContentCompleted,
+        ContentPending,
+    }
+
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let initial_search_query = std::env::var("YGGTERM_SEARCH_QUERY").unwrap_or_default();
@@ -21563,6 +21612,10 @@ impl ShellState {
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
             terminal_sessions_painted: HashSet::new(),
+            terminal_sessions_applied_content: HashMap::new(),
+            terminal_expected_applied_tuple: HashMap::new(),
+            terminal_pending_content_claims: HashMap::new(),
+            terminal_sessions_paint_pending: HashSet::new(),
             reveal_log: VecDeque::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
@@ -28899,6 +28952,10 @@ impl ShellState {
         self.terminal_reveal_grace_until_ms.remove(session_path);
         self.terminal_sessions_reached_ready.remove(session_path);
         self.terminal_sessions_painted.remove(session_path);
+        self.terminal_sessions_applied_content.remove(session_path);
+        self.terminal_expected_applied_tuple.remove(session_path);
+        self.terminal_pending_content_claims.remove(session_path);
+        self.terminal_sessions_paint_pending.remove(session_path);
         if self
             .active_terminal_host_id
             .as_deref()
@@ -29445,10 +29502,176 @@ impl ShellState {
     fn terminal_session_host_has_painted(&self, session_path: &str) -> bool {
         self.terminal_sessions_painted.contains(session_path)
     }
+
+    /// [Q7-R2] THE GUARDED READY TRANSACTION: ONE door for every Ready
+    /// completion. A guard inside the old marker alone was BYPASSABLE —
+    /// sites inserted `terminal_resume_ready_paths` BEFORE the marker and
+    /// `terminal_session_has_visual_resume_reveal` accepted that set OR any
+    /// ready attempt (sol s23 R2). The latch insertion now lives INSIDE this
+    /// transaction, and only a qualified receipt opens it. DECISION claims
+    /// run the attempt-lifecycle effects without the latch or a reveal
+    /// record; CONTENT claims additionally require the receipt — a miss
+    /// parks the claim for the ack-arrival promotion
+    /// (record_terminal_applied_content) to complete.
+    fn complete_terminal_open_attempt_ready(
+        &mut self,
+        session_path: &str,
+        claim: TerminalReadyClaim,
+    ) -> TerminalReadyOutcome {
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return TerminalReadyOutcome::NoAttempt;
+        };
+        let _ = attempt_id;
+        let (reason, content_qualified) = match claim {
+            TerminalReadyClaim::Decision { reason } => (reason, false),
+            TerminalReadyClaim::Content { reason } => {
+                let qualifies = self
+                    .terminal_session_applied_receipt_qualifies(session_path);
+                if !qualifies {
+                    // PARK: no promotion without evidence. The claim waits
+                    // for the receipt to arrive (live-write event or the
+                    // re-attest probe) — liveness must not fabricate
+                    // content.
+                    self.terminal_pending_content_claims
+                        .insert(session_path.to_string(), reason);
+                    return TerminalReadyOutcome::ContentPending;
+                }
+                (reason, true)
+            }
+        };
+        if content_qualified {
+            self.terminal_resume_ready_paths.insert(session_path.to_string());
+        }
+        self.mark_terminal_open_attempt_ready_for_session(session_path, reason, content_qualified);
+        if content_qualified {
+            TerminalReadyOutcome::ContentCompleted
+        } else {
+            TerminalReadyOutcome::DecisionCompleted
+        }
+    }
+
+    /// Park a CONTENT claim WITHOUT an attempt lifecycle (the render-path
+    /// latch sites: a deadline/ceiling release or a poison clear used to
+    /// open the input gate with zero content evidence).
+    fn park_terminal_content_claim(&mut self, session_path: &str, reason: &'static str) {
+        if !self.terminal_session_applied_receipt_qualifies(session_path) {
+            self.terminal_pending_content_claims
+                .insert(session_path.to_string(), reason);
+            return;
+        }
+        // Already-qualified evidence: the latch is earned right now.
+        self.terminal_resume_ready_paths.insert(session_path.to_string());
+    }
+
+    /// Does this session hold a stored application receipt matching its
+    /// CURRENT mount tuple? (The epoch must still be the one the receipt
+    /// was earned under; the expected tuple's runtime — when named — must
+    /// match. An unknown expected runtime is unresolved, not a wildcard:
+    /// the epoch binds.)
+    fn terminal_session_applied_receipt_qualifies(&self, session_path: &str) -> bool {
+        let Some(current_epoch) = self.terminal_mount_epochs.get(session_path) else {
+            return false;
+        };
+        let Some(record) = self.terminal_sessions_applied_content.get(session_path) else {
+            return false;
+        };
+        if record.mount_epoch != *current_epoch {
+            return false;
+        }
+        if let Some(expected) = self.terminal_expected_applied_tuple.get(session_path) {
+            if expected.mount_epoch != record.mount_epoch {
+                return false;
+            }
+            if expected.runtime_spawn_id != 0
+                && record.runtime_spawn_id != 0
+                && record.runtime_spawn_id != expected.runtime_spawn_id
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [Q7-R3] Arm the first-live-write receipt expectation for THIS mount.
+    /// An epoch CHANGE resets the stored evidence: a new mount's parked
+    /// claims and receipts belong to the dead incarnation.
+    fn arm_terminal_applied_content(
+        &mut self,
+        session_path: &str,
+        mount_epoch: u64,
+        runtime_spawn_id: u64,
+    ) {
+        let epoch_changed = self
+            .terminal_mount_epochs
+            .get(session_path)
+            .is_some_and(|current| *current != mount_epoch);
+        if epoch_changed {
+            self.terminal_sessions_applied_content.remove(session_path);
+            self.terminal_pending_content_claims.remove(session_path);
+            self.terminal_sessions_paint_pending.remove(session_path);
+        }
+        self.terminal_expected_applied_tuple.insert(
+            session_path.to_string(),
+            TerminalExpectedAppliedTuple {
+                mount_epoch,
+                runtime_spawn_id,
+            },
+        );
+    }
+
+    /// [Q7-R3] THE ACK-ARRIVAL PROMOTION: validate a page-pushed (or
+    /// probe-read) application receipt against CURRENT authoritative
+    /// state, store it, then complete any parked CONTENT claim and pending
+    /// paint witness. Returns whether any promotion fired.
+    fn record_terminal_applied_content(
+        &mut self,
+        session_path: &str,
+        record: TerminalAppliedContentRecord,
+    ) -> bool {
+        let Some(current_epoch) = self.terminal_mount_epochs.get(session_path).copied() else {
+            return false;
+        };
+        if record.mount_epoch != current_epoch {
+            return false;
+        }
+        if let Some(expected) = self.terminal_expected_applied_tuple.get(session_path) {
+            if expected.mount_epoch != record.mount_epoch {
+                return false;
+            }
+            if expected.runtime_spawn_id != 0
+                && record.runtime_spawn_id != 0
+                && record.runtime_spawn_id != expected.runtime_spawn_id
+            {
+                return false;
+            }
+        }
+        self.terminal_sessions_applied_content
+            .insert(session_path.to_string(), record);
+        let mut promoted = false;
+        if let Some(reason) = self.terminal_pending_content_claims.remove(session_path) {
+            self.terminal_resume_ready_paths.insert(session_path.to_string());
+            self.mark_terminal_open_attempt_ready_for_session(session_path, reason, true);
+            promoted = true;
+        }
+        if self.terminal_sessions_paint_pending.remove(session_path) {
+            self.note_terminal_session_painted_for_mount_epoch(
+                session_path,
+                current_epoch,
+            );
+            promoted = true;
+        }
+        promoted
+    }
+
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
         session_path: &str,
         reason: &'static str,
+        content_qualified: bool,
     ) {
         let Some(attempt_id) = self
             .terminal_open_attempt_by_session
@@ -29492,7 +29715,14 @@ impl ShellState {
         // record its timing + the swap snapshot taken at reveal start into the
         // reveal log. Recovered-failure re-readies are not fresh reveals.
         if first_ready_for_reveal_log {
-            self.record_reveal_outcome(session_path, &attempt_id, "ready", None);
+            // [Q7-R2] a DECISION completion is not a reveal: the log
+            // label separates the classes for every histogram reader.
+            self.record_reveal_outcome(
+                session_path,
+                &attempt_id,
+                if content_qualified { "ready" } else { "decision_ready" },
+                None,
+            );
         }
         // Successful recovery is the OTHER natural end of the
         // RetainedFaultRecoveryLoop gate. Record the duration into the
@@ -29725,7 +29955,10 @@ impl ShellState {
             })),
         );
         if fast_ready_eligible {
-            self.mark_terminal_open_attempt_ready_for_session(session_path, fast_ready_reason);
+            self.complete_terminal_open_attempt_ready(
+                session_path,
+                TerminalReadyClaim::Content { reason: fast_ready_reason },
+            );
         }
     }
     fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
@@ -30422,9 +30655,9 @@ impl ShellState {
             && host_has_painted
             && self.terminal_session_host_id(session_path).is_some()
         {
-            self.mark_terminal_open_attempt_ready_for_session(
+            self.complete_terminal_open_attempt_ready(
                 session_path,
-                "ready_on_inactive_cancel_host_already_live",
+                TerminalReadyClaim::Decision { reason: "ready_on_inactive_cancel_host_already_live" },
             );
             return false;
         }
@@ -32940,8 +33173,12 @@ impl ShellState {
         true
     }
     fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
+        // [Q7-R2] THE LATCH ONLY. "OR any ready attempt" was the bypass: a
+        // DECISION-class Ready (liveness / reuse / deadline) satisfied the
+        // visual-resume reveal and opened the remote-resume input gate with
+        // zero content evidence (sol s23 R2). The latch is inserted ONLY by
+        // the guarded CONTENT transaction.
         self.terminal_resume_ready_paths.contains(session_path)
-            || self.terminal_session_has_ready_attempt(session_path)
     }
     /// Is the resume gate currently refusing this row?
     ///
@@ -33614,9 +33851,9 @@ impl ShellState {
         if !should_rearm && !exhausted_budget {
             if saw_live_host_output && self.terminal_session_host_id(active_session_path).is_some()
             {
-                self.mark_terminal_open_attempt_ready_for_session(
+                self.complete_terminal_open_attempt_ready(
                     active_session_path,
-                    "ready_on_fault_watchdog_host_already_live",
+                    TerminalReadyClaim::Decision { reason: "ready_on_fault_watchdog_host_already_live" },
                 );
             }
             return false;
@@ -33654,9 +33891,9 @@ impl ShellState {
                 // session alive + usable (a keystroke or slash repaints) instead of
                 // marking it Failed (which yanks/closes it). Auto-closing a working
                 // session is the worst outcome. See [[finding-hot-switch-latency-remount]].
-                self.mark_terminal_open_attempt_ready_for_session(
+                self.complete_terminal_open_attempt_ready(
                     active_session_path,
-                    "retained_fault_recovery_exhausted_keep_alive",
+                    TerminalReadyClaim::Decision { reason: "retained_fault_recovery_exhausted_keep_alive" },
                 );
             } else {
                 // No live runtime — a genuine failure. Mark it failed as before.
