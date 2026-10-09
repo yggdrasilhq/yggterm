@@ -17845,6 +17845,64 @@ console.log('ok');
     }
 
     #[test]
+    fn established_frame_read_error_hold_is_bounded_and_escalates() {
+        // [11.229](b)] The established-frame read-error hold must be
+        // BOUNDED: transient restart-gap errors hold the mounted frame
+        // ([11.167]), but an owner-flip whose reads error forever used to
+        // ghost-hold the DEAD runtime's last frame with no escalation —
+        // the identity signal needs an ANSWER carrying a new
+        // runtime_spawn_id, and errors never answer.
+        let escalate = should_escalate_established_read_error;
+        let now = 1_000_000u64;
+        assert!(!escalate(now, now), "the first error of a streak holds");
+        assert!(
+            !escalate(now, now + 29_999),
+            "inside the window holds — the restart gap is transient by design"
+        );
+        assert!(
+            escalate(now, now + 30_000),
+            "past the window the hold escalates to the recovery ladder"
+        );
+        assert!(
+            escalate(now, now + 600_000),
+            "a forever-erroring read must never hold the frame indefinitely"
+        );
+        let viewport = include_str!("viewport.rs");
+        assert!(
+            viewport
+                .find("read_error_held_frame_escalated")
+                .is_some(),
+            "the escalation must leave a named trace (the production detector)"
+        );
+        assert!(
+            viewport
+                .find("read_error_held_frame_escalated")
+                .is_some_and(|at| {
+                    let after = &viewport[at..viewport.len().min(at + 1_400)];
+                    after.contains("established_read_error_held_since_ms = None;")
+                }),
+            "the streak must reset when the hold escalates"
+        );
+        // The wiring: the established branch consults the predicate and
+        // FALLS THROUGH (no continue) past the window; the answered read
+        // resets the streak.
+        let hold_at = viewport
+            .find("read_error_held_frame_escalated")
+            .expect("detector must exist");
+        let window = &viewport[hold_at..viewport.len().min(hold_at + 3_000)];
+        assert!(
+            window.contains("} else {") && window.contains("continue;"),
+            "the hold must CONTINUE only inside the window — past it the              branch falls through to the post-attach ladder"
+        );
+        assert!(
+            viewport
+                .find("established_read_error_held_since_ms = None;")
+                .is_some(),
+            "an answered read must reset the streak (the rising edge)"
+        );
+    }
+
+    #[test]
     fn every_mount_loop_select_arm_enters_under_a_branch_guard() {
         // (i-r1) The drop witness's exit_hint names the last select branch a
         // mount loop ENTERED — but only arms that construct a
