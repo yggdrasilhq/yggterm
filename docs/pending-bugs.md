@@ -984,6 +984,34 @@ CLIENT halves that still recur on healthy rows.
   machinery, not this signal) and any owner-flip shape where reads
   ERROR rather than answer (unreproducible locally; watch for
   terminal_stream_runtime_replaced in the wild as the detector).
+  UPDATE 2026-10-10 (sitting 27, lane lane/rt2/read-error-escalation
+  stacked on lane/ir1/exit-arm-names): THE ERROR ARM IS BOUNDED IN CODE.
+  Measured at source: the read-outcome Err arm's ESTABLISHED-FRAME HOLD
+  (remote-resume + attached + painted + output) ghost-held the frame and
+  `continue`d FOREVER — "no remount, input disable, or reset is allowed
+  on this established-frame path" — correct for [11.167]'s TRANSIENT
+  restart gap, but an owner-flip whose reads error forever froze the
+  DEAD runtime's last frame with NO bound and NO invalidation (the
+  identity signal needs an ANSWER carrying a new runtime_spawn_id;
+  errors never answer). FIX: the hold is now windowed —
+  TERMINAL_ESTABLISHED_FRAME_READ_ERROR_ESCALATION_MS (30s) of
+  CONTINUOUS errors (streak reset on every answered read, the [11.167]
+  rising edge) escalates via read_error_held_frame_escalated{held_ms}
+  and FALLS THROUGH to the post-attach machinery (recovery retries ->
+  exhaustion -> the (e-r3) parked-claim ladder, whose R3 re-attest
+  probe can promote when the runtime answers again) — attached=true
+  skips the initial-retry branch by construction. TEST HOOK
+  YGGTERM_TEST_READ_ERROR_FILE (marker-matched, absent file = inert;
+  the (h2)/spawn-id precedent) + tools/uxspeed/readerr-rig.sh = the
+  LOCAL regression bar (hook errors reads; the local row takes the
+  bounded ladder; the REMOTE established branch stays
+  unconstructible locally — the s20 rig v5b remote-row pattern pointed
+  at a live remote target is the OWED construction bar, named).
+  Shape-locked by established_frame_read_error_hold_is_bounded_and_
+  escalates (predicate edges + the fall-through wiring + the streak
+  resets). PROOF LEVEL (the (c)/(f2)/(h2) precedent): landed in code +
+  suite lock + local hook proof; live proof owed by detector
+  (read_error_held_frame_escalated in the wild).
 - (c) REVEAL DEADLINE → PERMANENT BLANK: `reveal_cover_released
   reason:deadline bytes:0` when a cold transcript re-render outruns the
   cover deadline — the cover drops to a blank viewport that never
