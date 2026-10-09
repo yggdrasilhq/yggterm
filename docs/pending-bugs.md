@@ -828,7 +828,7 @@ campaign's living map, maintained by the zcode+sol loop (consult node
 
 ## ⛔ [11.238] TWO FLEET-SKILL TESTS ARE RED ON CLEAN MAIN — ygg-auth's ROTATION SCORING RANKS A FULL ACCOUNT FIRST ("headroom did not lead": acct-full > acct-good > acct-dead) AND THE SANDBOX-AIM TEST'S REMOTE ARM NEVER MAKES ITS SSH HOP (measured 2026-10-07, both rc=1 identically on main e1b99812 and on the [11.237] arm-2 lane — PRE-EXISTING, surfaced by arm 2's skill-suite gate)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-10-07 by the [11.237] arm-2 sitting (board ACK-da8179c1e1's
 outcome). The migration's gate ran the whole
@@ -856,6 +856,23 @@ against the test's expectation and decide bug-vs-stale-test with the
 owner's rotation laws (ygg-auth skill); for (2) trace the aimed sandbox
 spawn's own log — the test prints the sandbox dir; check whether the
 headless binary registered rows at all.
+  RESOLVED 2026-10-10 (sitting 27, zcode on oc): RED 1 WAS A REAL BUG —
+  lane lane/fleet/auth-headroom e38a7c551 (off main): rotate_score's
+  headroom `min(free(pri), free(sec))` read a MISSING secondary window
+  as free(None)=0 — every single-window snapshot walled its account at
+  headroom 0/tier 1 below every two-window peer regardless of real
+  usage (the red's exact shape: acct-good min(90, 0)=0 tier-tied with
+  acct-full, slug-alphabetical tiebreak put acct-full first). Headroom
+  now mins over the windows that EXIST (min(default=0) only when
+  neither answers). The test was RIGHT and is the falsifier (12/12
+  green on the lane). RED 2 IS ENVIRONMENTAL ON DEV, PROBED: the SAME
+  battery on oc (main + only the scoring fix) runs 28/28 rc=0 INCLUDING
+  test_the_fleet_verbs_can_be_aimed_at_a_sandbox — the ssh-hop arm
+  completes off-dev. The dev-side leg (watcher/live-daemon contention
+  hypothesis) stays UNPROVEN: retest on dev's return; if it greens
+  there, close as environment; else read the sandbox dir's own log per
+  the original attack. [11.238] itself closes with red 1's landing;
+  the red-2 retest rides the dev-return checklist.
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
