@@ -546,26 +546,45 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   is therefore transport-blocked on warm remounts: post-swap
   generations can only receipt through the Rust-minted seed path.
   FILED as (e-r6) below. STILL OPEN (the re-scoped residue): (e-r6)
-  the warm-remount receipt transport (a receipt leg that survives the
-  captured-send death — candidate lines: routing the write-callback
-  receipt over the eval-return channel the liveness poll already
-  rides; re-capturing the send per warm invocation; accepting the
-  seed path as the sole post-swap receipt source and hardening the
-  retained/replay re-feed instead — sol s31 Q2 ranks these); sol Q1's
+  the warm-remount event transport — RE-SCOPED AGAIN by s32: the
+  page-side cold capture is FIXED (invocation bridge, V4) and the
+  death is now the RUST-side receiver (the warm mount task stops
+  draining its eval channel after the early-ready phase; the
+  dual-leg event journal per sol s32 Q2/Q4 is the design); sol Q1's
   stale-caller credit (claims carry no originating attempt identity);
   the wedge-1 re-attest scheduling (unchanged); page_gen comparison
   (stored, never compared — the seed path records page_gen 0 by
   convention, naming it needs the seed proof to carry the page gen);
   wedge 2 (snapshot missing-vs-empty) untouched.
-  (e-r6) THE WARM-REMOUNT RECEIPT TRANSPORT — OPEN 2026-10-10 (filed
-  by sitting 31 from the MODE=swap run-1 measurement): the naming
-  chain's page-side receipt leg dies with the cold eval's captured
-  send on every warm remount (the runtime-swap recovery path!), so
-  post-swap live-write receipts never reach the validator — the
-  applied-content evidence for a swapped-in runtime rides the seed
-  path alone. Attack: per sol s31 Q2's ranking (consult node); the
-  rig bar is MODE=swap's WRITE verdict extended to the post-retirement
-  generation once a transport lands.
+  (e-r6) THE WARM-REMOUNT EVENT TRANSPORT — RE-SCOPED 2026-10-10
+  (sitting 32, measured to the receiving side): the s31 cold-capture
+  diagnosis was real but SECONDARY. The invocation-bridge fix landed
+  (the fn takes the invocation channel as its 2nd argument and
+  prefers it; V4; both dispatch shapes pass their own eval binding)
+  and the page side is PROVEN healthy — the warm invocation passes a
+  VALID bridge (its own eval channel, request_id recorded), the tag
+  send returns without throwing, the invocation reaches the command
+  pump, and the warm ready record CROSSED the channel at +97ms
+  (js_ready source=bridge_event). THE LOAD-BEARING DEATH IS
+  RUST-SIDE: at steady state a fresh-eval direct-send into the same
+  live page-side channel (id verified via the __msg_queues dump)
+  queues forever, undelivered — the warm mount task's receiver
+  STOPPED DRAINING eval.recv() after the early-ready phase. The task
+  never drops (no second terminal_mount_task_dropped) and
+  js_wait_begin at +9ms post-retirement has no end: the loop is
+  alive-but-not-reading (a hang or a never-returning await in the
+  warm completion path — the (i-r1) exit-arm naming +
+  loop-heartbeat instrumentation is the attack; sol s32 Q2/Q4 ACCEPT
+  the dual-leg event journal — append-before-push,
+  incarnation+sequence ids (epoch alone is insufficient: runtime
+  swaps keep epoch), cursor-read + ack-after-process, push stays the
+  fast path — for events whose delivery depends on the mount channel;
+  receipts already guaranteed in flush-eval returns need no second
+  queue. sol Q5: report the delivery discrepancy upstream with the
+  staged repro design, NO race label). Rig bar: MODE=swap +
+  FENCE_RIG_TRANSPORT_PROBE=1 rc 21 is the STANDING RED (warm tags
+  must reach the bridge; red on main AND on the s32 lane — the lane
+  fixes the page side, the receiver defect is the next unit).
   (e-r6-probe) THE DIFFERENTIAL TRANSPORT PROBE MEASURED 2026-10-10
   (sitting 31 unit 2, same sitting, lane lane/e6/transport-probe;
   fence-rig MODE=swap + FENCE_RIG_TRANSPORT_PROBE=1, rc 0): every
@@ -600,6 +619,39 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   consumed by the wrong elif first). LOCKS:
   the_differential_transport_probe_tags_both_legs +
   the_retire_adoption_control_gates_only_the_retirement_branch.
+  (e-r6-s32) THE INVOCATION-BRIDGE FIX + FULL DISCRIMINATION CHAIN —
+  MEASURED + LANDED IN CODE 2026-10-10 (sitting 32, lane
+  lane/e7/transport-channel; sol node
+  lores/chain-of-thought/2026-10-10-yggterm-s32-transport-sol.md):
+  (1) the fn signature (__yggAttempt, __yggInvocationBridge) with the
+  invocation-passed bridge (send+recv both callable) WINNING over the
+  lexical capture — refreshes sendTerminalEvent, the
+  recvTerminalCommand pump, and the resend arm together;
+  TERMINAL_MOUNT_FN_VERSION 3->4 (the probe forces the reinstall).
+  (2) NEW ORGANIC EVIDENCE NOW CROSSES: a post-retirement live_write
+  receipt carrying the ADOPTED runtime, epoch-matched, accepted
+  (wrote=186/353) — 4/4 lane runs, 0/1 on main (one main run; run
+  variance not excluded) — the chain bar's gen2-evidence clause now
+  accepts seed_proof OR live_write on the adopted name, and the
+  write-mislabel clause allows the adopted name post-retirement.
+  (3) the probe grew into the full discrimination chain: stage tags
+  (the invocation-time tag dies in the warm eval first-ms window —
+  the ~1KB warm script has no parse stall, the body starts before
+  the reader attaches; run-1's +930ms veil-release events were NOT
+  warm-push proof), bridge/lexical/request_id mailbox fields, the
+  __msg_queues dump, and the direct-send falsifier. (4) MEASURED
+  TIMING LAWS: the warm body starts +1ms after dispatch (cold:
+  +234ms — the ~500KB parse is the cold reader-attach delay); the
+  warm ready crosses +97ms; the receiver dies between +97ms and the
+  stable probe. Consult verdicts: Q1 REBUT (the slab-reuse ABA race
+  is causally incomplete — the freeing drop precedes the reuse
+  insertion; ranked alternate #1 wrong-identity measured and
+  ELIMINATED by the direct-send falsifier; alternate #3
+  receiver-not-held is the measured shape), Q2/Q4 ACCEPT (the
+  dual-leg journal design recorded in (e-r6)), Q3 REBUT (the receipt
+  crossing is proven, its TRANSPORT attribution to flush-eval returns
+  is NOT — needs route-tag evidence before the queue claims it), Q5
+  REBUT (upstream report without the race label).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
