@@ -329,6 +329,57 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   green + full rerun green) + server 1668/0 no-fail-fast. CI +
   DEPLOY OWED ON DEV'S RETURN (lanes stay pushed to origin for
   subscription the moment the integration watcher lives again).
+  LANDED+DEPLOYED 2026-10-10 06:02 IST (sitting 28, zcode seat
+  sess_dc91c13e): all six s26/s27 lanes (er3 full-binding FIRST,
+  docs26, ir1, rt2, auth, docs27) merged by the ci in ONE build with
+  ZERO conflicts → main 5be94c461ceb pushed + deployed + read-back
+  verified; verb set re-dispersed (35 replicas at 5be94c46, zero
+  drift). INFRA NOTE: the live watcher had been respawned with
+  `--project` pinned to one project during dev's outage — with
+  a.project set the tick loop serves ONLY that project, starving
+  every other project's subs; replaced with the canonical
+  all-projects watcher (ONE watcher verified, old one killed by
+  exact pid). SOL ROUND 2 on the landed
+  evidence (gpt-6.1-sol HIGH, juju on dev, node
+  lores/chain-of-thought/2026-10-10-yggterm-s28-er3-full-sol-round2.md,
+  probes + full ANSWER preserved alongside): THE INDICTMENT REMAINS
+  OPEN — the caller-side latch leak and the arm race ARE closed (all
+  17 sites verified, 8 CONTENT / 9 DECISION routes), but the record's
+  "structure, complete" was too strong (three guarded insertion
+  routes, not one door; claims still carry no originating
+  attempt/epoch identity), and two NEW defects are REAL at source,
+  both reproduced by sol's own probes and re-verified by the seat on
+  deployed main: (S28-1) noteAppliedLive resolves the registry entry
+  AT CALLBACK TIME — a write callback from entry A held across
+  same-host replacement mints the REPLACEMENT B's receipt (epoch 2)
+  for A's bytes, consumes B's eligibility, and B's parked claims
+  promote without application (violates R1's ownership rule
+  verbatim; the probe shows old_entry_receipt:false + replacement
+  receipt epoch 2 + eligibility consumed; a superseded write also
+  publishes). (S28-2) both runtime predicates reject only when BOTH
+  runtimes are nonzero — a receipt runtime 0 satisfies a NAMED
+  expectation (expected 7 + receipt 0 → accepted + latch promoted)
+  while production arms runtime 0 hardcoded, so the tuple never
+  establishes current-runtime provenance; page_gen stored but never
+  compared. (Q3, also verified) the seed paint note fires
+  UNCONDITIONALLY after record_terminal_applied_content returns — a
+  FOREIGN-rejected seed record still earns paint at the current
+  epoch. NAMED NEXT UNIT (e-r4), sol's disposition: retain the sweep
+  + construction arm; close S28-1 FIRST (capture the writing entry +
+  immutable tuple + supersession AT WRITE ISSUANCE; at callback
+  require registry identity + unchanged qualification before
+  consuming/publishing — never resolve B to acknowledge bytes parsed
+  by A), then the runtime-zero rule (receipt runtime 0 must not
+  satisfy a named expectation; bind runtime when known + a defined
+  provisional policy), then the paint-note guard (accepted≠promoted;
+  the paint mutation needs the accepted receipt). Rig arms owed: the
+  held-callback page arm (the worst missing falsifier — the state
+  test never holds a callback and the callback fabricates the NEW
+  epoch, so the existing old-epoch test misses S28-1), seed-skip
+  isolation, `accepted` in the phase-C bar (it reads a hard-coded
+  epoch-1 trace event today), and the wedge-1 re-attest scheduling
+  (the skipped-bootstrap site is DECISION and never parks — the
+  re-attest probe has no path from it).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
@@ -873,6 +924,27 @@ headless binary registered rows at all.
   there, close as environment; else read the sandbox dir's own log per
   the original attack. [11.238] itself closes with red 1's landing;
   the red-2 retest rides the dev-return checklist.
+  RETEST 2026-10-10 ~06:05 IST (sitting 28, dev back up): STILL RED on
+  dev, and the mechanism is now NAMED — s27's watcher/live-daemon
+  contention hypothesis is FALSIFIED. ygg-spawn's own error is the
+  whole story: "no live Yggterm GUI client is registered for app
+  control on this host (dev)" — app control is served by the GUI
+  PROCESS, and dev has run NO yggterm GUI (nor daemon) since its
+  2026-10-08 reboot; ygg-deliver then cascades ("no row matches
+  <uuid>") off the same absence. NO CODE IMPLICATION: the verbs are
+  unchanged by the 2026-10-10 landing except ygg-auth.py (which this
+  battery does not aim at), and the 28/28 oc green ran the EXACT
+  landed bytes (e38a7c551 verbatim). At retest hour no fleet host had
+  a live GUI (the muse-lab host's last server socket retired
+  2026-10-07; oc's rig GUIs torn down; dev none since reboot), so a
+  live-arm re-run is blocked fleet-wide until a GUI is next up — a
+  GUI is the owner's desktop flow, not agent-forced (the
+  untargeted-GUI-action law). RED 1 IS LANDED+DEPLOYED+DISPERSED
+  (main 5be94c461ceb, replicas at 5be94c46). DISPOSITION:
+  environmental-with-mechanism stands; if the
+  battery is still red on dev WITH a GUI up, reopen and read the
+  sandbox dir's log per the original attack — until then the only
+  owed live proof is red 1's rotation behavior in real usage.
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
