@@ -271,24 +271,64 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (fenced_repaint, wrote_seed=7, blank=true, receipt qualifies,
   covered drop 195B/1 batch, page marker 0 through every transient
   sample); loss/dup/order + healthy regressions GREEN on the same
-  build; shell 2246/0 + server 1668/0 no-fail-fast. RESIDUE (the
-  named next unit, sol's R2/R3/R4 structure): the 17-site
-  CONTENT/DECISION sweep (sol's classification: CONTENT =
-  active_recovery_snapshot_replay, visual_reveal x2,
+  build; shell 2246/0 + server 1668/0 no-fail-fast.
+  (e-r3-full) LANDED IN CODE 2026-10-09 (sittings 24-26, lane
+  lane/er3/full-binding 1d88a1a36 pushed to origin; s24/s25 died
+  with dev's outage mid-unit — s26 resumed s25's uncommitted oc
+  worktree): THE GUARDED READY TRANSACTION + THE FIRST-LIVE-WRITE
+  RECEIPT + THE DOM-PAINT BINDING — sol round-1's R2/R3/R4/R6
+  structure, complete. R2: complete_terminal_open_attempt_ready is
+  ONE door for every Ready completion — the
+  terminal_resume_ready_paths latch insertion moved INSIDE it (the
+  bypass: sites inserted the latch before the marker and
+  terminal_session_has_visual_resume_reveal accepted that set OR any
+  ready attempt) and the predicate reads the LATCH ONLY. The 17-site
+  sweep per sol's classification: 7 CONTENT reasons
+  (active_recovery_snapshot_replay, visual_reveal x2,
   retained_transcript_browser, retained_non_prompt_snapshot_replay,
   blank_host_snapshot_replay, live_transcript_browser,
-  fresh_remote_codex_start; DECISION/liveness = the other seven
-  reasons), the marker's ONE guarded transaction — a guard inside
-  the Ready marker alone is BYPASSABLE (sites insert
-  terminal_resume_ready_paths BEFORE the marker and
-  terminal_session_has_visual_resume_reveal accepts that set OR
-  any ready attempt, state.rs 32921-32924; the marker credits
-  whichever attempt is current) — the first-live-write receipt
-  (ownership is not application; a one-time callback on the first
-  eligible current-generation live batch; the DOM-presence
-  first-paint branch's `painted` is child_count||xterm||screen||
-  viewport||rows, not buffer content), and the negative-control
-  rig arms (painted-but-unapplied + liveness-signal shapes).
+  fresh_remote_codex_start) require a qualified
+  AppliedContentReceiptSpec receipt matching the current tuple or
+  PARK — the ack-arrival promotion (record_terminal_applied_content)
+  completes parked claims AND pending paint, same-epoch,
+  tuple-validated; 7 DECISION reasons end their own wait without the
+  latch; the render-path latch sites (gate-ceiling release, poison
+  clears, attach-complete) park via park_terminal_content_claim; the
+  reveal log separates the classes (ready vs decision_ready). R3:
+  the page entry arms AT CONSTRUCTION — the tuple rides the host
+  div's data-terminal-mount-epoch, one-shot eligibility per entry
+  generation, WITHHOLD/FOREIGN hooks at build time. MEASURED ROOT:
+  s25's separate post-js_ready arm eval RACED entry registration and
+  the first live write — armed traced Rust-side while the page stamp
+  missed, the first write bailed not_eligible, and a single-batch
+  mount never minted a receipt (the s26 bail diagnostics caught it).
+  The first completing live write publishes __e.appliedContent and
+  pushes the AppliedContent wire event; Rust validates epoch+runtime
+  against the armed tuple before storing or promoting; a
+  rate-limited re-attest probe (2s, parked claims only) reads a
+  retained host's page-published receipt back. R4: the DOM-presence
+  paint witness (child_count||xterm||screen||viewport||rows) no
+  longer mints paint facts alone — without a current receipt the
+  witness parks (paint_pending, traced) and the promotion completes
+  it epoch-qualified. TRACES: applied_content_armed /
+  applied_content_promoted (source-tagged live_write|seed_proof,
+  promoted=bool) / applied_content_reattested. RIG: fence-rig
+  MODE=negative — phase A (withheld + seed forced-skip: zero
+  promotions AND zero CONTENT-reason completions — the latch-leak
+  detector; unfixed main = RED exit 13 "a Ready attempt completed
+  with ZERO application evidence"), phase C (controlled release:
+  armed + a valid epoch-matched receipt recorded, claim-order
+  independent + content on screen; the dummy-row + force-open shape
+  kills the 15s row-create orphan race), phase D (FOREIGN poison at
+  the RECORD boundary, epoch+1000, deterministic via the seed path;
+  observed rejected, nothing promotes). MEASURED on oc Xvfb (dev
+  down since 2026-10-08 ~20:45 IST; rig patience 150s for oc —
+  dev's Xvfb was the original target): RED rc13 hook-only main
+  e122a2f39 (worktree --redmain); GREEN rc0 phases A/C/D on the
+  lane; suites shell 2252/0 (one sidebar-memo load flake, isolation
+  green + full rerun green) + server 1668/0 no-fail-fast. CI +
+  DEPLOY OWED ON DEV'S RETURN (lanes stay pushed to origin for
+  subscription the moment the integration watcher lives again).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
