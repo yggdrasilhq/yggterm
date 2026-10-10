@@ -4645,6 +4645,9 @@ fn TerminalCanvas(
         let runtime_session_path_for_task =
             state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
         let session_path_for_task = session_path.clone();
+        // [e-r8] ORIGIN capture at spawn (sol s34 Q1): the unready attempt
+        // this probe serves — never re-read at completion time.
+        let recovery_origin_attempt_id = latest_unready_attempt_id.clone();
         let trace_home_for_task = trace_home.clone();
         let remote_starting_agent_session_for_task = remote_starting_agent_session;
         spawn(async move {
@@ -4657,6 +4660,12 @@ fn TerminalCanvas(
                             .latest_terminal_open_attempt_for_path(&session_path_for_task)
                             .is_some_and(|attempt| {
                                 !matches!(attempt.state, TerminalOpenAttemptState::Ready)
+                                    // [e-r8] ownership: this probe serves
+                                    // the attempt it was keyed on; a
+                                    // churned attempt gets its OWN probe
+                                    // (a fresh key re-arms one).
+                                    && Some(attempt.attempt_id.as_str())
+                                        == recovery_origin_attempt_id.as_deref()
                             })
                 });
                 if !still_recovering {
@@ -4694,6 +4703,30 @@ fn TerminalCanvas(
                         let snapshot_text = sanitize_terminal_replay_payload(&snapshot_text);
                         if snapshot_text.trim().is_empty() {
                             continue;
+                        }
+                        // [e-r8] Ownership re-check AFTER the await, BEFORE
+                        // any effect (sol s34 Q3): the door guard cannot
+                        // undo replayed data, dismissed overlays, cleared
+                        // notifications, or an attach_in_flight removal — a
+                        // churned task must perform NONE of them.
+                        let still_owned = state.with(|shell| {
+                            shell
+                                .terminal_open_attempt_id_for(&session_path_for_task)
+                                .as_deref()
+                                == recovery_origin_attempt_id.as_deref()
+                        });
+                        if !still_owned {
+                            append_trace_event(
+                                &trace_home_for_task,
+                                "ui",
+                                "terminal_mount",
+                                "active_recovery_stale_break",
+                                json!({
+                                    "session_path": session_path_for_task.clone(),
+                                    "origin_attempt_id": recovery_origin_attempt_id.clone(),
+                                }),
+                            );
+                            break;
                         }
                         let _ = document::eval(&terminal_replay_retained_data_script_for_session(
                             &session_path_for_task,
@@ -4735,7 +4768,7 @@ fn TerminalCanvas(
                                 shell.complete_terminal_open_attempt_ready(
                                     &session_path_for_task,
                                     TerminalReadyClaim::Content { reason: "active_recovery_snapshot_replay" },
-                                );
+                                    recovery_origin_attempt_id.as_deref(),                                );
                                 shell.maybe_finish_terminal_surface_request_for_session(
                                     &session_path_for_task,
                                 );
@@ -5801,6 +5834,11 @@ fn TerminalCanvas(
     // swallow this candidate so no lease and no bootstrap task exist. A first
     // mount, a fault recovery, an in-flight attach, or a degraded surface
     // fails the predicate and takes the bootstrap path unchanged.
+    // [e-r8] ORIGIN capture at block entry (sol s34 Q1): the raise
+    // credits the attempt current when this decision block began, not
+    // whichever is current when the door runs.
+    let raise_origin_attempt_id =
+        state.read().terminal_open_attempt_id_for(session_path.as_str());
     let (raise_has_host, raise_was_ready, raise_daemon_owns, raise_degraded) = state
         .with(|shell| {
             (
@@ -5848,7 +5886,7 @@ fn TerminalCanvas(
             shell.complete_terminal_open_attempt_ready(
                 &session_path,
                 TerminalReadyClaim::Decision { reason: "reveal_retained_host" },
-            );
+                raise_origin_attempt_id.as_deref(),            );
         });
         append_trace_event(
             &trace_home,
@@ -5917,6 +5955,11 @@ fn TerminalCanvas(
             let reparent_mount_epoch = mount_epoch;
             let reparent_mount_identity = mount_identity.clone();
             let reparent_open_request_id = latest_open_request_id;
+            // [e-r8] ORIGIN capture at spawn (sol s34 Q1): the reparent
+            // task credits the attempt that created it, never a successor.
+            let reparent_origin_attempt_id = state
+                .read()
+                .terminal_open_attempt_id_for(session_path.as_str());
             spawn(async move {
                 // The re-created element can lag this task by a DOM commit
                 // (the mount body itself waits out the same race with
@@ -5964,7 +6007,7 @@ fn TerminalCanvas(
                         shell.complete_terminal_open_attempt_ready(
                             &session_path,
                             TerminalReadyClaim::Decision { reason: "reparent_retained_host" },
-                        );
+                            reparent_origin_attempt_id.as_deref(),                        );
                     });
                     append_trace_event(
                         &trace_home,
@@ -6046,6 +6089,11 @@ fn TerminalCanvas(
         // The de-dup is still doing its real job — this block re-enters on every
         // render while the lease is held, and `latest_open_request_id` only moves
         // when the user acts, so the trace stays one event per selection.
+        // [e-r8] ORIGIN capture at block entry: the lease-skip decision
+        // credit belongs to the attempt current when the skip was keyed.
+        let skip_origin_attempt_id = state
+            .read()
+            .terminal_open_attempt_id_for(session_path.as_str());
         let skip_key = bootstrap_skip_dedup_key(
             "existing-lease-skip",
             &bootstrap_identity,
@@ -6078,6 +6126,7 @@ fn TerminalCanvas(
                         TerminalReadyClaim::Decision {
                             reason: "bootstrap_skipped_existing_lease_host_already_live",
                         },
+                        skip_origin_attempt_id.as_deref(),
                     );
                 }
                 shell.record_terminal_io_telemetry(
@@ -7470,6 +7519,14 @@ fn TerminalCanvas(
             // break below fires on the first iteration wake past the armed
             // deadline, before any named exit arm: the silent death shape.
             let silent_death = take_silent_loop_death_token(&session_path);
+            // [e-r8] ORIGIN capture at loop entry (sol s34 Q1): the loop is
+            // created for the attempt that armed this mount; its Ready
+            // credits stay pinned to that attempt. A successor attempt
+            // completes through its OWN paths (reveal raise, reparent, or a
+            // fresh mount) — never through this loop's stale arms.
+            let mount_origin_attempt_id = state
+                .read()
+                .terminal_open_attempt_id_for(session_path.as_str());
             loop {
                 bump_terminal_loop_heartbeat(&session_path);
                 if silent_death
@@ -9025,7 +9082,7 @@ fn TerminalCanvas(
                                                 shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "visual_reveal" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                                 shell.maybe_finish_terminal_surface_request_for_session(
                                                     &session_path,
                                                 );
@@ -9801,7 +9858,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Decision { reason: "stale_retry_host_health" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -9867,7 +9924,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Decision { reason: "clean_ready_attempt_surface" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -9926,7 +9983,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "retained_transcript_browser" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -10041,7 +10098,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Decision { reason: "non_prompt_wait_ceiling" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -12091,7 +12148,7 @@ fn TerminalCanvas(
                                                     shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "retained_non_prompt_snapshot_replay" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                                     shell
                                                         .maybe_finish_terminal_surface_request_for_session(
                                                             &session_path,
@@ -12326,7 +12383,7 @@ fn TerminalCanvas(
                                                 shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "blank_host_snapshot_replay" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                                 shell
                                                     .maybe_finish_terminal_surface_request_for_session(
                                                         &session_path,
@@ -12679,7 +12736,7 @@ fn TerminalCanvas(
                                         shell.complete_terminal_open_attempt_ready(
                                             &session_path,
                                             TerminalReadyClaim::Decision { reason: "warm_alive_posted_ready" },
-                                        )
+                                            mount_origin_attempt_id.as_deref(),                                        )
                                     },
                                 );
                             }
@@ -16055,7 +16112,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "fresh_remote_codex_start" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -16103,7 +16160,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "live_transcript_browser" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -16415,7 +16472,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Decision { reason: "stale_retry_host_health" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -16479,7 +16536,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Decision { reason: "clean_ready_attempt_surface" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -16562,7 +16619,7 @@ fn TerminalCanvas(
                                             shell.complete_terminal_open_attempt_ready(
                                     &session_path,
                                     TerminalReadyClaim::Content { reason: "visual_reveal" },
-                                );
+                                    mount_origin_attempt_id.as_deref(),                                );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
