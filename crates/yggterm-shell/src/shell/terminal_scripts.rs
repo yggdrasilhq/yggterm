@@ -848,6 +848,19 @@ fn terminal_eval_script_with_canvas_renderer(
     })
     .map(|list| serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()))
     .unwrap_or_else(|| "null".to_string());
+    // [e-r5 residue RIG ARM] the MODE=swap flush driver (sol s30 Q4's (b)
+    // end-to-end bar): ONE real flushPendingWrite against the real entry,
+    // NO entry replacement (the S28-1 probe couples drive+replace; the (b)
+    // bar needs the drive alone so the receipt is the production write
+    // callback's own, carrying the arm's stored runtime). The fired marker
+    // is the bar's engagement proof. The late-evidence negatives for the
+    // same-epoch replacement arm are delivered RUST-side at the validator
+    // boundary (see fire_swap_late_negatives in viewport.rs) — the page
+    // ingress is transport-dead on warm remounts.
+    let applied_content_drive_real_flush =
+        std::env::var("YGGTERM_TEST_DRIVE_REAL_FLUSH")
+            .map(|value| value == "1")
+            .unwrap_or(false);
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -12584,6 +12597,10 @@ fn terminal_eval_script_with_canvas_renderer(
             // published too).
             const __acReplaceMidwrite = {applied_content_replace_midwrite};
             const __acInjectRuntimes = {applied_content_inject_runtimes};
+            // [e-r5 residue] the MODE=swap flush driver (see the build-site
+            // comment): ONE real flushPendingWrite, no replacement, fired on
+            // the first eligible construction.
+            const __acDriveFlush = {applied_content_drive_real_flush};
             const noteAppliedLive = (wroteLen, issueEntry, issueTuple, issueEligible, issueSupersession) => {{
                 try {{
                     const __acBail = (__reason) => {{
@@ -13864,6 +13881,41 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }};
             setTimeout(__acInjectTick, 700);
+        }}
+        // [e-r5 residue RIG ARM] the (b) end-to-end flush driver: ONE real
+        // flushPendingWrite against the REAL entry with NO entry
+        // replacement — the production write callback itself must mint the
+        // receipt (issuance capture, arm, callback validation all live;
+        // only the existence of a write is constructed). Fired on the
+        // FIRST eligible construction: the cold mount is the one bridge
+        // the receipt can deliver on (the warm remount's captured send
+        // died with the cold eval's receiver — measured s31 run 1: zero
+        // page events post-remount), so the write-boundary naming proof
+        // lands on the current COLD entry before any retirement. The
+        // eligibility ticker retries (a posted+0 one-shot can race the
+        // arm's eligibility flag) and stops when this construction's
+        // entry is replaced.
+        if (__acDriveFlush && !window.__yggtermAcFlushDrvFired) {{
+            const __acDrvTick = () => {{
+                try {{
+                    const __dEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    if (!__dEntry) {{
+                        return;
+                    }}
+                    if (__dEntry.appliedContentTuple && __dEntry.appliedContentEligible) {{
+                        window.__yggtermAcFlushDrvFired = true;
+                        sendTerminalEvent({{ kind: "debug", message: `appliedLive rig flush-driver fired host=${{hostId}} runtime=${{Number(__dEntry.appliedContentTuple.runtime || 0)}} epoch=${{Number(__dEntry.appliedContentTuple.epoch || 0)}}` }});
+                        __dEntry.writeBridgeInFlight = false;
+                        __dEntry.writeBridgePendingData = String(__dEntry.writeBridgePendingData || "") + "\r\n__ACPROBE2__\r\n";
+                        flushPendingWrite();
+                        return;
+                    }}
+                    setTimeout(__acDrvTick, 150);
+                }} catch (__dError) {{
+                    sendTerminalEvent({{ kind: "debug", message: `appliedLive rig flush-driver error=${{String(__dError)}} host=${{hostId}}` }});
+                }}
+            }};
+            setTimeout(__acDrvTick, 0);
         }}
         // [11.178]-c2 RE-REQUEST ARM. A "posted" mount whose ready event was
         // shed in the IPC window never reaches Rust; the gate's liveness

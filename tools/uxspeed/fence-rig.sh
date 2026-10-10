@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ] && [ "$MODE" != swap ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming|swap"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -412,6 +412,210 @@ PYEOF
     [ "$h" = "$NSCRATCH" ] && kill "$p" 2>/dev/null
   done
   tail -12 /tmp/f1e2-naming-run.log
+  exit $RC
+fi
+
+# ── [e-r5 residue] MODE=swap: THE TWO END-TO-END BARS the s30 machinery
+# owed (sol s30 Q4): the same-epoch runtime-replacement CHAIN and the (b)
+# REAL-WRITE receipt. Construction: the ONE-SHOT render seed names gen 1
+# (R=77); the daemon's real answer (µs-scale F) contradicts the frozen
+# name and the retirement seam fires — adopting F into the naming map
+# FIRST, then the fresh render freezes F through the production path
+# (the static seed retired in the map's favor). TRANSPORT REALITY
+# (measured s31 run 1): the post-retirement generation mounts WARM and
+# its page→Rust bridge events are DEAD (the mount fn's captured send
+# died with the cold eval's receiver — zero page events post-remount
+# while the alive record and the Rust-minted seed receipt still land),
+# so the late-evidence negatives are delivered RUST-SIDE at the record
+# boundary (wrote=34), and the write-boundary receipt is proven on the
+# COLD generation (the only bridge-alive named arm the rig can
+# deterministically construct). Verdicts (true rcs, exe-proofed):
+#   exit 17 = CHAIN RED — the retirement chain broke (no remount trace /
+#             churned generations / gen 2 never armed on the daemon name /
+#             late-R evidence accepted / matched-F rejected / no visible
+#             content);
+#   exit 18 = WRITE RED — the real write's receipt mislabeled or refused
+#             (no live receipt carrying the arm's stored runtime,
+#             accepted, before the retirement);
+#   exit 4  = shape broke (no gen-1 arm / negatives never fired / driver
+#             marker never fired — a vacuous-GREEN guard);
+#   exit 0  = both bars GREEN.
+# FENCE_RIG_SWAP_ARM=chain|write|both (default both) isolates one verdict
+# for reruns; the exit code of the isolated arm maps to 17/18 unchanged. ──
+if [ "$MODE" = swap ]; then
+  SSPCRATCH=/tmp/f1e2-swap-$(date +%s)
+  mkdir -p "$SSPCRATCH"
+  YGGTERM_TEST_SEED_RENDER_RUNTIME_ID=77 YGGTERM_TEST_DRIVE_REAL_FLUSH=1 YGGTERM_TEST_SWAP_RETIRE_NEGATIVES=77 run_boot "$SSPCRATCH" 0
+  SGUI=$!
+  SREADY=$(boot_wait_ready); echo "swap daemon ready=$SREADY"; sleep 8
+  SSPCRATCH=$SSPCRATCH FENCE_RIG_SWAP_ARM=${FENCE_RIG_SWAP_ARM:-both} python3 - <<'PYEOF' > /tmp/f1e2-swap-run.log 2>&1
+import json, subprocess, time, os
+bin_path = os.environ["BIN"]
+TRACE = os.environ["SSPCRATCH"] + "/event-trace.jsonl"
+ARM = os.environ.get("FENCE_RIG_SWAP_ARM", "both")
+SEEDED = 77
+def verb(*args, timeout=60):
+    return subprocess.run([bin_path] + list(args), capture_output=True, text=True, timeout=timeout)
+def read_events():
+    out = []
+    try:
+        for ln_no, line in enumerate(open(TRACE), 1):
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            name = (event.get("name") or event.get("event"))
+            if name:
+                out.append((ln_no, name, event.get("payload") or {}))
+    except FileNotFoundError:
+        pass
+    return out
+def make_row(title):
+    for attempt in range(4):
+        out = verb("server", "app", "terminal", "new", "--kind", "shell", "--title", title)
+        try:
+            return (json.loads(out.stdout).get("data") or {}).get("session_path")
+        except Exception:
+            print("row create attempt %d failed: %s" % (attempt, (out.stdout or out.stderr)[:120].replace("\n", " ")))
+            time.sleep(4)
+    return None
+# ⛔ SINGLE-ROW LAW (s29): one row, zero further churn — the write
+# callback's page->Rust events die in the IPC shed under creation churn.
+s = make_row("swap")
+if not s:
+    print("SWAP FAIL: no row"); raise SystemExit(4)
+print("row: s=%s arm=%s" % (s, ARM))
+deadline = time.time() + 60
+while time.time() < deadline:
+    ev = read_events()
+    armed = [(ln, p) for ln, nm, p in ev
+             if nm == "applied_content_armed" and p.get("session_path") == s]
+    remounts = [(ln, p) for ln, nm, p in ev
+                if nm == "terminal_runtime_named_remount" and p.get("session_path") == s]
+    drv = any("flush-driver fired" in str(p.get("message") or "")
+              for _, nm, p in ev if nm == "js_debug")
+    negatives = [(ln, p) for ln, nm, p in ev
+                 if nm == "applied_content_promoted" and p.get("session_path") == s
+                 and p.get("wrote") == 34]
+    if (len(armed) >= 2 and remounts and drv and len(negatives) >= 3):
+        break
+    time.sleep(0.5)
+time.sleep(2)  # settle stragglers
+events = read_events()
+armed = [(ln, p) for ln, nm, p in events
+         if nm == "applied_content_armed" and p.get("session_path") == s]
+remounts = [(ln, p) for ln, nm, p in events
+            if nm == "terminal_runtime_named_remount" and p.get("session_path") == s]
+js_debug_all = [(ln, str(p.get("message") or "")) for ln, nm, p in events
+                if nm == "js_debug"]
+if not armed:
+    print("RIG SHAPE BROKE: no arm trace for the row")
+    raise SystemExit(4)
+# ── THE CHAIN VERDICT ─────────────────────────────────────────────────
+chain_ok = True
+gen1 = armed[0]
+gen1_r = gen1[1].get("runtime") or 0
+if gen1_r != SEEDED:
+    print("RIG SHAPE BROKE: gen 1 did not arm on the seeded name %d (armed runtime=%s) — the one-shot seed did not name the first generation" % (SEEDED, gen1_r))
+    raise SystemExit(4)
+if not remounts:
+    print("VERDICT CHAIN RED: no terminal_runtime_named_remount trace — the daemon's contradicting answer did NOT retire the seeded generation (the seam dead at the live path)")
+    chain_ok = False
+elif len(remounts) > 1:
+    print("VERDICT CHAIN RED: %d retirement traces — the seam CHURNED (re-freezing a retired name loop); the chain must be exactly one retirement" % len(remounts))
+    chain_ok = False
+else:
+    rem = remounts[0]
+    adopted = rem[1].get("answer_runtime_spawn_id") or 0
+    after = [p for ln, p in armed if ln > rem[0]]
+    gen2 = next((p for p in after if (p.get("runtime") or 0) == adopted and adopted != 0), None)
+    print("VERDICT CHAIN: gen1_runtime=%d remount(known=%s answer=%s frozen=%s) gen2_on_adopted=%s" % (
+        gen1_r, rem[1].get("known_runtime_spawn_id"), adopted,
+        rem[1].get("page_frozen_runtime"), bool(gen2)))
+    if gen2 is None:
+        print("VERDICT CHAIN RED: no post-retirement generation armed on the DAEMON-DERIVED name (adopted=%s) — the fresh incarnation did not freeze/re-arm the adopted runtime" % adopted)
+        chain_ok = False
+    else:
+        promos = [(ln, p) for ln, nm, p in events
+                  if nm == "applied_content_promoted" and p.get("session_path") == s]
+        negatives = [(ln, p) for ln, p in promos if p.get("wrote") == 34]
+        retired_neg = [(ln, p) for ln, p in negatives if p.get("runtime") == SEEDED]
+        matched_neg = [(ln, p) for ln, p in negatives if (p.get("runtime") or 0) == adopted]
+        zero_neg = [(ln, p) for ln, p in negatives if (p.get("runtime") or 0) == 0]
+        seed_ok = [p for ln, p in promos
+                   if p.get("source") == "seed_proof" and (p.get("runtime") or 0) == adopted
+                   and p.get("accepted")]
+        print("   rust-side negatives: retired=%d matched=%d zero=%d seed_proof_accepted=%d" % (
+            len(retired_neg), len(matched_neg), len(zero_neg), len(seed_ok)))
+        if not negatives:
+            print("RIG SHAPE BROKE: the late-negative burst never fired — the verdicts below would be vacuous")
+            raise SystemExit(4)
+        if not retired_neg:
+            print("VERDICT CHAIN RED: the retired-runtime negative is MISSING from the burst")
+            chain_ok = False
+        if any(p.get("accepted") for _, p in retired_neg):
+            print("VERDICT CHAIN RED: a RETIRED-runtime receipt (%d) was ACCEPTED at the current epoch — a stale delivery revived the retired generation" % SEEDED)
+            chain_ok = False
+        if matched_neg and not any(p.get("accepted") for _, p in matched_neg):
+            print("VERDICT CHAIN RED: the MATCHED adopted-name control (%s) was rejected at the record boundary — the new generation cannot earn its own evidence" % adopted)
+            chain_ok = False
+        if any(p.get("accepted") for _, p in zero_neg):
+            print("VERDICT CHAIN RED: an unbound-0 receipt was ACCEPTED — S28-2 broken at the live path")
+            chain_ok = False
+        if not seed_ok:
+            print("VERDICT CHAIN RED: no accepted seed_proof receipt on the adopted runtime — the fresh generation's own organic evidence was refused")
+            chain_ok = False
+# ── THE WRITE VERDICT (the (b) bar, on the cold generation) ───────────
+write_ok = True
+drv_line = next((ln for ln, m in js_debug_all if "flush-driver fired" in m), None)
+if drv_line is None:
+    print("RIG SHAPE BROKE: the flush-driver marker never fired — the real-write receipt cannot be attributed")
+    raise SystemExit(4)
+remount_line = remounts[0][0] if remounts else None
+live_receipts = [(ln, p) for ln, nm, p in events
+                 if nm == "applied_content_promoted" and p.get("session_path") == s
+                 and p.get("source") == "live_write"]
+print("VERDICT WRITE: gen1_runtime=%s driver@%s retirement@%s live_receipts=%d" % (
+    gen1_r, drv_line, remount_line, len(live_receipts)))
+good = [(ln, p) for ln, p in live_receipts
+        if (p.get("runtime") or 0) == gen1_r and p.get("accepted")]
+pre_retirement = [(ln, p) for ln, p in good
+                  if remount_line is None or ln < remount_line]
+if not pre_retirement:
+    print("VERDICT WRITE RED: no real-write receipt carrying the ARM'S STORED runtime (%s) was accepted before the retirement (candidates=%d) — the production naming write point is broken end-to-end" % (
+        gen1_r, len(live_receipts)))
+    write_ok = False
+else:
+    ln, p = pre_retirement[0]
+    print("   real-write receipt@%d: runtime=%s epoch=%s wrote=%s accepted=%s promoted=%s" % (
+        ln, p.get("runtime"), p.get("epoch"), p.get("wrote"), p.get("accepted"), p.get("promoted")))
+mislabel = [(ln, p) for ln, p in live_receipts
+            if (p.get("runtime") or 0) not in (0, gen1_r)]
+if mislabel:
+    print("VERDICT WRITE RED: real-write receipts mislabeled under a foreign runtime (%s) — a receipt's runtime must be its bytes' daemon source incarnation" % (
+        sorted({str(p.get("runtime")) for _, p in mislabel})))
+    write_ok = False
+body = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
+visible = len(body.strip()) > 0
+print("   row health: visible content=%s ACPROBE2=%s" % (visible, "__ACPROBE2__" in body))
+if not visible:
+    print("VERDICT CHAIN RED: the post-swap row shows NO visible content — the retirement broke the mount instead of re-earning it")
+    chain_ok = False
+if ARM in ("chain", "both") and not chain_ok:
+    raise SystemExit(17)
+if ARM in ("write", "both") and not write_ok:
+    raise SystemExit(18)
+print("RIG PASS — chain: gen1 %d retired on the daemon answer, gen2 armed on the adopted name, late-R rejected at the record boundary, matched accepted, content visible; write: the cold generation's real write minted a receipt carrying the arm's stored runtime, accepted" % SEEDED)
+raise SystemExit(0)
+PYEOF
+  RC=$?
+  kill "$SGUI" 2>/dev/null; sleep 1
+  pkill -x yggterm 2>/dev/null; pkill -f "dbus-run-session" 2>/dev/null; sleep 1
+  for p in $(pgrep -f 'yggterm-headless server daemon'); do
+    h=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^YGGTERM_HOME=//p')
+    [ "$h" = "$SSPCRATCH" ] && kill "$p" 2>/dev/null
+  done
+  tail -14 /tmp/f1e2-swap-run.log
   exit $RC
 fi
 
