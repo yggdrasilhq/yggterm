@@ -633,9 +633,39 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   loop_live=false signal present in the GREEN trace; remount-hook-rig
   green (one (e-r1)-class double-paint flake, rerun green — see (e-r1));
   rj1-rig green; workspace suite per-target green. REMAINDERS:
-  (i-r1) name the silent exit arm exactly (add branch guards to the
-  uninstrumented select arms; exit_hint currently bottoms out at
-  pre_select). MEASURED SHARPENER (healthy-mode d-rig, sitting 15, the
+  (i-r1) CLOSED (sitting 27, 2026-10-10, lane lane/ir1/exit-arm-names
+  stacked on the unmerged (e-r3) tip — dev still down, the oc pattern;
+  exitarm-rig RED/GREEN + suite lock): every mount-loop select arm now
+  enters under a named TerminalLoopBranchGuard. The four arms measured
+  unguarded at source — eval_result (the bridge-ended EXIT arm: lease
+  release + spawns + traces + break, all invisible to the witness),
+  probe_answer, synth_release_flush_done, applied_content_probe_done (the
+  s22/s26 machinery arms landed without stamps) — now stamp
+  eval_bridge_return / warm_probe_answer / synth_release_flush_apply /
+  applied_content_probe_done; the write arm's unconditional
+  "write_failure" ENTRY stamp (a SUCCESSFUL Completed/CacheFull write
+  lied about where the loop was) is now write_event_apply with nested
+  per-variant stamps (write_failure / write_completed / write_cache_full).
+  The silent-death token grew an optional "@<branch>" AIM (loop-top fires
+  only after the aimed arm stamped; plain tokens keep rj2-rig semantics
+  byte-identical). RIG tools/uxspeed/exitarm-rig.sh (hermetic + exe-proof,
+  healthy bridge path): MODE=aimed RED rc5 on the er3 tip (the token
+  write-back degenerates to '2:1000' — the build cannot aim at a branch;
+  boot drops read pre_select / synth_input_drain_tick) / GREEN rc0 on the
+  lane (4/4 drops exit_hint==read_poll_start exactly, remount loops
+  included, screen corroborated). MODE=close MEASURED on BOTH builds: the
+  session-remove death reads pre_select — remove CANCELS the mount task
+  at the select await; it does NOT flow through the eval arm. CONCLUSION
+  the family carries forward: with every arm stamping and ZERO awaits in
+  the pre-select body, exit_hint=pre_select is now CONCLUSIVE for
+  "cancelled at the await" — the creation-churn silent death is a task
+  drop mid-poll, not an in-arm exit, and (i-r2)'s keep-alive target is
+  exactly that await-cancel window. RIG-CONSTRUCTION LAWS banked: the
+  write arm fires only for remote-resume rows
+  (track_completion=is_remote_resume_session) or post-failure recovery —
+  plain local typing never emits TerminalWriteEvent::Completed; on the
+  suppress path input rides the drain arm and produces no write events at
+  all. MEASURED SHARPENER (healthy-mode d-rig, sitting 15, the
   fixed build, NO suppression — tools/uxspeed/demote-rig-healthy.sh):
   the silent loop death is NOT plain demotion — a row demoted while
   QUIESCENT (already attach_ready, no concurrent churn) KEEPS its loop,
@@ -798,7 +828,7 @@ campaign's living map, maintained by the zcode+sol loop (consult node
 
 ## ⛔ [11.238] TWO FLEET-SKILL TESTS ARE RED ON CLEAN MAIN — ygg-auth's ROTATION SCORING RANKS A FULL ACCOUNT FIRST ("headroom did not lead": acct-full > acct-good > acct-dead) AND THE SANDBOX-AIM TEST'S REMOTE ARM NEVER MAKES ITS SSH HOP (measured 2026-10-07, both rc=1 identically on main e1b99812 and on the [11.237] arm-2 lane — PRE-EXISTING, surfaced by arm 2's skill-suite gate)
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 Filed 2026-10-07 by the [11.237] arm-2 sitting (board ACK-da8179c1e1's
 outcome). The migration's gate ran the whole
@@ -826,6 +856,23 @@ against the test's expectation and decide bug-vs-stale-test with the
 owner's rotation laws (ygg-auth skill); for (2) trace the aimed sandbox
 spawn's own log — the test prints the sandbox dir; check whether the
 headless binary registered rows at all.
+  RESOLVED 2026-10-10 (sitting 27, zcode on oc): RED 1 WAS A REAL BUG —
+  lane lane/fleet/auth-headroom e38a7c551 (off main): rotate_score's
+  headroom `min(free(pri), free(sec))` read a MISSING secondary window
+  as free(None)=0 — every single-window snapshot walled its account at
+  headroom 0/tier 1 below every two-window peer regardless of real
+  usage (the red's exact shape: acct-good min(90, 0)=0 tier-tied with
+  acct-full, slug-alphabetical tiebreak put acct-full first). Headroom
+  now mins over the windows that EXIST (min(default=0) only when
+  neither answers). The test was RIGHT and is the falsifier (12/12
+  green on the lane). RED 2 IS ENVIRONMENTAL ON DEV, PROBED: the SAME
+  battery on oc (main + only the scoring fix) runs 28/28 rc=0 INCLUDING
+  test_the_fleet_verbs_can_be_aimed_at_a_sandbox — the ssh-hop arm
+  completes off-dev. The dev-side leg (watcher/live-daemon contention
+  hypothesis) stays UNPROVEN: retest on dev's return; if it greens
+  there, close as environment; else read the sandbox dir's own log per
+  the original attack. [11.238] itself closes with red 1's landing;
+  the red-2 retest rides the dev-return checklist.
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
@@ -954,6 +1001,34 @@ CLIENT halves that still recur on healthy rows.
   machinery, not this signal) and any owner-flip shape where reads
   ERROR rather than answer (unreproducible locally; watch for
   terminal_stream_runtime_replaced in the wild as the detector).
+  UPDATE 2026-10-10 (sitting 27, lane lane/rt2/read-error-escalation
+  stacked on lane/ir1/exit-arm-names): THE ERROR ARM IS BOUNDED IN CODE.
+  Measured at source: the read-outcome Err arm's ESTABLISHED-FRAME HOLD
+  (remote-resume + attached + painted + output) ghost-held the frame and
+  `continue`d FOREVER — "no remount, input disable, or reset is allowed
+  on this established-frame path" — correct for [11.167]'s TRANSIENT
+  restart gap, but an owner-flip whose reads error forever froze the
+  DEAD runtime's last frame with NO bound and NO invalidation (the
+  identity signal needs an ANSWER carrying a new runtime_spawn_id;
+  errors never answer). FIX: the hold is now windowed —
+  TERMINAL_ESTABLISHED_FRAME_READ_ERROR_ESCALATION_MS (30s) of
+  CONTINUOUS errors (streak reset on every answered read, the [11.167]
+  rising edge) escalates via read_error_held_frame_escalated{held_ms}
+  and FALLS THROUGH to the post-attach machinery (recovery retries ->
+  exhaustion -> the (e-r3) parked-claim ladder, whose R3 re-attest
+  probe can promote when the runtime answers again) — attached=true
+  skips the initial-retry branch by construction. TEST HOOK
+  YGGTERM_TEST_READ_ERROR_FILE (marker-matched, absent file = inert;
+  the (h2)/spawn-id precedent) + tools/uxspeed/readerr-rig.sh = the
+  LOCAL regression bar (hook errors reads; the local row takes the
+  bounded ladder; the REMOTE established branch stays
+  unconstructible locally — the s20 rig v5b remote-row pattern pointed
+  at a live remote target is the OWED construction bar, named).
+  Shape-locked by established_frame_read_error_hold_is_bounded_and_
+  escalates (predicate edges + the fall-through wiring + the streak
+  resets). PROOF LEVEL (the (c)/(f2)/(h2) precedent): landed in code +
+  suite lock + local hook proof; live proof owed by detector
+  (read_error_held_frame_escalated in the wild).
 - (c) REVEAL DEADLINE → PERMANENT BLANK: `reveal_cover_released
   reason:deadline bytes:0` when a cold transcript re-render outruns the
   cover deadline — the cover drops to a blank viewport that never
