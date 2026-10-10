@@ -879,6 +879,18 @@ fn terminal_eval_script_with_canvas_renderer(
         std::env::var("YGGTERM_TEST_TRANSPORT_PROBE")
             .map(|value| value == "1")
             .unwrap_or(false);
+    // [e-r7 RIG ARM] the stale-capture NEGATIVE control: forces the mount
+    // fn to prefer the LEXICAL dioxus capture over the invocation bridge —
+    // the exact pre-(e-r6) addressing shape, where the warm invocation's
+    // sends ride the retired cold channel and its tags must vanish from
+    // the Rust arrival ledger while the page mailbox still records them.
+    // Production never sets the env; the rig points the transport verdict's
+    // negative arm at it (sol s33 Q2: the differential must be provably
+    // able to fail, through the SAME assertion path as the positive).
+    let transport_stale_capture =
+        std::env::var("YGGTERM_TEST_TRANSPORT_STALE_CAPTURE")
+            .map(|value| value == "1")
+            .unwrap_or(false);
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -975,6 +987,7 @@ fn terminal_eval_script_with_canvas_renderer(
         // WINS over the capture, refreshing sendTerminalEvent, the
         // recvTerminalCommand pump, and the resend arm together.
         const __ygInvocationApi =
+            !{transport_stale_capture} &&
             __yggInvocationBridge
                 && typeof __yggInvocationBridge.send === "function"
                 && typeof __yggInvocationBridge.recv === "function"

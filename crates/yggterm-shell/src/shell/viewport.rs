@@ -11082,6 +11082,35 @@ fn TerminalCanvas(
                                 );
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
+                                // [e-r7] THE TRANSPORT-PROBE ARRIVAL LEDGER —
+                                // the exact-tag arrival record, written BEFORE
+                                // and independent of the js_debug write-throttle
+                                // below. s33 measured the s32 "warm receiver
+                                // death" as an artifact of that throttle (the
+                                // mount's own burst exhausts the process-global
+                                // 30/s budget and sheds the probe's trace lines
+                                // while the channel itself delivers — Ready,
+                                // veil release, bail and receipts all crossed
+                                // post-retirement): absence from the sampled
+                                // js_debug trace is NOT arrival evidence (sol
+                                // s33 Q1/Q2). The ledger family is bounded by
+                                // construction — probe tags exist only under
+                                // YGGTERM_TEST_TRANSPORT_PROBE (~6 per
+                                // invocation), so the flood protection the
+                                // throttle exists for is untouched.
+                                if message.contains("transport-probe") {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "transport_probe_arrival",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "message": message.clone(),
+                                        }),
+                                    );
+                                }
+                                // Throttle the synchronous trace WRITE only; the                            Ok(TerminalJsEvent::Debug { message }) => {
                                 // Throttle the synchronous trace WRITE only; the
                                 // message is still processed below for the
                                 // functional rebuild_blank_host branch. A reveal
