@@ -1005,7 +1005,9 @@ fn terminal_eval_script_with_canvas_renderer(
         // The differential between the two legs IS the measurement.
         if ({mount_transport_probe}) {{
             try {{
-                const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation" }};
+                const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation",
+                    bridge: __yggInvocationBridge === undefined ? "undef" : (__yggInvocationBridge === null ? "null" : ((typeof __yggInvocationBridge.send === "function" && typeof __yggInvocationBridge.recv === "function") ? "valid" : "invalid")),
+                    lexical: (typeof dioxus !== "undefined") ? "present" : "absent" }};
                 window.__yggProbeMailbox = window.__yggProbeMailbox || [];
                 window.__yggProbeMailbox.push(__tpTag);
                 sendTerminalEvent({{ kind: "debug", message: `transport-probe invocation attempt=${{__tpTag.attempt}} ts=${{__tpTag.ts}}` }});
