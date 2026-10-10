@@ -456,6 +456,15 @@ if [ "$MODE" = swap ]; then
   if [ "${FENCE_RIG_ADOPTION_CONTROL:-0}" = "1" ]; then
     SWAP_ENV="$SWAP_ENV YGGTERM_TEST_SUPPRESS_RETIRE_ADOPTION=1"
   fi
+  # [e-r7] FENCE_RIG_TRANSPORT_NEGATIVE=1 (requires TRANSPORT_PROBE=1)
+  # forces the mount fn to prefer the LEXICAL capture — the pre-(e-r6)
+  # stale-addressing shape. The transport verdict then EXPECTS the warm
+  # tags to vanish from the arrival ledger while the mailbox keeps them:
+  # the differential must be provably able to fail through the SAME
+  # assertion path as the positive run (sol s33 Q2).
+  if [ "${FENCE_RIG_TRANSPORT_NEGATIVE:-0}" = "1" ]; then
+    SWAP_ENV="$SWAP_ENV YGGTERM_TEST_TRANSPORT_STALE_CAPTURE=1"
+  fi
   # NB: run_boot is a shell FUNCTION — an `env` prefix cannot invoke it
   # (the assignments must be exported, not prefixed).
   export $SWAP_ENV
@@ -655,6 +664,15 @@ if not visible:
 # ([e-r6] fix), so a warm tag missing from the bridge is the stale-
 # addressing regression (the warm mount re-bound the cold capture).
 if PROBE and not CONTROL:
+    # [e-r7] THE VERDICT READS THE ARRIVAL LEDGER, not the js_debug trace
+    # lines: s33 measured the js_debug write-throttle (process-global 30/s)
+    # shedding the probe tags under the mount's own burst while the channel
+    # delivered -- the old bar read the shed instrument and stayed RED on a
+    # healthy transport (exit 21 artifact, sol s33 Q1/Q2). The Rust Debug
+    # arm now records every transport-probe arrival in its own dedicated
+    # UNTHROTTLED family (transport_probe_arrival) BEFORE the throttle
+    # decision, so the ledger IS the exact-tag arrival record.
+    NEG = os.environ.get("FENCE_RIG_TRANSPORT_NEGATIVE") == "1"
     mbox = [(ln, p) for ln, nm, p in events if nm == "transport_probe_mailbox"]
     tags = []
     if mbox:
@@ -663,24 +681,35 @@ if PROBE and not CONTROL:
         except Exception:
             tags = []
     attempts = sorted({int(t.get("attempt") or 0) for t in tags})
-    bridge_attempts = sorted({int(m.split("attempt=")[1].split()[0])
-                              for _, m in js_debug_all
-                              if "transport-probe" in m and "attempt=" in m})
-    print("VERDICT TRANSPORT: mailbox_attempts=%s bridge_attempts=%s" % (attempts, bridge_attempts))
+    arrival_msgs = [str(p.get("message") or "") for ln, nm, p in events
+                    if nm == "transport_probe_arrival"]
+    arrival_attempts = sorted({int(m.split("attempt=")[1].split()[0])
+                               for m in arrival_msgs
+                               if "transport-probe" in m and "attempt=" in m})
+    print("VERDICT TRANSPORT: mailbox_attempts=%s arrival_attempts=%s (ledger_events=%d, negative=%s)" % (
+        attempts, arrival_attempts, len(arrival_msgs), NEG))
     if not mbox:
         print("RIG SHAPE BROKE: the mailbox probe never traced -- no differential is possible")
         raise SystemExit(4)
     if not attempts or attempts[0] != 1 or not any(a >= 2 for a in attempts):
         print("RIG SHAPE BROKE: the mailbox does not hold a cold tag AND a warm tag (attempts=%s)" % attempts)
         raise SystemExit(4)
-    if 1 not in bridge_attempts:
-        print("RIG SHAPE BROKE: the COLD tag never landed on the bridge either -- the whole channel was dead from the start, the differential is vacuous")
+    if 1 not in arrival_attempts:
+        print("RIG SHAPE BROKE: the COLD tag never arrived either -- the ledger never recorded the one leg that must always work, the differential is vacuous (ledger=%s)" % arrival_attempts)
         raise SystemExit(4)
-    warm_on_bridge = [a for a in bridge_attempts if a >= 2]
-    if not warm_on_bridge:
-        print("VERDICT TRANSPORT RED: the warm invocation tags (mailbox %s) did NOT reach the bridge -- the invocation-passed channel is missing or dead; the warm mount re-bound the cold capture (the [e-r6] stale-addressing regression)" % [a for a in attempts if a >= 2])
-        raise SystemExit(21)
-    print("TRANSPORT PASS: every invocation tag reached the bridge (cold+warm %s) -- the invocation-passed channel carries the warm mount transport ([e-r6] fix proven at the differential level)" % bridge_attempts)
+    warm_arrived = sorted(a for a in arrival_attempts if a >= 2)
+    if not NEG:
+        missing = [a for a in attempts if a not in arrival_attempts]
+        if missing:
+            print("VERDICT TRANSPORT RED: invocation tags %s are in the page mailbox but MISSING from the Rust arrival ledger -- the channel dropped them between the page send and the eval receiver (transport defect, not a trace artifact: the ledger is unthrottled)" % missing)
+            raise SystemExit(21)
+        print("TRANSPORT PASS: EXACT coverage -- every invocation tag (cold+warm %s) arrived in the Rust ledger through the invocation-passed channel ([e-r6] fix + [e-r7] honest instrument proven at the differential level)" % arrival_attempts)
+    else:
+        if warm_arrived:
+            print("VERDICT TRANSPORT NEGATIVE VACUOUS: the stale-capture hook still delivered warm tags %s to the ledger -- the negative control does not starve the differential, it proves nothing" % warm_arrived)
+            raise SystemExit(22)
+        print("TRANSPORT NEGATIVE PASS: with the lexical capture forced, the warm tags vanished from the ledger while the mailbox kept them (mailbox=%s arrivals=%s) -- the differential fails exactly as the pre-(e-r6) shape did" % (
+            attempts, arrival_attempts))
 if ARM in ("chain", "both") and not chain_ok:
     raise SystemExit(17)
 if ARM in ("write", "both") and not write_ok:

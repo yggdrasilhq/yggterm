@@ -365,7 +365,16 @@ static BROWSER_TREE_REFRESH_UNCHANGED_STREAK: AtomicU64 = AtomicU64::new(0);
 // the js_debug trace WRITE to a sane rate (the Debug message is still fully
 // processed for the functional `rebuild_blank_host` branch; only the disk write
 // is throttled). Rare diagnostics fit comfortably under the cap; only a flood is
-// shed. See [[finding-ui-freeze-js-debug-trace-flood]].
+// shed. See [[finding-ui-freeze-js-debug-trace-flood]].// is throttled). Only a flood is shed — but a flood is NOT rare in practice:
+// one warm remount's own body re-run bursts ~46 debug events inside a single
+// window (measured s33), so a rare diagnostic arriving during mount churn IS
+// shed with it. ABSENCE FROM THE SAMPLED js_debug TRACE IS NOT ARRIVAL
+// EVIDENCE — instruments that must survive a flood (the [e-r7]
+// transport-probe arrival ledger) write their own dedicated family instead
+// of relying on this budget. The drop summary flushes only on the next
+// ADMITTED write, never by timer — after total silence nothing reports the
+// drop until an event is admitted again. See
+// [[finding-ui-freeze-js-debug-trace-flood]].
 const JS_DEBUG_TRACE_WINDOW_MS: u64 = 1_000;
 const JS_DEBUG_TRACE_WINDOW_MAX: u64 = 30;
 static JS_DEBUG_TRACE_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);

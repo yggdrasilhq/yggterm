@@ -60989,6 +60989,50 @@ fn the_differential_transport_probe_tags_both_legs() {
 }
 
 #[test]
+fn the_transport_probe_arrival_ledger_precedes_the_throttle_decision() {
+    // [e-r7] sol s33 Q1/Q2: the s32 "warm receiver death" was an artifact of
+    // the js_debug write-throttle (process-global 30/s; the mount's own burst
+    // exhausts it and sheds the probe tags' trace lines while the channel
+    // delivers). The exact-tag arrival record must therefore be its OWN
+    // dedicated trace family written BEFORE and independent of the throttle
+    // decision — absence from the sampled js_debug trace is not arrival
+    // evidence, and the rig verdict reads this ledger, never js_debug.
+    let viewport = include_str!("viewport.rs");
+    let ledger = viewport.find("\"transport_probe_arrival\"")
+        .expect("the arrival ledger family must exist");
+    let arm_start = viewport.find("Ok(TerminalJsEvent::Debug { message }) => {")
+        .expect("the Debug arm must exist");
+    let throttle = viewport.find("js_debug_trace_write_decision(current_millis())")
+        .expect("the throttle decision must exist");
+    assert!(
+        arm_start < ledger && ledger < throttle,
+        "the arrival ledger must live INSIDE the Debug arm and fire BEFORE the throttle decision (arm@{} ledger@{} throttle@{})",
+        arm_start,
+        ledger,
+        throttle
+    );
+}
+
+#[test]
+fn the_stale_capture_control_inverts_the_invocation_preference() {
+    // [e-r7] sol s33 Q2: the differential verdict must be provably able to
+    // FAIL through the same assertion path as the positive run. The rig arm
+    // YGGTERM_TEST_TRANSPORT_STALE_CAPTURE forces the mount fn to prefer
+    // the LEXICAL dioxus capture over the invocation bridge (the exact
+    // pre-(e-r6) addressing shape), so warm tags must vanish from the
+    // arrival ledger while the page mailbox keeps them.
+    let scripts = include_str!("terminal_scripts.rs");
+    assert!(
+        scripts.contains("YGGTERM_TEST_TRANSPORT_STALE_CAPTURE"),
+        "the stale-capture control env must be read by the script builder"
+    );
+    assert!(
+        scripts.contains("!{transport_stale_capture} &&"),
+        "the invocation-bridge preference must be gated by the stale-capture hook"
+    );
+}
+
+#[test]
 fn the_retire_adoption_control_gates_only_the_retirement_branch() {
     // [e-r6] sol s31 Q3: the control suppresses ONLY the retirement
     // branch's map adoption -- the fall-through identity adoption and
