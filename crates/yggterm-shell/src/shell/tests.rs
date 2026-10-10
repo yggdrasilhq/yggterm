@@ -60871,6 +60871,83 @@ fn the_naming_chain_sources_are_locked() {
 }
 
 #[test]
+fn the_render_seed_is_one_shot_against_the_naming_map() {
+    // [e-r5 residue] MODE=swap's scaffolding premise: the env seed may
+    // name the render ONLY while the naming map is unnamed for the
+    // session. A static seed would contradict every real answer and the
+    // retirement seam would churn generations forever (measured s30);
+    // once an authoritative answer adopts the real id, the render MUST
+    // freeze the adopted name through the production path.
+    let viewport = include_str!("viewport.rs");
+    let seed_site = viewport
+        .find("YGGTERM_TEST_SEED_RENDER_RUNTIME_ID")
+        .expect("the render seed hook must stay at the render site");
+    let tail = &viewport[seed_site..];
+    let window = &tail[..tail
+        .find("let bootstrap_identity =")
+        .expect("the bootstrap identity follows the seed site")];
+    assert!(
+        window.contains(".filter(|_| {"),
+        "the seed must be FILTERED, not unwrapped — a static seed loops the retirement"
+    );
+    assert!(
+        window.contains("terminal_runtime_spawn_id_for(&session_path)) == 0"),
+        "the filter condition must be the naming map being UNNAMED (0): the seed retires the moment an answer names the map"
+    );
+    assert!(
+        window.contains(".unwrap_or_else(|| {\n            state.with(|shell| shell.terminal_runtime_spawn_id_for(&session_path))\n        })"),
+        "the fallback must remain the production map read"
+    );
+}
+
+#[test]
+fn the_swap_scaffolding_gates_on_the_adopted_generation() {
+    // [e-r5 residue] the MODE=swap hooks: the flush driver fires on the
+    // FIRST eligible construction with an engagement marker (the cold
+    // mount is the only bridge-alive named arm — the warm remount's
+    // captured send is dead, measured s31 run 1), and the late-evidence
+    // negatives are delivered RUST-SIDE at the validator boundary (wrote
+    // =34, source=swap_late_negative), gated one-shot on the stable
+    // post-retirement state (frozen == known != 0 != retired).
+    let scripts = include_str!("terminal_scripts.rs");
+    let viewport = include_str!("viewport.rs");
+    assert!(
+        scripts.contains(
+            "if (__acDriveFlush && !window.__yggtermAcFlushDrvFired) {{\n            const __acDrvTick = () => {{"
+        ),
+        "the flush driver must fire on the first eligible construction, ticker-retried"
+    );
+    assert!(
+        scripts.contains("appliedLive rig flush-driver fired host=${{hostId}} runtime="),
+        "the driver's fired marker is the bar's engagement proof"
+    );
+    assert!(
+        viewport.contains("fn swap_late_negatives_due("),
+        "the rust-side negatives gate must stay at the stream seam"
+    );
+    assert!(
+        viewport.contains("YGGTERM_TEST_SWAP_RETIRE_NEGATIVES"),
+        "the negatives hook stays env-armed (absent = inert)"
+    );
+    assert_eq!(
+        viewport.matches("wrote: 34,").count()
+            + viewport.matches("\"wrote\": 34,").count(),
+        2,
+        "the trace record and the validator record both carry wrote=34 (the burst's attribution)"
+    );
+    assert!(
+        viewport.contains("\"source\": \"swap_late_negative\","),
+        "the burst traces under its own source label"
+    );
+    assert!(
+        viewport.contains(
+            "frozen_spawn_id == known_spawn_id\n                && frozen_spawn_id != retired"
+        ),
+        "the negatives fire only from the stable post-retirement state (frozen == known, not the retired seed)"
+    );
+}
+
+#[test]
 fn an_unbound_runtime_receipt_never_satisfies_a_named_expectation() {
     // sol s28 S28-2 (probe line 1): expected 7 + receipt runtime 0 used to
     // pass BOTH predicates (the old rule rejected only when both runtimes

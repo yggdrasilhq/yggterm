@@ -3972,9 +3972,20 @@ fn TerminalCanvas(
     // seed: the hook names the RENDER KNOWLEDGE directly (sol s30 Q4 — a
     // hook may seed the render input; it must never arm Rust or patch the
     // page tuple, those are the production links under test).
+    // [e-r5 residue] ONE-SHOT seed: the env name applies only while the
+    // naming map is still unnamed for the session — once an authoritative
+    // answer adopts the real id, later renders freeze the ADOPTED name
+    // through the production path. A static seed would contradict every
+    // real answer and the retirement seam would churn generations forever
+    // (measured s30: the (a) bar's DISABLE_NAMED_REMOUNT exists because
+    // of it); the residue arms (MODE=swap) rely on the seed retiring in
+    // favor of the map the moment the daemon answers.
     let runtime_spawn_id = std::env::var("YGGTERM_TEST_SEED_RENDER_RUNTIME_ID")
         .ok()
         .and_then(|value| value.parse().ok())
+        .filter(|_| {
+            state.with(|shell| shell.terminal_runtime_spawn_id_for(&session_path)) == 0
+        })
         .unwrap_or_else(|| {
             state.with(|shell| shell.terminal_runtime_spawn_id_for(&session_path))
         });
@@ -14103,7 +14114,38 @@ fn TerminalCanvas(
                                     );
                                 }
                                 known_runtime_spawn_id = runtime_spawn_id;
-                                // [11.167] A runtime START under this watch is a
+                                // [e-r5 residue RIG ARM] the same-epoch
+                                // runtime-replacement LATE NEGATIVES (sol s30
+                                // Q4): once the retirement's fresh generation
+                                // has frozen and armed the ADOPTED name (the
+                                // stable state: a nonzero frozen name the
+                                // current answers agree with, and NOT the
+                                // retired seed), deliver the retired
+                                // generation's runtime, a matched control, and
+                                // an unbound-0 record straight to the
+                                // validator. The PAGE-side ingress is
+                                // transport-dead on warm remounts (the mount
+                                // fn's captured send died with the cold eval's
+                                // receiver — measured s31 run 1: zero page
+                                // events post-remount while the alive record
+                                // and the Rust-minted seed path still
+                                // receipted), so the validator's retirement
+                                // state is proven at the record boundary.
+                                // Only the receipt inputs are constructed
+                                // (same class as the daemon capture-stall
+                                // hooks); wrote=34 distinguishes the burst.
+                                if swap_late_negatives_due(
+                                    page_frozen_runtime,
+                                    known_runtime_spawn_id,
+                                ) {
+                                    fire_swap_late_negatives(
+                                        state,
+                                        &trace_home,
+                                        &session_path,
+                                        mount_epoch,
+                                        page_frozen_runtime,
+                                    );
+                                }                                // [11.167] A runtime START under this watch is a
                                 // replacement: the child the watch accumulated its
                                 // hard-fail evidence against is gone. Re-arm the
                                 // escalation budget so a force_remote restart must
@@ -24374,6 +24416,94 @@ fn runtime_name_requires_remount(
         || (frozen_spawn_id != 0
             && answer_spawn_id != 0
             && answer_spawn_id != frozen_spawn_id)
+}
+
+/// [e-r5 residue RIG ARM] one-shot latch for the swap bar's late
+/// negatives — one burst per PROCESS, fired only from the stable
+/// post-retirement state (see the call site in the read-poll answer arm).
+static SWAP_LATE_NEGATIVES_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Gate: env-armed (YGGTERM_TEST_SWAP_RETIRE_NEGATIVES=<retired runtime
+/// id>), not yet fired, and the CURRENT generation has frozen a nonzero
+/// name that the answers corroborate and that is NOT the retired seed —
+/// i.e. the retirement completed and the adopted name is live.
+fn swap_late_negatives_due(frozen_spawn_id: u64, known_spawn_id: u64) -> bool {
+    if SWAP_LATE_NEGATIVES_FIRED.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    let retired = std::env::var("YGGTERM_TEST_SWAP_RETIRE_NEGATIVES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    match retired {
+        Some(retired) => {
+            frozen_spawn_id != 0
+                && known_spawn_id != 0
+                && frozen_spawn_id == known_spawn_id
+                && frozen_spawn_id != retired
+        }
+        None => false,
+    }
+}
+
+/// Deliver the late-evidence burst at the validator boundary: the RETIRED
+/// runtime (a stale delivery that must not revive the retired
+/// generation), the CURRENT frozen name (the matched control), and
+/// unbound 0 (S28-2). Each outcome traces in the applied_content_promoted
+/// family with source=swap_late_negative and wrote=34 so the rig can
+/// attribute the burst unambiguously.
+fn fire_swap_late_negatives(
+    state: Signal<ShellState>,
+    trace_home: &std::path::Path,
+    session_path: &str,
+    mount_epoch: u64,
+    current_runtime: u64,
+) {
+    SWAP_LATE_NEGATIVES_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let retired = std::env::var("YGGTERM_TEST_SWAP_RETIRE_NEGATIVES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    for runtime in [retired, current_runtime, 0] {
+        let outcome = safe_shell_mut(
+            state,
+            "swap_late_negative",
+            |shell| {
+                shell.record_terminal_applied_content(
+                    session_path,
+                    TerminalAppliedContentRecord {
+                        mount_epoch,
+                        runtime_spawn_id: runtime,
+                        wrote: 34,
+                        blank: false,
+                        ts: current_millis(),
+                        page_gen: 0,
+                        source: "swap_late_negative",
+                    },
+                )
+            },
+        );
+        let (accepted, promoted) = match outcome {
+            Ok(result) => (result.accepted, result.promoted),
+            Err(_) => (false, false),
+        };
+        append_trace_event(
+            trace_home,
+            "ui",
+            "terminal_mount",
+            "applied_content_promoted",
+            json!({
+                "session_path": session_path,
+                "epoch": mount_epoch,
+                "runtime": runtime,
+                "wrote": 34,
+                "blank": false,
+                "promoted": promoted,
+                "accepted": accepted,
+                "source": "swap_late_negative",
+            }),
+        );
+    }
 }
 
 /// [e-r5] The alive record's readyRecord, parsed from the poll answer's
