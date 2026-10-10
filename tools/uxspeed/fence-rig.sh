@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ] && [ "$MODE" != swap ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming|swap"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ] && [ "$MODE" != swap ] && [ "$MODE" != reattest ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming|swap|reattest"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -1368,6 +1368,183 @@ for p in $(pgrep -f 'yggterm-headless server daemon'); do
   h=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^YGGTERM_HOME=//p')
   [ "$h" = "$SCRATCH" ] && kill "$p" 2>/dev/null
 done
+
+# ── [e9 wedge-1] MODE=reattest: THE IDLE RE-ATTEST BAR ─────────────────
+# sol s35 Q4-corrected construction: a healthy boot drives the phase-C
+# shape (dummy row + test row + force-open + probe-type echo) until the
+# tuple is ARMED, an ACCEPTED receipt is stored, and the screen is
+# painted — the page entry now holds published evidence and Rust holds
+# the stored copy. QUIET DRAIN (no applied-content/synth/flush-family
+# events for 3s; the DECISION surface is already released — prompt back
+# on screen). Then the marker file is written and the pre_select RIG
+# HOOK fires: begin a fresh attempt + DROP the stored Rust receipt +
+# park the claim (traced applied_content_test_park). The row stays IDLE.
+# Verdicts (true rcs, exe-proofed):
+#   exit 0  = GREEN — applied_content_reattested{accepted:true,
+#             promoted:true} for the session within the 10s window, no
+#             issuer-sourced promotion and no tuple churn post-marker
+#             (the idle loop armed the probe with ZERO output traffic);
+#   exit 23 = RED — the park is proven (parked:true) but no re-attest
+#             fired in the window (main's traffic-gated arming: the
+#             probe needed flush_due bytes that never came);
+#   exit 4  = shape broke — no arm/receipt/park evidence, a declined
+#             park, issuer contamination, or tuple churn (vacuous). ──
+if [ "$MODE" = reattest ]; then
+  RSCRATCH=/tmp/f1e2-reattest-$(date +%s)
+  mkdir -p "$RSCRATCH"
+  export YGGTERM_TEST_PARK_CLAIM_FILE="$RSCRATCH/park-marker"
+  run_boot "$RSCRATCH" 0
+  RGUI=$!
+  RREADY=$(boot_wait_ready); echo "reattest daemon ready=$RREADY"; sleep 8
+  RSCRATCH=$RSCRATCH python3 - <<'PYEOF' > /tmp/f1e2-reattest-run.log 2>&1
+import json, subprocess, time, os
+bin_path = os.environ["BIN"]
+TRACE = os.environ["RSCRATCH"] + "/event-trace.jsonl"
+MARKER = os.environ["RSCRATCH"] + "/park-marker"
+WINDOW_S = 10
+QUIET_S = 3
+def verb(*args, timeout=60):
+    return subprocess.run([bin_path] + list(args), capture_output=True, text=True, timeout=timeout)
+def read_events():
+    out = []
+    try:
+        for line in open(TRACE):
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            name = (event.get("name") or event.get("event"))
+            if name:
+                out.append((name, event.get("payload") or {}))
+    except FileNotFoundError:
+        pass
+    return out
+def make_row(title):
+    for attempt in range(4):
+        out = verb("server", "app", "terminal", "new", "--kind", "shell", "--title", title)
+        try:
+            return (json.loads(out.stdout).get("data") or {}).get("session_path")
+        except Exception:
+            print("row create attempt %d failed: %s" % (attempt, (out.stdout or out.stderr)[:120].replace("\n", " ")))
+            time.sleep(4)
+    return None
+# ⛔ SINGLE-ROW LAW (s29) with the dummy-first shape (s26 phase C).
+_a = make_row("reattest-dummy")
+s = make_row("reattest")
+if not s:
+    print("REATTTEST FAIL: no row"); raise SystemExit(4)
+print("rows: a=%s s=%s" % (_a, s))
+verb("server", "app", "open", s, "--view", "terminal")
+verb("server", "app", "terminal", "probe-type", s, "--data", "echo E9RGREEN", "--enter", "--mode", "xterm")
+# PHASE 1 — evidence: armed tuple + accepted receipt + painted screen.
+deadline = time.time() + 25
+armed = []
+receipt_ok = False
+body = ""
+while time.time() < deadline:
+    ev = read_events()
+    armed = [p for nm, p in ev if nm == "applied_content_armed" and p.get("session_path") == s]
+    receipt_ok = any(nm == "applied_content_promoted" and p.get("session_path") == s
+                     and p.get("accepted") is True for nm, p in ev)
+    body = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
+    if armed and receipt_ok and body.count("E9RGREEN") >= 1:
+        break
+    time.sleep(0.5)
+print("PHASE 1: armed=%s receipt=%s painted=%s" % (bool(armed), receipt_ok, body.count("E9RGREEN") >= 1))
+if not (armed and receipt_ok and body.count("E9RGREEN") >= 1):
+    print("REATTTEST SHAPE BROKE: no page-side evidence for the row (armed/receipt/paint missing)")
+    raise SystemExit(4)
+# PHASE 2 — quiet drain: no evidence-family events for QUIET_S seconds
+# (an in-flight queued batch would arm main's old flush_due site and
+# make the RED vacuous — sol s35 Q4). Cap 15s.
+def evidence_families(ev):
+    return [nm for nm, _ in ev if nm.startswith(("applied_content", "synth", "xterm_write", "terminal_runtime_named"))]
+drain_deadline = time.time() + 15
+last_count = len(evidence_families(read_events()))
+quiet_since = None
+while time.time() < drain_deadline:
+    time.sleep(1)
+    count = len(evidence_families(read_events()))
+    if count == last_count:
+        quiet_since = quiet_since or time.time()
+        if time.time() - quiet_since >= QUIET_S:
+            break
+    else:
+        quiet_since = None
+        last_count = count
+body = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
+print("PHASE 2: drained (quiet=%ss) prompt_back=%s" % (
+    bool(quiet_since and time.time() - quiet_since >= QUIET_S), body.count("E9RGREEN") >= 1))
+# The DECISION-release assertion (sol s35 Q4): the surface is released
+# (screen paints the settled row) while the CONTENT evidence is about to
+# go pending — the parked claim must not wedge the visible surface.
+if body.count("E9RGREEN") < 1:
+    print("REATTTEST SHAPE BROKE: the settled screen lost the prompt frame")
+    raise SystemExit(4)
+# PHASE 3 — the marker: the pre_select hook parks the claim (fresh
+# attempt + stored receipt dropped; the page entry keeps the evidence).
+with open(MARKER, "w") as f:
+    f.write(s + "\n")
+mark_ts = time.time()
+park_ev = None
+deadline = mark_ts + 5
+while time.time() < deadline:
+    park_ev = next((p for nm, p in read_events()
+                    if nm == "applied_content_test_park" and p.get("session_path") == s), None)
+    if park_ev:
+        break
+    time.sleep(0.5)
+if not park_ev:
+    print("REATTTEST SHAPE BROKE: the park hook never fired (no applied_content_test_park)")
+    raise SystemExit(4)
+if park_ev.get("parked") is not True:
+    print("REATTTEST SHAPE BROKE: the park was DECLINED (parked=%s) — no living attempt or latch released" % park_ev.get("parked"))
+    raise SystemExit(4)
+print("PHASE 3: parked=true attempt=%s at +%.1fs" % (park_ev.get("attempt_id"), time.time() - mark_ts))
+# PHASE 4 — the window: only the re-attest probe may promote. Issuer
+# activity or tuple churn after the park = contaminated construction.
+n_at_park = len(read_events())
+deadline = time.time() + WINDOW_S
+verdict = None
+while time.time() < deadline:
+    ev = read_events()
+    tail = ev[n_at_park:]
+    reattested = [p for nm, p in tail if nm == "applied_content_reattested" and p.get("session_path") == s]
+    issuer = [p for nm, p in tail if nm == "applied_content_promoted" and p.get("session_path") == s]
+    churn = [nm for nm, _ in tail if nm in ("terminal_runtime_named_remount",) or nm == "applied_content_armed"]
+    if issuer:
+        print("REATTTEST SHAPE BROKE: an issuer promoted post-marker (source=%s) — not idle" % issuer[0].get("source"))
+        raise SystemExit(4)
+    if churn:
+        print("REATTTEST SHAPE BROKE: tuple churn post-marker (%s)" % churn[:3])
+        raise SystemExit(4)
+    if reattested:
+        r = reattested[-1]
+        if r.get("accepted") is True and r.get("promoted") is True:
+            verdict = "GREEN"
+            print("VERDICT REATTTEST GREEN: re-attested at +%.2fs accepted=true promoted=true (idle host, zero traffic)" % (time.time() - mark_ts))
+        else:
+            print("VERDICT REATTTEST RED: re-attest fired but did not promote (accepted=%s promoted=%s)" % (r.get("accepted"), r.get("promoted")))
+            verdict = "RED_WEAK"
+        break
+    time.sleep(0.5)
+if verdict == "GREEN":
+    raise SystemExit(0)
+if verdict == "RED_WEAK":
+    raise SystemExit(23)
+print("VERDICT REATTTEST RED: parked claim proven at +%.1fs, ZERO re-attest events in %ds (traffic-gated arming never fired on the idle host)" % (time.time() - mark_ts, WINDOW_S))
+raise SystemExit(23)
+PYEOF
+  RC=$?
+  kill "$RGUI" 2>/dev/null; sleep 1
+  pkill -x yggterm 2>/dev/null; pkill -f "dbus-run-session" 2>/dev/null; sleep 1
+  for p in $(pgrep -f 'yggterm-headless server daemon'); do
+    h=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^YGGTERM_HOME=//p')
+    [ "$h" = "$RSCRATCH" ] && kill "$p" 2>/dev/null
+  done
+  tail -6 /tmp/f1e2-reattest-run.log
+  exit $RC
+fi
 
 # ── [Q7-R6] NEGATIVE PHASES C+D: the controlled release + the foreign
 # tuple (only for MODE=negative; each is its own healthy boot) ───────────
