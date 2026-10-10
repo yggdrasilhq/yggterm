@@ -555,8 +555,9 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   The (e-r6) invocation-bridge fix stands on its own page-side
   merits (exact-tag ledger proof: every cold AND warm tag arrives,
   (e-r7) bar 1). STILL OPEN (the actual residue): sol Q1's
-  stale-caller credit (claims carry no originating attempt
-  identity); the wedge-1 re-attest scheduling (unchanged);
+  stale-caller credit CLOSED 2026-10-10 sitting 34 ((e-r8) below —
+  claims now carry their originating attempt); the wedge-1
+  re-attest scheduling (unchanged);
   page_gen comparison (stored, never compared — the seed path
   records page_gen 0 by convention, naming it needs the seed proof
   to carry the page gen); wedge 2 (snapshot missing-vs-empty)
@@ -701,6 +702,74 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   cure, survives as a proposal for push-dependent events lacking
   pre-send evidence (sol s33 Q4); the s32 Q5 upstream report stands
   (delivery discrepancy report, no race label).
+
+  (e-r8) THE STALE-CALLER CREDIT — CLOSED IN CODE 2026-10-10 (sitting
+  34, lane lane/e8/stale-caller-credit; sol round node
+  lores/chain-of-thought/2026-10-10-yggterm-s34-stale-caller-sol.md):
+  sol s28 Q1's last open arm — "claims carry no originating
+  attempt/epoch identity, so a late completion from attempt A can
+  complete current attempt B when a qualifying current receipt
+  exists." MEASURED AT SOURCE (main 3137ef09): the door read the
+  current attempt id then DISCARDED it (`let _ = attempt_id;`) — 21
+  production call sites (17 in TerminalCanvas's flows + 4
+  state-internal) credited whichever attempt was current at call
+  time; terminal_pending_content_claims was session-keyed with no
+  identity; begin_terminal_open_attempt did NOT clear it, and (sol
+  s34 finding) neither did the standalone clear — only the
+  render-state drop removed claims. THE FIX (sol s34 verdicts: Q1
+  accept UNIFORM origin wiring, Q2 accept clear-at-begin +
+  re-match-at-promotion, Q3 accept equality + a post-await
+  ownership re-check, Q4 accept current-side event, Q5 accept the
+  state-level differential): (1) the door takes
+  originating_attempt_id: Option<&str>; Some != current -> NEW
+  outcome StaleCaller + a "stale_caller_rejected" attempt event
+  (both ids, reason, claim class) — the guard runs BEFORE receipt
+  qualification, parking, latch insertion, ready marking, or reveal
+  recording; None is the test-only escape hatch, audited
+  mechanically forever by a source lock. (2) Parked claims are
+  {reason, attempt_id}: a park REQUIRES a living attempt (an
+  attempt-less park is declined — no unnamed route to credit a
+  successor); begin retires the session's claims (the begin payload
+  names the voided claim); the standalone clear retires them too;
+  the promotion completes a claim only when it names the CURRENT
+  attempt, else drops it with a "stale_claim_dropped" event while
+  the receipt stays accepted and the independent pending-paint
+  promotion still runs. (3) EVERY production caller carries its
+  origin: the mount loop captures at LOOP ENTRY (pinned to the
+  attempt that armed the mount — a successor completes via its own
+  paths: reveal raise, reparent, or a fresh mount; sol's liveness
+  clause for a surviving loop is (i-r2)'s keep-alive policy); the
+  recovery-snapshot task captures at spawn, tightens
+  still_recovering to require the latest attempt BE its origin, and
+  re-checks ownership AFTER the snapshot await BEFORE any effect (a
+  churned task replays nothing, dismisses nothing —
+  "active_recovery_stale_break"); the reparent task captures at
+  spawn; the reveal-raise and lease-skip blocks capture at block
+  entry; the four state-internal callers (fast-ready,
+  inactive-cancel, fault-watchdog x2) pass the attempt each handler
+  resolved. PROOF: RED on hook-only main (worktree --e8red, main +
+  the RED lock only): "A's parked claim survives the churn" — sol's
+  exact shape failing on deployed main. GREEN on the lane: 8 new
+  locks — the None/matching/mismatched x Decision/Content matrix,
+  churn-voids + B's fresh claim completing against the SAME stored
+  receipt (the liveness positive), stale rejection preserving B's
+  own parked claim, the defensive promotion drop, park-requires-
+  attempt both arms, clear-retires, attempt-id uniqueness, and the
+  mechanical call-site audit. Suites: shell 2278/0 + server 1668/0
+  no-fail-fast. Fence-rig regressions on the lane build:
+  order/dup/loss/naming/swap ALL rc 0 (order: fenced_repaint +
+  flush rode the proof; dup: the seed stamp dropped the covered
+  differential; loss: the unapplied seed delivered every retained
+  byte; naming: the arm NAMED 77, foreign rejected everywhere; swap:
+  gen2 armed on the adopted name + the cold generation's real write
+  receipt accepted — NO liveness regression from the loop-entry
+  origin pinning, the successor paths complete their own attempts).
+  RESIDUE UNTOUCHED: wedge-1 re-attest scheduling, page_gen
+  comparison, wedge 2, (c) live proof, F2, (e-r2), (i-r2), the (b)
+  owed remote construction. sol's Q3 deferral stands: "churn always
+  re-arms a successor probe" is proven only at the predicate level
+  (a fresh key re-arms while should_start_recovery_snapshot_probe
+  holds; the probe-identity no-reset concern is unchanged).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
