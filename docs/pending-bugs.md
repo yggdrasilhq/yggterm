@@ -380,6 +380,73 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   epoch-1 trace event today), and the wedge-1 re-attest scheduling
   (the skipped-bootstrap site is DECISION and never parks — the
   re-attest probe has no path from it).
+  CLOSED IN CODE 2026-10-10 ~09:50 IST (sitting 29, zcode seat, lane
+  lane/e4/receipt-provenance 3a23f5e0): S28-1 + S28-2 + Q3 per sol's
+  disposition, all three seat-verified at source then closed at the
+  Rust+page boundary. (1) S28-1 — noteAppliedLive no longer resolves
+  the registry at callback time: the ISSUER captures (entry object,
+  tuple object, eligibility flag, flush supersession) at write issuance;
+  the callback requires REGISTRY IDENTITY + UNCHANGED QUALIFICATION
+  before consuming/publishing — a callback from entry A held across
+  same-host replacement by B never resolves B to acknowledge bytes
+  parsed by A (sol's R1 ownership rule, restored verbatim). (2) S28-2 —
+  the runtime rule: a receipt runtime of 0 is UNBOUND, not a wildcard —
+  a NAMED expectation rejects it (the old both-nonzero rule accepted
+  expected-7+receipt-0); an unnamed expectation (0, the production arm
+  convention) stays PROVISIONAL — epoch+session bind, the documented
+  policy. AND the arm cleanup keys on the PREVIOUS EXPECTED TUPLE (any
+  epoch OR runtime change retires parked claims + pending paint; the
+  epoch-map term kept for never-armed mounts): the arm-after-epoch-bump
+  order no longer leaves the dead tuple's parked state for a current
+  receipt to consume, and runtime-swap-without-epoch-bump retires too.
+  (3) Q3 — record_terminal_applied_content returns {accepted, promoted}
+  (separate truths: accepted-with-nothing-parked is LEGAL, the old bool
+  could not gate anything on acceptance); the seed paint note fires only
+  on accepted; a new applied_content_seed_paint trace carries the
+  gate's decision (noted/accepted); the live-write and reattest traces
+  carry accepted too. RIG: fence-rig MODE=provenance — sol's Q4 arm 1
+  (the held-callback falsifier, ranked worst-missing): the page replaces
+  the registry entry synchronously after the first eligible write
+  issuance (epoch+50/gen+1 armed eligible replacement — +50 cannot
+  collide with real remount epochs in the window); a deterministic
+  probe drives ONE REAL flushPendingWrite (rig rows ride the synthesized
+  seed path — the live bridge issues NOTHING organically, measured:
+  zero xterm_write_flush on healthy probe-type shapes; phase C's
+  historical receipts were seed_proof-sourced all along). RED rc14 on
+  hook-only main: the receipt at armed+50 minted BEFORE the
+  not_eligible bail (the successor's own write refused — its
+  eligibility consumed by the ORIGINAL's callback). GREEN rc0 on the
+  lane: entry_replaced bail FIRST, the replacement's OWN receipt after
+  (honestly rejected Rust-side, foreign epoch). Ordering is the
+  discriminator; the write bridge is strictly one-in-flight so GREEN's
+  order holds by construction. PROBE CONSTRUCTION LAWS measured:
+  single-row sequencing is mandatory (a second row's creation churn
+  sheds the callback's page->Rust events — the [11.178] class, run 5);
+  the probe fires at posted+0 (the +1.5s timer died with the demoted
+  eval context); the fired-marker decides AFTER the RED check (its own
+  delivery can be shed independently). PHASE UPGRADES (sol Q4):
+  phase C reads accepted + correlates the ARMED epoch (the hard-coded
+  epoch-1 trace read could not fail on a rejection); phase A isolates
+  the seed skip (seed_mode=test_forced_skip + wrote_seed=0 on record);
+  phase D asserts the seed-paint gate (1 seed_paint event,
+  noted_true=0 under FOREIGN); MODE=blank rerun GREEN on this tip (the
+  s23-owed rerun). All bars green on the lane: provenance/order/dup/
+  loss/negative(A+C+D)/blank. LOCKS: an_unbound_runtime_receipt_never_
+  satisfies_a_named_expectation, an_arm_after_an_epoch_bump_retires_
+  the_dead_tuples_parked_state, a_runtime_replacement_with_a_stable_
+  epoch_retires_the_old_expectations_state, an_accepted_receipt_with_
+  nothing_parked_promotes_nothing. STILL OPEN (the (e-r4) residue,
+  next unit — DESIGNED, deliberately deferred): the runtime NAMING
+  chain (render data-terminal-runtime-spawn-id on the host div ->
+  the page tuple freezes it at construction -> the ready handshake
+  record CARRIES the frozen tuple -> the arm binds exactly what the
+  page froze — one source, zero render/arm divergence; the predicate
+  rule above makes the name binding the moment it engages); sol Q1's
+  stale-caller credit (claims carry no originating attempt identity);
+  the wedge-1 re-attest scheduling (unchanged); page_gen comparison
+  (stored, never compared — the seed path records page_gen 0 by
+  convention, naming it needs the seed proof to carry the page gen);
+  wedge 2 (snapshot missing-vs-empty) untouched.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
