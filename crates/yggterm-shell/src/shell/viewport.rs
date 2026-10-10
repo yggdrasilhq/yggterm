@@ -7672,25 +7672,10 @@ fn TerminalCanvas(
                         // select branch (release precedes the batch that
                         // broke the fence; one fence, one release, one
                         // staged flush).
-                        // [Q7-R2] re-attest probe staging (rate-limited):
-                        // a parked claim for THIS session with no probe in
-                        // flight gets one.
-                        if applied_content_probe_future.is_none()
-                            && current_millis() >= applied_content_probe_next_ms
-                        {
-                            let parked = state.with(|shell| {
-                                shell.terminal_pending_content_claims.contains_key(&session_path)
-                            });
-                            if parked {
-                                applied_content_probe_next_ms = current_millis() + 2000;
-                                applied_content_probe_future = Some(stage_applied_content_probe(
-                                    state,
-                                    host_id.clone(),
-                                    session_path.clone(),
-                                    trace_home.clone(),
-                                ));
-                            }
-                        }
+                        // [e9] the re-attest probe arming moved OUT of this
+                        // output-flush branch (see the hoisted site in the
+                        // pre_select body below) — arming here required
+                        // pending output bytes, so an idle host never armed.
                         if let Some(fence) = released_fence.take() {
                             synth_release_flush_future = Some(stage_synth_release_flush(
                                 fence,
@@ -7718,6 +7703,40 @@ fn TerminalCanvas(
                             data,
                             protocol_only: false,
                         });
+                    }
+                }
+                // [e9 wedge-1] THE RE-ATTEST PROBE ARMING — hoisted OUT of
+                // the output-flush branch above (sol s35 Q1/Q2): arming used
+                // to require pending output bytes (flush_due) on a
+                // synthesized mount with active bridge reads, so an IDLE
+                // host never armed the probe and a parked claim whose
+                // evidence already lived in the page entry never
+                // re-attested (sol s23 R2: reuse re-attests existing
+                // evidence — it does not demand fresh spontaneous output).
+                // The pre_select body runs on every loop wake — the read
+                // poll deadline fires even when idle — and staging only
+                // constructs a pinned future, so the body stays await-free
+                // (the (i-r1) law). Gates kept: js_ready (a page must
+                // exist to read), one probe in flight, the 2s cooldown, a
+                // parked claim for THIS session. Gates dropped:
+                // js_ready_synthesized, bridge-read policy, flush_due —
+                // real mounts publish receipts through the live-write
+                // issuer and the probe script is entryLive-guarded.
+                if js_ready
+                    && applied_content_probe_future.is_none()
+                    && current_millis() >= applied_content_probe_next_ms
+                {
+                    let parked = state.with(|shell| {
+                        shell.terminal_pending_content_claims.contains_key(&session_path)
+                    });
+                    if parked {
+                        applied_content_probe_next_ms = current_millis() + 2000;
+                        applied_content_probe_future = Some(stage_applied_content_probe(
+                            state,
+                            host_id.clone(),
+                            session_path.clone(),
+                            trace_home.clone(),
+                        ));
                     }
                 }
                 // [e9 RIG HOOK] the re-attest bar's park constructor — the
