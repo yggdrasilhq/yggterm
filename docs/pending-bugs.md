@@ -545,31 +545,38 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   re-runs the body through a dead send. The naming chain's RECEIPT leg
   is therefore transport-blocked on warm remounts: post-swap
   generations can only receipt through the Rust-minted seed path.
-  FILED as (e-r6) below. STILL OPEN (the re-scoped residue): (e-r6)
-  the warm-remount event transport — RE-SCOPED AGAIN by s32: the
-  page-side cold capture is FIXED (invocation bridge, V4) and the
-  death is now the RUST-side receiver (the warm mount task stops
-  draining its eval channel after the early-ready phase; the
-  dual-leg event journal per sol s32 Q2/Q4 is the design); sol Q1's
-  stale-caller credit (claims carry no originating attempt identity);
-  the wedge-1 re-attest scheduling (unchanged); page_gen comparison
-  (stored, never compared — the seed path records page_gen 0 by
-  convention, naming it needs the seed proof to carry the page gen);
-  wedge 2 (snapshot missing-vs-empty) untouched.
+  FILED as (e-r6) below. CLOSED 2026-10-10 sitting 33: the s32
+  "Rust-side receiver death" was an INSTRUMENT ARTIFACT — the
+  transport probe's tags are kind=debug and the js_debug TRACE WRITE
+  is process-globally throttled (30/s); the mount's own burst
+  exhausted the budget and shed the tags' trace lines while the
+  channel delivered (Ready, warm veil release, appliedLive bail, and
+  the post-retirement live_write receipt all crossed — see (e-r7)).
+  The (e-r6) invocation-bridge fix stands on its own page-side
+  merits (exact-tag ledger proof: every cold AND warm tag arrives,
+  (e-r7) bar 1). STILL OPEN (the actual residue): sol Q1's
+  stale-caller credit (claims carry no originating attempt
+  identity); the wedge-1 re-attest scheduling (unchanged);
+  page_gen comparison (stored, never compared — the seed path
+  records page_gen 0 by convention, naming it needs the seed proof
+  to carry the page gen); wedge 2 (snapshot missing-vs-empty)
+  untouched; the dual-leg event journal survives as a PROPOSAL for
+  push-dependent events that lack pre-send evidence (sol s33 Q4),
+  no longer as this family's cure.
   (e-r6) THE WARM-REMOUNT EVENT TRANSPORT — RE-SCOPED 2026-10-10
-  (sitting 32, measured to the receiving side): the s31 cold-capture
-  diagnosis was real but SECONDARY. The invocation-bridge fix landed
-  (the fn takes the invocation channel as its 2nd argument and
-  prefers it; V4; both dispatch shapes pass their own eval binding)
-  and the page side is PROVEN healthy — the warm invocation passes a
-  VALID bridge (its own eval channel, request_id recorded), the tag
-  send returns without throwing, the invocation reaches the command
-  pump, and the warm ready record CROSSED the channel at +97ms
-  (js_ready source=bridge_event). THE LOAD-BEARING DEATH IS
-  RUST-SIDE: at steady state a fresh-eval direct-send into the same
-  live page-side channel (id verified via the __msg_queues dump)
-  queues forever, undelivered — the warm mount task's receiver
-  STOPPED DRAINING eval.recv() after the early-ready phase. The task
+  (sitting 32, measured to the receiving side; CORRECTED sitting 33):
+  the s31 cold-capture diagnosis was real but SECONDARY. The
+  invocation-bridge fix landed (the fn takes the invocation channel
+  as its 2nd argument and prefers it; V4; both dispatch shapes pass
+  their own eval binding) and the page side is PROVEN healthy. THE
+  S32 "LOAD-BEARING DEATH IS RUST-SIDE" CLAIM IS RETRACTED (sitting
+  33 + sol s33 Q5): the "fresh-eval direct-send never lands"
+  evidence read the js_debug trace family, whose WRITE is
+  process-globally throttled at 30/s — the mount's own burst had
+  exhausted the budget and the sends ARRIVED, only their trace lines
+  were shed. The warm receiver drained throughout (Ready at +97ms,
+  veil release, appliedLive bail, and the post-retirement
+  live_write receipt all crossed; exact-tag proof in (e-r7)). The task
   never drops (no second terminal_mount_task_dropped) and
   js_wait_begin at +9ms post-retirement has no end: the loop is
   alive-but-not-reading (a hang or a never-returning await in the
@@ -582,9 +589,10 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   receipts already guaranteed in flush-eval returns need no second
   queue. sol Q5: report the delivery discrepancy upstream with the
   staged repro design, NO race label). Rig bar: MODE=swap +
-  FENCE_RIG_TRANSPORT_PROBE=1 rc 21 is the STANDING RED (warm tags
-  must reach the bridge; red on main AND on the s32 lane — the lane
-  fixes the page side, the receiver defect is the next unit).
+  FENCE_RIG_TRANSPORT_PROBE=1 rc 21 was the STANDING RED of s32 —
+  retired sitting 33: the bar read the throttled js_debug lines, and
+  the fixed bar (the unthrottled arrival ledger, (e-r7)) passes with
+  EXACT coverage.
   (e-r6-probe) THE DIFFERENTIAL TRANSPORT PROBE MEASURED 2026-10-10
   (sitting 31 unit 2, same sitting, lane lane/e6/transport-probe;
   fence-rig MODE=swap + FENCE_RIG_TRANSPORT_PROBE=1, rc 0): every
@@ -652,6 +660,47 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   crossing is proven, its TRANSPORT attribution to flush-eval returns
   is NOT — needs route-tag evidence before the queue claims it), Q5
   REBUT (upstream report without the race label).
+  (e-r7) THE TRANSPORT-PROBE ARRIVAL LEDGER + THE INSTRUMENT LAW —
+  MEASURED, LANDED, AND THE WARM-RECEIVER DEATH RETRACTED 2026-10-10
+  (sitting 33, lane lane/e7/transport-ledger; sol node
+  lores/chain-of-thought/2026-10-10-yggterm-s33-transport-ledger-sol.md,
+  staged raw at /tmp/s33-sol-consult on dev EPHEMERAL): s32's "warm
+  mount task alive-but-not-reading" was an artifact of the js_debug
+  WRITE THROTTLE (state.rs — 30 writes/s process-global; the
+  comment claimed "rare diagnostics fit comfortably under the cap"
+  while ONE warm remount's body re-run bursts ~46 debug events in a
+  window, measured twice: s32's trace and the fresh s33 repro, both
+  dropped=46). The s32 chain's "direct-send never lands" and the
+  rc-21 standing red both read the SHED trace family; the channel
+  delivered all along (Ready +97ms, warm veil release, appliedLive
+  bail, the post-retirement organic live_write receipt — 4/4+1 runs).
+  INSTRUMENT LAW (sol s33 Q1/Q3): ABSENCE FROM THE SAMPLED js_debug
+  TRACE IS NOT ARRIVAL EVIDENCE; an instrument that must survive a
+  flood writes its own dedicated family. LANDED: (1) the Debug arm
+  records every transport-probe arrival in a dedicated UNTHROTTLED
+  transport_probe_arrival trace family BEFORE the throttle decision
+  (bounded by construction: probe tags exist only under
+  YGGTERM_TEST_TRANSPORT_PROBE, ~6/invocation); (2) the stale-capture
+  negative control YGGTERM_TEST_TRANSPORT_STALE_CAPTURE forces the
+  pre-(e-r6) lexical preference so the differential is PROVABLY able
+  to fail through the same assertion path (sol s33 Q2); (3) the rig
+  verdict reads the ledger with EXACT coverage (every mailbox
+  attempt must arrive — the old "any attempt>=2" mismatch fixed);
+  rc 21 = a real transport miss on an honest instrument; rc 22 =
+  vacuous negative. (4) the throttle comment corrected (floods are
+  not rare; the drop summary flushes only on a later admitted write,
+  never by timer). BARS (exe-proofed, true rcs): saturated positive
+  rc 0 — mailbox_attempts=[1,2] arrival_attempts=[1,2],
+  ledger_events=10, EXACT coverage; negative rc 0 —
+  mailbox=[1,2] arrivals=[1], warm tags starved exactly as the
+  pre-fix shape; regressions order/dup/loss/negative/provenance/
+  naming ALL rc 0 on the lane build. LOCKS:
+  the_transport_probe_arrival_ledger_precedes_the_throttle_decision +
+  the_stale_capture_control_inverts_the_invocation_preference. The
+  dual-leg event journal (sol s32 Q2/Q4) is RETIRED as this family's
+  cure, survives as a proposal for push-dependent events lacking
+  pre-send evidence (sol s33 Q4); the s32 Q5 upstream report stands
+  (delivery discrepancy report, no race label).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
