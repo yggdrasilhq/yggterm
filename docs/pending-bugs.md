@@ -566,6 +566,40 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   path alone. Attack: per sol s31 Q2's ranking (consult node); the
   rig bar is MODE=swap's WRITE verdict extended to the post-retirement
   generation once a transport lands.
+  (e-r6-probe) THE DIFFERENTIAL TRANSPORT PROBE MEASURED 2026-10-10
+  (sitting 31 unit 2, same sitting, lane lane/e6/transport-probe;
+  fence-rig MODE=swap + FENCE_RIG_TRANSPORT_PROBE=1, rc 0): every
+  mount-fn invocation tags the page mailbox (read back over a FRESH
+  eval return — the leg measured alive) AND sends the same tag over
+  the closure's CAPTURED channel. RESULT: mailbox_attempts=[1,2],
+  bridge_attempts=[1] — the COLD invocation's tag landed on the
+  bridge, the WARM invocation's tag lives in the mailbox alone:
+  STALE ADDRESSING CONFIRMED, not general IPC shedding (sol s31 Q2
+  rank 1 settled — the captured receiver died with the cold eval, and
+  the fix target is exactly the cold-captured send/recv pair; sol's
+  corrected candidate (ii) — pass the current invocation's channel
+  into the stored fn — is the validated next step, with the
+  eval-return mailbox as the fallback design already proven by this
+  probe's control leg). IN THE SAME UNIT, sol s31 Q3's
+  adoption-provenance control (FENCE_RIG_ADOPTION_CONTROL=1,
+  YGGTERM_TEST_SUPPRESS_RETIRE_ADOPTION suppressing ONLY the
+  retirement-branch map adoption) MEASURED rc 20 VACUITY: with the
+  retirement adoption suppressed, a generation STILL armed on the
+  daemon-derived name — the SEED-SEAM adoption is a SECOND map writer
+  (by design, s30 Q2's output_seq-independent adoption). The s31
+  chain bar's mechanism attribution therefore narrows to a
+  CONVERGENCE claim (the system reaches the daemon-derived name
+  whichever writer supplies it — operationally what matters), not an
+  exclusive-credit claim; both writers source the same daemon answer.
+  RIG CONSTRUCTION LAWS BANKED: (1) `env VARS... fn` cannot invoke a
+  shell FUNCTION — the assignments must be exported (cost three
+  vacuous rc4 boots: the verb fell through to the SYSTEM daemon and
+  saw no GUI client — the ready-gate answered from the wrong daemon);
+  (2) a verdict branch that must OWN a run has to precede the generic
+  churn/multiplicity checks (the control's churn was real evidence,
+  consumed by the wrong elif first). LOCKS:
+  the_differential_transport_probe_tags_both_legs +
+  the_retire_adoption_control_gates_only_the_retirement_branch.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
