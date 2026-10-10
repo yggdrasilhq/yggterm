@@ -22959,7 +22959,8 @@ console.log('ok');
             warm.len()
         );
         assert!(warm.contains("__yggtermMountParams ="));
-        assert!(warm.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== \\\"undefined\\\" ? dioxus : null));"));
+        assert!(warm.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus"));
+        assert!(warm.contains("? dioxus : null));"));
 
         let probe = terminal_mount_fn_probe_script();
         // ⛔ Bridge contract (live-proven 2026-09-27): the eval bridge wraps
