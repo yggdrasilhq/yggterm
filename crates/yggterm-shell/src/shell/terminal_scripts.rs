@@ -1093,6 +1093,15 @@ fn terminal_eval_script_with_canvas_renderer(
                             ? performance.now()
                             : Date.now(),
                 }};
+                // [e-r6 s32] the STAGE tag: the invocation-time tag dies
+                // in the warm eval first-ms window (the ~1 KB warm script
+                // has no parse stall, so the body starts before the Rust
+                // reader attaches); a stage tag rides the steady-state
+                // flow, which is the delivery the receipts themselves
+                // depend on.
+                if ({mount_transport_probe}) {{
+                    sendTerminalEvent({{ kind: "debug", message: `transport-probe stage=${{stage}} attempt=${{__yggAttemptStamp}} ts=${{Date.now()}}` }});
+                }}
             }} catch (_error) {{}}
         }};
         __yggNoteMountAlive("entry");

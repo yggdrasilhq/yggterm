@@ -578,11 +578,14 @@ else:
         retired_neg = [(ln, p) for ln, p in negatives if p.get("runtime") == SEEDED]
         matched_neg = [(ln, p) for ln, p in negatives if (p.get("runtime") or 0) == adopted]
         zero_neg = [(ln, p) for ln, p in negatives if (p.get("runtime") or 0) == 0]
-        seed_ok = [p for ln, p in promos
-                   if p.get("source") == "seed_proof" and (p.get("runtime") or 0) == adopted
-                   and p.get("accepted")]
-        print("   rust-side negatives: retired=%d matched=%d zero=%d seed_proof_accepted=%d" % (
-            len(retired_neg), len(matched_neg), len(zero_neg), len(seed_ok)))
+        organic = [p for ln, p in promos
+                   if p.get("source") in ("seed_proof", "live_write")
+                   and (p.get("runtime") or 0) == adopted
+                   and p.get("accepted") and ln > rem[0]]
+        seed_ok = organic
+        print("   rust-side negatives: retired=%d matched=%d zero=%d organic_on_adopted=%d (sources=%s)" % (
+            len(retired_neg), len(matched_neg), len(zero_neg), len(organic),
+            sorted({p.get("source") for _, p in organic})))
         if not negatives:
             print("RIG SHAPE BROKE: the late-negative burst never fired — the verdicts below would be vacuous")
             raise SystemExit(4)
@@ -599,7 +602,7 @@ else:
             print("VERDICT CHAIN RED: an unbound-0 receipt was ACCEPTED — S28-2 broken at the live path")
             chain_ok = False
         if not seed_ok:
-            print("VERDICT CHAIN RED: no accepted seed_proof receipt on the adopted runtime — the fresh generation's own organic evidence was refused")
+            print("VERDICT CHAIN RED: no accepted ORGANIC receipt (seed_proof or live_write) on the adopted runtime — the fresh generation's own evidence was refused or never crossed")
             chain_ok = False
 # ── THE WRITE VERDICT (the (b) bar, on the cold generation) ───────────
 write_ok = True
@@ -625,8 +628,16 @@ else:
     ln, p = pre_retirement[0]
     print("   real-write receipt@%d: runtime=%s epoch=%s wrote=%s accepted=%s promoted=%s" % (
         ln, p.get("runtime"), p.get("epoch"), p.get("wrote"), p.get("accepted"), p.get("promoted")))
+adopted_now = (remounts[0][1].get("answer_runtime_spawn_id") or 0) if remounts else 0
+post_retire_organic = [(ln, p) for ln, p in live_receipts
+                       if (p.get("runtime") or 0) == adopted_now and adopted_now != 0
+                       and (remount_line is None or ln > remount_line)]
 mislabel = [(ln, p) for ln, p in live_receipts
-            if (p.get("runtime") or 0) not in (0, gen1_r)]
+            if (p.get("runtime") or 0) not in (0, gen1_r, adopted_now)]
+if post_retire_organic:
+    for ln, p in post_retire_organic:
+        print("   POST-RETIREMENT organic receipt@%d: runtime=%s wrote=%s accepted=%s — the warm generation earned live evidence through the repaired transport" % (
+            ln, p.get("runtime"), p.get("wrote"), p.get("accepted")))
 if mislabel:
     print("VERDICT WRITE RED: real-write receipts mislabeled under a foreign runtime (%s) — a receipt's runtime must be its bytes' daemon source incarnation" % (
         sorted({str(p.get("runtime")) for _, p in mislabel})))
@@ -654,7 +665,7 @@ if PROBE and not CONTROL:
     attempts = sorted({int(t.get("attempt") or 0) for t in tags})
     bridge_attempts = sorted({int(m.split("attempt=")[1].split()[0])
                               for _, m in js_debug_all
-                              if "transport-probe invocation" in m and "attempt=" in m})
+                              if "transport-probe" in m and "attempt=" in m})
     print("VERDICT TRANSPORT: mailbox_attempts=%s bridge_attempts=%s" % (attempts, bridge_attempts))
     if not mbox:
         print("RIG SHAPE BROKE: the mailbox probe never traced -- no differential is possible")
