@@ -223,7 +223,13 @@ fn terminal_reused_host_grid_script(session_path: &str) -> String {
 // __yggtermMountResend re-request arm at "posted" — the gate polls the
 // record via eval returns and keeps a live warm mount whose bridge events
 // were shed instead of redoing cold into the remount storm.
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 3;
+// [e-r6] Bumped 2026-10-10: the body takes the invocation bridge as a
+// second parameter and prefers it over the lexical `dioxus` capture — that
+// free variable resolves through the COLD eval wrapper scope, so warm
+// re-invocations re-bound the dead cold channel pair (s31 differential:
+// the warm invocation tag lives in the mailbox alone). Both invoke sites
+// pass their OWN eval binding; the version gate forces the reinstall.
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 4;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -297,7 +303,7 @@ fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
     // guard instead of registering over the fresh mount (the stale closure
     // used to win the host last-writer-wins via its ownerToken).
     format!(
-        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
+        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== \"undefined\" ? dioxus : null));"
     )
 }
 
@@ -958,11 +964,24 @@ fn terminal_eval_script_with_canvas_renderer(
     format!(
         r#"window.__yggtermMountParams = {mount_params_json};
         window.__yggtermMountFnV = {TERMINAL_MOUNT_FN_VERSION};
-        window.__yggtermMountFn = async (__yggAttempt) => {{
+        window.__yggtermMountFn = async (__yggAttempt, __yggInvocationBridge) => {{
         const __mp = window.__yggtermMountParams || {{}};
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const hostId = String(__mp.hostId || "");
-        const terminalDioxusApi = typeof dioxus !== "undefined" ? dioxus : null;
+        // [e-r6] The lexical `dioxus` below resolves through the COLD eval
+        // wrapper scope — a warm re-invocation re-binds the dead cold
+        // channel pair. The invocation passes its OWN eval binding as the
+        // second argument; a valid invocation bridge (both legs callable)
+        // WINS over the capture, refreshing sendTerminalEvent, the
+        // recvTerminalCommand pump, and the resend arm together.
+        const __ygInvocationApi =
+            __yggInvocationBridge
+                && typeof __yggInvocationBridge.send === "function"
+                && typeof __yggInvocationBridge.recv === "function"
+                ? __yggInvocationBridge
+                : null;
+        const terminalDioxusApi = __ygInvocationApi
+            || (typeof dioxus !== "undefined" ? dioxus : null);
         const terminalDioxusSend =
             terminalDioxusApi && typeof terminalDioxusApi.send === "function"
                 ? terminalDioxusApi.send.bind(terminalDioxusApi)
@@ -980,8 +999,10 @@ fn terminal_eval_script_with_canvas_renderer(
         // invocation (cold install AND every warm re-invocation) records
         // itself in the page mailbox — which the Rust probe reads over a
         // FRESH eval return, a leg measured alive — and sends the same
-        // tag over this closure's CAPTURED channel. The differential
-        // between the two legs IS the measurement.
+        // tag over this invocation channel (pre-fix: the cold CAPTURE, so
+        // warm tags lived in the mailbox alone; post-fix: the
+        // invocation-passed bridge, and both legs must carry every tag).
+        // The differential between the two legs IS the measurement.
         if ({mount_transport_probe}) {{
             try {{
                 const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation" }};
@@ -14244,7 +14265,7 @@ fn terminal_eval_script_with_canvas_renderer(
         // guard instead of fighting this one for the host.
         window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;
         window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;
-        await window.__yggtermMountFn(window.__yggtermMountAttempt);
+        await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== "undefined" ? dioxus : null));
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,
         frame_hash_probe_js = FRAME_HASH_PROBE_JS,

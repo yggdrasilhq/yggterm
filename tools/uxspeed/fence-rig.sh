@@ -637,11 +637,12 @@ print("   row health: visible content=%s ACPROBE2=%s" % (visible, "__ACPROBE2__"
 if not visible:
     print("VERDICT CHAIN RED: the post-swap row shows NO visible content — the retirement broke the mount instead of re-earning it")
     chain_ok = False
-# [e-r6] THE TRANSPORT VERDICT (sol s31 Q2 rank 1, the differential):
-# the page mailbox (read over a FRESH eval return) must hold BOTH the
-# cold and the warm invocation tags, while the CAPTURED bridge channel
-# delivered the cold tag but NOT the warm ones -- stale addressing
-# (the captured receiver died with the cold eval), not general shedding.
+# [e-r6] THE TRANSPORT VERDICT — post-fix standing bar (s32): the page
+# mailbox (read over a FRESH eval return) must hold BOTH the cold and
+# the warm invocation tags, AND the bridge must now carry EVERY tag —
+# the warm invocations pass their OWN eval binding into the stored fn
+# ([e-r6] fix), so a warm tag missing from the bridge is the stale-
+# addressing regression (the warm mount re-bound the cold capture).
 if PROBE and not CONTROL:
     mbox = [(ln, p) for ln, nm, p in events if nm == "transport_probe_mailbox"]
     tags = []
@@ -665,10 +666,10 @@ if PROBE and not CONTROL:
         print("RIG SHAPE BROKE: the COLD tag never landed on the bridge either -- the whole channel was dead from the start, the differential is vacuous")
         raise SystemExit(4)
     warm_on_bridge = [a for a in bridge_attempts if a >= 2]
-    if warm_on_bridge:
-        print("VERDICT TRANSPORT RED: a WARM invocation tag (attempt %s) LANDED on the captured bridge -- the captured send is NOT dead; the post-remount silence is general IPC shedding or something else" % warm_on_bridge)
-        raise SystemExit(19)
-    print("TRANSPORT PASS: the captured channel delivered the cold tag only; the warm invocations' tags live in the mailbox alone -- STALE ADDRESSING confirmed (the captured receiver died with the cold eval)")
+    if not warm_on_bridge:
+        print("VERDICT TRANSPORT RED: the warm invocation tags (mailbox %s) did NOT reach the bridge -- the invocation-passed channel is missing or dead; the warm mount re-bound the cold capture (the [e-r6] stale-addressing regression)" % [a for a in attempts if a >= 2])
+        raise SystemExit(21)
+    print("TRANSPORT PASS: every invocation tag reached the bridge (cold+warm %s) -- the invocation-passed channel carries the warm mount transport ([e-r6] fix proven at the differential level)" % bridge_attempts)
 if ARM in ("chain", "both") and not chain_ok:
     raise SystemExit(17)
 if ARM in ("write", "both") and not write_ok:
