@@ -40001,7 +40001,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let outcome = shell.complete_terminal_open_attempt_ready(
             session_path,
             TerminalReadyClaim::Content { reason: "test_ready" },
-        );
+            None,        );
         assert!(matches!(outcome, TerminalReadyOutcome::ContentCompleted));
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(
@@ -60466,7 +60466,7 @@ fn a_decision_ready_never_opens_the_content_qualified_latch() {
     let outcome = shell.complete_terminal_open_attempt_ready(
         session_path,
         TerminalReadyClaim::Decision { reason: "reveal_retained_host" },
-    );
+        None,    );
     assert!(matches!(outcome, TerminalReadyOutcome::DecisionCompleted));
     assert!(!shell.terminal_resume_ready_paths.contains(session_path));
     assert!(shell.terminal_session_has_ready_attempt(session_path));
@@ -60489,7 +60489,7 @@ fn a_content_claim_without_a_receipt_parks_instead_of_promoting() {
     let outcome = shell.complete_terminal_open_attempt_ready(
         session_path,
         TerminalReadyClaim::Content { reason: "visual_reveal" },
-    );
+        None,    );
     assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
     assert!(!shell.terminal_resume_ready_paths.contains(session_path));
     let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
@@ -60514,7 +60514,7 @@ fn the_ack_arrival_promotion_completes_a_parked_claim_and_pending_paint() {
     let outcome = shell.complete_terminal_open_attempt_ready(
         session_path,
         TerminalReadyClaim::Content { reason: "visual_reveal" },
-    );
+        None,    );
     assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
     shell.terminal_sessions_paint_pending.insert(session_path.to_string());
     let promoted = shell.record_terminal_applied_content(
@@ -60546,8 +60546,15 @@ fn a_foreign_epoch_or_runtime_receipt_never_promotes() {
     let _attempt = shell.begin_terminal_open_attempt(session_path, "req-f", 1, "open_row");
     shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
     shell.arm_terminal_applied_content(session_path, 1, 7);
-    shell.terminal_pending_content_claims
-        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_pending_content_claims.insert(
+        session_path.to_string(),
+        TerminalPendingContentClaim {
+            reason: "visual_reveal",
+            attempt_id: shell
+                .terminal_open_attempt_id_for(session_path)
+                .expect("a living attempt parks the claim"),
+        },
+    );
     // foreign EPOCH: the receipt belongs to a moved/dead mount.
     let promoted = shell.record_terminal_applied_content(
         session_path,
@@ -60638,7 +60645,7 @@ fn a_valid_blank_receipt_qualifies_content_without_cursor_motion() {
     let outcome = shell.complete_terminal_open_attempt_ready(
         session_path,
         TerminalReadyClaim::Content { reason: "blank_host_snapshot_replay" },
-    );
+        None,    );
     assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
     let promoted = shell.record_terminal_applied_content(
         session_path,
@@ -61070,8 +61077,15 @@ fn an_unbound_runtime_receipt_never_satisfies_a_named_expectation() {
     let _attempt = shell.begin_terminal_open_attempt(session_path, "req-z", 1, "open_row");
     shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
     shell.arm_terminal_applied_content(session_path, 1, 7);
-    shell.terminal_pending_content_claims
-        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_pending_content_claims.insert(
+        session_path.to_string(),
+        TerminalPendingContentClaim {
+            reason: "visual_reveal",
+            attempt_id: shell
+                .terminal_open_attempt_id_for(session_path)
+                .expect("a living attempt parks the claim"),
+        },
+    );
     let outcome = shell.record_terminal_applied_content(
         session_path,
         TerminalAppliedContentRecord {
@@ -61100,8 +61114,15 @@ fn an_unbound_runtime_receipt_never_satisfies_a_named_expectation() {
         !shell.terminal_pending_content_claims.contains_key(session_path),
         "the named-tuple era's parked claim retired with the re-arm"
     );
-    shell.terminal_pending_content_claims
-        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_pending_content_claims.insert(
+        session_path.to_string(),
+        TerminalPendingContentClaim {
+            reason: "visual_reveal",
+            attempt_id: shell
+                .terminal_open_attempt_id_for(session_path)
+                .expect("a living attempt parks the claim"),
+        },
+    );
     let outcome = shell.record_terminal_applied_content(
         session_path,
         TerminalAppliedContentRecord {
@@ -61131,8 +61152,15 @@ fn an_arm_after_an_epoch_bump_retires_the_dead_tuples_parked_state() {
     let _attempt = shell.begin_terminal_open_attempt(session_path, "req-b", 1, "open_row");
     shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
     shell.arm_terminal_applied_content(session_path, 1, 0);
-    shell.terminal_pending_content_claims
-        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_pending_content_claims.insert(
+        session_path.to_string(),
+        TerminalPendingContentClaim {
+            reason: "visual_reveal",
+            attempt_id: shell
+                .terminal_open_attempt_id_for(session_path)
+                .expect("a living attempt parks the claim"),
+        },
+    );
     shell.terminal_sessions_paint_pending.insert(session_path.to_string());
     // The epoch map bumps FIRST (the authoritative transition), then the
     // new mount arms — exactly the order the old comparison mis-read.
@@ -61163,6 +61191,308 @@ fn an_arm_after_an_epoch_bump_retires_the_dead_tuples_parked_state() {
     assert!(!shell.terminal_session_host_has_painted(session_path));
 }
 
+// ---------------------------------------------------------------------------
+// [e-r8] THE STALE-CALLER CREDIT LOCKS (sitting 34): claims carry their
+// originating attempt; a late completion from attempt A never credits
+// attempt B — sol s28 Q1's open indictment, design per the s34 round
+// (uniform origin wiring, clear-at-begin, park-requires-attempt,
+// post-await ownership re-check).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_stale_caller_never_credits_the_current_attempt() {
+    // Matrix: both claim classes x None / matching / mismatched origin.
+    let session_path = "remote-session://dev/stale-caller";
+    // --- mismatched origin, DECISION claim: rejected wholesale.
+    {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_a = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+        let _attempt_b = shell.begin_terminal_open_attempt(session_path, "req-b", 2, "open_row");
+        let outcome = shell.complete_terminal_open_attempt_ready(
+            session_path,
+            TerminalReadyClaim::Decision { reason: "stale_probe" },
+            Some(&attempt_a),
+        );
+        assert!(matches!(outcome, TerminalReadyOutcome::StaleCaller));
+        assert!(!shell.terminal_session_has_ready_attempt(session_path));
+        assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    }
+    // --- mismatched origin, CONTENT claim, with a QUALIFYING receipt for
+    // the current attempt: still rejected, and the evidence is untouched.
+    {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_a = shell.begin_terminal_open_attempt(session_path, "req-a", 3, "open_row");
+        let attempt_b = shell.begin_terminal_open_attempt(session_path, "req-b", 4, "open_row");
+        shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+        shell.arm_terminal_applied_content(session_path, 1, 0);
+        let accepted = shell.record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 0,
+                wrote: 7,
+                blank: false,
+                ts: 0,
+                page_gen: 0,
+                source: "seed_proof",
+            },
+        );
+        assert!(accepted.accepted);
+        let outcome = shell.complete_terminal_open_attempt_ready(
+            session_path,
+            TerminalReadyClaim::Content { reason: "visual_reveal" },
+            Some(&attempt_a),
+        );
+        assert!(matches!(outcome, TerminalReadyOutcome::StaleCaller));
+        assert!(!shell.terminal_session_has_ready_attempt(session_path));
+        assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+        // The receipt SURVIVES the rejection (accepted is independent of
+        // claim promotion):
+        assert!(shell.terminal_session_applied_receipt_qualifies(session_path));
+        // B's own claim against the SAME stored receipt completes (the
+        // liveness positive — the fence must not trade wrong credit for a
+        // stall).
+        let outcome_b = shell.complete_terminal_open_attempt_ready(
+            session_path,
+            TerminalReadyClaim::Content { reason: "visual_reveal" },
+            Some(&attempt_b),
+        );
+        assert!(matches!(outcome_b, TerminalReadyOutcome::ContentCompleted));
+        assert!(shell.terminal_session_has_ready_attempt(session_path));
+        assert!(shell.terminal_resume_ready_paths.contains(session_path));
+    }
+    // --- matching origin and None proceed exactly as before.
+    {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt = shell.begin_terminal_open_attempt(session_path, "req-c", 5, "open_row");
+        let matched = shell.complete_terminal_open_attempt_ready(
+            session_path,
+            TerminalReadyClaim::Decision { reason: "warm_alive_posted_ready" },
+            Some(&attempt),
+        );
+        assert!(matches!(matched, TerminalReadyOutcome::DecisionCompleted));
+        let escaped = shell.complete_terminal_open_attempt_ready(
+            session_path,
+            TerminalReadyClaim::Decision { reason: "reveal_retained_host" },
+            None,
+        );
+        assert!(matches!(escaped, TerminalReadyOutcome::DecisionCompleted));
+    }
+}
+
+#[test]
+fn attempt_churn_voids_the_dead_attempt_s_parked_claim() {
+    // sol s28 Q1's exact shape: A parks; B begins; a matching current
+    // receipt arrives — B must stay unready until B claims on its own.
+    let session_path = "remote-session://dev/churn-voids-claim";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt_a = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let parked = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "visual_reveal" },
+        None,
+    );
+    assert!(matches!(parked, TerminalReadyOutcome::ContentPending));
+    assert!(shell.terminal_pending_content_claims.contains_key(session_path));
+    // Churn: B begins — A's claim RETIRES with it.
+    let attempt_b = shell.begin_terminal_open_attempt(session_path, "req-b", 2, "open_row");
+    assert!(!shell.terminal_pending_content_claims.contains_key(session_path));
+    // The qualifying receipt arrives NOW (current tuple, after churn):
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 32,
+            blank: false,
+            ts: 0,
+            page_gen: 0,
+            source: "seed_proof",
+        },
+    );
+    assert!(outcome.accepted);
+    assert!(!outcome.promoted, "A's retired claim must not promote B");
+    assert!(!shell.terminal_session_has_ready_attempt(session_path));
+    // B's own claim completes against the SAME stored receipt:
+    let b = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "visual_reveal" },
+        Some(&attempt_b),
+    );
+    assert!(matches!(b, TerminalReadyOutcome::ContentCompleted));
+}
+
+#[test]
+fn a_stale_caller_leaves_the_current_attempt_s_own_claim_intact() {
+    // Preservation (sol s34 Q5): B parks its own claim; a stale caller
+    // from A is rejected and B's claim survives untouched.
+    let session_path = "remote-session://dev/stale-preserves-claim";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let attempt_a = shell.begin_terminal_open_attempt(session_path, "req-a", 6, "open_row");
+    let attempt_b = shell.begin_terminal_open_attempt(session_path, "req-b", 7, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let parked = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "visual_reveal" },
+        Some(&attempt_b),
+    );
+    assert!(matches!(parked, TerminalReadyOutcome::ContentPending));
+    let stale = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "visual_reveal" },
+        Some(&attempt_a),
+    );
+    assert!(matches!(stale, TerminalReadyOutcome::StaleCaller));
+    let claim = shell
+        .terminal_pending_content_claims
+        .get(session_path)
+        .expect("B's parked claim survives the stale rejection");
+    assert_eq!(claim.attempt_id, attempt_b);
+    assert_eq!(claim.reason, "visual_reveal");
+}
+
+#[test]
+fn the_promotion_drops_a_claim_that_names_a_dead_attempt() {
+    // Defensive arm (clear-at-begin normally makes this shape unreachable):
+    // a claim naming a non-current attempt is dropped at promotion, never
+    // completed — and the receipt still lands accepted.
+    let session_path = "remote-session://dev/promotion-drop";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    shell.terminal_pending_content_claims.insert(
+        session_path.to_string(),
+        TerminalPendingContentClaim {
+            reason: "visual_reveal",
+            attempt_id: "terminal-open-1-999".to_string(),
+        },
+    );
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 16,
+            blank: false,
+            ts: 0,
+            page_gen: 0,
+            source: "seed_proof",
+        },
+    );
+    assert!(outcome.accepted, "the receipt itself stays valid");
+    assert!(!outcome.promoted, "a dead-attempt claim never promotes");
+    assert!(!shell.terminal_session_has_ready_attempt(session_path));
+    assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    assert!(!shell.terminal_pending_content_claims.contains_key(session_path));
+}
+
+#[test]
+fn the_render_path_park_requires_a_living_attempt() {
+    let session_path = "remote-session://dev/park-needs-attempt";
+    // No attempt at all: the park is DECLINED (an unnamed claim must never
+    // become a route to credit a later attempt).
+    {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+        shell.arm_terminal_applied_content(session_path, 1, 0);
+        shell.park_terminal_content_claim(session_path, "gate_ceiling_release");
+        assert!(!shell.terminal_pending_content_claims.contains_key(session_path));
+    }
+    // With a living attempt: parks NAMED under it.
+    {
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+        shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+        shell.arm_terminal_applied_content(session_path, 1, 0);
+        shell.park_terminal_content_claim(session_path, "gate_ceiling_release");
+        let claim = shell
+            .terminal_pending_content_claims
+            .get(session_path)
+            .expect("the park lands under a living attempt");
+        assert_eq!(claim.attempt_id, attempt);
+        assert_eq!(claim.reason, "gate_ceiling_release");
+    }
+}
+
+#[test]
+fn clearing_the_open_attempt_retires_parked_claims() {
+    // sol s34 finding: the standalone clear previously left the session's
+    // parked claim alive with a dead attempt.
+    let session_path = "remote-session://dev/clear-retires";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    shell.park_terminal_content_claim(session_path, "poison_clear");
+    assert!(shell.terminal_pending_content_claims.contains_key(session_path));
+    shell.clear_terminal_open_attempt_for_session(session_path, "closed");
+    assert!(!shell.terminal_pending_content_claims.contains_key(session_path));
+}
+
+#[test]
+fn attempt_ids_never_collide_within_one_process() {
+    // The ownership fence is string equality — two begins must never mint
+    // the same id (open_request_id is monotonic; sol s34 premise check).
+    let session_path = "remote-session://dev/attempt-id-uniqueness";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let a = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+    let b = shell.begin_terminal_open_attempt(session_path, "req-b", 2, "open_row");
+    assert_ne!(a, b);
+}
+
+#[test]
+fn every_production_door_call_carries_its_originating_attempt() {
+    // The call-site audit, mechanical forever (sol s34 Q5): every
+    // complete_terminal_open_attempt_ready CALL in the production source
+    // passes one of the captured origin variables — the None escape hatch
+    // belongs to state tests only. SHELL_SOURCE concatenates state.rs
+    // first (the definition lives there), so chunks without a claim
+    // argument are skipped.
+    let origins = [
+        "recovery_origin_attempt_id.as_deref()",
+        "raise_origin_attempt_id.as_deref()",
+        "reparent_origin_attempt_id.as_deref()",
+        "skip_origin_attempt_id.as_deref()",
+        "mount_origin_attempt_id.as_deref()",
+        // the four state-internal callers (fast-ready, inactive-cancel,
+        // fault-watchdog pair) carry the attempt each handler resolved:
+        "Some(&attempt_snapshot.attempt_id)",
+        "Some(&attempt_id)",
+        "origin_attempt_id.as_deref()",
+    ];
+    let mut audited = 0usize;
+    for chunk in SHELL_SOURCE.split("complete_terminal_open_attempt_ready(").skip(1) {
+        let head = &chunk[..chunk.find(')').map(|i| i + 1).unwrap_or(chunk.len())];
+        if !head.contains("TerminalReadyClaim::") {
+            continue; // the fn definition in state.rs, not a call
+        }
+        assert!(
+            origins.iter().any(|origin| head.contains(origin)),
+            "a production door call passes no captured origin: ...{}",
+            &head[..head.len().min(220)]
+        );
+        audited += 1;
+    }
+    assert!(
+        audited >= 17,
+        "expected the 17 production call sites, audited {audited}"
+    );
+}
+
 #[test]
 fn a_runtime_replacement_with_a_stable_epoch_retires_the_old_expectations_state() {
     // sol s28 Q5: replacement can occur WITHOUT an epoch change — the
@@ -61174,8 +61504,15 @@ fn a_runtime_replacement_with_a_stable_epoch_retires_the_old_expectations_state(
     let _attempt = shell.begin_terminal_open_attempt(session_path, "req-s", 1, "open_row");
     shell.terminal_mount_epochs.insert(session_path.to_string(), 5);
     shell.arm_terminal_applied_content(session_path, 5, 9);
-    shell.terminal_pending_content_claims
-        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_pending_content_claims.insert(
+        session_path.to_string(),
+        TerminalPendingContentClaim {
+            reason: "visual_reveal",
+            attempt_id: shell
+                .terminal_open_attempt_id_for(session_path)
+                .expect("a living attempt parks the claim"),
+        },
+    );
     shell.terminal_sessions_paint_pending.insert(session_path.to_string());
     // Runtime re-spawn, epoch unchanged: the arm's tuple still changes.
     shell.arm_terminal_applied_content(session_path, 5, 12);
@@ -73697,7 +74034,7 @@ mod web_surface_immersion_locks {
         // first_frame deliberately never fires on a raise.
         for needle in [
             "let reveal_raise_eligible = bootstrap_schedule_candidate",
-            "shell.complete_terminal_open_attempt_ready(\n                &session_path,\n                TerminalReadyClaim::Decision { reason: \"reveal_retained_host\" },\n            )",
+            "shell.complete_terminal_open_attempt_ready(\n                &session_path,\n                TerminalReadyClaim::Decision { reason: \"reveal_retained_host\" },\n                raise_origin_attempt_id.as_deref(),\n            )",
             "\"terminal_mount\", \"reveal_served\"",
             "terminal_reveal_stamp_script(&session_path, &host_id,)",
             "bootstrap_schedule_candidate && !reveal_raise_eligible && !reparent_raise_probe_needed",

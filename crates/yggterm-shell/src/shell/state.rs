@@ -19128,7 +19128,7 @@ struct ShellState {
     /// rejected) and 0 never overwrites a name.
     terminal_runtime_spawn_ids: HashMap<String, u64>,
     /// CONTENT claims parked pending a receipt (ack-arrival promotion).
-    terminal_pending_content_claims: HashMap<String, &'static str>,
+    terminal_pending_content_claims: HashMap<String, TerminalPendingContentClaim>,
     /// paint observed but not yet application-qualified (R4).
     terminal_sessions_paint_pending: HashSet<String>,
     // Bounded history of finished terminal reveals (ready or failed), newest
@@ -21420,11 +21420,26 @@ impl TerminalSurfaceStatus {
         Content { reason: &'static str },
     }
 
+    /// [e-r8] A parked CONTENT claim carries the identity of the attempt
+    /// that parked it: only THAT attempt's promotion may complete it. A
+    /// claim whose attempt churned is retired (at begin/clear) or dropped
+    /// (at promotion) — it never migrates to the successor (sol s28 Q1: a
+    /// late completion from attempt A must not complete attempt B).
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct TerminalPendingContentClaim {
+        pub(crate) reason: &'static str,
+        pub(crate) attempt_id: String,
+    }
+
     pub(crate) enum TerminalReadyOutcome {
         NoAttempt,
         DecisionCompleted,
         ContentCompleted,
         ContentPending,
+        /// [e-r8] The caller named an originating attempt that is no longer
+        /// the session's current attempt — nothing was latched, marked, or
+        /// revealed; the current attempt refused the credit.
+        StaleCaller,
     }
 
 impl ShellState {
@@ -28945,15 +28960,39 @@ impl ShellState {
                     .remove(&removed.unwrap().session_path);
             }
         }
+        // [e-r8] A new attempt RETIRES the session's parked claims: a
+        // parked claim is authorization to complete the attempt that parked
+        // it, and that attempt is now dead. The successor re-earns its own
+        // claim at its own Ready site (sol s28 Q1 / s34 Q2 — A's claim must
+        // never complete B, even against B's qualifying receipt).
+        let voided_pending_claim = self
+            .terminal_pending_content_claims
+            .remove(session_path)
+            .map(|claim| {
+                json!({
+                    "reason": claim.reason,
+                    "attempt_id": claim.attempt_id,
+                })
+            });
         self.record_terminal_open_attempt_event(
             "begin",
             &attempt,
             Some(json!({
                 "context": begin_context,
+                "voided_pending_claim": voided_pending_claim,
             })),
         );
         attempt_id
     }
+    /// [e-r8] The session's current open-attempt id, for callers that
+    /// capture their ORIGIN at scope entry (the attempt a task/block was
+    /// created for) and fence their later completions against churn.
+    pub(crate) fn terminal_open_attempt_id_for(&self, session_path: &str) -> Option<String> {
+        self.terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+    }
+
     fn latest_terminal_open_attempt_for_path(
         &self,
         session_path: &str,
@@ -29000,6 +29039,12 @@ impl ShellState {
         let Some(attempt_id) = self.terminal_open_attempt_by_session.remove(session_path) else {
             return;
         };
+        // [e-r8] A standalone clear retires the session's parked claims
+        // too: the claim was authorization to complete THIS attempt (sol
+        // s34 finding — only drop_terminal_render_state_for_session
+        // removed them, leaving an ownerless claim alive after a bare
+        // clear).
+        self.terminal_pending_content_claims.remove(session_path);
         self.terminal_open_attempt_order
             .retain(|candidate| candidate != &attempt_id);
         if let Some(attempt) = self.terminal_open_attempts.remove(&attempt_id) {
@@ -29598,15 +29643,48 @@ impl ShellState {
         &mut self,
         session_path: &str,
         claim: TerminalReadyClaim,
+        originating_attempt_id: Option<&str>,
     ) -> TerminalReadyOutcome {
-        let Some(attempt_id) = self
+        let Some(current_attempt_id) = self
             .terminal_open_attempt_by_session
             .get(session_path)
             .cloned()
         else {
             return TerminalReadyOutcome::NoAttempt;
         };
-        let _ = attempt_id;
+        // [e-r8] THE STALE-CALLER RULE (sol s28 Q1; uniform wiring per sol
+        // s34 Q1): a caller that captured its context under attempt A must
+        // never credit attempt B. The guard runs BEFORE receipt
+        // qualification, parking, latch insertion, ready marking, or reveal
+        // recording — a rejected credit has no effects at all. `None` is
+        // the compatibility escape hatch (state tests); every production
+        // caller passes the attempt it was created for.
+        if let Some(origin) = originating_attempt_id {
+            if origin != current_attempt_id {
+                let claim_class = match &claim {
+                    TerminalReadyClaim::Decision { .. } => "decision",
+                    TerminalReadyClaim::Content { .. } => "content",
+                };
+                let reason = match &claim {
+                    TerminalReadyClaim::Decision { reason }
+                    | TerminalReadyClaim::Content { reason } => *reason,
+                };
+                if let Some(attempt) = self.terminal_open_attempts.get(&current_attempt_id) {
+                    let attempt = attempt.clone();
+                    self.record_terminal_open_attempt_event(
+                        "stale_caller_rejected",
+                        &attempt,
+                        Some(json!({
+                            "originating_attempt_id": origin,
+                            "current_attempt_id": current_attempt_id,
+                            "reason": reason,
+                            "claim_class": claim_class,
+                        })),
+                    );
+                }
+                return TerminalReadyOutcome::StaleCaller;
+            }
+        }
         let (reason, content_qualified) = match claim {
             TerminalReadyClaim::Decision { reason } => (reason, false),
             TerminalReadyClaim::Content { reason } => {
@@ -29617,8 +29695,13 @@ impl ShellState {
                     // for the receipt to arrive (live-write event or the
                     // re-attest probe) — liveness must not fabricate
                     // content.
-                    self.terminal_pending_content_claims
-                        .insert(session_path.to_string(), reason);
+                    self.terminal_pending_content_claims.insert(
+                        session_path.to_string(),
+                        TerminalPendingContentClaim {
+                            reason,
+                            attempt_id: current_attempt_id,
+                        },
+                    );
                     return TerminalReadyOutcome::ContentPending;
                 }
                 (reason, true)
@@ -29639,9 +29722,23 @@ impl ShellState {
     /// latch sites: a deadline/ceiling release or a poison clear used to
     /// open the input gate with zero content evidence).
     fn park_terminal_content_claim(&mut self, session_path: &str, reason: &'static str) {
+        // [e-r8] Contract (sol s34 Q2): a park requires a LIVING attempt —
+        // the claim is authorization to complete THAT attempt. Without one
+        // there is no honest owner to name and the park is DECLINED (an
+        // attempt-less park would be an unnamed route to credit whichever
+        // attempt comes next).
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return;
+        };
         if !self.terminal_session_applied_receipt_qualifies(session_path) {
-            self.terminal_pending_content_claims
-                .insert(session_path.to_string(), reason);
+            self.terminal_pending_content_claims.insert(
+                session_path.to_string(),
+                TerminalPendingContentClaim { reason, attempt_id },
+            );
             return;
         }
         // Already-qualified evidence: the latch is earned right now.
@@ -29778,10 +29875,41 @@ impl ShellState {
         self.terminal_sessions_applied_content
             .insert(session_path.to_string(), record);
         let mut promoted = false;
-        if let Some(reason) = self.terminal_pending_content_claims.remove(session_path) {
-            self.terminal_resume_ready_paths.insert(session_path.to_string());
-            self.mark_terminal_open_attempt_ready_for_session(session_path, reason, true);
-            promoted = true;
+        if let Some(claim) = self.terminal_pending_content_claims.remove(session_path) {
+            // [e-r8] The claim names the attempt that parked it; only that
+            // attempt's promotion completes it. A claim naming any other
+            // (or evicted) attempt is DROPPED — no latch, no ready mark —
+            // while the receipt itself stays accepted and the independent
+            // pending-paint promotion below still runs (sol s34 Q2:
+            // dropping a stale claim must not discard a valid receipt).
+            let claim_still_current = self
+                .terminal_open_attempt_by_session
+                .get(session_path)
+                .is_some_and(|current| current == &claim.attempt_id);
+            if claim_still_current {
+                self.terminal_resume_ready_paths.insert(session_path.to_string());
+                self.mark_terminal_open_attempt_ready_for_session(
+                    session_path,
+                    claim.reason,
+                    true,
+                );
+                promoted = true;
+            } else {
+                let current = self
+                    .terminal_open_attempt_by_session
+                    .get(session_path)
+                    .and_then(|id| self.terminal_open_attempts.get(id).cloned());
+                if let Some(attempt) = current {
+                    self.record_terminal_open_attempt_event(
+                        "stale_claim_dropped",
+                        &attempt,
+                        Some(json!({
+                            "claim_attempt_id": claim.attempt_id,
+                            "reason": claim.reason,
+                        })),
+                    );
+                }
+            }
         }
         if self.terminal_sessions_paint_pending.remove(session_path) {
             self.note_terminal_session_painted_for_mount_epoch(
@@ -30087,6 +30215,9 @@ impl ShellState {
             self.complete_terminal_open_attempt_ready(
                 session_path,
                 TerminalReadyClaim::Content { reason: fast_ready_reason },
+                // [e-r8] origin: the attempt this first-meaningful-output
+                // observation was recorded against.
+                Some(&attempt_snapshot.attempt_id),
             );
         }
     }
@@ -30787,6 +30918,8 @@ impl ShellState {
             self.complete_terminal_open_attempt_ready(
                 session_path,
                 TerminalReadyClaim::Decision { reason: "ready_on_inactive_cancel_host_already_live" },
+                // [e-r8] origin: the attempt the cancel handler resolved.
+                Some(&attempt_id),
             );
             return false;
         }
@@ -33934,6 +34067,13 @@ impl ShellState {
         let mut exhausted_budget = false;
         let mut should_rearm = false;
         let mut saw_live_host_output = false;
+        // [e-r8] ORIGIN capture at handler entry (sol s34 Q1): the
+        // watchdog's completions credit the attempt it inspected — not
+        // whichever is current when the decision arms fire below.
+        let origin_attempt_id = self
+            .terminal_open_attempt_by_session
+            .get(active_session_path)
+            .cloned();
         if let Some(attempt_id) = self
             .terminal_open_attempt_by_session
             .get(active_session_path)
@@ -33983,6 +34123,8 @@ impl ShellState {
                 self.complete_terminal_open_attempt_ready(
                     active_session_path,
                     TerminalReadyClaim::Decision { reason: "ready_on_fault_watchdog_host_already_live" },
+                    // [e-r8] origin: the watchdog's own attempt resolution.
+                    origin_attempt_id.as_deref(),
                 );
             }
             return false;
@@ -34023,6 +34165,8 @@ impl ShellState {
                 self.complete_terminal_open_attempt_ready(
                     active_session_path,
                     TerminalReadyClaim::Decision { reason: "retained_fault_recovery_exhausted_keep_alive" },
+                    // [e-r8] origin: the watchdog's own attempt resolution.
+                    origin_attempt_id.as_deref(),
                 );
             } else {
                 // No live runtime — a genuine failure. Mark it failed as before.
