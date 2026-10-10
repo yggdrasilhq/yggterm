@@ -461,6 +461,31 @@ try {{
     )
 }
 
+/// [Q7-R3] ARM was a separate post-js_ready eval in the first cut — it
+/// raced both entry registration and the first live write (measured s26:
+/// armed traced Rust-side while the page stamp missed; the first write
+/// bailed not_eligible and a single-batch mount never minted a receipt).
+/// The arm now lives AT CONSTRUCTION in the entry literal inside
+/// `terminal_eval_script_with_canvas_renderer` (tuple + one-shot
+/// eligibility + the WITHHOLD/FOREIGN rig hooks); this fn is gone.
+///
+/// [Q7-R2] The RE-ATTEST probe: read the entry's page-published application
+/// receipt back into Rust for validation — how a CONTENT site qualifies a
+/// RETAINED host without demanding fresh spontaneous output (sol s23 R2:
+/// reuse re-attests existing evidence). The entry-identity check rides the
+/// read: a receipt from a replaced entry is not this mount's evidence.
+pub(crate) fn terminal_applied_content_probe_script(host_id: &str) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"".to_string());
+    format!(
+        r#"const __h = {host};
+const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
+const __r = __e && __e.appliedContent ? __e.appliedContent : null;
+const __entryLive = __e ? (window.__yggtermXtermHosts[__h] === __e) : false;
+return JSON.stringify({{ present: Boolean(__r), receipt: __r, entry_live: __entryLive }});"#
+    )
+}
+
+
 /// [F1-(e) Q2] The synthesized mount's frame-hash probe over a FRESH
 /// eval: pair the daemon's authoritative-grid hash (same `fnv32:%08x`
 /// canonical form both sides — frame_hash_probe.js and the daemon twin
@@ -784,6 +809,15 @@ fn terminal_eval_script_with_canvas_renderer(
         alt_scroll,
         initial_buffer_kind,
     );
+    // [Q7-R3] construction-time first-live-write receipt arm: the rig's
+    // WITHHOLD (negative control) and FOREIGN (tuple-mismatch) hooks, read
+    // at script build time — per-mount, matching the old arm-eval semantics.
+    let applied_content_withhold = std::env::var("YGGTERM_TEST_APPLIED_CONTENT_WITHHOLD")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let applied_content_foreign = std::env::var("YGGTERM_TEST_APPLIED_CONTENT_FOREIGN")
+        .map(|value| value == "1")
+        .unwrap_or(false);
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -11249,6 +11283,26 @@ fn terminal_eval_script_with_canvas_renderer(
             inputEnabled,
             rustInputGateOpen,
             hostId,
+            // [Q7-R3] first-live-write receipt state: armed AT CONSTRUCTION
+            // (tuple + one-shot eligibility), consumed by the first
+            // completing live write in flushPendingWrite. CONSTRUCTION-time,
+            // not a post-js_ready eval: the separate fire-and-forget arm
+            // eval raced both entry registration and the first live write
+            // (measured s26 phase-C: armed traced Rust-side while the page
+            // stamp missed — the first write bailed not_eligible and, when
+            // no second batch came, no receipt ever existed). The epoch
+            // rides the host div's data-terminal-mount-epoch, rendered
+            // before this script runs; a remount re-renders the attribute
+            // and re-runs this script — one arm per entry generation.
+            appliedContentEligible: true,
+            appliedContentTuple: {{
+                session: host.getAttribute("data-terminal-session-path") || "",
+                epoch: Number(host.getAttribute("data-terminal-mount-epoch") || 0),
+                runtime: 0,
+                gen: Number(window.__yggtermMountAttempt || 0),
+            }},
+            appliedContentWithhold: {applied_content_withhold},
+            appliedContentForeign: {applied_content_foreign},
                     sessionPath: host.getAttribute("data-terminal-session-path") || "",
                     sessionKind: host.getAttribute("data-terminal-session-kind") || "",
             // CC-DRAG-STALL: cross-host flush hook — primarySelectionTextForPaste
@@ -12469,6 +12523,58 @@ fn terminal_eval_script_with_canvas_renderer(
                 emitHostHealthThrottled();
                 schedulePendingWriteFlush(false);
             }};
+            // [Q7-R3] THE FIRST-LIVE-WRITE RECEIPT: one-shot per
+            // qualification generation. The entry was armed AT CONSTRUCTION
+            // (tuple + eligibility in the entry literal); the first live
+            // batch whose write COMPLETES (this callback — the same ack the
+            // seed proof rides) publishes the page-local receipt and pushes
+            // the event; Rust validates against current state before any
+            // promotion. The WITHHOLD hook is the rig's negative-control
+            // arm; FOREIGN is the tuple-mismatch arm.
+            const noteAppliedLive = (wroteLen) => {{
+                try {{
+                    const __acEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    if (!__acEntry || !__acEntry.appliedContentEligible || !__acEntry.appliedContentTuple) {{
+                        // [Q7-R3 DIAG] the bail reason is a trace event: no
+                        // entry (host-id mismatch?), not eligible (arm stamp
+                        // missed), or no tuple. One-shot: log the FIRST bail
+                        // per entry only (the mount banner writes several
+                        // batches; the reason repeats).
+                        if (!(window.__yggtermAppliedLiveBailLogged || {{}})[hostId]) {{
+                            (window.__yggtermAppliedLiveBailLogged = window.__yggtermAppliedLiveBailLogged || {{}})[hostId] = true;
+                            const __reason = !__acEntry ? "no_entry" : (!__acEntry.appliedContentEligible ? "not_eligible" : "no_tuple");
+                            sendTerminalEvent({{ kind: "debug", message: `appliedLive bail reason=${{__reason}} host=${{hostId}} registryKeys=${{Object.keys(window.__yggtermXtermHosts || {{}}).slice(0, 4).join(",")}} armLog=${{JSON.stringify((window.__yggtermAppliedArmLog || []).slice(-3))}}` }});
+                        }}
+                        return;
+                    }}
+                    __acEntry.appliedContentEligible = false;
+                    if (__acEntry.appliedContentWithhold) {{
+                        sendTerminalEvent({{ kind: "debug", message: `appliedLive withheld host=${{hostId}}` }});
+                        return;
+                    }}
+                    const __acTuple = __acEntry.appliedContentTuple;
+                    __acEntry.appliedContent = {{
+                        session: __acTuple.session,
+                        epoch: __acEntry.appliedContentForeign ? (__acTuple.epoch + 1000) : __acTuple.epoch,
+                        runtime: __acTuple.runtime,
+                        wrote: wroteLen,
+                        blank: false,
+                        ts: Date.now(),
+                        gen: __acTuple.gen,
+                        source: 'live_write',
+                    }};
+                    sendTerminalEvent({{
+                        kind: 'applied_content',
+                        session: __acEntry.appliedContent.session,
+                        epoch: __acEntry.appliedContent.epoch,
+                        runtime: __acEntry.appliedContent.runtime,
+                        wrote: wroteLen,
+                        blank: false,
+                        ts: __acEntry.appliedContent.ts,
+                        page_gen: __acTuple.gen,
+                    }});
+                }} catch (_appliedError) {{}}
+            }};
             const flushPendingWrite = () => {{
                 if (writeBridgeFlushTimer !== null) {{
                     clearTimeout(writeBridgeFlushTimer);
@@ -12688,10 +12794,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 if (preferSyncWrite) {{
                     syncWrite(payload);
+                    noteAppliedLive(renderPayloadLength);
                     finalizeWriteFlush(flushShouldFollow, false, paintRepairReason);
                     return;
                 }}
                 term.write(payload, () => {{
+                    noteAppliedLive(renderPayloadLength);
                     finalizeWriteFlush(flushShouldFollow, true, paintRepairReason);
                 }});
             }} catch (error) {{

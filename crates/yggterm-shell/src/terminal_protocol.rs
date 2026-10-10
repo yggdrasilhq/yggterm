@@ -123,6 +123,15 @@ pub(crate) enum TerminalJsEvent {
         cols: u16,
         rows: u16,
     },
+    AppliedContent {
+        session: String,
+        epoch: u64,
+        runtime: u64,
+        wrote: u64,
+        blank: bool,
+        ts: u64,
+        page_gen: u64,
+    },
     Input {
         data: String,
         /// [F1-input] The page-side input-ring id (dual-leg exactly-once
@@ -482,6 +491,22 @@ enum TerminalJsEventWire {
         #[serde(default)]
         ring_id: Option<u64>,
     },
+    AppliedContent {
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        runtime: u64,
+        #[serde(default)]
+        wrote: u64,
+        #[serde(default)]
+        blank: bool,
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        page_gen: u64,
+    },
     ReadNudge {
         #[serde(default)]
         reason: String,
@@ -752,6 +777,23 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::Input { data, ring_id } => {
                 TerminalJsEvent::Input { data, ring_id }
             }
+            TerminalJsEventWire::AppliedContent {
+                session,
+                epoch,
+                runtime,
+                wrote,
+                blank,
+                ts,
+                page_gen,
+            } => TerminalJsEvent::AppliedContent {
+                session,
+                epoch,
+                runtime,
+                wrote,
+                blank,
+                ts,
+                page_gen,
+            },
             TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
             TerminalJsEventWire::WheelGate {
                 decision,

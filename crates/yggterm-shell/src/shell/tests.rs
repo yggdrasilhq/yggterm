@@ -34569,7 +34569,7 @@ console.log('ok');
         let session_path = "local://closing-shell";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
         let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-test", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(session_path, "visual_reveal",false);
         assert!(shell.terminal_open_attempts.contains_key(&attempt_id));
         assert!(
             shell
@@ -39845,7 +39845,25 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(shell.input_gate_denied_since_ms.contains_key(session_path));
 
         // The ordinary route opens it: a mount reaches Ready.
-        shell.mark_terminal_open_attempt_ready_for_session(session_path, "test_ready");
+        shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+        shell.arm_terminal_applied_content(session_path, 1, 0);
+        shell.record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 0,
+                wrote: 64,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 0,
+                source: "live_write",
+            },
+        );
+        let outcome = shell.complete_terminal_open_attempt_ready(
+            session_path,
+            TerminalReadyClaim::Content { reason: "test_ready" },
+        );
+        assert!(matches!(outcome, TerminalReadyOutcome::ContentCompleted));
         assert_eq!(
             shell.tick_input_gate_deadline_for_candidate(
                 Some(session_path.to_string()),
@@ -40155,7 +40173,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "request:hot", 1, "test");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         // Simulate the hidden-host state: not in resume-ready set, and the
         // attempt now carries an empty-surface problem so has_ready_attempt is
         // false. ready_history (ready_at_ms) is sticky and remains.
@@ -40199,7 +40217,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "request:rg", 1, "test");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         shell
             .terminal_resume_ready_paths
             .remove(active_session_path);
@@ -40240,7 +40258,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.begin_terminal_open_attempt(active_session_path, "request:test", 1, "test");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         let attempt_id = shell
             .terminal_open_attempt_by_session
             .get(active_session_path)
@@ -40571,7 +40589,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.retain_terminal_session_path(active_session_path);
         shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell.begin_terminal_open_attempt(active_session_path, "req-ready", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         shell
             .terminal_attach_in_flight
             .insert(active_session_path.to_string());
@@ -40690,7 +40708,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
 
         assert!(
             !shell.terminal_session_is_retained_live(active_session_path),
@@ -40723,7 +40741,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.retain_terminal_session_path(active_session_path);
         shell.bump_terminal_mount_epoch_for_session(active_session_path, "test");
         shell.begin_terminal_open_attempt(active_session_path, "req-ready", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
 
         assert!(
             !shell.terminal_session_is_active_ready_focus_target(active_session_path),
@@ -40744,7 +40762,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         shell.begin_terminal_open_attempt(active_session_path, "req-ready", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         assert!(shell.terminal_session_is_retained_live(active_session_path));
 
         let mut snapshot = test_server_snapshot_for_active_session(active_session_path);
@@ -41008,7 +41026,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "recovery past the futile cap must be suppressed"
         );
         // Ready proves recovery isn't futile — the budget re-opens.
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         make_stale(
             &mut shell,
             u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 2,
@@ -41773,7 +41791,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         let attempt = shell
             .terminal_open_attempts
             .get(&attempt_id)
@@ -41793,7 +41811,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             shell.begin_terminal_open_attempt(active_session_path, "req-reveal", 1, "open_row");
         assert!(shell.reveal_log.is_empty());
 
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        // [Q7-R2] the reveal log records the FIRST completion with the
+        // class label: content-qualified reveals say "ready", decision
+        // completions say "decision_ready" (the classes are separated).
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",true);
         assert_eq!(shell.reveal_log.len(), 1);
         let entry = shell.reveal_log.back().expect("reveal entry");
         assert_eq!(entry.session_path, active_session_path);
@@ -41805,7 +41826,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(entry.finished_at_ms >= entry.started_at_ms);
 
         // A recovered re-ready of the same attempt must NOT log a duplicate.
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready_again");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready_again",false);
         assert_eq!(shell.reveal_log.len(), 1);
     }
 
@@ -42228,7 +42249,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(status["memory_pressure"].is_object());
 
         // Once ready, the in-flight status clears (the live status line hides).
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         assert!(shell.active_reveal_status_json().is_null());
     }
 
@@ -42260,7 +42281,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 ..Default::default()
             };
         }
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",true);
         let notification = shell
             .notifications
             .iter()
@@ -42300,7 +42321,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
             attempt.started_at_ms = current_millis().saturating_sub(1_233_000);
         }
-        shell.mark_terminal_open_attempt_ready_for_session(attempted, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(attempted, "test_ready",false);
         assert!(
             !shell
                 .notifications
@@ -42334,7 +42355,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 ..Default::default()
             };
         }
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",true);
         let notification = shell
             .notifications
             .iter()
@@ -42368,7 +42389,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 ..Default::default()
             };
         }
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready",false);
         assert!(
             !shell
                 .notifications
@@ -42906,7 +42927,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         shell
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
@@ -42932,7 +42953,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
         shell.fail_remote_terminal_resume_timeout(active_session_path, "", "timed out".to_string());
 
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "late_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "late_ready",false);
 
         let attempt = shell
             .terminal_open_attempts
@@ -42950,7 +42971,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         assert!(shell.terminal_session_has_ready_attempt(active_session_path));
 
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -42995,7 +43016,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut shell = ShellState::new(bootstrap);
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         assert!(shell.terminal_session_has_ready_history(active_session_path));
         assert!(
             !shell.terminal_session_ready_for_daemon_retained_replay(active_session_path),
@@ -43192,7 +43213,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         shell.active_terminal_host_id = Some("stale-remote-host".to_string());
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         assert!(shell.terminal_session_is_retained_live(active_session_path));
 
         let fault_viewport = json!({
@@ -43309,7 +43330,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         shell.active_terminal_host_id = Some("healthy-retained-host".to_string());
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         assert!(shell.terminal_session_is_retained_live(active_session_path));
         let latest_before = shell.latest_open_request_id;
         let epoch_before = shell
@@ -43388,7 +43409,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         shell.active_terminal_host_id = Some("empty-retained-host".to_string());
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal",false);
         assert!(shell.terminal_session_is_retained_live(active_session_path));
 
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -43828,7 +43849,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
 
         // Resolve via the success path.
-        shell.mark_terminal_open_attempt_ready_for_session(success_path, "ready_test");
+        shell.mark_terminal_open_attempt_ready_for_session(success_path, "ready_test",false);
         assert!(
             !shell
                 .retained_fault_recovery_loop_armed_at_ms
@@ -43910,6 +43931,22 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             attempt.surface_mounted_at_ms = Some(current_millis());
         }
 
+        // [Q7-R2/R3] the fast-ready is a CONTENT claim under the (e-r3)
+        // binding: qualify it with an armed tuple + a stored receipt.
+        shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+        shell.arm_terminal_applied_content(session_path, 1, 0);
+        shell.record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 0,
+                wrote: 4096,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 0,
+                source: "live_write",
+            },
+        );
         shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
             session_path,
             "test_prompt_arrival",
@@ -43994,6 +44031,22 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "req-daemon",
             1,
             "retained_fault_recovery",
+        );
+        // [Q7-R2/R3] the fast-ready is a CONTENT claim under the (e-r3)
+        // binding: qualify it with an armed tuple + a stored receipt.
+        shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+        shell.arm_terminal_applied_content(session_path, 1, 0);
+        shell.record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 0,
+                wrote: 4096,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 0,
+                source: "live_write",
+            },
         );
         shell.mark_terminal_open_attempt_first_output_for_session(
             session_path,
@@ -44264,7 +44317,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             shell.switch_arm_ms_by_session.contains_key(hot_path),
             "hot click must arm the switch gate"
         );
-        shell.mark_terminal_open_attempt_ready_for_session(hot_path, "ready");
+        shell.mark_terminal_open_attempt_ready_for_session(hot_path, "ready",false);
         assert!(
             !shell.switch_arm_ms_by_session.contains_key(hot_path),
             "ready transition must clear the switch arm"
@@ -44273,7 +44326,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // Cold click: arms COLD, clears COLD on first ready.
         shell.begin_terminal_open_attempt(cold_path, "req-cold", 2, "hot_open_row");
         assert!(shell.switch_arm_ms_by_session.contains_key(cold_path));
-        shell.mark_terminal_open_attempt_ready_for_session(cold_path, "ready");
+        shell.mark_terminal_open_attempt_ready_for_session(cold_path, "ready",false);
         assert!(!shell.switch_arm_ms_by_session.contains_key(cold_path));
 
         let snapshot = shell.xterm_gate_metrics.to_app_state_json();
@@ -44565,7 +44618,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path,
             "terminal_surface_mounted",
         );
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "host_health");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "host_health",false);
         shell
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
@@ -44618,7 +44671,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             9,
             "retained_fault_recovery",
         );
-        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "host_health");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "host_health",false);
         shell
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
@@ -52877,7 +52930,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell
             .terminal_bootstrap_lease_by_session
             .insert(active_path.to_string(), "lease:live".to_string());
-        shell.mark_terminal_open_attempt_ready_for_session(active_path, "test_ready_attempt");
+        shell.mark_terminal_open_attempt_ready_for_session(active_path, "test_ready_attempt",false);
         bump_terminal_loop_heartbeat(active_path);
 
         shell.prune_terminal_attach_in_flight();
@@ -52919,7 +52972,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell
             .terminal_bootstrap_lease_by_session
             .insert(active_path.to_string(), "lease:dead".to_string());
-        shell.mark_terminal_open_attempt_ready_for_session(active_path, "test_ready_attempt");
+        shell.mark_terminal_open_attempt_ready_for_session(active_path, "test_ready_attempt",false);
         remove_terminal_loop_heartbeat(active_path);
 
         shell.prune_terminal_attach_in_flight();
@@ -54685,7 +54738,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
         shell.begin_terminal_open_attempt(session_path, "req-test", 1, "retained_fault_recovery");
-        shell.mark_terminal_open_attempt_ready_for_session(session_path, "prior_ready");
+        shell.mark_terminal_open_attempt_ready_for_session(session_path, "prior_ready",false);
 
         assert!(shell.terminal_session_should_suppress_initial_resume_notice(session_path));
         assert!(!shell.terminal_session_resume_notification_should_stay_visible(session_path));
@@ -54819,7 +54872,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(session_path);
         shell.begin_terminal_open_attempt(session_path, "req-test", 1, "retained_fault_recovery");
-        shell.mark_terminal_open_attempt_ready_for_session(session_path, "initial_visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(session_path, "initial_visual_reveal",false);
         shell.upsert_job_notification(
             notification_key.clone(),
             NotificationTone::Info,
@@ -56223,7 +56276,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         shell
             .terminal_resume_ready_paths
             .insert(remote_path.to_string());
-        shell.mark_terminal_open_attempt_ready_for_session(remote_path, "visual_reveal");
+        shell.mark_terminal_open_attempt_ready_for_session(remote_path, "visual_reveal",false);
         assert!(matches!(
             shell
                 .terminal_open_attempts
@@ -60252,6 +60305,218 @@ Updated at   Branch  Conversation\n\
             "the firing must be trace-named so the falsifier is measurable on live bytes"
         );
     }
+// ---------------------------------------------------------------------------
+// [Q7-R2/R3/R4] THE (e-r3) FULL-BINDING LOCKS (sitting 25): the guarded
+// Ready transaction, the first-live-write receipt promotion, and the
+// DOM-presence paint binding. sol s23 round 1 (R2/R3/R4/R6) — the
+// classification and the bypass shapes these lock out.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_decision_ready_never_opens_the_content_qualified_latch() {
+    // sol R2: a DECISION/liveness completion may end its own wait but must
+    // never insert the resume latch (the old bypass: sites inserted
+    // terminal_resume_ready_paths BEFORE the marker and
+    // terminal_session_has_visual_resume_reveal ORed in any ready attempt).
+    let session_path = "remote-session://dev/decision-no-latch";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-d", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Decision { reason: "reveal_retained_host" },
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::DecisionCompleted));
+    assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    assert!(shell.terminal_session_has_ready_attempt(session_path));
+    // THE PREDICATE LOCK: a ready attempt alone no longer satisfies the
+    // visual-resume reveal (the input-gate reader).
+    assert!(!shell.terminal_session_has_visual_resume_reveal(session_path));
+    assert!(shell.remote_resume_input_gate_is_shut(session_path));
+}
+
+#[test]
+fn a_content_claim_without_a_receipt_parks_instead_of_promoting() {
+    // sol R2/R6: liveness must not fabricate content. A CONTENT claim with
+    // no qualified receipt parks — no latch, no Ready, no reveal.
+    let session_path = "remote-session://dev/content-parks";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-c", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "visual_reveal" },
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
+    assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+    assert!(attempt.ready_at_ms.is_none(), "a parked claim does not mark Ready");
+    assert!(
+        shell.terminal_pending_content_claims.contains_key(session_path),
+        "the claim parks for the ack-arrival promotion"
+    );
+}
+
+#[test]
+fn the_ack_arrival_promotion_completes_a_parked_claim_and_pending_paint() {
+    // sol R3/R5: the receipt's arrival (live-write event or re-attest
+    // probe) completes the parked claim — the input gate opens and the
+    // pending paint witness advances under the SAME epoch.
+    let session_path = "remote-session://dev/ack-arrival";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-a", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "visual_reveal" },
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
+    shell.terminal_sessions_paint_pending.insert(session_path.to_string());
+    let promoted = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 128,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 3,
+            source: "live_write",
+        },
+    );
+    assert!(promoted);
+    assert!(shell.terminal_resume_ready_paths.contains(session_path));
+    assert!(shell.terminal_session_has_visual_resume_reveal(session_path));
+    assert!(!shell.remote_resume_input_gate_is_shut(session_path));
+    assert!(shell.terminal_session_host_has_painted(session_path));
+    assert!(shell.terminal_sessions_paint_pending.is_empty());
+}
+
+#[test]
+fn a_foreign_epoch_or_runtime_receipt_never_promotes() {
+    // sol R6: the tuple arms — one mismatch must not be masked by another.
+    let session_path = "remote-session://dev/foreign-tuple";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-f", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 7);
+    shell.terminal_pending_content_claims
+        .insert(session_path.to_string(), "visual_reveal");
+    // foreign EPOCH: the receipt belongs to a moved/dead mount.
+    let promoted = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1001,
+            runtime_spawn_id: 7,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(!promoted, "a foreign epoch must reject");
+    assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    // foreign RUNTIME (named expectation 7, receipt claims 9):
+    let promoted = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 9,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(!promoted, "a foreign runtime must reject");
+    // the matching tuple releases:
+    let promoted = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 7,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(promoted, "the matching tuple promotes");
+    assert!(shell.terminal_resume_ready_paths.contains(session_path));
+}
+
+#[test]
+fn a_receipt_from_a_dead_epoch_does_not_qualify_a_new_mount() {
+    // sol R6 (callback-held-across-replacement, state-level arm): an old
+    // incarnation's evidence must not promote the new mount's claim.
+    let session_path = "remote-session://dev/epoch-replacement";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-e", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    // the mount MOVES (epoch bumps): the arm resets the stored evidence.
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 2);
+    shell.arm_terminal_applied_content(session_path, 2, 0);
+    assert!(
+        !shell.terminal_session_applied_receipt_qualifies(session_path),
+        "the old epoch's receipt died with the old mount"
+    );
+}
+
+#[test]
+fn a_valid_blank_receipt_qualifies_content_without_cursor_motion() {
+    // sol R6: the valid-blank arm — geometry/surface and input readiness
+    // complete without meaningful-output or cursor-motion requirements.
+    let session_path = "remote-session://dev/blank-receipt";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-b", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "blank_host_snapshot_replay" },
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
+    let promoted = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 7,
+            blank: true,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "seed_proof",
+        },
+    );
+    assert!(promoted, "the blank repaint's own control bytes earn the receipt");
+    assert!(shell.terminal_resume_ready_paths.contains(session_path));
+}
+
 }
 
 #[cfg(test)]
@@ -72715,7 +72980,7 @@ mod web_surface_immersion_locks {
         // first_frame deliberately never fires on a raise.
         for needle in [
             "let reveal_raise_eligible = bootstrap_schedule_candidate",
-            "shell.mark_terminal_open_attempt_ready_for_session(&session_path, \"reveal_retained_host\",)",
+            "shell.complete_terminal_open_attempt_ready(\n                &session_path,\n                TerminalReadyClaim::Decision { reason: \"reveal_retained_host\" },\n            )",
             "\"terminal_mount\", \"reveal_served\"",
             "terminal_reveal_stamp_script(&session_path, &host_id,)",
             "bootstrap_schedule_candidate && !reveal_raise_eligible && !reparent_raise_probe_needed",
