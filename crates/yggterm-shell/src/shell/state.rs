@@ -21381,6 +21381,18 @@ impl TerminalSurfaceStatus {
         pub(crate) runtime_spawn_id: u64,
     }
 
+    /// [Q3/s28] The two truths of an ack arrival, deliberately separate:
+    /// `accepted` — the receipt validated against current state and was
+    /// stored; `promoted` — a parked claim or pending paint consumed it.
+    /// Accepted-with-nothing-parked is LEGAL (promoted=false), so the old
+    /// single bool could not serve as an acceptance flag (sol s28 Q3: the
+    /// seed paint gate must read `accepted`, never `promoted`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub(crate) struct TerminalAppliedContentOutcome {
+        pub(crate) accepted: bool,
+        pub(crate) promoted: bool,
+    }
+
     /// [Q7-R2] The typed Ready claim. DECISION/liveness completions may end
     /// their own wait — they never insert the content-qualified resume latch
     /// and never complete a reveal. CONTENT completions require a qualified
@@ -29636,8 +29648,11 @@ impl ShellState {
             if expected.mount_epoch != record.mount_epoch {
                 return false;
             }
+            // [S28-2] the runtime rule, identical to
+            // record_terminal_applied_content's: a NAMED expectation
+            // rejects an unbound (0) or foreign runtime alike; an unnamed
+            // expectation (0) binds by epoch + session only.
             if expected.runtime_spawn_id != 0
-                && record.runtime_spawn_id != 0
                 && record.runtime_spawn_id != expected.runtime_spawn_id
             {
                 return false;
@@ -29655,11 +29670,27 @@ impl ShellState {
         mount_epoch: u64,
         runtime_spawn_id: u64,
     ) {
+        // [S28-2] Cleanup keys on the PREVIOUS EXPECTED TUPLE, not on
+        // terminal_mount_epochs alone: the epoch map may already have been
+        // bumped before this arm runs (the arm-after-epoch-bump order),
+        // which made the old comparison read "unchanged" and left the dead
+        // tuple's parked claims and pending paint alive for a current
+        // receipt to consume (sol s28 probe line 2). Any expectation
+        // change — epoch OR runtime — retires the old incarnation's
+        // evidence wholesale; the epoch-map term still covers mounts that
+        // never armed under an expectation at all.
+        let tuple_changed = self
+            .terminal_expected_applied_tuple
+            .get(session_path)
+            .is_some_and(|previous| {
+                previous.mount_epoch != mount_epoch
+                    || previous.runtime_spawn_id != runtime_spawn_id
+            });
         let epoch_changed = self
             .terminal_mount_epochs
             .get(session_path)
             .is_some_and(|current| *current != mount_epoch);
-        if epoch_changed {
+        if tuple_changed || epoch_changed {
             self.terminal_sessions_applied_content.remove(session_path);
             self.terminal_pending_content_claims.remove(session_path);
             self.terminal_sessions_paint_pending.remove(session_path);
@@ -29681,22 +29712,28 @@ impl ShellState {
         &mut self,
         session_path: &str,
         record: TerminalAppliedContentRecord,
-    ) -> bool {
+    ) -> TerminalAppliedContentOutcome {
         let Some(current_epoch) = self.terminal_mount_epochs.get(session_path).copied() else {
-            return false;
+            return TerminalAppliedContentOutcome::default();
         };
         if record.mount_epoch != current_epoch {
-            return false;
+            return TerminalAppliedContentOutcome::default();
         }
         if let Some(expected) = self.terminal_expected_applied_tuple.get(session_path) {
             if expected.mount_epoch != record.mount_epoch {
-                return false;
+                return TerminalAppliedContentOutcome::default();
             }
+            // [S28-2] A NAMED runtime expectation binds: the receipt must
+            // carry the same runtime. A receipt runtime of 0 is UNBOUND,
+            // not a wildcard — it must never satisfy a named expectation
+            // (sol s28 S28-2: expected 7 + receipt 0 used to pass). An
+            // UNNAMED expectation (0 — the production arm convention when
+            // the mount does not know its runtime) stays provisional: the
+            // epoch + session qualifiers bind (the documented policy).
             if expected.runtime_spawn_id != 0
-                && record.runtime_spawn_id != 0
                 && record.runtime_spawn_id != expected.runtime_spawn_id
             {
-                return false;
+                return TerminalAppliedContentOutcome::default();
             }
         }
         self.terminal_sessions_applied_content
@@ -29714,7 +29751,10 @@ impl ShellState {
             );
             promoted = true;
         }
-        promoted
+        TerminalAppliedContentOutcome {
+            accepted: true,
+            promoted,
+        }
     }
 
     fn mark_terminal_open_attempt_ready_for_session(

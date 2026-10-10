@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -121,6 +121,142 @@ boot_wait_ready() {
 pkill -f "Xvfb :78" 2>/dev/null; sleep 1
 Xvfb :78 -screen 0 1600x1000x24 -ac > /tmp/f1e2-xvfb.log 2>&1 &
 XVFB_PID=$!; sleep 1.5
+
+# ── [S28-1] MODE=provenance: THE HELD-CALLBACK FALSIFIER (sitting 29, sol
+# s28 round 2 Q4 arm 1 — the worst missing arm). Its OWN healthy boot,
+# BEFORE phase 1 (the synthesized-boot shape issues no live write-bridge
+# writes — measured s29 run 1: fired=0 bails=0 — while the healthy
+# probe-type shape is where first-live-write receipts demonstrably mint,
+# phase C's measurement). The page replaces the host registry entry
+# synchronously right after the first eligible write is ISSUED, before the
+# async callback can fire; the bar reads the trace's ORDER. Unfixed: the
+# callback resolves the REPLACEMENT at callback time and mints its tuple
+# for the original's bytes (RED, exit 14 — a receipt at armed_epoch+50
+# preceding any entry_replaced bail, and the successor's own write then
+# bailing not_eligible: its eligibility was consumed by the ORIGINAL's
+# callback). Fixed: the callback bails entry_replaced FIRST — the write
+# bridge is strictly one-in-flight, so a replacement-tuple receipt can only
+# FOLLOW the bail, minted by the replacement's OWN bytes. ────────────────
+if [ "$MODE" = provenance ]; then
+  PSCRATCH=/tmp/f1e2-provenance-$(date +%s)
+  mkdir -p "$PSCRATCH"
+  YGGTERM_TEST_APPLIED_CONTENT_REPLACE_MIDWRITE=1 run_boot "$PSCRATCH" 0
+  PGUI=$!
+  PREADY=$(boot_wait_ready); echo "provenance daemon ready=$PREADY"; sleep 8
+  PSCRATCH=$PSCRATCH python3 - <<'PYEOF' > /tmp/f1e2-provenance-run.log 2>&1
+import json, subprocess, time, os
+bin_path = os.environ["BIN"]
+TRACE = os.environ["PSCRATCH"] + "/event-trace.jsonl"
+def verb(*args, timeout=60):
+    return subprocess.run([bin_path] + list(args), capture_output=True, text=True, timeout=timeout)
+def read_events():
+    out = []
+    try:
+        for ln_no, line in enumerate(open(TRACE), 1):
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            name = (event.get("name") or event.get("event"))
+            if name:
+                out.append((ln_no, name, event.get("payload") or {}))
+    except FileNotFoundError:
+        pass
+    return out
+def make_row(title):
+    for attempt in range(4):
+        out = verb("server", "app", "terminal", "new", "--kind", "shell", "--title", title)
+        try:
+            return (json.loads(out.stdout).get("data") or {}).get("session_path")
+        except Exception:
+            print("row create attempt %d failed: %s" % (attempt, (out.stdout or out.stderr)[:120].replace("\n", " ")))
+            time.sleep(4)
+    return None
+# ⛔ ROW + SEQUENCING LAW (measured s29 run 5): the probe rides the FIRST
+# row's mount (the window-global one-shot fires at its posted-ready). The
+# write callback's page->Rust events die in the IPC shed if a SECOND row's
+# creation churn starts before the callback delivers ([11.178] class) — so
+# this bar runs SINGLE-ROW: create the one row, then wait for the probe's
+# evidence with zero further churn. No test row, no switch, no probe-type.
+s = make_row("prov")
+if not s:
+    print("PROVENANCE FAIL: no row"); raise SystemExit(14)
+print("row: s=%s" % (s,))
+deadline = time.time() + 40
+saw_bail_or_receipt = False
+while time.time() < deadline:
+    ev = read_events()
+    has_fired = any("replace-midwrite fired" in str(p.get("message") or "")
+                    for _, nm, p in ev if nm == "js_debug")
+    has_verdict = any(
+        ("appliedLive bail reason=" in str(p.get("message") or "")) and nm == "js_debug"
+        for _, nm, p in ev) or any(
+        nm == "applied_content_promoted" and p.get("epoch") not in (None, 1)
+        for _, nm, p in ev)
+    if has_fired and has_verdict:
+        saw_bail_or_receipt = True
+        break
+    time.sleep(0.5)
+time.sleep(2)  # settle: any straggler callback events land
+events = read_events()
+# the probe fires on the FIRST row to post ready (the window-global
+# one-shot) — the rig's dummy row, not the test row. The evidence keys on
+# whichever session ACTUALLY armed, not on `s`.
+all_armed = [(ln, p) for ln, nm, p in events if nm == "applied_content_armed"]
+if not all_armed:
+    print("RIG SHAPE BROKE: no arm trace at any session")
+    raise SystemExit(4)
+s = all_armed[0][1].get("session_path")
+armed = all_armed
+js_debug = [(ln, p) for ln, nm, p in events
+            if nm == "js_debug" and p.get("session_path") == s]
+bails = [(ln, str(p.get("message") or "")) for ln, p in js_debug
+         if "appliedLive bail reason=" in str(p.get("message") or "")]
+armed_epoch = armed[0][1].get("epoch")
+fired = [(ln, p) for ln, p in js_debug
+         if "replace-midwrite fired" in str(p.get("message") or "")]
+replacement_receipts = [(ln, p) for ln, nm, p in events
+                        if nm == "applied_content_promoted"
+                        and p.get("session_path") == s
+                        and p.get("epoch") == (armed_epoch or 0) + 50]
+print("VERDICT PROVENANCE: armed_epoch=%s fired=%d bails=%d replacement_receipts=%d" % (
+    armed_epoch, len(fired), len(bails), len(replacement_receipts)))
+for ln, msg in bails[:3]:
+    print("   bail@%d: %s" % (ln, msg[:140]))
+for ln, p in replacement_receipts[:3]:
+    print("   replacement receipt@%d: epoch=%s promoted=%s" % (ln, p.get("epoch"), p.get("promoted")))
+# RED decides FIRST (the fired marker is the GREEN vacuity guard, not a
+# precondition — its delivery can be shed independently of the evidence).
+entry_replaced_ln = next((ln for ln, msg in bails if "reason=entry_replaced" in msg), None)
+if replacement_receipts and (entry_replaced_ln is None
+                             or replacement_receipts[0][0] < entry_replaced_ln):
+    first_bail = bails[0][1][:80] if bails else "(none)"
+    print("VERDICT RED CONFIRMED: the held callback minted the REPLACEMENT's receipt for the original's bytes (epoch %s+50 receipt at line %d, first bail=%s) — callback-time registry resolution, the sol s28 S28-1 defect live" % (
+        armed_epoch, replacement_receipts[0][0], first_bail))
+    raise SystemExit(14)
+if not fired:
+    print("RIG SHAPE BROKE: the replace-midwrite hook never fired (no eligible live write issued) — a GREEN here would be vacuous")
+    raise SystemExit(4)
+if entry_replaced_ln is None:
+    print("RIG SHAPE BROKE: hook fired but no appliedLive bail is on record (the js_debug throttle may have dropped it) — cannot decide")
+    raise SystemExit(4)
+if replacement_receipts and replacement_receipts[0][0] > entry_replaced_ln:
+    print("   (a replacement-tuple receipt exists AFTER the entry_replaced bail — the replacement's OWN write minted it; Rust rejects the foreign epoch, honest rejection)")
+body = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
+print("   row health: E1RPROV on screen=%s" % (body.count("E1RPROV") >= 1))
+print("RIG PASS — the held callback refused the replacement (entry_replaced bailed before any replacement-tuple receipt; registry identity held at the callback boundary)")
+raise SystemExit(0)
+PYEOF
+  RC=$?
+  kill "$PGUI" 2>/dev/null; sleep 1
+  pkill -x yggterm 2>/dev/null; pkill -f "dbus-run-session" 2>/dev/null; sleep 1
+  for p in $(pgrep -f 'yggterm-headless server daemon'); do
+    h=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^YGGTERM_HOME=//p')
+    [ "$h" = "$PSCRATCH" ] && kill "$p" 2>/dev/null
+  done
+  tail -12 /tmp/f1e2-provenance-run.log
+  exit $RC
+fi
 
 # ── PHASE 1: the synthesized race (BARS 1+2) ─────────────────────────────
 SCRATCH=/tmp/f1e2-home-$(date +%s)
@@ -677,8 +813,18 @@ if MODE == "negative":
     paint_events = [p for _, nm, p in events
                     if nm == "paint_ready" and p.get("session_path") == s]
     paint_pending_seen = any(p.get("paint_pending") is True for p in paint_events)
-    print("VERDICT NEGATIVE-A: armed=%d promoted_any=%d promoted_true=%d ready=%d content_readies=%d paint_pending=%d" % (
-        len(armed), len(promoted_any), len(promoted_true), len(ready_events), len(content_readies), 1 if paint_pending_seen else 0))
+    # [s29 Q4 arm 4] SEED-SKIP ISOLATION: phase A couples the withheld
+    # live receipt with a forced-skip seed — the skip must be ON RECORD as
+    # its own evidence (seed_mode=test_forced_skip with wrote_seed=0), not
+    # inferred from the absence of receipts (withholding explains that
+    # alone).
+    proof_payload = (session_events(events, s, "synthesized_mount_open") or [(0, {})])[-1][1]
+    if proof_payload.get("seed_mode") != "test_forced_skip" or int(proof_payload.get("wrote_seed") or 0) != 0:
+        print("PHASE A PRE-FLIGHT FAIL: the seed skip is not on record (seed_mode=%s wrote_seed=%s) — the zero-evidence premise is unproven" % (
+            proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
+        raise SystemExit(4)
+    print("VERDICT NEGATIVE-A: armed=%d promoted_any=%d promoted_true=%d ready=%d content_readies=%d paint_pending=%d seed_mode=%s wrote_seed=%s" % (
+        len(armed), len(promoted_any), len(promoted_true), len(ready_events), len(content_readies), 1 if paint_pending_seen else 0, proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
     if not armed:
         # unfixed build: the machinery is absent — the RED discriminator is
         # the UNQUALIFIED promotion (a ready attempt with no evidence).
@@ -828,8 +974,19 @@ while time.time() < deadline:
     # DECISION claims (reparent/warm-alive) — content-claim completion is
     # remote-resume territory (suite-locked; the LiveSsh gate keeps the
     # rig out). Foreign epochs (the poison) never match.
-    promoted_valid = [p for nm, p in ev if nm == "applied_content_promoted" and p.get("session_path") == s and p.get("epoch") == 1]
+    # [s29 Q4] the bar reads ACCEPTED (the record validated and stored —
+    # the trace fires on rejection too, promoted=false alone cannot
+    # discriminate) and correlates the ARMED epoch instead of hard-coding
+    # 1: any other rejection reason would have passed the old bar.
+    promoted_valid = [p for nm, p in ev if nm == "applied_content_promoted" and p.get("session_path") == s and p.get("accepted") is True]
     armed = [p for nm, p in ev if nm == "applied_content_armed" and p.get("session_path") == s]
+    if armed and promoted_valid:
+        armed_epoch = armed[0].get("epoch")
+        accepted_epochs = {p.get("epoch") for p in promoted_valid}
+        if accepted_epochs != {armed_epoch}:
+            print("RELEASE FAIL — accepted receipts at epochs %s, armed at %s (tuple mismatch)" % (
+                sorted(accepted_epochs), armed_epoch))
+            raise SystemExit(14)
     body = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
     if armed and promoted_valid and body.count("E1RGOOD") >= 1:
         ok = True
@@ -946,6 +1103,18 @@ print("VERDICT FOREIGN: rejected=%d promoted_true=%d paint_events=%d paint_pendi
 if any_true or not saw_reject:
     print("FOREIGN FAIL — the foreign tuple was not rejected (rejects=%d, promoted_true=%d)" % (len(foreign_rejects), len(any_true)))
     raise SystemExit(15)
+# [s29 Q3] THE SEED PAINT GATE: a FOREIGN-rejected seed record must not
+# earn paint at the current epoch. The applied_content_seed_paint trace
+# carries the gate's decision (noted) — asserted false/absent here; the
+# positive control (a healthy seed noting paint) is the order/blank bars'
+# healthy boots.
+seed_paint = [p for nm, p in all_ev
+              if nm == "applied_content_seed_paint" and p.get("session_path") == s]
+if any(p.get("noted") is True for p in seed_paint):
+    print("FOREIGN FAIL — the rejected seed record still earned paint (the Q3 gate)")
+    raise SystemExit(15)
+print("   seed paint gate: %d seed_paint events, noted_true=%d" % (
+    len(seed_paint), sum(1 for p in seed_paint if p.get("noted") is True)))
 # [Q7-R4] the DOM first-paint on a HEALTHY mount (Paint events flow here):
 # painted structure with a REJECTED tuple must leave the paint witness
 # PENDING — the paint note never advances without qualified application.
