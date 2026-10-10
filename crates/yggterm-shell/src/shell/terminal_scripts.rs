@@ -12818,8 +12818,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     && payload.includes('\x1b[?2026h')
                     && payload.includes('\x1b[?2026l');
                 const syncWriteBypassFrameBudget =
-                    __acReplaceMidwrite
-                    || rawFrameLike
+                    rawFrameLike
+                    || __acReplaceMidwrite
                     || rawSynchronizedSmallFrame
                     || terminalPayloadLooksSynchronizedRepaintFrame(payload)
                     || terminalPayloadLooksInlineStatusRewrite(payload)
