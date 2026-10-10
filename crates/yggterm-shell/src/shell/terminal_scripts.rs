@@ -827,6 +827,27 @@ fn terminal_eval_script_with_canvas_renderer(
         std::env::var("YGGTERM_TEST_APPLIED_CONTENT_REPLACE_MIDWRITE")
             .map(|value| value == "1")
             .unwrap_or(false);
+    // [e-r5 RIG ARM] the naming bar's receipt injections: FOREIGN runtime
+    // ids the page pushes through the PRODUCTION applied_content ingress
+    // (same session, the tuple's CURRENT epoch, valid application fields —
+    // only the runtime is constructed). The matched control (the frozen
+    // tuple's own runtime) and the unbound-0 control ride every round;
+    // rounds repeat past the ready/arm race. Hook-only main builds carry
+    // this hook WITHOUT the chain — there the foreign receipt is ACCEPTED
+    // under the unnamed arm (the RED); the lane's named arm rejects it.
+    let applied_content_inject_runtimes = std::env::var(
+        "YGGTERM_TEST_INJECT_APPLIED_RUNTIMES",
+    )
+    .ok()
+    .and_then(|value| {
+        let list: Vec<u64> = value
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        (!list.is_empty()).then_some(list)
+    })
+    .map(|list| serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()))
+    .unwrap_or_else(|| "null".to_string());
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -998,12 +1019,15 @@ fn terminal_eval_script_with_canvas_renderer(
         // record means the mount is RUNNING and its bridge events were
         // merely shed, so the gate keeps the warm mount instead of redoing
         // cold into the remount storm.
-        const __yggNoteMountAlive = (stage) => {{
+        const __yggNoteMountAlive = (stage, readyRecord) => {{
             try {{
                 (window.__yggtermMountAlive =
                     window.__yggtermMountAlive || {{}})[hostId] = {{
                     attempt: __yggAttemptStamp,
                     stage,
+                    // [e-r5] the SECOND carrier: the same frozen tuple the
+                    // ready event attests, read by the warm-alive poll leg.
+                    readyRecord: readyRecord || null,
                     pageTs:
                         performance && performance.now
                             ? performance.now()
@@ -11265,6 +11289,19 @@ fn terminal_eval_script_with_canvas_renderer(
                 emitResize();
             }});
         }};
+        // [e-r5] THE FROZEN TUPLE, captured ONCE from the host div at
+        // construction — the one source every carrier attests (the entry
+        // arm, the ready record, the alive record, the resend). The
+        // runtime rides the div's data-terminal-runtime-spawn-id (the
+        // render-side name map); 0 = unnamed, the provisional first-mount
+        // policy (sol s30 Q3 — a seed-arrival re-render never mutates a
+        // frozen tuple; the name engages on the next construction).
+        const __acFrozenTuple = {{
+            session: host.getAttribute("data-terminal-session-path") || "",
+            epoch: Number(host.getAttribute("data-terminal-mount-epoch") || 0),
+            runtime: Number(host.getAttribute("data-terminal-runtime-spawn-id") || 0),
+            gen: Number(window.__yggtermMountAttempt || 0),
+        }};
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
         window.__yggtermXtermHosts[hostId] = {{
             ownerToken: closureOwnerToken,
@@ -11304,12 +11341,7 @@ fn terminal_eval_script_with_canvas_renderer(
             // before this script runs; a remount re-renders the attribute
             // and re-runs this script — one arm per entry generation.
             appliedContentEligible: true,
-            appliedContentTuple: {{
-                session: host.getAttribute("data-terminal-session-path") || "",
-                epoch: Number(host.getAttribute("data-terminal-mount-epoch") || 0),
-                runtime: 0,
-                gen: Number(window.__yggtermMountAttempt || 0),
-            }},
+            appliedContentTuple: __acFrozenTuple,
             appliedContentWithhold: {applied_content_withhold},
             appliedContentForeign: {applied_content_foreign},
                     sessionPath: host.getAttribute("data-terminal-session-path") || "",
@@ -12551,6 +12583,7 @@ fn terminal_eval_script_with_canvas_renderer(
             // B's tuple for A's write; a same-entry supersession change
             // published too).
             const __acReplaceMidwrite = {applied_content_replace_midwrite};
+            const __acInjectRuntimes = {applied_content_inject_runtimes};
             const noteAppliedLive = (wroteLen, issueEntry, issueTuple, issueEligible, issueSupersession) => {{
                 try {{
                     const __acBail = (__reason) => {{
@@ -13768,8 +13801,13 @@ fn terminal_eval_script_with_canvas_renderer(
         emitHostHealth();
         scheduleResizeNudges();
         {constructed_debug}
-        sendTerminalEvent({{ kind: "ready" }});
-        __yggNoteMountAlive("posted");
+        // [e-r5] THE READY RECORD (carrier 1): the constructing entry's
+        // frozen tuple, captured once — the resend and the alive record
+        // carry the SAME values (never a re-read of the DOM or the
+        // current registry: a replaced entry must not be attested under
+        // the original's ready — sol s30 Q1).
+        sendTerminalEvent({{ kind: "ready", record: {{ session: String(__acFrozenTuple.session || ""), epoch: Number(__acFrozenTuple.epoch || 0), runtime: Number(__acFrozenTuple.runtime || 0), gen: Number(__acFrozenTuple.gen || 0) }} }});
+        __yggNoteMountAlive("posted", __acFrozenTuple);
         // [S28-1 RIG ARM] the deterministic live-write driver: rig rows
         // mount through the synthesized path whose content rides seeds —
         // the live write bridge may never issue organically (measured s29
@@ -13796,13 +13834,46 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }}, 0);
         }}
+        // [e-r5 RIG ARM] the naming-chain carrier bar: repeated rounds of
+        // receipt injections through the PRODUCTION applied_content
+        // ingress — FOREIGN runtime(s) from the env, then the matched
+        // control (the frozen tuple's OWN runtime), then the unbound-0
+        // control (S28-2: a named arm must reject it). Rounds repeat past
+        // the ready/arm race; the armed marker is the engagement proof.
+        if (__acInjectRuntimes && !window.__yggtermAcInjectArmed) {{
+            window.__yggtermAcInjectArmed = true;
+            sendTerminalEvent({{ kind: "debug", message: `appliedLive rig inject armed host=${{hostId}} tupleEpoch=${{__acFrozenTuple.epoch}} tupleRuntime=${{__acFrozenTuple.runtime}}` }});
+            let __acInjectRound = 0;
+            const __acInjectTick = () => {{
+                try {{
+                    const __iEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    if (__iEntry && __iEntry.appliedContentTuple) {{
+                        const __iT = __iEntry.appliedContentTuple;
+                        for (const __f of __acInjectRuntimes) {{
+                            sendTerminalEvent({{ kind: "applied_content", session: String(__iT.session || ""), epoch: Number(__iT.epoch || 0), runtime: Number(__f), wrote: 32, blank: false, ts: Date.now(), page_gen: Number(__iT.gen || 0) }});
+                        }}
+                        sendTerminalEvent({{ kind: "applied_content", session: String(__iT.session || ""), epoch: Number(__iT.epoch || 0), runtime: Number(__iT.runtime || 0), wrote: 32, blank: false, ts: Date.now(), page_gen: Number(__iT.gen || 0) }});
+                        sendTerminalEvent({{ kind: "applied_content", session: String(__iT.session || ""), epoch: Number(__iT.epoch || 0), runtime: 0, wrote: 32, blank: false, ts: Date.now(), page_gen: Number(__iT.gen || 0) }});
+                    }}
+                    __acInjectRound += 1;
+                    if (__acInjectRound < 12) {{
+                        setTimeout(__acInjectTick, 700);
+                    }}
+                }} catch (__iError) {{
+                    sendTerminalEvent({{ kind: "debug", message: `appliedLive rig inject error=${{String(__iError)}} host=${{hostId}}` }});
+                }}
+            }};
+            setTimeout(__acInjectTick, 700);
+        }}
         // [11.178]-c2 RE-REQUEST ARM. A "posted" mount whose ready event was
         // shed in the IPC window never reaches Rust; the gate's liveness
         // poll re-calls this to re-post ready until one lands. Rust's
         // js_ready duplicate guard makes the re-send idempotent.
         window.__yggtermMountResend = (h) => {{
             if (h === hostId) {{
-                sendTerminalEvent({{ kind: "ready" }});
+                // [e-r5] carrier 3: the RESEND re-posts the SAME frozen
+                // record — idempotent on the js_ready duplicate guard.
+                sendTerminalEvent({{ kind: "ready", record: {{ session: String(__acFrozenTuple.session || ""), epoch: Number(__acFrozenTuple.epoch || 0), runtime: Number(__acFrozenTuple.runtime || 0), gen: Number(__acFrozenTuple.gen || 0) }} }});
             }}
         }};
         while (true) {{

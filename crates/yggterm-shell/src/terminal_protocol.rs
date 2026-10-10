@@ -84,9 +84,57 @@ pub(crate) enum TerminalJsCommand {
     },
 }
 
+/// [e-r5] The frozen tuple one ready record carries — the SAME values
+/// through all three carriers (the bridge ready event, the alive-poll
+/// record, the page's resend), captured ONCE from the CONSTRUCTING
+/// entry's frozen tuple. Never re-read from the DOM or a current
+/// registry entry at resend/poll time (sol s30 Q1: one record, no second
+/// spelling).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TerminalReadyRecord {
+    pub(crate) session: String,
+    pub(crate) epoch: u64,
+    pub(crate) runtime: u64,
+    pub(crate) page_gen: u64,
+}
+
+/// [e-r5] The three-state classification of a ready record before it may
+/// win the js_ready duplicate guard. Control = payload-free (the
+/// asset-failure path has no constructed entry to attest). Named carries
+/// the page-frozen runtime (0 = explicitly unnamed — valid, the
+/// provisional first-mount policy). Malformed (a session or epoch that is
+/// not THIS mount's) must never silently win the guard — it would swallow
+/// the well-formed resend and the name would never engage (sol s30 Q1).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReadyRecordVerdict {
+    Control,
+    Named(u64),
+    Malformed,
+}
+
+pub(crate) fn classify_ready_record(
+    record: Option<&TerminalReadyRecord>,
+    expected_session: &str,
+    expected_epoch: u64,
+) -> ReadyRecordVerdict {
+    match record {
+        None => ReadyRecordVerdict::Control,
+        Some(record)
+            if record.session == expected_session && record.epoch == expected_epoch =>
+        {
+            ReadyRecordVerdict::Named(record.runtime)
+        }
+        Some(_) => ReadyRecordVerdict::Malformed,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum TerminalJsEvent {
-    Ready,
+    /// [e-r5] `record: None` = the CONTROL path (asset failure — no
+    /// constructed entry to attest a frozen tuple).
+    Ready {
+        record: Option<TerminalReadyRecord>,
+    },
     HostHealth {
         cursor_line_text: String,
         text_tail: String,
@@ -444,9 +492,23 @@ fn unknown_gesture_age_ms() -> i64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct TerminalReadyRecordWire {
+    session: String,
+    epoch: u64,
+    runtime: u64,
+    /// The page sends `gen` (the mount attempt); `gen` is a reserved
+    /// keyword in this edition, so the field is page_gen on the Rust side.
+    #[serde(rename = "gen")]
+    page_gen: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum TerminalJsEventWire {
-    Ready,
+    Ready {
+        #[serde(default)]
+        record: Option<TerminalReadyRecordWire>,
+    },
     HostHealth {
         cursor_line_text: String,
         text_tail: String,
@@ -725,7 +787,19 @@ pub fn parse_terminal_js_event_for_test(value: serde_json::Value) -> TerminalJsE
 impl From<TerminalJsEventWire> for TerminalJsEvent {
     fn from(value: TerminalJsEventWire) -> Self {
         match value {
-            TerminalJsEventWire::Ready => TerminalJsEvent::Ready,
+            TerminalJsEventWire::Ready { record } => TerminalJsEvent::Ready {
+                // [e-r5] A PARTIAL record (some fields missing or
+                // wrong-typed) fails the inner struct's deserialization,
+                // erroring the WHOLE event — loud, traced at the bridge,
+                // and never a silent guard win. Only the complete record
+                // or the deliberate payload-free control path parses.
+                record: record.map(|record| TerminalReadyRecord {
+                    session: record.session,
+                    epoch: record.epoch,
+                    runtime: record.runtime,
+                    page_gen: record.page_gen,
+                }),
+            },
             TerminalJsEventWire::HostHealth {
                 cursor_line_text,
                 text_tail,

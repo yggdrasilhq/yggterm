@@ -3966,6 +3966,18 @@ fn TerminalCanvas(
     // cannot be cleared from outside the component — the epoch-in-identity
     // mechanism is what lets an external watchdog re-arm a dead loop).
     let watchdog_remount_epoch = state.with(|shell| shell.terminal_watchdog_remount_epoch(&session_path));
+    // [e-r5] The runtime NAME the div attr freezes — the render cache fed
+    // by the stream/seed adoption seams (0 = unnamed, the provisional
+    // first-mount policy). [e-r5 RIG ARM] the naming bar's deterministic
+    // seed: the hook names the RENDER KNOWLEDGE directly (sol s30 Q4 — a
+    // hook may seed the render input; it must never arm Rust or patch the
+    // page tuple, those are the production links under test).
+    let runtime_spawn_id = std::env::var("YGGTERM_TEST_SEED_RENDER_RUNTIME_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            state.with(|shell| shell.terminal_runtime_spawn_id_for(&session_path))
+        });
     let bootstrap_identity =
         format!("{mount_identity}:{current_bootstrap_generation}:{bootstrap_activation_epoch}:wr{watchdog_remount_epoch}");
     if *last_bootstrap_identity.borrow() != mount_identity {
@@ -6961,6 +6973,22 @@ fn TerminalCanvas(
             // replaced the runtime underneath the mount; `0` = unknown (an
             // older daemon not sending the field) and never triggers.
             let mut known_runtime_spawn_id = 0u64;
+            // [e-r5] The runtime NAME the page froze in this mount's entry
+            // tuple — learned from the ready record (both js_ready legs),
+            // compared at the stream seam for the retirement decision
+            // (sol s30 Q2: a frozen name the answers contradict retires
+            // the generation; an unnamed mount never retires on naming).
+            let mut page_frozen_runtime = 0u64;
+            // [e-r5 RIG GATE] the naming bar's (a) phase isolates the
+            // CARRIER+PREDICATE with a synthetic seeded name — which the
+            // real daemon answers legitimately contradict, so the
+            // retirement would kill the mount (and the injection ticks
+            // with it) mid-bar. The retirement machinery earns its OWN
+            // end-to-end bar (sol s30 Q4's additional arm), not this one.
+            let named_remount_disabled_for_test =
+                std::env::var("YGGTERM_TEST_DISABLE_NAMED_REMOUNT")
+                    .map(|value| value == "1")
+                    .unwrap_or(false);
             let mut read_poll_ms = if is_remote_resume_session {
                 TERMINAL_REMOTE_RESUME_READ_POLL_MS
             } else {
@@ -8094,7 +8122,7 @@ fn TerminalCanvas(
                             &session_path,
                         );
                         match event {
-                            Ok(TerminalJsEvent::Ready) => {
+                            Ok(TerminalJsEvent::Ready { record }) => {
                                 if js_ready {
                                     append_trace_event(
                                         &trace_home,
@@ -8108,7 +8136,39 @@ fn TerminalCanvas(
                                     );
                                     continue;
                                 }
+                                // [e-r5] THE READY RECORD: classify the
+                                // page's attestation before it may win the
+                                // duplicate guard. CONTROL (payload-free —
+                                // the asset-failure path has no constructed
+                                // entry to attest) completes unnamed;
+                                // MALFORMED (a session/epoch that is not
+                                // THIS mount's) never wins the guard — it
+                                // would swallow the well-formed resend and
+                                // the name would never engage (sol s30 Q1).
+                                let bridge_frozen_runtime = match classify_ready_record(
+                                    record.as_ref(),
+                                    &session_path,
+                                    mount_epoch,
+                                ) {
+                                    ReadyRecordVerdict::Control => 0,
+                                    ReadyRecordVerdict::Named(runtime) => runtime,
+                                    ReadyRecordVerdict::Malformed => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "js_ready_malformed_record",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "host_id": host_id.clone(),
+                                                "record": format!("{record:?}"),
+                                            }),
+                                        );
+                                        continue;
+                                    }
+                                };
                                 js_ready = true;
+                                page_frozen_runtime = bridge_frozen_runtime;
                                 // [11.217] The Ready init is factored so the
                                 // bridge event and the warm-eval alive-poll
                                 // proof run the SAME completion — a second
@@ -8118,6 +8178,7 @@ fn TerminalCanvas(
                                     state,
                                     &session_path,
                                     mount_epoch,
+                                    bridge_frozen_runtime,
                                     &host_id,
                                     &title,
                                     &theme,
@@ -12487,13 +12548,67 @@ fn TerminalCanvas(
                             .and_then(|r| r.get("stage"))
                             .and_then(|stage| stage.as_str())
                             == Some("posted");
-                        if matched && alive_stage_posted && !js_ready {
+                        // [e-r5] carrier 2: the alive record's readyRecord
+                        // carries the same frozen tuple the ready event
+                        // attests. A malformed record never wins the guard —
+                        // the gate keeps polling and the page's resend keeps
+                        // re-posting the well-formed record (sol s30 Q1).
+                        let alive_frozen_runtime = if matched && alive_stage_posted {
+                            match alive_ready_record_from_json(
+                                record.and_then(|r| r.get("readyRecord")),
+                            ) {
+                                AliveReadyRecord::Absent => Some(0),
+                                AliveReadyRecord::Ready(ready) => {
+                                    match classify_ready_record(
+                                        Some(&ready),
+                                        &session_path,
+                                        mount_epoch,
+                                    ) {
+                                        ReadyRecordVerdict::Named(runtime) => Some(runtime),
+                                        ReadyRecordVerdict::Control => Some(0),
+                                        ReadyRecordVerdict::Malformed => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "warm_alive_malformed_record",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "host_id": host_id.clone(),
+                                                    "record": format!("{ready:?}"),
+                                                }),
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                AliveReadyRecord::Malformed => {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "warm_alive_malformed_record",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "host_id": host_id.clone(),
+                                        }),
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            Some(0)
+                        };
+                        if matched && alive_stage_posted && !js_ready && alive_frozen_runtime.is_some() {
                             js_ready = true;
+                            let alive_ready_runtime = alive_frozen_runtime.unwrap_or(0);
+                            page_frozen_runtime = alive_ready_runtime;
                             terminal_stage_js_ready(
                                 &eval,
                                 state,
                                 &session_path,
                                 mount_epoch,
+                                alive_ready_runtime,
                                 &host_id,
                                 &title,
                                 &theme,
@@ -12685,6 +12800,24 @@ fn TerminalCanvas(
                                 .await;
                             }
                         } else {
+                        // [e-r5] Identity adoption is INDEPENDENT of
+                        // coverage: a qualified seed answer names the
+                        // incarnation even at seq 0 (sol s30 Q2 — the old
+                        // adoption lived inside the seq>0 branch, so a
+                        // valid empty/zero-sequence answer never named the
+                        // map). The runtime qualification above fences
+                        // stale seeds; loop order fences recency.
+                        if synth_seed_runtime != 0 {
+                            let _ = safe_shell_mut(
+                                state,
+                                "note_runtime_spawn_id_seed",
+                                |shell| shell
+                                    .note_terminal_runtime_spawn_id(
+                                        &session_path,
+                                        synth_seed_runtime,
+                                    ),
+                            );
+                        }
                         let seed_bytes = synth_seed_text.len();
                         // [F1-(e-r1)-R1] THE STAMP IS PROVISIONAL: the
                         // answer carries the daemon seq the seeded screen
@@ -13896,6 +14029,78 @@ fn TerminalCanvas(
                                     synth_seed_stamp = 0;
                                     synth_pending_seed_seq = 0;
                                     synth_pending_seed_runtime = 0;
+                                }
+                                // [e-r5] THE NAME-MISMATCH RETIREMENT (sol
+                                // s30 Q2): the two-known-id edge trigger
+                                // above misses the first-answer-vs-frozen-
+                                // name case (known starts 0; a nonzero
+                                // frozen name came from the previous
+                                // generation's render). A frozen name the
+                                // answer contradicts retires the
+                                // generation: adopt the new name FIRST
+                                // (the fresh render freezes it), then
+                                // break with the remount armed — a fresh
+                                // entry re-freezes, re-readies, re-arms;
+                                // the S28-2 prev-tuple cleanup retires the
+                                // stored evidence; the old JS issuer dies
+                                // with the registry replacement; and
+                                // undelivered bytes re-feed through the
+                                // retained/replay path. Without this, the
+                                // surviving frozen tuple would mislabel
+                                // the new runtime's bytes under the old
+                                // name and REJECT its true seed receipts.
+                                if !named_remount_disabled_for_test
+                                    && runtime_name_requires_remount(
+                                        known_runtime_spawn_id,
+                                        runtime_spawn_id,
+                                        page_frozen_runtime,
+                                    )
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "terminal_runtime_named_remount",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "known_runtime_spawn_id": known_runtime_spawn_id,
+                                            "answer_runtime_spawn_id": runtime_spawn_id,
+                                            "page_frozen_runtime": page_frozen_runtime,
+                                            "cursor": cursor,
+                                            "next_cursor": next_cursor,
+                                        }),
+                                    );
+                                    if runtime_spawn_id != 0 {
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "note_runtime_spawn_id_remount",
+                                            |shell| shell
+                                                .note_terminal_runtime_spawn_id(
+                                                    &session_path,
+                                                    runtime_spawn_id,
+                                                ),
+                                        );
+                                    }
+                                    mount_task_guard.arm_remount.set(true);
+                                    break;
+                                }
+                                // [e-r5] Identity adoption: every ANSWERED
+                                // nonzero runtime names the map — the
+                                // render cache the next generation's div
+                                // attr freezes from. Stream answers are the
+                                // most-current authority (loop order =
+                                // recency); the seed seam's runtime
+                                // qualification fences stale seeds.
+                                if runtime_spawn_id != 0 {
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "note_runtime_spawn_id",
+                                        |shell| shell
+                                            .note_terminal_runtime_spawn_id(
+                                                &session_path,
+                                                runtime_spawn_id,
+                                            ),
+                                    );
                                 }
                                 known_runtime_spawn_id = runtime_spawn_id;
                                 // [11.167] A runtime START under this watch is a
@@ -17479,6 +17684,7 @@ fn TerminalCanvas(
                         "false"
                     },
                     "data-terminal-mount-epoch": "{mount_epoch}",
+                    "data-terminal-runtime-spawn-id": "{runtime_spawn_id}",
                     "data-terminal-resume-overlay-visible": "false",
                     "data-terminal-resume-overlay-text": "",
                     "data-terminal-resume-overlay-excerpt": "",
@@ -23218,6 +23424,7 @@ fn terminal_stage_js_ready(
     state: Signal<ShellState>,
     session_path: &str,
     mount_epoch: u64,
+    page_frozen_runtime: u64,
     host_id: &str,
     title: &str,
     theme: &TerminalTheme,
@@ -23253,7 +23460,12 @@ fn terminal_stage_js_ready(
     // (measured s26 — the first write bailed not_eligible and a
     // single-batch mount never minted a receipt).
     let _ = safe_shell_mut(state, "terminal_applied_content_armed", |shell| {
-        shell.arm_terminal_applied_content(session_path, mount_epoch, 0);
+        // [e-r5] The arm binds EXACTLY what the page froze — the ready
+        // record's runtime, not a parallel Rust derivation (one source,
+        // zero render/arm divergence). 0 = unnamed (the provisional
+        // first-mount policy; the S28-2 predicate engages the moment a
+        // generation freezes a real name).
+        shell.arm_terminal_applied_content(session_path, mount_epoch, page_frozen_runtime);
     });
     append_trace_event(
         trace_home,
@@ -23263,6 +23475,11 @@ fn terminal_stage_js_ready(
         json!({
             "session_path": session_path,
             "epoch": mount_epoch,
+            // [e-r5] the STORED expectation's runtime — a trace must
+            // report the value actually stored (sol s30 Q4) — plus the
+            // correlation fields the rig bars read.
+            "runtime": page_frozen_runtime,
+            "host_id": host_id,
         }),
     );
     let _ = eval.send(terminal_reset_command(title, theme));
@@ -24139,6 +24356,57 @@ fn test_forced_terminal_read_error(session_path: &str) -> Option<anyhow::Error> 
 
 fn terminal_stream_runtime_replaced(known_spawn_id: u64, answer_spawn_id: u64) -> bool {
     known_spawn_id != 0 && answer_spawn_id != 0 && answer_spawn_id != known_spawn_id
+}
+
+/// [e-r5] Does the answered runtime demand a fresh entry generation? Two
+/// shapes: the two-known-id replacement (above), and the frozen-NAME
+/// mismatch — the page froze a nonzero name (from the previous
+/// generation's render) and the answer names a different incarnation
+/// (sol s30 Q2: the edge trigger alone misses this — `known` starts 0).
+/// An UNNAMED frozen tuple (0 — the provisional first-mount policy) never
+/// demands a remount: learning a name is not a replacement.
+fn runtime_name_requires_remount(
+    known_spawn_id: u64,
+    answer_spawn_id: u64,
+    frozen_spawn_id: u64,
+) -> bool {
+    terminal_stream_runtime_replaced(known_spawn_id, answer_spawn_id)
+        || (frozen_spawn_id != 0
+            && answer_spawn_id != 0
+            && answer_spawn_id != frozen_spawn_id)
+}
+
+/// [e-r5] The alive record's readyRecord, parsed from the poll answer's
+/// JSON: Absent (null — the record was noted before the ready tuple
+/// existed, or a control path), Ready (all four fields present and
+/// typed), Malformed (present but partial or wrong-typed — must never
+/// silently win the js_ready guard).
+#[derive(Debug, Clone)]
+enum AliveReadyRecord {
+    Absent,
+    Ready(TerminalReadyRecord),
+    Malformed,
+}
+
+fn alive_ready_record_from_json(value: Option<&serde_json::Value>) -> AliveReadyRecord {
+    let Some(value) = value else {
+        return AliveReadyRecord::Absent;
+    };
+    if value.is_null() {
+        return AliveReadyRecord::Absent;
+    }
+    let parse = || -> Option<TerminalReadyRecord> {
+        Some(TerminalReadyRecord {
+            session: value.get("session")?.as_str()?.to_string(),
+            epoch: value.get("epoch")?.as_u64()?,
+            runtime: value.get("runtime")?.as_u64()?,
+            page_gen: value.get("gen")?.as_u64()?,
+        })
+    };
+    match parse() {
+        Some(record) => AliveReadyRecord::Ready(record),
+        None => AliveReadyRecord::Malformed,
+    }
 }
 fn notification_delivery_mode(settings: &AppSettings) -> NotificationDeliveryMode {
     match (settings.in_app_notifications, settings.system_notifications) {
