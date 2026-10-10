@@ -499,20 +499,73 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   error, a_partial_alive_ready_record_is_malformed_not_control,
   a_frozen_name_the_answer_contradicts_demands_a_fresh_generation,
   the_runtime_name_map_renders_what_the_answers_named,
-  the_naming_chain_sources_are_locked. STILL OPEN (the (e-r5)
-  residue): the (b) end-to-end arm — a matched receipt from an ACTUAL
-  current-entry write callback (the provenance-probe class combined
-  with naming), and the same-epoch runtime-replacement arm (establish
-  R, daemon swaps to F, verify the retirement chain end-to-end: old
-  qualification retired, fresh generation armed on F, late R evidence
-  rejected, current F accepted with visible content) — the retirement
-  machinery is construction-locked (the predicate unit locks + the
-  terminal_runtime_named_remount trace detector) but has NO rig bar
-  yet; then sol Q1's stale-caller credit (claims carry no originating
-  attempt identity); the wedge-1 re-attest scheduling (unchanged);
-  page_gen comparison (stored, never compared — the seed path records
-  page_gen 0 by convention, naming it needs the seed proof to carry
-  the page gen); wedge 2 (snapshot missing-vs-empty) untouched.
+  the_naming_chain_sources_are_locked. (e-r5-residue) THE TWO
+  END-TO-END BARS CLOSED IN CODE + RIG-PROVEN 2026-10-10 (sitting 31,
+  zcode seat, lane lane/e5/residue-arms; sol round
+  lores/chain-of-thought/2026-10-10-yggterm-s31-residue-arms-sol.md):
+  fence-rig MODE=swap (GREEN ×2, rc 0 exe-proofed). THE CHAIN VERDICT:
+  gen 1 armed on the ONE-SHOT seeded name (77) → exactly ONE
+  terminal_runtime_named_remount trace (the daemon's real µs-scale
+  answer contradicting frozen 77) → gen 2 armed on the ADOPTED
+  daemon-derived name (applied_content_armed runtime=F) → the
+  late-evidence negatives at the RECORD boundary: retired-R receipt
+  REJECTED, matched-F receipt accepted, unbound-0 REJECTED (S28-2) →
+  the organic seed_proof receipt on F accepted → visible content.
+  THE WRITE VERDICT (the (b) arm): a real flushPendingWrite driven
+  against gen 1's cold entry — the S28-1 probe's DRIVE half split from
+  the entry replacement (YGGTERM_TEST_DRIVE_REAL_FLUSH, ticker-retried
+  eligibility, fired-marker engagement proof) — minted its receipt
+  through the PRODUCTION write callback between the driver marker and
+  the retirement line: runtime = the ARM'S STORED expectation, epoch
+  matched, accepted=true, promoted=false (nothing parked — the honest
+  accepted-with-nothing-parked state). ENABLING HOOKS (test-gated):
+  the ONE-SHOT render seed (SEED_RENDER_RUNTIME_ID applies only while
+  the naming map is unnamed for the session — a STATIC seed
+  contradicts every real answer and the retirement churns generations
+  forever, the reason s30's (a) bar gated the remount off; lock
+  the_render_seed_is_one_shot_against_the_naming_map),
+  the flush-driver split, and
+  YGGTERM_TEST_SWAP_RETIRE_NEGATIVES (the Rust-side late-negative
+  burst straight to record_terminal_applied_content — wrote=34,
+  source=swap_late_negative; lock
+  the_swap_scaffolding_gates_on_the_adopted_generation). Regressions
+  green on the same build: MODE=naming (a), naming WARM (carrier 2),
+  MODE=provenance. MEASURED FINDING THAT OUTLIVES THE BARS (the F1
+  dead-IPC-leg family, new arm — run 1 raw trace
+  /tmp/f1e2-swap-1791624839/event-trace.jsonl lines 148-245): the
+  post-retirement generation mounts WARM (the mount fn re-invoked
+  against the SURVIVING host: mount_eval_warm → alive-record poll →
+  js_ready source=warm_alive_posted → armed on F) and its page→Rust
+  bridge events are DEAD — ZERO page events post-remount (no js_debug
+  construction markers, no page-injected receipts) while the alive
+  record (carrier 2, the EVAL-RETURN leg) and the Rust-minted seed
+  receipt still land. The mount fn's captured send (the
+  sendTerminalEvent closure captured when the cold eval installed the
+  fn) died with the cold eval's receiver — every warm invocation
+  re-runs the body through a dead send. The naming chain's RECEIPT leg
+  is therefore transport-blocked on warm remounts: post-swap
+  generations can only receipt through the Rust-minted seed path.
+  FILED as (e-r6) below. STILL OPEN (the re-scoped residue): (e-r6)
+  the warm-remount receipt transport (a receipt leg that survives the
+  captured-send death — candidate lines: routing the write-callback
+  receipt over the eval-return channel the liveness poll already
+  rides; re-capturing the send per warm invocation; accepting the
+  seed path as the sole post-swap receipt source and hardening the
+  retained/replay re-feed instead — sol s31 Q2 ranks these); sol Q1's
+  stale-caller credit (claims carry no originating attempt identity);
+  the wedge-1 re-attest scheduling (unchanged); page_gen comparison
+  (stored, never compared — the seed path records page_gen 0 by
+  convention, naming it needs the seed proof to carry the page gen);
+  wedge 2 (snapshot missing-vs-empty) untouched.
+  (e-r6) THE WARM-REMOUNT RECEIPT TRANSPORT — OPEN 2026-10-10 (filed
+  by sitting 31 from the MODE=swap run-1 measurement): the naming
+  chain's page-side receipt leg dies with the cold eval's captured
+  send on every warm remount (the runtime-swap recovery path!), so
+  post-swap live-write receipts never reach the validator — the
+  applied-content evidence for a swapped-in runtime rides the seed
+  path alone. Attack: per sol s31 Q2's ranking (consult node); the
+  rig bar is MODE=swap's WRITE verdict extended to the post-retirement
+  generation once a transport lands.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
