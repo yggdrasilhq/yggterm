@@ -1007,10 +1007,16 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{
                 const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation",
                     bridge: __yggInvocationBridge === undefined ? "undef" : (__yggInvocationBridge === null ? "null" : ((typeof __yggInvocationBridge.send === "function" && typeof __yggInvocationBridge.recv === "function") ? "valid" : "invalid")),
+                    bridge_request_id: (__yggInvocationBridge && __yggInvocationBridge.request_id !== undefined) ? __yggInvocationBridge.request_id : null,
                     lexical: (typeof dioxus !== "undefined") ? "present" : "absent" }};
                 window.__yggProbeMailbox = window.__yggProbeMailbox || [];
                 window.__yggProbeMailbox.push(__tpTag);
-                sendTerminalEvent({{ kind: "debug", message: `transport-probe invocation attempt=${{__tpTag.attempt}} ts=${{__tpTag.ts}}` }});
+                try {{
+                    sendTerminalEvent({{ kind: "debug", message: `transport-probe invocation attempt=${{__tpTag.attempt}} ts=${{__tpTag.ts}}` }});
+                    window.__yggProbeMailbox.push({{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "invocation-send-returned" }});
+                }} catch (__tpSendError) {{
+                    window.__yggProbeMailbox.push({{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "invocation-send-threw", err: String(__tpSendError && __tpSendError.message || __tpSendError) }});
+                }}
             }} catch (__tpError) {{}}
         }}
         // [F1-input] THE INPUT DUAL-LEG. The dioxus.send leg dies with the
@@ -13986,6 +13992,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 sendTerminalEvent({{ kind: "ready", record: {{ session: String(__acFrozenTuple.session || ""), epoch: Number(__acFrozenTuple.epoch || 0), runtime: Number(__acFrozenTuple.runtime || 0), gen: Number(__acFrozenTuple.gen || 0) }} }});
             }}
         }};
+        if ({mount_transport_probe}) {{
+            try {{
+                window.__yggProbeMailbox = window.__yggProbeMailbox || [];
+                window.__yggProbeMailbox.push({{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "pump-start" }});
+            }} catch (_pumpProbeError) {{}}
+        }}
         while (true) {{
             const message = await recvTerminalCommand();
             if (!message) {{

@@ -24512,6 +24512,42 @@ async fn fire_transport_mailbox_probe(
     .await
     .ok()
     .and_then(|value| value.as_str().map(str::to_string));
+    // [e-r6 s32, sol Q1-alt-1] WRONG-IDENTITY DISCRIMINATION: dump the
+    // live page-side channel table, then DIRECT-SEND a debug probe into
+    // the WARM invocation's bridge request_id from a FRESH eval. If the
+    // direct send lands as a js_debug, the id routes to a live receiver
+    // (timing/lifetime question); if it vanishes, the id is dead on the
+    // Rust side (wrong-handle or removed-entry question); if getQuery
+    // errors, the page slot itself was closed/cleared.
+    let queues = document::eval(
+        "return JSON.stringify((window.__msg_queues || []).map((c, i) => ({ id: i, present: !!(c && c.request_id !== undefined), request_id: c ? c.request_id : null })));",
+    )
+    .await
+    .ok()
+    .and_then(|value| value.as_str().map(str::to_string));
+    let warm_id = mailbox
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| {
+            value.as_array().and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.get("tag").and_then(|t| t.as_str()) == Some("mount-fn-invocation"))
+                    .cloned()
+            })
+        })
+        .and_then(|last| last.get("bridge_request_id").cloned())
+        .and_then(|id| id.as_i64());
+    let direct_send = match warm_id {
+        Some(id) => document::eval(&format!(
+            "try {{ window.getQuery({id}).send({{ kind: \"debug\", message: \"warm-id-direct-send id={id}\" }}); return \"sent\"; }} catch (__e) {{ return \"err:\" + String(__e && __e.message || __e); }}"
+        ))
+        .await
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string)),
+        None => None,
+    };
     append_trace_event(
         trace_home,
         "ui",
@@ -24520,6 +24556,9 @@ async fn fire_transport_mailbox_probe(
         json!({
             "session_path": session_path,
             "mailbox": mailbox,
+            "queues": queues,
+            "warm_id": warm_id,
+            "direct_send": direct_send,
         }),
     );
 }
