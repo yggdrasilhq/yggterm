@@ -14081,7 +14081,9 @@ fn TerminalCanvas(
                                             "next_cursor": next_cursor,
                                         }),
                                     );
-                                    if runtime_spawn_id != 0 {
+                                    if runtime_spawn_id != 0
+                                        && !retire_adoption_suppressed_for_test()
+                                    {
                                         let _ = safe_shell_mut(
                                             state,
                                             "note_runtime_spawn_id_remount",
@@ -14145,7 +14147,26 @@ fn TerminalCanvas(
                                         mount_epoch,
                                         page_frozen_runtime,
                                     );
-                                }                                // [11.167] A runtime START under this watch is a
+                                }
+                                // [e-r6 RIG ARM] the mailbox half of the
+                                // differential transport probe: read the
+                                // page mailbox over a FRESH eval return
+                                // (the leg measured alive) once the stable
+                                // post-retirement state holds, and trace
+                                // it — the rig compares the mailbox's
+                                // recorded invocations against the bridge
+                                // events that actually landed.
+                                if transport_probe_due(
+                                    page_frozen_runtime,
+                                    known_runtime_spawn_id,
+                                ) {
+                                    fire_transport_mailbox_probe(
+                                        &trace_home,
+                                        &session_path,
+                                    )
+                                    .await;
+                                }
+                                // [11.167] A runtime START under this watch is a
                                 // replacement: the child the watch accumulated its
                                 // hard-fail evidence against is gone. Re-arm the
                                 // escalation budget so a force_remote restart must
@@ -24452,6 +24473,69 @@ fn swap_late_negatives_due(frozen_spawn_id: u64, known_spawn_id: u64) -> bool {
 /// unbound 0 (S28-2). Each outcome traces in the applied_content_promoted
 /// family with source=swap_late_negative and wrote=34 so the rig can
 /// attribute the burst unambiguously.
+/// [e-r6 RIG ARM] one-shot latch for the differential transport probe's
+/// mailbox read — one per PROCESS, fired from the stable post-retirement
+/// state (same gate shape as the swap negatives).
+static TRANSPORT_PROBE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Gate: env-armed (YGGTERM_TEST_TRANSPORT_PROBE=1 — the same env that
+/// arms the page-side per-invocation tag), not yet fired, stable
+/// post-retirement state (a nonzero frozen name the answers corroborate).
+fn transport_probe_due(frozen_spawn_id: u64, known_spawn_id: u64) -> bool {
+    if TRANSPORT_PROBE_FIRED.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    if std::env::var("YGGTERM_TEST_TRANSPORT_PROBE")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        frozen_spawn_id != 0
+            && known_spawn_id != 0
+            && frozen_spawn_id == known_spawn_id
+    } else {
+        false
+    }
+}
+
+/// Read the page mailbox over a FRESH eval return and trace it — the
+/// eval-return leg is the control channel; the rig diffs the mailbox's
+/// recorded invocations against the bridge events that landed.
+async fn fire_transport_mailbox_probe(
+    trace_home: &std::path::Path,
+    session_path: &str,
+) {
+    TRANSPORT_PROBE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mailbox = document::eval(
+        "return JSON.stringify(window.__yggProbeMailbox || null);",
+    )
+    .await
+    .ok()
+    .and_then(|value| value.as_str().map(str::to_string));
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_mount",
+        "transport_probe_mailbox",
+        json!({
+            "session_path": session_path,
+            "mailbox": mailbox,
+        }),
+    );
+}
+
+/// [e-r6 RIG ARM] sol s31 Q3's adoption-provenance control: gate ONLY the
+/// retirement branch's map adoption — with it suppressed, the retirement
+/// still fires but nothing writes the adopted name, so the next
+/// generation re-freezes the one-shot seed and the seam CHURNS. A gen 2
+/// armed on the daemon name DESPITE the suppression would prove another
+/// map writer exists (the s31 bar's provenance vacuity).
+fn retire_adoption_suppressed_for_test() -> bool {
+    std::env::var("YGGTERM_TEST_SUPPRESS_RETIRE_ADOPTION")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 fn fire_swap_late_negatives(
     state: Signal<ShellState>,
     trace_home: &std::path::Path,

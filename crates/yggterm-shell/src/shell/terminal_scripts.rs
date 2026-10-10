@@ -861,6 +861,18 @@ fn terminal_eval_script_with_canvas_renderer(
         std::env::var("YGGTERM_TEST_DRIVE_REAL_FLUSH")
             .map(|value| value == "1")
             .unwrap_or(false);
+    // [e-r6 RIG ARM] the differential transport probe (sol s31 Q2 rank 1):
+    // per mount-fn invocation, tag the page mailbox (read back over the
+    // EVAL-RETURN leg by the Rust probe at the stable post-retirement
+    // state) AND send the same tag over the CAPTURED bridge channel. Cold
+    // invocations' tags should land both ways; a warm (post-remount)
+    // invocation's tag present in the mailbox but ABSENT from the bridge
+    // = stale addressing (the captured receiver died with the cold eval),
+    // not general IPC shedding.
+    let mount_transport_probe =
+        std::env::var("YGGTERM_TEST_TRANSPORT_PROBE")
+            .map(|value| value == "1")
+            .unwrap_or(false);
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -964,6 +976,20 @@ fn terminal_eval_script_with_canvas_renderer(
                 terminalDioxusSend(payload);
             }}
         }};
+        // [e-r6 RIG ARM] the differential transport probe: EVERY
+        // invocation (cold install AND every warm re-invocation) records
+        // itself in the page mailbox — which the Rust probe reads over a
+        // FRESH eval return, a leg measured alive — and sends the same
+        // tag over this closure's CAPTURED channel. The differential
+        // between the two legs IS the measurement.
+        if ({mount_transport_probe}) {{
+            try {{
+                const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation" }};
+                window.__yggProbeMailbox = window.__yggProbeMailbox || [];
+                window.__yggProbeMailbox.push(__tpTag);
+                sendTerminalEvent({{ kind: "debug", message: `transport-probe invocation attempt=${{__tpTag.attempt}} ts=${{__tpTag.ts}}` }});
+            }} catch (__tpError) {{}}
+        }}
         // [F1-input] THE INPUT DUAL-LEG. The dioxus.send leg dies with the
         // mount eval's captured bindings under spawn churn; a synthesized
         // mount's keystrokes would be lost. EVERY input chunk is ALSO

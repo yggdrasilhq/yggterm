@@ -445,14 +445,30 @@ fi
 if [ "$MODE" = swap ]; then
   SSPCRATCH=/tmp/f1e2-swap-$(date +%s)
   mkdir -p "$SSPCRATCH"
-  YGGTERM_TEST_SEED_RENDER_RUNTIME_ID=77 YGGTERM_TEST_DRIVE_REAL_FLUSH=1 YGGTERM_TEST_SWAP_RETIRE_NEGATIVES=77 run_boot "$SSPCRATCH" 0
+  SWAP_ENV="YGGTERM_TEST_SEED_RENDER_RUNTIME_ID=77 YGGTERM_TEST_DRIVE_REAL_FLUSH=1 YGGTERM_TEST_SWAP_RETIRE_NEGATIVES=77"
+  # [e-r6] FENCE_RIG_TRANSPORT_PROBE=1 adds the differential transport
+  # probe (mailbox + captured-channel tags); FENCE_RIG_ADOPTION_CONTROL=1
+  # runs sol s31 Q3's control (suppress ONLY the retirement adoption and
+  # expect the churn, not the adopted-name generation).
+  if [ "${FENCE_RIG_TRANSPORT_PROBE:-0}" = "1" ]; then
+    SWAP_ENV="$SWAP_ENV YGGTERM_TEST_TRANSPORT_PROBE=1"
+  fi
+  if [ "${FENCE_RIG_ADOPTION_CONTROL:-0}" = "1" ]; then
+    SWAP_ENV="$SWAP_ENV YGGTERM_TEST_SUPPRESS_RETIRE_ADOPTION=1"
+  fi
+  # NB: run_boot is a shell FUNCTION — an `env` prefix cannot invoke it
+  # (the assignments must be exported, not prefixed).
+  export $SWAP_ENV
+  run_boot "$SSPCRATCH" 0
   SGUI=$!
   SREADY=$(boot_wait_ready); echo "swap daemon ready=$SREADY"; sleep 8
-  SSPCRATCH=$SSPCRATCH FENCE_RIG_SWAP_ARM=${FENCE_RIG_SWAP_ARM:-both} python3 - <<'PYEOF' > /tmp/f1e2-swap-run.log 2>&1
+  SSPCRATCH=$SSPCRATCH FENCE_RIG_SWAP_ARM=${FENCE_RIG_SWAP_ARM:-both} FENCE_RIG_TRANSPORT_PROBE=${FENCE_RIG_TRANSPORT_PROBE:-0} FENCE_RIG_ADOPTION_CONTROL=${FENCE_RIG_ADOPTION_CONTROL:-0} python3 - <<'PYEOF' > /tmp/f1e2-swap-run.log 2>&1
 import json, subprocess, time, os
 bin_path = os.environ["BIN"]
 TRACE = os.environ["SSPCRATCH"] + "/event-trace.jsonl"
 ARM = os.environ.get("FENCE_RIG_SWAP_ARM", "both")
+PROBE = os.environ.get("FENCE_RIG_TRANSPORT_PROBE") == "1"
+CONTROL = os.environ.get("FENCE_RIG_ADOPTION_CONTROL") == "1"
 SEEDED = 77
 def verb(*args, timeout=60):
     return subprocess.run([bin_path] + list(args), capture_output=True, text=True, timeout=timeout)
@@ -497,7 +513,10 @@ while time.time() < deadline:
     negatives = [(ln, p) for ln, nm, p in ev
                  if nm == "applied_content_promoted" and p.get("session_path") == s
                  and p.get("wrote") == 34]
-    if (len(armed) >= 2 and remounts and drv and len(negatives) >= 3):
+    if CONTROL:
+        if len(armed) >= 2 and len(remounts) >= 2 and drv:
+            break
+    elif (len(armed) >= 2 and remounts and drv and len(negatives) >= 3):
         break
     time.sleep(0.5)
 time.sleep(2)  # settle stragglers
@@ -521,6 +540,23 @@ if gen1_r != SEEDED:
 if not remounts:
     print("VERDICT CHAIN RED: no terminal_runtime_named_remount trace — the daemon's contradicting answer did NOT retire the seeded generation (the seam dead at the live path)")
     chain_ok = False
+elif CONTROL:
+    # [e-r6] sol s31 Q3: with ONLY the retirement adoption suppressed, the
+    # map stays unnamed, the one-shot seed re-freezes 77, and the seam
+    # churns -- NOTHING may arm on a daemon-derived name. A gen-2 armed on
+    # the adopted name despite the suppression = another map writer
+    # exists (the s31 bar's provenance vacuity).
+    adopted_ctrl = max((p.get("runtime") or 0) for _, p in armed)
+    churned = len(remounts) >= 2
+    print("VERDICT CONTROL: retirements=%d armed_runtimes=%s" % (
+        len(remounts), sorted({str(p.get("runtime") or 0) for _, p in armed})))
+    if adopted_ctrl not in (0, SEEDED):
+        print("VERDICT VACUITY: a generation armed on a DAEMON-DERIVED name (%s) with the retirement adoption SUPPRESSED -- another map writer supplied it; the s31 chain bar's adoption provenance was vacuous" % adopted_ctrl)
+        raise SystemExit(20)
+    if not churned:
+        print("RIG SHAPE BROKE: the suppressed adoption did not churn (retirements=%d) -- the control premise is unproven" % len(remounts))
+        raise SystemExit(4)
+    print("CONTROL CONFIRMED: the retirement-branch adoption is the load-bearing map writer -- suppressed, the seam churns on the re-frozen seed and nothing arms on a daemon-derived name")
 elif len(remounts) > 1:
     print("VERDICT CHAIN RED: %d retirement traces — the seam CHURNED (re-freezing a retired name loop); the chain must be exactly one retirement" % len(remounts))
     chain_ok = False
@@ -601,6 +637,38 @@ print("   row health: visible content=%s ACPROBE2=%s" % (visible, "__ACPROBE2__"
 if not visible:
     print("VERDICT CHAIN RED: the post-swap row shows NO visible content — the retirement broke the mount instead of re-earning it")
     chain_ok = False
+# [e-r6] THE TRANSPORT VERDICT (sol s31 Q2 rank 1, the differential):
+# the page mailbox (read over a FRESH eval return) must hold BOTH the
+# cold and the warm invocation tags, while the CAPTURED bridge channel
+# delivered the cold tag but NOT the warm ones -- stale addressing
+# (the captured receiver died with the cold eval), not general shedding.
+if PROBE and not CONTROL:
+    mbox = [(ln, p) for ln, nm, p in events if nm == "transport_probe_mailbox"]
+    tags = []
+    if mbox:
+        try:
+            tags = json.loads(mbox[0][1].get("mailbox") or "null") or []
+        except Exception:
+            tags = []
+    attempts = sorted({int(t.get("attempt") or 0) for t in tags})
+    bridge_attempts = sorted({int(m.split("attempt=")[1].split()[0])
+                              for _, m in js_debug_all
+                              if "transport-probe invocation" in m and "attempt=" in m})
+    print("VERDICT TRANSPORT: mailbox_attempts=%s bridge_attempts=%s" % (attempts, bridge_attempts))
+    if not mbox:
+        print("RIG SHAPE BROKE: the mailbox probe never traced -- no differential is possible")
+        raise SystemExit(4)
+    if not attempts or attempts[0] != 1 or not any(a >= 2 for a in attempts):
+        print("RIG SHAPE BROKE: the mailbox does not hold a cold tag AND a warm tag (attempts=%s)" % attempts)
+        raise SystemExit(4)
+    if 1 not in bridge_attempts:
+        print("RIG SHAPE BROKE: the COLD tag never landed on the bridge either -- the whole channel was dead from the start, the differential is vacuous")
+        raise SystemExit(4)
+    warm_on_bridge = [a for a in bridge_attempts if a >= 2]
+    if warm_on_bridge:
+        print("VERDICT TRANSPORT RED: a WARM invocation tag (attempt %s) LANDED on the captured bridge -- the captured send is NOT dead; the post-remount silence is general IPC shedding or something else" % warm_on_bridge)
+        raise SystemExit(19)
+    print("TRANSPORT PASS: the captured channel delivered the cold tag only; the warm invocations' tags live in the mailbox alone -- STALE ADDRESSING confirmed (the captured receiver died with the cold eval)")
 if ARM in ("chain", "both") and not chain_ok:
     raise SystemExit(17)
 if ARM in ("write", "both") and not write_ok:

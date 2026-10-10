@@ -60945,6 +60945,64 @@ fn the_swap_scaffolding_gates_on_the_adopted_generation() {
         ),
         "the negatives fire only from the stable post-retirement state (frozen == known, not the retired seed)"
     );
+
+}
+
+#[test]
+fn the_differential_transport_probe_tags_both_legs() {
+    // [e-r6] sol s31 Q2 rank 1: every mount-fn invocation (cold install
+    // AND every warm re-invocation) must tag the page mailbox -- which
+    // the Rust probe reads over a FRESH eval return, the leg measured
+    // alive -- AND send the same tag over the closure's CAPTURED
+    // channel. The differential between the two legs IS the measurement
+    // (stale addressing vs general shedding).
+    let scripts = include_str!("terminal_scripts.rs");
+    let viewport = include_str!("viewport.rs");
+    assert!(
+        scripts.contains("window.__yggProbeMailbox = window.__yggProbeMailbox || [];"),
+        "every invocation must append its tag to the page mailbox"
+    );
+    assert!(
+        scripts.contains("transport-probe invocation attempt=${{__tpTag.attempt}}"),
+        "the same tag must ride the captured channel (the bridge leg of the differential)"
+    );
+    assert!(
+        viewport.contains("transport_probe_mailbox"),
+        "the Rust probe must trace the mailbox read"
+    );
+    assert!(
+        viewport.contains(
+            "return JSON.stringify(window.__yggProbeMailbox || null);"
+        ),
+        "the mailbox read must ride a fresh eval return (the control leg)"
+    );
+}
+
+#[test]
+fn the_retire_adoption_control_gates_only_the_retirement_branch() {
+    // [e-r6] sol s31 Q3: the control suppresses ONLY the retirement
+    // branch's map adoption -- the fall-through identity adoption and
+    // every other map writer stay live, so a generation arming on a
+    // daemon-derived name DESPITE the suppression proves another writer
+    // (the s31 chain bar's adoption provenance would be vacuous).
+    let viewport = include_str!("viewport.rs");
+    let retire_site = viewport
+        .find("\"note_runtime_spawn_id_remount\"")
+        .expect("the retirement adoption site");
+    let window = &viewport[retire_site.saturating_sub(400)..retire_site + 200];
+    assert!(
+        window.contains("!retire_adoption_suppressed_for_test()"),
+        "the retirement-branch adoption must be gated by the control"
+    );
+    assert!(
+        viewport.contains("YGGTERM_TEST_SUPPRESS_RETIRE_ADOPTION"),
+        "the control stays env-armed (absent = inert)"
+    );
+    assert_eq!(
+        viewport.matches("retire_adoption_suppressed_for_test").count(),
+        2,
+        "exactly the fn definition + its single call site -- the control gates nothing else"
+    );
 }
 
 #[test]
