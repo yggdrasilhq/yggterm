@@ -17845,6 +17845,71 @@ console.log('ok');
     }
 
     #[test]
+    fn every_mount_loop_select_arm_enters_under_a_branch_guard() {
+        // (i-r1) The drop witness's exit_hint names the last select branch a
+        // mount loop ENTERED — but only arms that construct a
+        // TerminalLoopBranchGuard report; an uninstrumented arm leaves the
+        // stamp stale at pre_select, so a death mid-arm-body reads as a
+        // death at the await (measured 2026-10-09: the eval-result EXIT arm,
+        // the warm-gate probe answer, the synth release flush, and the
+        // applied-content probe all ran unguarded — the s22/s26 machinery
+        // arms landed without stamps; the write arm stamped "write_failure"
+        // for ALL variants, so a successful write lied about where it was).
+        // Every pinned head below must enter under its own named guard, and
+        // the write arm's variants re-stamp so a death inside Completed or
+        // CacheFull no longer reads "write_failure".
+        let viewport = include_str!("viewport.rs");
+        let pinned = |head: &str, guard: &str| {
+            let at = viewport
+                .find(head)
+                .unwrap_or_else(|| panic!("arm head must exist: {head}"));
+            let window = &viewport[at..viewport.len().min(at + 600)];
+            assert!(
+                window.contains(guard),
+                "arm `{head}` must enter under branch guard {guard} — an \
+                 uninstrumented arm leaves exit_hint stale at pre_select"
+            );
+        };
+        pinned(
+            "result = &mut eval_result => {",
+            "\"eval_bridge_return\"",
+        );
+        pinned(
+            "if warm_probe_eval.is_some() =>",
+            "\"warm_probe_answer\"",
+        );
+        pinned(
+            "if synth_release_flush_future.is_some() =>",
+            "\"synth_release_flush_apply\"",
+        );
+        pinned(
+            "if applied_content_probe_future.is_some() =>",
+            "\"applied_content_probe_done\"",
+        );
+        pinned(
+            "Some(write_event) = terminal_write_event_rx.recv() => {",
+            "\"write_event_apply\"",
+        );
+        for name in [
+            "\"write_failure\"",
+            "\"write_completed\"",
+            "\"write_cache_full\"",
+        ] {
+            assert!(
+                viewport.find(name).is_some(),
+                "the write-event arm must stamp its variant branches ({name})"
+            );
+        }
+        // tripwire: the mount loop's select carries this many guarded sites
+        // — an arm added without a guard drops the count and fails here.
+        assert!(
+            viewport.matches("TerminalLoopBranchGuard::new").count() >= 24,
+            "every select arm (and the write arm's variants) must stamp — \
+             the guard-site count regressed below the (i-r1) floor"
+        );
+    }
+
+    #[test]
     fn terminal_osc52_copy_suppresses_replay_and_dedupes_c_plus_p() {
         // finding-osc52-copy-chime-replay-refire: switching into a session replays
         // its buffered scrollback through the SAME parser, so a prior OSC 52 in that

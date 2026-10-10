@@ -1006,7 +1006,40 @@ pub(crate) fn remove_terminal_loop_heartbeat(session_path: &str) {
 /// shape the healthy-mode demote rig measured (exit_hint pre_select). The
 /// drop guard's heartbeat punch makes the death read honestly as dead.
 /// Production never sets the env; the rig points it at its scratch.
-pub(crate) fn take_silent_loop_death_token(session_path: &str) -> Option<tokio::time::Instant> {
+///
+/// (i-r1) The delay field may carry an `@<branch>` suffix — an AIMED death:
+/// the loop-top check fires only after that select arm's
+/// TerminalLoopBranchGuard stamped (`terminal_loop_last_branch` == branch).
+/// This is the exitarm-rig discriminator: an arm without a guard can never
+/// be aimed (its name never stamps), so a mismatched or early hint is the
+/// RED verdict, an exact match is GREEN. A pre-suffix build parses
+/// "1:250@x" as count=1 delay=1000 (the default) and dies UNCONDITIONALLY
+/// at ~1s — the hint then reads whatever boot-time arm ran last, never the
+/// aimed name. Plain "count:delay" tokens keep the rj2-rig semantics
+/// byte-identical.
+pub(crate) struct SilentLoopDeathToken {
+    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) after_branch: Option<String>,
+}
+
+impl SilentLoopDeathToken {
+    /// True when the armed death may fire: past the deadline, and either no
+    /// branch was aimed (the unconditional rj2 shape) or the loop's
+    /// last-entered branch IS the aimed branch.
+    pub(crate) fn ready(&self, session_path: &str) -> bool {
+        if tokio::time::Instant::now() < self.deadline {
+            return false;
+        }
+        match self.after_branch.as_deref() {
+            None => true,
+            Some(branch) => terminal_loop_last_branch(session_path) == Some(branch),
+        }
+    }
+}
+
+pub(crate) fn take_silent_loop_death_token(
+    session_path: &str,
+) -> Option<SilentLoopDeathToken> {
     let path = std::env::var("YGGTERM_TEST_SILENT_LOOP_DEATHS_FILE").ok()?;
     let raw = std::fs::read_to_string(&path).ok()?;
     let mut lines = raw.split('\n');
@@ -1016,15 +1049,32 @@ pub(crate) fn take_silent_loop_death_token(session_path: &str) -> Option<tokio::
     }
     let mut parts = lines.next()?.split(':');
     let count: u64 = parts.next()?.trim().parse().ok()?;
-    let delay_ms: u64 = parts
-        .next()
-        .and_then(|d| d.trim().parse().ok())
-        .unwrap_or(1_000);
+    let (delay_raw, after_branch) = match parts.next() {
+        Some(field) => match field.split_once('@') {
+            Some((delay, branch)) => {
+                let branch = branch.trim();
+                (delay, if branch.is_empty() { None } else { Some(branch.to_string()) })
+            }
+            None => (field, None),
+        },
+        None => ("", None),
+    };
+    let delay_ms: u64 = delay_raw.trim().parse().unwrap_or(1_000);
     if count == 0 || count > 32 {
         return None;
     }
-    let _ = std::fs::write(&path, format!("{}\n{}:{}", marker, count - 1, delay_ms));
-    Some(tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms))
+    let branch_suffix = after_branch
+        .as_deref()
+        .map(|branch| format!("@{branch}"))
+        .unwrap_or_default();
+    let _ = std::fs::write(
+        &path,
+        format!("{}\n{}:{}{}", marker, count - 1, delay_ms, branch_suffix),
+    );
+    Some(SilentLoopDeathToken {
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+        after_branch,
+    })
 }
 
 /// [F1-(i) 2026-10-06] The last select branch a session's mount loop ENTERED.

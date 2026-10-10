@@ -7427,12 +7427,12 @@ fn TerminalCanvas(
             // (r-j1)/(r-j2) RIG HOOK — armed once per task start; the bare
             // break below fires on the first iteration wake past the armed
             // deadline, before any named exit arm: the silent death shape.
-            let silent_death_deadline: Option<tokio::time::Instant> =
-                take_silent_loop_death_token(&session_path);
+            let silent_death = take_silent_loop_death_token(&session_path);
             loop {
                 bump_terminal_loop_heartbeat(&session_path);
-                if let Some(deadline) = silent_death_deadline
-                    && tokio::time::Instant::now() >= deadline
+                if silent_death
+                    .as_ref()
+                    .is_some_and(|death| death.ready(&session_path))
                 {
                     break;
                 }
@@ -8020,6 +8020,10 @@ fn TerminalCanvas(
                         }
                     }
                     result = &mut eval_result => {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "eval_bridge_return",
+                            &session_path,
+                        );
                         saw_warm_bridge_event = true;
                         warm_gate_deadline = None;
                         let _ = safe_shell_mut(state, "terminal_attach_bridge_result", |shell| {
@@ -11403,13 +11407,15 @@ fn TerminalCanvas(
                         // ARRIVES instead of holding every later keystroke
                         // hostage while the failing write timed out.
                         let _branch_guard =
-                            TerminalLoopBranchGuard::new("write_failure", &session_path);
+                            TerminalLoopBranchGuard::new("write_event_apply", &session_path);
                         match write_event {
                         TerminalWriteEvent::Failed {
                             shape: write_shape,
                             pending_bytes: write_pending_bytes,
                             error: write_error,
                         } => {
+                            let _variant_branch =
+                                TerminalLoopBranchGuard::new("write_failure", &session_path);
                             cached_input_bytes = write_pending_bytes;
                             terminal_transport_degraded = true;
                             terminal_ghost_frame = terminal_paint_seen
@@ -11610,6 +11616,8 @@ fn TerminalCanvas(
                             pending_bytes: write_pending_bytes,
                             recovered_transport,
                         } => {
+                            let _variant_branch =
+                                TerminalLoopBranchGuard::new("write_completed", &session_path);
                             cached_input_bytes = cached_input_bytes.saturating_sub(data_bytes);
                             let transport_recovered = recovered_transport
                                 || (terminal_transport_degraded && write_pending_bytes == 0);
@@ -11649,6 +11657,8 @@ fn TerminalCanvas(
                             data_bytes,
                             pending_bytes: write_pending_bytes,
                         } => {
+                            let _variant_branch =
+                                TerminalLoopBranchGuard::new("write_cache_full", &session_path);
                             cached_input_bytes = cached_input_bytes.saturating_sub(data_bytes);
                             update_terminal_surface_status(
                                 state,
@@ -12392,6 +12402,10 @@ fn TerminalCanvas(
                     },
                         if warm_probe_eval.is_some() =>
                     {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "warm_probe_answer",
+                            &session_path,
+                        );
                         warm_probe_alive = Some(
                             probe_answer
                                 .as_ref()
@@ -13091,6 +13105,10 @@ fn TerminalCanvas(
                     },
                         if synth_release_flush_future.is_some() =>
                     {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "synth_release_flush_apply",
+                            &session_path,
+                        );
                         synth_release_flush_future = None;
                         if let Some(batch) = synth_release_flush_batch.take() {
                             let _ = document::eval(&terminal_page_write_script(
@@ -13109,6 +13127,10 @@ fn TerminalCanvas(
                     },
                         if applied_content_probe_future.is_some() =>
                     {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "applied_content_probe_done",
+                            &session_path,
+                        );
                         applied_content_probe_future = None;
                     },
                     synth_hash_probe_answer = async {
