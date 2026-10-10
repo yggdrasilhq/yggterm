@@ -528,8 +528,14 @@ def rotate_score(p, measure=True):
             return 100 - (used if isinstance(used, (int, float)) else 100)
         pri, sec = snap.get("primary"), snap.get("secondary")
         # the binding constraint is the TIGHTER window: a full weekly bank
-        # walls the account even when its 5h window is untouched (and vice versa)
-        headroom = min(free(pri), free(sec)) if (pri or sec) else free(pri)
+        # walls the account even when its 5h window is untouched (and vice
+        # versa). ⛔ ONLY over the windows that EXIST: a missing secondary
+        # (single-window snapshots) used to read as 0% free and wall the
+        # account below every two-window peer regardless of real usage —
+        # the [11.238] rotation red (acct-full outranked acct-good because
+        # good's headroom min'd against free(None)=0).
+        windows = [w for w in (pri, sec) if w]
+        headroom = min((free(w) for w in windows), default=0)
         tier = 1 if (snap.get("limit_reached") or headroom <= 0) else 0
         return (tier, headroom, p["slug"])
     if p["expired"]:
