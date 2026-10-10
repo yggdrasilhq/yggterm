@@ -578,7 +578,7 @@ else:
         retired_neg = [(ln, p) for ln, p in negatives if p.get("runtime") == SEEDED]
         matched_neg = [(ln, p) for ln, p in negatives if (p.get("runtime") or 0) == adopted]
         zero_neg = [(ln, p) for ln, p in negatives if (p.get("runtime") or 0) == 0]
-        organic = [p for ln, p in promos
+        organic = [(ln, p) for ln, p in promos
                    if p.get("source") in ("seed_proof", "live_write")
                    and (p.get("runtime") or 0) == adopted
                    and p.get("accepted") and ln > rem[0]]
