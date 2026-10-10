@@ -12481,8 +12481,9 @@ console.log('ok');
     fn terminal_eval_script_guards_missing_dioxus_channel_global() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, false);
+        assert!(script.contains("const terminalDioxusApi = __ygInvocationApi"));
         assert!(script.contains(
-            "const terminalDioxusApi = typeof dioxus !== \"undefined\" ? dioxus : null;"
+            "|| (typeof dioxus !== \"undefined\" ? dioxus : null);"
         ));
         assert!(!script.contains("dioxus && typeof dioxus.send"));
         assert!(!script.contains("dioxus && typeof dioxus.recv"));
@@ -22958,7 +22959,8 @@ console.log('ok');
             warm.len()
         );
         assert!(warm.contains("__yggtermMountParams ="));
-        assert!(warm.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt);"));
+        assert!(warm.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus"));
+        assert!(warm.contains("? dioxus : null));"));
 
         let probe = terminal_mount_fn_probe_script();
         // ⛔ Bridge contract (live-proven 2026-09-27): the eval bridge wraps
@@ -22974,9 +22976,17 @@ console.log('ok');
 
         let cold = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(cold.contains(&format!("window.__yggtermMountFnV = {TERMINAL_MOUNT_FN_VERSION}")));
-        assert!(cold.contains("window.__yggtermMountFn = async (__yggAttempt) =>"));
+        assert!(cold.contains("window.__yggtermMountFn = async (__yggAttempt, __yggInvocationBridge) =>"));
         assert!(cold.contains("const __mp = window.__yggtermMountParams || {};"));
         assert!(cold.contains("await window.__yggtermMountFn("));
+        // [e-r6] the invocation bridge law: the body PREFERS the
+        // invocation-passed bridge over the lexical capture, and BOTH
+        // dispatch shapes pass their own eval binding — a dispatch that
+        // omits the bridge re-binds the dead cold channel pair.
+        assert!(cold.contains("const terminalDioxusApi = __ygInvocationApi"));
+        assert!(cold.contains("typeof __yggInvocationBridge.send === \"function\""));
+        assert!(cold.contains("typeof __yggInvocationBridge.recv === \"function\""));
+        assert!(cold.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== \"undefined\" ? dioxus : null));"));
         // The body must read its identity from the per-mount params, never
         // bake it in: a baked host id would silently serve one session's
         // mount fn to another after the fn is cached in the page.
@@ -73886,10 +73896,11 @@ mod web_surface_immersion_locks {
              dispatched attempt"
         );
         assert_eq!(
-            scripts.matches("await window.__yggtermMountFn(window.__yggtermMountAttempt);").count(),
+            scripts.matches("await window.__yggtermMountFn(window.__yggtermMountAttempt,").count(),
             2,
             "both dispatch shapes invoke the shared body with the stamped \
-             attempt"
+             attempt AND their own eval bridge — a dispatch that omits the \
+             bridge re-binds the dead cold channel pair ([e-r6])"
         );
     }
 

@@ -223,7 +223,13 @@ fn terminal_reused_host_grid_script(session_path: &str) -> String {
 // __yggtermMountResend re-request arm at "posted" — the gate polls the
 // record via eval returns and keeps a live warm mount whose bridge events
 // were shed instead of redoing cold into the remount storm.
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 3;
+// [e-r6] Bumped 2026-10-10: the body takes the invocation bridge as a
+// second parameter and prefers it over the lexical `dioxus` capture — that
+// free variable resolves through the COLD eval wrapper scope, so warm
+// re-invocations re-bound the dead cold channel pair (s31 differential:
+// the warm invocation tag lives in the mailbox alone). Both invoke sites
+// pass their OWN eval binding; the version gate forces the reinstall.
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 4;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -297,7 +303,7 @@ fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
     // guard instead of registering over the fresh mount (the stale closure
     // used to win the host last-writer-wins via its ownerToken).
     format!(
-        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt);"
+        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== \"undefined\" ? dioxus : null));"
     )
 }
 
@@ -958,11 +964,24 @@ fn terminal_eval_script_with_canvas_renderer(
     format!(
         r#"window.__yggtermMountParams = {mount_params_json};
         window.__yggtermMountFnV = {TERMINAL_MOUNT_FN_VERSION};
-        window.__yggtermMountFn = async (__yggAttempt) => {{
+        window.__yggtermMountFn = async (__yggAttempt, __yggInvocationBridge) => {{
         const __mp = window.__yggtermMountParams || {{}};
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const hostId = String(__mp.hostId || "");
-        const terminalDioxusApi = typeof dioxus !== "undefined" ? dioxus : null;
+        // [e-r6] The lexical `dioxus` below resolves through the COLD eval
+        // wrapper scope — a warm re-invocation re-binds the dead cold
+        // channel pair. The invocation passes its OWN eval binding as the
+        // second argument; a valid invocation bridge (both legs callable)
+        // WINS over the capture, refreshing sendTerminalEvent, the
+        // recvTerminalCommand pump, and the resend arm together.
+        const __ygInvocationApi =
+            __yggInvocationBridge
+                && typeof __yggInvocationBridge.send === "function"
+                && typeof __yggInvocationBridge.recv === "function"
+                ? __yggInvocationBridge
+                : null;
+        const terminalDioxusApi = __ygInvocationApi
+            || (typeof dioxus !== "undefined" ? dioxus : null);
         const terminalDioxusSend =
             terminalDioxusApi && typeof terminalDioxusApi.send === "function"
                 ? terminalDioxusApi.send.bind(terminalDioxusApi)
@@ -980,14 +999,24 @@ fn terminal_eval_script_with_canvas_renderer(
         // invocation (cold install AND every warm re-invocation) records
         // itself in the page mailbox — which the Rust probe reads over a
         // FRESH eval return, a leg measured alive — and sends the same
-        // tag over this closure's CAPTURED channel. The differential
-        // between the two legs IS the measurement.
+        // tag over this invocation channel (pre-fix: the cold CAPTURE, so
+        // warm tags lived in the mailbox alone; post-fix: the
+        // invocation-passed bridge, and both legs must carry every tag).
+        // The differential between the two legs IS the measurement.
         if ({mount_transport_probe}) {{
             try {{
-                const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation" }};
+                const __tpTag = {{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "mount-fn-invocation",
+                    bridge: __yggInvocationBridge === undefined ? "undef" : (__yggInvocationBridge === null ? "null" : ((typeof __yggInvocationBridge.send === "function" && typeof __yggInvocationBridge.recv === "function") ? "valid" : "invalid")),
+                    bridge_request_id: (__yggInvocationBridge && __yggInvocationBridge.request_id !== undefined) ? __yggInvocationBridge.request_id : null,
+                    lexical: (typeof dioxus !== "undefined") ? "present" : "absent" }};
                 window.__yggProbeMailbox = window.__yggProbeMailbox || [];
                 window.__yggProbeMailbox.push(__tpTag);
-                sendTerminalEvent({{ kind: "debug", message: `transport-probe invocation attempt=${{__tpTag.attempt}} ts=${{__tpTag.ts}}` }});
+                try {{
+                    sendTerminalEvent({{ kind: "debug", message: `transport-probe invocation attempt=${{__tpTag.attempt}} ts=${{__tpTag.ts}}` }});
+                    window.__yggProbeMailbox.push({{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "invocation-send-returned" }});
+                }} catch (__tpSendError) {{
+                    window.__yggProbeMailbox.push({{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "invocation-send-threw", err: String(__tpSendError && __tpSendError.message || __tpSendError) }});
+                }}
             }} catch (__tpError) {{}}
         }}
         // [F1-input] THE INPUT DUAL-LEG. The dioxus.send leg dies with the
@@ -1072,6 +1101,15 @@ fn terminal_eval_script_with_canvas_renderer(
                             ? performance.now()
                             : Date.now(),
                 }};
+                // [e-r6 s32] the STAGE tag: the invocation-time tag dies
+                // in the warm eval first-ms window (the ~1 KB warm script
+                // has no parse stall, so the body starts before the Rust
+                // reader attaches); a stage tag rides the steady-state
+                // flow, which is the delivery the receipts themselves
+                // depend on.
+                if ({mount_transport_probe}) {{
+                    sendTerminalEvent({{ kind: "debug", message: `transport-probe stage=${{stage}} attempt=${{__yggAttemptStamp}} ts=${{Date.now()}}` }});
+                }}
             }} catch (_error) {{}}
         }};
         __yggNoteMountAlive("entry");
@@ -13954,6 +13992,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 sendTerminalEvent({{ kind: "ready", record: {{ session: String(__acFrozenTuple.session || ""), epoch: Number(__acFrozenTuple.epoch || 0), runtime: Number(__acFrozenTuple.runtime || 0), gen: Number(__acFrozenTuple.gen || 0) }} }});
             }}
         }};
+        if ({mount_transport_probe}) {{
+            try {{
+                window.__yggProbeMailbox = window.__yggProbeMailbox || [];
+                window.__yggProbeMailbox.push({{ attempt: Number(__yggAttempt || 0), ts: Date.now(), tag: "pump-start" }});
+            }} catch (_pumpProbeError) {{}}
+        }}
         while (true) {{
             const message = await recvTerminalCommand();
             if (!message) {{
@@ -14244,7 +14288,7 @@ fn terminal_eval_script_with_canvas_renderer(
         // guard instead of fighting this one for the host.
         window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;
         window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;
-        await window.__yggtermMountFn(window.__yggtermMountAttempt);
+        await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== "undefined" ? dioxus : null));
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,
         frame_hash_probe_js = FRAME_HASH_PROBE_JS,
