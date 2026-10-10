@@ -23009,13 +23009,19 @@ console.log('ok');
 
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let cold = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        // The fn advances the record at every guarded stage...
-        for stage in ["entry", "host_ready", "pre_construct", "posted"] {
+        // The fn advances the record at every guarded stage; the POSTED
+        // record additionally carries the frozen tuple (e-r5 carrier 2 —
+        // the same record the bridge ready event attests).
+        for stage in ["entry", "host_ready", "pre_construct"] {
             assert!(
                 cold.contains(&format!("__yggNoteMountAlive(\"{stage}\")")),
                 "mount body must stamp the {stage} liveness stage"
             );
         }
+        assert!(
+            cold.contains("__yggNoteMountAlive(\"posted\", __acFrozenTuple)"),
+            "the POSTED record must carry the frozen tuple (e-r5 carrier 2)"
+        );
         // ...installs the resend arm on the success tail...
         assert!(cold.contains("window.__yggtermMountResend = (h) =>"));
         // ...and both invoke wrappers stamp the dispatched attempt so the
@@ -60648,6 +60654,223 @@ fn a_valid_blank_receipt_qualifies_content_without_cursor_motion() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_ready_record_classifies_control_named_and_malformed() {
+    // [e-r5] sol s30 Q1: the ready record is the ONE attestation of the
+    // page's frozen tuple. Payload-free = CONTROL (asset failure — no
+    // constructed entry); a matching session+epoch = NAMED (0 = the
+    // explicit unnamed record, valid); anything else is MALFORMED and
+    // must never win the js_ready duplicate guard (it would swallow the
+    // well-formed resend and the name would never engage).
+    let record = TerminalReadyRecord {
+        session: "remote-session://dev/naming".to_string(),
+        epoch: 4,
+        runtime: 7,
+        page_gen: 2,
+    };
+    assert_eq!(
+        classify_ready_record(None, "remote-session://dev/naming", 4),
+        ReadyRecordVerdict::Control
+    );
+    assert_eq!(
+        classify_ready_record(Some(&record), "remote-session://dev/naming", 4),
+        ReadyRecordVerdict::Named(7)
+    );
+    // Explicit unnamed: runtime 0 is a VALID record, not a wildcard.
+    let unnamed = TerminalReadyRecord { runtime: 0, ..record.clone() };
+    assert_eq!(
+        classify_ready_record(Some(&unnamed), "remote-session://dev/naming", 4),
+        ReadyRecordVerdict::Named(0)
+    );
+    // A foreign session or a foreign epoch is MALFORMED for this mount.
+    assert_eq!(
+        classify_ready_record(Some(&record), "remote-session://dev/other", 4),
+        ReadyRecordVerdict::Malformed
+    );
+    assert_eq!(
+        classify_ready_record(Some(&record), "remote-session://dev/naming", 5),
+        ReadyRecordVerdict::Malformed
+    );
+}
+
+#[test]
+fn the_wire_parses_a_payload_free_ready_a_full_record_and_a_partial_error() {
+    // [e-r5] The three wire states: {"kind":"ready"} alone = control;
+    // the full record parses (with the page's `gen` mapped to page_gen);
+    // a PARTIAL record fails the inner struct — erroring the whole event
+    // (loud, never a silent guard win).
+    let control = crate::terminal_protocol::parse_terminal_js_event(
+        serde_json::json!({ "kind": "ready" }),
+    )
+    .expect("payload-free ready parses as control");
+    match control {
+        TerminalJsEvent::Ready { record } => assert!(record.is_none()),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    let named = crate::terminal_protocol::parse_terminal_js_event(
+        serde_json::json!({
+            "kind": "ready",
+            "record": { "session": "s", "epoch": 1, "runtime": 7, "gen": 3 }
+        }),
+    )
+    .expect("full ready record parses");
+    match named {
+        TerminalJsEvent::Ready { record } => {
+            let record = record.expect("record present");
+            assert_eq!(record.session, "s");
+            assert_eq!(record.epoch, 1);
+            assert_eq!(record.runtime, 7);
+            assert_eq!(record.page_gen, 3);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert!(
+        crate::terminal_protocol::parse_terminal_js_event(serde_json::json!({
+            "kind": "ready",
+            "record": { "session": "s", "epoch": 1 }
+        }))
+        .is_none(),
+        "a partial record must ERROR the event, not parse as control"
+    );
+}
+
+#[test]
+fn a_partial_alive_ready_record_is_malformed_not_control() {
+    // [e-r5] carrier 2: the alive record's readyRecord. Null = Absent (a
+    // stage noted before the ready tuple existed); complete = Ready;
+    // partial/wrong-typed = Malformed — which never wins the guard.
+    assert!(matches!(
+        alive_ready_record_from_json(None),
+        AliveReadyRecord::Absent
+    ));
+    assert!(matches!(
+        alive_ready_record_from_json(Some(&serde_json::Value::Null)),
+        AliveReadyRecord::Absent
+    ));
+    match alive_ready_record_from_json(Some(&serde_json::json!({
+        "session": "s", "epoch": 2, "runtime": 9, "gen": 1
+    }))) {
+        AliveReadyRecord::Ready(record) => {
+            assert_eq!(record.runtime, 9);
+            assert_eq!(record.page_gen, 1);
+        }
+        other => panic!("unexpected verdict: {other:?}"),
+    }
+    assert!(matches!(
+        alive_ready_record_from_json(Some(&serde_json::json!({
+            "session": "s", "runtime": 9
+        }))),
+        AliveReadyRecord::Malformed
+    ));
+    assert!(matches!(
+        alive_ready_record_from_json(Some(&serde_json::json!({
+            "session": "s", "epoch": "two", "runtime": 9, "gen": 1
+        }))),
+        AliveReadyRecord::Malformed
+    ));
+}
+
+#[test]
+fn a_frozen_name_the_answer_contradicts_demands_a_fresh_generation() {
+    // [e-r5] sol s30 Q2: the two-known-id edge trigger misses the
+    // first-answer-vs-frozen-name case (known starts 0; a nonzero frozen
+    // name came from the previous generation's render). The frozen-name
+    // mismatch retires the generation; an unnamed mount NEVER retires on
+    // learning a name (the provisional first-mount policy).
+    let replaced = runtime_name_requires_remount(7, 9, 7);
+    assert!(replaced, "two known ids differing retires");
+    let frozen_mismatch_known_zero = runtime_name_requires_remount(0, 9, 7);
+    assert!(
+        frozen_mismatch_known_zero,
+        "the frozen name 7 contradicted by the FIRST answer 9 retires \
+         (the edge trigger alone misses this)"
+    );
+    let unnamed_mount = runtime_name_requires_remount(0, 9, 0);
+    assert!(
+        !unnamed_mount,
+        "an unnamed mount learning a name is NOT a replacement"
+    );
+    let stable = runtime_name_requires_remount(7, 7, 7);
+    assert!(!stable, "a matching name never retires");
+    let old_daemon = runtime_name_requires_remount(7, 0, 7);
+    assert!(
+        !old_daemon,
+        "an answer without the field (older daemon) never retires"
+    );
+}
+
+#[test]
+fn the_runtime_name_map_renders_what_the_answers_named() {
+    // [e-r5] The render cache: a named answer freezes into the map, 0
+    // never overwrites a name (unnamed is not knowledge), and the session
+    // teardown drops the name with the rest of the render state.
+    let session_path = "remote-session://dev/naming-map";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    assert_eq!(shell.terminal_runtime_spawn_id_for(session_path), 0);
+    shell.note_terminal_runtime_spawn_id(session_path, 7);
+    assert_eq!(shell.terminal_runtime_spawn_id_for(session_path), 7);
+    shell.note_terminal_runtime_spawn_id(session_path, 0);
+    assert_eq!(
+        shell.terminal_runtime_spawn_id_for(session_path),
+        7,
+        "0 (unnamed) never overwrites a name"
+    );
+    shell.note_terminal_runtime_spawn_id(session_path, 9);
+    assert_eq!(
+        shell.terminal_runtime_spawn_id_for(session_path),
+        9,
+        "a newer authoritative name replaces the older one"
+    );
+    shell.drop_terminal_render_state_for_session(session_path, "test");
+    assert_eq!(
+        shell.terminal_runtime_spawn_id_for(session_path),
+        0,
+        "teardown drops the name with the rest of the render state"
+    );
+}
+
+#[test]
+fn the_naming_chain_sources_are_locked() {
+    // [e-r5] The chain's four links, locked at source: the div RENDER
+    // writes the attr; the page FREEZES it at construction (one captured
+    // tuple, not a re-read); all THREE carriers attest the SAME record;
+    // the ARM binds exactly what the page froze.
+    let scripts = include_str!("terminal_scripts.rs");
+    let viewport = include_str!("viewport.rs");
+    assert!(
+        viewport.contains("\"data-terminal-runtime-spawn-id\": \"{runtime_spawn_id}\""),
+        "the render must write the runtime name onto the host div"
+    );
+    assert!(
+        scripts.contains(
+            "runtime: Number(host.getAttribute(\"data-terminal-runtime-spawn-id\") || 0)"
+        ),
+        "the page tuple must FREEZE the runtime from the div attr (the one source)"
+    );
+    assert_eq!(
+        scripts
+            .matches("kind: \"ready\", record: {{ session: String(__acFrozenTuple.session")
+            .count(),
+        2,
+        "the ready send AND the resend must carry the same frozen record"
+    );
+    assert!(
+        scripts.contains("__yggNoteMountAlive(\"posted\", __acFrozenTuple);"),
+        "the alive record (carrier 2) must attest the same frozen tuple"
+    );
+    assert!(
+        viewport.contains(
+            "shell.arm_terminal_applied_content(session_path, mount_epoch, page_frozen_runtime);"
+        ),
+        "the arm must bind the page-frozen runtime, never a parallel derivation"
+    );
+    assert!(
+        viewport.contains("fn runtime_name_requires_remount("),
+        "the frozen-name retirement predicate must stay at the stream seam"
+    );
+}
+
+#[test]
 fn an_unbound_runtime_receipt_never_satisfies_a_named_expectation() {
     // sol s28 S28-2 (probe line 1): expected 7 + receipt runtime 0 used to
     // pass BOTH predicates (the old rule rejected only when both runtimes
@@ -73451,10 +73674,13 @@ mod web_surface_immersion_locks {
     fn the_warm_alive_posted_proof_completes_the_ready_handshake() {
         let viewport = include_str!("viewport.rs");
         for needle in [
-            // The synthesis gate: matched + stage "posted" + not yet ready.
+            // The synthesis gate: matched + stage "posted" + not yet
+            // ready + a classifiable ready record (e-r5: a MALFORMED
+            // record never wins the guard — the gate keeps polling).
             "let alive_stage_posted = record",
             "== Some(\"posted\");",
-            "if matched && alive_stage_posted && !js_ready {",
+            "if matched && alive_stage_posted && !js_ready && alive_frozen_runtime.is_some() {",
+            "alive_ready_record_from_json(",
             // Both wires run the SAME factored init — a second spelling is
             // how the arms drift.
             "fn terminal_stage_js_ready(",

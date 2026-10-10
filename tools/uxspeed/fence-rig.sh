@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -255,6 +255,163 @@ PYEOF
     [ "$h" = "$PSCRATCH" ] && kill "$p" 2>/dev/null
   done
   tail -12 /tmp/f1e2-provenance-run.log
+  exit $RC
+fi
+
+# ── [e-r5] MODE=naming: THE RUNTIME NAMING CHAIN CARRIER/PREDICATE BAR
+# (sitting 30, sol s30 Q4 — arm (a), the deterministic isolation). The
+# page injects repeated rounds of receipts through the PRODUCTION
+# applied_content ingress: a FOREIGN runtime (901), the MATCHED control
+# (the frozen tuple's own runtime — 77 via the seeded render name), and
+# the UNBOUND-0 control. Verdicts (true rcs, exe-proofed):
+#   exit 15 = RED — the foreign runtime was ACCEPTED (the vacuous
+#             unnamed-arm predicate live; the hook-only main build);
+#   exit 16 = the named arm ACCEPTED an unbound-0 receipt (S28-2 broken
+#             at the live path);
+#   exit 0  = GREEN — the arm is NAMED 77, foreign rejected everywhere,
+#             matched accepted, unbound-0 rejected;
+#   exit 4  = shape broke (no arm / marker never fired / injections never
+#             landed / matched control rejected — a vacuous-GREEN guard).
+# FENCE_RIG_NAMING_WARM=1 runs the CARRIER-2 bar instead: bridge IPC
+# suppressed, the alive record is the only ready leg — the arm must still
+# bind 77 (the warm-alive path carried the frozen name). ────────────────
+if [ "$MODE" = naming ]; then
+  NSCRATCH=/tmp/f1e2-naming-$(date +%s)
+  mkdir -p "$NSCRATCH"
+  # [e-r5] F=901 (the foreign runtime injected through the production
+  # applied_content ingress) and R=77 (the seeded RENDER name — the hook
+  # names the render knowledge only, never the arm). Env goes as a
+  # run_boot PREFIX (provenance's pattern): the healthy branch expands no
+  # CAPT_EXPORT. The WARM sub-run drops the injections — under bridge-IPC
+  # suppression they would be shed anyway; its bar is the ARM's runtime
+  # alone (carrier 2, the alive record).
+  # YGGTERM_TEST_DISABLE_NAMED_REMOUNT=1: the (a) bar seeds a SYNTHETIC
+  # name the real daemon answers legitimately contradict — the retirement
+  # (working as designed) would kill the mount mid-bar. The retirement
+  # machinery earns its own end-to-end arm (sol s30 Q4).
+  if [ "${FENCE_RIG_NAMING_WARM:-0}" = "1" ]; then
+    YGGTERM_TEST_SEED_RENDER_RUNTIME_ID=77 YGGTERM_TEST_DISABLE_NAMED_REMOUNT=1 run_boot "$NSCRATCH" 1
+  else
+    YGGTERM_TEST_INJECT_APPLIED_RUNTIMES=901 YGGTERM_TEST_SEED_RENDER_RUNTIME_ID=77 YGGTERM_TEST_DISABLE_NAMED_REMOUNT=1 run_boot "$NSCRATCH" 0
+  fi
+  NGUI=$!
+  NREADY=$(boot_wait_ready); echo "naming daemon ready=$NREADY"; sleep 8
+  NSCRATCH=$NSCRATCH FENCE_RIG_NAMING_WARM=${FENCE_RIG_NAMING_WARM:-0} python3 - <<'PYEOF' > /tmp/f1e2-naming-run.log 2>&1
+import json, subprocess, time, os
+bin_path = os.environ["BIN"]
+TRACE = os.environ["NSCRATCH"] + "/event-trace.jsonl"
+WARM = os.environ.get("FENCE_RIG_NAMING_WARM") == "1"
+FOREIGN = 901
+NAMED = 77
+def verb(*args, timeout=60):
+    return subprocess.run([bin_path] + list(args), capture_output=True, text=True, timeout=timeout)
+def read_events():
+    out = []
+    try:
+        for ln_no, line in enumerate(open(TRACE), 1):
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            name = (event.get("name") or event.get("event"))
+            if name:
+                out.append((ln_no, name, event.get("payload") or {}))
+    except FileNotFoundError:
+        pass
+    return out
+def make_row(title):
+    for attempt in range(4):
+        out = verb("server", "app", "terminal", "new", "--kind", "shell", "--title", title)
+        try:
+            return (json.loads(out.stdout).get("data") or {}).get("session_path")
+        except Exception:
+            print("row create attempt %d failed: %s" % (attempt, (out.stdout or out.stderr)[:120].replace("\n", " ")))
+            time.sleep(4)
+    return None
+# ⛔ SINGLE-ROW LAW (s29): one row, zero further churn.
+s = make_row("naming")
+if not s:
+    print("NAMING FAIL: no row"); raise SystemExit(4)
+print("row: s=%s warm=%s" % (s, WARM))
+deadline = time.time() + 50
+while time.time() < deadline:
+    ev = read_events()
+    armed = [(ln, p) for ln, nm, p in ev
+             if nm == "applied_content_armed" and p.get("session_path") == s]
+    marker = any("rig inject armed" in str(p.get("message") or "")
+                 for _, nm, p in ev if nm == "js_debug")
+    promos = [(ln, p) for ln, nm, p in ev
+              if nm == "applied_content_promoted" and p.get("session_path") == s]
+    if WARM:
+        if armed:
+            break
+    else:
+        if armed and marker and len(promos) >= 8:
+            break
+    time.sleep(0.5)
+time.sleep(2)  # settle stragglers
+events = read_events()
+armed = [(ln, p) for ln, nm, p in events
+         if nm == "applied_content_armed" and p.get("session_path") == s]
+if not armed:
+    print("RIG SHAPE BROKE: no arm trace for the row")
+    raise SystemExit(4)
+armed_runtime = armed[0][1].get("runtime") or 0
+armed_epoch = armed[0][1].get("epoch")
+print("VERDICT NAMING: armed_epoch=%s armed_runtime=%s warm=%s" % (
+    armed_epoch, armed_runtime, WARM))
+if WARM:
+    # carrier 2 alone: under bridge-IPC suppression the alive record's
+    # readyRecord is the ONLY ready leg — the arm must bind the frozen
+    # name it carried.
+    if armed_runtime != NAMED:
+        print("RIG SHAPE BROKE: the warm-alive leg did not bind the frozen name %d (armed_runtime=%s) — carrier 2 lost the record" % (NAMED, armed_runtime))
+        raise SystemExit(4)
+    print("RIG PASS (warm carrier): the alive record carried the frozen name; the arm bound %d" % NAMED)
+    raise SystemExit(0)
+promos = [(ln, p) for ln, nm, p in events
+          if nm == "applied_content_promoted" and p.get("session_path") == s]
+marker = any("rig inject armed" in str(p.get("message") or "")
+             for _, nm, p in events if nm == "js_debug")
+f_events = [p for _, p in promos if p.get("runtime") == FOREIGN]
+m_events = [p for _, p in promos if p.get("runtime") == NAMED]
+z_events = [p for _, p in promos if p.get("runtime") == 0]
+print("   injections: foreign=%d matched=%d zero=%d marker=%s" % (
+    len(f_events), len(m_events), len(z_events), marker))
+if not marker:
+    print("RIG SHAPE BROKE: the inject marker never fired — every verdict below would be vacuous")
+    raise SystemExit(4)
+if not f_events:
+    print("RIG SHAPE BROKE: the foreign injections never landed (zero applied_content events)")
+    raise SystemExit(4)
+if any(p.get("accepted") for p in f_events):
+    if armed_runtime != NAMED:
+        print("VERDICT RED CONFIRMED: the FOREIGN runtime %d receipt was ACCEPTED under the unnamed arm (armed_runtime=%s) — the vacuous predicate live, the naming chain's defect" % (FOREIGN, armed_runtime))
+        raise SystemExit(15)
+    print("RIG SHAPE BROKE: a NAMED arm (%d) accepted a foreign runtime — the predicate itself failed" % armed_runtime)
+    raise SystemExit(4)
+if armed_runtime != NAMED:
+    print("RIG SHAPE BROKE: the arm is unnamed (%s) yet the foreign receipt was rejected anyway — rejection by some OTHER disqualifier, a GREEN here would be vacuous" % armed_runtime)
+    raise SystemExit(4)
+if not any(p.get("accepted") for p in m_events):
+    print("RIG SHAPE BROKE: the MATCHED control (%d) was never accepted — the rejection above may be session/epoch breakage, not the runtime predicate" % NAMED)
+    raise SystemExit(4)
+if any(p.get("accepted") for p in z_events):
+    print("VERDICT RED (unbound): the named arm ACCEPTED an unbound-0 receipt — S28-2 broken at the live path")
+    raise SystemExit(16)
+body = verb("server", "app", "terminal", "read-buffer", s, "--mode", "screen").stdout or ""
+print("   row health: prompt on screen=%s" % (len(body.strip()) > 0))
+print("RIG PASS — the arm is NAMED %d: foreign %d rejected everywhere, matched accepted, unbound-0 rejected" % (NAMED, FOREIGN))
+raise SystemExit(0)
+PYEOF
+  RC=$?
+  kill "$NGUI" 2>/dev/null; sleep 1
+  pkill -x yggterm 2>/dev/null; pkill -f "dbus-run-session" 2>/dev/null; sleep 1
+  for p in $(pgrep -f 'yggterm-headless server daemon'); do
+    h=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^YGGTERM_HOME=//p')
+    [ "$h" = "$NSCRATCH" ] && kill "$p" 2>/dev/null
+  done
+  tail -12 /tmp/f1e2-naming-run.log
   exit $RC
 fi
 

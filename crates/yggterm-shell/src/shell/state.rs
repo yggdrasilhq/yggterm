@@ -54,6 +54,7 @@ use crate::terminal_observe::{
 };
 use crate::terminal_protocol::{
     Fido2Account, PanePlacement, SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent,
+    ReadyRecordVerdict, TerminalReadyRecord, classify_ready_record,
 };
 use crate::terminal_retained_replay_policy::{
     RETAINED_EMPTY_XTERM_SURFACE_PROBLEM, RetainedRehydrateMode,
@@ -19110,6 +19111,13 @@ struct ShellState {
     terminal_sessions_applied_content: HashMap<String, TerminalAppliedContentRecord>,
     /// the tuple this mount's live receipt must carry (armed at mount).
     terminal_expected_applied_tuple: HashMap<String, TerminalExpectedAppliedTuple>,
+    /// [e-r5] The daemon-named PTY incarnation per session — the render
+    /// cache the host div's data-terminal-runtime-spawn-id freezes from.
+    /// Fed ONLY by authoritative daemon answers (the stream/seed
+    /// adoption seams); a name is never downgraded on rejection (sol s30
+    /// Q2: the protection must not be defeatable by the evidence it
+    /// rejected) and 0 never overwrites a name.
+    terminal_runtime_spawn_ids: HashMap<String, u64>,
     /// CONTENT claims parked pending a receipt (ack-arrival promotion).
     terminal_pending_content_claims: HashMap<String, &'static str>,
     /// paint observed but not yet application-qualified (R4).
@@ -21676,6 +21684,7 @@ impl ShellState {
             terminal_sessions_painted: HashSet::new(),
             terminal_sessions_applied_content: HashMap::new(),
             terminal_expected_applied_tuple: HashMap::new(),
+            terminal_runtime_spawn_ids: HashMap::new(),
             terminal_pending_content_claims: HashMap::new(),
             terminal_sessions_paint_pending: HashSet::new(),
             reveal_log: VecDeque::new(),
@@ -29016,6 +29025,7 @@ impl ShellState {
         self.terminal_sessions_painted.remove(session_path);
         self.terminal_sessions_applied_content.remove(session_path);
         self.terminal_expected_applied_tuple.remove(session_path);
+        self.terminal_runtime_spawn_ids.remove(session_path);
         self.terminal_pending_content_claims.remove(session_path);
         self.terminal_sessions_paint_pending.remove(session_path);
         if self
@@ -29659,6 +29669,26 @@ impl ShellState {
             }
         }
         true
+    }
+
+    /// [e-r5] THE RUNTIME NAME MAP: adopt a daemon-named PTY incarnation
+    /// for the session — the render cache the div attr freezes from.
+    /// Zero never writes (0 = unnamed); a later answer's name replaces an
+    /// earlier one (loop order = recency; the seams trace the adoption).
+    fn note_terminal_runtime_spawn_id(&mut self, session_path: &str, runtime_spawn_id: u64) {
+        if runtime_spawn_id == 0 {
+            return;
+        }
+        self.terminal_runtime_spawn_ids
+            .insert(session_path.to_string(), runtime_spawn_id);
+    }
+
+    /// The session's daemon-named runtime id, 0 = unnamed.
+    fn terminal_runtime_spawn_id_for(&self, session_path: &str) -> u64 {
+        self.terminal_runtime_spawn_ids
+            .get(session_path)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// [Q7-R3] Arm the first-live-write receipt expectation for THIS mount.
