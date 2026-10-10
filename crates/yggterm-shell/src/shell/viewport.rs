@@ -6996,6 +6996,9 @@ fn TerminalCanvas(
             let mut force_remote_restart_attempted = false;
             let mut protected_remote_restore_attempted = false;
             let mut post_attach_read_recovery_attempts = 0_u64;
+            // [11.229](b)] First-error stamp of the CURRENT established-frame
+            // read-error streak; None = no streak. Reset on every answered read.
+            let mut established_read_error_held_since_ms: Option<u64> = None;
             // Latch so the exhausted-transport release fires once per mount rather
             // than on every subsequent event that still sees the spent budget.
             let mut transport_error_input_released = false;
@@ -13827,6 +13830,10 @@ fn TerminalCanvas(
                                 // so a later raise can serve a retained remote
                                 // host on this evidence instead of remounting.
                                 record_terminal_remote_runtime_read_ok(&session_path);
+                                // [11.229](b)] An answered read ends any
+                                // established-frame error streak — the hold
+                                // window measures CONTINUOUS errors only.
+                                established_read_error_held_since_ms = None;
                                 // [11.229](b)] Runtime-identity change: the
                                 // daemon replaced the runtime under this mount.
                                 // Edge-triggered (two KNOWN ids differing), so
@@ -16885,14 +16892,49 @@ fn TerminalCanvas(
                                             }),
                                         );
                                     }
-                                    // Keep the one mounted surface alive. The
-                                    // next read gets a chance to prove recovery;
-                                    // no remount, input disable, or reset is
-                                    // allowed on this established-frame path.
-                                    read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
-                                    next_read_deadline = tokio::time::Instant::now()
-                                        + Duration::from_millis(read_poll_ms);
-                                    continue;
+                                    // Keep the one mounted surface alive while
+                                    // the errors stay TRANSIENT ([11.167]'s
+                                    // restart-gap design — the next successful
+                                    // read is the honest rising edge). But an
+                                    // owner-flip whose reads ERROR forever used
+                                    // to freeze the DEAD runtime's last frame
+                                    // with no bound: the identity signal needs
+                                    // an ANSWER carrying a new runtime_spawn_id,
+                                    // and errors never answer. Past the
+                                    // escalation window the hold STOPS holding
+                                    // and falls through to the post-attach
+                                    // machinery (recovery retries -> exhaustion
+                                    // -> the parked-claim ladder, whose
+                                    // re-attest probe can promote when the
+                                    // runtime answers again).
+                                    let now_ms = current_millis();
+                                    let held_since_ms = established_read_error_held_since_ms
+                                        .get_or_insert(now_ms);
+                                    if should_escalate_established_read_error(
+                                        *held_since_ms,
+                                        now_ms,
+                                    ) {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "read_error_held_frame_escalated",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "held_ms": now_ms
+                                                    .saturating_sub(*held_since_ms),
+                                                "error": error.to_string(),
+                                            }),
+                                        );
+                                        established_read_error_held_since_ms = None;
+                                        // Fall through: the ladder below treats
+                                        // this as a fresh post-attach error.
+                                    } else {
+                                        read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                                        next_read_deadline = tokio::time::Instant::now()
+                                            + Duration::from_millis(read_poll_ms);
+                                        continue;
+                                    }
                                 }
                                 if should_retry_terminal_initial_read_error(
                                     attached_or_visible,
@@ -21002,6 +21044,14 @@ async fn terminal_read_async(
     // replaced-runtime signal for a mounted client.
     u64,
 )> {
+    // [11.229](b) RIG HOOK — deterministic read errors for the readerr
+    // falsifier: YGGTERM_TEST_READ_ERROR_FILE names a file whose first line
+    // is a session marker (empty = every session). The file's ABSENCE keeps
+    // the hook inert, so a rig can arm it mid-flight by creating the file.
+    // Production never sets the env.
+    if let Some(error) = test_forced_terminal_read_error(&session_path) {
+        return Err(error);
+    }
     run_dedicated_terminal_io("terminal_read", trace_home, move || {
         terminal_read(&endpoint, &session_path, cursor)
     })
@@ -24025,6 +24075,37 @@ fn terminal_read_cursor_rewound(previous_cursor: u64, next_cursor: u64) -> bool 
 /// field, or the pre-adoption state): ADOPT, never trigger — the signal is a
 /// CHANGE between two KNOWN ids, so a fresh mount or a cross-version peer
 /// can never fire it spuriously.
+/// [11.229](b)] How long an established remote frame may be HELD on
+/// continuous read errors before the hold escalates to the post-attach
+/// recovery ladder. Generous on purpose: [11.167]'s restart gap is
+/// TRANSIENT and must hold; only an owner-flip whose reads error forever
+/// crosses the window.
+pub(crate) const TERMINAL_ESTABLISHED_FRAME_READ_ERROR_ESCALATION_MS: u64 = 30_000;
+
+/// [11.229](b)] True when the established-frame read-error hold has lasted
+/// past the escalation window. The caller resets the streak on every
+/// successful read (the [11.167] rising-edge discipline).
+pub(crate) fn should_escalate_established_read_error(held_since_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(held_since_ms)
+        >= TERMINAL_ESTABLISHED_FRAME_READ_ERROR_ESCALATION_MS
+}
+
+/// [11.229](b) RIG HOOK — the read-error injector (see the call site).
+fn test_forced_terminal_read_error(session_path: &str) -> Option<anyhow::Error> {
+    let path = std::env::var("YGGTERM_TEST_READ_ERROR_FILE").ok()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let marker = raw.split('\n').next().unwrap_or("").trim();
+    if !marker.is_empty() && !session_path.contains(marker) {
+        return None;
+    }
+    // The message deliberately matches the RECOVERABLE daemon-response
+    // class ([11.228] measured it live) so the rig exercises the retry
+    // machinery, not the permanent-error skip.
+    Some(anyhow::anyhow!(
+        "reading daemon response — test-forced read error (rig hook)",
+    ))
+}
+
 fn terminal_stream_runtime_replaced(known_spawn_id: u64, answer_spawn_id: u64) -> bool {
     known_spawn_id != 0 && answer_spawn_id != 0 && answer_spawn_id != known_spawn_id
 }
