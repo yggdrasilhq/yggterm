@@ -435,18 +435,84 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   satisfies_a_named_expectation, an_arm_after_an_epoch_bump_retires_
   the_dead_tuples_parked_state, a_runtime_replacement_with_a_stable_
   epoch_retires_the_old_expectations_state, an_accepted_receipt_with_
-  nothing_parked_promotes_nothing. STILL OPEN (the (e-r4) residue,
-  next unit — DESIGNED, deliberately deferred): the runtime NAMING
-  chain (render data-terminal-runtime-spawn-id on the host div ->
-  the page tuple freezes it at construction -> the ready handshake
-  record CARRIES the frozen tuple -> the arm binds exactly what the
-  page froze — one source, zero render/arm divergence; the predicate
-  rule above makes the name binding the moment it engages); sol Q1's
-  stale-caller credit (claims carry no originating attempt identity);
-  the wedge-1 re-attest scheduling (unchanged); page_gen comparison
-  (stored, never compared — the seed path records page_gen 0 by
-  convention, naming it needs the seed proof to carry the page gen);
-  wedge 2 (snapshot missing-vs-empty) untouched.
+  nothing_parked_promotes_nothing.
+  (e-r5) THE RUNTIME NAMING CHAIN + THE ADOPTION/RETIREMENT SEAM —
+  CLOSED IN CODE 2026-10-10 (sitting 30, zcode seat, lane
+  lane/e5/runtime-naming; sol round
+  lores/chain-of-thought/2026-10-10-yggterm-s30-runtime-naming-sol-round.md,
+  Q1/Q3/Q4 accept, Q2 REBUT adopted): the arm binds EXACTLY what the
+  page froze — one source, zero render/arm divergence, and the S28-2
+  named-runtime predicate finally LIVE in production. (1) THE CHAIN:
+  the render writes data-terminal-runtime-spawn-id from the new
+  terminal_runtime_spawn_ids state map (fed ONLY by authoritative
+  daemon answers — the stream seam, and the seed answer INDEPENDENT
+  of output_seq>0, sol s30 Q2: the old adoption site lived inside the
+  seq>0 branch so a valid empty answer never named; teardown drops
+  the name with the render state; a name is never downgraded on
+  rejection); the page freezes the attr into ONE captured tuple at
+  construction (__acFrozenTuple — the entry arm, the ready record,
+  the alive record, and the resend all attest the SAME object, never
+  a re-read of the DOM or the current registry: a replaced entry must
+  not be attested under the original's ready); the ready record rides
+  ALL THREE carriers (the bridge event's nested record
+  {session,epoch,runtime,gen}, the alive record's readyRecord at
+  "posted", the page's resend) and BOTH js_ready legs classify before
+  the duplicate guard may be won (payload-free = CONTROL — the
+  asset-failure path has no constructed entry to attest; a
+  session/epoch mismatch or a partial payload = MALFORMED, never a
+  silent guard win — it would swallow the well-formed resend and the
+  name would never engage); terminal_stage_js_ready arms with the
+  page-frozen runtime and the applied_content_armed trace reports the
+  STORED expectation (runtime + host_id). (2) THE RETIREMENT SEAM
+  (the Q2 rebut — the chain ALONE made the runtime-swap window WORSE:
+  a surviving frozen 7 would mislabel runtime-9 bytes under the old
+  name AND reject the new runtime's true seed receipts):
+  runtime_name_requires_remount extends the two-known-id edge trigger
+  with the frozen-NAME mismatch (known starts 0 — the first answer vs
+  a nonzero frozen name was the missed case); on trigger the seam
+  adopts the new name FIRST (the fresh render freezes it), then
+  breaks with arm_remount — a fresh entry generation re-freezes,
+  re-readies, re-arms; the S28-2 prev-tuple cleanup retires the
+  stored evidence; the old JS issuer dies with the registry
+  replacement; undelivered bytes re-feed through the retained/replay
+  path. An unnamed mount NEVER retires on learning a name (the
+  provisional first-mount policy, sol s30 Q3 — a seed-arrival
+  re-render never mutates a frozen tuple; the name engages on the
+  next construction). RIG: fence-rig MODE=naming — RED rc15 on
+  hook-only main (main + the page injection hook only: the foreign
+  runtime 901 receipt ACCEPTED under the unnamed arm through the
+  PRODUCTION applied_content ingress — the vacuous predicate live);
+  GREEN rc0 on the lane (arm NAMED 77 via the seeded render name:
+  foreign 901 rejected everywhere, the matched control accepted,
+  unbound-0 rejected — S28-2 live at the ingress; row healthy);
+  GREEN rc0 WARM (FENCE_RIG_NAMING_WARM=1: bridge IPC suppressed, the
+  alive record ALONE carried the frozen name — carrier 2 proven). The
+  (a) bar gates the retirement via YGGTERM_TEST_DISABLE_NAMED_REMOUNT
+  =1 — measured live: the seeded synthetic name legitimately
+  contradicts the daemon's real runtime ids (µs-scale), and the
+  retirement working AS DESIGNED killed the mount mid-bar (two armed
+  generations, the injection ticks dead with the demoted eval
+  context). ALL SIX prior fence bars re-proven green on the lane
+  (provenance/blank/order/dup/loss/negative). LOCKS:
+  a_ready_record_classifies_control_named_and_malformed,
+  the_wire_parses_a_payload_free_ready_a_full_record_and_a_partial_
+  error, a_partial_alive_ready_record_is_malformed_not_control,
+  a_frozen_name_the_answer_contradicts_demands_a_fresh_generation,
+  the_runtime_name_map_renders_what_the_answers_named,
+  the_naming_chain_sources_are_locked. STILL OPEN (the (e-r5)
+  residue): the (b) end-to-end arm — a matched receipt from an ACTUAL
+  current-entry write callback (the provenance-probe class combined
+  with naming), and the same-epoch runtime-replacement arm (establish
+  R, daemon swaps to F, verify the retirement chain end-to-end: old
+  qualification retired, fresh generation armed on F, late R evidence
+  rejected, current F accepted with visible content) — the retirement
+  machinery is construction-locked (the predicate unit locks + the
+  terminal_runtime_named_remount trace detector) but has NO rig bar
+  yet; then sol Q1's stale-caller credit (claims carry no originating
+  attempt identity); the wedge-1 re-attest scheduling (unchanged);
+  page_gen comparison (stored, never compared — the seed path records
+  page_gen 0 by convention, naming it needs the seed proof to carry
+  the page gen); wedge 2 (snapshot missing-vs-empty) untouched.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
