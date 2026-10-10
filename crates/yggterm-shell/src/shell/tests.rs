@@ -60512,7 +60512,7 @@ fn the_ack_arrival_promotion_completes_a_parked_claim_and_pending_paint() {
             page_gen: 3,
             source: "live_write",
         },
-    );
+    ).promoted;
     assert!(promoted);
     assert!(shell.terminal_resume_ready_paths.contains(session_path));
     assert!(shell.terminal_session_has_visual_resume_reveal(session_path));
@@ -60544,7 +60544,7 @@ fn a_foreign_epoch_or_runtime_receipt_never_promotes() {
             page_gen: 0,
             source: "live_write",
         },
-    );
+    ).promoted;
     assert!(!promoted, "a foreign epoch must reject");
     assert!(!shell.terminal_resume_ready_paths.contains(session_path));
     // foreign RUNTIME (named expectation 7, receipt claims 9):
@@ -60559,7 +60559,7 @@ fn a_foreign_epoch_or_runtime_receipt_never_promotes() {
             page_gen: 0,
             source: "live_write",
         },
-    );
+    ).promoted;
     assert!(!promoted, "a foreign runtime must reject");
     // the matching tuple releases:
     let promoted = shell.record_terminal_applied_content(
@@ -60573,7 +60573,7 @@ fn a_foreign_epoch_or_runtime_receipt_never_promotes() {
             page_gen: 0,
             source: "live_write",
         },
-    );
+    ).promoted;
     assert!(promoted, "the matching tuple promotes");
     assert!(shell.terminal_resume_ready_paths.contains(session_path));
 }
@@ -60635,10 +60635,192 @@ fn a_valid_blank_receipt_qualifies_content_without_cursor_motion() {
             page_gen: 0,
             source: "seed_proof",
         },
-    );
+    ).promoted;
     assert!(promoted, "the blank repaint's own control bytes earn the receipt");
     assert!(shell.terminal_resume_ready_paths.contains(session_path));
 }
+// ---------------------------------------------------------------------------
+// [S28-1/S28-2/Q3] THE (e-r4) PROVENANCE LOCKS (sitting 29, sol s28 round
+// 2): the runtime-zero rule, the previous-expectation cleanup, and the
+// accepted/promoted split. The PAGE-side S28-1 falsifier (a held callback
+// across same-host replacement) is fence-rig MODE=provenance — these lock
+// the Rust boundary of the same indictment.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unbound_runtime_receipt_never_satisfies_a_named_expectation() {
+    // sol s28 S28-2 (probe line 1): expected 7 + receipt runtime 0 used to
+    // pass BOTH predicates (the old rule rejected only when both runtimes
+    // were nonzero). A receipt runtime of 0 is UNBOUND, not a wildcard.
+    let session_path = "remote-session://dev/runtime-zero";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-z", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 7);
+    shell.terminal_pending_content_claims
+        .insert(session_path.to_string(), "visual_reveal");
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(
+        !outcome.accepted,
+        "an unbound (0) receipt must not satisfy the named runtime 7"
+    );
+    assert!(!outcome.promoted);
+    assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    assert!(!shell.terminal_session_applied_receipt_qualifies(session_path));
+    // The UNNAMED expectation stays provisional (the production arm
+    // convention when the mount does not know its runtime): the epoch +
+    // session qualifiers bind. The re-arm below changes the tuple, so the
+    // parked claim retires with it — re-park to prove the promotion.
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    assert!(
+        !shell.terminal_pending_content_claims.contains_key(session_path),
+        "the named-tuple era's parked claim retired with the re-arm"
+    );
+    shell.terminal_pending_content_claims
+        .insert(session_path.to_string(), "visual_reveal");
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 9,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(outcome.accepted, "an unnamed expectation binds by epoch only");
+    assert!(outcome.promoted);
+    assert!(shell.terminal_resume_ready_paths.contains(session_path));
+}
+
+#[test]
+fn an_arm_after_an_epoch_bump_retires_the_dead_tuples_parked_state() {
+    // sol s28 S28-2 (probe line 2): the old cleanup compared against
+    // terminal_mount_epochs, so an arm that ran AFTER the epoch map was
+    // already bumped read "unchanged" — the dead tuple's parked claim and
+    // pending paint survived for a CURRENT receipt to consume.
+    let session_path = "remote-session://dev/arm-after-bump";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-b", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    shell.terminal_pending_content_claims
+        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_sessions_paint_pending.insert(session_path.to_string());
+    // The epoch map bumps FIRST (the authoritative transition), then the
+    // new mount arms — exactly the order the old comparison mis-read.
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 2);
+    shell.arm_terminal_applied_content(session_path, 2, 0);
+    assert!(
+        !shell.terminal_pending_content_claims.contains_key(session_path),
+        "the dead tuple's parked claim retires with the arm"
+    );
+    assert!(
+        !shell.terminal_sessions_paint_pending.contains(session_path),
+        "the dead tuple's pending paint retires with the arm"
+    );
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 2,
+            runtime_spawn_id: 0,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(outcome.accepted);
+    assert!(!outcome.promoted, "no dead state left to promote");
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+}
+
+#[test]
+fn a_runtime_replacement_with_a_stable_epoch_retires_the_old_expectations_state() {
+    // sol s28 Q5: replacement can occur WITHOUT an epoch change — the
+    // runtime dimension is the discriminator there, and the
+    // previous-expectation cleanup keys on EITHER tuple field.
+    let session_path = "remote-session://dev/runtime-swap";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-s", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 5);
+    shell.arm_terminal_applied_content(session_path, 5, 9);
+    shell.terminal_pending_content_claims
+        .insert(session_path.to_string(), "visual_reveal");
+    shell.terminal_sessions_paint_pending.insert(session_path.to_string());
+    // Runtime re-spawn, epoch unchanged: the arm's tuple still changes.
+    shell.arm_terminal_applied_content(session_path, 5, 12);
+    assert!(
+        !shell.terminal_pending_content_claims.contains_key(session_path),
+        "the dead runtime's parked claim retires with the re-arm"
+    );
+    assert!(
+        !shell.terminal_sessions_paint_pending.contains(session_path),
+        "the dead runtime's pending paint retires with the re-arm"
+    );
+    // A receipt naming the DEAD runtime must not qualify either.
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 5,
+            runtime_spawn_id: 9,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(!outcome.accepted, "the dead runtime's receipt must reject");
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+}
+
+#[test]
+fn an_accepted_receipt_with_nothing_parked_promotes_nothing() {
+    // sol s28 Q3: `promoted == false` is LEGAL for an accepted receipt with
+    // nothing parked — the old single bool could not serve as an acceptance
+    // flag, which is exactly why the seed paint gate now reads `accepted`.
+    let session_path = "remote-session://dev/accepted-unpromoted";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-u", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 64,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(outcome.accepted, "the tuple matches: the receipt is stored");
+    assert!(!outcome.promoted, "nothing was parked — nothing promotes");
+    assert!(shell.terminal_session_applied_receipt_qualifies(session_path));
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+}
+
 
 }
 

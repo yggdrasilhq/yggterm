@@ -8981,11 +8981,12 @@ fn TerminalCanvas(
                                 // CURRENT state, store it, and promote any
                                 // parked CONTENT claim / pending paint.
                                 let mut promoted = false;
+                                let mut accepted = false;
                                 let _ = safe_shell_mut(
                                     state,
                                     "terminal_applied_content_promoted",
                                     |shell| {
-                                        promoted = shell.record_terminal_applied_content(
+                                        let outcome = shell.record_terminal_applied_content(
                                             &applied_session,
                                             TerminalAppliedContentRecord {
                                                 mount_epoch: applied_epoch,
@@ -8997,6 +8998,8 @@ fn TerminalCanvas(
                                                 source: "live_write",
                                             },
                                         );
+                                        promoted = outcome.promoted;
+                                        accepted = outcome.accepted;
                                         if promoted {
                                             shell
                                                 .maybe_finish_terminal_surface_request_for_session(
@@ -9017,6 +9020,7 @@ fn TerminalCanvas(
                                         "wrote": applied_wrote,
                                         "blank": applied_blank,
                                         "promoted": promoted,
+                                        "accepted": accepted,
                                         "source": "live_write",
                                     }),
                                 );
@@ -12901,7 +12905,7 @@ fn TerminalCanvas(
                                             // observability see every
                                             // application, not only the
                                             // ack-arrival order.
-                                            let seed_record_promoted = shell
+                                            let seed_outcome = shell
                                                 .record_terminal_applied_content(
                                                     &session_path,
                                                     record,
@@ -12920,13 +12924,35 @@ fn TerminalCanvas(
                                                         .get("blank")
                                                         .and_then(Value::as_bool)
                                                         .unwrap_or(false),
-                                                    "promoted": seed_record_promoted,
+                                                    "promoted": seed_outcome.promoted,
+                                                    "accepted": seed_outcome.accepted,
                                                     "source": "seed_proof",
                                                 }),
                                             );
-                                            shell.note_terminal_session_painted_for_mount_epoch(
-                                                &session_path,
-                                                mount_epoch,
+                                            // [Q3/s28] THE PAINT GATE: the seed's paint
+                                            // witness advances ONLY on an ACCEPTED receipt —
+                                            // a FOREIGN-rejected record (epoch+1000) must
+                                            // not earn paint at the current epoch (sol s28
+                                            // Q3). `promoted` cannot gate this:
+                                            // accepted-with-nothing-parked legally promotes
+                                            // nothing.
+                                            let seed_paint_noted = seed_outcome.accepted
+                                                && shell
+                                                    .note_terminal_session_painted_for_mount_epoch(
+                                                        &session_path,
+                                                        mount_epoch,
+                                                    );
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "applied_content_seed_paint",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "epoch": mount_epoch,
+                                                    "noted": seed_paint_noted,
+                                                    "accepted": seed_outcome.accepted,
+                                                }),
                                             );
                                         },
                                     );
@@ -22049,8 +22075,12 @@ fn stage_applied_content_probe(
             source: "reattest_probe",
         };
         let mut promoted = false;
+        let mut accepted = false;
         let _ = safe_shell_mut(state, "terminal_applied_content_reattested", |shell| {
-            promoted = shell.record_terminal_applied_content(&session_path, record.clone());
+            let outcome =
+                shell.record_terminal_applied_content(&session_path, record.clone());
+            promoted = outcome.promoted;
+            accepted = outcome.accepted;
             if promoted {
                 shell.maybe_finish_terminal_surface_request_for_session(&session_path);
             }
@@ -22063,6 +22093,7 @@ fn stage_applied_content_probe(
             json!({
                 "session_path": session_path.clone(),
                 "promoted": promoted,
+                "accepted": accepted,
             }),
         );
     })

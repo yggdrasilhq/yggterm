@@ -818,6 +818,15 @@ fn terminal_eval_script_with_canvas_renderer(
     let applied_content_foreign = std::env::var("YGGTERM_TEST_APPLIED_CONTENT_FOREIGN")
         .map(|value| value == "1")
         .unwrap_or(false);
+    // [S28-1 RIG ARM] the held-callback falsifier hook: replace the host
+    // registry entry synchronously right after the first live write is
+    // ISSUED, before the async write callback can fire — fence-rig's
+    // provenance bar (RED: the old helper minted the replacement's receipt
+    // for the original's bytes; GREEN: the callback bails entry_replaced).
+    let applied_content_replace_midwrite =
+        std::env::var("YGGTERM_TEST_APPLIED_CONTENT_REPLACE_MIDWRITE")
+            .map(|value| value == "1")
+            .unwrap_or(false);
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -12531,31 +12540,64 @@ fn terminal_eval_script_with_canvas_renderer(
             // the event; Rust validates against current state before any
             // promotion. The WITHHOLD hook is the rig's negative-control
             // arm; FOREIGN is the tuple-mismatch arm.
-            const noteAppliedLive = (wroteLen) => {{
+            // [S28-1] ISSUANCE CAPTURE: the helper no longer resolves the
+            // registry at callback time. Everything a receipt may claim is
+            // captured by the ISSUER at write issuance (the entry object,
+            // its tuple object, the eligibility flag, and the flush
+            // supersession) and revalidated here against the registry — a
+            // callback from entry A held across same-host replacement by B
+            // must NEVER resolve B to acknowledge bytes parsed by A (sol
+            // s28 S28-1: the old shape consumed B's eligibility and minted
+            // B's tuple for A's write; a same-entry supersession change
+            // published too).
+            const __acReplaceMidwrite = {applied_content_replace_midwrite};
+            const noteAppliedLive = (wroteLen, issueEntry, issueTuple, issueEligible, issueSupersession) => {{
                 try {{
-                    const __acEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
-                    if (!__acEntry || !__acEntry.appliedContentEligible || !__acEntry.appliedContentTuple) {{
-                        // [Q7-R3 DIAG] the bail reason is a trace event: no
-                        // entry (host-id mismatch?), not eligible (arm stamp
-                        // missed), or no tuple. One-shot: log the FIRST bail
-                        // per entry only (the mount banner writes several
-                        // batches; the reason repeats).
+                    const __acBail = (__reason) => {{
+                        // [Q7-R3 DIAG] one-shot per host: the mount banner
+                        // writes several batches; the first bail names the
+                        // reason and the repeats are noise.
                         if (!(window.__yggtermAppliedLiveBailLogged || {{}})[hostId]) {{
                             (window.__yggtermAppliedLiveBailLogged = window.__yggtermAppliedLiveBailLogged || {{}})[hostId] = true;
-                            const __reason = !__acEntry ? "no_entry" : (!__acEntry.appliedContentEligible ? "not_eligible" : "no_tuple");
                             sendTerminalEvent({{ kind: "debug", message: `appliedLive bail reason=${{__reason}} host=${{hostId}} registryKeys=${{Object.keys(window.__yggtermXtermHosts || {{}}).slice(0, 4).join(",")}} armLog=${{JSON.stringify((window.__yggtermAppliedArmLog || []).slice(-3))}}` }});
                         }}
+                    }};
+                    const __registryEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    // REGISTRY IDENTITY FIRST: the callback belongs to the
+                    // incarnation that ISSUED the write. A registry that no
+                    // longer maps hostId to the issuing entry — replaced OR
+                    // removed — makes this callback a dead incarnation's: it
+                    // must not consume the successor's eligibility or mint
+                    // its receipt, whatever the registry now holds.
+                    if (!issueEntry || __registryEntry !== issueEntry) {{
+                        __acBail(!issueEntry ? "no_issue_entry" : "entry_replaced");
                         return;
                     }}
-                    __acEntry.appliedContentEligible = false;
-                    if (__acEntry.appliedContentWithhold) {{
+                    if (!issueEligible || !issueTuple) {{
+                        __acBail(!issueEligible ? "not_eligible" : "no_tuple");
+                        return;
+                    }}
+                    // UNCHANGED QUALIFICATION: the entry still holds the
+                    // same tuple OBJECT, the same flush supersession, and
+                    // an unconsumed eligibility flag — nothing re-armed or
+                    // superseded it while the write was in flight.
+                    if (
+                        issueEntry.appliedContentTuple !== issueTuple
+                        || Number(issueEntry.flushSupersession || 0) !== issueSupersession
+                        || !issueEntry.appliedContentEligible
+                    ) {{
+                        __acBail("qualification_changed");
+                        return;
+                    }}
+                    issueEntry.appliedContentEligible = false;
+                    if (issueEntry.appliedContentWithhold) {{
                         sendTerminalEvent({{ kind: "debug", message: `appliedLive withheld host=${{hostId}}` }});
                         return;
                     }}
-                    const __acTuple = __acEntry.appliedContentTuple;
-                    __acEntry.appliedContent = {{
+                    const __acTuple = issueTuple;
+                    issueEntry.appliedContent = {{
                         session: __acTuple.session,
-                        epoch: __acEntry.appliedContentForeign ? (__acTuple.epoch + 1000) : __acTuple.epoch,
+                        epoch: issueEntry.appliedContentForeign ? (__acTuple.epoch + 1000) : __acTuple.epoch,
                         runtime: __acTuple.runtime,
                         wrote: wroteLen,
                         blank: false,
@@ -12565,12 +12607,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     }};
                     sendTerminalEvent({{
                         kind: 'applied_content',
-                        session: __acEntry.appliedContent.session,
-                        epoch: __acEntry.appliedContent.epoch,
-                        runtime: __acEntry.appliedContent.runtime,
+                        session: issueEntry.appliedContent.session,
+                        epoch: issueEntry.appliedContent.epoch,
+                        runtime: issueEntry.appliedContent.runtime,
                         wrote: wroteLen,
                         blank: false,
-                        ts: __acEntry.appliedContent.ts,
+                        ts: issueEntry.appliedContent.ts,
                         page_gen: __acTuple.gen,
                     }});
                 }} catch (_appliedError) {{}}
@@ -12776,7 +12818,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     && payload.includes('\x1b[?2026h')
                     && payload.includes('\x1b[?2026l');
                 const syncWriteBypassFrameBudget =
-                    rawFrameLike
+                    __acReplaceMidwrite
+                    || rawFrameLike
                     || rawSynchronizedSmallFrame
                     || terminalPayloadLooksSynchronizedRepaintFrame(payload)
                     || terminalPayloadLooksInlineStatusRewrite(payload)
@@ -12792,16 +12835,52 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (window.__yggtermTrace && window.__yggtermTrace.captureStream) {{
                     window.__yggtermTrace.captureStream(hostId, "live_stream", payload);
                 }}
+                // [S28-1] THE ISSUANCE CAPTURE (see noteAppliedLive): the
+                // writing entry, its tuple object, the eligibility flag,
+                // and the flush supersession — frozen HERE, consumed only
+                // after the callback revalidates them against the registry.
+                const __acIssueEntry = entry;
+                const __acIssueTuple = entry && entry.appliedContentTuple ? entry.appliedContentTuple : null;
+                const __acIssueEligible = Boolean(entry && entry.appliedContentEligible);
+                const __acIssueSupersession = entry ? Number(entry.flushSupersession || 0) : 0;
                 if (preferSyncWrite) {{
                     syncWrite(payload);
-                    noteAppliedLive(renderPayloadLength);
+                    noteAppliedLive(renderPayloadLength, __acIssueEntry, __acIssueTuple, __acIssueEligible, __acIssueSupersession);
                     finalizeWriteFlush(flushShouldFollow, false, paintRepairReason);
                     return;
                 }}
                 term.write(payload, () => {{
-                    noteAppliedLive(renderPayloadLength);
+                    noteAppliedLive(renderPayloadLength, __acIssueEntry, __acIssueTuple, __acIssueEligible, __acIssueSupersession);
                     finalizeWriteFlush(flushShouldFollow, true, paintRepairReason);
                 }});
+                // [S28-1 RIG ARM] the held-callback falsifier: replace the
+                // registry entry SYNCHRONOUSLY after issuance, before the
+                // async write callback can fire. The replacement is a
+                // shallow copy (live term/bridge refs intact) with a fresh
+                // arm — on the unfixed shape the callback mints the
+                // REPLACEMENT's receipt for the original's bytes. The
+                // tuple's epoch rides +50: real remount epochs cannot reach
+                // the armed epoch +50 inside the bar window, so every
+                // epoch+50 receipt names THIS replacement unambiguously
+                // (the rig's RED/GREEN ordering discriminator). The fired
+                // marker debug event is the bar's engagement proof — a
+                // GREEN without it would be vacuous.
+                if (__acReplaceMidwrite && !window.__yggtermAcReplaceFired && __acIssueTuple) {{
+                    window.__yggtermAcReplaceFired = true;
+                    window.__yggtermXtermHosts[hostId] = Object.assign({{}}, __acIssueEntry, {{
+                        appliedContentEligible: true,
+                        appliedContentTuple: {{
+                            session: __acIssueTuple.session,
+                            epoch: __acIssueTuple.epoch + 50,
+                            runtime: __acIssueTuple.runtime,
+                            gen: __acIssueTuple.gen + 1,
+                        }},
+                        appliedContentForeign: false,
+                        appliedContentWithhold: false,
+                        appliedContent: null,
+                    }});
+                    sendTerminalEvent({{ kind: "debug", message: `appliedLive rig replace-midwrite fired host=${{hostId}} epoch=${{__acIssueTuple.epoch}} replacement_epoch=${{__acIssueTuple.epoch + 50}}` }});
+                }}
             }} catch (error) {{
                 if (entry) {{
                     entry.writeBridgeInFlight = false;
@@ -13691,6 +13770,32 @@ fn terminal_eval_script_with_canvas_renderer(
         {constructed_debug}
         sendTerminalEvent({{ kind: "ready" }});
         __yggNoteMountAlive("posted");
+        // [S28-1 RIG ARM] the deterministic live-write driver: rig rows
+        // mount through the synthesized path whose content rides seeds —
+        // the live write bridge may never issue organically (measured s29
+        // run 2: zero xterm_write_flush on the healthy probe-type shape).
+        // The probe guarantees ONE real flushPendingWrite run against the
+        // REAL entry: the issuance capture, the write arm, the registry
+        // replacement injection, and the callback validation all execute
+        // the production code path — only the existence of a write is
+        // constructed (same class as the daemon capture-stall hooks).
+        if (__acReplaceMidwrite && !window.__yggtermAcProbeFired) {{
+            window.__yggtermAcProbeFired = true;
+            setTimeout(() => {{
+                try {{
+                    const __pEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    if (__pEntry && __pEntry.appliedContentTuple && __pEntry.appliedContentEligible) {{
+                        __pEntry.writeBridgeInFlight = false;
+                        __pEntry.writeBridgePendingData = String(__pEntry.writeBridgePendingData || "") + "\r\n__ACPROBE__\r\n";
+                        flushPendingWrite();
+                    }} else {{
+                        sendTerminalEvent({{ kind: "debug", message: `appliedLive rig probe skipped host=${{hostId}}` }});
+                    }}
+                }} catch (__pError) {{
+                    sendTerminalEvent({{ kind: "debug", message: `appliedLive rig probe error=${{String(__pError)}} host=${{hostId}}` }});
+                }}
+            }}, 0);
+        }}
         // [11.178]-c2 RE-REQUEST ARM. A "posted" mount whose ready event was
         // shed in the IPC window never reaches Rust; the gate's liveness
         // poll re-calls this to re-post ready until one lands. Rust's
