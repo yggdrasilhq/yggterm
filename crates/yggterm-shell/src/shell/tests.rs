@@ -61329,6 +61329,100 @@ fn attempt_churn_voids_the_dead_attempt_s_parked_claim() {
 }
 
 #[test]
+fn a_qualifying_stored_receipt_releases_the_latch_instead_of_parking() {
+    // [e9 sol s35 Q4] the rig-vacuity trap locked at state level:
+    // park_terminal_content_claim with qualifying evidence must OPEN the
+    // latch, never park — the pending map stays empty.
+    let session_path = "remote-session://dev/stored-receipt-releases";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 32,
+            blank: false,
+            ts: 0,
+            page_gen: 0,
+            source: "live_write",
+        },
+    );
+    assert!(outcome.accepted);
+    shell.park_terminal_content_claim(session_path, "gate_ceiling_release");
+    assert!(
+        !shell.terminal_pending_content_claims.contains_key(session_path),
+        "a qualifying stored receipt must release the latch, not park"
+    );
+    assert!(shell.terminal_resume_ready_paths.contains(session_path));
+}
+
+#[test]
+fn the_reattest_shape_promotes_a_parked_claim_from_re_read_evidence() {
+    // [e9 wedge-1] the idle re-attest shape at state level: the page
+    // entry published a receipt, Rust's stored copy is gone (the rig
+    // hook drops it; a shed push is the production analogue), a fresh
+    // attempt parks — the probe's re-read of the SAME receipt must
+    // promote the claim.
+    let session_path = "remote-session://dev/reattest-promotes";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let published = TerminalAppliedContentRecord {
+        mount_epoch: 1,
+        runtime_spawn_id: 0,
+        wrote: 32,
+        blank: false,
+        ts: 0,
+        page_gen: 0,
+        source: "live_write",
+    };
+    let first = shell.record_terminal_applied_content(session_path, published.clone());
+    assert!(first.accepted);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "reattest", 7, "reattest_rig");
+    shell.terminal_sessions_applied_content.remove(session_path);
+    shell.park_terminal_content_claim(session_path, "reattest_rig_park");
+    assert!(shell.terminal_pending_content_claims.contains_key(session_path));
+    assert!(!shell.terminal_resume_ready_paths.contains(session_path));
+    let reattested = shell.record_terminal_applied_content(session_path, published);
+    assert!(reattested.accepted);
+    assert!(
+        reattested.promoted,
+        "the re-read receipt must promote the parked claim"
+    );
+    assert!(!shell.terminal_pending_content_claims.contains_key(session_path));
+    assert!(shell.terminal_resume_ready_paths.contains(session_path));
+    assert!(shell.terminal_session_has_ready_attempt(session_path));
+}
+
+#[test]
+fn the_probe_decoder_abstains_on_a_null_receipt_and_keeps_blank_evidence() {
+    // [e9 sol s35 Q5] receipt:null constructs NO record (an epoch-0
+    // fabric); a blank receipt object decodes with blank=true preserved.
+    let null_verdict = serde_json::json!({
+        "present": false,
+        "receipt": null,
+        "entry_live": true,
+    });
+    assert!(decode_applied_content_probe_receipt(&null_verdict).is_none());
+    let blank_verdict = serde_json::json!({
+        "present": true,
+        "receipt": { "epoch": 3, "runtime": 0, "wrote": 7, "blank": true, "ts": 9, "gen": 0 },
+        "entry_live": true,
+    });
+    let record =
+        decode_applied_content_probe_receipt(&blank_verdict).expect("a blank receipt decodes");
+    assert_eq!(record.mount_epoch, 3);
+    assert_eq!(record.wrote, 7);
+    assert!(record.blank);
+    assert_eq!(record.source, "reattest_probe");
+}
+
+#[test]
 fn a_stale_caller_leaves_the_current_attempt_s_own_claim_intact() {
     // Preservation (sol s34 Q5): B parks its own claim; a stale caller
     // from A is rejected and B's claim survives untouched.

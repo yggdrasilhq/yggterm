@@ -7344,6 +7344,10 @@ fn TerminalCanvas(
                 std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
             > = None;
             let mut applied_content_probe_next_ms: u64 = 0;
+            // [e9 RIG HOOK] one-shot latch for the re-attest park marker
+            // (YGGTERM_TEST_PARK_CLAIM_FILE — absent = inert).
+            let reattest_park_hook = std::env::var("YGGTERM_TEST_PARK_CLAIM_FILE").is_ok();
+            let mut reattest_park_fired = false;
             // [F1-(e-r1)] The seed's stream-cursor stamp, OUTLIVING the
             // fence: chunks at or below it are inside the seeded screen
             // forever on this mount, so a round that resolves after the
@@ -7668,25 +7672,10 @@ fn TerminalCanvas(
                         // select branch (release precedes the batch that
                         // broke the fence; one fence, one release, one
                         // staged flush).
-                        // [Q7-R2] re-attest probe staging (rate-limited):
-                        // a parked claim for THIS session with no probe in
-                        // flight gets one.
-                        if applied_content_probe_future.is_none()
-                            && current_millis() >= applied_content_probe_next_ms
-                        {
-                            let parked = state.with(|shell| {
-                                shell.terminal_pending_content_claims.contains_key(&session_path)
-                            });
-                            if parked {
-                                applied_content_probe_next_ms = current_millis() + 2000;
-                                applied_content_probe_future = Some(stage_applied_content_probe(
-                                    state,
-                                    host_id.clone(),
-                                    session_path.clone(),
-                                    trace_home.clone(),
-                                ));
-                            }
-                        }
+                        // [e9] the re-attest probe arming moved OUT of this
+                        // output-flush branch (see the hoisted site in the
+                        // pre_select body below) — arming here required
+                        // pending output bytes, so an idle host never armed.
                         if let Some(fence) = released_fence.take() {
                             synth_release_flush_future = Some(stage_synth_release_flush(
                                 fence,
@@ -7715,6 +7704,50 @@ fn TerminalCanvas(
                             protocol_only: false,
                         });
                     }
+                }
+                // [e9 wedge-1] THE RE-ATTEST PROBE ARMING — hoisted OUT of
+                // the output-flush branch above (sol s35 Q1/Q2): arming used
+                // to require pending output bytes (flush_due) on a
+                // synthesized mount with active bridge reads, so an IDLE
+                // host never armed the probe and a parked claim whose
+                // evidence already lived in the page entry never
+                // re-attested (sol s23 R2: reuse re-attests existing
+                // evidence — it does not demand fresh spontaneous output).
+                // The pre_select body runs on every loop wake — the read
+                // poll deadline fires even when idle — and staging only
+                // constructs a pinned future, so the body stays await-free
+                // (the (i-r1) law). Gates kept: js_ready (a page must
+                // exist to read), one probe in flight, the 2s cooldown, a
+                // parked claim for THIS session. Gates dropped:
+                // js_ready_synthesized, bridge-read policy, flush_due —
+                // real mounts publish receipts through the live-write
+                // issuer and the probe script is entryLive-guarded.
+                if js_ready
+                    && applied_content_probe_future.is_none()
+                    && current_millis() >= applied_content_probe_next_ms
+                {
+                    let parked = state.with(|shell| {
+                        shell.terminal_pending_content_claims.contains_key(&session_path)
+                    });
+                    if parked {
+                        applied_content_probe_next_ms = current_millis() + 2000;
+                        applied_content_probe_future = Some(stage_applied_content_probe(
+                            state,
+                            host_id.clone(),
+                            session_path.clone(),
+                            trace_home.clone(),
+                        ));
+                    }
+                }
+                // [e9 RIG HOOK] the re-attest bar's park constructor — the
+                // marker file is absent in production, making this inert.
+                if reattest_park_hook && !reattest_park_fired {
+                    test_park_terminal_content_claim_for_reattest(
+                        state,
+                        &session_path,
+                        &trace_home,
+                        &mut reattest_park_fired,
+                    );
                 }
                 // Post-resize background reconcile: a settled column-resize reflow
                 // may have dropped cell backgrounds (codex composer bg-split bug). Once
@@ -22414,20 +22447,8 @@ fn stage_applied_content_probe(
         if !verdict.get("entry_live").and_then(Value::as_bool).unwrap_or(false) {
             return;
         }
-        let Some(receipt) = verdict.get("receipt") else {
+        let Some(record) = decode_applied_content_probe_receipt(&verdict) else {
             return;
-        };
-        let record = TerminalAppliedContentRecord {
-            mount_epoch: receipt.get("epoch").and_then(Value::as_u64).unwrap_or(0),
-            runtime_spawn_id: receipt
-                .get("runtime")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            wrote: receipt.get("wrote").and_then(Value::as_u64).unwrap_or(0),
-            blank: receipt.get("blank").and_then(Value::as_bool).unwrap_or(false),
-            ts: receipt.get("ts").and_then(Value::as_u64).unwrap_or(0),
-            page_gen: receipt.get("gen").and_then(Value::as_u64).unwrap_or(0),
-            source: "reattest_probe",
         };
         let mut promoted = false;
         let mut accepted = false;
@@ -22451,6 +22472,27 @@ fn stage_applied_content_probe(
                 "accepted": accepted,
             }),
         );
+    })
+}
+
+/// [e9 sol s35 Q5] decode the probe verdict's receipt. The probe script
+/// returns receipt:null when the entry holds no evidence — decoding that
+/// would construct an all-zero record (epoch 0) instead of abstaining, so
+/// an OBJECT receipt is required; a legitimate blank (blank=true inside
+/// the object) still decodes.
+fn decode_applied_content_probe_receipt(verdict: &Value) -> Option<TerminalAppliedContentRecord> {
+    let receipt = verdict.get("receipt").filter(|receipt| receipt.is_object())?;
+    Some(TerminalAppliedContentRecord {
+        mount_epoch: receipt.get("epoch").and_then(Value::as_u64).unwrap_or(0),
+        runtime_spawn_id: receipt
+            .get("runtime")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        wrote: receipt.get("wrote").and_then(Value::as_u64).unwrap_or(0),
+        blank: receipt.get("blank").and_then(Value::as_bool).unwrap_or(false),
+        ts: receipt.get("ts").and_then(Value::as_u64).unwrap_or(0),
+        page_gen: receipt.get("gen").and_then(Value::as_u64).unwrap_or(0),
+        source: "reattest_probe",
     })
 }
 
@@ -24501,6 +24543,58 @@ fn test_forced_terminal_read_error(session_path: &str) -> Option<anyhow::Error> 
     Some(anyhow::anyhow!(
         "reading daemon response — test-forced read error (rig hook)",
     ))
+}
+
+/// [e9 wedge-1 RIG HOOK] construct the idle re-attest wedge: with a
+/// marker file (first line matched against the session path — the
+/// READ_ERROR_FILE pattern), ONE-SHOT per loop: begin a fresh open
+/// attempt, DROP the stored Rust-side receipt (the page entry retains
+/// the published evidence — sol s35 Q4: a stored receipt would release
+/// the latch instead of parking), and park the content claim. On an
+/// idle host the re-attest probe — and nothing else — can then read the
+/// page entry's receipt back and promote the claim.
+fn test_park_terminal_content_claim_for_reattest(
+    state: Signal<ShellState>,
+    session_path: &str,
+    trace_home: &Path,
+    fired: &mut bool,
+) {
+    let Ok(path) = std::env::var("YGGTERM_TEST_PARK_CLAIM_FILE") else {
+        return;
+    };
+    if *fired {
+        return;
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let marker = raw.split('\n').next().unwrap_or("").trim();
+    if marker.is_empty() || !session_path.contains(marker) {
+        return;
+    }
+    *fired = true;
+    let mut attempt_id: Option<String> = None;
+    let _ = safe_shell_mut(state, "terminal_applied_content_test_park", |shell| {
+        attempt_id = Some(shell.begin_terminal_open_attempt(
+            session_path,
+            "reattest-rig",
+            0,
+            "reattest_rig",
+        ));
+        shell.terminal_sessions_applied_content.remove(session_path);
+        shell.park_terminal_content_claim(session_path, "reattest_rig_park");
+    });
+    let parked = state
+        .with(|shell| shell.terminal_pending_content_claims.contains_key(session_path));
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_mount",
+        "applied_content_test_park",
+        json!({
+            "session_path": session_path,
+            "parked": parked,
+            "attempt_id": attempt_id,
+        }),
+    );
 }
 
 fn terminal_stream_runtime_replaced(known_spawn_id: u64, answer_spawn_id: u64) -> bool {

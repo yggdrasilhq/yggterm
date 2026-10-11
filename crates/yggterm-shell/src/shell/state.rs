@@ -29718,9 +29718,13 @@ impl ShellState {
         }
     }
 
-    /// Park a CONTENT claim WITHOUT an attempt lifecycle (the render-path
-    /// latch sites: a deadline/ceiling release or a poison clear used to
-    /// open the input gate with zero content evidence).
+    /// Park a CONTENT claim for the session's CURRENT open attempt (the
+    /// render-path latch sites: a deadline/ceiling release or a poison
+    /// clear used to open the input gate with zero content evidence).
+    /// [e-r8] a park REQUIRES a living attempt — attempt-less parks are
+    /// declined. [e9 sol s35 Q4] already-qualifying evidence earns the
+    /// latch immediately: a stored receipt RELEASES the latch, it never
+    /// parks.
     fn park_terminal_content_claim(&mut self, session_path: &str, reason: &'static str) {
         // [e-r8] Contract (sol s34 Q2): a park requires a LIVING attempt —
         // the claim is authorization to complete THAT attempt. Without one
