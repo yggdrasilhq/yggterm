@@ -21392,6 +21392,16 @@ impl TerminalSurfaceStatus {
 
     /// The tuple a receipt must carry for THIS mount (armed at mount time;
     /// runtime 0 = not yet named — the epoch + session qualifiers bind).
+    /// [e-r10 DECISION] page_gen is deliberately NOT part of the
+    /// expectation: every known gen-moving lifecycle (a remount, a
+    /// runtime replacement, a recovery re-arm) also moves epoch or
+    /// runtime, and the js_ready duplicate guard means Rust would NOT
+    /// re-learn a same-epoch-same-runtime replacement's gen — a named-gen
+    /// rule would reject the honest receipts of any generation the
+    /// expectation never learned (sol s35b Q1). The record's page_gen is
+    /// TELEMETRY (which entry generation published it); making it
+    /// load-bearing first needs a re-arm chain that re-learns a
+    /// replacement's gen under a stable epoch+runtime.
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub(crate) struct TerminalExpectedAppliedTuple {
         pub(crate) mount_epoch: u64,

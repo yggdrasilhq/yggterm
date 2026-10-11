@@ -13143,11 +13143,22 @@ fn TerminalCanvas(
                                             )
                                             .map(|value| value == "1")
                                             .unwrap_or(false);
+                                            let seed_proof_gen = proof
+                                                .get("applied")
+                                                .and_then(|applied| applied.get("gen"))
+                                                .and_then(Value::as_u64)
+                                                .unwrap_or(0);
                                             let record_epoch = if foreign_hook {
                                                 mount_epoch + 1000
                                             } else {
                                                 mount_epoch
                                             };
+                                            // [e-r10] the page gen from the
+                                            // proof's OWN applied.gen return — the
+                                            // qualification gate above already
+                                            // demands its presence (the old
+                                            // page_gen: 0 convention recorded an
+                                            // unbound gen for every seed receipt).
                                             let record = TerminalAppliedContentRecord {
                                                 mount_epoch: record_epoch,
                                                 runtime_spawn_id: synth_pending_seed_runtime,
@@ -13157,7 +13168,7 @@ fn TerminalCanvas(
                                                     .and_then(Value::as_bool)
                                                     .unwrap_or(false),
                                                 ts: current_millis(),
-                                                page_gen: 0,
+                                                page_gen: seed_proof_gen,
                                                 source: "seed_proof",
                                             };
                                             // [Q7-R3] the seed receipt is a
@@ -13182,6 +13193,7 @@ fn TerminalCanvas(
                                                     "session_path": session_path.clone(),
                                                     "epoch": record_epoch,
                                                     "runtime": synth_pending_seed_runtime,
+                                                    "gen": seed_proof_gen,
                                                     "wrote": wrote_seed,
                                                     "blank": proof
                                                         .get("blank")
@@ -22468,6 +22480,7 @@ fn stage_applied_content_probe(
             "applied_content_reattested",
             json!({
                 "session_path": session_path.clone(),
+                "gen": record.page_gen,
                 "promoted": promoted,
                 "accepted": accepted,
             }),
