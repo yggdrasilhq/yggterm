@@ -1353,6 +1353,21 @@ if fail_rc == 0:
     else:
         print("VERDICT FENCE-EVIDENCE: OK (fenced_repaint + flush rode the proof)")
 
+# BAR 3 [e-r10]: the seed receipt carried a REAL page gen (telemetry
+# honesty — the page_gen: 0 convention is dead; RED on main records 0).
+if fail_rc == 0:
+    seed_promoted = [p for _, p in session_events(read_events(), s, "applied_content_promoted")
+                     if p.get("source") == "seed_proof"]
+    seed_gens = [int(p.get("gen") or 0) for p in seed_promoted]
+    if not seed_promoted:
+        print("VERDICT SEED-GEN VACUOUS: no seed_proof promotion event to read")
+        fail_rc = fail_rc or 7
+    elif not all(g > 0 for g in seed_gens):
+        print("VERDICT SEED-GEN FAIL: seed receipts carried gens %s (want all > 0 — the 0-convention mint)" % seed_gens)
+        fail_rc = fail_rc or 7
+    else:
+        print("VERDICT SEED-GEN: OK (seed receipts carried gens %s)" % seed_gens)
+
 if fail_rc:
     print("RIG FAIL rc=%d — verdicts above" % fail_rc)
     raise SystemExit(fail_rc)
