@@ -557,13 +557,14 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (e-r7) bar 1). STILL OPEN (the actual residue): sol Q1's
   stale-caller credit CLOSED 2026-10-10 sitting 34 ((e-r8) below —
   claims now carry their originating attempt); the wedge-1
-  re-attest scheduling (unchanged);
-  page_gen comparison (stored, never compared — the seed path
-  records page_gen 0 by convention, naming it needs the seed proof
-  to carry the page gen); wedge 2 (snapshot missing-vs-empty)
-  untouched; the dual-leg event journal survives as a PROPOSAL for
-  push-dependent events that lack pre-send evidence (sol s33 Q4),
-  no longer as this family's cure.
+  re-attest scheduling CLOSED 2026-10-11 sitting 35 ((e-r9) below —
+  the probe arms traffic-independently; the loop-dead arm stays open
+  under (i-r2)); page_gen comparison (stored, never compared — the
+  seed path records page_gen 0 by convention, naming it needs the
+  seed proof to carry the page gen); wedge 2 (snapshot
+  missing-vs-empty) untouched; the dual-leg event journal survives
+  as a PROPOSAL for push-dependent events that lack pre-send
+  evidence (sol s33 Q4), no longer as this family's cure.
   (e-r6) THE WARM-REMOUNT EVENT TRANSPORT — RE-SCOPED 2026-10-10
   (sitting 32, measured to the receiving side; CORRECTED sitting 33):
   the s31 cold-capture diagnosis was real but SECONDARY. The
@@ -770,6 +771,57 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   re-arms a successor probe" is proven only at the predicate level
   (a fresh key re-arms while should_start_recovery_snapshot_probe
   holds; the probe-identity no-reset concern is unchanged).
+  (e-r9) THE WEDGE-1 RE-ATTEST SCHEDULING — CLOSED IN CODE 2026-10-11
+  (sitting 35, lane lane/e9/reattest-scheduling; sol round node
+  lores/chain-of-thought/2026-10-11-yggterm-s35-reattest-scheduling-sol.md):
+  the re-attest probe — the only path that reads a page-published
+  applied-content receipt back into Rust without fresh traffic —
+  armed at ONE site (verified by grep repo-wide) nested under
+  js_ready && bridge-write-flush-allowed && flush_due(data) &&
+  js_ready_synthesized in the pre_select output branch: arming
+  required PENDING OUTPUT BYTES, so an IDLE host never armed it and
+  a parked claim whose evidence already lived in the page entry
+  never re-attested (sol s23 R2's reuse law unreachable on idle
+  hosts; the s29 dissolution held only for the skipped-bootstrap
+  DECISION site, which never parks). THE FIX (sol s35 Q1/Q2 accept):
+  the arming HOISTED into the pre_select body — every loop wake (the
+  read poll deadline fires even when idle) checks js_ready +
+  one-in-flight + the 2s cooldown + a parked claim for the session;
+  staging constructs a pinned future (no await — the (i-r1)
+  input-starvation law holds); js_ready_synthesized and the
+  flush/read-policy gates dropped (real mounts publish receipts via
+  the live-write issuer; the probe script is entryLive-guarded).
+  ALSO LANDED: the probe decoder extracted
+  (decode_applied_content_probe_receipt) with the null-receipt
+  ABSTAIN guard (receipt:null used to decode to an all-zero epoch-0
+  record — sol s35 Q5); the stale "WITHOUT an attempt lifecycle"
+  park doc comment corrected (a stored receipt RELEASES the latch,
+  never parks — now locked); the YGGTERM_TEST_PARK_CLAIM_FILE rig
+  hook (pre_select, the READ_ERROR_FILE absent-inert pattern, one
+  shot per loop, marker-matched): begin a fresh living attempt +
+  DROP the stored Rust receipt + park the claim, traced
+  applied_content_test_park. RIG: fence-rig MODE=reattest (sol s35
+  Q4-corrected construction): healthy boot → the phase-C shape
+  (armed tuple + accepted receipt + painted screen) → QUIET DRAIN
+  (3s with zero applied_content/synth/xterm_write/runtime-named
+  events — an in-flight batch would arm the OLD site and vacuate the
+  RED) → the marker parks the claim → a 10s IDLE window with
+  issuer-contamination and tuple-churn guards; GREEN requires
+  applied_content_reattested {accepted:true, promoted:true}; rc 23 =
+  RED (park proven via parked:true, ZERO re-attest events); rc 4 =
+  vacuous. VERDICTS: RED rc 23 on the hook-only build 2d3a0f1e (park proven via parked:true at +0.5s, ZERO re-attest events in the 10s idle window — true rc file /tmp/s35-red2.rc; first RED run identical verdict). GREEN rc 0-shape on the lane 5142db6e + rig-anchor fix 64e76faa: VERDICT REATTTEST GREEN — re-attested at +1.02s accepted=true promoted=true (run 2), and the run-1 raw trace measured the probe chain at +9ms park-to-reattest; the rig re-run after the anchor fix is the honest bar (the first GREEN run misread RED through the poll-baseline artifact — the rig law banked). SUITES:
+  shell 2281/0 (2278 baseline + the 3 new locks) + server 1668/0, both rc 0. Fence regressions on the lane build: MODE=order rc 0 (fenced_repaint + flush rode the proof) + MODE=dup rc 0 (covered differential dropped, marker exactly-once) — the pre_select surgery broke nothing. LOCKS (3):
+  a_qualifying_stored_receipt_releases_the_latch_instead_of_parking,
+  the_reattest_shape_promotes_a_parked_claim_from_re_read_evidence,
+  the_probe_decoder_abstains_on_a_null_receipt_and_keeps_blank_
+  evidence. LOOP-DEAD ARM FILED OPEN (sol s35 Q3 option b): the
+  exhaustion park (attach_complete_latch, viewport.rs ~17522) parks
+  then BREAKS the mount loop — its re-attest depends on a future
+  remount arming the probe; ownership boundary per sol: THIS wedge
+  owns scheduling reads of existing evidence + validation routing,
+  (i-r2) owns loop survival/restart. The sitting's claim is exactly:
+  alive-loop idle re-attestation fixed; loop-dead re-attestation
+  remains open.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
