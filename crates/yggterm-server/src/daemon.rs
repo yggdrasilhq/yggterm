@@ -14670,6 +14670,16 @@ impl DaemonRuntime {
                         });
                     }
                 }
+                // [wedge-2, measured 2026-10-11] A MISSING session
+                // (None — no runtime) and an EMPTY authoritative screen
+                // (Some(("", 0)) — a live silent session) both answer
+                // ("", 0) here. The conflation is SAFE by contract: the
+                // client's seed decision treats blank+seq0 as a None
+                // seed (no seed write, no blank receipt — viewport's
+                // synthesized_mount_open_script call), so a missing
+                // snapshot can never be laundered into authoritative
+                // blankness; a live silent session mints its receipts
+                // from its first real output instead.
                 let (text, output_seq) = self
                     .terminals
                     .session_screen_snapshot_stamped(&runtime_path)

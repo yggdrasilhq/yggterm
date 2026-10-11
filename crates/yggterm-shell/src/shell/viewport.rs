@@ -13003,8 +13003,18 @@ fn TerminalCanvas(
                                 // [F1-(e-r1)-R1] (sol Q2): blank text
                                 // WITH a stamp is a VALID blank screen —
                                 // it must apply as an empty repaint, not
-                                // skip; only blank AND seq 0 (the fetch
-                                // failed / old daemon) is a None seed.
+                                // skip. Blank AND seq 0 is a None seed:
+                                // that shape is the snapshot MISSING or
+                                // failed (the daemon's unwrap_or_default
+                                // answers an absent session as ("",0) —
+                                // wedge-2, measured 2026-10-11), an old
+                                // daemon without stamps, or a LIVE
+                                // SILENT session (spawned, never output —
+                                // its seq is genuinely 0). All three lack
+                                // stampable authority and none may earn a
+                                // blank receipt (sol s23: missing/failed
+                                // stays distinct; liveness must not
+                                // fabricate content).
                                 if synth_seed_text.trim().is_empty()
                                     && synth_seed_output_seq == 0
                                 {
