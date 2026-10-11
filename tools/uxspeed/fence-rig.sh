@@ -1503,12 +1503,23 @@ if park_ev.get("parked") is not True:
 print("PHASE 3: parked=true attempt=%s at +%.1fs" % (park_ev.get("attempt_id"), time.time() - mark_ts))
 # PHASE 4 — the window: only the re-attest probe may promote. Issuer
 # activity or tuple churn after the park = contaminated construction.
-n_at_park = len(read_events())
+# Anchor the tail at the PARK EVENT'S OWN INDEX: the probe can fire
+# within ~10ms of the park (measured lane run 1791688321) — far faster
+# than this poll loop — so a count-at-poll-time baseline would swallow
+# the reattest into the base slice and misread GREEN as RED.
+def park_index(ev):
+    for i, (nm, p) in enumerate(ev):
+        if nm == "applied_content_test_park" and p.get("session_path") == s:
+            return i
+    return None
 deadline = time.time() + WINDOW_S
 verdict = None
 while time.time() < deadline:
     ev = read_events()
-    tail = ev[n_at_park:]
+    pi = park_index(ev)
+    if pi is None:
+        continue
+    tail = ev[pi + 1:]
     reattested = [p for nm, p in tail if nm == "applied_content_reattested" and p.get("session_path") == s]
     issuer = [p for nm, p in tail if nm == "applied_content_promoted" and p.get("session_path") == s]
     churn = [nm for nm, _ in tail if nm in ("terminal_runtime_named_remount",) or nm == "applied_content_armed"]
