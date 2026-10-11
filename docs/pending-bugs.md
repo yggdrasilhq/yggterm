@@ -559,10 +559,13 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   claims now carry their originating attempt); the wedge-1
   re-attest scheduling CLOSED 2026-10-11 sitting 35 ((e-r9) below —
   the probe arms traffic-independently; the loop-dead arm stays open
-  under (i-r2)); page_gen comparison (stored, never compared — the
-  seed path records page_gen 0 by convention, naming it needs the
-  seed proof to carry the page gen); wedge 2 (snapshot
-  missing-vs-empty) untouched; the dual-leg event journal survives
+  under (i-r2)); page_gen comparison RESOLVED 2026-10-11
+  sitting 35 as TELEMETRY-BY-DECISION ((e-r10) below — no comparison
+  rule: every gen-moving lifecycle also moves epoch or runtime, and
+  the js_ready duplicate guard means Rust never re-learns a
+  same-epoch replacement's gen — a named-gen rule would reject honest
+  receipts; the precondition checklist is in the record); wedge 2
+  (snapshot missing-vs-empty) untouched; the dual-leg event journal survives
   as a PROPOSAL for push-dependent events that lack pre-send
   evidence (sol s33 Q4), no longer as this family's cure.
   (e-r6) THE WARM-REMOUNT EVENT TRANSPORT — RE-SCOPED 2026-10-10
@@ -822,6 +825,41 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (i-r2) owns loop survival/restart. The sitting's claim is exactly:
   alive-loop idle re-attestation fixed; loop-dead re-attestation
   remains open.
+  (e-r10) PAGE_GEN — RESOLVED AS TELEMETRY BY MEASUREMENT 2026-10-11
+  (sitting 35 unit 2, lane lane/e10/page-gen-comparison; sol round
+  node lores/chain-of-thought/2026-10-11-yggterm-s35b-page-gen-sol.md):
+  the receipt's page_gen (window.__yggtermMountAttempt — incremented
+  per MOUNT-FN INVOCATION, terminal_scripts 306, cold AND warm) was
+  stored but never compared, and the seed path's Rust mint recorded 0
+  BY CONVENTION although the proof's applied.gen return carries it
+  (the qualifies gate already demands its presence). THE COMPARISON
+  RULE IS DELIBERATELY NOT SHIPPED (sol s35b Q1 defer + the seat's
+  measurements): (a) every gen-moving lifecycle (a remount, the
+  runtime-named replacement, a recovery re-arm) also moves epoch or
+  runtime — "every remount goes through an epoch bump" ([11.215],
+  bump_terminal_mount_epoch_for_session) and the S28-2 cleanup
+  retires on either — so no production {E, R, gen A} → {E, R, gen B}
+  shape exists where gen alone discriminates; (b) the js_ready
+  duplicate guard means Rust would NEVER re-learn a same-epoch
+  same-runtime replacement's gen — a named-gen expectation would
+  reject the honest receipts of any generation the expectation never
+  learned (sol's hazard, the mirror of the (e-r6) stale-addressing
+  wedge). WHAT LANDED INSTEAD: the seed mint reads applied.gen
+  through the EXISTING application-evidence gate (applied:null earns
+  no receipt — the 0-convention is dead); the promoted(seed) and
+  reattested trace payloads carry gen (telemetry completeness); the
+  decision comment sits on TerminalExpectedAppliedTuple. RIG:
+  fence-rig MODE=order BAR 3 — every seed_proof promotion event must
+  carry gen>0. VERDICTS: RED rc 7 on deployed main f1a3015f3d06 (SEED-GEN FAIL — gens [0], the 0-convention mint, with the ordering+fence bars green); GREEN rc 0 on the lane (SEED-GEN OK — gens [2], a real mount-attempt gen).  PRECONDITION CHECKLIST
+  for ever making gen load-bearing (from sol's corrections): (1) a
+  demonstrated production same-epoch-same-runtime entry replacement;
+  (2) a re-arm chain that re-learns the replacement's gen (the js_ready
+  guard must permit the replacement binding); (3) the initial
+  unnamed→named transition must not retire claims parked for the
+  entry being named; (4) the runtime and gen predicates applied
+  independently; (5) the rejection trio + the lifecycle test (park
+  under A, arm B same-epoch, retire A, accept B) as the bars.
+  SUITES: shell 2281/0 + server 1668/0, both rc 0 (no state-behavior change — telemetry only).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
