@@ -72167,7 +72167,9 @@ fn a_valid_blank_seed_reaches_the_fenced_repaint() {
         );
         assert!(script.contains("__blank = __seed.length === 0;"));
     }
-    // the None seed (fetch failed / old daemon) is still a skip
+    // the None seed (snapshot missing/failed — the daemon answers an
+    // absent session as ("",0); old daemon without stamps; live silent
+    // session) is still a skip
     let none_script = terminal_synthesized_mount_open_script(
         "host-m1",
         None,

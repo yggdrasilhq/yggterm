@@ -564,10 +564,14 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   rule: every gen-moving lifecycle also moves epoch or runtime, and
   the js_ready duplicate guard means Rust never re-learns a
   same-epoch replacement's gen — a named-gen rule would reject honest
-  receipts; the precondition checklist is in the record); wedge 2
-  (snapshot missing-vs-empty) untouched; the dual-leg event journal survives
-  as a PROPOSAL for push-dependent events that lack pre-send
-  evidence (sol s33 Q4), no longer as this family's cure.
+  receipts; the precondition checklist is in the record); wedge 2 (snapshot missing-vs-empty)
+  RESOLVED-BY-MEASUREMENT 2026-10-11 sitting 35 unit 3 (see (e-r11)
+  below — the conflation exists at the daemon answer but degrades
+  SAFE at both boundaries; comments corrected per sol s23 R5's
+  standing instruction; the residue re-files under (i-r2)); the
+  dual-leg event journal survives as a PROPOSAL for push-dependent
+  events that lack pre-send evidence (sol s33 Q4), no longer as this
+  family's cure.
   (e-r6) THE WARM-REMOUNT EVENT TRANSPORT — RE-SCOPED 2026-10-10
   (sitting 32, measured to the receiving side; CORRECTED sitting 33):
   the s31 cold-capture diagnosis was real but SECONDARY. The
@@ -860,6 +864,34 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   independently; (5) the rejection trio + the lifecycle test (park
   under A, arm B same-epoch, retire A, accept B) as the bars.
   SUITES: shell 2281/0 + server 1668/0, both rc 0 (no state-behavior change — telemetry only).
+  (e-r11) WEDGE-2 SNAPSHOT MISSING-VS-EMPTY — RESOLVED BY
+  MEASUREMENT 2026-10-11 (sitting 35 unit 3, lane
+  lane/docs/s35c-wedge2, comment-only + this record; sol s23 R5 line
+  75/77): the daemon's TerminalSnapshot handler conflates a MISSING
+  session (session_screen_snapshot_stamped → None) with an EMPTY
+  authoritative screen via unwrap_or_default — both answer ("", 0).
+  MEASURED SAFE at both boundaries: (1) the client's seed decision
+  (viewport, the synthesized_mount_open_script call) treats
+  blank+seq0 as a None seed — no seed write, NO BLANK RECEIPT — so a
+  missing/failed snapshot can never be laundered into authoritative
+  blankness (sol's requirement holds; suite-locked by the s23
+  presence-test locks: __seedPresent false + the null literal); (2) a
+  LIVE SILENT session (spawned, never output, seq genuinely 0) rides
+  the same None-seed degradation — no fabrication — and mints its
+  receipts from its first real output. LANDED: the two misleading
+  comments corrected (the viewport None-seed comment claimed
+  "fetch failed / old daemon" alone; the daemon boundary now names
+  the conflation + the safety contract; the test comment follows) —
+  sol's standing "correct the misleading comment" instruction from
+  s23 R5. RESIDUE RE-FILED under (i-r2)'s family: sol's remaining
+  demand ("missing/failed evidence needs bounded retry/recovery or
+  an explicit failure resolution") reduces to the attempt-level
+  bound for a parked claim with NO evidence source and NO output
+  ever — the same policy family as (e-r9)'s loop-dead arm and
+  (i-r2)'s keep-alive (a claim parked on an evidence-less mount
+  waits today until a real write, the probe abstaining correctly —
+  whether the ATTEMPT needs its own bounded failure resolution is
+  the open question, owned with (i-r2)).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
