@@ -45311,8 +45311,11 @@ mod tests {
         let request_lock_at = dispatch
             .find("lock_daemon_runtime_for_request(")
             .expect("the dispatcher must take the per-request lock somewhere");
+        // [F2] The literal carries the arm's wire fields (`..` = the
+        // capability field the rehydrate opts into); the law pinned here is
+        // unchanged: the interception precedes the per-request lock.
         let branch_at = dispatch
-            .find("if let ServerRequest::TerminalRead { path, cursor } = &request {")
+            .find("if let ServerRequest::TerminalRead { path, cursor, .. } = &request {")
             .expect(
                 "TerminalRead must be intercepted in the dispatcher, before the \
                  per-request lock, or the proxy round trip runs under it",
