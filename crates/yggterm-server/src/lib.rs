@@ -35511,11 +35511,8 @@ pub fn run_app_control_read_terminal_buffer(
                         runtime_spawn_id: spawn,
                         composer_holds_draft: None,
                         pty_in_alternate_screen: None,
+                        // [F2] the read-buffer fallback answers from THIS daemon's own held screen — legacy local, no authority to name.
                         authority: None,
-                        authority: None,
-// [F2] the read-buffer fallback answers from THIS daemon's own held screen — legacy local, no authority to name.
-                        authority: None,
-authority: None,
                     }
                 })
         } else {
