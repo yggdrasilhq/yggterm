@@ -4581,12 +4581,30 @@ pub enum ServerRequest {
     TerminalRead {
         path: String,
         cursor: u64,
+        /// [F2] Capability gate for read-side owner adoption. `false` (the
+        /// serde default, and what an old client sends by omitting it) keeps
+        /// the read arms' behavior EXACTLY as before: registry lookup + local
+        /// fall-through, never an adoption scan. `true` (the rehydrate seed
+        /// only) additionally allows the ONE bounded owner-resolution scan
+        /// when this daemon represents the row but holds neither the session
+        /// nor a preserved-owner record — the state that used to answer an
+        /// authoritative-looking empty ([11.32]).
+        #[serde(default)]
+        resolve_owner: bool,
     },
     TerminalSnapshot {
         path: String,
+        /// [F2] See `TerminalRead::resolve_owner` — the same capability gate
+        /// for the snapshot arm's read-side adoption.
+        #[serde(default)]
+        resolve_owner: bool,
     },
     TerminalRetainedSnapshot {
         path: String,
+        /// [F2] See `TerminalRead::resolve_owner` — the same capability gate
+        /// for the retained-snapshot arm's read-side adoption.
+        #[serde(default)]
+        resolve_owner: bool,
     },
     /// Diagnostic: the daemon's CLEAN scrolled-off vt100 scrollback rows for a
     /// session (the history that CAN load into xterm scrollback). Used to confirm
@@ -4780,6 +4798,15 @@ pub enum ServerResponse {
         // triggers on the client.
         #[serde(default)]
         runtime_spawn_id: u64,
+        /// [F2] The content-plane authority behind this answer. `None` (the
+        /// serde default, and what an old daemon sends by omitting it) =
+        /// legacy: this daemon answered from its own state exactly as before.
+        /// `Some` marks the answer as PROXIED (`OwnerProxy` / `OwnerAdopted`)
+        /// or, critically, `OwnerUnresolved` — the text is a local
+        /// absent-session default for a row this daemon only REPRESENTS, and
+        /// must never be read as an authoritative empty screen ([11.32]).
+        #[serde(default)]
+        authority: Option<TerminalContentAuthority>,
     },
     TerminalSnapshot {
         text: String,
@@ -4828,6 +4855,10 @@ pub enum ServerResponse {
         /// the seed falls through as it always did.
         #[serde(default)]
         pty_in_alternate_screen: Option<bool>,
+        /// [F2] The content-plane authority behind this answer — see
+        /// `TerminalStream::authority`. `None` = legacy local answer.
+        #[serde(default)]
+        authority: Option<TerminalContentAuthority>,
     },
     TerminalRetainedSnapshot {
         text: String,
@@ -4839,6 +4870,10 @@ pub enum ServerResponse {
         last_resize_seq: u64,
         #[serde(default)]
         runtime_spawn_id: u64,
+        /// [F2] The content-plane authority behind this answer — see
+        /// `TerminalStream::authority`. `None` = legacy local answer.
+        #[serde(default)]
+        authority: Option<TerminalContentAuthority>,
     },
     TerminalHistory {
         #[serde(default)]
@@ -5609,6 +5644,12 @@ struct CachedClaudeCodeRuntimeIdentity {
 /// frame.
 const PROXIED_WORKING_REFRESH_MS: u128 = 1_500;
 
+/// [F2] The per-runtime-key cooldown for the read-side owner adoption scan.
+/// A represented-but-unowned row costs at most one bounded scan per window no
+/// matter how its reads arrive — a rehydrate retry ladder (or a poll loop,
+/// should a future lane opt it in) must never clone the N-probe scan.
+const READ_AUTHORITY_ADOPT_COOLDOWN_MS: u64 = 2_000;
+
 pub(crate) struct DaemonRuntime {
     support: GhosttyHostSupport,
     /// Set when this daemon started from the BACKUP state document because the
@@ -5666,6 +5707,11 @@ pub(crate) struct DaemonRuntime {
     /// unreachable backoff applies.
     discovered_working_flag_owners: HashMap<String, ServerEndpoint>,
     discovered_working_owners_scanned_ms: u64,
+    /// [F2] Per-runtime-key cooldown for the read-side owner adoption scan —
+    /// see [`READ_AUTHORITY_ADOPT_COOLDOWN_MS`]. In-memory only, like the
+    /// working-flag discovery caches: the durable owner record lives in
+    /// `preserved_terminal_owners`.
+    read_authority_adopt_cooldown_until_ms: HashMap<String, u64>,
     /// The shared-scope ledger order AS THIS DAEMON BOOTED — the arrangement the
     /// user left behind on the daemon we are succeeding.
     ///
@@ -5967,6 +6013,7 @@ impl DaemonRuntime {
             proxied_working_flags: HashMap::new(),
             discovered_working_flag_owners: HashMap::new(),
             discovered_working_owners_scanned_ms: 0,
+            read_authority_adopt_cooldown_until_ms: HashMap::new(),
             proxied_working_refreshed_ms: 0,
             booted_with_row_order,
             live_row_tombstones,
@@ -7483,6 +7530,7 @@ impl DaemonRuntime {
             &owner_endpoint,
             &ServerRequest::TerminalSnapshot {
                 path: runtime_path.clone(),
+                resolve_owner: false,
             },
             &identity,
             std::time::Duration::from_millis(IO_BUDGET_MS),
@@ -10015,6 +10063,83 @@ impl DaemonRuntime {
         );
         measured.idle_secs = idle_secs;
         measured
+    }
+
+    /// [F2] THE ONE read-authority resolution for the read / snapshot /
+    /// retained-snapshot arms — the gate that ends the empty-screen lie.
+    ///
+    /// Precedence mirrors `preserved_owner_endpoint_for_request` (hold beats
+    /// record beats representation), then adds what the read arms never had:
+    /// an ADOPT arm. The write path has recovered a lost runtime by scanning
+    /// reachable sibling daemons and registering the owner since
+    /// `recover_terminal_write_lost_runtime`; a READ arriving in the same
+    /// state answered the local absent-session default — an
+    /// authoritative-looking empty screen ([11.32]'s 10 ms empty, filed on
+    /// 3.2.12, still structurally reachable whenever the registry record is
+    /// missing: between a row resume and the startup recovery pass, after an
+    /// unreachable-mark eviction, or a plain scan miss).
+    ///
+    /// `allow_adopt` is the REQUEST's capability gate (`resolve_owner`,
+    /// serde-default false): an old client — and every non-rehydrate caller —
+    /// keeps today's behavior byte-identically, per sol s36 Q2. Adoption
+    /// itself is bounded: coalesced per runtime key by
+    /// [`READ_AUTHORITY_ADOPT_COOLDOWN_MS`], reusing the write path's exact
+    /// candidate selector (sol s36 Q1: the selector, never the relaunch
+    /// ladder), and one trace event per scan.
+    fn terminal_read_authority(&mut self, runtime_key: &str, allow_adopt: bool) -> TerminalReadAuthority {
+        if self.terminals.has_session(runtime_key) {
+            return TerminalReadAuthority::Held;
+        }
+        if let Some(endpoint) = self.preserved_owner_endpoint_for_request(runtime_key) {
+            return TerminalReadAuthority::Owner(endpoint, false);
+        }
+        if !self.server.represents_terminal_runtime_key(runtime_key) {
+            // sol s36 Q1: NOT a confident "absent" — the registry state does
+            // not establish one. Answer exactly as before, unstamped.
+            return TerminalReadAuthority::NotRepresentedHere;
+        }
+        if !allow_adopt {
+            return TerminalReadAuthority::UnresolvedRepresented;
+        }
+        let now = crate::app_control::current_millis() as u64;
+        if let Some(until) = self.read_authority_adopt_cooldown_until_ms.get(runtime_key)
+            && now < *until
+        {
+            return TerminalReadAuthority::UnresolvedRepresented;
+        }
+        self.read_authority_adopt_cooldown_until_ms
+            .insert(runtime_key.to_string(), now + READ_AUTHORITY_ADOPT_COOLDOWN_MS);
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        );
+        if let Some((owner_endpoint, owner_status)) =
+            preserved_owner_candidate_for_runtime_key(statuses, runtime_key, std::process::id())
+        {
+            let registered = self.preserved_terminal_owners.upsert_runtime_owner(
+                self.store.home_dir(),
+                runtime_key,
+                &owner_endpoint,
+                &owner_status,
+                Some(SERVER_PROTOCOL_VERSION.to_string()),
+            );
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "terminal_runtime",
+                "terminal_read_adopted_preserved_owner",
+                serde_json::json!({
+                    "runtime_key": runtime_key,
+                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                    "owner_server_version": owner_status.server_version,
+                    "owner_server_pid": owner_status.server_pid,
+                    "registered": registered.is_ok(),
+                }),
+            );
+            return TerminalReadAuthority::Owner(owner_endpoint, registered.is_ok());
+        }
+        TerminalReadAuthority::UnresolvedRepresented
     }
 
     fn preserved_owner_endpoint_for_request(
@@ -14460,10 +14585,19 @@ impl DaemonRuntime {
                 let message = self.ensure_terminal_for_path(&path)?;
                 ServerResponse::Ack { message }
             }
-            ServerRequest::TerminalRead { path, cursor } => {
+            ServerRequest::TerminalRead {
+                path,
+                cursor,
+                resolve_owner,
+            } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
-                if let Some(owner_endpoint) =
-                    self.preserved_owner_endpoint_for_request(&runtime_path)
+                // [F2] The ONE authority gate. Held -> local; Owner -> the
+                // direct proxy below (the hot loop — no mismatch probe, see
+                // the source-law test); UnresolvedRepresented -> the local
+                // read below stamped `OwnerUnresolved` so the client never
+                // spends its empty ladder on a screen that lives elsewhere.
+                let read_authority = self.terminal_read_authority(&runtime_path, resolve_owner);
+                if let TerminalReadAuthority::Owner(owner_endpoint, owner_adopted) = read_authority.clone()
                 {
                     match terminal_read(&owner_endpoint, &runtime_path, cursor) {
                         Ok((
@@ -14489,6 +14623,11 @@ impl DaemonRuntime {
                                 resync_required,
                                 screen_hash,
                                 runtime_spawn_id,
+                                authority: Some(if owner_adopted {
+                                    TerminalContentAuthority::OwnerAdopted
+                                } else {
+                                    TerminalContentAuthority::OwnerProxy
+                                }),
                             });
                         }
                         Err(error) => {
@@ -14563,12 +14702,26 @@ impl DaemonRuntime {
                         .unwrap_or_else(|| {
                             self.terminals.session_runtime_spawn_id(&runtime_path)
                         }),
+                    // [F2] A local answer to a REPRESENTED row this daemon
+                    // cannot resolve is NOT an authoritative empty ([11.32]).
+                    authority: if matches!(
+                        read_authority,
+                        TerminalReadAuthority::UnresolvedRepresented
+                    ) {
+                        Some(TerminalContentAuthority::OwnerUnresolved)
+                    } else {
+                        None
+                    },
                 }
             }
-            ServerRequest::TerminalSnapshot { path } => {
+            ServerRequest::TerminalSnapshot {
+                path,
+                resolve_owner,
+            } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
-                if let Some(owner_endpoint) =
-                    self.preserved_owner_endpoint_for_request(&runtime_path)
+                // [F2] The ONE authority gate (see the TerminalRead arm).
+                let read_authority = self.terminal_read_authority(&runtime_path, resolve_owner);
+                if let TerminalReadAuthority::Owner(owner_endpoint, owner_adopted) = read_authority.clone()
                 {
                     if self.reject_preserved_owner_saved_session_mismatch(
                         &path,
@@ -14593,6 +14746,18 @@ impl DaemonRuntime {
                                     // not invent one.
                                     composer_holds_draft: answer.composer_holds_draft,
                                     pty_in_alternate_screen: answer.pty_in_alternate_screen,
+                                    // [F2] Adopted here -> say so; otherwise
+                                    // keep the owner's own stamp, and a legacy
+                                    // owner (no stamp) reads as the plain
+                                    // proxy verdict — this daemon KNOWS the
+                                    // answer came from elsewhere.
+                                    authority: if owner_adopted {
+                                        Some(TerminalContentAuthority::OwnerAdopted)
+                                    } else {
+                                        answer
+                                            .authority
+                                            .or(Some(TerminalContentAuthority::OwnerProxy))
+                                    },
                                 });
                             }
                             Err(error) => {
@@ -14647,6 +14812,7 @@ impl DaemonRuntime {
                         return Ok(ServerResponse::TerminalSnapshot {
                             text: String::new(),
                             output_seq: injected_seq.unwrap_or_default(),
+                            authority: None,
                             running: self.terminals.session_is_running(&runtime_path),
                             runtime_output_seen: self
                                 .terminals
@@ -14673,7 +14839,11 @@ impl DaemonRuntime {
                 // [wedge-2, measured 2026-10-11] A MISSING session
                 // (None — no runtime) and an EMPTY authoritative screen
                 // (Some(("", 0)) — a live silent session) both answer
-                // ("", 0) here. The conflation is SAFE by contract: the
+                // ("", 0) here. [F2] One of the three facts behind a blank
+                // answer now rides OUT of the daemon beside the text: when
+                // this daemon only REPRESENTS the row and could not resolve
+                // its owner, `authority: Some(OwnerUnresolved)` marks the
+                // text as a local default, never an authoritative empty. The conflation is SAFE by contract: the
                 // client's seed decision treats blank+seq0 as a None
                 // seed (no seed write, no blank receipt — viewport's
                 // synthesized_mount_open_script call), so a missing
@@ -14701,12 +14871,24 @@ impl DaemonRuntime {
                     pty_in_alternate_screen: self
                         .terminals
                         .session_in_alternate_screen(&runtime_path),
+                    authority: if matches!(
+                        read_authority,
+                        TerminalReadAuthority::UnresolvedRepresented
+                    ) {
+                        Some(TerminalContentAuthority::OwnerUnresolved)
+                    } else {
+                        None
+                    },
                 }
             }
-            ServerRequest::TerminalRetainedSnapshot { path } => {
+            ServerRequest::TerminalRetainedSnapshot {
+                path,
+                resolve_owner,
+            } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
-                if let Some(owner_endpoint) =
-                    self.preserved_owner_endpoint_for_request(&runtime_path)
+                // [F2] The ONE authority gate (see the TerminalRead arm).
+                let read_authority = self.terminal_read_authority(&runtime_path, resolve_owner);
+                if let TerminalReadAuthority::Owner(owner_endpoint, owner_adopted) = read_authority.clone()
                 {
                     if self.reject_preserved_owner_saved_session_mismatch(
                         &path,
@@ -14732,6 +14914,16 @@ impl DaemonRuntime {
                                     post_resize_output_seen,
                                     last_resize_seq,
                                     runtime_spawn_id,
+                                    // [F2] Same stamp law as the snapshot arm:
+                                    // adopted -> say so; a registry owner is at
+                                    // least a proxy. This arm's helper answers a
+                                    // legacy tuple, so the proxy verdict is
+                                    // minted here where the hop is known.
+                                    authority: Some(if owner_adopted {
+                                        TerminalContentAuthority::OwnerAdopted
+                                    } else {
+                                        TerminalContentAuthority::OwnerProxy
+                                    }),
                                 });
                             }
                             Err(error) => {
@@ -14758,6 +14950,14 @@ impl DaemonRuntime {
                         .session_post_resize_output_seen(&runtime_path),
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
                     runtime_spawn_id: self.terminals.session_runtime_spawn_id(&runtime_path),
+                    authority: if matches!(
+                        read_authority,
+                        TerminalReadAuthority::UnresolvedRepresented
+                    ) {
+                        Some(TerminalContentAuthority::OwnerUnresolved)
+                    } else {
+                        None
+                    },
                 }
             }
             ServerRequest::TerminalHistory { path } => {
@@ -24281,6 +24481,9 @@ pub fn terminal_read(
         &ServerRequest::TerminalRead {
             path: path.to_string(),
             cursor,
+            // [F2] The owner holds the session by definition — never cascade
+            // the resolution capability across the proxy hop.
+            resolve_owner: false,
         },
     )? {
         ServerResponse::TerminalStream {
@@ -24294,6 +24497,9 @@ pub fn terminal_read(
             resync_required,
             screen_hash,
             runtime_spawn_id,
+            // The owner's own stamp is not forwarded through this tuple; the
+            // proxying daemon stamps its answer from its own knowledge.
+            authority: _,
         } => Ok((
             cursor,
             chunks,
@@ -24309,6 +24515,52 @@ pub fn terminal_read(
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal stream response: {:?}", other),
     }
+}
+
+/// [F2] The daemon-side verdict of [`DaemonRuntime::terminal_read_authority`]
+/// — not on the wire; the arms translate it into
+/// [`TerminalContentAuthority`] stamps (or the exact legacy answer).
+#[derive(Debug, Clone)]
+enum TerminalReadAuthority {
+    /// This daemon holds the session — the local answer IS the authority.
+    Held,
+    /// A resolvable owner answered. The bool = the owner was found AND
+    /// registered by THIS read's bounded adoption scan (vs a record the
+    /// registry already held).
+    Owner(ServerEndpoint, bool),
+    /// The row is represented here but holds neither the session nor a
+    /// resolvable owner. A local-default answer must carry
+    /// [`TerminalContentAuthority::OwnerUnresolved`] on the wire.
+    UnresolvedRepresented,
+    /// This daemon knows nothing of the runtime key — answer exactly as
+    /// before, unstamped.
+    NotRepresentedHere,
+}
+
+/// [F2] WHERE a terminal content answer came from — the wire vocabulary that
+/// ends the empty-screen lie. Before this, `text: ""` covered three different
+/// facts (the session is absent here; the session lives on a daemon this
+/// daemon only REPRESENTS but could not resolve; the screen is genuinely
+/// empty) and the client could only treat all three as an authoritative empty
+/// screen and back off ([11.32]'s measured 2.5s->5s ladder against a dead
+/// end). `None` on the wire (the serde default) = legacy: a local answer from
+/// a daemon that holds its content plane, byte-identical to every build
+/// before the field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalContentAuthority {
+    /// Answered by this daemon's REGISTERED preserved owner. The registry
+    /// record predates the request (handoff, startup recovery, keep-alive).
+    OwnerProxy,
+    /// No owner was registered when the read arrived; the request opted into
+    /// resolution, the ONE bounded scan found + registered an owner, and the
+    /// answer is proxied from it.
+    OwnerAdopted,
+    /// This daemon REPRESENTS the row but holds neither the session nor a
+    /// resolvable owner. The text is a local absent-session default — NOT an
+    /// authoritative empty screen. The client must not spend its empty-read
+    /// backoff budget on it.
+    OwnerUnresolved,
 }
 
 /// The full answer to `ServerRequest::TerminalSnapshot` — a STRUCT, where an
@@ -24337,6 +24589,11 @@ pub struct TerminalSnapshotAnswer {
     pub runtime_spawn_id: u64,
     pub composer_holds_draft: Option<bool>,
     pub pty_in_alternate_screen: Option<bool>,
+    /// [F2] The content-plane authority behind this answer (see
+    /// [`TerminalContentAuthority`]). `None` = legacy local answer; the
+    /// rehydrate's empty-read decision branches on `Some(OwnerUnresolved)`
+    /// instead of spending the empty ladder.
+    pub authority: Option<TerminalContentAuthority>,
 }
 
 /// The one place the wire answer becomes the struct — factored out so the
@@ -24353,6 +24610,7 @@ fn terminal_snapshot_answer_from_response(response: ServerResponse) -> Result<Te
             runtime_spawn_id,
             composer_holds_draft,
             pty_in_alternate_screen,
+            authority,
         } => Ok(TerminalSnapshotAnswer {
             text,
             output_seq,
@@ -24363,6 +24621,7 @@ fn terminal_snapshot_answer_from_response(response: ServerResponse) -> Result<Te
             runtime_spawn_id,
             composer_holds_draft,
             pty_in_alternate_screen,
+            authority,
         }),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
@@ -24394,6 +24653,24 @@ pub fn terminal_snapshot(
         endpoint,
         &ServerRequest::TerminalSnapshot {
             path: path.to_string(),
+            // [F2] Plain ask: registry lookup + local fall-through, no
+            // adoption scan. The rehydrate's resolved variant opts in.
+            resolve_owner: false,
+        },
+    )?)
+}
+
+/// [F2] The rehydrate seed's snapshot ask with the resolution capability ON —
+/// the only caller that may trigger the bounded read-side owner adoption.
+pub fn terminal_snapshot_resolved(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<TerminalSnapshotAnswer> {
+    terminal_snapshot_answer_from_response(send_request(
+        endpoint,
+        &ServerRequest::TerminalSnapshot {
+            path: path.to_string(),
+            resolve_owner: true,
         },
     )?)
 }
@@ -24406,6 +24683,8 @@ pub fn terminal_retained_snapshot(
         endpoint,
         &ServerRequest::TerminalRetainedSnapshot {
             path: path.to_string(),
+            // [F2] Plain ask — see `terminal_snapshot`.
+            resolve_owner: false,
         },
     )? {
         ServerResponse::TerminalRetainedSnapshot {
@@ -24415,6 +24694,7 @@ pub fn terminal_retained_snapshot(
             post_resize_output_seen,
             last_resize_seq,
             runtime_spawn_id,
+            authority: _,
         } => Ok((
             text,
             running,
@@ -24441,6 +24721,109 @@ pub fn terminal_history(endpoint: &ServerEndpoint, path: &str) -> Result<(Vec<St
         ServerResponse::TerminalHistory { rows, running } => Ok((rows, running)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal history response: {:?}", other),
+    }
+}
+
+/// [F2] The rehydrate seed's read ask with the resolution capability ON,
+/// answering the authority verdict beside the legacy tuple.
+pub fn terminal_read_resolved(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    cursor: u64,
+) -> Result<(
+    u64,
+    Vec<TerminalStreamChunk>,
+    bool,
+    bool,
+    bool,
+    bool,
+    u64,
+    bool,
+    Option<String>,
+    u64,
+    Option<TerminalContentAuthority>,
+)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalRead {
+            path: path.to_string(),
+            cursor,
+            resolve_owner: true,
+        },
+    )? {
+        ServerResponse::TerminalStream {
+            cursor,
+            chunks,
+            running,
+            runtime_output_seen,
+            eof_without_output,
+            post_resize_output_seen,
+            last_resize_seq,
+            resync_required,
+            screen_hash,
+            runtime_spawn_id,
+            authority,
+        } => Ok((
+            cursor,
+            chunks,
+            running,
+            runtime_output_seen,
+            eof_without_output,
+            post_resize_output_seen,
+            last_resize_seq,
+            resync_required,
+            screen_hash,
+            runtime_spawn_id,
+            authority,
+        )),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal stream response: {:?}", other),
+    }
+}
+
+/// [F2] The rehydrate seed's retained-snapshot ask with the resolution
+/// capability ON, answering the authority verdict beside the legacy tuple.
+pub fn terminal_retained_snapshot_resolved(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<(
+    String,
+    bool,
+    bool,
+    bool,
+    u64,
+    u64,
+    Option<TerminalContentAuthority>,
+)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalRetainedSnapshot {
+            path: path.to_string(),
+            resolve_owner: true,
+        },
+    )? {
+        ServerResponse::TerminalRetainedSnapshot {
+            text,
+            running,
+            runtime_output_seen,
+            post_resize_output_seen,
+            last_resize_seq,
+            runtime_spawn_id,
+            authority,
+        } => Ok((
+            text,
+            running,
+            runtime_output_seen,
+            post_resize_output_seen,
+            last_resize_seq,
+            runtime_spawn_id,
+            authority,
+        )),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!(
+            "unexpected terminal retained snapshot response: {:?}",
+            other
+        ),
     }
 }
 
@@ -29863,7 +30246,7 @@ fn daemon_request_response(
     // handler either way. Total held time on the common path is unchanged to
     // within microseconds; on the proxied path it drops from a multi-second round
     // trip to that same lookup. Do not "optimize" this back into the handler.
-    if let ServerRequest::TerminalRead { path, cursor } = &request {
+    if let ServerRequest::TerminalRead { path, cursor, .. } = &request {
         let resolved = {
             let mut guard = lock_daemon_runtime(runtime, "terminal_read_owner_resolve");
             let runtime_path = guard.terminal_runtime_key_for_path(path);
@@ -29897,6 +30280,9 @@ fn daemon_request_response(
                         resync_required,
                         screen_hash,
                         runtime_spawn_id,
+                        // [F2] Registry owner on the pre-lock interception:
+                        // a plain proxy, never an adoption (no scan here).
+                        authority: Some(TerminalContentAuthority::OwnerProxy),
                     };
                 }
                 Err(error) => {
@@ -37633,9 +38019,16 @@ mod tests {
             ServerRequest::TerminalRead {
                 path: "p".into(),
                 cursor: 0,
+                resolve_owner: false,
             },
-            ServerRequest::TerminalSnapshot { path: "p".into() },
-            ServerRequest::TerminalRetainedSnapshot { path: "p".into() },
+            ServerRequest::TerminalSnapshot {
+                path: "p".into(),
+                resolve_owner: false,
+            },
+            ServerRequest::TerminalRetainedSnapshot {
+                path: "p".into(),
+                resolve_owner: false,
+            },
             ServerRequest::TerminalHistory { path: "p".into() },
             // Pure accounting, and the shadow client is the agent's default
             // probe surface — auditing what a predecessor left running is the
@@ -37756,7 +38149,10 @@ mod tests {
         }
 
         // Reads still go to the wire — the shadow's whole purpose is observing.
-        let allowed = ServerRequest::TerminalSnapshot { path: "p".into() };
+        let allowed = ServerRequest::TerminalSnapshot {
+            path: "p".into(),
+            resolve_owner: false,
+        };
         assert_eq!(role_gate(&allowed), ShadowAccess::Allow);
         assert!(
             shadow_client_refusal(&allowed, &shadow).is_none(),
@@ -37777,6 +38173,7 @@ mod tests {
         let req = ServerRequest::TerminalRead {
             path: "p".into(),
             cursor: 9,
+            resolve_owner: false,
         };
         // (a) An anonymous envelope serializes BYTE-IDENTICAL to the bare request,
         // so the user's GUI wire never moves (zero regression / 26-row handoff).
@@ -37913,7 +38310,10 @@ mod tests {
         for request in [
             ServerRequest::Status,
             ServerRequest::Snapshot,
-            ServerRequest::TerminalSnapshot { path: "p".into() },
+            ServerRequest::TerminalSnapshot {
+                path: "p".into(),
+                resolve_owner: false,
+            },
         ] {
             let wire =
                 serde_json::to_string(&ClientRequestEnvelope::new(request, &shadow)).unwrap();
@@ -39636,10 +40036,18 @@ mod tests {
     fn terminal_read_preserved_owner_path_does_not_run_saved_session_mismatch_probe() {
         let source = include_str!("daemon.rs");
         let terminal_read_branch = source
-            .split("ServerRequest::TerminalRead { path, cursor } => {")
+            // [F2] The split literals carry the arm's wire fields; the law
+            // pinned here is unchanged: the read arm proxies bytes directly,
+            // classifies owner errors before local fallback, and never grows
+            // a saved-session mismatch probe (it is the hot loop).
+            .split(
+                "ServerRequest::TerminalRead {\n                path,\n                cursor,\n                resolve_owner,\n            } => {",
+            )
             .nth(1)
             .expect("terminal read branch")
-            .split("ServerRequest::TerminalSnapshot { path } => {")
+            .split(
+                "ServerRequest::TerminalSnapshot {\n                path,\n                resolve_owner,\n            } => {",
+            )
             .next()
             .expect("terminal snapshot branch follows terminal read");
 
@@ -39650,6 +40058,56 @@ mod tests {
         assert!(
             !terminal_read_branch.contains("reject_preserved_owner_saved_session_mismatch"),
             "terminal read is the hot loop; mismatch probes belong to ensure/snapshot paths"
+        );
+    }
+
+    /// [F2] THE OWNER-RESOLUTION PIN (sol s36 Q1): the read arms consult the
+    /// ONE authority gate, and the gate's adopt arm reuses the WRITE path's
+    /// exact candidate selector — never a second selector, and never the
+    /// relaunch ladder (reads must not respawn runtimes). The capability gate
+    /// (`allow_adopt`) must sit BETWEEN the representation check and the
+    /// scan, so an old client's request (resolve_owner absent = false) can
+    /// never trigger adoption (the sol Q2 legacy law, enforced again by the
+    /// serde test beside the compat tests).
+    #[test]
+    fn the_read_arms_resolve_authority_through_one_gate_which_adopts_via_the_write_selector() {
+        let source = include_str!("daemon.rs");
+        // The fourth match is this pin's own assertion line below — the three
+        // read arms plus the quote of it here.
+        let arm_opener =
+            "let read_authority = self.terminal_read_authority(&runtime_path, resolve_owner);";
+        assert_eq!(
+            source.matches(arm_opener).count(),
+            4,
+            "all three read arms (read/snapshot/retained) must consult the ONE gate"
+        );
+        let gate = source
+            .split("fn terminal_read_authority(")
+            .nth(1)
+            .expect("the authority gate exists")
+            .split("\n    fn ")
+            .next()
+            .expect("gate body ends at the next fn");
+        assert!(
+            gate.contains("preserved_owner_candidate_for_runtime_key(statuses, runtime_key, std::process::id())"),
+            "the adopt arm must reuse the WRITE path's candidate selector verbatim"
+        );
+        assert!(
+            !gate.contains("ensure_terminal_for_path") && !gate.contains("restart_session"),
+            "a READ must never relaunch a runtime — recovery ladders belong to write/ensure paths"
+        );
+        let repr_ix = gate
+            .find("!self.server.represents_terminal_runtime_key(runtime_key)")
+            .expect("the representation check precedes everything adopt-shaped");
+        let adopt_ix = gate
+            .find("if !allow_adopt {")
+            .expect("the capability gate must exist");
+        let scan_ix = gate
+            .find("reachable_versioned_daemon_statuses_excluding_endpoint(")
+            .expect("the bounded scan must exist");
+        assert!(
+            repr_ix < adopt_ix && adopt_ix < scan_ix,
+            "representation check -> capability gate -> scan, in that order"
         );
     }
 
@@ -39677,10 +40135,18 @@ mod tests {
     fn terminal_read_preserved_owner_missing_runtime_falls_back_to_local_ensure() {
         let source = include_str!("daemon.rs");
         let terminal_read_branch = source
-            .split("ServerRequest::TerminalRead { path, cursor } => {")
+            // [F2] The split literals carry the arm's wire fields; the law
+            // pinned here is unchanged: the read arm proxies bytes directly,
+            // classifies owner errors before local fallback, and never grows
+            // a saved-session mismatch probe (it is the hot loop).
+            .split(
+                "ServerRequest::TerminalRead {\n                path,\n                cursor,\n                resolve_owner,\n            } => {",
+            )
             .nth(1)
             .expect("terminal read branch")
-            .split("ServerRequest::TerminalSnapshot { path } => {")
+            .split(
+                "ServerRequest::TerminalSnapshot {\n                path,\n                resolve_owner,\n            } => {",
+            )
             .next()
             .expect("terminal snapshot branch follows terminal read");
         let owner_error_ix = terminal_read_branch
@@ -44845,8 +45311,11 @@ mod tests {
         let request_lock_at = dispatch
             .find("lock_daemon_runtime_for_request(")
             .expect("the dispatcher must take the per-request lock somewhere");
+        // [F2] The literal carries the arm's wire fields (`..` = the
+        // capability field the rehydrate opts into); the law pinned here is
+        // unchanged: the interception precedes the per-request lock.
         let branch_at = dispatch
-            .find("if let ServerRequest::TerminalRead { path, cursor } = &request {")
+            .find("if let ServerRequest::TerminalRead { path, cursor, .. } = &request {")
             .expect(
                 "TerminalRead must be intercepted in the dispatcher, before the \
                  per-request lock, or the proxy round trip runs under it",
@@ -46101,8 +46570,14 @@ mod tests {
         // `#[serde(default)]`, so an older daemon's absence deserializes as
         // 0 = unknown and the client's dedupe fails open; an older client
         // ignores the field.
-        const STAMPED_AT_VERSION: &str = "3.2.118";
-        const STAMPED_SHAPE_HASH: u64 = 0x3ddb6bb1cff9058b;
+        // Re-cut for 3.2.119 (lane f2/owner-resolution, sol s36): the three
+        // read requests gained the `resolve_owner` capability gate and the
+        // three read answers gained the `TerminalContentAuthority` stamp —
+        // the wire vocabulary that ends the empty-screen lie ([11.32], F2).
+        // Both `#[serde(default)]`: an old daemon's answers decode legacy
+        // (None) and an old client's requests decode capability-off (false).
+        const STAMPED_AT_VERSION: &str = "3.2.119";
+        const STAMPED_SHAPE_HASH: u64 = 0xc27aa17dbbbf5b59;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
@@ -46149,6 +46624,7 @@ mod tests {
             resync_required: false,
             screen_hash: None,
             runtime_spawn_id: 1791299780008,
+            authority: None,
         })
         .expect("serializes");
         let mut stripped = written.clone();
@@ -46183,6 +46659,75 @@ mod tests {
         }
     }
 
+    /// [F2] THE AUTHORITY CROSS-VERSION CONTRACT: an OLD daemon wire — the
+    /// `authority` field absent — deserializes to `None` = legacy local
+    /// answer, byte-identical behavior; a NEW daemon `owner_unresolved` stamp
+    /// round-trips verbatim; and an OLD client request — `resolve_owner`
+    /// absent — decodes `false`, so a new daemon never adopts for it (sol s36
+    /// Q2 legacy law). The empty-screen lie ends ONLY when the verdict
+    /// survives the wire in BOTH directions.
+    #[test]
+    fn a_terminal_answer_carries_the_content_authority_across_versions() {
+        use crate::ServerResponse;
+        let written = serde_json::to_value(ServerResponse::TerminalSnapshot {
+            text: String::new(),
+            output_seq: 0,
+            running: true,
+            runtime_output_seen: false,
+            post_resize_output_seen: false,
+            last_resize_seq: 0,
+            runtime_spawn_id: 0,
+            composer_holds_draft: None,
+            pty_in_alternate_screen: None,
+            authority: Some(crate::daemon::TerminalContentAuthority::OwnerUnresolved),
+        })
+        .expect("serializes");
+        // Strip the field the way an OLD daemon's wire would look — handling
+        // both enum encodings the way the identity test beside this does.
+        let mut stripped = written.clone();
+        let strip_field = |value: &mut serde_json::Value| {
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("authority");
+            }
+        };
+        if stripped.is_object() && stripped.as_object().unwrap().len() != 1 {
+            strip_field(&mut stripped);
+        } else if stripped.is_object() {
+            if let Some(inner) = stripped.as_object_mut().unwrap().values_mut().next() {
+                strip_field(inner);
+            }
+        }
+        match serde_json::from_value::<ServerResponse>(stripped).expect("old shape parses") {
+            ServerResponse::TerminalSnapshot { authority, .. } => assert!(
+                authority.is_none(),
+                "an absent authority must deserialize as legacy (None), never a guess"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match serde_json::from_value::<ServerResponse>(written).expect("new shape parses") {
+            ServerResponse::TerminalSnapshot { authority, .. } => assert_eq!(
+                authority,
+                Some(crate::daemon::TerminalContentAuthority::OwnerUnresolved),
+                "the unresolved verdict must survive the wire verbatim"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // The wire is INTERNALLY tagged (`kind`) — the flat old-client shape.
+        let request: ServerRequest = serde_json::from_value(serde_json::json!({
+            "kind": "terminal_read",
+            "path": "p",
+            "cursor": 0
+        }))
+        .expect("old request shape parses");
+        match request {
+            ServerRequest::TerminalRead { resolve_owner, .. } => assert!(
+                !resolve_owner,
+                "an absent resolve_owner must decode false: the capability is opt-in"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
         fn a_terminal_snapshot_answer_carries_the_alternate_screen_truth_across_versions() {
         use crate::daemon::ServerResponse;
         let answer = ServerResponse::TerminalSnapshot {
@@ -46193,6 +46738,7 @@ mod tests {
             post_resize_output_seen: false,
             last_resize_seq: 0,
             runtime_spawn_id: 0,
+            authority: None,
             composer_holds_draft: None,
             pty_in_alternate_screen: Some(true),
         };
@@ -46523,6 +47069,7 @@ mod terminal_snapshot_answer_tests {
                 post_resize_output_seen: false,
                 last_resize_seq: 7,
                 runtime_spawn_id: 9,
+                authority: None,
                 composer_holds_draft: Some(false),
                 pty_in_alternate_screen: Some(true),
             })

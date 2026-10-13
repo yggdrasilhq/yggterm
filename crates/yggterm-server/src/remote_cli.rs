@@ -10,7 +10,8 @@ use crate::{
     run_remote_durable_sessions, run_remote_scan, run_remote_stage_clipboard_png,
     run_remote_start_agent, run_remote_start_cc,
     run_remote_start_codex,
-    run_remote_agent_runtime_alive, run_remote_apps, run_remote_cli_presence,
+    run_remote_agent_runtime_alive, run_remote_agent_screen_snapshot, run_remote_apps,
+    run_remote_cli_presence,
     run_remote_terminate_agent,
     run_remote_terminate_cc,
     run_remote_terminate_codex, run_remote_upsert_generated_copy,
@@ -121,6 +122,14 @@ pub enum RemoteServerCommand {
     /// its own ssh client. Sweeps every coexisting daemon, so an older daemon
     /// still holding the PTY answers `alive: true` rather than going unseen.
     AgentRuntimeAlive {
+        runtime_key: String,
+    },
+    /// What does the daemon on THIS host answer on `TerminalSnapshot` for
+    /// `runtime_key`? The [11.32] first slice's remote leg: the OWNING
+    /// machine's screen, three-valued (definitive_screen / definitive_empty /
+    /// unknown) — a GUI-host daemon never holds remote runtimes, so only the
+    /// owner can answer, and "unknown" must stay unknown (no vouch, no kill).
+    AgentScreenSnapshot {
         runtime_key: String,
     },
     UpsertGeneratedCopy {
@@ -311,6 +320,11 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "agent-runtime-alive" if args.len() == 4 => RemoteServerCommand::AgentRuntimeAlive {
             runtime_key: args[3].clone(),
         },
+        "agent-screen-snapshot" if args.len() == 4 => {
+            RemoteServerCommand::AgentScreenSnapshot {
+                runtime_key: args[3].clone(),
+            }
+        }
         "upsert-generated-copy" if args.len() == 4 => RemoteServerCommand::UpsertGeneratedCopy {
             session_id: args[3].clone(),
         },
@@ -407,6 +421,9 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::TerminateCc { session_id } => run_remote_terminate_cc(&session_id),
         RemoteServerCommand::AgentRuntimeAlive { runtime_key } => {
             run_remote_agent_runtime_alive(&runtime_key)
+        }
+        RemoteServerCommand::AgentScreenSnapshot { runtime_key } => {
+            run_remote_agent_screen_snapshot(&runtime_key)
         }
         RemoteServerCommand::UpsertGeneratedCopy { session_id } => {
             run_remote_upsert_generated_copy(&session_id)

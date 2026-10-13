@@ -19021,6 +19021,12 @@ struct ShellState {
     /// Rows whose stuck gate has already been reported this episode, so the
     /// tick says it once instead of once per poll.
     input_gate_stuck_reported: HashSet<String>,
+    /// The [11.32 · F2 s36] remote-screen ask budget, keyed by SESSION PATH.
+    /// Deliberately NOT the rehydrate identity key: the recovery lane's mode
+    /// flip re-arms the seed with a fresh identity (and a fresh local ladder),
+    /// and that must not read as a fresh authority to re-ask the owning
+    /// machine (sol s36b Q2). Shape: (session_path, window_start_ms, asks).
+    remote_screen_ask_budget: Option<(String, u64, u32)>,
     retained_terminal_session_paths: HashSet<String>,
     terminal_mount_epochs: HashMap<String, u64>,
     active_terminal_host_id: Option<String>,
@@ -21536,6 +21542,7 @@ impl ShellState {
         let keytip_config = load_keytip_config_from_disk();
         let keymap = keymap_from_keytip_config(&keytip_config);
         let mut state = Self {
+            remote_screen_ask_budget: None,
             render_snapshot_cache: std::cell::RefCell::new(None),
             selection_crawl_cache: std::cell::RefCell::new(None),
             settings,
@@ -32388,6 +32395,37 @@ impl ShellState {
             .copied()
             .map(|epoch| terminal_mount_host_id(session_path, epoch))
     }
+    /// The [11.32 · F2 s36] ask gate: may this session path ask the OWNING
+    /// machine for its screen right now? Initial ask + ≤2 follow-ups inside
+    /// a 10s window (sol s36b Q2); past the window the automatic asks END
+    /// for this burst — a later reveal opens a fresh window, but the
+    /// recovery lane's identity flip (same seconds, same path) cannot reset
+    /// the count.
+    fn remote_screen_ask_allowed(&self, session_path: &str, now_ms: u64) -> bool {
+        match &self.remote_screen_ask_budget {
+            Some((path, window_started_ms, asks)) if path == session_path => {
+                now_ms.saturating_sub(*window_started_ms) <= 10_000 && *asks < 3
+            }
+            Some(_) | None => true,
+        }
+    }
+
+    fn record_remote_screen_ask(&mut self, session_path: &str, now_ms: u64) {
+        match &mut self.remote_screen_ask_budget {
+            Some((path, window_started_ms, asks)) if path == session_path => {
+                if now_ms.saturating_sub(*window_started_ms) > 10_000 {
+                    *window_started_ms = now_ms;
+                    *asks = 1;
+                } else {
+                    *asks += 1;
+                }
+            }
+            _ => {
+                self.remote_screen_ask_budget = Some((session_path.to_string(), now_ms, 1));
+            }
+        }
+    }
+
     fn terminal_session_uses_remote_runtime(&self, session_path: &str) -> bool {
         if session_path_names_remote_runtime_by_scheme(session_path) {
             return true;
