@@ -5092,7 +5092,7 @@ fn TerminalCanvas(
                 }
             };
             match retained_rehydrate_result {
-                Ok((data, mut replay_source, snapshot_status, mut runtime_spawn_id)) => {
+                Ok((data, mut replay_source, mut snapshot_status, mut runtime_spawn_id)) => {
                     if let Some((
                         running,
                         runtime_output_seen,
@@ -5211,6 +5211,212 @@ fn TerminalCanvas(
                                         "error": error.to_string(),
                                     }),
                                 );
+                            }
+                        }
+                    }
+                    if data.trim().is_empty() {
+                        // [11.32 · F2 s36] THE LOCAL DAEMON DOES NOT HOLD
+                        // REMOTE RUNTIMES. Its ("", 0) for a remote row is a
+                        // missing-owner fall-through, not screen knowledge —
+                        // before it may call this screen empty, ask the
+                        // OWNING machine (its daemon answers TerminalSnapshot
+                        // three-valued over the agent-screen-snapshot hop).
+                        // Skips: a live-connected pump (the stream repaints;
+                        // the ask would race the truth it carries), and the
+                        // ask budget (sol s36b Q2: initial + ≤2 follow-ups
+                        // inside a 10s window, keyed by session path so the
+                        // recovery lane's identity flip cannot reset it).
+                        let remote_ask_parts = state.with(|shell| {
+                            let parts = yggterm_core::agent_scheme::parse_remote_agent_session_path(
+                                &session_path_for_task,
+                            );
+                            let allowed = shell
+                                .remote_screen_ask_allowed(&session_path_for_task, current_millis());
+                            parts.map(|(kind, machine_key, session_id)| {
+                                (kind, machine_key.to_string(), session_id.to_string(), allowed)
+                            })
+                        });
+                        if !terminal_live_host_connected() {
+                            if let Some((kind, machine_key, session_id, allowed)) = remote_ask_parts {
+                                if allowed {
+                                    let _ask_begin = json!({
+                                        "session_path": &session_path_for_task,
+                                        "machine": &machine_key,
+                                        "session_id": &session_id,
+                                        "kind": format!("{kind:?}"),
+                                    });
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "retained_rehydrate_remote_screen_ask_begin",
+                                        _ask_begin.clone(),
+                                    );
+                                    yggterm_core::perf::ytrace_emit_event(
+                                        "ui",
+                                        "terminal_mount",
+                                        "retained_rehydrate_remote_screen_ask_begin",
+                                        _ask_begin,
+                                    );
+                                    let machine_ref = state.with(|shell| {
+                                        shell
+                                            .server
+                                            .remote_machines()
+                                            .iter()
+                                            .find(|machine| machine.machine_key == machine_key)
+                                            .map(|machine| machine.routing_ref())
+                                    });
+                                    let ask_result = match machine_ref {
+                                        None => Err(anyhow::anyhow!(
+                                            "no registered remote machine {machine_key}"
+                                        )),
+                                        Some(machine_ref) => {
+                                            state.with(|shell| {
+                                                shell.record_remote_screen_ask(
+                                                    &session_path_for_task,
+                                                    current_millis(),
+                                                );
+                                            });
+                                            run_dedicated_terminal_io(
+                                                "remote_agent_screen_snapshot",
+                                                &trace_home,
+                                                move || {
+                                                    yggterm_server::remote_agent_session_screen_snapshot(
+                                                        &machine_ref,
+                                                        &session_id,
+                                                        kind,
+                                                    )
+                                                },
+                                            )
+                                            .await
+                                        }
+                                    };
+                                    // ⛔ THE ROW MAY HAVE MOVED WHILE THE HOP
+                                    // RAN (ssh is seconds; a remount re-arms a
+                                    // fresh task). Only the holder of this
+                                    // rehydrate identity may act on the answer.
+                                    let ask_still_ours = *retained_rehydrate_identity.borrow()
+                                        == retained_rehydrate_key_for_task
+                                        && state.with(|shell| {
+                                            shell.server.active_view_mode()
+                                                == WorkspaceViewMode::Terminal
+                                                && shell.server.active_session_path()
+                                                    == Some(session_path_for_task.as_str())
+                                        });
+                                    if !ask_still_ours {
+                                        return;
+                                    }
+                                    match ask_result {
+                                        Ok(answer) => match answer.kind {
+                                            yggterm_server::RemoteScreenSnapshotKind::DefinitiveScreen => {
+                                                let _ask_hit = json!({
+                                                    "session_path": &session_path_for_task,
+                                                    "machine": &machine_key,
+                                                    "bytes": answer.text.len(),
+                                                    "output_seq": answer.output_seq,
+                                                    "runtime_spawn_id": answer.runtime_spawn_id,
+                                                });
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_rehydrate_remote_screen_hit",
+                                                    _ask_hit.clone(),
+                                                );
+                                                yggterm_core::perf::ytrace_emit_event(
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_rehydrate_remote_screen_hit",
+                                                    _ask_hit,
+                                                );
+                                                let screen_text =
+                                                    sanitize_terminal_replay_payload(&answer.text);
+                                                data = screen_text;
+                                                replay_source =
+                                                    "remote_daemon_screen_snapshot".to_string();
+                                                if let Some(spawn_id) = answer.runtime_spawn_id {
+                                                    runtime_spawn_id = spawn_id;
+                                                }
+                                                snapshot_status = Some((
+                                                    answer.running.unwrap_or(false),
+                                                    answer.runtime_output_seen.unwrap_or(false),
+                                                    answer.post_resize_output_seen.unwrap_or(false),
+                                                    answer.last_resize_seq.unwrap_or(0),
+                                                ));
+                                            }
+                                            yggterm_server::RemoteScreenSnapshotKind::DefinitiveEmpty => {
+                                                // A LIVE SILENT SESSION IS REAL.
+                                                // The owning daemon HELD the
+                                                // runtime and stamped an
+                                                // authoritative empty screen —
+                                                // knowledge, not absence: stop
+                                                // HERE. No ladder, no refusal,
+                                                // no false "Terminal Screen
+                                                // Unavailable" (sol s36b Q3).
+                                                let _ask_empty = json!({
+                                                    "session_path": &session_path_for_task,
+                                                    "machine": &machine_key,
+                                                    "output_seq": answer.output_seq,
+                                                    "runtime_output_seen": answer.runtime_output_seen,
+                                                });
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_rehydrate_remote_screen_definitive_empty",
+                                                    _ask_empty.clone(),
+                                                );
+                                                yggterm_core::perf::ytrace_emit_event(
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_rehydrate_remote_screen_definitive_empty",
+                                                    _ask_empty,
+                                                );
+                                                return;
+                                            }
+                                            yggterm_server::RemoteScreenSnapshotKind::Unknown => {
+                                                let _ask_unknown = json!({
+                                                    "session_path": &session_path_for_task,
+                                                    "machine": &machine_key,
+                                                    "reason": answer.reason,
+                                                });
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_rehydrate_remote_screen_unknown",
+                                                    _ask_unknown.clone(),
+                                                );
+                                                yggterm_core::perf::ytrace_emit_event(
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_rehydrate_remote_screen_unknown",
+                                                    _ask_unknown,
+                                                );
+                                            }
+                                        },
+                                        Err(error) => {
+                                            let _ask_error = json!({
+                                                "session_path": &session_path_for_task,
+                                                "machine": &machine_key,
+                                                "error": error.to_string(),
+                                            });
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "retained_rehydrate_remote_screen_error",
+                                                _ask_error.clone(),
+                                            );
+                                            yggterm_core::perf::ytrace_emit_event(
+                                                "ui",
+                                                "terminal_mount",
+                                                "retained_rehydrate_remote_screen_error",
+                                                _ask_error,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -19272,6 +19478,12 @@ fn terminal_replay_source_is_retained_snapshot(source: &str) -> bool {
     matches!(
         source,
         "daemon_retained_snapshot" | "daemon_retained_history_screen_snapshot"
+        // [11.32 · F2 s36] The owning machine's daemon answered the screen
+        // over the agent-screen-snapshot hop: retained-snapshot evidence
+        // (installs through the retained branch; must NOT mark
+        // terminal_live_host_connected — an ssh answer proves no live
+        // stream connection), with its own provenance stamp.
+        | "remote_daemon_screen_snapshot"
     )
 }
 

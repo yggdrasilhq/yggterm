@@ -170,6 +170,23 @@ pub(crate) fn retained_rehydrate_seed_retry_delay_ms(retries_done: u32) -> Optio
     Some(delay)
 }
 
+/// [F2] The OWNER-UNRESOLVED ladder — the distinct retry budget for an empty
+/// answer stamped `TerminalContentAuthority::OwnerUnresolved` (the daemon
+/// represents the row but could not resolve the daemon holding its screen).
+/// Sol s36 Q3: the initial ask plus AT MOST two follow-ups inside ~10 s —
+/// the daemon's own adoption cooldown (2 s) makes the third read the first
+/// that could see a freshly registered owner — and past the ceiling the
+/// automatic retry STOPS without ever declaring the screen absent. The
+/// generic [`retained_rehydrate_seed_retry_delay_ms`] (and its exponential
+/// backoff against a daemon that holds nothing) is for empty answers only.
+pub(crate) fn retained_rehydrate_owner_unresolved_retry_delay_ms(retries_done: u32) -> Option<u64> {
+    match retries_done {
+        0 => Some(2_500),
+        1 => Some(5_000),
+        _ => None,
+    }
+}
+
 pub(crate) fn retained_rehydrate_ready_history_retry_reason(reason: Option<&str>) -> bool {
     if reason == Some(RETAINED_EMPTY_XTERM_SURFACE_PROBLEM) {
         return true;
@@ -306,6 +323,31 @@ pub(crate) fn blank_host_snapshot_replay_from_read_should_start(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_owner_unresolved_ladder_is_bounded_at_two_followups_inside_ten_seconds() {
+        // [F2] sol s36 Q3's falsifiable shape: initial + <=2 follow-ups within
+        // ~10 s; the third attempt ends AUTOMATIC retry (None) without
+        // declaring absence.
+        assert_eq!(
+            retained_rehydrate_owner_unresolved_retry_delay_ms(0),
+            Some(2_500)
+        );
+        assert_eq!(
+            retained_rehydrate_owner_unresolved_retry_delay_ms(1),
+            Some(5_000)
+        );
+        assert_eq!(
+            retained_rehydrate_owner_unresolved_retry_delay_ms(2),
+            None
+        );
+        // And the total automatic window stays inside the 10 s bound.
+        let total: u64 = (0..2)
+            .map(|r| retained_rehydrate_owner_unresolved_retry_delay_ms(r).unwrap_or(0))
+            .sum();
+        assert!(total <= 10_000, "ladder total {total} ms exceeds the 10 s bound");
+    }
+
     use super::*;
 
     // Boring retained reveal (spec-boring-session-loads lane 1): a positive
