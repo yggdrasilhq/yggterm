@@ -175,9 +175,7 @@ pub use daemon::{
     hot_update_handoff_would_refuse_binary,
     HotRestartBlocker, HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest,
     ServerResponse, ServerRuntimeStatus, SessionDraftState, hot_restart_block_reason_summary,
-    TerminalContentAuthority, TerminalSnapshotAnswer, TerminalStreamChunk, cleanup_legacy_daemons,
-    connect_ssh, terminal_read_resolved, terminal_retained_snapshot_resolved,
-    terminal_snapshot_resolved,
+    TerminalSnapshotAnswer, TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh,
     connect_ssh_custom, default_endpoint,
     resolve_client_daemon_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
@@ -35514,6 +35512,10 @@ pub fn run_app_control_read_terminal_buffer(
                         composer_holds_draft: None,
                         pty_in_alternate_screen: None,
                         authority: None,
+                        authority: None,
+// [F2] the read-buffer fallback answers from THIS daemon's own held screen — legacy local, no authority to name.
+                        authority: None,
+authority: None,
                     }
                 })
         } else {
@@ -37148,6 +37150,147 @@ pub fn run_remote_agent_runtime_alive(runtime_key: &str) -> anyhow::Result<()> {
         "owner_endpoint": owner.as_ref().map(|endpoint| format!("{endpoint:?}")),
     });
     println!("{payload}");
+    Ok(())
+}
+
+/// The screen a remote row's OWNING daemon holds — the [11.32] first slice's
+/// remote leg (F2/owner-resolution, sitting 36).
+///
+/// A GUI-host daemon asked for a `remote-*://` row's retained screen does not
+/// hold that session: its snapshot arm falls through `preserved_owner_…` (the
+/// SAME-HOST takeover registry) to `session_screen_snapshot_stamped` → None →
+/// `("", 0)`, and the client's rehydrate read that authoritative-sounding
+/// empty as "the screen is empty", backing 2.5s→5s against a screen that was
+/// alive on the owning machine the whole time. This ask goes to THAT machine
+/// and returns its daemon's `TerminalSnapshot` answer, three-valued:
+///
+/// - `definitive_screen` — the owning daemon holds the runtime and answered
+///   a non-empty screen (text + output_seq + the geometry witnesses).
+/// - `definitive_empty` — the owning daemon holds the runtime and answered
+///   an authoritative EMPTY screen: a live silent session is real, and this
+///   is knowledge, not absence.
+/// - `unknown` — no local owner, a failed snapshot request, or a remote
+///   binary too old to know the verb. Vouches nothing, kills nothing — the
+///   same honesty contract as the saved-store ask's `Unknowable`, and the
+///   strictness law of [`parse_remote_agent_runtime_alive_output`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RemoteScreenSnapshotAnswer {
+    pub kind: RemoteScreenSnapshotKind,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub output_seq: u64,
+    #[serde(default)]
+    pub running: Option<bool>,
+    #[serde(default)]
+    pub runtime_output_seen: Option<bool>,
+    #[serde(default)]
+    pub post_resize_output_seen: Option<bool>,
+    #[serde(default)]
+    pub last_resize_seq: Option<u64>,
+    #[serde(default)]
+    pub runtime_spawn_id: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteScreenSnapshotKind {
+    DefinitiveScreen,
+    DefinitiveEmpty,
+    #[default]
+    Unknown,
+}
+
+/// Ask the machine that OWNS a remote agent session what its daemon's
+/// `TerminalSnapshot` answers for the session's runtime key. The remote twin
+/// of [`remote_agent_session_runtime_alive`]: same runtime-key builder, same
+/// strict parse law — an old remote binary prints a usage line, and usage is
+/// not a screen.
+pub fn remote_agent_session_screen_snapshot(
+    machine: &RemoteMachineRef,
+    session_id: &str,
+    kind: SessionKind,
+) -> anyhow::Result<RemoteScreenSnapshotAnswer> {
+    let runtime_key = remote_runtime_agent_session_key(kind, session_id)
+        .with_context(|| format!("no daemon runtime lane for session kind {kind:?}"))?;
+    let output = run_remote_yggterm_command(
+        &machine.ssh_target,
+        machine.prefix.as_deref(),
+        &["server", "remote", "agent-screen-snapshot", &runtime_key],
+        None,
+    )?;
+    parse_remote_agent_screen_snapshot_output(&output)
+}
+
+/// Read the `agent-screen-snapshot` answer. Strict on purpose — the alive
+/// verb's law: an unparseable answer is an ERROR the caller classifies as
+/// unknown, never a screen and never an absence.
+pub fn parse_remote_agent_screen_snapshot_output(
+    output: &str,
+) -> anyhow::Result<RemoteScreenSnapshotAnswer> {
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(answer) = serde_json::from_str::<RemoteScreenSnapshotAnswer>(line) {
+            return Ok(answer);
+        }
+    }
+    anyhow::bail!("unreadable agent-screen-snapshot answer: {}", output.trim())
+}
+
+/// Remote-host side of [`remote_agent_session_screen_snapshot`]: answer the
+/// OWNING daemon's `TerminalSnapshot` for `runtime_key` from THIS host.
+///
+/// ⚖ Sol s36b Q5(a): a transport success does not vouch authority — an
+/// unknown must stay unknown. `no_local_owner`, a failed request, and an
+/// old binary's usage line all answer `unknown`; `definitive_empty`
+/// requires the owning daemon to have HELD the runtime and stamped an
+/// authoritative (empty) screen.
+pub fn run_remote_agent_screen_snapshot(runtime_key: &str) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let answer = match owning_daemon_endpoint_for_runtime_key(&home, runtime_key) {
+        None => RemoteScreenSnapshotAnswer {
+            kind: RemoteScreenSnapshotKind::Unknown,
+            reason: Some("no_local_owner".to_string()),
+            ..Default::default()
+        },
+        Some(endpoint) => match terminal_snapshot(&endpoint, runtime_key) {
+            Ok(TerminalSnapshotAnswer {
+                text,
+                output_seq,
+                running,
+                runtime_output_seen,
+                post_resize_output_seen,
+                last_resize_seq,
+                runtime_spawn_id,
+                ..
+            }) => RemoteScreenSnapshotAnswer {
+                kind: if text.trim().is_empty() {
+                    RemoteScreenSnapshotKind::DefinitiveEmpty
+                } else {
+                    RemoteScreenSnapshotKind::DefinitiveScreen
+                },
+                text,
+                output_seq,
+                running: Some(running),
+                runtime_output_seen: Some(runtime_output_seen),
+                post_resize_output_seen: Some(post_resize_output_seen),
+                last_resize_seq: Some(last_resize_seq),
+                runtime_spawn_id: Some(runtime_spawn_id),
+                reason: None,
+            },
+            Err(error) => RemoteScreenSnapshotAnswer {
+                kind: RemoteScreenSnapshotKind::Unknown,
+                reason: Some(format!("snapshot_request_failed: {error:#}")),
+                ..Default::default()
+            },
+        },
+    };
+    write_stdout_line(&serde_json::to_string(&answer)?)?;
     Ok(())
 }
 
