@@ -1257,11 +1257,21 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
   reveal_failed "is not in the scan" over a live row, running:false over
-  alive, declare_absent noise). ATTACK (sol #1): ONE owner-resolution
-  function for read/screen/presence/attach, distinguishing Absent /
-  Unavailable / valid-empty; measured HEALTHY on a fresh row when the IPC
-  leg is healthy — the divergence compounds with F1. MEMBERS: [11.32],
-  the [11.229] absent-declaration sub-item.
+  alive, declare_absent noise). ATTACK STATE: the FIRST SLICE LANDED IN
+  CODE 2026-10-14 (lane/f2/owner-resolution, the joint s36/s36b sitting):
+  the read/screen/retained arms answer WHERE content came from
+  (Held/OwnerProxy/OwnerAdopted/OwnerUnresolved + the additive
+  `authority` wire verdict, capability-gated for old clients) and the
+  client's remote-key rehydrate asks the OWNING machine
+  (agent-screen-snapshot verb, three-valued) instead of trusting a local
+  daemon's ("",0) — [11.32]'s entry carries the full record + falsifier.
+  REMAINDERS: presence/liveness gate (sol s36 Q4 DEFER — the declare_absent
+  witness inspection; unavailable must SUPPRESS an absence declaration),
+  the [11.229] absent-declaration sub-item, the live rig + dev-local GUI
+  harness (the falsifier's dependency), and the enum-variant upgrade
+  (additive fields → the full Absent/Unavailable/valid-empty vocabulary)
+  when a second consumer needs it. MEMBERS: [11.32], the [11.229]
+  absent-declaration sub-item.
 - **F3 — HOST-LIFECYCLE IMMORTALITY**: a bad host must be replaced, never
   revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71);
   THE RELAUNCH/RE-BIND ARM ROOT-FIXED (sitting 13, 2026-10-06, main
@@ -1307,9 +1317,13 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   [11.175] kimi descriptor drift, the 11.6.x family stone.
 - **F5 — CI-PLANE SELF-INTEGRITY**: [11.227] four-part guard LANDED
   (accf7b5b — live-pid liveness, any-watcher belt, push read-back,
-  monotonic main) ⛔ RE-DISPERSE OWED (ygg-disperse install --fleet from
-  main + watcher restart — the running watcher is old code); [11.230] the
-  sub-file wedge (below); the docs-gate 16-30 min cost (dream
+  monotonic main); the owed re-disperse is MOOT, verified 2026-10-14:
+  the running watcher (pid 49892, started 2026-10-10 05:39 IST) executes
+  ygg-ci.py bytes IDENTICAL to main (md5-compared) — the stale-note
+  correction landed with the s36 sitting; [11.230] the
+  sub-file wedge (below; ONE callgraph sub remains, skipped-as-merged
+  each tick — the callgraph campaign's lane to retire);
+  the docs-gate 16-30 min cost (dream
   ACK-a8a9eec7c3 — wants a path-scoped gate skip).
 - **F6 — MANAGED-CLI REFRESH CONVERGENCE**: [11.224] escalation LIVE
   (streak doubling measured; final falsifier = a day of walks without mimo
@@ -1388,75 +1402,6 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   read-version fencing — seq_start == seq_now at commit or abort.
   Composer transport must follow the model ruling (sol/GLM; gemini
   knowledge/creativity only). SLICE 2 LANDED 2026-10-06 (sitting 11, lane lane/memory/dream-verb): the `dream` verb (--prepare/--apply/--run/--status: journal-delta collector with dreamer ingestion isolation + per-ns dream watermark + input budget, machine-parsed composer contract, MANDATORY adversarial-critic verdicts, per-claim [as-of; proof] stamps over a closed vocabulary, append-section/propose-tombstone ops whitelist, ns-level NOW.md + _global owner-now.md landed through journaled origin=dreamer publishes, per-dream OPLOG) + the `search` verb (regex across hub doors, provenance per hit) + tests/test_memory_dream_verb.py (green: isolation, budget, refusals x10, watermark, ops, owner-now, search). FIRST REAL DREAM applied live on -home-pi-gh-yggterm via the seat-composer path (sol transport built but juju-capped to Oct 10 3:54 AM): NOW.md 2309B/9 claims/0 contested AFTER the critic pass contested three generator claims (a stale 33KB figure copied from the door, an unsourced watcher count, an unevidenced 'sittings 1-10') — the adversarial gate measured working on its first live run. owner-now.md live in _global and pinned into every zcode project. Remaining for F8: slices 3-4 (H_vocab phase telemetry, Hebbian decay/canaries) + the [11.236] byte-source probe + the per-host ns-index gap (a peer host never learns a new door's hub-ns MEMORY.md line — the index is per-host publish-time state; NOW.md is read by `get`, so orientation works, but the index drift is a dream-grade gap).
-
-## ⛔ [11.238] TWO FLEET-SKILL TESTS ARE RED ON CLEAN MAIN — ygg-auth's ROTATION SCORING RANKS A FULL ACCOUNT FIRST ("headroom did not lead": acct-full > acct-good > acct-dead) AND THE SANDBOX-AIM TEST'S REMOTE ARM NEVER MAKES ITS SSH HOP (measured 2026-10-07, both rc=1 identically on main e1b99812 and on the [11.237] arm-2 lane — PRE-EXISTING, surfaced by arm 2's skill-suite gate)
-
-**Status:** FIXED IN CODE — LIVE PROOF OWED
-
-Filed 2026-10-07 by the [11.237] arm-2 sitting (board ACK-da8179c1e1's
-outcome). The migration's gate ran the whole
-.agents/skills/yggterm-agent-fleet/tests/ battery; 22 green, 2 red — and
-both reproduce BYTE-IDENTICALLY on the clean main checkout, so they are
-not the migration's regressions:
-
-1. `tests/test_ygg_auth_rotation.py` — unit arm: "convert_flat + rotate
-   scoring rank measured headroom first: ranked ['acct-full', 'acct-good',
-   'acct-dead'] — headroom did not lead". A LOGIC-shape failure (the
-   rotation picker is supposed to prefer headroom; a full account winning
-   the ranking is either a real scoring bug or a stale test encoding an
-   older policy — the deterministic-auth-homes law of 2026-09-30 rewrote
-   rotation, and this test may predate it). No privacy interplay.
-2. `tests/test_the_fleet_verbs_can_be_aimed_at_a_sandbox.py` — "ygg-spawn:
-   never reached `terminal new` through the aimed binary" + "remote arm:
-   ygg-deliver made no ssh hop at all … no row matches <uuid>". Smells
-   ENVIRONMENTAL on dev (a sandbox daemon spawn under a host that already
-   runs the live watcher), but it is unproven which leg dies — needs its
-   own probe before "environmental" is allowed to stand (the anti-lying
-   law).
-
-ATTACK: rerun both in isolation; for (1) read ygg-auth.py's scoring order
-against the test's expectation and decide bug-vs-stale-test with the
-owner's rotation laws (ygg-auth skill); for (2) trace the aimed sandbox
-spawn's own log — the test prints the sandbox dir; check whether the
-headless binary registered rows at all.
-  RESOLVED 2026-10-10 (sitting 27, zcode on oc): RED 1 WAS A REAL BUG —
-  lane lane/fleet/auth-headroom e38a7c551 (off main): rotate_score's
-  headroom `min(free(pri), free(sec))` read a MISSING secondary window
-  as free(None)=0 — every single-window snapshot walled its account at
-  headroom 0/tier 1 below every two-window peer regardless of real
-  usage (the red's exact shape: acct-good min(90, 0)=0 tier-tied with
-  acct-full, slug-alphabetical tiebreak put acct-full first). Headroom
-  now mins over the windows that EXIST (min(default=0) only when
-  neither answers). The test was RIGHT and is the falsifier (12/12
-  green on the lane). RED 2 IS ENVIRONMENTAL ON DEV, PROBED: the SAME
-  battery on oc (main + only the scoring fix) runs 28/28 rc=0 INCLUDING
-  test_the_fleet_verbs_can_be_aimed_at_a_sandbox — the ssh-hop arm
-  completes off-dev. The dev-side leg (watcher/live-daemon contention
-  hypothesis) stays UNPROVEN: retest on dev's return; if it greens
-  there, close as environment; else read the sandbox dir's own log per
-  the original attack. [11.238] itself closes with red 1's landing;
-  the red-2 retest rides the dev-return checklist.
-  RETEST 2026-10-10 ~06:05 IST (sitting 28, dev back up): STILL RED on
-  dev, and the mechanism is now NAMED — s27's watcher/live-daemon
-  contention hypothesis is FALSIFIED. ygg-spawn's own error is the
-  whole story: "no live Yggterm GUI client is registered for app
-  control on this host (dev)" — app control is served by the GUI
-  PROCESS, and dev has run NO yggterm GUI (nor daemon) since its
-  2026-10-08 reboot; ygg-deliver then cascades ("no row matches
-  <uuid>") off the same absence. NO CODE IMPLICATION: the verbs are
-  unchanged by the 2026-10-10 landing except ygg-auth.py (which this
-  battery does not aim at), and the 28/28 oc green ran the EXACT
-  landed bytes (e38a7c551 verbatim). At retest hour no fleet host had
-  a live GUI (the muse-lab host's last server socket retired
-  2026-10-07; oc's rig GUIs torn down; dev none since reboot), so a
-  live-arm re-run is blocked fleet-wide until a GUI is next up — a
-  GUI is the owner's desktop flow, not agent-forced (the
-  untargeted-GUI-action law). RED 1 IS LANDED+DEPLOYED+DISPERSED
-  (main 5be94c461ceb, replicas at 5be94c46). DISPOSITION:
-  environmental-with-mechanism stands; if the
-  battery is still red on dev WITH a GUI up, reopen and read the
-  sandbox dir's log per the original attack — until then the only
-  owed live proof is red 1's rotation behavior in real usage.
 
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
@@ -4212,7 +4157,8 @@ already supplied the activation.
 
 ## ⛔ [11.32] A REMOTE ROW'S SCREEN READ ANSWERS "EMPTY" FROM THE LOCAL DAEMON — THE CLIENT BACKS OFF 2.5s→5s AND THE ROW SITS BLANK AND INPUT-GATED FOR 10+ SECONDS
 
-**Status:** OPEN
+**Status:** FIXED IN CODE — LIVE PROOF OWED (lane/f2/owner-resolution,
+2026-10-14, the joint s36/s36b sitting; falsifier below)
 
 The empty-screen-read half is open; the watchdog-remount half of this
 entry is **FIXED IN CODE — LIVE PROOF OWED**: `rearm_stale_retained_fault_
@@ -4265,6 +4211,37 @@ daemon-forwarded output and the host record still exists
 output) still consumes the remount budget exactly as before. Locked by
 `the_fault_watchdog_latches_ready_instead_of_remounting_a_live_host` and
 `the_fault_watchdog_still_remounts_an_attempt_with_no_live_output`.
+
+**LANDED IN CODE 2026-10-14 (the joint s36/s36b sitting, lane
+lane/f2/owner-resolution: 688d84bf + a6e5c57c + d1249887 + 4739ff1b) —
+FIXED IN CODE, LIVE PROOF OWED.** Both seams closed: (1) THE DAEMON — the
+three read arms consult one authority gate (`terminal_read_authority`):
+Held answers locally, a registered owner is proxied (`OwnerProxy`), a
+represented-but-unowned row ADOPTS its owner with the write path's
+candidate selector (`OwnerAdopted`, 2s per-key cooldown), and — the arm
+the read paths never had — an unresolvable represented row answers
+`OwnerUnresolved` instead of an authoritative-looking empty; the wire
+gains the additive `authority` verdict (serde default None = legacy) +
+`resolve_owner` capability gates (old clients keep today's behavior
+exactly; stamp 3.2.119). (2) THE CLIENT — on a local-empty for a remote
+key (and no live-connected pump), the rehydrate asks the OWNING machine
+over the new `server remote agent-screen-snapshot` verb (strict parse,
+three-valued): `definitive_screen` installs through the retained branch
+with its own provenance (never marks live_host_connected),
+`definitive_empty` STOPS the ladder honestly (a live silent session is
+real — no false "Screen Unavailable"), `unknown` rides today's ladder
+with the ask recorded; the ask ledger (state.rs) budgets initial + ≤2
+follow-ups in a 10s window keyed by SESSION PATH so the recovery lane's
+identity flip cannot reset it (sol s36b Q2/Q3/Q5 corrections adopted;
+consults: lores/chain-of-thought/2026-10-14-yggterm-s36-sol-a-owner-design.md
++ ...-s36b-screen-ask-slice.md). **THE FALSIFIER (what would fail this
+fix):** a remote-agy row with a painted screen on the owning host,
+resumed on the GUI host after a local daemon restart, must trace
+`retained_rehydrate_remote_screen_ask_begin → hit` and paint WITHOUT the
+empty ladder; `definitive_empty` must leave no resume warning. Owed on
+the dev-local GUI harness (§INFRA sanctions it; filed as its own infra
+line — it also unblocks the (c) live-proof lane). Suites + deploy +
+read-back owed on the lane's landing.
 
 ## ⛔ [CLI] OPENCODE2 SELF-MINTS `ses_…` IDS — THE STORE PROBE CANNOT SEE YGGTERM ROWS (identity rebind owed)
 
