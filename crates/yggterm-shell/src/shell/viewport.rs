@@ -5091,6 +5091,11 @@ fn TerminalCanvas(
                     )
                 }
             };
+            // [F2] The wire now carries the authority verdict (lane f2, the
+            // daemon half of this sitting) but the rehydrate's empty decision
+            // rides the budgeted OWNER-ASK below (sol s36b Q2/Q3) — the
+            // authority stamp's client consumer is the next lane that opts a
+            // read into `resolve_owner`.
             match retained_rehydrate_result {
                 Ok((data, mut replay_source, mut snapshot_status, mut runtime_spawn_id)) => {
                     if let Some((
@@ -5271,12 +5276,18 @@ fn TerminalCanvas(
                                             "no registered remote machine {machine_key}"
                                         )),
                                         Some(machine_ref) => {
-                                            state.with(|shell| {
-                                                shell.record_remote_screen_ask(
-                                                    &session_path_for_task,
-                                                    current_millis(),
-                                                );
-                                            });
+                                            // record is &mut self — the safe_shell_mut
+                                            // house pattern, not the read-only state.with.
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "retained_rehydrate_remote_screen_ask_recorded",
+                                                |shell| {
+                                                    shell.record_remote_screen_ask(
+                                                        &session_path_for_task,
+                                                        current_millis(),
+                                                    );
+                                                },
+                                            );
                                             run_dedicated_terminal_io(
                                                 "remote_agent_screen_snapshot",
                                                 &trace_home,
@@ -5333,7 +5344,7 @@ fn TerminalCanvas(
                                                     sanitize_terminal_replay_payload(&answer.text);
                                                 data = screen_text;
                                                 replay_source =
-                                                    "remote_daemon_screen_snapshot".to_string();
+                                                    "remote_daemon_screen_snapshot";
                                                 if let Some(spawn_id) = answer.runtime_spawn_id {
                                                     runtime_spawn_id = spawn_id;
                                                 }

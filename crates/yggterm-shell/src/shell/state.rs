@@ -21542,6 +21542,7 @@ impl ShellState {
         let keytip_config = load_keytip_config_from_disk();
         let keymap = keymap_from_keytip_config(&keytip_config);
         let mut state = Self {
+            remote_screen_ask_budget: None,
             render_snapshot_cache: std::cell::RefCell::new(None),
             selection_crawl_cache: std::cell::RefCell::new(None),
             settings,
