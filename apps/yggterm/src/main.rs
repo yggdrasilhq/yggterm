@@ -1641,7 +1641,8 @@ fn main() -> Result<()> {
         // "no declared web surface". Connect directly like the other read-only
         // diagnostics — no version gate, no daemon spawn.
         let endpoint = cli_server_endpoint(store.home_dir());
-        let (records, running) = yggterm_server::terminal_app_declares(&endpoint, &args[3])?;
+        let (records, running, _declare_authority) =
+            yggterm_server::terminal_app_declares(&endpoint, &args[3])?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({

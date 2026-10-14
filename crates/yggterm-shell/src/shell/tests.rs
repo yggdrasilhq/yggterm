@@ -8110,6 +8110,7 @@ JSON.stringify({{
                     seq: 7,
                 }],
                 running: true,
+                authority: None,
             };
             serde_json::to_writer(&mut stream, &response).expect("write declares response");
             stream.write_all(b"\n").expect("write response terminator");

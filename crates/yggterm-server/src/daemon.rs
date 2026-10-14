@@ -4884,6 +4884,10 @@ pub enum ServerResponse {
         #[serde(default)]
         records: Vec<crate::app_declare::AppDeclareRecord>,
         running: bool,
+        /// [F2] WHERE this answer's right to witness absence came from — see
+        /// [`TerminalAppDeclareAuthority`]. Missing/`None` = legacy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<TerminalAppDeclareAuthority>,
     },
     TerminalAppDeclaresAll {
         #[serde(default)]
@@ -15044,7 +15048,7 @@ impl DaemonRuntime {
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
                     match terminal_app_declares(&owner_endpoint, &runtime_path) {
-                        Ok((records, running)) => {
+                        Ok((records, running, owner_authority)) => {
                             // [11.80] the owner answer is also LAST-KNOWN
                             // truth for this daemon: record it, so a later
                             // succession or restart keeps the row surfaces
@@ -15055,7 +15059,18 @@ impl DaemonRuntime {
                                     records.clone(),
                                 );
                             }
-                            return Ok(ServerResponse::TerminalAppDeclares { records, running });
+                            // [F2] The proxy PRESERVES the owner's verdict
+                            // verbatim (sol s42 Q2): a stale registry record
+                            // whose owner no longer holds the row answers
+                            // no_local_authority upstream, and upgrading it
+                            // here would mint the same false witness one hop
+                            // away. A LEGACY owner (None) stays legacy — the
+                            // client's own remote-keyed belt covers it.
+                            return Ok(ServerResponse::TerminalAppDeclares {
+                                records,
+                                running,
+                                authority: owner_authority,
+                            });
                         }
                         Err(error) => {
                             self.handle_preserved_owner_request_error(
@@ -15070,17 +15085,33 @@ impl DaemonRuntime {
                 // [11.80] Live truth first (and it refreshes the snapshot —
                 // empty clears it, so an app's Clear propagates); the
                 // last-known snapshot answers only when the runtime is gone.
-                let records = match self.terminals.session_app_declares(&runtime_path) {
+                let live_records = self.terminals.session_app_declares(&runtime_path);
+                let records = match &live_records {
                     Some(records) => {
                         self.server
                             .record_last_known_app_declares(&runtime_path, records.clone());
-                        records
+                        records.clone()
                     }
                     None => self.server.last_known_app_declares(&runtime_path),
                 };
+                // [F2] The single-ask authority verdict (sol s42 Q2): the answer
+                // must say WHERE its right to witness absence came from. An
+                // empty answer for a remote-keyed path this daemon neither
+                // holds nor can resolve is no_local_authority — a self-answer,
+                // never a witness (measured live 2026-10-14, the harness RED).
+                // Classified on the CANONICAL key the answer describes:
+                // the [11.161] fold may resolve an ask into an alias's key
+                // space, and the verdict must read the key actually answered
+                // about (sol s42 Q2).
+                let authority = terminal_app_declares_authority(
+                    live_records.is_some(),
+                    !records.is_empty(),
+                    session_path_is_remote_keyed(&runtime_path),
+                );
                 ServerResponse::TerminalAppDeclares {
                     records,
                     running: self.terminals.session_is_running(&runtime_path),
+                    authority: Some(authority),
                 }
             }
             ServerRequest::TerminalTenants { path } => self.terminal_tenants_response(path),
@@ -24563,6 +24594,66 @@ pub enum TerminalContentAuthority {
     OwnerUnresolved,
 }
 
+/// [F2] The authority behind a `TerminalAppDeclares` answer — the single-ask
+/// vocabulary that ends the empty-ledger lie (sol s42 Q1/Q2). Before this, an
+/// empty `records` covered two different facts (the answering daemon witnessed
+/// the declares and found none; the daemon holds neither the session nor a
+/// resolvable owner and its empty ledger is a self-answer) and the client could
+/// only treat both as an authoritative absence — the rebuild path declared
+/// `daemon_declare_absent` for live remote rows (measured live 2026-10-14: the
+/// batch-fallback single asks declared the painted remote-agy harness row
+/// absent on the standing backoff ladder). `None`/missing on the wire = legacy:
+/// a pre-field answer whose emptiness predates the vocabulary. Deliberately a
+/// NEW type, never a new variant inside [`TerminalContentAuthority`] — an old
+/// client deserializing a snapshot answer that carried an unknown enum variant
+/// would fail the whole message (sol s36 Q2's compat law).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalAppDeclareAuthority {
+    /// The answering daemon witnessed the declares itself — it holds the
+    /// session live, or holds last-known records, or proxied a registered
+    /// owner whose own answer carried this verdict. An empty record set under
+    /// this verdict is a REAL absence: the client may declare, retire, and
+    /// rebuild from it.
+    Authoritative,
+    /// The answering daemon holds neither the session nor a resolvable owner:
+    /// its empty ledger is "I don't know", never "absent" (the F2
+    /// presence-gate law — an unavailable witness must SUPPRESS the absence
+    /// declaration, sol s36 Q4 / s40 Q1). The client must not declare absence
+    /// from it.
+    NoLocalAuthority,
+}
+
+/// Whether a session path is keyed to a row whose PTY authority lives on
+/// another machine (`remote-<kind>://...`). THE one definition — the shell's
+/// restore tick applies the same test client-side
+/// (`app_surface_target_is_remote_keyed` delegates here), and the
+/// `TerminalAppDeclares` handler uses it to refuse witnessing absence for
+/// rows it merely represents.
+pub fn session_path_is_remote_keyed(session_path: &str) -> bool {
+    session_path.starts_with("remote-") && session_path.contains("://")
+}
+
+/// The `TerminalAppDeclares` handler's verdict for a LOCAL answer (the
+/// owner-proxy path passes the owner's own verdict through verbatim — sol s42
+/// Q2: a proxy must never upgrade an upstream no_local_authority into an
+/// authoritative witness one hop away). Held-live and record-bearing answers
+/// speak; an empty answer witnesses absence for a local-keyed path under
+/// the standing [11.80] local-authority contract (the verdict reads the
+/// key shape, not lifetime ownership — sol s42 Q2's caveat); a
+/// remote-keyed path's emptiness is a self-answer.
+pub fn terminal_app_declares_authority(
+    live_held: bool,
+    records_non_empty: bool,
+    remote_keyed: bool,
+) -> TerminalAppDeclareAuthority {
+    if live_held || records_non_empty || !remote_keyed {
+        TerminalAppDeclareAuthority::Authoritative
+    } else {
+        TerminalAppDeclareAuthority::NoLocalAuthority
+    }
+}
+
 /// The full answer to `ServerRequest::TerminalSnapshot` — a STRUCT, where an
 /// 8-wide positional tuple used to be. The tuple's two trailing
 /// `Option<bool>`s (`composer_holds_draft`, `pty_in_alternate_screen`) were
@@ -24846,14 +24937,22 @@ pub struct TerminalAppDeclareSession {
 pub fn terminal_app_declares(
     endpoint: &ServerEndpoint,
     path: &str,
-) -> Result<(Vec<crate::app_declare::AppDeclareRecord>, bool)> {
+) -> Result<(
+    Vec<crate::app_declare::AppDeclareRecord>,
+    bool,
+    Option<TerminalAppDeclareAuthority>,
+)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalAppDeclares {
             path: path.to_string(),
         },
     )? {
-        ServerResponse::TerminalAppDeclares { records, running } => Ok((records, running)),
+        ServerResponse::TerminalAppDeclares {
+            records,
+            running,
+            authority,
+        } => Ok((records, running, authority)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal app declares response: {:?}", other),
     }
@@ -46576,8 +46675,8 @@ mod tests {
         // the wire vocabulary that ends the empty-screen lie ([11.32], F2).
         // Both `#[serde(default)]`: an old daemon's answers decode legacy
         // (None) and an old client's requests decode capability-off (false).
-        const STAMPED_AT_VERSION: &str = "3.2.119";
-        const STAMPED_SHAPE_HASH: u64 = 0xc27aa17dbbbf5b59;
+        const STAMPED_AT_VERSION: &str = "3.2.120";
+        const STAMPED_SHAPE_HASH: u64 = 0xddf938f1ec695871;
         let source = include_str!("daemon.rs");
         let shape = format!(
             "{}\n{}",
@@ -46655,6 +46754,113 @@ mod tests {
             ServerResponse::TerminalStream {
                 runtime_spawn_id, ..
             } => assert_eq!(runtime_spawn_id, 1791299780008),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// [F2] THE PROXY PRESERVES THE OWNER'S VERDICT VERBATIM (sol s42 Q2):
+    /// a source-shape lock — the owner-proxy arm hands the OWNER's authority
+    /// upstream unchanged; successful transport must never upgrade a
+    /// no_local_authority into a local witness one hop away.
+    #[test]
+    fn the_owner_proxy_arm_returns_the_owner_verdict_verbatim() {
+        let source = include_str!("daemon.rs");
+        let needle = concat!("authority: owner_", "authority,");
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "the proxy arm must pass the owner's verdict through verbatim"
+        );
+    }
+
+    /// [F2] THE DECLARES AUTHORITY TRUTH TABLE (sol s42 Q2): live-held speaks
+    /// even when empty; records speak; a remote-keyed empty from a daemon that
+    /// neither holds nor can resolve is no_local_authority — the self-answer
+    /// the rebuild path declared absent from (measured live 2026-10-14). A
+    /// local-keyed empty stays authoritative: [11.80]'s last-known semantics
+    /// are how genuinely dead local rows retire.
+    #[test]
+    fn the_declares_authority_truth_table_refuses_to_witness_a_remote_self_answer() {
+        use crate::daemon::{TerminalAppDeclareAuthority as A, terminal_app_declares_authority};
+        assert_eq!(
+            terminal_app_declares_authority(true, false, false),
+            A::Authoritative,
+            "a live-held session's empty ledger is a real absence witness"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(true, false, true),
+            A::Authoritative,
+            "live-held speaks even for a remote-keyed path"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(false, true, false),
+            A::Authoritative,
+            "last-known records speak (rebuild fuel), never no_local_authority"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(false, true, true),
+            A::Authoritative,
+            "records speak for remote-keyed paths too"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(false, false, false),
+            A::Authoritative,
+            "a local-keyed empty keeps [11.80]'s authoritative-absence semantics"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(false, false, true),
+            A::NoLocalAuthority,
+            "a remote-keyed empty from an unresolving daemon is a self-answer, never a witness"
+        );
+    }
+
+    /// [F2] THE DECLARES AUTHORITY CROSS-VERSION CONTRACT (mirrors the
+    /// snapshot authority lock beside this): an OLD daemon wire — the field
+    /// absent — deserializes to `None` = legacy, byte-identical behavior; a
+    /// NEW daemon's `no_local_authority` stamp round-trips verbatim; and a
+    /// `None` verdict never serializes the field at all (the legacy wire is
+    /// byte-identical, not null-carrying).
+    #[test]
+    fn a_declares_answer_carries_its_authority_across_versions() {
+        use crate::ServerResponse;
+        let written = serde_json::to_value(ServerResponse::TerminalAppDeclares {
+            records: vec![],
+            running: true,
+            authority: Some(crate::daemon::TerminalAppDeclareAuthority::NoLocalAuthority),
+        })
+        .expect("serializes");
+        let written_str = serde_json::to_string(&written).expect("wire string");
+        assert!(
+            written_str.contains("no_local_authority"),
+            "the verdict must ride the wire verbatim: {written_str}"
+        );
+        let mut stripped = written.clone();
+        stripped
+            .as_object_mut()
+            .expect("internally-tagged wire object (tag = kind)")
+            .remove("authority");
+        match serde_json::from_value::<ServerResponse>(stripped).expect("old shape parses") {
+            ServerResponse::TerminalAppDeclares { authority, .. } => assert_eq!(
+                authority, None,
+                "an absent authority must deserialize as legacy (None), never a guess"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let legacy = ServerResponse::TerminalAppDeclares {
+            records: vec![],
+            running: false,
+            authority: None,
+        };
+        let legacy_str = serde_json::to_string(&legacy).expect("legacy serializes");
+        assert!(
+            !legacy_str.contains("authority"),
+            "a None verdict must not ride the wire at all (byte-identical legacy): {legacy_str}"
+        );
+        match serde_json::from_value::<ServerResponse>(written).expect("new shape parses") {
+            ServerResponse::TerminalAppDeclares { authority, .. } => assert_eq!(
+                authority,
+                Some(crate::daemon::TerminalAppDeclareAuthority::NoLocalAuthority)
+            ),
             other => panic!("wrong variant: {other:?}"),
         }
     }

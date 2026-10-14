@@ -22838,7 +22838,11 @@ async fn terminal_app_declares_async(
     endpoint: ServerEndpoint,
     session_path: String,
     trace_home: &Path,
-) -> Result<(Vec<yggterm_server::app_declare::AppDeclareRecord>, bool)> {
+) -> Result<(
+    Vec<yggterm_server::app_declare::AppDeclareRecord>,
+    bool,
+    Option<yggterm_server::TerminalAppDeclareAuthority>,
+)> {
     run_dedicated_terminal_io("terminal_app_declares", trace_home, move || {
         yggterm_server::terminal_app_declares(&endpoint, &session_path)
     })

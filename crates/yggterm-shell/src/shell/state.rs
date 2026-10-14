@@ -17058,9 +17058,9 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
     // `TerminalAppDeclares`, so it writes nothing and the proxy surfaces
     // `parsing daemon response: ""`. Swallowed, that read exactly like "this app
     // never declared": no rail, no error, nothing in the trace to look at.
-    let declares =
+    let (declares, _running, authority) =
         match terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home).await {
-            Ok((records, _running)) => records,
+            Ok((records, running, authority)) => (records, running, authority),
             Err(error) => {
                 append_trace_event(
                     &trace_home,
@@ -17077,6 +17077,32 @@ async fn rebuild_sidebar_contribution_from_daemon_declare(
         };
     let now_ms = current_millis();
     let Some(record) = declares.into_iter().find(|record| record.verb == "sidebar") else {
+        // [F2] THE MISSING-VERB DECISION (sol s42 Q3). An explicit verdict
+        // outranks everything: `no_local_authority` suppresses (the daemon
+        // said "I don't know"); `authoritative` declares — even for a
+        // remote-keyed row, because the answering daemon carries live truth, last-known
+        // records, or a registered owner's proxied verdict — the authority
+        // to witness absence. The legacy belt (no verdict on the wire) is the client-side
+        // remote-keyed rule the restore batch already applies: a remote row's
+        // local emptiness was never a witness. Measured live 2026-10-14: the
+        // batch-fallback single asks declared the painted remote-agy harness
+        // row absent on the standing backoff ladder (RED on deployed main).
+        if single_ask_missing_verb_suppressed(
+            authority,
+            app_surface_target_is_remote_keyed(session_path),
+        ) {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_declare",
+                "daemon_declare_suppressed_no_local_authority",
+                json!({
+                    "session_path": session_path,
+                    "via": if authority.is_some() { "single_ask" } else { "single_ask:legacy" },
+                }),
+            );
+            return false;
+        }
         // Reached the owner and it genuinely holds no sidebar declare — a
         // different answer from the error above, and traced as such so the two
         // can never again look identical from the outside.
@@ -17428,6 +17454,12 @@ enum DeclareRebuild {
     /// The daemon fetch itself failed. A FAILED FETCH IS NOT AN ABSENT
     /// DECLARE — collapsing them is what made this unreadable.
     FetchFailed { error: String },
+    /// [F2] The answer carried no authority to witness absence (sol s42 Q4):
+    /// a self-answer from a daemon that holds neither the session nor a
+    /// resolvable owner. The caller must NOT corpse-arm on it — a suppressed
+    /// unknown never retires a possibly-painted surface (the 06:43 drop
+    /// class, the batch's own s40 mapping).
+    NoLocalAuthority,
 }
 
 impl DeclareRebuild {
@@ -17443,6 +17475,7 @@ impl DeclareRebuild {
             Self::Stale { .. } => "declare_stale",
             Self::UrlRefused { .. } => "declare_url_scheme_refused",
             Self::NoUrl => "declare_without_url",
+            Self::NoLocalAuthority => "declare_no_local_authority",
             Self::FetchFailed { .. } => "daemon_declare_unavailable",
         }
     }
@@ -17463,6 +17496,9 @@ impl DeclareRebuild {
             Self::NoUrl => {
                 format!("the declare for {session_path} carried no url to open")
             }
+            Self::NoLocalAuthority => format!(
+                "the daemon answering for {session_path} holds neither the session nor a resolvable owner, so its empty ledger is a self-answer: no declare, no corpse arm"
+            ),
             Self::FetchFailed { error } => format!(
                 "could not ask the daemon for {session_path}'s declares ({error}) — this is NOT the same as having none"
             ),
@@ -17591,8 +17627,23 @@ async fn web_ensure_closed_session_check(
 ) -> WebEnsureClosedSessionCheck {
     let runtime = match terminal_app_declares_async(endpoint, session_path.to_string(), home).await
     {
-        Ok((_, true)) => SessionRuntimeLiveness::Running,
-        Ok((_, false)) => SessionRuntimeLiveness::Dead,
+        Ok((_, true, _)) => SessionRuntimeLiveness::Running,
+        Ok((_, false, authority)) => {
+            if declare_negative_witnesses_death(
+                authority,
+                yggterm_server::session_path_is_remote_keyed(session_path),
+            ) {
+                SessionRuntimeLiveness::Dead
+            } else {
+                // [F2] A NEGATIVE ANSWER WITH NO AUTHORITY IS NOT A DEAD
+                // RUNTIME (sol s42 Q6-2): an explicit no_local_authority —
+                // or a legacy remote-keyed self-answer — cannot witness
+                // death. Unknown, the same honesty a failed fetch gets
+                // below; refusing here would break every session whose
+                // surface lives on a row this daemon merely represents.
+                SessionRuntimeLiveness::Unknown
+            }
+        }
         // A FETCH THAT FAILED IS NOT A DEAD RUNTIME. Refusing here would
         // break every session whose owner is a predecessor daemon.
         Err(_) => SessionRuntimeLiveness::Unknown,
@@ -17766,7 +17817,11 @@ mod web_ensure_closed_session_locks {
     /// A daemon that answers exactly one `TerminalAppDeclares` and says whether
     /// the runtime is running. The owner's own word is the fact the arm must
     /// use, so the lock has to speak the wire rather than hand the arm a value.
-    fn spawn_one_declares_socket(path: PathBuf, running: bool) -> std::thread::JoinHandle<()> {
+    fn spawn_one_declares_socket(
+        path: PathBuf,
+        running: bool,
+        authority: Option<yggterm_server::TerminalAppDeclareAuthority>,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             use std::io::{BufRead, Write};
             let listener = std::os::unix::net::UnixListener::bind(&path)
@@ -17783,6 +17838,7 @@ mod web_ensure_closed_session_locks {
             let response = yggterm_server::ServerResponse::TerminalAppDeclares {
                 records: Vec::new(),
                 running,
+                authority,
             };
             serde_json::to_writer(&mut stream, &response).expect("write declares response");
             stream.write_all(b"\n").expect("write response terminator");
@@ -17801,6 +17857,16 @@ mod web_ensure_closed_session_locks {
         /// `running: None` = NO socket at all, so the declare fetch fails. That
         /// is the predecessor-daemon case, not a death.
         fn new(label: &str, running: Option<bool>) -> Self {
+            Self::with_authority(label, running, None)
+        }
+
+        /// `authority` rides the ONE declares answer the socket gives — the
+        /// wire fact the check must consume (the sol s42 Q6-2 consumer locks).
+        fn with_authority(
+            label: &str,
+            running: Option<bool>,
+            authority: Option<yggterm_server::TerminalAppDeclareAuthority>,
+        ) -> Self {
             let home = std::env::temp_dir().join(format!(
                 "yggterm-web-ensure-{label}-{}-{}",
                 std::process::id(),
@@ -17808,7 +17874,7 @@ mod web_ensure_closed_session_locks {
             ));
             std::fs::create_dir_all(&home).expect("create temp home");
             let socket = home.join("owner.sock");
-            let owner = running.map(|running| spawn_one_declares_socket(socket.clone(), running));
+            let owner = running.map(|running| spawn_one_declares_socket(socket.clone(), running, authority));
             if owner.is_some() {
                 for _ in 0..200 {
                     if socket.exists() {
@@ -17918,6 +17984,59 @@ mod web_ensure_closed_session_locks {
     /// predecessor-daemon case, which mixed-version ownership makes the COMMON
     /// one during a handover. Collapse `Err(_)` into `Dead` and every session on
     /// an older daemon loses `web ensure`; this is where that shows up.
+    /// **[F2] A NO-AUTHORITY NEGATIVE IS NOT A DEAD RUNTIME** (sol s42
+    /// Q6-2): the check consumed the authority verdict — an explicit
+    /// no_local_authority `running:false` answers Unknown, the same honesty
+    /// an unreachable owner gets. Collapse it back into `Dead` and this
+    /// goes red.
+    #[tokio::test]
+    async fn a_no_authority_negative_runtime_is_unknown_never_dead() {
+        let session_path = "remote-agy://oc/no-authority-negative";
+        let world = EnsureWorld::with_authority(
+            "no-authority-negative",
+            Some(false),
+            Some(yggterm_server::TerminalAppDeclareAuthority::NoLocalAuthority),
+        );
+
+        let check = world.check(session_path).await;
+
+        assert_eq!(
+            check.runtime,
+            SessionRuntimeLiveness::Unknown,
+            "a no_local_authority negative must not witness death"
+        );
+    }
+
+    /// **[F2] A LEGACY REMOTE SELF-ANSWER IS NOT A DEAD RUNTIME** (sol s42
+    /// Q6-2): an old daemon's empty remote-keyed negative is the lie this
+    /// lane exists for — Unknown, never Dead.
+    #[tokio::test]
+    async fn a_legacy_remote_self_answer_negative_is_unknown_never_dead() {
+        let session_path = "remote-agy://oc/legacy-self-answer";
+        let world = EnsureWorld::with_authority("legacy-self-answer", Some(false), None);
+
+        let check = world.check(session_path).await;
+
+        assert_eq!(
+            check.runtime,
+            SessionRuntimeLiveness::Unknown,
+            "a legacy remote-keyed negative is a self-answer, not a death"
+        );
+    }
+
+    /// **A LEGACY LOCAL NEGATIVE STILL WITNESSES DEATH** — the [11.80]
+    /// contract this lane preserves; the honest local retirement path keeps
+    /// working (the positive control for the two locks above).
+    #[tokio::test]
+    async fn a_legacy_local_negative_still_witnesses_death() {
+        let session_path = "local://honest-local-negative";
+        let world = EnsureWorld::with_authority("legacy-local-negative", Some(false), None);
+
+        let check = world.check(session_path).await;
+
+        assert_eq!(check.runtime, SessionRuntimeLiveness::Dead);
+    }
+
     #[tokio::test]
     async fn an_unreachable_owner_is_unknown_and_never_refuses() {
         let session_path = "local://owned-by-a-predecessor";
@@ -18170,9 +18289,9 @@ async fn rebuild_web_surface_from_daemon_declare(
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     // Same distinction as the sidebar twin above: a fetch that FAILED is not an
     // app that never declared. See `daemon_declare_unavailable` there.
-    let declares =
+    let (declares, _running, authority) =
         match terminal_app_declares_async(endpoint, session_path.to_string(), &trace_home).await {
-            Ok((records, _running)) => records,
+            Ok((records, running, authority)) => (records, running, authority),
             Err(error) => {
                 append_trace_event(
                     &trace_home,
@@ -18197,6 +18316,27 @@ async fn rebuild_web_surface_from_daemon_declare(
         .into_iter()
         .find(|record| record.verb == "web-surface")
     else {
+        // [F2] Same missing-verb law as the sidebar twin (sol s42 Q4): a
+        // no_local_authority answer (or a legacy remote-keyed one) must not
+        // climb the corpse ladder — the caller maps this outcome to an honest
+        // no_declare with NO arm, mirroring the batch's s40 mapping.
+        if single_ask_missing_verb_suppressed(
+            authority,
+            app_surface_target_is_remote_keyed(session_path),
+        ) {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_declare",
+                "daemon_declare_suppressed_no_local_authority",
+                json!({
+                    "session_path": session_path,
+                    "verb": "web-surface",
+                    "via": if authority.is_some() { "single_ask" } else { "single_ask:legacy" },
+                }),
+            );
+            return DeclareRebuild::NoLocalAuthority;
+        }
         return DeclareRebuild::NoDeclare;
     };
     let age_ms = now_ms.saturating_sub(record.at_ms);
@@ -41003,7 +41143,7 @@ fn mark_app_surface_restore_attempted(
 /// another machine, so a local daemon's empty app-declare ledger cannot
 /// witness absence for it. Local keys are `local://...`.
 fn app_surface_target_is_remote_keyed(session_path: &str) -> bool {
-    session_path.starts_with("remote-") && session_path.contains("://")
+    yggterm_server::session_path_is_remote_keyed(session_path)
 }
 
 /// The batch's local absence declaration reads WANTED halves only: an
@@ -41014,6 +41154,79 @@ fn app_surface_wanted_half_decided_absent(
     verdict: AppSurfaceBatchVerdict,
 ) -> bool {
     want && verdict == AppSurfaceBatchVerdict::AbsentLocally
+}
+
+/// The single-ask rebuilds' law for a MISSING verb in the answer (the failed
+/// `find`, sol s42 Q3 — not an empty vector: a legacy web-only declare must
+/// never authorize sidebar absence). Explicit authority outranks the client's
+/// own check: `authoritative` permits genuine absence even for remote-keyed
+/// rows (the answering daemon carries the authority to witness absence);
+/// `no_local_authority` suppresses everywhere. The LEGACY belt fires only
+/// when no verdict rode the wire (an old daemon): for a remote-keyed row the
+/// local daemon's empty ledger still cannot witness absence — the same
+/// client-side rule the restore batch applies.
+fn single_ask_missing_verb_suppressed(
+    authority: Option<yggterm_server::TerminalAppDeclareAuthority>,
+    remote_keyed: bool,
+) -> bool {
+    authority == Some(yggterm_server::TerminalAppDeclareAuthority::NoLocalAuthority)
+        || (authority.is_none() && remote_keyed)
+}
+
+/// The closed-session check's law for a `running:false` answer (sol s42
+/// Q6-2): death is witnessed only by an explicit Authoritative verdict, or
+/// by a legacy LOCAL answer (today's contract — the daemon answers about
+/// rows it serves). An explicit no_local_authority and a legacy
+/// remote-keyed self-answer are "I don't know", never death.
+fn declare_negative_witnesses_death(
+    authority: Option<yggterm_server::TerminalAppDeclareAuthority>,
+    remote_keyed: bool,
+) -> bool {
+    authority == Some(yggterm_server::TerminalAppDeclareAuthority::Authoritative)
+        || (authority.is_none() && !remote_keyed)
+}
+
+#[cfg(test)]
+mod single_ask_authority_locks {
+    use super::*;
+
+    /// sol s42 Q3: explicit authority outranks the client-side check, and the
+    /// legacy belt is remote-keyed-only. Shadow any arm and a lock goes red.
+    #[test]
+    fn the_single_ask_missing_verb_decision_obeys_the_authority_precedence() {
+        use yggterm_server::TerminalAppDeclareAuthority as A;
+        let remote = "remote-agy://oc/ecdfd72b";
+        let local = "local://ws";
+        // Explicit no_local_authority suppresses everywhere — the daemon said
+        // "I don't know", and that is never a witness.
+        assert!(single_ask_missing_verb_suppressed(Some(A::NoLocalAuthority), false));
+        assert!(single_ask_missing_verb_suppressed(Some(A::NoLocalAuthority), true));
+        // Explicit authoritative declares everywhere — the answering daemon
+        // carries the authority to witness absence, remote-keyed or not.
+        assert!(!single_ask_missing_verb_suppressed(Some(A::Authoritative), true));
+        assert!(!single_ask_missing_verb_suppressed(Some(A::Authoritative), false));
+        // Legacy: the belt is the client-side remote-keyed rule and nothing
+        // else — local emptiness keeps its honest declare.
+        assert!(single_ask_missing_verb_suppressed(None, true));
+        assert!(!single_ask_missing_verb_suppressed(None, false));
+        // The predicate this rides on is THE shared definition.
+        assert!(app_surface_target_is_remote_keyed(remote));
+        assert!(!app_surface_target_is_remote_keyed(local));
+    }
+
+    /// sol s42 Q6-2: a `running:false` answer witnesses death only under an
+    /// explicit Authoritative verdict or a legacy LOCAL answer; an explicit
+    /// no_local_authority and a legacy remote-keyed self-answer do not.
+    #[test]
+    fn a_running_false_answer_witnesses_death_only_under_authority() {
+        use yggterm_server::TerminalAppDeclareAuthority as A;
+        assert!(declare_negative_witnesses_death(Some(A::Authoritative), true));
+        assert!(declare_negative_witnesses_death(Some(A::Authoritative), false));
+        assert!(!declare_negative_witnesses_death(Some(A::NoLocalAuthority), true));
+        assert!(!declare_negative_witnesses_death(Some(A::NoLocalAuthority), false));
+        assert!(!declare_negative_witnesses_death(None, true));
+        assert!(declare_negative_witnesses_death(None, false));
+    }
 }
 
 #[derive(Debug, Default)]
@@ -41501,7 +41714,10 @@ async fn restore_app_surfaces_tick(
                         // Healed: the record is live again. A stall that
                         // recurs starts the corpse ladder over from clean.
                         corpse_arms.borrow_mut().remove(&target.session_path);
-                    } else if !matches!(rebuilt, DeclareRebuild::FetchFailed { .. }) {
+                    } else if !matches!(
+                        rebuilt,
+                        DeclareRebuild::FetchFailed { .. } | DeclareRebuild::NoLocalAuthority
+                    ) {
                         // The daemon's answer carries NO FRESH declare behind
                         // this surface (too stale, absent, or unusable): the
                         // app really did go quiet. Climb the same ladder the
