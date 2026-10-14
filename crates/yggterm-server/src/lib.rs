@@ -6181,9 +6181,13 @@ impl YggtermServer {
         }
     }
 
-    /// [11.80] The snapshot to answer when the terminal runtime is gone
-    /// (daemon succession, GUI restart): the surfaces the row last declared,
-    /// so the metadata rail keeps them until the app re-declares for real.
+    /// [11.80] The snapshot to answer when the terminal runtime is gone:
+    /// the surfaces the row last declared, so the metadata rail keeps them
+    /// until the app re-declares for real. This survives the loss of the
+    /// live session WITHIN one daemon incarnation (and any GUI restart —
+    /// the daemon outlives the GUI); it does NOT survive a daemon restart
+    /// and is not transferred to a successor (in-memory by design; the
+    /// persistence residue is filed separately, sol s42 round-2 R3).
     pub fn last_known_app_declares(
         &self,
         key: &str,

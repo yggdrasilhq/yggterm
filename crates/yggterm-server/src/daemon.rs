@@ -15050,9 +15050,12 @@ impl DaemonRuntime {
                     match terminal_app_declares(&owner_endpoint, &runtime_path) {
                         Ok((records, running, owner_authority)) => {
                             // [11.80] the owner answer is also LAST-KNOWN
-                            // truth for this daemon: record it, so a later
-                            // succession or restart keeps the row surfaces
-                            // answerable even after the owner is gone.
+                            // truth for this daemon: record it, so losing
+                            // the live session WITHIN this daemon incarnation
+                            // keeps the row surfaces answerable even after
+                            // the owner is gone (the map is per-incarnation
+                            // memory — it does not survive a daemon restart,
+                            // sol s42 round-2 R3).
                             if !records.is_empty() {
                                 self.server.record_last_known_app_declares(
                                     &runtime_path,
@@ -15104,7 +15107,6 @@ impl DaemonRuntime {
                 // space, and the verdict must read the key actually answered
                 // about (sol s42 Q2).
                 let authority = terminal_app_declares_authority(
-                    live_records.is_some(),
                     !records.is_empty(),
                     session_path_is_remote_keyed(&runtime_path),
                 );
@@ -24610,11 +24612,15 @@ pub enum TerminalContentAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalAppDeclareAuthority {
-    /// The answering daemon witnessed the declares itself — it holds the
-    /// session live, or holds last-known records, or proxied a registered
-    /// owner whose own answer carried this verdict. An empty record set under
-    /// this verdict is a REAL absence: the client may declare, retire, and
-    /// rebuild from it.
+    /// The answering daemon witnessed the declares itself — records are
+    /// present in its ledger, or the path is LOCAL-keyed under the [11.80]
+    /// contract, or it proxied a registered owner whose own answer carried
+    /// this verdict. An empty record set under this verdict is a REAL
+    /// absence: the client may declare, retire, and rebuild from it.
+    /// (NoLocalAuthority can coexist with a live-held session and
+    /// `running: true` — a transport-held projection's ledger is
+    /// per-incarnation memory, so its emptiness witnesses nothing; sol s42
+    /// round-2 R1, falsified natural-fire 2026-10-14.)
     Authoritative,
     /// The answering daemon holds neither the session nor a resolvable owner:
     /// its empty ledger is "I don't know", never "absent" (the F2
@@ -24637,17 +24643,19 @@ pub fn session_path_is_remote_keyed(session_path: &str) -> bool {
 /// The `TerminalAppDeclares` handler's verdict for a LOCAL answer (the
 /// owner-proxy path passes the owner's own verdict through verbatim — sol s42
 /// Q2: a proxy must never upgrade an upstream no_local_authority into an
-/// authoritative witness one hop away). Held-live and record-bearing answers
-/// speak; an empty answer witnesses absence for a local-keyed path under
-/// the standing [11.80] local-authority contract (the verdict reads the
-/// key shape, not lifetime ownership — sol s42 Q2's caveat); a
-/// remote-keyed path's emptiness is a self-answer.
+/// authoritative witness one hop away). Record-bearing answers speak; a
+/// local-keyed empty witnesses absence under the standing [11.80]
+/// local-authority contract (the verdict reads the key shape, not lifetime
+/// ownership — sol s42 Q2's caveat); a REMOTE-KEYED empty NEVER speaks —
+/// not even live-held: the falsified natural-fire run of 2026-10-14 showed
+/// a fresh incarnation's transport-held ledger declaring a painted remote
+/// row absent while the machine actually holding the process answered
+/// no_local_authority on the same wire (sol s42 round-2 R1).
 pub fn terminal_app_declares_authority(
-    live_held: bool,
     records_non_empty: bool,
     remote_keyed: bool,
 ) -> TerminalAppDeclareAuthority {
-    if live_held || records_non_empty || !remote_keyed {
+    if records_non_empty || !remote_keyed {
         TerminalAppDeclareAuthority::Authoritative
     } else {
         TerminalAppDeclareAuthority::NoLocalAuthority
@@ -46773,44 +46781,38 @@ mod tests {
         );
     }
 
-    /// [F2] THE DECLARES AUTHORITY TRUTH TABLE (sol s42 Q2): live-held speaks
-    /// even when empty; records speak; a remote-keyed empty from a daemon that
-    /// neither holds nor can resolve is no_local_authority — the self-answer
-    /// the rebuild path declared absent from (measured live 2026-10-14). A
-    /// local-keyed empty stays authoritative: [11.80]'s last-known semantics
-    /// are how genuinely dead local rows retire.
+    /// [F2] THE DECLARES AUTHORITY TRUTH TABLE (sol s42 round-2 R1): records
+    /// speak; a local-keyed empty keeps [11.80]'s authoritative-absence
+    /// semantics (genuinely dead local rows retire); a REMOTE-KEYED empty
+    /// NEVER speaks — the arm that claimed "live-held speaks even for a
+    /// remote-keyed path" was FALSIFIED by the natural-fire run of
+    /// 2026-10-14 (the transport-held fresh incarnation declared a painted
+    /// remote row absent while the machine holding the process answered
+    /// no_local_authority on the same wire), so live-heldness was removed
+    /// from the verdict entirely.
     #[test]
     fn the_declares_authority_truth_table_refuses_to_witness_a_remote_self_answer() {
         use crate::daemon::{TerminalAppDeclareAuthority as A, terminal_app_declares_authority};
+        // signature: (records_non_empty, remote_keyed)
         assert_eq!(
-            terminal_app_declares_authority(true, false, false),
-            A::Authoritative,
-            "a live-held session's empty ledger is a real absence witness"
-        );
-        assert_eq!(
-            terminal_app_declares_authority(true, false, true),
-            A::Authoritative,
-            "live-held speaks even for a remote-keyed path"
-        );
-        assert_eq!(
-            terminal_app_declares_authority(false, true, false),
-            A::Authoritative,
-            "last-known records speak (rebuild fuel), never no_local_authority"
-        );
-        assert_eq!(
-            terminal_app_declares_authority(false, true, true),
-            A::Authoritative,
-            "records speak for remote-keyed paths too"
-        );
-        assert_eq!(
-            terminal_app_declares_authority(false, false, false),
+            terminal_app_declares_authority(false, false),
             A::Authoritative,
             "a local-keyed empty keeps [11.80]'s authoritative-absence semantics"
         );
         assert_eq!(
-            terminal_app_declares_authority(false, false, true),
+            terminal_app_declares_authority(true, false),
+            A::Authoritative,
+            "local records speak (rebuild fuel), never no_local_authority"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(true, true),
+            A::Authoritative,
+            "records speak for remote-keyed paths too — the CLOSE-retirement enabler"
+        );
+        assert_eq!(
+            terminal_app_declares_authority(false, true),
             A::NoLocalAuthority,
-            "a remote-keyed empty from an unresolving daemon is a self-answer, never a witness"
+            "a remote-keyed empty is a self-answer, never a witness — live-held or not"
         );
     }
 
