@@ -1425,8 +1425,10 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   terminate's preventive tombstone + the start door's 120s fresh-close
   veto — see the (d) block).
 - **F4 — STARTUP GATES & CLI CONTRACTS** (mostly owner-gated policy):
-  [11.226] agy trust gate (probe marker FIXED bb4a1dab; DA2 fix landed;
-  auto-answer policy = owner), [11.93] phrase-table audit, [11.168],
+  [11.226] agy trust gate CLOSED 2026-10-15 (DA2 answer + probe post-gate
+  markers + the AUTO-ANSWER watcher 71df7df7 landed, natural-fire proved on
+  the deploy bfac8a69; the entry is deleted per the verified-fix law and git
+  remembers its full arc), [11.93] phrase-table audit, [11.168],
   [11.175] kimi descriptor drift, the 11.6.x family stone.
 - **F5 — CI-PLANE SELF-INTEGRITY**: [11.227] four-part guard LANDED
   (accf7b5b — live-pid liveness, any-watcher belt, push read-back,
@@ -1910,93 +1912,6 @@ directions (a)/(c)); the owner's GUI rode the older bits all night.
 (2) The re-resume could inherit the session's last-known client grid
 instead of the 120×36 default — a direction, not coded (the forward is
 the architecture's chosen heal; make it reliable first).
-
-## ⛔ [11.226] THE agy 1.2.16 SELF-UPDATE PAINTS A FOLDER-TRUST GATE THE ROW CANNOT ANSWER AND THE E2E PROBE CANNOT SEE — FRESH-CWD agy ROWS SIT AT "Do you trust the contents of this project?" FOREVER, THE PROBE'S CLI MARKER MATCHES THE GATE TEXT ITSELF, AND THE 19:0x [11.225] FALSIFIER LEG'S "painted its CLI" WAS THE GATE (measured 2026-10-03 ~21:37-22:0x IST, guihost + dev, agy 1.2.16 md5-identical on both)
-
-**Status:** OPEN
-
-Filed 2026-10-03 ~22:0x IST by the proof-collection seat (zcode on guihost,
-work FROM dev; board outcome ACK pending). Found collecting the [11.225]
-production falsifier: the E2E connection probe's fresh_start_connects
-returned a row born-but-blank (0 chars, 150 s) on dev while the [11.218]
-hunt's defmiss scenarios on guihost "passed" with 818 chars minutes apart —
-the two contradictory readings forced the dig.
-
-THE MEASUREMENT (agy 1.2.16, self-updated under the descriptor 2026-10-03
-~10:10 dev / ~10:58 guihost, md5 56361e4b… IDENTICAL on both hosts — the
-[11.175] drift class for provenance):
-- A daemon-minted agy row in a FRESH cwd paints the folder-trust gate:
-  "Accessing workspace: <cwd> / Do you trust the contents of this project?
-  Antigravity CLI requires permission to read, edit, and execute files
-  here. / > Yes, I trust this folder / No, exit / ↑/↓ Navigate · enter
-  Confirm" plus a live model footer ("Gemini 3.8 Flash · high"). The
-  daemon's classifier answers `startup_gate` — the [99.1] gate-table work
-  pays off here; the state is VISIBLE and may_type is false.
-- THE GATE IS NOT ANSWERABLE BY THE SANCTIONED INSTRUMENTS, all tried on
-  a live row this sitting: `server app terminal send --data '\r'` and
-  `--stdin` (handled by the GUI, state unchanged — headless-minted row,
-  send-path suspect: an UNMOUNTED row), and direct slave-PTY writes to
-  the holder's /dev/pts/N (CR, LF, and 'y' — none consumed; the row's agy
-  is IDLE at the gate, its cli log quiet, no input processing). Whether
-  the real mounted viewport's Enter clears it is the owner's one-keystroke
-  test. THE [99.1] LAW ("nine CLIs declare no startup gate, so their
-  trust prompt reads as typeable") is hereby LIVE on agy: a seat that
-  submits a brief into this row types into a gate.
-- ⛔ THE E2E CONNECTION PROBE IS BLIND TO THE GATE: CLI_MARKERS includes
-  "Antigravity CLI" — which appears IN THE GATE TEXT. Every agy scenario
-  that "connected" tonight (the [11.218] hunt's 20+ defmiss PASSes at 818
-  chars; fresh-start PASSes) was reading a GATED row as a signed-in TUI.
-  The marker must require a post-gate signature (the composer footer "? for
-  shortcuts" marker already exists — "Antigravity CLI" must be dropped or
-  the screen state must be asserted ≠ startup_gate).
-- ⛔ THE 19:0x [11.225] HEAL FALSIFIER LEG CARRIES THE SAME LIE: "a hand
-  server remote start-agy mint … painted its CLI (chars 0 → 440" — ~440
-  chars is the GATE TEXT LENGTH. The spawn-plane heal itself stands (the
-  verb minted, the row ran — the plane was up); the "CLI painted" leg was
-  the gate. Recorded here so no future audit re-uses that leg as
-  signed-in-TUI evidence.
-- THE dev/guihost VARIANCE IS REAL AND UNEXPLAINED: same binary, but dev's
-  fresh_start row painted NOTHING at all in 150 s (not even the gate —
-  empty screen, running:true) while guihost's painted the gate in ~30 s. A
-  standalone PTY run on guihost (no daemon, TERM=xterm-256color) also paints
-  nothing for 5+ minutes and logged a crash at ~3 min
-  (crashes/crash_1981227_*.log, empty). Print mode is healthy on both
-  hosts (`--print` round-trips in seconds) — auth/model/network are fine;
-  only the interactive path is affected.
-- The chore reads the gate's "> Yes, I trust this folder" grid row as a
-  composer draft (composer_draft_union grid_row_text on the gated row) —
-  the [11.86]-adjacent class, now evidenced on agy.
-
-WHAT IT WANTS: (1) the probe's marker fix + a gate-state assertion (small,
-this campaign's own instrument); (2) an owner call on the gate itself —
-auto-answer policy for the spawn path (the default option is Yes), a
-spawn-time `--trust-folder`-style flag if agy grows one, or manual
-viewport confirmation per fresh project; (3) the unanswerable-from-slave
-input finding wants the row-mounted `terminal send` path re-verified once
-a gated row is mounted (suspect: send to unmounted rows silently no-ops).
-UPDATE 2026-10-03 ~23:1x IST (the continuation seat, zcode on guihost, work
-FROM dev; board plan ACK-c62c39ea56): THE dev/guihost VARIANCE IS ROOT-CAUSED
-— it was never agy being flaky. agy 1.2.16 gates its whole TUI startup on
-a DA2 handshake (`ESC[>c` — secondary device attributes): measured
-standalone on dev (fresh cwd, TERM=xterm-256color, real PTY), agy emits
-exactly 53 bytes — the `ESC[>c` query — then paints NOTHING past a 75 s
-kill. The daemon's terminal protocol filter answered CPR (`ESC[6n`), DSR
-(`ESC[5n`) and DA-primary (`ESC[c`) but NOT DA2, so an UNMOUNTED row's
-agy blocked forever on the unanswered query: dev's probe-minted
-(headless, unmounted) row zero-painted 150 s, while guihost's gated row was
-MOUNTED and its xterm.js viewport answered DA2 itself (`ESC[>0;277;0c`)
-— gate painted ~30 s. The guihost standalone zero-paint + ~3-min crash log
-is the same nobody-answered class. FIXED IN CODE this sitting: the daemon
-filter now answers `ESC[>c`/`ESC[>0c` with `ESC[>0;277;0c` (xterm.js
-parity — an unmounted row now behaves like a mounted one at the protocol
-layer), unit-tested in `terminal_protocol_filter_answers_secondary_da_queries`;
-the probe marker fix (bb4a1dab) rides the same lane. Want (2) — DECIDED (owner,
-2026-10-15 gate sweep, settled-calls.md): AUTO-ANSWER EVERYWHERE — the spawn
-path AND interactive GUI opens (the owner accepted silent trust of fresh
-project folders). The auto-answer unit is unblocked; every agy-minting E2E
-stays honestly RED until it lands. LIVE PROOF OWED: after
-deploy, a fresh-cwd UNMOUNTED agy row on dev must paint the gate (not
-zero-paint), and the probe must fail it as `[startup_gate painted…]`.
 
 ## ⛔ [11.227] ygg-ci LOGGED pushed=True AND DEPLOYED A MERGE origin/main NEVER RECEIVED — THE SUBSCRIPTION WAS THEN AUTO-UNSUBSCRIBED ON LOCAL TRUTH, AND THE FLEET RAN BUILT BITS NO REFERENCE ON origin/main POINTED AT (measured 2026-10-03 23:30-23:4x IST, dev ci.log + git)
 
