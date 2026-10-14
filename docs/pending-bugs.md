@@ -1313,11 +1313,45 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   lane's two natural-fire runs all delivered on it). MEMBERS: [11.32],
   the [11.229] absent-declaration sub-item.
   F2 RESIDUES (filed 2026-10-14, sitting 42):
-  (i) DECLARE-LEDGER PERSISTENCE (sol round-2 R3): last_known_app_declares
-  is per-incarnation memory — [11.80]'s restart-protection promise is only
-  true within one daemon incarnation (the comments were corrected in-lane;
-  the behavioral question — persist last-known across daemon restarts or
-  accept the loss until the app re-declares — is its own unit).
+  (i) DECLARE-LEDGER PERSISTENCE — RESOLVED 2026-10-14 (sitting 43, lane
+  lane/f2/declare-ledger-persistence 10efbfe8): s42's premise was MEASURED
+  FALSE — the ledger already rode PersistedDaemonState end to end (snapshot
+  retain, restore at boot) and a harness stop/start restored the record; the
+  old "in-memory by design" comments (accessor + proxy site) are corrected
+  to the measured truth. The REAL defects, all fixed in the lane per the sol
+  s43 round (gpt-6.1-sol HIGH; consult node
+  lores/chain-of-thought/2026-10-14-yggterm-s43-ledger-sol.md):
+  (a) CADENCE (sol Q1) — no defer_persist existed at the record sites (its
+  only production caller was light focus), so a record lived in memory until
+  an unrelated lifecycle persist and even SIGTERM shutdown persisted nothing
+  (state-doc mtime measured unchanged at stop); the record sites now defer
+  on REAL changes (record_last_known_app_declares returns changed) and the
+  [11.214] flusher's mute bug is fixed (a muted persist dropped the pending
+  write after the flag swap — the flusher re-arms now);
+  (b) THE BATCH OMISSION (sol Q2) — TerminalAppDeclaresAll enumerated
+  live_session_views() (live runtimes only), so a restored session without
+  a runtime was OMITTED and the client declared a false LOCAL absence for
+  surfaces the daemon still held (measured live: daemon_declare_absent at
+  boot for a row the single ask served one second later); the batch
+  enumerates all_session_paths() now, preserved-owner branch first;
+  (c) SILENCE-ERASURE (sol Q3 REBUT — the load-bearing correction) — a
+  live-but-never-spoken runtime answers Some(empty) and the arms treated
+  that as the app's Clear, erasing the restored entry; the three-state
+  AppDeclareObservation (Silent/Declared/Cleared; a Clear can be the app's
+  FIRST operation so a Store-only spoken flag was unsound) gates ONE shared
+  decision app_declare_live_answer: silence serves the ledger and keeps it,
+  a real answer refreshes, an earned Clear erases;
+  (d) AUTHORITY-AWARE PROXY RECORD (sol Q5) — an owner EMPTY records/erases
+  only under an explicit Authoritative verdict; legacy/no_local_authority
+  empties keep the non-empty-only belt.
+  PROOF: server suite 1680/0 no-fail-fast (+7 locks); natural fire
+  (tools/e2e/declare-persistence-rig.sh, exe-proofed lane binaries): the
+  injected sidebar declare served by the single ask, the record in
+  server-state.json in 2s, a daemon SIGKILL + fresh respawn serves the SAME
+  record, zero daemon_declare_absent for the row after the kill. RED
+  differential measured on deployed 441aa10f the same sitting (the boot-time
+  batch absence). STILL OPEN: the update-restart successor handover of the
+  ledger (sol Q4 — separate, unverified; the s43 comments say so).
   (ii) THE CLEAR-TO-EMPTY RETIREMENT LIMITATION (sol round-2 R2): for a
   remote-keyed row, an app Clear that removes the final record now reads
   as an unwitnessable empty (suppressed) instead of an authoritative
@@ -1327,12 +1361,15 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (records speak — the truth-table lock pins this). Bounded consumer check
   owed if a real case appears; never restore false authority to recover
   retirement.
-  (iii) THE APP_SURFACE_BATCH_UNAVAILABLE LIFETIME LATCH (sol s42 Q7):
-  one transport Err converts the client to per-target asks for the process
-  lifetime; the fix must distinguish unsupported batch capability from
-  transient transport failure (bounded retries + invalidation on
-  endpoint/incarnation change; reset-on-single-ask-success proves the
-  wrong thing — sol's own rebuttal of the cheap fix).
+  (iii) THE APP_SURFACE_BATCH_UNAVAILABLE LIFETIME LATCH (sol s42 Q7;
+  consequence extended by sol s43 Q5): one transport Err converts the client
+  to per-target asks for the process lifetime; the fix must distinguish
+  unsupported batch capability from transient transport failure (bounded
+  retries + invalidation on endpoint/incarnation change; reset-on-single-
+  ask-success proves the wrong thing — sol's own rebuttal of the cheap
+  fix). s43 addition: the latch also disables the batch-only [11.186]
+  retained-close retire pass, so its cost is missed retirements, not just
+  request volume.
   (iv) The CLI `terminal app declares` verb ignores the authority verdict
   in its printed output (cosmetic; the daemon+client fixes carry the
   substance).
