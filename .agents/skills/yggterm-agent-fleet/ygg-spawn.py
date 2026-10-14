@@ -62,11 +62,20 @@ def log(msg):
 
 
 def gui_host():
+    # ⛔ THE AIM WINS, EVEN WHEN EMPTY (empty = force the local plane): the
+    # sandbox battery sets `YGG_GUI_HOST=""` precisely so no real GUI host is
+    # resolved, and a probe-first read made the verb reach the live daemon of
+    # whatever machine it ran on — green on a host with a GUI, red on one
+    # without, exactly the machine-shaped divergence the battery pins.
+    # ygg_host's documented order: explicit flag · $YGG_GUI_HOST · resolver.
+    aimed = os.environ.get("YGG_GUI_HOST")
+    if aimed is not None:
+        return aimed.strip()
     r = subprocess.run(
         [os.path.join(HERE, "..", "..", "..", "scripts", "ygg-live-host.sh"), "--quiet"],
         capture_output=True, text=True, timeout=60,
     )
-    return (r.stdout or "").strip() or os.environ.get("YGG_GUI_HOST", "")
+    return (r.stdout or "").strip()
 
 
 #: ⛔ One owner for reaching the plane — see `ygg_plane`. Spelling it here is how
@@ -97,7 +106,10 @@ def main():
     a = ap.parse_args()
 
     host = a.host or gui_host()
-    if not host:
+    # An explicitly aimed EMPTY host (YGG_GUI_HOST="") names the local plane —
+    # the aim battery runs this verb exactly so. Refuse only when nothing named
+    # a host at all: no --host, no aim, and the live-host probe silent.
+    if not host and a.host is None and os.environ.get("YGG_GUI_HOST") is None:
         log("⛔ no GUI host")
         return 2
     if not os.path.exists(a.brief):

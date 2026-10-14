@@ -43,9 +43,15 @@ def log(m):
 
 
 def gui_host():
+    # ⛔ THE AIM WINS, EVEN WHEN EMPTY — see ygg-spawn.gui_host (same sit):
+    # probe-first made the verb reach the live daemon of whatever machine it
+    # ran on instead of the aimed plane.
+    aimed = os.environ.get("YGG_GUI_HOST")
+    if aimed is not None:
+        return aimed.strip()
     r = subprocess.run([os.path.join(HERE, "..", "..", "..", "scripts", "ygg-live-host.sh"),
                         "--quiet"], capture_output=True, text=True, timeout=60)
-    return (r.stdout or "").strip() or os.environ.get("YGG_GUI_HOST", "")
+    return (r.stdout or "").strip()
 
 
 #: ⛔ Reaching the plane has ONE owner. This verb spelled the binary itself and
