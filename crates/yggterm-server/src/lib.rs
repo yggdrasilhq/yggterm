@@ -5585,9 +5585,44 @@ impl ActivationOrigin {
     }
 }
 
+/// ONE armed startup-gate watcher (see [`YggtermServer::startup_gate_watches`]).
+#[derive(Debug, Clone)]
+pub struct StartupGateWatch {
+    pub kind: SessionKind,
+    pub armed_at: std::time::Instant,
+    pub phase: StartupGateWatchPhase,
+    /// Confirms actually SENT for this launch generation. The policy bound is
+    /// ONE: an unchanged grid after a confirm cannot prove the first Enter
+    /// was discarded rather than buffered, so a second Enter risks landing in
+    /// a live composer (sol s44 Q3).
+    pub confirms_sent: u8,
+}
+
+/// The watcher's lifecycle. NOT "disarm on the first non-gate reading": a
+/// row is blank or signing in BEFORE its gate paints, and those are not
+/// readiness (sol s44 Q3's corrected shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupGateWatchPhase {
+    /// Watching for the authorized gate — and for an already-ready row.
+    AwaitStartup,
+    /// The confirm was sent; watching for positive readiness. NO further
+    /// input is ever sent in this phase.
+    VerifyReady,
+}
+
 #[derive(Debug, Clone)]
 pub struct YggtermServer {
     sessions: BTreeMap<String, ManagedSessionView>,
+    /// Armed startup-gate watchers, ONE per actual agent PTY launch whose
+    /// descriptor carries an auto-answer policy (agy only today). Armed in
+    /// `start_remote_runtime_agent_session`'s new-spawn branch — the one
+    /// place every launch (detached start, resume, the ensure ladder,
+    /// GUI-created, heal mints) is actually born — and consumed by the
+    /// daemon's watch pass. An existing-runtime reuse arm does NOT re-arm:
+    /// mounting or reopening an already-running row never creates a watcher,
+    /// and neither does a daemon restart's restore (it never passes the
+    /// new-spawn branch) (sol s44 Q1).
+    pub(crate) startup_gate_watches: BTreeMap<String, StartupGateWatch>,
     /// ⛔ ONE WRITER: `set_active_session_path`. The field stays private and
     /// every assignment goes through that funnel, because an origin recorded
     /// at only some of the call sites answers "why did it change" with
@@ -5733,6 +5768,7 @@ impl YggtermServer {
 
         let this = Self {
             sessions: BTreeMap::new(),
+            startup_gate_watches: BTreeMap::new(),
             active_session_path: None,
             last_activation_at_ms: None,
             last_activation_origin: None,
@@ -13766,6 +13802,29 @@ impl YggtermServer {
         Ok(key)
     }
 
+    /// Arm the startup-gate watcher for a NEWLY SPAWNED agent PTY whose
+    /// descriptor carries an auto-answer policy. Called ONLY from the
+    /// new-spawn branch of [`Self::start_remote_runtime_agent_session`]: the
+    /// request is the launch generation, so a reuse arm, a remount, or a
+    /// restore never passes here, and a live watch for the same key is never
+    /// duplicated (`or_insert`).
+    fn arm_startup_gate_watch(&mut self, key: &str, kind: SessionKind) {
+        if yggterm_core::agent_cli::agent_cli_descriptor(kind)
+            .and_then(|descriptor| descriptor.startup_gate_auto_answer)
+            .is_none()
+        {
+            return;
+        }
+        self.startup_gate_watches
+            .entry(key.to_string())
+            .or_insert_with(|| StartupGateWatch {
+                kind,
+                armed_at: std::time::Instant::now(),
+                phase: StartupGateWatchPhase::AwaitStartup,
+                confirms_sent: 0,
+            });
+    }
+
     pub fn start_remote_runtime_codex_session(
         &mut self,
         session_id: &str,
@@ -14016,6 +14075,11 @@ impl YggtermServer {
                 "Transport bridge: stdio attach to daemon PTY".to_string(),
             ];
         }
+        // The PTY launch is born HERE — the new-spawn branch is the one
+        // place every start/resume/ensure/GUI/heal launch composes a fresh
+        // CLI process — so the auto-answer watcher arms at the birth, never
+        // on reuse.
+        self.arm_startup_gate_watch(&key, kind);
         self.set_active_session_path(
             Some(key.clone()),
             ActivationOrigin::launch("start_remote_runtime_agent_session_new"),
