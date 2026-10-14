@@ -41214,6 +41214,66 @@ mod single_ask_authority_locks {
         assert!(!app_surface_target_is_remote_keyed(local));
     }
 
+    /// sol s43 Q5 (F2 residue iii): a daemon ANSWER latches at any count;
+    /// transport loss retries within the budget and latches only at the cap.
+    #[test]
+    fn the_batch_latch_distinguishes_an_answered_error_from_transport_loss() {
+        use AppSurfaceBatchFailureDecision::*;
+        // An answered Error settles capability — latch at count 0.
+        assert_eq!(
+            app_surface_batch_failure_decision(true, 0),
+            (Latch, 0)
+        );
+        // Transport loss within the budget: retry, counting up.
+        assert_eq!(
+            app_surface_batch_failure_decision(false, 0),
+            (RetryNextTick, 1)
+        );
+        assert_eq!(
+            app_surface_batch_failure_decision(false, 3),
+            (RetryNextTick, 4)
+        );
+        // The cap latches.
+        let at_cap = APP_SURFACE_BATCH_TRANSPORT_LATCH_AFTER - 1;
+        assert_eq!(
+            app_surface_batch_failure_decision(false, at_cap),
+            (Latch, at_cap + 1)
+        );
+    }
+
+    /// The acquisition block must reset the transport budget ONLY on batch
+    /// success and count ONLY in the failure arms — the sol-rebotted
+    /// "reset on single-ask success" shape must never appear.
+    #[test]
+    fn the_batch_budget_resets_only_on_batch_success() {
+        let source = include_str!("state.rs");
+        // The needle is built by concatenation so this lock cannot
+        // self-match its own text (the s42 include_str! law).
+        let needle = concat!(
+            "let batch = if APP_SURFACE_BATCH_",
+            "UNAVAILABLE.load(Ordering::Relaxed)"
+        );
+        let block_start = source
+            .find(needle)
+            .expect("the acquisition block exists");
+        let block = &source[block_start..];
+        let block_end = block.find("for target in targets").expect("the target loop follows");
+        let block = &block[..block_end];
+        assert_eq!(
+            block.matches("APP_SURFACE_BATCH_TRANSPORT_FAILURES.store(0,").count(),
+            1,
+            "exactly one reset, on batch success"
+        );
+        assert!(
+            block.contains("app_surface_batch_failure_decision("),
+            "the decision goes through the pure fn"
+        );
+        assert!(
+            block.contains("batch_transport_retry"),
+            "transient losses trace their retry"
+        );
+    }
+
     /// sol s42 Q6-2: a `running:false` answer witnesses death only under an
     /// explicit Authoritative verdict or a legacy LOCAL answer; an explicit
     /// no_local_authority and a legacy remote-keyed self-answer do not.
@@ -41359,7 +41419,47 @@ enum AppSurfaceBatchVerdict {
 /// Set the first time a daemon answers the batch ask with `Error` (a daemon
 /// too old to know the variant). The tick then falls back to the per-target
 /// asks permanently for this process — one lost tick, not a per-tick tax.
+/// [F2 residue (iii), s43 unit 2] ONLY an answered Error (or an exhausted
+/// transport budget) lands here now — a bare transport loss never does.
 static APP_SURFACE_BATCH_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Consecutive TRANSPORT failures of the batch ask (sol s43 Q5): retried
+/// with this bounded budget — reset to zero by any batch SUCCESS, never by
+/// single-ask success (sol's own rebuttal of that cheap fix) — and latched
+/// only at the cap. A daemon-down window therefore costs a few per-target
+/// ticks, not the process lifetime (and not the batch-only [11.186]
+/// retained-close retire pass).
+const APP_SURFACE_BATCH_TRANSPORT_LATCH_AFTER: u32 = 5;
+static APP_SURFACE_BATCH_TRANSPORT_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// What one failed batch ask does to the client's batching state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppSurfaceBatchFailureDecision {
+    /// The capability question is settled — latch for the process lifetime.
+    Latch,
+    /// Transient loss inside the budget — per-target asks THIS tick, the
+    /// batch is retried next tick.
+    RetryNextTick,
+}
+
+/// PURE — locked below. A daemon ANSWER (an `Error` response) latches at any
+/// failure count: an old daemon will answer Error forever. A transport loss
+/// retries until the consecutive-failure cap, then latches (bounded
+/// retries, no unbounded storm).
+fn app_surface_batch_failure_decision(
+    answered_error: bool,
+    prior_failures: u32,
+) -> (AppSurfaceBatchFailureDecision, u32) {
+    if answered_error {
+        return (AppSurfaceBatchFailureDecision::Latch, prior_failures);
+    }
+    let failures = prior_failures.saturating_add(1);
+    if failures >= APP_SURFACE_BATCH_TRANSPORT_LATCH_AFTER {
+        (AppSurfaceBatchFailureDecision::Latch, failures)
+    } else {
+        (AppSurfaceBatchFailureDecision::RetryNextTick, failures)
+    }
+}
 
 /// How many no-fresh-declare corpse arms a session may fire before the client
 /// gives up on the surface and retires it. ONE arm keeps the historical reload
@@ -41553,16 +41653,86 @@ async fn restore_app_surfaces_tick(
     } else {
         let endpoint = state.read().bootstrap.server_endpoint.clone();
         match terminal_app_declares_all_async(endpoint, &trace_home).await {
-            Ok(sessions) => Some(AppSurfaceRestoreBatch::from_sessions(sessions)),
-            Err(_) => {
-                APP_SURFACE_BATCH_UNAVAILABLE.store(true, Ordering::Relaxed);
-                append_trace_event(
-                    &trace_home,
-                    "ui",
-                    "app_surface_restore",
-                    "batch_unavailable",
-                    json!({"fallback": "per_target_asks"}),
+            Ok(Ok(sessions)) => {
+                // Any success resets the transport budget (this is the ONLY
+                // reset — never a single-ask success, sol s42 Q7).
+                APP_SURFACE_BATCH_TRANSPORT_FAILURES.store(0, Ordering::Relaxed);
+                Some(AppSurfaceRestoreBatch::from_sessions(sessions))
+            }
+            Ok(Err(failure)) => {
+                let (decision, failures) = app_surface_batch_failure_decision(
+                    matches!(
+                        failure,
+                        yggterm_server::TerminalAppDeclaresAllFailure::AnsweredError(_)
+                    ),
+                    APP_SURFACE_BATCH_TRANSPORT_FAILURES.load(Ordering::Relaxed),
                 );
+                APP_SURFACE_BATCH_TRANSPORT_FAILURES
+                    .store(failures, Ordering::Relaxed);
+                match decision {
+                    AppSurfaceBatchFailureDecision::Latch => {
+                        APP_SURFACE_BATCH_UNAVAILABLE.store(true, Ordering::Relaxed);
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "app_surface_restore",
+                            "batch_unavailable",
+                            json!({
+                                "fallback": "per_target_asks",
+                                "reason": if matches!(
+                                    failure,
+                                    yggterm_server::TerminalAppDeclaresAllFailure::AnsweredError(_)
+                                ) {
+                                    "daemon_answered_error"
+                                } else {
+                                    "transport_failures_exhausted"
+                                },
+                            }),
+                        );
+                        None
+                    }
+                    AppSurfaceBatchFailureDecision::RetryNextTick => {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "app_surface_restore",
+                            "batch_transport_retry",
+                            json!({
+                                "failures": failures,
+                                "latch_after": APP_SURFACE_BATCH_TRANSPORT_LATCH_AFTER,
+                            }),
+                        );
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                // The dedicated-io runner itself failed — transport loss,
+                // same bounded budget.
+                let (decision, failures) = app_surface_batch_failure_decision(
+                    false,
+                    APP_SURFACE_BATCH_TRANSPORT_FAILURES.load(Ordering::Relaxed),
+                );
+                APP_SURFACE_BATCH_TRANSPORT_FAILURES
+                    .store(failures, Ordering::Relaxed);
+                if decision == AppSurfaceBatchFailureDecision::Latch {
+                    APP_SURFACE_BATCH_UNAVAILABLE.store(true, Ordering::Relaxed);
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "app_surface_restore",
+                        "batch_unavailable",
+                        json!({"fallback": "per_target_asks", "reason": "transport_failures_exhausted"}),
+                    );
+                } else {
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "app_surface_restore",
+                        "batch_transport_retry",
+                        json!({"failures": failures, "latch_after": APP_SURFACE_BATCH_TRANSPORT_LATCH_AFTER}),
+                    );
+                }
                 None
             }
         }

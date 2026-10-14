@@ -209,6 +209,7 @@ pub use daemon::{
     terminal_app_declares, terminal_app_declares_all, TerminalAppDeclareAuthority,
     session_path_is_remote_keyed,
     TerminalAppDeclareSession,
+    terminal_app_declares_all_classified, TerminalAppDeclaresAllFailure,
     terminal_ensure, terminal_history, terminal_read, terminal_resize,
     terminal_resize_repaint, hot_restart_gate_screens, terminal_restart, terminal_tenants,
     terminal_restart_with_size,

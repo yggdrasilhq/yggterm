@@ -25030,10 +25030,45 @@ pub fn terminal_app_declares(
 pub fn terminal_app_declares_all(
     endpoint: &ServerEndpoint,
 ) -> Result<Vec<TerminalAppDeclareSession>> {
-    match send_request(endpoint, &ServerRequest::TerminalAppDeclaresAll {})? {
+    terminal_app_declares_all_classified(endpoint).map_err(|failure| match failure {
+        TerminalAppDeclaresAllFailure::AnsweredError(message) => {
+            anyhow::anyhow!(message)
+        }
+        TerminalAppDeclaresAllFailure::Transport(message) => anyhow::anyhow!(message),
+    })
+}
+
+/// WHY the batch ask failed — the client's latch decision needs the split
+/// (F2 residue (iii), sol s42 Q7 + s43 Q5): a daemon ANSWER settles the
+/// capability question (an old daemon that does not know the variant will
+/// answer Error forever), while a transport loss is transient by nature and
+/// must never permanently restructure the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalAppDeclaresAllFailure {
+    /// The daemon answered with an Error response (unknown variant on an
+    /// old daemon, or a genuine refusal): latching is correct.
+    AnsweredError(String),
+    /// No answer at all — the transport failed (daemon down, socket gone).
+    Transport(String),
+}
+
+pub fn terminal_app_declares_all_classified(
+    endpoint: &ServerEndpoint,
+) -> Result<Vec<TerminalAppDeclareSession>, TerminalAppDeclaresAllFailure> {
+    let response = match send_request(endpoint, &ServerRequest::TerminalAppDeclaresAll {}) {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(TerminalAppDeclaresAllFailure::Transport(error.to_string()))
+        }
+    };
+    match response {
         ServerResponse::TerminalAppDeclaresAll { sessions } => Ok(sessions),
-        ServerResponse::Error { message } => bail!(message),
-        other => bail!("unexpected terminal app declares-all response: {:?}", other),
+        ServerResponse::Error { message } => {
+            Err(TerminalAppDeclaresAllFailure::AnsweredError(message))
+        }
+        other => Err(TerminalAppDeclaresAllFailure::AnsweredError(format!(
+            "unexpected terminal app declares-all response: {other:?}"
+        ))),
     }
 }
 

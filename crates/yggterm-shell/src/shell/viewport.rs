@@ -22851,10 +22851,18 @@ async fn terminal_app_declares_async(
 async fn terminal_app_declares_all_async(
     endpoint: ServerEndpoint,
     trace_home: &Path,
-) -> Result<Vec<yggterm_server::TerminalAppDeclareSession>> {
-    run_dedicated_terminal_io("terminal_app_declares_all", trace_home, move || {
-        yggterm_server::terminal_app_declares_all(&endpoint)
-    })
+) -> Result<Result<Vec<yggterm_server::TerminalAppDeclareSession>, yggterm_server::TerminalAppDeclaresAllFailure>>
+{
+    // The inner Result is the CLASSIFIED ask (answer vs transport — F2
+    // residue (iii)); the outer one is the dedicated-io runner's own
+    // machinery, which this tick treats as transport loss.
+    run_dedicated_terminal_io(
+        "terminal_app_declares_all",
+        trace_home,
+        move || {
+            Ok(yggterm_server::terminal_app_declares_all_classified(&endpoint))
+        },
+    )
     .await
 }
 async fn terminal_retained_snapshot_async(
