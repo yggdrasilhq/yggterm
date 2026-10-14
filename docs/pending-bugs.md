@@ -2191,6 +2191,8 @@ persisted streak — that is the falsifier's red.
 
 ## ★ THE 2026-10-15 GATE SWEEP — UNBLOCKED WORK INDEX (rulings in settled-calls.md § "THE 2026-10-15 GATE SWEEP")
 
+**Status:** OPEN
+
 Twenty owner gates cleared in one interactive sitting (zcode sess_b7eff89a). The
 rulings live in settled-calls.md; the WORK they unblock lives here:
 
@@ -2217,6 +2219,8 @@ rulings live in settled-calls.md; the WORK they unblock lives here:
   question closed as accepted). The greeting run proceeds on the working set.
 
 ## ⛔ THE INTERFACE LLM MOVES TO llmproxy + METERED URL ROUTES (owner directive, 2026-10-15 gate sweep; litellm RETIRED)
+
+**Status:** OPEN
 
 The interface LLM (title/summary chore) pointed at the owner's litellm proxy
 layer; **litellm is retired in lieu of the new llmproxy at the same
