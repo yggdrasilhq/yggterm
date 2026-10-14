@@ -1279,17 +1279,63 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   absent 7× in 138s (backoff gaps 2.5→5→10→20→40→60s — s38's "~5s storm"
   DECAYS to a persistent ~60s lie on a GUI-only restart). sol s40 round:
   Q1 accept (suppression only), Q2 defer (the wire upgrade is its own
-  lane), Q3 rebut folded (the wanted-half gate). OWED: the harness GREEN
-  re-run post-deploy (zero declares + the suppression trace on a boot-2).
-  STILL OPEN: the SINGLE-ASK arm's authority gap — a proxy-spawned remote
-  row with no preserved-owner record self-answers empty and
-  `daemon_declare_absent` (no via:batch) can still fire from the rebuild
-  path — whose fix is the enum-variant upgrade (additive fields → the full
-  Absent/Unavailable/valid-empty vocabulary); its second consumer now
-  EXISTS. The [11.229] absent-declaration sub-item stands. The live rig
-  (the dev-local GUI harness is BUILT — `tools/e2e/gui-harness.sh`, s38;
-  [11.32]'s live proof delivered on it). MEMBERS: [11.32], the [11.229]
-  absent-declaration sub-item.
+  lane), Q3 rebut folded (the wanted-half gate). The batch GREEN delivered
+  same-day on the deploy (s40: 240s observe — declares 0, 8 suppressions
+  via:batch, viewport painted whole), re-proven by s42's natural-fire runs.
+  THE SINGLE-ASK ARM CLOSED 2026-10-14 (sitting 42, adopting sitting 41's
+  lane/f2/single-ask-authority — s41 posted the plan and died mid-grind;
+  its construction was adopted uncommitted, corrected per the REAL sol
+  round, and landed c9e0e360 + 05868745 → main; s41's comments had cited
+  "sol s41 Q1–Q4" verdicts that never ran — corrected, node
+  lores/chain-of-thought/2026-10-14-yggterm-s42-single-ask-sol.md):
+  `ServerResponse::TerminalAppDeclares` carries `authority:
+  Option<TerminalAppDeclareAuthority>` (Authoritative/NoLocalAuthority — a
+  NEW type, never a variant inside TerminalContentAuthority; missing field
+  = legacy bytes; protocol stamp 3.2.120 same-commit, hash taken from the
+  stamp test's own computation — s41's precomputed hash was wrong and the
+  test caught it). The handler classifies on the CANONICAL runtime_path
+  (the [11.161] fold may answer in an alias's key space); the owner proxy
+  passes the OWNER's verdict through verbatim. THE REMOTE-KEYED EMPTY
+  NEVER SPEAKS — NOT EVEN LIVE-HELD: s42's round-1 GREEN natural-fire run
+  FALSIFIED "live-held speaks" (the fresh transport-held harness daemon
+  answered authoritative + empty + running:true and the client declared
+  the painted remote row absent ×4 on the ladder, while oc — holding the
+  actual process, same 3.2.120, same wire — answered no_local_authority
+  for the same row; the declare ledger is per-incarnation memory);
+  sol round-2 R1 removed live_held from the verdict entirely. GREEN round
+  2 (exe d6b64f1d): batch fallback armed +1672ms, 8 single asks on the
+  ladder, 8 suppressions via:single_ask consumed by the client, ZERO
+  daemon_declare_absent for the target, viewport painted whole at pixels
+  through the ladder (sol's four demonstrables). Suites shell 2289/0 +
+  server 1673/0 no-fail-fast. RESIDUES FILED below. The [11.229]
+  absent-declaration sub-item stands. The live rig: the dev-local GUI
+  harness (`tools/e2e/gui-harness.sh`, s38; [11.32]'s live proof and this
+  lane's two natural-fire runs all delivered on it). MEMBERS: [11.32],
+  the [11.229] absent-declaration sub-item.
+  F2 RESIDUES (filed 2026-10-14, sitting 42):
+  (i) DECLARE-LEDGER PERSISTENCE (sol round-2 R3): last_known_app_declares
+  is per-incarnation memory — [11.80]'s restart-protection promise is only
+  true within one daemon incarnation (the comments were corrected in-lane;
+  the behavioral question — persist last-known across daemon restarts or
+  accept the loss until the app re-declares — is its own unit).
+  (ii) THE CLEAR-TO-EMPTY RETIREMENT LIMITATION (sol round-2 R2): for a
+  remote-keyed row, an app Clear that removes the final record now reads
+  as an unwitnessable empty (suppressed) instead of an authoritative
+  absence — the correct conservative reading (on this wire a Clear is
+  indistinguishable from lost history); a genuine remote surface death
+  still retires through CLOSE records while they remain in the ledger
+  (records speak — the truth-table lock pins this). Bounded consumer check
+  owed if a real case appears; never restore false authority to recover
+  retirement.
+  (iii) THE APP_SURFACE_BATCH_UNAVAILABLE LIFETIME LATCH (sol s42 Q7):
+  one transport Err converts the client to per-target asks for the process
+  lifetime; the fix must distinguish unsupported batch capability from
+  transient transport failure (bounded retries + invalidation on
+  endpoint/incarnation change; reset-on-single-ask-success proves the
+  wrong thing — sol's own rebuttal of the cheap fix).
+  (iv) The CLI `terminal app declares` verb ignores the authority verdict
+  in its printed output (cosmetic; the daemon+client fixes carry the
+  substance).
 - **F3 — HOST-LIFECYCLE IMMORTALITY**: a bad host must be replaced, never
   revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71);
   THE RELAUNCH/RE-BIND ARM ROOT-FIXED (sitting 13, 2026-10-06, main
