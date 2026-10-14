@@ -15242,11 +15242,31 @@ impl DaemonRuntime {
                                 })
                         })
                 {
-                    return Ok(ServerResponse::Ack {
-                        message: Some(format!(
-                            "{STARTUP_GATE_REFUSAL_MESSAGE}: {runtime_path} is parked on its startup gate - answer it interactively (arrow keys + Enter), then resend"
-                        )),
-                    });
+                    {
+                        // The refusal is the net under the auto-answer watcher
+                        // (sol s44 Q5): for a descriptor WITH the policy the row
+                        // will confirm itself — bounded, once, only while the
+                        // picker's selection is still on Yes — so the remedy
+                        // names the armed watcher and a resend-after-ready.
+                        // Without the policy the remedy stays the human's.
+                        let auto_answered = self
+                            .server
+                            .live_session_kind(&runtime_path)
+                            .and_then(yggterm_core::agent_cli::agent_cli_descriptor)
+                            .is_some_and(|descriptor| {
+                                descriptor.startup_gate_auto_answer.is_some()
+                            });
+                        let remedy = if auto_answered {
+                            "the auto-answer watcher is armed for this row (one Enter on Yes); resend once the composer is ready"
+                        } else {
+                            "answer it interactively (arrow keys + Enter), then resend"
+                        };
+                        return Ok(ServerResponse::Ack {
+                            message: Some(format!(
+                                "{STARTUP_GATE_REFUSAL_MESSAGE}: {runtime_path} is parked on its startup gate - {remedy}"
+                            )),
+                        });
+                    }
                 }
                 // The draft guard. A daemon that only proxies the row reads
                 // `None` and must not decide — it forwards the flag and lets
@@ -18476,6 +18496,229 @@ fn match_agent_identities_to_targets(
 /// ever followed. Owner-set titles never follow — `set_session_title_hint`
 /// refuses them, so a human's name outranks the store.
 const ROW_TITLE_FOLLOW_INTERVAL_MS: u64 = 120_000;
+
+/// The startup-gate watch pass cadence. The gate paints seconds (~30s
+/// measured mounted) after spawn, so sub-second reaction buys nothing.
+const STARTUP_GATE_WATCH_INTERVAL_MS: u64 = 500;
+/// How long the watcher looks for the authorized gate before giving up:
+/// covers the spawn latency plus agy's sign-in phase, inside the E2E probe's
+/// 150s budget (sol s44 Q3's starting bounds — validated, not guaranteed).
+const STARTUP_GATE_DISCOVERY_DEADLINE_MS: u64 = 120_000;
+/// The total arm-to-verdict bound; the verify window after the confirm is
+/// whatever remains of it.
+const STARTUP_GATE_WATCH_TOTAL_DEADLINE_MS: u64 = 130_000;
+
+/// Why a watcher stopped. Terminal: the watch is removed and stays disarmed
+/// for that launch generation — a gate re-asked days later is a NEW decision
+/// a new launch gets to arm (sol s44 Q3). A replaced generation's screen is
+/// gone from this daemon's eyes, so it reports as `process_exited`; the
+/// replacement launch arms its own watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupGateWatchStop {
+    /// The row was ready before any gate showed (a CLI with stored trust).
+    AlreadyReady,
+    /// Gate answered: gone from the grid AND a ready marker present.
+    Ready,
+    DeadlineNoGate,
+    /// The confirm never cleared the gate.
+    GatePersisted,
+    /// The gate cleared but no ready marker ever appeared — unconfirmed.
+    GateClearedComposerUnconfirmed,
+    /// The gate is up with the selection NOT on Yes: never a blind Enter.
+    SelectionMismatch,
+    /// The row's screen is gone (process exited / runtime replaced).
+    ProcessExited,
+    /// The confirm write itself failed.
+    WriteFailed,
+}
+
+/// What the pass should do for one watch, decided from PURE inputs so the
+/// whole state machine is table-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupGateWatchDecision {
+    Wait,
+    SendConfirm,
+    Finish(StartupGateWatchStop),
+}
+
+fn startup_gate_watch_decision(
+    phase: crate::StartupGateWatchPhase,
+    elapsed_ms: u64,
+    confirms_sent: u8,
+    gate_present: bool,
+    selection_present: bool,
+    ready_present: bool,
+) -> StartupGateWatchDecision {
+    match phase {
+        crate::StartupGateWatchPhase::AwaitStartup => {
+            if ready_present && !gate_present {
+                return StartupGateWatchDecision::Finish(StartupGateWatchStop::AlreadyReady);
+            }
+            if gate_present {
+                if !selection_present {
+                    // The gate with the selection moved off Yes is a STOP,
+                    // never a blind Enter on an assumed default (sol s44 Q2).
+                    return StartupGateWatchDecision::Finish(StartupGateWatchStop::SelectionMismatch);
+                }
+                if confirms_sent == 0 {
+                    return StartupGateWatchDecision::SendConfirm;
+                }
+                return StartupGateWatchDecision::Wait;
+            }
+            if elapsed_ms >= STARTUP_GATE_DISCOVERY_DEADLINE_MS {
+                return StartupGateWatchDecision::Finish(StartupGateWatchStop::DeadlineNoGate);
+            }
+            StartupGateWatchDecision::Wait
+        }
+        crate::StartupGateWatchPhase::VerifyReady => {
+            if !gate_present && ready_present {
+                return StartupGateWatchDecision::Finish(StartupGateWatchStop::Ready);
+            }
+            if elapsed_ms >= STARTUP_GATE_WATCH_TOTAL_DEADLINE_MS {
+                return StartupGateWatchDecision::Finish(if gate_present {
+                    StartupGateWatchStop::GatePersisted
+                } else {
+                    StartupGateWatchStop::GateClearedComposerUnconfirmed
+                });
+            }
+            // A still-visible gate (or a blank grid) after the confirm earns
+            // NO second Enter: an unchanged grid cannot prove the first was
+            // discarded rather than buffered — the retry could land in a live
+            // composer (sol s44 Q3).
+            StartupGateWatchDecision::Wait
+        }
+    }
+}
+
+fn startup_gate_watch_stop_reason(stop: StartupGateWatchStop) -> &'static str {
+    match stop {
+        StartupGateWatchStop::AlreadyReady => "already_ready",
+        StartupGateWatchStop::Ready => "ready",
+        StartupGateWatchStop::DeadlineNoGate => "gate_not_seen_before_deadline",
+        StartupGateWatchStop::GatePersisted => "gate_persisted",
+        StartupGateWatchStop::GateClearedComposerUnconfirmed => {
+            "gate_cleared_composer_unconfirmed"
+        }
+        StartupGateWatchStop::SelectionMismatch => "selection_mismatch",
+        StartupGateWatchStop::ProcessExited => "process_exited",
+        StartupGateWatchStop::WriteFailed => "write_failed",
+    }
+}
+
+/// The startup-gate watch pass: for every armed launch whose descriptor
+/// carries an auto-answer policy, read the RENDERED grid, decide, and act.
+/// One confirm per launch generation, positive readiness verification, and
+/// every terminal outcome traced (sol s44 Q4's event set, folded: the gate's
+/// first sighting rides the write trace's `gate_seen_ms`).
+fn run_startup_gate_watch_pass(runtime: &Arc<Mutex<DaemonRuntime>>) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let mut traces: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    {
+        let mut rt = lock_daemon_runtime(runtime, "startup_gate_watch_pass");
+        let keys: Vec<String> = rt.server.startup_gate_watches.keys().cloned().collect();
+        for key in keys {
+            let Some(watch) = rt.server.startup_gate_watches.get(&key).cloned() else {
+                continue;
+            };
+            let Some(descriptor) = yggterm_core::agent_cli::agent_cli_descriptor(watch.kind)
+            else {
+                rt.server.startup_gate_watches.remove(&key);
+                continue;
+            };
+            let Some(policy) = descriptor.startup_gate_auto_answer else {
+                rt.server.startup_gate_watches.remove(&key);
+                continue;
+            };
+            let elapsed_ms = watch.armed_at.elapsed().as_millis() as u64;
+            let Some(rows) = rt.terminals.session_screen_plain_rows(&key) else {
+                traces.push((
+                    "startup_gate_auto_answer_stopped",
+                    serde_json::json!({
+                        "path": key,
+                        "reason": startup_gate_watch_stop_reason(StartupGateWatchStop::ProcessExited),
+                        "confirms_sent": watch.confirms_sent,
+                        "elapsed_ms": elapsed_ms,
+                    }),
+                ));
+                rt.server.startup_gate_watches.remove(&key);
+                continue;
+            };
+            let grid = rows.join("\n").to_lowercase();
+            let gate_present = descriptor.screen_shows_startup_gate(&grid);
+            let selection_present = grid.contains(policy.selected_option_needle);
+            let ready_present = policy
+                .ready_markers
+                .iter()
+                .any(|marker| grid.contains(marker));
+            match startup_gate_watch_decision(
+                watch.phase,
+                elapsed_ms,
+                watch.confirms_sent,
+                gate_present,
+                selection_present,
+                ready_present,
+            ) {
+                StartupGateWatchDecision::Wait => {}
+                StartupGateWatchDecision::SendConfirm => {
+                    match rt.terminals.write_with_provenance(&key, "\r", true) {
+                        Ok(()) => {
+                            if watch.confirms_sent == 0 {
+                                if let Some(w) = rt.server.startup_gate_watches.get_mut(&key) {
+                                    w.phase = crate::StartupGateWatchPhase::VerifyReady;
+                                    w.confirms_sent = 1;
+                                }
+                                traces.push((
+                                    "startup_gate_auto_answer_write",
+                                    serde_json::json!({
+                                        "path": key,
+                                        "confirm": "enter",
+                                        "bytes": policy.confirm.bytes().len(),
+                                        "gate_seen_ms": elapsed_ms,
+                                        "phase": "verify_ready",
+                                    }),
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            traces.push((
+                                "startup_gate_auto_answer_stopped",
+                                serde_json::json!({
+                                    "path": key,
+                                    "reason": startup_gate_watch_stop_reason(StartupGateWatchStop::WriteFailed),
+                                    "error": error.to_string(),
+                                    "elapsed_ms": elapsed_ms,
+                                }),
+                            ));
+                            rt.server.startup_gate_watches.remove(&key);
+                        }
+                    }
+                }
+                StartupGateWatchDecision::Finish(stop) => {
+                    let ready = stop == StartupGateWatchStop::Ready;
+                    traces.push((
+                        if ready {
+                            "startup_gate_auto_answer_ready"
+                        } else {
+                            "startup_gate_auto_answer_stopped"
+                        },
+                        serde_json::json!({
+                            "path": key,
+                            "reason": startup_gate_watch_stop_reason(stop),
+                            "confirms_sent": watch.confirms_sent,
+                            "elapsed_ms": elapsed_ms,
+                        }),
+                    ));
+                    rt.server.startup_gate_watches.remove(&key);
+                }
+            }
+        }
+    }
+    for (name, payload) in traces {
+        append_trace_event(&home, "daemon", "startup_gate_auto_answer", name, payload);
+    }
+    Ok(())
+}
+
 
 fn run_row_title_follow_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
     // 1. Snapshot the candidates under the lock — from THE SAME SOURCE the
@@ -29221,6 +29464,23 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             }
         });
     }
+    {
+        // The startup-gate watch: answers the gates its descriptors' policy
+        // allows (agy's folder trust — settled-calls #20) for rows this
+        // daemon spawned. Bounded per launch generation; the write-guard
+        // refusal stays the net for programmatic sends that race the answer.
+        let runtime = runtime.clone();
+        std::thread::Builder::new()
+            .name("yggterm-startup-gate-watch".to_string())
+            .spawn(move || loop {
+                if let Err(error) = run_startup_gate_watch_pass(&runtime) {
+                    warn!(error = %error, "daemon startup gate watch pass failed");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    STARTUP_GATE_WATCH_INTERVAL_MS,
+                ));
+            })?;
+    }
     if remote_codex_identity_poll_enabled() {
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
@@ -37371,6 +37631,139 @@ mod tests {
     /// the right instrument, because a daemon-originated write is invisible to
     /// it. This test states the split so that "finish the migration" cannot
     /// silently break the probe.
+    #[test]
+    fn the_gate_watch_decision_never_reconfirms_and_verifies_positively() {
+        use super::startup_gate_watch_decision;
+        use super::startup_gate_watch_stop_reason;
+        use super::StartupGateWatchDecision;
+        use super::StartupGateWatchStop;
+        use super::STARTUP_GATE_DISCOVERY_DEADLINE_MS;
+        use super::STARTUP_GATE_WATCH_TOTAL_DEADLINE_MS;
+        use crate::StartupGateWatchPhase as Phase;
+        // Pre-gate: blank/sign-in readings wait; no readiness forgery.
+        assert_eq!(
+            startup_gate_watch_decision(Phase::AwaitStartup, 0, 0, false, false, false),
+            StartupGateWatchDecision::Wait
+        );
+        // An already-ready row stops before any input.
+        assert_eq!(
+            startup_gate_watch_decision(Phase::AwaitStartup, 5_000, 0, false, false, true),
+            StartupGateWatchDecision::Finish(StartupGateWatchStop::AlreadyReady)
+        );
+        // Gate with the selection on Yes and no confirm yet: send it.
+        assert_eq!(
+            startup_gate_watch_decision(Phase::AwaitStartup, 30_000, 0, true, true, false),
+            StartupGateWatchDecision::SendConfirm
+        );
+        // Gate with the selection MOVED off Yes: stop, never a blind Enter.
+        assert_eq!(
+            startup_gate_watch_decision(Phase::AwaitStartup, 30_000, 0, true, false, false),
+            StartupGateWatchDecision::Finish(StartupGateWatchStop::SelectionMismatch)
+        );
+        // No gate within the discovery deadline: give up honestly.
+        assert_eq!(
+            startup_gate_watch_decision(
+                Phase::AwaitStartup,
+                STARTUP_GATE_DISCOVERY_DEADLINE_MS,
+                0,
+                false,
+                false,
+                false
+            ),
+            StartupGateWatchDecision::Finish(StartupGateWatchStop::DeadlineNoGate)
+        );
+        // VerifyReady: positive readiness finishes.
+        assert_eq!(
+            startup_gate_watch_decision(Phase::VerifyReady, 31_000, 1, false, false, true),
+            StartupGateWatchDecision::Finish(StartupGateWatchStop::Ready)
+        );
+        // A still-visible gate (or a blank grid) after the confirm NEVER
+        // earns a second Enter (sol s44 Q3).
+        assert_eq!(
+            startup_gate_watch_decision(Phase::VerifyReady, 31_000, 1, true, true, false),
+            StartupGateWatchDecision::Wait
+        );
+        assert_eq!(
+            startup_gate_watch_decision(Phase::VerifyReady, 31_000, 1, false, false, false),
+            StartupGateWatchDecision::Wait
+        );
+        // Past the total deadline the verify phase resolves by what it sees.
+        assert_eq!(
+            startup_gate_watch_decision(
+                Phase::VerifyReady,
+                STARTUP_GATE_WATCH_TOTAL_DEADLINE_MS,
+                1,
+                true,
+                true,
+                false
+            ),
+            StartupGateWatchDecision::Finish(StartupGateWatchStop::GatePersisted)
+        );
+        assert_eq!(
+            startup_gate_watch_decision(
+                Phase::VerifyReady,
+                STARTUP_GATE_WATCH_TOTAL_DEADLINE_MS,
+                1,
+                false,
+                false,
+                false
+            ),
+            StartupGateWatchDecision::Finish(StartupGateWatchStop::GateClearedComposerUnconfirmed)
+        );
+    }
+
+    #[test]
+    fn the_startup_gate_watcher_arms_at_the_new_spawn_branch_only() {
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source.matches("self.arm_startup_gate_watch(&key, kind);").count(),
+            1,
+            "the watcher arms at exactly one site: the launch birth"
+        );
+        let arm_ix = source
+            .find("self.arm_startup_gate_watch(&key, kind);")
+            .expect("arm call");
+        // The arm must sit INSIDE the new-spawn branch: after the reuse
+        // arm's origin string (which an existing-runtime launch records
+        // instead) and before the new branch's own activation record.
+        let reuse_ix = source
+            .find("start_remote_runtime_agent_session_existing")
+            .expect("reuse origin");
+        let new_ix = source
+            .find("ActivationOrigin::launch(\"start_remote_runtime_agent_session_new\")")
+            .expect("new origin");
+        assert!(
+            arm_ix > reuse_ix && arm_ix < new_ix,
+            "the arm belongs to the new-spawn branch only, never the reuse path"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_with_the_auto_answer_policy_names_the_watcher_in_its_refusal() {
+        let source = include_str!("daemon.rs");
+        // Both remedies share the ONE stable prefix the parser keys on. The
+        // needle is split so this lock does not contain its own match (the
+        // s42 self-match law).
+        let refusal_format = format!(
+            "STARTUP_GATE_{}{{runtime_path}} is parked on its startup gate - ",
+            "REFUSAL_MESSAGE}: "
+        );
+        assert_eq!(
+            source.matches(&refusal_format).count(),
+            1,
+            "one refusal format site"
+        );
+        assert!(
+            source.contains("the auto-answer watcher is armed for this row"),
+            "the policy branch names the armed watcher (sol s44 Q5)"
+        );
+        assert!(
+            source.contains("answer it interactively (arrow keys + Enter), then resend"),
+            "the no-policy remedy stays the human's"
+        );
+    }
+
+    #[test]
     #[test]
     fn a_startup_gate_guard_reads_the_rows_own_descriptor_on_the_rendered_grid() {
         let source = include_str!("daemon.rs");

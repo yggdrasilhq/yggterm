@@ -211,6 +211,48 @@ fn screen_phrases_match(
 /// only BELOW the composer for the agent-row plane. This one is the whole-screen
 /// matcher behind the sidebar dot and the hot-update idle gate — the two
 /// consumers that must never disagree.
+/// HOW the watcher confirms a startup gate it is allowed to answer. One
+/// variant on purpose: Enter is the only MEASURED confirm (agy's first-run
+/// modal discards typed input, and its trailing Enter answered the picker —
+/// measured 2026-09-10, agy 1.2.0), and any other key is unmeasured input
+/// into a trust decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupGateConfirm {
+    /// One carriage return on the picker's preselected Yes option.
+    Enter,
+}
+
+impl StartupGateConfirm {
+    /// The exact bytes the confirm sends. ONE measured form: a bare CR —
+    /// never CRLF, never arrows, never prompt text.
+    pub fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Enter => b"\r",
+        }
+    }
+}
+
+/// The per-CLI auto-answer policy for ONE named startup gate (see
+/// [`AgentCliDescriptor::startup_gate_auto_answer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupGateAutoAnswer {
+    pub confirm: StartupGateConfirm,
+    /// Lowercased needle that must appear on the rendered grid BESIDE the
+    /// gate question, proving the picker's selection still sits on the YES
+    /// option before the confirm is sent. agy's picker paints
+    /// `> Yes, I trust this folder` with the `>` cursor on Yes by default; a
+    /// future default flip or a human's arrow keys must turn this needle
+    /// absent and the watcher stops instead of trusting blindly (sol s44 Q2).
+    pub selected_option_needle: &'static str,
+    /// Lowercased post-gate readiness markers: readiness = the gate needle
+    /// ABSENT and one of these PRESENT. Borrowed from the E2E connection
+    /// probe's measured connected signatures for agy ("? for shortcuts" is
+    /// the signed-in TUI's composer footer; "google ai" the welcome header's
+    /// account line). The descriptor's generic footer hints are NOT
+    /// readiness — the gate itself paints model/Enter chrome (sol s44 Q4).
+    pub ready_markers: &'static [&'static str],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenWorkingPhrase {
     /// Lowercase fragment the line must contain.
@@ -791,6 +833,24 @@ pub struct AgentCliDescriptor {
     ///
     /// ⛔ EMPTY means UNMEASURED, the same law as `working_screen_phrases`.
     pub startup_gate_screen_phrases: &'static [ScreenWorkingPhrase],
+    /// The startup gates this CLI is ALLOWED to have answered automatically
+    /// by the daemon's startup-gate watcher. `None` — every CLI except agy
+    /// today — means a painted gate is answered by a human or not at all: the
+    /// watcher never injects input into a CLI whose gate semantics the owner
+    /// has not ruled on (kimi-code's per-directory trust re-asks EVERY launch
+    /// and its one-time migration picker has host-level consequences; its
+    /// suite answers the trust gate only for its own scratch dirs,
+    /// deliberately).
+    ///
+    /// The ruling (owner, 2026-10-15 gate sweep, docs/settled-calls.md #20):
+    /// agy's folder-trust gate is AUTO-ANSWERED EVERYWHERE — the spawn path
+    /// and interactive GUI opens both; the owner accepted silent trust of
+    /// fresh project folders. The confirm is ONE Enter on the picker's
+    /// preselected Yes option, sent only while the rendered grid proves the
+    /// selection still sits on Yes, and readiness is verified positively
+    /// afterwards (gate absent + a ready marker present). An unchanged grid
+    /// after the Enter earns NO second Enter (sol s44 Q3).
+    pub startup_gate_auto_answer: Option<StartupGateAutoAnswer>,
     /// Whole-SCREEN phrases meaning the CLI is holding a LIMIT/BILLING DIALOG
     /// whose options are NOT equivalent.
     ///
@@ -1962,6 +2022,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // `codex resume <id>` reopens the session's ORIGINAL cwd unless
@@ -2162,6 +2223,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
         startup_gate_screen_phrases: &[],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Subcommand("resume"),
         // ⚠ Deliberately FALSE, preserving shipped behavior exactly: the
@@ -2366,6 +2428,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // hold different ideas of what a billing dialog looks like. Every entry
         // names the money question itself; the structural guard beside it is
         // what keeps an ordinary sentence about limits from arming the state.
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[
             ScreenWorkingPhrase {
                 needle: "session limit",
@@ -2568,6 +2631,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
         startup_gate_screen_phrases: &[],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         // `pi` takes `process.cwd()`; there is no `--cwd`, and `--session-dir`
@@ -2724,6 +2788,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // changes, `Build` vs `Build auto`). Empty here is MEASURED-NONE,
         // not UNMEASURED.
         startup_gate_screen_phrases: &[],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--session"),
         resume_re_roots_with_cwd: false,
@@ -2876,6 +2941,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         question_picker_screen_phrases: &[],
         background_agent_hint_screen_phrases: &[],
         startup_gate_screen_phrases: &[],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         resume_selector: ResumeSelector::Flag("--resume"),
         resume_re_roots_with_cwd: false,
@@ -3099,6 +3165,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         // ⛔ FLIPPED [11.175] (kimi-code 2.1.1 `--help`, live 2026-09-27):
         // `-S, --session [id]` — the `--resume` long form and bare `-r` are
@@ -3303,6 +3370,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         // ⭐ MEASURED 2026-08-08 on guihost, from `muse resume --help` on a real
         // install: `muse resume` / `muse resume --last` / `muse resume
@@ -3521,6 +3589,15 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
             needle: "do you trust the contents of this project?",
             also_any: &[],
         }],
+        // The 2026-10-15 owner ruling (docs/settled-calls.md #20): agy's
+        // folder-trust gate is auto-answered EVERYWHERE. Bounds live on the
+        // field's doc; the ready markers are the E2E probe's measured
+        // connected signatures.
+        startup_gate_auto_answer: Some(StartupGateAutoAnswer {
+            confirm: StartupGateConfirm::Enter,
+            selected_option_needle: "> yes, i trust this folder",
+            ready_markers: &["? for shortcuts", "google ai"],
+        }),
         plan_limit_choice_screen_phrases: &[],
         // Read off `agy --help`, v1.0.5 on guihost (2026-08-08): resume is
         // `--conversation <ID>`, and `-c`/`--continue` takes the most recent.
@@ -3790,6 +3867,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         // MEASURED: `-r, --resume [<SESSION_ID_OR_TITLE>]`. 1.0.30's help
         // (2026-09-15) also spells `--continue` as an alias of the same
@@ -4036,6 +4114,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
         // workspaceHookTrustGrant protocol message, server-side). Empty
         // here is MEASURED-NONE, not UNMEASURED.
         startup_gate_screen_phrases: &[],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         // MEASURED: `--resume <sessionId>` boots straight into a resumed
         // session (added 0.5.1 for exactly this contract).
@@ -4200,6 +4279,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         // MEASURED: `-r/--resume [<SESSION_ID>]` resumes by slug (the bare
         // form opens an interactive picker), `-c/--continue` resumes the
@@ -4441,6 +4521,7 @@ pub const AGENT_CLIS: &[AgentCliDescriptor] = &[
                 also_any: &[],
             },
         ],
+        startup_gate_auto_answer: None,
         plan_limit_choice_screen_phrases: &[],
         // MEASURED off `mimo --help`: `-s, --session <id>` continues by id,
         // `-c, --continue` the last session, `--fork` branches when
@@ -11276,6 +11357,36 @@ mod tests {
     /// ⚠ The screens below are REAL captures with the directory replaced by an
     /// invented one — the gate's wording is what is under test, and the path is
     /// the one part of it that identifies nothing.
+    #[test]
+    #[test]
+    fn only_agy_declares_a_startup_gate_auto_answer() {
+        // The auto-answer is an OWNER RULING over ONE gate (settled-calls
+        // #20, 2026-10-15): a descriptor may carry it only alongside gate
+        // phrases, and today only agy's folder-trust gate is ruled. A new
+        // auto-answer arriving without this test's knowledge is exactly the
+        // silent input-injection the policy field exists to prevent.
+        let agy = agent_cli_descriptor(SessionKind::Antigravity)
+            .expect("agy has a descriptor");
+        assert!(!agy.startup_gate_screen_phrases.is_empty());
+        let policy = agy
+            .startup_gate_auto_answer
+            .expect("agy's folder-trust gate is auto-answered by ruling");
+        assert_eq!(policy.confirm, StartupGateConfirm::Enter);
+        assert_eq!(policy.confirm.bytes(), b"\r");
+        assert_eq!(policy.selected_option_needle, "> yes, i trust this folder");
+        assert!(policy.ready_markers.len() >= 1);
+        for descriptor in AGENT_CLIS.iter() {
+            if descriptor.kind == SessionKind::Antigravity {
+                continue;
+            }
+            assert!(
+                descriptor.startup_gate_auto_answer.is_none(),
+                "{} declares a startup-gate auto-answer the owner never ruled",
+                descriptor.slug
+            );
+        }
+    }
+
     #[test]
     fn a_startup_gate_is_recognised_for_every_cli_that_declares_one() {
         const CODEX_GATE: &str = "\

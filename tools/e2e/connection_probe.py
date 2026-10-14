@@ -184,6 +184,14 @@ def screen(key, timeout=30):
     return ANSI_RE.sub("", answer.stdout)
 
 
+# [11.226] auto-answer world (settled-calls #20): the daemon's startup-gate
+# watcher OWNS agy's folder-trust gate, so a sighting during a connection
+# poll is TRANSIENT — the watcher answers it within its bounds and the poll
+# continues. Each sighting is remembered per key so a deadline verdict can
+# still name a gate that persisted past the watcher (the startup_gate label
+# stays greppable — a persisted gate is still a FAIL, never laundered).
+GATE_SIGHTINGS: dict = {}
+
 def screen_ok(key):
     text = screen(key)
     if not text.strip():
@@ -200,7 +208,10 @@ def screen_ok(key):
     # timeout message prints only the tail and hides it). The gate's own
     # signature line is the witness.
     if "Do you trust the contents of this project" in text:
-        return False, "[startup_gate painted — row is at a trust gate, not connected] " + text
+        # Transient in the auto-answer world (the watcher's Enter lands
+        # sub-second after the paint): keep polling, remember the sighting.
+        GATE_SIGHTINGS[key] = True
+        return None, text
     return None, text
 
 
@@ -428,6 +439,12 @@ def scenario_fresh_start():
             return sc.ok(f"screen shows the CLI ({len(text)} chars)")
         if connected is False:
             return sc.fail(f"refusal painted on the row screen: {text[:300]!r}")
+        if GATE_SIGHTINGS.pop(key, False):
+            # The watcher never cleared it: honest gate label at the deadline.
+            return sc.fail(
+                "[startup_gate persisted past the auto-answer watcher] "
+                + text[-260:]
+            )
         return sc.fail(f"no CLI on screen after 150s; screen tail: {text[-300:]!r}")
     finally:
         reap(key)
@@ -672,6 +689,11 @@ def scenario_rebirth_uuid_vouch():
                 "wrapper refused without the tombstone witness — the ladder never "
                 f"consulted the store: {refused_stderr[:240]!r}"
             )
+        if GATE_SIGHTINGS.pop(key, False):
+            return sc.fail(
+                "[startup_gate persisted past the auto-answer watcher] "
+                f"stderr={refused_stderr[:240]!r} screen={text[-260:]!r}"
+            )
         return sc.fail(
             "no CLI after 150s and no named refusal in the wrapper's stderr — a "
             f"silent death: stderr={refused_stderr[:240]!r} screen={text[-160:]!r}"
@@ -907,6 +929,11 @@ def scenario_defmiss_fresh_start_mint():
                 "the row connected through some other arm; the mint falsifier "
                 f"stays unexercised (wrapper exit={proc.poll()} stderr={refused_stderr[:400]!r} "
                 f"window_arms=[{arms_text}])"
+            )
+        if GATE_SIGHTINGS.pop(key, False):
+            return sc.fail(
+                "[startup_gate persisted past the auto-answer watcher] "
+                f"stderr={refused_stderr[:240]!r} screen={text[-260:]!r}"
             )
         return sc.fail(
             "no CLI after 150s and no named refusal — stderr="
