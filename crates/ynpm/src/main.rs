@@ -225,8 +225,7 @@ fn version_answer_matches_identity(answer: &str, expected: &str) -> bool {
     let (Ok(actual), Ok(expected)) = (
         SemVer::parse(actual.as_deref().unwrap_or("")),
         SemVer::parse(expected),
-    )
-    else {
+    ) else {
         return false;
     };
     (actual.major, actual.minor, actual.patch) == (expected.major, expected.minor, expected.patch)
@@ -346,9 +345,13 @@ pub fn dev_handback(
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     pub packages: BTreeMap<String, Package>,
+    /// Last time the automatic retention pass ran ([11.239]). Throttles the
+    /// post-install sweep so a hot `ynpx` loop never pays for it per call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_auto_sweep_ms: Option<u64>,
 }
 
 /// The three roots of ynpm's on-disk world, all under the yggterm home.
@@ -442,18 +445,16 @@ impl Paths {
 static YNPM_TRACE_RUN_ID: OnceLock<String> = OnceLock::new();
 
 fn ynpm_trace_run_id() -> &'static str {
-    YNPM_TRACE_RUN_ID
-        .get_or_init(|| {
-            std::env::var("YNPM_TRACE_RUN_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| format!("ynpm-{}-{}", std::process::id(), now_ms()))
-        })
+    YNPM_TRACE_RUN_ID.get_or_init(|| {
+        std::env::var("YNPM_TRACE_RUN_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("ynpm-{}-{}", std::process::id(), now_ms()))
+    })
 }
 
 fn ynpm_trace_home(paths: &Paths) -> PathBuf {
-    yggterm_core::resolve_yggterm_home()
-        .unwrap_or_else(|_| paths.home.join(".yggterm"))
+    yggterm_core::resolve_yggterm_home().unwrap_or_else(|_| paths.home.join(".yggterm"))
 }
 
 fn trace_safe_text(text: &str) -> String {
@@ -551,9 +552,7 @@ fn find_package_key<'a>(state: &'a State, package: &str) -> Option<&'a str> {
             1
         } else if legacy_key.is_some_and(|legacy| key.as_str() == legacy) {
             2
-        } else if value.package_name.is_none()
-            && package.rsplit('/').next() == Some(key.as_str())
-        {
+        } else if value.package_name.is_none() && package.rsplit('/').next() == Some(key.as_str()) {
             3
         } else {
             continue;
@@ -582,8 +581,10 @@ fn another_package_owns_app_name(state: &State, excluded_key: &str, app_name: &s
         .iter()
         .filter(|(key, _)| key.as_str() != excluded_key)
         .any(|(key, package)| {
-            app_name_for_package(&package_identity(key, package), package.integration.as_ref())
-                == app_name
+            app_name_for_package(
+                &package_identity(key, package),
+                package.integration.as_ref(),
+            ) == app_name
         })
 }
 
@@ -599,8 +600,7 @@ fn another_package_owns_binary(
         .iter()
         .filter(|(key, _)| key.as_str() != excluded_key)
         .any(|(_, package)| {
-            package_destination(paths, package) == destination
-                && package.bins.contains_key(binary)
+            package_destination(paths, package) == destination && package.bins.contains_key(binary)
         })
 }
 
@@ -780,12 +780,14 @@ pub fn parse_manifest(doc: &serde_json::Value) -> anyhow::Result<Manifest> {
             .and_then(|value| value.as_str())
             .map(str::to_string),
         integration: integration_value
-            .map(|value| -> anyhow::Result<yggterm_core::YggtermPackageMetadata> {
-                let metadata: yggterm_core::YggtermPackageMetadata =
-                    serde_json::from_value(value.clone())?;
-                metadata.validate()?;
-                Ok(metadata)
-            })
+            .map(
+                |value| -> anyhow::Result<yggterm_core::YggtermPackageMetadata> {
+                    let metadata: yggterm_core::YggtermPackageMetadata =
+                        serde_json::from_value(value.clone())?;
+                    metadata.validate()?;
+                    Ok(metadata)
+                },
+            )
             .transpose()?,
         optional_dependencies,
     })
@@ -1003,9 +1005,9 @@ fn parse_tarball_source(spec: &str) -> anyhow::Result<TarballSource> {
     let raw = spec
         .strip_prefix("tarball:")
         .context("tarball source wants tarball:URL")?;
-    let (url, fragment) = raw.split_once('#').map_or((raw, None), |(url, fragment)| {
-        (url, Some(fragment))
-    });
+    let (url, fragment) = raw
+        .split_once('#')
+        .map_or((raw, None), |(url, fragment)| (url, Some(fragment)));
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         bail!("tarball source must use http:// or https://");
     }
@@ -1090,9 +1092,11 @@ fn install_prebuilt_tarball(
     destination: Option<&Path>,
 ) -> anyhow::Result<InstallOutcome> {
     let (archive, source) = fetch_verified_tarball(paths, spec)?;
-    let extracted = paths
-        .scratch()
-        .join(format!("tarball-{}-{}", source_cache_key(&source.url), std::process::id()));
+    let extracted = paths.scratch().join(format!(
+        "tarball-{}-{}",
+        source_cache_key(&source.url),
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&extracted);
     extract_tarball(&archive, &extracted)?;
     let package_dir = archive_package_root(&extracted)?;
@@ -1156,7 +1160,8 @@ fn install_prebuilt_tarball(
             fs::rename(&incoming, &target)?;
         }
     }
-    let app_manifest = app_manifest_from_metadata(&package, integration.as_ref(), &destination, &bins)?;
+    let app_manifest =
+        app_manifest_from_metadata(&package, integration.as_ref(), &destination, &bins)?;
     let mut state = paths.load_state()?;
     let previous = state.packages.get(&key).map(|entry| entry.current.clone());
     let previous_integration = state
@@ -1170,7 +1175,12 @@ fn install_prebuilt_tarball(
         .or_else(|| {
             bins.keys()
                 .next()
-                .and_then(|bin| destination.join(bin).exists().then(|| destination.join(bin)))
+                .and_then(|bin| {
+                    destination
+                        .join(bin)
+                        .exists()
+                        .then(|| destination.join(bin))
+                })
                 .and_then(|path| run_version(&path).ok())
                 .and_then(|answer| version_from_answer(&answer))
         });
@@ -1368,9 +1378,15 @@ fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::Instal
         paths.home.join(format!(".yggterm/bin/yggterm{extension}")),
     ]);
     if let Ok(current) = std::env::current_exe()
-        && current.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-            matches!(name, "yggterm" | "yggterm.exe" | "yggterm-headless" | "yggterm-headless.exe")
-        })
+        && current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "yggterm" | "yggterm.exe" | "yggterm-headless" | "yggterm-headless.exe"
+                )
+            })
     {
         candidates.push(current);
     }
@@ -1380,8 +1396,7 @@ fn yggterm_install_context(paths: &Paths) -> anyhow::Result<yggterm_core::Instal
         let Ok(mut context) = yggterm_core::detect_install_context(&candidate) else {
             continue;
         };
-        if context.channel != yggterm_core::InstallChannel::Direct
-            || context.managed_root.is_none()
+        if context.channel != yggterm_core::InstallChannel::Direct || context.managed_root.is_none()
         {
             continue;
         }
@@ -2455,13 +2470,55 @@ fn install_npm_package(
         for note in dev_channel_supersedence_notes(&state, &version, &existing.bins) {
             println!("ynpm: {note}");
         }
-        return Ok(InstallOutcome {
+        // The throttle point for the hottest path there is: a repeat `ynpx`
+        // of an already-published version lands here.
+        let outcome = InstallOutcome {
             name: package.to_string(),
             version,
             previous: Some(existing.current.clone()),
             bins: existing.bins.keys().cloned().collect(),
-        });
+        };
+        auto_sweep_if_due(paths, &mut state);
+        let _ = paths.save_state(&state);
+        return Ok(outcome);
     }
+
+    // A state entry is not the only reuse key: the published generation tree
+    // is immutable and self-describing (bin/ plus its own package.json). A
+    // stateless invocation — a fresh HOME, a wiped state.json — used to
+    // re-download and re-stage the identical version, which is exactly the
+    // 138G /tmp/455-dir arm of [11.239]. Verify the generation's declared
+    // bins and reuse it instead.
+    let generation = paths.generation_dir(&key, &version);
+    let mut reuse_generation = false;
+    let generation_manifest = generation
+        .join("lib/node_modules")
+        .join(package)
+        .join("package.json");
+    if generation.join("bin").is_dir() && generation_manifest.is_file() {
+        reuse_generation = (|| -> anyhow::Result<bool> {
+            let doc: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&generation_manifest)?)?;
+            for bin in parse_bin_table(&doc)?.keys() {
+                run_version(&generation.join("bin").join(bin))
+                    .with_context(|| format!("stale generation bin {bin}"))?;
+            }
+            Ok(true)
+        })()
+        .unwrap_or(false);
+    }
+    if reuse_generation {
+        ynpm_trace(
+            paths,
+            "source.reuse.generation",
+            serde_json::json!({ "package": package, "version": version }),
+        );
+    }
+
+    // Capacity admission BEFORE allocating: the inode half of [11.239]
+    // already took a host down once. Reclaim what is already ours first,
+    // then refuse with numbers instead of dying mid-extract.
+    ensure_install_headroom(paths)?;
 
     let npm = PathBuf::from(
         std::env::var_os("YNPM_NPM")
@@ -2478,18 +2535,27 @@ fn install_npm_package(
     fs::create_dir_all(&scratch)
         .with_context(|| format!("creating npm staging {}", scratch.display()))?;
     let result = (|| -> anyhow::Result<InstallOutcome> {
-        ynpm_trace(
-            paths,
-            "source.fetch.begin",
-            serde_json::json!({ "source": "npm", "package": package, "version": version }),
-        );
-        run_npm_install_package(&npm, paths, &scratch, package, &version)?;
-        ynpm_trace(
-            paths,
-            "source.fetch.complete",
-            serde_json::json!({ "source": "npm", "package": package, "version": version }),
-        );
-        let package_dir = npm_package_dir(&scratch, package);
+        if !reuse_generation {
+            ynpm_trace(
+                paths,
+                "source.fetch.begin",
+                serde_json::json!({ "source": "npm", "package": package, "version": version }),
+            );
+            run_npm_install_package(&npm, paths, &scratch, package, &version)?;
+            ynpm_trace(
+                paths,
+                "source.fetch.complete",
+                serde_json::json!({ "source": "npm", "package": package, "version": version }),
+            );
+        }
+        // Both flows read the same tree shape: a fresh stage, or the verified
+        // generation being reused.
+        let read_root = if reuse_generation {
+            generation.clone()
+        } else {
+            scratch.clone()
+        };
+        let package_dir = npm_package_dir(&read_root, package);
         let manifest_path = package_dir.join("package.json");
         let package_doc: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(&manifest_path)
@@ -2497,7 +2563,8 @@ fn install_npm_package(
         )
         .with_context(|| format!("parsing {}", manifest_path.display()))?;
         let bins = parse_bin_table(&package_doc)?;
-        let integration = package_integration(&package_doc)?.or_else(|| manifest.integration.clone());
+        let integration =
+            package_integration(&package_doc)?.or_else(|| manifest.integration.clone());
         ynpm_trace(
             paths,
             "package.metadata",
@@ -2510,7 +2577,7 @@ fn install_npm_package(
         );
         let app_manifest = app_manifest_from_metadata(package, integration.as_ref(), &dest, &bins)?;
         for (bin, rel) in &bins {
-            let candidate = scratch.join("bin").join(bin);
+            let candidate = read_root.join("bin").join(bin);
             if !candidate.exists() {
                 bail!(
                     "npm package {package}@{version} declares bin '{bin}' at '{rel}', but {} is missing",
@@ -2529,22 +2596,21 @@ fn install_npm_package(
             serde_json::json!({ "package": package, "version": version, "bins": bins.keys().collect::<Vec<_>>() }),
         );
 
-        let generation = paths.generation_dir(&key, &version);
-        if generation.exists() {
+        if !reuse_generation {
             // The same immutable npm version may be encountered after a
             // partial run. Never remove a currently published generation; if
             // it is not current, use the existing verified bytes.
-            if !generation.join("bin").exists() {
+            if generation.exists() && !generation.join("bin").exists() {
                 fs::remove_dir_all(&generation)
                     .with_context(|| format!("removing incomplete {}", generation.display()))?;
             }
-        }
-        if !generation.exists() {
-            if let Some(parent) = generation.parent() {
-                fs::create_dir_all(parent)?;
+            if !generation.exists() {
+                if let Some(parent) = generation.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                copy_dir_all(&scratch, &generation)
+                    .with_context(|| format!("keeping generation {}", generation.display()))?;
             }
-            copy_dir_all(&scratch, &generation)
-                .with_context(|| format!("keeping generation {}", generation.display()))?;
         }
 
         let previous = state.packages.get(&key).map(|value| value.current.clone());
@@ -2637,8 +2703,14 @@ fn install_npm_package(
             bins: bins.keys().cloned().collect(),
         })
     })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&scratch);
+    // The staging tree is a duplicate by the time the closure returns: on
+    // success its bytes were copied into the generation, on failure they are
+    // partial. Leaving it behind was the single largest scratchpad growth
+    // path ([11.239-a]).
+    let _ = fs::remove_dir_all(&scratch);
+    if result.is_ok() {
+        auto_sweep_if_due(paths, &mut state);
+        let _ = paths.save_state(&state);
     }
     result
 }
@@ -3208,7 +3280,10 @@ fn converge_cli_links_to_newer_dev(
                 .or_else(|| entry.dev.as_ref().and_then(|dev| dev.generation.as_deref()))?;
             Some((
                 dev_semver,
-                entry.package_name.clone().unwrap_or_else(|| key.to_string()),
+                entry
+                    .package_name
+                    .clone()
+                    .unwrap_or_else(|| key.to_string()),
                 entry.current.clone(),
                 paths.generation_dir(key, generation),
             ))
@@ -3224,7 +3299,10 @@ fn converge_cli_links_to_newer_dev(
             continue;
         }
         let cli_link = cli_dir.join(bin);
-        if fs::read_link(&cli_link).map(|target| target == source).unwrap_or(false) {
+        if fs::read_link(&cli_link)
+            .map(|target| target == source)
+            .unwrap_or(false)
+        {
             continue;
         }
         if let Err(error) = publish_link(&source, &cli_link) {
@@ -3262,8 +3340,8 @@ fn dev_channel_supersedence_notes(
 ) -> Vec<String> {
     let mut notes = Vec::new();
     for name in bins.keys() {
-        let Some((dev_package, dev_version, dev_dest)) = state.packages.iter().find_map(
-            |(key, entry)| {
+        let Some((dev_package, dev_version, dev_dest)) =
+            state.packages.iter().find_map(|(key, entry)| {
                 let is_dev = entry.dev.is_some() && entry.bins.contains_key(name);
                 is_dev.then(|| {
                     (
@@ -3272,8 +3350,8 @@ fn dev_channel_supersedence_notes(
                         entry.destination.clone(),
                     )
                 })
-            },
-        ) else {
+            })
+        else {
             continue;
         };
         let (Ok(dev_semver), Ok(npm_semver)) = (
@@ -3619,9 +3697,9 @@ fn fleet_push_impl(
             std::env::current_exe().ok().as_deref(),
         );
         candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .context("locating a stable ynpm binary for fleet bootstrap")?
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .context("locating a stable ynpm binary for fleet bootstrap")?
     };
     if !ynpm_self.is_file() {
         bail!(
@@ -3636,7 +3714,10 @@ fn fleet_push_impl(
     } else {
         shell_quote(&destination.display().to_string())
     };
-    let trace_env = format!("export YNPM_TRACE_RUN_ID={}; ", shell_quote(ynpm_trace_run_id()));
+    let trace_env = format!(
+        "export YNPM_TRACE_RUN_ID={}; ",
+        shell_quote(ynpm_trace_run_id())
+    );
     for host in hosts {
         let remote_root = format!(
             ".yggterm/scratchpad/ynpm/incoming/{}-{}",
@@ -3749,7 +3830,9 @@ fn fleet_push_impl(
         if outcome.package == "@ygghq/yggterm" {
             let status = Command::new("ssh")
                 .arg(host)
-                .arg(format!("{trace_env}$HOME/.local/bin/ynpm activate-yggterm-dev"))
+                .arg(format!(
+                    "{trace_env}$HOME/.local/bin/ynpm activate-yggterm-dev"
+                ))
                 .status()?;
             if !status.success() {
                 bail!("could not activate the yggterm dev build on {host}");
@@ -4050,10 +4133,7 @@ fn verb_check(paths: &Paths) -> anyhow::Result<()> {
         let mut flags = Vec::new();
         let mut notes = Vec::new();
         if package.dev.is_none() {
-            match disk_answer
-                .as_deref()
-                .and_then(version_from_answer)
-            {
+            match disk_answer.as_deref().and_then(version_from_answer) {
                 Some(version)
                     if !version_answer_matches_identity(
                         disk_answer.as_deref().unwrap_or(""),
@@ -4062,9 +4142,11 @@ fn verb_check(paths: &Paths) -> anyhow::Result<()> {
                 {
                     // A converged cli link answers the dev channel's newer
                     // build on purpose; that is the split healed, not drift.
-                    let served_by_dev = package.bins.keys().next().is_some_and(|bin| {
-                        dev_channel_serves_bin(&state, bin, &version)
-                    });
+                    let served_by_dev = package
+                        .bins
+                        .keys()
+                        .next()
+                        .is_some_and(|bin| dev_channel_serves_bin(&state, bin, &version));
                     if served_by_dev {
                         notes.push(format!(
                             "cli link serves the dev channel's build {version} (converged)"
@@ -4804,7 +4886,10 @@ fn verb_upgrade(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     if dry_run {
         println!("ynpm: dry run — nothing installed, nothing repointed");
     } else {
-        println!("ynpm: {updated} updated, {} failed, {repointed} path links repointed, {foreign} foreign shadows named", failed.len());
+        println!(
+            "ynpm: {updated} updated, {} failed, {repointed} path links repointed, {foreign} foreign shadows named",
+            failed.len()
+        );
     }
     if failed.is_empty() {
         Ok(())
@@ -5390,20 +5475,11 @@ fn verb_import_yggterm(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     let final_dir = versions.join(version);
     let replaced = activate_yggterm_generation(&staging, &final_dir, extension)?;
     if replaced > 0 && final_dir.exists() {
-        println!(
-            "ynpm: refreshed {replaced} yggterm product(s) in same-version {version}"
-        );
+        println!("ynpm: refreshed {replaced} yggterm product(s) in same-version {version}");
     }
     let yggterm = final_dir.join(format!("yggterm{extension}"));
     yggterm_core::write_direct_install_state(&root, &repo, &asset_label, version, &yggterm)?;
-    mirror_legacy_compatibility_state(
-        paths,
-        &root,
-        &repo,
-        &asset_label,
-        version,
-        &yggterm,
-    )?;
+    mirror_legacy_compatibility_state(paths, &root, &repo, &asset_label, version, &yggterm)?;
     for name in ["ynpm", "ynpx"] {
         publish_release_aux_link(
             &paths.home,
@@ -5962,6 +6038,642 @@ fn path_is_live(path: &Path, live: &[PathBuf]) -> bool {
     live.iter().any(|executable| executable.starts_with(path))
 }
 
+// ===== disk retention (F9 [11.239]) =====
+//
+// Retention lives in the writer, with fail-safe guards: a candidate that is
+// running, linked, pinned, recorded, textually referenced, or too fresh is
+// deferred, never deleted. Every pass reports what it reclaimed AND what it
+// deferred, so protected usage is visible instead of guessed at.
+
+const SWEEP_DEFAULT_KEEP: usize = 2;
+const SWEEP_DEFAULT_CACHE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const SWEEP_GRACE_MS: u64 = 30 * 60 * 1000;
+const SWEEP_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const SWEEP_MIN_FREE_INODES: u64 = 10_000;
+const AUTO_SWEEP_MIN_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// One pass's results. `deferred` carries (path, reason) so a report always
+/// explains the usage that survived.
+#[derive(Debug, Default)]
+struct SweepOutcome {
+    removed: Vec<String>,
+    deferred: Vec<(String, String)>,
+    reclaimed_bytes: u64,
+    reclaimed_files: u64,
+}
+
+impl SweepOutcome {
+    fn note_deferred(&mut self, path: &Path, reason: &str) {
+        self.deferred
+            .push((path.display().to_string(), reason.to_string()));
+    }
+
+    fn merge(&mut self, other: SweepOutcome) {
+        self.removed.extend(other.removed);
+        self.deferred.extend(other.deferred);
+        self.reclaimed_bytes += other.reclaimed_bytes;
+        self.reclaimed_files += other.reclaimed_files;
+    }
+}
+
+/// Free bytes and free inodes on the filesystem holding `path`. std has no
+/// statvfs and the fleet is linux-only, so POSIX df is parsed — the same
+/// substrate honesty as curl and tar.
+fn filesystem_free(path: &Path) -> anyhow::Result<(u64, u64)> {
+    let df = |args: &[&str]| -> anyhow::Result<String> {
+        let output = Command::new("df")
+            .args(args)
+            .arg(path)
+            .output()
+            .with_context(|| format!("running df for {}", path.display()))?;
+        if !output.status.success() {
+            bail!("df {} failed for {}", args.join(" "), path.display());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let last_line = |text: &str| -> anyhow::Result<String> {
+        text.lines()
+            .last()
+            .map(str::to_string)
+            .context("df printed nothing")
+    };
+    let bytes_out = last_line(&df(&["-k", "-P"])?)?;
+    let inodes_out = last_line(&df(&["-i", "-P"])?)?;
+    let avail_kb = bytes_out
+        .split_whitespace()
+        .nth(3)
+        .context("unexpected df -k shape")?
+        .parse::<u64>()
+        .context("parsing df -k avail")?;
+    let free_inodes = inodes_out
+        .split_whitespace()
+        .nth(3)
+        .context("unexpected df -i shape")?
+        .parse::<u64>()
+        .context("parsing df -i ifree")?;
+    Ok((avail_kb * 1024, free_inodes))
+}
+
+/// (bytes, file-and-dir count) of a tree; None when unreadable, which the
+/// caller treats as defer, never delete.
+fn tree_footprint(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.is_file() || meta.file_type().is_symlink() {
+        return Some((meta.len(), 1));
+    }
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for entry in fs::read_dir(path).ok()? {
+        let entry = entry.ok()?;
+        let (entry_bytes, entry_files) = tree_footprint(&entry.path())?;
+        bytes += entry_bytes;
+        files += entry_files;
+    }
+    Some((bytes, files + 1))
+}
+
+fn tree_mtime_ms(path: &Path) -> Option<u64> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|age| age.as_millis() as u64)
+}
+
+/// True when any link ynpm publishes, any recorded destination, or any
+/// state/registration text still points into `candidate`. Deliberately
+/// over-inclusive: a string hit always defers.
+fn path_is_referenced(paths: &Paths, state: &State, candidate: &Path) -> bool {
+    let mut scan_roots = vec![
+        paths.root().join("bin"),
+        paths.home.join(".local/bin"),
+        paths.home.join(".yggterm/bin"),
+    ];
+    for package in state.packages.values() {
+        if let Some(dest) = package.destination.as_deref() {
+            scan_roots.push(PathBuf::from(dest));
+        }
+    }
+    for root_dir in &scan_roots {
+        let Ok(entries) = fs::read_dir(root_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            let resolved = fs::canonicalize(&target).unwrap_or(target);
+            if resolved.starts_with(candidate) {
+                return true;
+            }
+        }
+    }
+    let needle = candidate.display().to_string();
+    if needle.is_empty() {
+        return false;
+    }
+    let mut text_roots = vec![paths.state_file()];
+    if let Ok(entries) = fs::read_dir(paths.home.join(".yggterm/apps")) {
+        for entry in entries.flatten() {
+            text_roots.push(entry.path());
+        }
+    }
+    for file in text_roots {
+        if let Ok(text) = fs::read_to_string(&file) {
+            if text.contains(&needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The fail-safe test for one candidate. Returns the reason it must survive,
+/// or None when it may be reclaimed. Unknown or unreadable evidence always
+/// reads as a reason to keep.
+fn retention_guard_blocks(
+    paths: &Paths,
+    state: &State,
+    candidate: &Path,
+    grace_ms: u64,
+    live: &[PathBuf],
+) -> Option<String> {
+    let current_pid_suffix = format!("-{}", std::process::id());
+    if let Some(name) = candidate.file_name().and_then(|name| name.to_str()) {
+        if name.ends_with(&current_pid_suffix) {
+            return Some("current process".to_string());
+        }
+    }
+    if path_is_live(candidate, live) {
+        return Some("live process".to_string());
+    }
+    match tree_mtime_ms(candidate) {
+        Some(mtime) => {
+            if now_ms().saturating_sub(mtime) < grace_ms as u64 {
+                return Some("grace window".to_string());
+            }
+        }
+        None => return Some("unreadable mtime".to_string()),
+    }
+    if path_is_referenced(paths, state, candidate) {
+        return Some("referenced".to_string());
+    }
+    None
+}
+
+/// Everything under the scratch root is staging by definition; the only
+/// survivors are the guarded ones. Successful installs no longer leave
+/// staging behind at all — this scope exists for pre-fix residue and crashed
+/// runs.
+fn sweep_scratch(paths: &Paths, grace_ms: u64, dry_run: bool, force: bool) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
+    let Ok(entries) = fs::read_dir(paths.scratch()) else {
+        return outcome;
+    };
+    let live = running_process_paths();
+    let state = paths.load_state().unwrap_or_default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if force {
+            // --force overrides only the grace window: a live or current
+            // process is never overridden.
+            if path_is_live(&path, &live) {
+                outcome.note_deferred(&path, "live process");
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(&format!("-{}", std::process::id())))
+                .unwrap_or(false)
+            {
+                outcome.note_deferred(&path, "current process");
+                continue;
+            }
+        } else if let Some(reason) = retention_guard_blocks(paths, &state, &path, grace_ms, &live) {
+            outcome.note_deferred(&path, &reason);
+            continue;
+        }
+        let (bytes, files) = tree_footprint(&path).unwrap_or((0, 0));
+        if dry_run {
+            outcome.removed.push(format!("(dry) {}", path.display()));
+            outcome.reclaimed_bytes += bytes;
+            outcome.reclaimed_files += files;
+            continue;
+        }
+        let removed = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+        match removed {
+            Ok(()) => {
+                outcome.removed.push(path.display().to_string());
+                outcome.reclaimed_bytes += bytes;
+                outcome.reclaimed_files += files;
+            }
+            Err(error) => outcome.note_deferred(&path, &format!("remove failed: {error}")),
+        }
+    }
+    outcome
+}
+
+/// The keep-set for one package's generation entries: current, dev-pinned,
+/// and the `keep` newest versions survive; everything else is a candidate.
+/// Rollback's contract already skips missing dirs ("the newest entry that
+/// still has a generation on disk"), so pruning beyond the newest `keep`
+/// degrades rollback depth, never correctness. dev-* trees are locally-built
+/// and owned by reap_orphan_yggterm_dev; they are never version-sorted here.
+fn generation_keep_names(
+    package: Option<&Package>,
+    entries: &[String],
+    keep: usize,
+) -> std::collections::BTreeSet<String> {
+    let mut keep_set = std::collections::BTreeSet::new();
+    if let Some(package) = package {
+        keep_set.insert(package.current.clone());
+        if let Some(dev) = package.dev_generation.as_deref() {
+            keep_set.insert(dev.to_string());
+        }
+        if package.dev.is_some() {
+            keep_set.insert("dev".to_string());
+        }
+    }
+    let mut versions: Vec<&String> = entries
+        .iter()
+        .filter(|name| !name.starts_with("dev-") && name.as_str() != "dev")
+        .collect();
+    versions.sort_by(|a, b| {
+        let rank = |text: &str| {
+            SemVer::parse(text)
+                .map(|parsed| (parsed.major, parsed.minor, parsed.patch, parsed.pre))
+                .unwrap_or((0, 0, 0, Some(String::from("~unparseable"))))
+        };
+        rank(b).cmp(&rank(a))
+    });
+    for name in versions.into_iter().take(keep) {
+        keep_set.insert(name.clone());
+    }
+    keep_set
+}
+
+fn sweep_generations(
+    paths: &Paths,
+    keep: usize,
+    grace_ms: u64,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<SweepOutcome> {
+    let mut outcome = SweepOutcome::default();
+    let Ok(keys) = fs::read_dir(paths.generations()) else {
+        return Ok(outcome);
+    };
+    let live = running_process_paths();
+    let state = paths.load_state().unwrap_or_default();
+    for key_entry in keys.flatten() {
+        let key_dir = key_entry.path();
+        if !key_dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&key_dir) else {
+            continue;
+        };
+        let names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        let package = state
+            .packages
+            .get(key_entry.file_name().to_string_lossy().as_ref());
+        let keep_set = generation_keep_names(package, &names, keep);
+        for name in &names {
+            if keep_set.contains(name) {
+                continue;
+            }
+            let candidate = key_dir.join(name);
+            if force {
+                // --force overrides only the grace window.
+                if path_is_live(&candidate, &live) {
+                    outcome.note_deferred(&candidate, "live process");
+                    continue;
+                }
+            } else if let Some(reason) =
+                retention_guard_blocks(paths, &state, &candidate, grace_ms, &live)
+            {
+                outcome.note_deferred(&candidate, &reason);
+                continue;
+            }
+            let (bytes, files) = tree_footprint(&candidate).unwrap_or((0, 0));
+            if dry_run {
+                outcome
+                    .removed
+                    .push(format!("(dry) {}", candidate.display()));
+                outcome.reclaimed_bytes += bytes;
+                outcome.reclaimed_files += files;
+                continue;
+            }
+            match fs::remove_dir_all(&candidate) {
+                Ok(()) => {
+                    outcome.removed.push(candidate.display().to_string());
+                    outcome.reclaimed_bytes += bytes;
+                    outcome.reclaimed_files += files;
+                }
+                Err(error) => outcome.note_deferred(&candidate, &format!("remove failed: {error}")),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn collect_files_by_mtime(dir: &Path, pool: &mut Vec<(PathBuf, u64, u64)>, total: &mut u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_by_mtime(&path, pool, total);
+        } else if let Ok(meta) = fs::metadata(&path) {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_millis() as u64)
+                .unwrap_or(0);
+            *total += meta.len();
+            pool.push((path, meta.len(), mtime));
+        }
+    }
+}
+
+/// Enforce the download-cache budget by evicting oldest-MODIFIED npm content
+/// files first (mtime measures modification, not use), then letting npm's
+/// own `cache verify` reconcile its index against the survivors — a content
+/// miss is a re-fetch, never a corruption. The cache is ynpm-owned: every
+/// install points npm_config_cache here.
+fn sweep_cache(cache_dir: &Path, cap_bytes: u64, dry_run: bool) -> anyhow::Result<SweepOutcome> {
+    let mut outcome = SweepOutcome::default();
+    let content_dir = cache_dir.join("_cacache/content-v2");
+    let mut pool: Vec<(PathBuf, u64, u64)> = Vec::new();
+    let mut total = 0u64;
+    collect_files_by_mtime(&content_dir, &mut pool, &mut total);
+    if total <= cap_bytes {
+        return Ok(outcome);
+    }
+    pool.sort_by_key(|(_, _, mtime)| *mtime);
+    let mut removed_bytes = 0u64;
+    for (path, size, _) in &pool {
+        if total.saturating_sub(removed_bytes) <= cap_bytes {
+            break;
+        }
+        if dry_run {
+            outcome.removed.push(format!("(dry) {}", path.display()));
+        } else if let Err(error) = fs::remove_file(path) {
+            outcome.note_deferred(path, &format!("remove failed: {error}"));
+            continue;
+        } else {
+            outcome.removed.push(path.display().to_string());
+        }
+        outcome.reclaimed_bytes += size;
+        outcome.reclaimed_files += 1;
+        removed_bytes += size;
+    }
+    if !dry_run && removed_bytes > 0 && cache_dir.join("_cacache/index-v2").exists() {
+        // Reconcile only when an index exists to reconcile: verify treats
+        // unreferenced content as garbage, which against an index-less cache
+        // would wipe everything regardless of the cap.
+        let npm = std::env::var_os("YNPM_NPM")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| OsString::from("npm"));
+        let _ = Command::new(npm)
+            .args(["cache", "verify"])
+            .env("npm_config_cache", cache_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    Ok(outcome)
+}
+
+/// The automatic retention pass: bounded, guarded, and throttled so a hot
+/// `ynpx` loop never pays for it on every invocation. Generations and cache
+/// ride along — sol's correction: retention triggered only at the operator's
+/// verb leaves the producers unbounded between visits.
+fn auto_sweep_if_due(paths: &Paths, state: &mut State) -> Option<SweepOutcome> {
+    let now = now_ms();
+    if let Some(stamp) = state.last_auto_sweep_ms {
+        if now.saturating_sub(stamp) < AUTO_SWEEP_MIN_INTERVAL_MS {
+            return None;
+        }
+    }
+    state.last_auto_sweep_ms = Some(now);
+    let mut merged = SweepOutcome::default();
+    merged.merge(sweep_scratch(paths, SWEEP_GRACE_MS, false, false));
+    if let Ok(outcome) = sweep_generations(paths, SWEEP_DEFAULT_KEEP, SWEEP_GRACE_MS, false, false)
+    {
+        merged.merge(outcome);
+    }
+    if let Ok(outcome) = sweep_cache(&paths.cache(), SWEEP_DEFAULT_CACHE_CAP_BYTES, false) {
+        merged.merge(outcome);
+    }
+    if !merged.removed.is_empty() {
+        ynpm_trace(
+            paths,
+            "retention.auto_sweep",
+            serde_json::json!({
+                "removed": merged.removed.len(),
+                "deferred": merged.deferred.len(),
+                "reclaimed_bytes": merged.reclaimed_bytes,
+                "reclaimed_files": merged.reclaimed_files,
+            }),
+        );
+    }
+    Some(merged)
+}
+
+/// Capacity admission before an install allocates: reclaim eligible scratch
+/// first, then refuse with numbers instead of dying mid-extract. Floors are
+/// env-overridable because a huge package on a small volume is a real shape.
+fn ensure_install_headroom(paths: &Paths) -> anyhow::Result<()> {
+    let min_bytes = std::env::var("YNPM_MIN_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(SWEEP_MIN_FREE_BYTES);
+    let min_inodes = std::env::var("YNPM_MIN_FREE_INODES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(SWEEP_MIN_FREE_INODES);
+    let (mut free_bytes, mut free_inodes) = filesystem_free(&filesystem_probe(paths.scratch()))?;
+    if free_bytes >= min_bytes && free_inodes >= min_inodes {
+        return Ok(());
+    }
+    let reclaimed = sweep_scratch(paths, SWEEP_GRACE_MS, false, false);
+    ynpm_trace(
+        paths,
+        "retention.headroom_reclaim",
+        serde_json::json!({
+            "reclaimed_bytes": reclaimed.reclaimed_bytes,
+            "reclaimed_files": reclaimed.reclaimed_files,
+        }),
+    );
+    (free_bytes, free_inodes) = filesystem_free(&filesystem_probe(paths.scratch()))?;
+    if free_bytes < min_bytes || free_inodes < min_inodes {
+        bail!(
+            "refusing to install: {} free bytes / {} free inodes on the scratch filesystem, floor {}/{}; retention already reclaimed {} bytes — free space or raise YNPM_MIN_FREE_BYTES/INODES",
+            free_bytes,
+            free_inodes,
+            min_bytes,
+            min_inodes,
+            reclaimed.reclaimed_bytes
+        );
+    }
+    Ok(())
+}
+
+/// The nearest existing ancestor: df needs a real path, and admission runs
+/// before the scratch root is created on a fresh home.
+fn filesystem_probe(path: PathBuf) -> PathBuf {
+    let mut probe = path;
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    probe
+}
+
+fn verb_sweep(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
+    let mut dry_run = false;
+    let mut force = false;
+    let mut json = false;
+    let mut alt_tmp = true;
+    let mut keep = SWEEP_DEFAULT_KEEP;
+    let mut cap = SWEEP_DEFAULT_CACHE_CAP_BYTES;
+    let mut grace = SWEEP_GRACE_MS;
+    let mut scopes: Vec<String> = vec![
+        "scratch".to_string(),
+        "generations".to_string(),
+        "cache".to_string(),
+    ];
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dry-run" => dry_run = true,
+            "--force" => force = true,
+            "--json" => json = true,
+            "--no-alt-tmp" => alt_tmp = false,
+            "--keep" => {
+                index += 1;
+                keep = args
+                    .get(index)
+                    .context("--keep wants a number")?
+                    .parse()
+                    .context("--keep wants a number")?;
+            }
+            "--cache-cap-bytes" => {
+                index += 1;
+                cap = args
+                    .get(index)
+                    .context("--cache-cap-bytes wants a number")?
+                    .parse()
+                    .context("--cache-cap-bytes wants a number")?;
+            }
+            "--grace-ms" => {
+                index += 1;
+                grace = args
+                    .get(index)
+                    .context("--grace-ms wants a number")?
+                    .parse()
+                    .context("--grace-ms wants a number")?;
+            }
+            "--scope" => {
+                index += 1;
+                let list = args.get(index).context("--scope wants a list")?;
+                scopes = list.split(',').map(str::to_string).collect();
+            }
+            other => bail!(
+                "unknown sweep flag `{other}`; use --dry-run | --force | --json | --keep N | --cache-cap-bytes N | --grace-ms MS | --scope scratch,generations,cache | --no-alt-tmp"
+            ),
+        }
+        index += 1;
+    }
+    let mut total = SweepOutcome::default();
+    let run_scope = |target: &Paths, total: &mut SweepOutcome| -> anyhow::Result<()> {
+        for scope in &scopes {
+            match scope.as_str() {
+                "scratch" => total.merge(sweep_scratch(target, grace, dry_run, force)),
+                "generations" => {
+                    total.merge(sweep_generations(target, keep, grace, dry_run, force)?)
+                }
+                "cache" => total.merge(sweep_cache(&target.cache(), cap, dry_run)?),
+                other => bail!("unknown scope `{other}`; use scratch, generations, cache"),
+            }
+        }
+        Ok(())
+    };
+    run_scope(paths, &mut total)?;
+    if alt_tmp {
+        // Residue of the /tmp-HOME misuse class ([11.239-a]'s 138G arm): a
+        // ynpm world rooted at /tmp is always suspect, but its bytes are
+        // ours, so the same guarded scopes run over it. Only ynpm-shaped
+        // trees are touched; nothing else in /tmp is.
+        let alt = Paths::new("/tmp");
+        if alt.root().is_dir() || alt.scratch().is_dir() {
+            run_scope(&alt, &mut total)?;
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": dry_run,
+                "removed": total.removed,
+                "deferred": total.deferred,
+                "reclaimed_bytes": total.reclaimed_bytes,
+                "reclaimed_files": total.reclaimed_files,
+            })
+        );
+    } else {
+        const LIST_CAP: usize = 50;
+        for path in total.removed.iter().take(LIST_CAP) {
+            println!("ynpm sweep: removed {path}");
+        }
+        if total.removed.len() > LIST_CAP {
+            println!(
+                "ynpm sweep: ... and {} more",
+                total.removed.len() - LIST_CAP
+            );
+        }
+        for (path, reason) in &total.deferred {
+            println!("ynpm sweep: deferred {path} ({reason})");
+        }
+        println!(
+            "ynpm sweep: {} entr{} reclaimed, {} bytes / {} files{}",
+            total.removed.len(),
+            if total.removed.len() == 1 { "y" } else { "ies" },
+            total.reclaimed_bytes,
+            total.reclaimed_files,
+            if dry_run {
+                " (dry run — nothing deleted)"
+            } else {
+                ""
+            },
+        );
+    }
+    ynpm_trace(
+        paths,
+        "retention.sweep",
+        serde_json::json!({
+            "dry_run": dry_run,
+            "force": force,
+            "scopes": scopes,
+            "removed": total.removed.len(),
+            "deferred": total.deferred.len(),
+            "reclaimed_bytes": total.reclaimed_bytes,
+        }),
+    );
+    Ok(())
+}
+
 /// Remove the old yggterm npm prefix and duplicate user-local npm package
 /// trees after `sync --integrated` has populated ynpm. Only exact package
 /// paths are considered, and a generation still used by a running process is
@@ -6195,21 +6907,13 @@ fn git_checkout(paths: &Paths, spec: &str) -> anyhow::Result<PathBuf> {
             if is_network_failure(&anyhow::anyhow!(detail.trim().to_string())) {
                 eprintln!("ynpx: git source unavailable; using the last local checkout");
             } else {
-                bail!(
-                    "could not fast-forward git checkout: {}",
-                    detail.trim()
-                );
+                bail!("could not fast-forward git checkout: {}", detail.trim());
             }
         }
     } else {
         fs::create_dir_all(checkout.parent().context("GitHub checkout has no parent")?)?;
         let status = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                &url,
-            ])
+            .args(["clone", "--depth", "1", &url])
             .arg(&checkout)
             .stdin(Stdio::null())
             .status()
@@ -6601,7 +7305,8 @@ fn main() -> anyhow::Result<()> {
     const USAGE: &str = "ynpm - the yggdrasilhq package manager\n\
          verbs: install [--dest DIR] <pkg>[@<ver>]... | install --dev <pkg> [--watch PKG] [--bin NAME=PATH]... |\n\
          list | check | doctor | sync [--integrated] | sync-fleet --hosts H1,H2 [--integrated] | upgrade [--dry-run] | self-update [--json] | export <pkg> [--metadata] [--archive PATH] | import <pkg> <ver> --archive PATH --bins a,b | import-yggterm <ver> --archive PATH | rollback <pkg> | remove <pkg> | prod <pkg> |\n\
-         purge-legacy                                        # remove old yggterm/npm copies when no live process uses them\n\
+         purge-legacy                                        # remove old yggterm/npm copies when no live process uses them
+         sweep [--dry-run] [--force] [--keep N] [--cache-cap-bytes N] [--grace-ms MS] [--scope scratch,generations,cache] [--no-alt-tmp] [--json]    # F9 retention: staging residue, old generations, cache budget (guards: live/linked/pinned/fresh always deferred)\n\
          upgrade [--dry-run]                                 # operator-explicit converge: fresh registry check, installs latest in BOTH directions, repoints stale user-local ynpm links shadowing PATH, names foreign shadows
          dev [--build CMD] [--watch PKG] [--fleet H1,H2] [--dest DIR] [--bin NAME=PATH] <checkout>\n\
          ynpx <pkg> [flags] installs/updates when online, then launches the verified bin; github:owner/repo and --dev checkout are supported\n\
@@ -6673,103 +7378,106 @@ fn main() -> anyhow::Result<()> {
     };
     let result = (|| -> anyhow::Result<()> {
         match verb.as_str() {
-        "install" => verb_install(&paths, &args[1..]),
-        "list" => verb_list(&paths),
-        "skills" => verb_skills(&paths, &args[1..]),
-        "check" => verb_check(&paths),
-        "doctor" => {
-            if args.len() != 1 {
-                bail!("doctor takes no arguments");
-            }
-            verb_doctor(&paths)
-        }
-        "sync" => verb_sync(&paths, &args[1..]),
-        "upgrade" => verb_upgrade(&paths, &args[1..]),
-        "sync-fleet" => verb_sync_fleet(&paths, &args[1..]),
-        "self-update" => verb_self_update(&paths, &args[1..]),
-        "import-yggterm" => verb_import_yggterm(&paths, &args[1..]),
-        "activate-yggterm-dev" => {
-            if args.len() != 1 {
-                bail!("activate-yggterm-dev takes no arguments");
-            }
-            activate_yggterm_dev(&paths)
-        }
-        "export" => verb_export(&paths, &args[1..]),
-        "import" => verb_import(&paths, &args[1..]),
-        "purge-legacy" => {
-            if args.len() != 1 {
-                bail!("purge-legacy takes no arguments");
-            }
-            verb_purge_legacy(&paths)
-        }
-        "remove" => {
-            let name = args.get(1).context("remove wants a package")?;
-            verb_remove(&paths, name)
-        }
-        "prod" => {
-            let name = args.get(1).context("prod wants a package")?;
-            verb_prod(&paths, name)
-        }
-        "dev" => {
-            let mut build = None;
-            let mut watch = None;
-            let mut fleet = Vec::new();
-            let mut destination = None;
-            let mut bins = BTreeMap::new();
-            let mut checkout = None;
-            let mut index = 1;
-            while index < args.len() {
-                match args[index].as_str() {
-                    "--build" => {
-                        index += 1;
-                        build = Some(args.get(index).context("--build wants a command")?.clone());
-                    }
-                    "--watch" => {
-                        index += 1;
-                        watch = Some(args.get(index).context("--watch wants a package")?.clone());
-                    }
-                    "--fleet" => {
-                        index += 1;
-                        fleet = args
-                            .get(index)
-                            .context("--fleet wants comma-separated host names")?
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|host| !host.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                    }
-                    "--dest" | "--destination" => {
-                        index += 1;
-                        destination = Some(PathBuf::from(
-                            args.get(index).context("--dest wants a destination")?,
-                        ));
-                    }
-                    "--bin" => {
-                        index += 1;
-                        let value = args.get(index).context("--bin wants name=path")?;
-                        let (name, path) =
-                            value.split_once('=').context("--bin wants name=path")?;
-                        bins.insert(name.to_string(), PathBuf::from(path));
-                    }
-                    value if value.starts_with("--") => bail!("unknown dev option '{value}'"),
-                    value if checkout.is_none() => checkout = Some(PathBuf::from(value)),
-                    value => bail!("unexpected dev argument '{value}'"),
+            "install" => verb_install(&paths, &args[1..]),
+            "list" => verb_list(&paths),
+            "skills" => verb_skills(&paths, &args[1..]),
+            "check" => verb_check(&paths),
+            "doctor" => {
+                if args.len() != 1 {
+                    bail!("doctor takes no arguments");
                 }
-                index += 1;
+                verb_doctor(&paths)
             }
-            let checkout = checkout.context("dev wants a checkout path")?;
-            dev_checkout(&paths, &checkout, build, watch, bins, destination, &fleet).map(|_| ())
-        }
-        "rollback" => {
-            let name = args
-                .get(1)
-                .context("rollback wants a package (example: ynpm rollback ychrome)")?;
-            verb_rollback(&paths, name)
-        }
-        other => bail!(
-            "'{other}' is not an ynpm verb (install | list | check | doctor | sync | sync-fleet | self-update | export | import | import-yggterm | rollback | remove | prod | purge-legacy | dev)"
-        ),
+            "sync" => verb_sync(&paths, &args[1..]),
+            "upgrade" => verb_upgrade(&paths, &args[1..]),
+            "sync-fleet" => verb_sync_fleet(&paths, &args[1..]),
+            "self-update" => verb_self_update(&paths, &args[1..]),
+            "import-yggterm" => verb_import_yggterm(&paths, &args[1..]),
+            "activate-yggterm-dev" => {
+                if args.len() != 1 {
+                    bail!("activate-yggterm-dev takes no arguments");
+                }
+                activate_yggterm_dev(&paths)
+            }
+            "export" => verb_export(&paths, &args[1..]),
+            "import" => verb_import(&paths, &args[1..]),
+            "purge-legacy" => {
+                if args.len() != 1 {
+                    bail!("purge-legacy takes no arguments");
+                }
+                verb_purge_legacy(&paths)
+            }
+            "sweep" => verb_sweep(&paths, &args[1..]),
+            "remove" => {
+                let name = args.get(1).context("remove wants a package")?;
+                verb_remove(&paths, name)
+            }
+            "prod" => {
+                let name = args.get(1).context("prod wants a package")?;
+                verb_prod(&paths, name)
+            }
+            "dev" => {
+                let mut build = None;
+                let mut watch = None;
+                let mut fleet = Vec::new();
+                let mut destination = None;
+                let mut bins = BTreeMap::new();
+                let mut checkout = None;
+                let mut index = 1;
+                while index < args.len() {
+                    match args[index].as_str() {
+                        "--build" => {
+                            index += 1;
+                            build =
+                                Some(args.get(index).context("--build wants a command")?.clone());
+                        }
+                        "--watch" => {
+                            index += 1;
+                            watch =
+                                Some(args.get(index).context("--watch wants a package")?.clone());
+                        }
+                        "--fleet" => {
+                            index += 1;
+                            fleet = args
+                                .get(index)
+                                .context("--fleet wants comma-separated host names")?
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|host| !host.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                        }
+                        "--dest" | "--destination" => {
+                            index += 1;
+                            destination = Some(PathBuf::from(
+                                args.get(index).context("--dest wants a destination")?,
+                            ));
+                        }
+                        "--bin" => {
+                            index += 1;
+                            let value = args.get(index).context("--bin wants name=path")?;
+                            let (name, path) =
+                                value.split_once('=').context("--bin wants name=path")?;
+                            bins.insert(name.to_string(), PathBuf::from(path));
+                        }
+                        value if value.starts_with("--") => bail!("unknown dev option '{value}'"),
+                        value if checkout.is_none() => checkout = Some(PathBuf::from(value)),
+                        value => bail!("unexpected dev argument '{value}'"),
+                    }
+                    index += 1;
+                }
+                let checkout = checkout.context("dev wants a checkout path")?;
+                dev_checkout(&paths, &checkout, build, watch, bins, destination, &fleet).map(|_| ())
+            }
+            "rollback" => {
+                let name = args
+                    .get(1)
+                    .context("rollback wants a package (example: ynpm rollback ychrome)")?;
+                verb_rollback(&paths, name)
+            }
+            other => bail!(
+                "'{other}' is not an ynpm verb (install | list | check | doctor | sync | sync-fleet | self-update | export | import | import-yggterm | rollback | remove | prod | purge-legacy | dev)"
+            ),
         }
     })();
     match &result {
@@ -6866,6 +7574,7 @@ mod tests {
             };
             let state = State {
                 packages: BTreeMap::from([("yggterm".to_string(), package)]),
+                last_auto_sweep_ms: None,
             };
             self.paths().save_state(&state).unwrap();
         }
@@ -7149,7 +7858,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.url, "https://forgejo.example/releases/tool.tgz");
-        assert_eq!(source.sha256.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            source.sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert!(parse_tarball_source("tarball:file:///tool.tgz").is_err());
         assert!(parse_tarball_source("tarball:https://example.test/tool.tgz#sha256=bad").is_err());
     }
@@ -7276,10 +7988,7 @@ mod tests {
                     package_name: Some("@ygghq/ydesign-app".to_string()),
                     current: "0.1.1".to_string(),
                     versions: vec!["0.1.1".to_string()],
-                    bins: BTreeMap::from([(
-                        "ydesign".to_string(),
-                        "bin/ydesign".to_string(),
-                    )]),
+                    bins: BTreeMap::from([("ydesign".to_string(), "bin/ydesign".to_string())]),
                     external_prev: None,
                     destination: None,
                     dev: None,
@@ -7295,6 +8004,7 @@ mod tests {
                     }),
                 },
             )]),
+            last_auto_sweep_ms: None,
         };
         assert_eq!(
             package_name_for_app(&state, "ydesign").as_deref(),
@@ -7345,6 +8055,7 @@ mod tests {
                     },
                 ),
             ]),
+            last_auto_sweep_ms: None,
         };
         assert!(another_package_owns_app_name(&state, "ydesign", "ydesign"));
     }
@@ -7375,6 +8086,7 @@ mod tests {
                 ("new-cli".to_string(), ghost),
                 ("zeta__new-cli".to_string(), canonical),
             ]),
+            last_auto_sweep_ms: None,
         };
         assert_eq!(
             find_package_key(&state, "@zeta/new-cli"),
@@ -7401,6 +8113,7 @@ mod tests {
         };
         let state = State {
             packages: BTreeMap::from([("zcode-tui".to_string(), ghost)]),
+            last_auto_sweep_ms: None,
         };
         assert_eq!(
             find_package_key(&state, "@ygghq/zcode-tui"),
@@ -7428,6 +8141,7 @@ mod tests {
                 ("old".to_string(), package("@ygghq/old")),
                 ("new".to_string(), package("@ygghq/new")),
             ]),
+            last_auto_sweep_ms: None,
         };
         let paths = Paths::new("/home/user");
         assert!(another_package_owns_binary(
@@ -7541,8 +8255,8 @@ mod tests {
             .expect("incoming product");
         }
 
-        let replaced = activate_yggterm_generation(&staging, &final_dir, "")
-            .expect("same-version activation");
+        let replaced =
+            activate_yggterm_generation(&staging, &final_dir, "").expect("same-version activation");
         assert_eq!(replaced, 1);
         assert_eq!(
             fs::read_to_string(final_dir.join("yggterm")).expect("new product"),
@@ -7569,11 +8283,7 @@ mod tests {
         let old_generation = paths.generation_dir("vendor__tool", "0.5.7");
         fs::create_dir_all(old_generation.join("bin")).expect("npm generation");
         fs::write(old_generation.join("bin/tool"), "npm-bytes").expect("npm bin");
-        publish_link(
-            &old_generation.join("bin/tool"),
-            &cli_dir.join("tool"),
-        )
-        .expect("npm link");
+        publish_link(&old_generation.join("bin/tool"), &cli_dir.join("tool")).expect("npm link");
         (paths, cli_dir, dev_dir)
     }
 
@@ -7727,12 +8437,11 @@ mod tests {
         let new_gen = paths.generation_dir("vendor__tool", "2.0.19");
         write_versioned_bin(&old_gen.join("bin/tool"), "2.0.3");
         write_versioned_bin(&new_gen.join("bin/tool"), "2.0.19");
-        publish_link(&new_gen.join("bin/tool"), &destination.join("tool"))
-            .expect("managed link");
+        publish_link(&new_gen.join("bin/tool"), &destination.join("tool")).expect("managed link");
         let user_dir = home.join(".local/bin");
         fs::create_dir_all(&user_dir).expect("user dir");
         publish_link(&old_gen.join("bin/tool"), &user_dir.join("tool")).expect("stale link");
-                (paths, destination, user_dir.join("tool"))
+        (paths, destination, user_dir.join("tool"))
     }
 
     fn shadow_home(name: &str) -> PathBuf {
@@ -7762,13 +8471,7 @@ mod tests {
         let managed = destination.join("tool");
         let root = paths.root();
         assert!(matches!(
-            classify_path_shadow(
-                &stale,
-                &managed,
-                &root,
-                Some("2.0.3"),
-                Some("2.0.19")
-            ),
+            classify_path_shadow(&stale, &managed, &root, Some("2.0.3"), Some("2.0.19")),
             ShadowVerdict::OwnedStale
         ));
         let report = converge_path_shadow(&paths, "tool", &destination, true, Some(&stale))
@@ -8154,7 +8857,9 @@ fn skills_clip(text: &str, max: usize) -> String {
 
 fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     let Some(sub) = args.first() else {
-        bail!("skills needs a subcommand: scan | list [--json] | info <name> | register <name> --home PATH [--summary S] [--notes N] [--tag T] | install <name> | note <name> <text> | enable <name> | disable <name> | check");
+        bail!(
+            "skills needs a subcommand: scan | list [--json] | info <name> | register <name> --home PATH [--summary S] [--notes N] [--tag T] | install <name> | note <name> <text> | enable <name> | disable <name> | check"
+        );
     };
     let mut registry = load_skill_registry(paths);
     match sub.as_str() {
@@ -8193,9 +8898,7 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
         }
         "list" => {
             let as_json = args.iter().any(|a| a == "--json");
-            registry
-                .skills
-                .sort_by(|a, b| a.name.cmp(&b.name));
+            registry.skills.sort_by(|a, b| a.name.cmp(&b.name));
             if as_json {
                 println!(
                     "{}",
@@ -8233,14 +8936,14 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
             }
         }
         "info" => {
-            let name = args
-                .get(1)
-                .context("skills info needs a skill name")?;
+            let name = args.get(1).context("skills info needs a skill name")?;
             let record = registry
                 .skills
                 .iter()
                 .find(|s| &s.name == name)
-                .context(format!("skill `{name}` not registered; run `ynpm skills scan`"))?;
+                .context(format!(
+                    "skill `{name}` not registered; run `ynpm skills scan`"
+                ))?;
             println!("{}", serde_json::to_string_pretty(record)?);
         }
         "register" => {
@@ -8253,7 +8956,9 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
                     "--home" => home = iter.next().context("--home needs a value")?.clone(),
-                    "--summary" => summary = iter.next().context("--summary needs a value")?.clone(),
+                    "--summary" => {
+                        summary = iter.next().context("--summary needs a value")?.clone()
+                    }
                     "--notes" => notes = iter.next().context("--notes needs a value")?.clone(),
                     "--tag" => tags.push(iter.next().context("--tag needs a value")?.clone()),
                     other if name.is_none() => name = Some(other.to_string()),
@@ -8283,7 +8988,9 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
                 .iter()
                 .find(|s| &s.name == name)
                 .map(|s| PathBuf::from(&s.home))
-                .context(format!("skill `{name}` not registered; run `ynpm skills scan` or `skills register`"))?;
+                .context(format!(
+                    "skill `{name}` not registered; run `ynpm skills scan` or `skills register`"
+                ))?;
             let target = skills_root(paths).join(name);
             if target.exists() {
                 std::fs::remove_dir_all(&target)?;
@@ -8336,7 +9043,14 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
             registry.skills[index].disabled = sub == "disable";
             registry.skills[index].updated = today_stamp();
             save_skill_registry(paths, &registry)?;
-            println!("ynpm skills: {} {name}", if sub == "disable" { "disabled" } else { "enabled" });
+            println!(
+                "ynpm skills: {} {name}",
+                if sub == "disable" {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+            );
         }
         "check" => {
             let mut broken = 0usize;
@@ -8386,4 +9100,220 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod f9_retention_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    struct Sandbox {
+        home: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .expect("test home")
+                .join(".yggterm/scratchpad/ynpm")
+                .join(format!("f9-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&home);
+            fs::create_dir_all(&home).unwrap();
+            Self { home }
+        }
+        fn paths(&self) -> Paths {
+            Paths::new(self.home.clone())
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn age_path(path: &Path, ms_ago: u64) {
+        let stamp = SystemTime::now() - Duration::from_millis(ms_ago);
+        let times = std::fs::FileTimes::new().set_modified(stamp);
+        let marker = path.join("aged-marker");
+        fs::write(&marker, "x").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+
+    fn age_file(path: &Path, ms_ago: u64) {
+        let stamp = SystemTime::now() - Duration::from_millis(ms_ago);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+    }
+
+    fn package_fixture(current: &str) -> Package {
+        Package {
+            package_name: None,
+            current: current.to_string(),
+            versions: Vec::new(),
+            bins: BTreeMap::new(),
+            external_prev: None,
+            destination: None,
+            dev: None,
+            dev_generation: None,
+            channel: None,
+            source: None,
+            integration: None,
+        }
+    }
+
+    #[test]
+    fn scratch_sweep_defers_the_fresh_and_removes_the_stale() {
+        let sandbox = Sandbox::new("scratch-basic");
+        let paths = sandbox.paths();
+        let fresh = paths.scratch().join("npm-a-1.0-111");
+        let stale = paths.scratch().join("npm-a-0.9-222");
+        fs::create_dir_all(fresh.join("bin")).unwrap();
+        fs::create_dir_all(stale.join("bin")).unwrap();
+        fs::write(fresh.join("bin/tool"), "#!/bin/sh\n").unwrap();
+        fs::write(stale.join("bin/tool"), "#!/bin/sh\n").unwrap();
+        age_path(&stale, 3 * 60 * 60 * 1000);
+        let outcome = sweep_scratch(&paths, SWEEP_GRACE_MS, false, false);
+        assert!(fresh.is_dir(), "fresh staging sits inside the grace window");
+        assert!(!stale.exists(), "stale staging must be reclaimed");
+        assert!(
+            outcome
+                .removed
+                .iter()
+                .any(|path| path.contains("npm-a-0.9-222"))
+        );
+        assert!(
+            outcome
+                .deferred
+                .iter()
+                .any(|(path, _)| path.contains("npm-a-1.0-111"))
+        );
+    }
+
+    #[test]
+    fn generation_keep_set_holds_current_and_the_newest_two() {
+        let entries: Vec<String> = ["1.0.0", "1.1.0", "1.2.0", "dev-abc"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let mut package = package_fixture("1.2.0");
+        package.dev_generation = Some("dev-abc".to_string());
+        let keep_set = generation_keep_names(Some(&package), &entries, SWEEP_DEFAULT_KEEP);
+        assert!(keep_set.contains("1.2.0"), "current always survives");
+        assert!(keep_set.contains("1.1.0"), "newest-two depth survives");
+        assert!(
+            !keep_set.contains("1.0.0"),
+            "beyond newest-two is a candidate"
+        );
+        assert!(keep_set.contains("dev-abc"), "dev-pinned survives");
+        // A package ynpm never knew (state wiped) keeps the newest two only.
+        let orphan = generation_keep_names(None, &entries, SWEEP_DEFAULT_KEEP);
+        assert!(orphan.contains("1.2.0") && orphan.contains("1.1.0"));
+        assert!(!orphan.contains("1.0.0") && !orphan.contains("dev-abc"));
+    }
+
+    #[test]
+    fn a_linked_generation_is_deferred_and_an_unlinked_one_is_reclaimed() {
+        let sandbox = Sandbox::new("generations-link");
+        let paths = sandbox.paths();
+        let key_dir = paths.generations().join("tool");
+        let newest = key_dir.join("0.1.0");
+        let linked = key_dir.join("0.0.9");
+        let free = key_dir.join("0.0.8");
+        for dir in [&newest, &linked, &free] {
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("bin/ytool"), "#!/bin/sh\n").unwrap();
+            age_path(dir, 3 * 60 * 60 * 1000);
+        }
+        fs::create_dir_all(paths.root().join("bin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(linked.join("bin/ytool"), paths.root().join("bin/ytool"))
+            .unwrap();
+        let outcome = sweep_generations(&paths, 1, SWEEP_GRACE_MS, false, false).unwrap();
+        assert!(newest.is_dir(), "keep=1 holds the newest version");
+        assert!(linked.is_dir(), "the linked generation is deferred");
+        assert!(!free.exists(), "the unlinked old generation is reclaimed");
+        assert!(
+            outcome
+                .deferred
+                .iter()
+                .any(|(path, reason)| path.contains("0.0.9") && reason == "referenced")
+        );
+    }
+
+    #[test]
+    fn dry_run_reports_reclaim_without_deleting() {
+        let sandbox = Sandbox::new("scratch-dry");
+        let paths = sandbox.paths();
+        let stale = paths.scratch().join("npm-a-1.0-333");
+        fs::create_dir_all(stale.join("bin")).unwrap();
+        fs::write(stale.join("bin/tool"), "#!/bin/sh\n").unwrap();
+        age_path(&stale, 3 * 60 * 60 * 1000);
+        let outcome = sweep_scratch(&paths, SWEEP_GRACE_MS, true, false);
+        assert!(stale.is_dir(), "a dry run deletes nothing");
+        assert!(outcome.removed.iter().any(|path| path.contains("(dry)")));
+        assert!(outcome.reclaimed_bytes > 0);
+    }
+
+    #[test]
+    fn cache_cap_evicts_oldest_modified_first() {
+        let sandbox = Sandbox::new("cache-cap");
+        let paths = sandbox.paths();
+        let content = paths.cache().join("_cacache/content-v2/sha512/ab");
+        fs::create_dir_all(&content).unwrap();
+        let oldest = content.join("aaa");
+        let middle = content.join("bbb");
+        let fresh = content.join("ccc");
+        for (path, size) in [(&oldest, 100u64), (&middle, 100), (&fresh, 100)] {
+            fs::write(path, vec![b'x'; size as usize]).unwrap();
+        }
+        age_file(&oldest, 3 * 60 * 60 * 1000);
+        age_file(&middle, 2 * 60 * 60 * 1000);
+        let outcome = sweep_cache(&paths.cache(), 250, false).unwrap();
+        assert!(!oldest.exists(), "the oldest-modified content evicts first");
+        assert!(middle.exists(), "eviction stops once under the cap");
+        assert!(fresh.exists(), "fresh content is never the first evicted");
+        assert_eq!(outcome.reclaimed_bytes, 100);
+    }
+
+    #[test]
+    fn filesystem_free_reports_both_resources() {
+        let (bytes, inodes) = filesystem_free(Path::new("/tmp")).unwrap();
+        assert!(bytes > 0, "df -k must yield free bytes");
+        assert!(inodes > 0, "df -i must yield free inodes");
+    }
+
+    #[test]
+    fn auto_sweep_throttles_on_the_stamp() {
+        let sandbox = Sandbox::new("auto-throttle");
+        let paths = sandbox.paths();
+        let mut state = State::default();
+        assert!(
+            auto_sweep_if_due(&paths, &mut state).is_some(),
+            "a fresh state runs the first pass"
+        );
+        assert!(state.last_auto_sweep_ms.is_some());
+        let stamp = state.last_auto_sweep_ms;
+        assert!(
+            auto_sweep_if_due(&paths, &mut state).is_none(),
+            "the second pass inside the interval is throttled"
+        );
+        assert_eq!(state.last_auto_sweep_ms, stamp, "the stamp is unchanged");
+    }
 }
