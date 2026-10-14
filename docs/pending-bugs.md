@@ -6786,7 +6786,8 @@ coming.
 
 ## ⛔ [11.25] THE ALL-CLI GREETING RUN HAS NOT BEEN TAKEN
 
-**Status:** DECIDED (owner, 2026-10-15 gate sweep, settled-calls.md): TAKE IT in a
+**Status:** OPEN
+**Decided (owner, 2026-10-15 gate sweep, settled-calls.md):** TAKE IT in a
 sandbox home against a headless daemon, scoped to CLIs with a working backend;
 live-client rows NOT required. CLI-auth ruling of the same sweep: opencode needs
 no sign-in, agy rides ygg-auth from jojo/dev/oc, qwen-code stays unsigned-in.
@@ -11935,7 +11936,8 @@ row reads as more broken than it is.
 
 ## ⛔⛔ [6.2] THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL
 
-**Status:** DECIDED — REVERSED (owner, 2026-10-15 gate sweep, settled-calls.md): **REPAIR AND ENFORCE.** Supersedes the 2026-08-20 "retire the tier" ruling by the owner's explicit word. The product promise ("dies with the GUI") gets kept; rows that survive today start dying with the GUI. Unit shape: repair first (make the shutdown path run and be OBSERVABLE — nine traced launches shed zero events from any step), with the departure ledger watching the transition, then enforce the tier.
+**Status:** OPEN
+**Decided — REVERSED (owner, 2026-10-15 gate sweep, settled-calls.md):** **REPAIR AND ENFORCE.** Supersedes the 2026-08-20 "retire the tier" ruling by the owner's explicit word. The product promise ("dies with the GUI") gets kept; rows that survive today start dying with the GUI. Unit shape: repair first (make the shutdown path run and be OBSERVABLE — nine traced launches shed zero events from any step), with the departure ledger watching the transition, then enforce the tier.
 
 **Who decides:** the owner, or 6.0 on his behalf. Repairing this would START
 destroying rows that survive today — see "why this is a decision" below.
