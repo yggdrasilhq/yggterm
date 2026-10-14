@@ -15000,12 +15000,16 @@ impl DaemonRuntime {
                 // proxying path above — locality preserved, deferral bounded).
                 let mut sessions = Vec::new();
                 // Own the paths up front: the per-row calls below take &mut self.
-                let session_paths: Vec<String> = self
-                    .server
-                    .live_session_views()
-                    .into_iter()
-                    .map(|view| view.session_path.clone())
-                    .collect();
+                // [s43] EVERY known session answers — not only live-runtime
+                // ones. The live-views-only iteration omitted restored
+                // sessions whose runtime had not respawned, and the client
+                // read the omission as a LOCAL absence for surfaces this
+                // daemon's own ledger still held (measured live 2026-10-14:
+                // daemon_declare_absent at boot for a row the single ask
+                // served correctly one second later). The preserved-owner
+                // branch stays ahead of the fallback so those entries still
+                // request an owner-proxied single answer.
+                let session_paths: Vec<String> = self.server.all_session_paths();
                 for session_path in session_paths {
                     let runtime_path = self.terminal_runtime_key_for_path(&session_path);
                     if self.preserved_owner_endpoint_for_request(&runtime_path).is_some() {
@@ -15017,19 +15021,23 @@ impl DaemonRuntime {
                         });
                         continue;
                     }
-                    // [11.80] same live-first / snapshot-fallback split as
-                    // the single-row arm above.
-                    let records = match self.terminals.session_app_declares(&runtime_path) {
-                        Some(records) => {
-                            self.server
-                                .record_last_known_app_declares(
-                                    &runtime_path,
-                                    records.clone(),
-                                );
-                            records
+                    // [11.80] live-first / snapshot-fallback with the s43
+                    // silence law — one decision shared with the single-row
+                    // arm (see app_declare_live_answer); a real change to
+                    // the ledger defers a persist (sol s43 Q1).
+                    let (records, to_record) = app_declare_live_answer(
+                        self.terminals
+                            .session_app_declare_observation(&runtime_path),
+                        self.server.last_known_app_declares(&runtime_path),
+                    );
+                    if let Some(records) = to_record {
+                        if self
+                            .server
+                            .record_last_known_app_declares(&runtime_path, records)
+                        {
+                            self.defer_persist();
                         }
-                        None => self.server.last_known_app_declares(&runtime_path),
-                    };
+                    }
                     sessions.push(TerminalAppDeclareSession {
                         records,
                         running: self.terminals.session_is_running(&runtime_path),
@@ -15053,14 +15061,24 @@ impl DaemonRuntime {
                             // truth for this daemon: record it, so losing
                             // the live session WITHIN this daemon incarnation
                             // keeps the row surfaces answerable even after
-                            // the owner is gone (the map is per-incarnation
-                            // memory — it does not survive a daemon restart,
-                            // sol s42 round-2 R3).
-                            if !records.is_empty() {
-                                self.server.record_last_known_app_declares(
+                            // the owner is gone. s43 (sol Q5): the record is
+                            // AUTHORITY-AWARE — an owner Authoritative EMPTY
+                            // is the app's Clear through the owner and
+                            // erases the cached copy; a legacy (None) or
+                            // no_local_authority owner keeps the non-empty-
+                            // only belt, because an unwitnessable empty must
+                            // never erase. Persisted entries survive daemon
+                            // restarts via the state doc (see the ledger
+                            // accessor's doc).
+                            let owner_witnesses_clear = owner_authority
+                                == Some(TerminalAppDeclareAuthority::Authoritative);
+                            if !records.is_empty() || owner_witnesses_clear {
+                                if self.server.record_last_known_app_declares(
                                     &runtime_path,
                                     records.clone(),
-                                );
+                                ) {
+                                    self.defer_persist();
+                                }
                             }
                             // [F2] The proxy PRESERVES the owner's verdict
                             // verbatim (sol s42 Q2): a stale registry record
@@ -15085,18 +15103,24 @@ impl DaemonRuntime {
                         }
                     }
                 }
-                // [11.80] Live truth first (and it refreshes the snapshot —
-                // empty clears it, so an app's Clear propagates); the
-                // last-known snapshot answers only when the runtime is gone.
-                let live_records = self.terminals.session_app_declares(&runtime_path);
-                let records = match &live_records {
-                    Some(records) => {
-                        self.server
-                            .record_last_known_app_declares(&runtime_path, records.clone());
-                        records.clone()
+                // [11.80] Live truth first — with the s43 silence law: a
+                // runtime that has never spoken serves the snapshot instead
+                // of its own pre-declare silence (and erases nothing), while
+                // a real answer (records, or an earned Clear) refreshes the
+                // ledger and defers a persist when it changed (sol s43 Q1).
+                let (records, to_record) = app_declare_live_answer(
+                    self.terminals
+                        .session_app_declare_observation(&runtime_path),
+                    self.server.last_known_app_declares(&runtime_path),
+                );
+                if let Some(records) = to_record {
+                    if self
+                        .server
+                        .record_last_known_app_declares(&runtime_path, records)
+                    {
+                        self.defer_persist();
                     }
-                    None => self.server.last_known_app_declares(&runtime_path),
-                };
+                }
                 // [F2] The single-ask authority verdict (sol s42 Q2): the answer
                 // must say WHERE its right to witness absence came from. An
                 // empty answer for a remote-keyed path this daemon neither
@@ -20359,6 +20383,14 @@ fn spawn_deferred_persist_flusher(
             continue;
         }
         let mut guard = lock_daemon_runtime(&runtime, "deferred_persist_flush");
+        // s43 (sol Q1): a muted persist writes NOTHING and returns Ok —
+        // landing with the flag already swapped would drop the pending
+        // write for good while tracing deferred_flush_landed. Re-arm and
+        // let a later tick try again.
+        if guard.routine_persist_muted() {
+            guard.defer_persist();
+            continue;
+        }
         if let Err(error) = guard.persist() {
             tracing::warn!(%error, "deferred persist flush failed");
             // The swap already retired the deferral — re-arm so the next
@@ -24651,6 +24683,31 @@ pub fn session_path_is_remote_keyed(session_path: &str) -> bool {
 /// a fresh incarnation's transport-held ledger declaring a painted remote
 /// row absent while the machine actually holding the process answered
 /// no_local_authority on the same wire (sol s42 round-2 R1).
+
+/// The [11.80] declare-answer law, as ONE pure decision (sol s43 Q3): given
+/// the live runtime's three-state observation and the last-known ledger,
+/// return (the answer to serve, what to store into the ledger). A runtime
+/// that has never spoken — or no runtime at all — SERVES the ledger and
+/// keeps it: pre-declare silence is not the app's Clear, and a restored
+/// snapshot must survive a resumed runtime's quiet. A real answer (records,
+/// or an earned Clear) serves live truth and refreshes the ledger.
+pub(crate) fn app_declare_live_answer(
+    observation: Option<crate::app_declare::AppDeclareObservation>,
+    last_known: Vec<crate::app_declare::AppDeclareRecord>,
+) -> (
+    Vec<crate::app_declare::AppDeclareRecord>,
+    Option<Vec<crate::app_declare::AppDeclareRecord>>,
+) {
+    match observation {
+        None | Some(crate::app_declare::AppDeclareObservation::Silent) => (last_known, None),
+        Some(crate::app_declare::AppDeclareObservation::Declared(records)) => {
+            let to_record = records.clone();
+            (records, Some(to_record))
+        }
+        Some(crate::app_declare::AppDeclareObservation::Cleared) => (Vec::new(), Some(Vec::new())),
+    }
+}
+
 pub fn terminal_app_declares_authority(
     records_non_empty: bool,
     remote_keyed: bool,
@@ -33834,6 +33891,127 @@ mod tests {
     /// `fn` at the same indentation. The residual seam for wiring a test
     /// cannot call (field guide §7.1) — used only where the alternative is a
     /// live `DaemonRuntime`.
+    /// sol s43 Q3: the ONE answer law. Silence (and no runtime) serves the
+    /// ledger and keeps it; a real answer serves live truth and refreshes;
+    /// an earned Clear serves empty and erases.
+    #[test]
+    fn the_declare_answer_serves_the_ledger_on_silence_and_absence() {
+        use super::app_declare_live_answer;
+        fn record(seq: u64) -> crate::app_declare::AppDeclareRecord {
+            crate::app_declare::AppDeclareRecord {
+                verb: "sidebar".to_string(),
+                action: "declare".to_string(),
+                payload: serde_json::json!({}),
+                at_ms: 0,
+                seq,
+            }
+        }
+        let remembered = vec![record(1)];
+        // No runtime at all: serve the snapshot, store nothing.
+        let (answer, to_record) = app_declare_live_answer(None, remembered.clone());
+        assert_eq!(answer, remembered);
+        assert_eq!(to_record, None);
+        // Pre-first-declare silence: serve the snapshot, store nothing —
+        // this is the arm that used to answer Some(empty) and erase.
+        let (answer, to_record) =
+            app_declare_live_answer(Some(crate::app_declare::AppDeclareObservation::Silent), remembered.clone());
+        assert_eq!(answer, remembered);
+        assert_eq!(to_record, None);
+        // A real answer refreshes (store = the live records).
+        let live = vec![record(2)];
+        let (answer, to_record) = app_declare_live_answer(
+            Some(crate::app_declare::AppDeclareObservation::Declared(live.clone())),
+            remembered.clone(),
+        );
+        assert_eq!(answer, live);
+        assert_eq!(to_record, Some(live));
+        // An earned Clear serves empty and erases (store = empty).
+        let (answer, to_record) = app_declare_live_answer(
+            Some(crate::app_declare::AppDeclareObservation::Cleared),
+            remembered,
+        );
+        assert!(answer.is_empty());
+        assert_eq!(to_record, Some(Vec::new()));
+    }
+
+    /// sol s43 Q1: the deferred flusher must RE-ARM a muted persist instead
+    /// of dropping the pending write (the flag is already swapped when the
+    /// mute gate is reached — without the re-arm the write is lost while
+    /// deferred_flush_landed is traced).
+    #[test]
+    fn the_deferred_flusher_re_arms_a_muted_persist_instead_of_dropping_it() {
+        let source = include_str!("daemon.rs");
+        let body = daemon_fn_body(source, "fn spawn_deferred_persist_flusher(");
+        let mute = body.find("routine_persist_muted()").expect("mute gate present");
+        let re_arm = body.find("guard.defer_persist()").expect("re-arm present");
+        let persist = body.find("guard.persist()").expect("persist call present");
+        assert!(
+            mute < re_arm && re_arm < persist,
+            "the re-arm must sit between the mute gate and the persist call"
+        );
+    }
+
+    /// s43: the app-declares batch answers EVERY known session — the
+    /// live-views-only iteration omitted restored runtime-less rows and the
+    /// client read the omission as a local absence (measured live
+    /// 2026-10-14). Locked at the arm's source: it enumerates through
+    /// all_session_paths and never through live_session_views.
+    #[test]
+    fn the_app_declares_batch_enumerates_all_known_sessions_not_live_only() {
+        let source = include_str!("daemon.rs");
+        let arm_start = source
+            .find("ServerRequest::TerminalAppDeclaresAll {} => {")
+            .expect("the batch handler arm exists");
+        let arm_end = source[arm_start..]
+            .find("ServerRequest::TerminalAppDeclares { path } => {")
+            .expect("the single-row arm follows");
+        let arm = &source[arm_start..arm_start + arm_end];
+        assert!(
+            arm.contains("all_session_paths()"),
+            "the batch must enumerate all known sessions"
+        );
+        assert!(
+            !arm.contains("live_session_views()"),
+            "the live-views-only iteration is the measured defect"
+        );
+        assert!(
+            arm.contains("app_declare_live_answer("),
+            "the batch must classify through the shared silence law"
+        );
+    }
+
+    /// s43: the single-row arm classifies through the same law (the old
+    /// bare Some(empty)-erases read is the silence-erasure defect).
+    #[test]
+    fn the_single_declare_ask_classifies_through_the_shared_silence_law() {
+        let source = include_str!("daemon.rs");
+        let arm_start = source
+            .find("ServerRequest::TerminalAppDeclares { path } => {")
+            .expect("the single-row arm exists");
+        let authority_at = source[arm_start..]
+            .find("let authority = terminal_app_declares_authority(")
+            .expect("the verdict computation follows the records read");
+        let arm = &source[arm_start..arm_start + authority_at];
+        assert!(arm.contains("app_declare_live_answer("));
+        assert!(!arm.contains("session_app_declares(&runtime_path)"));
+    }
+
+    /// s43 (sol Q5): the owner proxy records AUTHORITY-AWARE — only an
+    /// explicit Authoritative owner verdict may record an EMPTY answer
+    /// (the app's Clear through the owner); legacy/no_local_authority
+    /// empties keep the non-empty-only belt.
+    #[test]
+    fn the_owner_proxy_records_an_empty_only_under_an_authoritative_verdict() {
+        let source = include_str!("daemon.rs");
+        let at = source
+            .find("the owner answer is also LAST-KNOWN")
+            .expect("the proxy record site exists");
+        let body = &source[at..at + 2400];
+        assert!(body.contains("owner_witnesses_clear"));
+        assert!(body.contains("TerminalAppDeclareAuthority::Authoritative"));
+        assert!(body.contains("!records.is_empty() || owner_witnesses_clear"));
+    }
+
     pub(crate) fn daemon_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
         source
             .split(signature)

@@ -1762,6 +1762,18 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.app_declares())
     }
 
+    /// The s43 three-state declare observation, or None when no runtime
+    /// holds the key. The ask arms classify on THIS, never on a bare empty
+    /// records vector — silence and Clear demand opposite ledger treatment.
+    pub fn session_app_declare_observation(
+        &self,
+        key: &str,
+    ) -> Option<crate::app_declare::AppDeclareObservation> {
+        self.sessions
+            .get(key)
+            .map(|session| session.app_declare_observation())
+    }
+
     pub fn session_keys(&self) -> Vec<String> {
         let mut keys = self
             .sessions
@@ -3807,6 +3819,15 @@ impl PtySessionRuntime {
             .lock()
             .map(|log| log.records())
             .unwrap_or_default()
+    }
+
+    /// The s43 three-state read of this session's declare log (a poisoned
+    /// log lock reads as silence — the ledger keeps serving).
+    fn app_declare_observation(&self) -> crate::app_declare::AppDeclareObservation {
+        self.app_declares
+            .lock()
+            .map(|log| log.observation())
+            .unwrap_or(crate::app_declare::AppDeclareObservation::Silent)
     }
 
     fn matches_spec(&self, launch_command: &str, cwd: Option<&str>) -> bool {

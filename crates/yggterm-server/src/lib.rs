@@ -6165,29 +6165,46 @@ impl YggtermServer {
         self.session_pty_grids.get(key).copied()
     }
 
-    /// [11.80] Refresh the last-known declares for ONE row. Empty records are
-    /// the app's Clear (or a live runtime reporting nothing yet): they erase
-    /// the snapshot, because a live answer always outranks a remembered one.
+    /// [11.80] Refresh the last-known declares for ONE row. Returns whether
+    /// the snapshot CHANGED, so a caller defers a persist only on a real
+    /// mutation (sol s43 Q1). An empty `records` vec erases — and erasing an
+    /// absent key is a no-op, not a change. WHO may pass an empty vec is the
+    /// CALLER's law (see `app_declare_live_answer` in daemon.rs): a fresh
+    /// runtime's pre-declare silence is not a Clear and must never reach
+    /// here as one.
     pub fn record_last_known_app_declares(
         &mut self,
         key: &str,
         records: Vec<crate::app_declare::AppDeclareRecord>,
-    ) {
+    ) -> bool {
         if records.is_empty() {
-            self.last_known_app_declares.remove(key);
+            self.last_known_app_declares.remove(key).is_some()
         } else {
-            self.last_known_app_declares
-                .insert(key.to_string(), records);
+            let changed = self
+                .last_known_app_declares
+                .get(key)
+                .is_none_or(|existing| existing.as_slice() != records.as_slice());
+            if changed {
+                self.last_known_app_declares
+                    .insert(key.to_string(), records);
+            }
+            changed
         }
     }
 
-    /// [11.80] The snapshot to answer when the terminal runtime is gone:
-    /// the surfaces the row last declared, so the metadata rail keeps them
-    /// until the app re-declares for real. This survives the loss of the
-    /// live session WITHIN one daemon incarnation (and any GUI restart —
-    /// the daemon outlives the GUI); it does NOT survive a daemon restart
-    /// and is not transferred to a successor (in-memory by design; the
-    /// persistence residue is filed separately, sol s42 round-2 R3).
+    /// [11.80] The snapshot to answer when the terminal runtime is gone or
+    /// has never spoken: the surfaces the row last declared, so the metadata
+    /// rail keeps them until the app re-declares for real. Survives the loss
+    /// of the live session WITHIN one daemon incarnation (and any GUI
+    /// restart — the daemon outlives the GUI), AND daemon restarts for
+    /// session keys the daemon still knows: the entries ride the state doc
+    /// (`PersistedDaemonState::last_known_app_declares`, flushed by the
+    /// routine/deferred persists — record sites now defer on real changes,
+    /// sol s43 Q1) and are restored at boot. Measured live 2026-10-14 on
+    /// the dev-local harness (stop/start restores an earlier snapshot; the
+    /// old "in-memory by design" claim here was WRONG, sol s43 Q4). The
+    /// update-restart successor handover is a separate, still-unverified
+    /// path.
     pub fn last_known_app_declares(
         &self,
         key: &str,
@@ -8247,6 +8264,16 @@ impl YggtermServer {
                     .filter(|session| managed_session_is_live_runtime_session(key, session))
             })
             .collect()
+    }
+
+    /// Every session path this daemon knows — stored AND live-runtime — in
+    /// the canonical spellings clients address rows by. The app-declares
+    /// batch answers all of them: a restored session whose runtime has not
+    /// respawned is exactly the one whose last-known ledger must reach the
+    /// client's restore batch (s43; the live-only iteration declared false
+    /// local absences for those rows).
+    pub fn all_session_paths(&self) -> Vec<String> {
+        self.sessions.keys().cloned().collect()
     }
 
     /// Fast-path update from the WorkingFlags poll: patch ONLY the `working`
@@ -51580,6 +51607,29 @@ terminal_window_id: None,
     /// row present in the file and absent from the wire reads to a successor as
     /// *"this peer holds no such row"*, which is how rows get dropped at a
     /// handover. Divergence must fail here, not in production.
+    /// sol s43 Q1: the ledger record reports REAL changes only, so callers
+    /// defer a persist on mutations and stay silent on identical refreshes.
+    #[test]
+    fn record_last_known_app_declares_reports_real_changes_only() {
+        let mut server = YggtermServer::new(
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let record = |seq: u64| crate::app_declare::AppDeclareRecord {
+            verb: "sidebar".to_string(),
+            action: "declare".to_string(),
+            payload: serde_json::json!({"panes": []}),
+            at_ms: 0,
+            seq,
+        };
+        assert!(server.record_last_known_app_declares("k", vec![record(1)]));
+        assert!(!server.record_last_known_app_declares("k", vec![record(1)]));
+        assert!(server.record_last_known_app_declares("k", vec![record(2)]));
+        assert!(server.record_last_known_app_declares("k", Vec::new()));
+        assert!(!server.record_last_known_app_declares("k", Vec::new()));
+    }
+
     #[test]
     fn the_cheap_live_session_path_reports_exactly_what_the_full_persist_does() {
         let mut server = YggtermServer::new(

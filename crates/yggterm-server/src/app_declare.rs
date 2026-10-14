@@ -360,7 +360,27 @@ pub fn rewrite_consumed_web_surface_opens(stream: &str) -> Option<(String, usize
 #[derive(Debug, Default)]
 pub struct AppDeclareLog {
     seq: u64,
+    /// The app has SPOKEN this incarnation — a Store or a Clear, either one.
+    /// Kept separate from `seq` because a Clear can be the very first thing a
+    /// freshly-resumed runtime's app does (sol s43 Q3): silence and Clear
+    /// must never be conflated (silence serves and keeps the last-known
+    /// ledger; Clear serves empty and erases it).
+    spoke: bool,
     latest: BTreeMap<String, AppDeclareRecord>,
+}
+
+/// What a session's app has said through OSC 7717 this incarnation — the
+/// three states the declare-answer law needs (sol s43 Q3). NOT a records
+/// vector alone: an empty vector is ambiguous between "never spoke" and
+/// "spoke and cleared", and the two demand opposite ledger treatment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppDeclareObservation {
+    /// The app has neither declared nor cleared: pre-first-declare silence.
+    Silent,
+    /// The app currently stands behind these records.
+    Declared(Vec<AppDeclareRecord>),
+    /// The app spoke and its last word removed everything it had declared.
+    Cleared,
 }
 
 impl AppDeclareLog {
@@ -372,6 +392,7 @@ impl AppDeclareLog {
         match retention_for(&message.verb, &message.action) {
             Retention::Store => {
                 self.seq += 1;
+                self.spoke = true;
                 let seq = self.seq;
                 self.latest.insert(
                     message.verb.clone(),
@@ -385,6 +406,7 @@ impl AppDeclareLog {
                 );
             }
             Retention::Clear => {
+                self.spoke = true;
                 self.latest.remove(&message.verb);
             }
             Retention::Ignore => {}
@@ -393,6 +415,19 @@ impl AppDeclareLog {
 
     pub fn records(&self) -> Vec<AppDeclareRecord> {
         self.latest.values().cloned().collect()
+    }
+
+    /// The s43 three-state read of this incarnation's log.
+    pub fn observation(&self) -> AppDeclareObservation {
+        if self.latest.is_empty() {
+            if self.spoke {
+                AppDeclareObservation::Cleared
+            } else {
+                AppDeclareObservation::Silent
+            }
+        } else {
+            AppDeclareObservation::Declared(self.records())
+        }
     }
 }
 
@@ -741,6 +776,86 @@ impl OscWitness {
 
 #[cfg(test)]
 mod tests {
+
+    /// sol s43 Q3: the three-state observation. Silence and Clear must never
+    /// be conflated — a Clear can be the FIRST thing a resumed runtime's app
+    /// does, and only a spoken app's emptiness may erase the last-known
+    /// ledger.
+    #[test]
+    fn the_declare_log_classifies_silence_declared_and_earned_clear() {
+        let mut log = AppDeclareLog::new();
+        assert_eq!(log.observation(), AppDeclareObservation::Silent);
+        // A Clear as the app's FIRST operation is spoken, not silent.
+        log.ingest(
+            AppDeclareMessage {
+                verb: "web-surface".to_string(),
+                action: "close".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            0,
+        );
+        assert_eq!(log.observation(), AppDeclareObservation::Cleared);
+        // A declare flips to Declared; a later close of everything is Cleared.
+        log.ingest(
+            AppDeclareMessage {
+                verb: "sidebar".to_string(),
+                action: "declare".to_string(),
+                payload: serde_json::json!({}),
+            },
+            1,
+        );
+        match log.observation() {
+            AppDeclareObservation::Declared(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].verb, "sidebar");
+            }
+            other => panic!("expected Declared, got {other:?}"),
+        }
+        log.ingest(
+            AppDeclareMessage {
+                verb: "sidebar".to_string(),
+                action: "close".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            2,
+        );
+        // [11.186] a sidebar close is RETAINED, not cleared — the retained
+        // close IS the retirement the client acts on, so the observation
+        // stays Declared with the close as its record.
+        match log.observation() {
+            AppDeclareObservation::Declared(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].verb, "sidebar");
+                assert_eq!(records[0].action, "close");
+            }
+            other => panic!("expected the retained close, got {other:?}"),
+        }
+        // The full-Clear path on a fresh log (a retained sidebar close can
+        // never be un-stored — [11.186]): declare then close empties the
+        // log while the app has spoken — Cleared, the erasing state.
+        let mut log = AppDeclareLog::new();
+        log.ingest(
+            AppDeclareMessage {
+                verb: "web-surface".to_string(),
+                action: "open".to_string(),
+                payload: serde_json::json!({"url": "x"}),
+            },
+            3,
+        );
+        assert!(matches!(
+            log.observation(),
+            AppDeclareObservation::Declared(_)
+        ));
+        log.ingest(
+            AppDeclareMessage {
+                verb: "web-surface".to_string(),
+                action: "close".to_string(),
+                payload: serde_json::Value::Null,
+            },
+            4,
+        );
+        assert_eq!(log.observation(), AppDeclareObservation::Cleared);
+    }
 
     /// THE DRIFT LOCK: the wire's verbatim string table and the core enum
     /// must name the same five phases in the same order, forever. The parse
