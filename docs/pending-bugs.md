@@ -1266,9 +1266,15 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (agent-screen-snapshot verb, three-valued) instead of trusting a local
   daemon's ("",0) — [11.32]'s entry carries the full record + falsifier.
   REMAINDERS: presence/liveness gate (sol s36 Q4 DEFER — the declare_absent
-  witness inspection; unavailable must SUPPRESS an absence declaration),
-  the [11.229] absent-declaration sub-item, the live rig + dev-local GUI
-  harness (the falsifier's dependency), and the enum-variant upgrade
+  witness inspection; unavailable must SUPPRESS an absence declaration —
+  REPRODUCED LIVE s38 on the harness: after a daemon restart the fresh
+  daemon declares the LIVE remote-agy row absent every ~5s,
+  `daemon_declare_absent via:batch` 6+ times in 45s while the row is painted
+  and running:true on oc — the absence declaration is a lie exactly as the
+  witness inspection predicted), the [11.229] absent-declaration sub-item,
+  the live rig (the dev-local GUI harness is BUILT — `tools/e2e/
+  gui-harness.sh`, s38; [11.32]'s live proof delivered on it), and the
+  enum-variant upgrade
   (additive fields → the full Absent/Unavailable/valid-empty vocabulary)
   when a second consumer needs it. MEMBERS: [11.32], the [11.229]
   absent-declaration sub-item.
@@ -4294,6 +4300,42 @@ empty ladder; `definitive_empty` must leave no resume warning. Owed on
 the dev-local GUI harness (§INFRA sanctions it; filed as its own infra
 line — it also unblocks the (c) live-proof lane). Suites + deploy +
 read-back owed on the lane's landing.
+
+**LIVE PROOF, FIRST SLICE — 2026-10-14 ~09:0x-09:4x IST (sitting 38, the
+dev-local GUI harness now BUILT: `tools/e2e/gui-harness.sh`; deployed build
+ac8cf161fb9f, exe-proof md5 8bce4780):** on the harness, a REAL remote-agy row
+(session `ecdfd72b…` on oc, spawned by the open's ensure over the OwnerProxy
+ssh hop): (1) THE PRIMARY BAR — PAINT WITHOUT THE EMPTY LADDER — PROVEN on the
+cold resume (full GUI+daemon restart, fresh in-memory daemon):
+`retained_rehydrate_begin(initial-read)` → `retained_rehydrate_end bytes:570
+lines:2 source:daemon_terminal_read` — the F2 authority gate PROXIED to oc, no
+authoritative-looking empty — → `js_ready` → `attach_ready`, and `server
+screen` reads the owning host's real PTY frame (the agy workspace-trust gate)
+on the harness GUI. ZERO 2.5s/5s retries, zero `stuck_unrestorable`, zero
+resume warnings. (2) THE ASK CONTRACT through the same harness daemon:
+`server remote agent-screen-snapshot remote-agy://oc/ecdfd72b…` →
+`{"kind":"definitive_screen", text:<full rendered frame>, output_seq:2,
+running:true, runtime_spawn_id:…}`; the `local://` key form correctly answers
+`unknown/no_local_owner`. (3) MEASURED, WHY THE CLIENT ASK ARM STAYS SILENT AT
+3.2.119-BOTH-ENDS: the ask fires only on a local-empty, and the daemon's
+authority gate (OwnerProxy) answers non-empty first in every natural case
+(fresh mount, daemon-only restart, full restart) — the ask arm is the
+old-daemon/unresolvable-owner fallback, capability-gated, armed by design, NOT
+a dead path. HONEST REMAINDER: the ask leg's natural-fire proof
+(`ask_begin → hit` in the CLIENT trace) needs an owner host whose daemon
+predates the authority gate (or fault injection); the s37 daemon-plane proof +
+the harness contract probe above stand in until then. RIG LAWS BANKED: (a) the
+`server app open` settle window (~2.6s) is SHORTER than a cold remote ensure
+(ssh+spawn, ~8-14s) — the verb times out while the open completes async; read
+`open_row_outcome` in the trace, never the verb's timeout. (b) A falsifier's
+agy session must live under a NON-ephemeral cwd — the durable-sessions
+scanner hides conversations whose workspace root is ephemeral scratch
+(`antigravity_row_is_durable`; /tmp cwds are invisible to the open guard's
+scan). (c) A fresh YGGTERM_HOME must be seeded with the machine records
+(ssh_targets+remote_machines) AND a minimal-valid state doc
+(stored_sessions/live_sessions are the only PersistedDaemonState fields
+without serde defaults) or the daemon exit-1 crash-loops under its GUI
+supervisor (~15s respawn cadence, `spawned_daemon_exit exit status: 1`).
 
 ## ⛔ [CLI] OPENCODE2 SELF-MINTS `ses_…` IDS — THE STORE PROBE CANNOT SEE YGGTERM ROWS (identity rebind owed)
 
