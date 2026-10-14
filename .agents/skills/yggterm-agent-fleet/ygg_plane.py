@@ -56,10 +56,19 @@ def local_binary():
     it — documented in `docs/agent-control-plane.md` after it cost several lanes
     their ability to live-verify at all. ⇒ Validated here, with the install as the
     fallback, so the export is used when it is true and ignored when it is stale.
+
+    ⛔ **THE AIM OUTRANKS THE EXPORT.** `$YGG_HEADLESS_BIN` is the explicit aim
+    (`ygg_appctl`'s convention, and the sandbox battery's variable): a verb run
+    under it must call THROUGH it, or the aim silently degrades to the
+    production install and every rehearsal measures code nobody shipped.
+    Measured 2026-10-14: the battery's ygg-deliver ran the production binary
+    with the sandbox home and made ZERO calls through the aimed shim, red on
+    every host with no production GUI to paper over it.
     """
-    exported = (os.environ.get(BIN_ENV) or "").strip()
-    if exported and os.path.isfile(exported) and os.access(exported, os.X_OK):
-        return exported
+    for candidate in (os.environ.get("YGG_HEADLESS_BIN"), os.environ.get(BIN_ENV)):
+        exported = (candidate or "").strip()
+        if exported and os.path.isfile(exported) and os.access(exported, os.X_OK):
+            return exported
     return os.path.expanduser(DEFAULT_BIN)
 
 
@@ -70,7 +79,16 @@ def remote_binary():
     naming it on another host asserts the two installs sit at the same path. They
     do here and that is luck, not a contract. `~` is left for the far shell to
     resolve, or a verb run from one account addresses another account's install.
+
+    ⛔ EXCEPT the explicit `$YGG_HEADLESS_BIN` aim, which outranks the install
+    here exactly as it does locally (see `local_binary`): a rehearsal that
+    aimed a shim must hop to the SHIM, and an agent that staged a binary aims
+    it by name. Measured 2026-10-14: the aim battery's remote arm caught the
+    hop naming the production install while the local arm ran the shim.
     """
+    aimed = (os.environ.get("YGG_HEADLESS_BIN") or "").strip()
+    if aimed:
+        return aimed
     return DEFAULT_BIN
 
 
@@ -80,12 +98,21 @@ def sandbox_home():
 
 
 def runs_locally(host):
-    """Is the plane on THIS machine? ⛔ A sandbox home is always local."""
-    if sandbox_home():
-        return True
+    """Is the plane on THIS machine?
+
+    ⛔ The sandbox-local rule (99.1: rehearsals must not resolve their way onto
+    the fleet) binds the UNHOSTED case only — no `--host` and no aim. An
+    EXPLICIT host aims the remote plane even under a sandbox home, and the home
+    then has to travel IN the command because it does not survive ssh; that is
+    the remote arm of the aim battery, which an always-local reading made
+    unreachable (measured 2026-10-14: deliver reached its submit locally and
+    hopped nowhere).
+    """
     if not host:
         return True
-    return host == socket.gethostname()
+    if host == socket.gethostname():
+        return True
+    return False
 
 
 def stage(host, local_path):
@@ -116,6 +143,15 @@ def app(host, argstr, stdin_path=None, timeout=180):
         done = _run(argv, env, stdin_path, timeout)
     else:
         cmd = f"{remote_binary()} server app {argstr}"
+        # ⛔ THE HOME DOES NOT SURVIVE SSH — a fresh far shell inherits nothing,
+        # so a home left to the environment is silently the REAL one at the far
+        # end (the original defect this plane exists to kill: `--host` moved
+        # which MACHINE answered and nothing moved which HOME). Write it into
+        # the command whenever this process carries one.
+        home = sandbox_home() or (os.environ.get(HOME_ENV) or "").strip()
+        if home:
+            import shlex
+            cmd = f"YGGTERM_HOME={shlex.quote(home)} {cmd}"
         if stdin_path:
             cmd += f" < {stdin_path}"
         done = _run(["ssh", "-n", host, cmd], None, None, timeout)
