@@ -4157,8 +4157,7 @@ already supplied the activation.
 
 ## ⛔ [11.32] A REMOTE ROW'S SCREEN READ ANSWERS "EMPTY" FROM THE LOCAL DAEMON — THE CLIENT BACKS OFF 2.5s→5s AND THE ROW SITS BLANK AND INPUT-GATED FOR 10+ SECONDS
 
-**Status:** FIXED IN CODE — LIVE PROOF OWED (lane/f2/owner-resolution,
-2026-10-14, the joint s36/s36b sitting; falsifier below)
+**Status:** FIXED IN CODE — LIVE PROOF OWED
 
 The empty-screen-read half is open; the watchdog-remount half of this
 entry is **FIXED IN CODE — LIVE PROOF OWED**: `rearm_stale_retained_fault_
