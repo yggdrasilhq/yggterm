@@ -9,6 +9,68 @@ and referenced from here.
 says the answer changed.
 
 
+## ⛔⛔ THE 2026-10-15 GATE SWEEP — TWENTY OWNER-GATED ITEMS CLEARED IN ONE SITTING
+
+Cleared interactively by the owner (zcode sess_b7eff89a), one question at a time, with
+pre-populated recommendations. Recorded here so no seat re-asks any of them.
+
+1. **All-CLI greeting run** — TAKE IT in a sandbox home against a headless daemon, scoped to
+   CLIs with a working backend; live-client rows NOT required.
+2. **Fan RPM** — INSTALL nbfc-linux (read-only against the EC) for a true RPM. Board-specific
+   config + root accepted by the owner. Overrides the file's earlier "do not" recommendation.
+3. **Panic heartbeat** — may ACTUATE on the scan cadence only (bounded, self-reverting);
+   row parking stays manual.
+4. **Leak gate source** — private Forgejo repo. The gate already missed one real leak and its
+   fix lives unversioned; this is the sweep's most substantive ruling.
+5. **Fleet-sync hook bugs** — take BOTH: the `*.old*` glob fix and discovery by launcher
+   manifest (the `y*` spelling glob is not a membership test).
+6. **Unpushed-audit snippet** — REPLACE the line: `[ -e "$r/.git" ]` +
+   `git rev-list --left-right --count origin/main...HEAD`. Worktree-correct AND
+   direction-correct in one edit.
+7. **⛔ REVERSAL — the site-lore corpus.** The 2026-08-14 ruling above ("an asset, not a leak —
+   separate it, do not delete it") is REVERSED by the owner's explicit word today: **REMOVE the
+   corpus, bundled into the term-list purge.** The user may reverse their own call; nobody else may.
+8. **Adopted row `0462c0fb66e1`** — leave as is.
+9. **⛔ tsc=reliable is REJECTED, PERMANENTLY — AND IT WAS NEVER NEW.** The owner: it was TRIED
+   FOR TWO MONTHS and reverted — it **broke Chromium/Chrome apps and made life worse**; the
+   kernel defaults it off because the TSC is unreliable there; gains were negligible; the real
+   gains are in bug-fixing the clock-syscall storm. ⛔ **DO NOT RE-PROPOSE.** ⭐ The durable
+   lesson, owner-spoken: *"over the span of months you and many agents have asked me the same
+   question"* — this question sat in owner-attention with a fresh "try it" recommendation ON TOP
+   of a two-month-old reverted incident nobody had logged. **Before parking an owner question,
+   grep this file; when the owner answers anything a second time, the ruling lands HERE the same
+   session. A settled call asked twice is a settled-calls coverage failure.**
+10. **⛔ REVERSAL — [6.2] the GUI close path.** The 2026-08-20 "retire the tier" ruling is
+    REVERSED: **REPAIR AND ENFORCE.** The product promise ("dies with the GUI") gets kept;
+    rows that survive today start dying with the GUI. Repair first with the departure ledger
+    watching, then enforce.
+11. **Response-layer rule** — already settled 2026-08-20; the attention line was stale.
+    Re-confirmed by the sweep.
+12. **Watchdog Enter on plan-limit dialogs** — AUTHORIZED, NARROWLY: only when the screen reads,
+    exactly ONE `❯`-highlighted numbered option, and that option's text is stop-and-wait.
+    Unreadable screen / multiple highlights / any spend option refuse as today.
+13. **Wake on unreadable screen** — NO; the guard stands (the daemon-screen fallback already
+    fixed the outage that motivated the question).
+14. **Closed row's dot** — NO dot at all when closed; idle dot when open-idle; blink when
+    open-working. The render unit is unblocked (discovery half was already done).
+15. **Phone two-app split** — SPLIT: clean `yggterm` for the stores; sideload-only
+    `yggterm-agent` with accessibility/SMS/overlay.
+16. **⛔ THE INTERFACE LLM MOVES — litellm is RETIRED.** The interface LLM points at the NEW
+    **llmproxy** at the same `llm.gour.top`; interface-LLM work uses **gpt-6-luna-low**. The
+    owner has been burnt before (an interface LLM burned his whole usage meter through a wiring
+    bug), so: **BUILD the metered route system on llmproxy — `llm.gour.top/metered/weekly/500k/`
+    style URL routes that GATE usage by route — and make `/web` display per-metered-route
+    usage.** Filed as work in pending-bugs.md.
+17. **Out-of-credits row** — no action, prune (per-row suspension already contains it).
+18. **CLI credentials** — opencode works WITHOUT sign-in; **agy sign-ins ride ygg-auth from the
+    already-authed hosts (jojo, dev, oc), exactly like codex**; **qwen-code stays unsigned-in**
+    (its unmeasured-store question closes as accepted-unmeasured).
+19. **Android v3.2.0 Play publish** — HELD by owner ruling. Do not publish without a fresh word.
+20. **agy trust gate** — AUTO-ANSWER **EVERYWHERE** (spawn path AND interactive GUI opens; the
+    owner accepted silent trust of fresh project folders). Unblocks every agy-minting E2E.
+    **perf (linux-tools) on the GUI host** — APPROVED (one 60s `perf record -F 99 -t <ui_tid>
+    -g` during a phase names the ~320ms GTK/WebKit burn).
+
 ## ⛔⛔ CAPPING POWER TO CUT HEAT IS A CHEAT FIX, NOT A FIX (2026-08-14)
 
 **Settled by the owner**, rejecting an A/B this campaign had filed as a recommendation. The

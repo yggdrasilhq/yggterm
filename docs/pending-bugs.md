@@ -1990,9 +1990,11 @@ is the same nobody-answered class. FIXED IN CODE this sitting: the daemon
 filter now answers `ESC[>c`/`ESC[>0c` with `ESC[>0;277;0c` (xterm.js
 parity — an unmounted row now behaves like a mounted one at the protocol
 layer), unit-tested in `terminal_protocol_filter_answers_secondary_da_queries`;
-the probe marker fix (bb4a1dab) rides the same lane. Want (2) — the gate
-auto-answer policy — REMAINS THE OWNER CALL; every agy-minting E2E
-scenario stays honestly RED until it lands. LIVE PROOF OWED: after
+the probe marker fix (bb4a1dab) rides the same lane. Want (2) — DECIDED (owner,
+2026-10-15 gate sweep, settled-calls.md): AUTO-ANSWER EVERYWHERE — the spawn
+path AND interactive GUI opens (the owner accepted silent trust of fresh
+project folders). The auto-answer unit is unblocked; every agy-minting E2E
+stays honestly RED until it lands. LIVE PROOF OWED: after
 deploy, a fresh-cwd UNMOUNTED agy row on dev must paint the gate (not
 zero-paint), and the probe must fail it as `[startup_gate painted…]`.
 
@@ -2186,6 +2188,52 @@ subsequent failure, cap 24 h), and growing across walks. A flat
 ~30-min-class remaining_ms again means the escalation is not reading the
 persisted streak — that is the falsifier's red.
 
+
+## ★ THE 2026-10-15 GATE SWEEP — UNBLOCKED WORK INDEX (rulings in settled-calls.md § "THE 2026-10-15 GATE SWEEP")
+
+Twenty owner gates cleared in one interactive sitting (zcode sess_b7eff89a). The
+rulings live in settled-calls.md; the WORK they unblock lives here:
+
+- **THE WATCHDOG MAY SEND ENTER, NARROWLY** (ruling 12): only when the screen
+  reads, exactly ONE `❯`-highlighted numbered option, and its text is
+  stop-and-wait; unreadable/multi-highlight/spend options refuse as today. Unit:
+  implement the predicate + the send, trace each authorization decision
+  (the `❯`-is-also-the-composer-glyph trap is already recorded in the entry).
+- **CLOSED ROWS GET NO DOT** (ruling 14): no dot when closed; idle dot
+  open-idle; blink open-working (`sidebar.rs:973/985/1064`). Discovery half is
+  done — the render lands as soon as this unit runs.
+- **[6.2] REPAIR AND ENFORCE** the GUI close path (reversed ruling; see the
+  entry): repair = the shutdown path runs and is OBSERVABLE, departure ledger
+  watching; enforce = the tier actually reaps.
+- **nbfc-linux install APPROVED** (ruling 2; reverses the file's earlier "do
+  not"): read-only against the EC for a true fan RPM, board-specific config +
+  root accepted; the RPM field joins the fleet-heat notebook, labelled by
+  provenance. → `docs/idle-cost-model.md` §7b.
+- **perf install APPROVED** on the GUI host (ruling 20b): one 60s
+  `perf record -F 99 -t <ui_tid> -g` during a phase, flamegraph to the campaign
+  door — names the untraced ~320ms GTK/WebKit burn.
+- **CLI-AUTH RULING** (18): opencode works unsigned-in; agy rides ygg-auth from
+  jojo/dev/oc (codex pattern); qwen-code stays unsigned-in (unmeasured-store
+  question closed as accepted). The greeting run proceeds on the working set.
+
+## ⛔ THE INTERFACE LLM MOVES TO llmproxy + METERED URL ROUTES (owner directive, 2026-10-15 gate sweep; litellm RETIRED)
+
+The interface LLM (title/summary chore) pointed at the owner's litellm proxy
+layer; **litellm is retired in lieu of the new llmproxy at the same
+`llm.gour.top`.** Interface-LLM work uses **gpt-6-luna-low**. The owner has
+been burnt before — an interface LLM burned his ENTIRE usage meter through a
+wiring bug — so the wiring gets a hard gate, built on llmproxy itself:
+
+**BUILD: the metered route system — `llm.gour.top/metered/weekly/500k/` style
+URL routes that GATE usage by route (period + budget in the URL), and the
+`/web` route SHOWS per-metered-route usage.** Then re-point the interface LLM
+at a metered route (weekly/500k class) on gpt-6-luna-low.
+
+Why it is here and not only in llmproxy's own lane: the CONSUMER (the title
+chore's settings.json wiring — which an agent cannot edit under a running GUI)
+is yggterm's, and the burned-meter incident is the [11.3] family. Owner-spoken
+constraint for the build: the URL route IS the gate — no token-counting trust
+in the client.
 
 ## [11.222] THE NPM_TOKEN PUBLISH-SECRET LOSS THAT FROZE `@avikalpa/zcode-tui` npm latest AT 0.5.7 — RESTORE THE SECRET, THEN DECIDE THE PRODUCTION HANDBACK (owner call; re-filed from [11.123]/[11.221] so the slot fix could close)
 
@@ -6738,9 +6786,10 @@ coming.
 
 ## ⛔ [11.25] THE ALL-CLI GREETING RUN HAS NOT BEEN TAKEN
 
-**Status:** AWAITING A DECISION
-
-**Who decides:** the owner — it spends money and wants a screen.
+**Status:** DECIDED (owner, 2026-10-15 gate sweep, settled-calls.md): TAKE IT in a
+sandbox home against a headless daemon, scoped to CLIs with a working backend;
+live-client rows NOT required. CLI-auth ruling of the same sweep: opencode needs
+no sign-in, agy rides ygg-auth from jojo/dev/oc, qwen-code stays unsigned-in.
 
 **The ask:** spawn one session of every registered CLI through the normal path,
 make them greet each other, and score each one **per stage** — born, titled,
@@ -11886,8 +11935,7 @@ row reads as more broken than it is.
 
 ## ⛔⛔ [6.2] THE GUI CLOSE PATH NEVER RUNS, SO THE "DIES WITH THE GUI" TIER IS VESTIGIAL
 
-**Status:** OPEN
-**Decided (owner, 2026-08-20, via the 11.x Q/A):** RETIRE the "dies with the GUI" tier rather than repair it — align the spec with the survival behaviour users already rely on. Owner lane: 11.2 after the husk work.
+**Status:** DECIDED — REVERSED (owner, 2026-10-15 gate sweep, settled-calls.md): **REPAIR AND ENFORCE.** Supersedes the 2026-08-20 "retire the tier" ruling by the owner's explicit word. The product promise ("dies with the GUI") gets kept; rows that survive today start dying with the GUI. Unit shape: repair first (make the shutdown path run and be OBSERVABLE — nine traced launches shed zero events from any step), with the departure ledger watching the transition, then enforce the tier.
 
 **Who decides:** the owner, or 6.0 on his behalf. Repairing this would START
 destroying rows that survive today — see "why this is a decision" below.
