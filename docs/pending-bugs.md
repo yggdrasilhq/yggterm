@@ -1361,15 +1361,27 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (records speak — the truth-table lock pins this). Bounded consumer check
   owed if a real case appears; never restore false authority to recover
   retirement.
-  (iii) THE APP_SURFACE_BATCH_UNAVAILABLE LIFETIME LATCH (sol s42 Q7;
-  consequence extended by sol s43 Q5): one transport Err converts the client
-  to per-target asks for the process lifetime; the fix must distinguish
-  unsupported batch capability from transient transport failure (bounded
-  retries + invalidation on endpoint/incarnation change; reset-on-single-
-  ask-success proves the wrong thing — sol's own rebuttal of the cheap
-  fix). s43 addition: the latch also disables the batch-only [11.186]
-  retained-close retire pass, so its cost is missed retirements, not just
-  request volume.
+  (iii) THE APP_SURFACE_BATCH_UNAVAILABLE LIFETIME LATCH — RESOLVED
+  2026-10-14 (sitting 43 unit 2, lane lane/f2/batch-latch 93a10a96): the
+  ask is now CLASSIFIED at the server boundary
+  (terminal_app_declares_all_classified → TerminalAppDeclaresAllFailure::
+  AnsweredError|Transport). A daemon ANSWER (an old daemon's Error) still
+  latches — the capability question is settled. A transport loss retries
+  on a bounded consecutive-failure budget (5, APP_SURFACE_BATCH_TRANSPORT_
+  LATCH_AFTER), reset ONLY by a batch success (never single-ask success —
+  sol's rebuttal), tracing batch_transport_retry per loss; the latch fires
+  at the cap with its reason on the batch_unavailable trace. sol s43 Q5's
+  consequence thereby heals too: a daemon-down window no longer kills the
+  batch-only [11.186] retained-close retire pass for the process lifetime.
+  PROOF: server 1680/0 + shell 2291/0 (+2 locks); natural fire on the
+  harness (exe-proofed lane build): with a surface target held, a daemon
+  SIGKILL produced batch_transport_retry and ZERO batch_unavailable in the
+  down window, a post-respawn success reset the budget, and a SECOND kill
+  retried again instead of latching. RIG LAW: the restore tick early-exits
+  on empty targets — a client holds targets only after its boot restore
+  batch consumed a declare, so a transport-path natural fire needs the
+  declaring row to predate the GUI boot (declare → flush → full harness
+  reboot → the kills).
   (iv) The CLI `terminal app declares` verb ignores the authority verdict
   in its printed output (cosmetic; the daemon+client fixes carry the
   substance).
