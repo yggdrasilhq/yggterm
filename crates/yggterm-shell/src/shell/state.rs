@@ -2106,6 +2106,60 @@ mod app_surface_batch_tests {
     }
 
     #[test]
+    fn a_remote_keyed_row_with_no_local_evidence_is_never_decided_absent() {
+        // [F2] Measured live 2026-10-14: the remote-agy harness row was
+        // declared absent via:batch ~every backoff window while painted and
+        // running:true on its owner. A remote-keyed row the local daemon
+        // holds no positive evidence for — missing from the batch, or listed
+        // with empty records (a proxy-spawned row has no preserved-owner
+        // record) — is NoLocalAuthority, never AbsentLocally.
+        let empty = AppSurfaceRestoreBatch::from_sessions(vec![]);
+        let (rail, web) = empty.verdicts_for(&target("remote-agy://oc/x", true, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::NoLocalAuthority);
+        assert_eq!(web, AppSurfaceBatchVerdict::NoLocalAuthority);
+
+        let listed_empty =
+            AppSurfaceRestoreBatch::from_sessions(vec![session("remote-agy://oc/y", false, vec![])]);
+        let (rail, web) =
+            listed_empty.verdicts_for(&target("remote-agy://oc/y", true, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::NoLocalAuthority);
+        assert_eq!(web, AppSurfaceBatchVerdict::NoLocalAuthority);
+
+        // An unwanted half keeps the never-ask invariant.
+        let (rail, web) =
+            listed_empty.verdicts_for(&target("remote-agy://oc/y", false, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::AbsentLocally);
+        assert_eq!(web, AppSurfaceBatchVerdict::NoLocalAuthority);
+
+        // A LOCAL row unknown to the batch is still the measured win.
+        let (rail, web) = empty.verdicts_for(&target("local://plain", true, true));
+        assert_eq!(rail, AppSurfaceBatchVerdict::AbsentLocally);
+        assert_eq!(web, AppSurfaceBatchVerdict::AbsentLocally);
+    }
+
+    #[test]
+    fn the_absence_declaration_reads_wanted_halves_only() {
+        // sol s40 Q3: an unwanted half is AbsentLocally by construction —
+        // counting it let a suppressed wanted half declare anyway.
+        assert!(app_surface_wanted_half_decided_absent(
+            true,
+            AppSurfaceBatchVerdict::AbsentLocally
+        ));
+        assert!(!app_surface_wanted_half_decided_absent(
+            false,
+            AppSurfaceBatchVerdict::AbsentLocally
+        ));
+        assert!(!app_surface_wanted_half_decided_absent(
+            true,
+            AppSurfaceBatchVerdict::NoLocalAuthority
+        ));
+        assert!(!app_surface_wanted_half_decided_absent(
+            true,
+            AppSurfaceBatchVerdict::AskSingle
+        ));
+    }
+
+    #[test]
     fn the_restore_tick_asks_for_a_dead_web_surface_record() {
         // Measured 2026-09-05 (GUI host): after a daemon swap the client's
         // web-surface record survived with tabs but a frozen last_seen, and
@@ -40944,6 +40998,24 @@ fn mark_app_surface_restore_attempted(
 /// 2026-09-04 on the 359-row desktop during the UI-thrash storm: the
 /// per-target asks were ~35 daemon round trips/min with
 /// `terminal_app_declares` dispatches at ui_wait up to 526 ms each.
+/// A remote-keyed row: `remote-<kind>://<host>/<id>` (remote-session,
+/// remote-cc, remote-agy, remote-muse, ...). Its PTY authority lives on
+/// another machine, so a local daemon's empty app-declare ledger cannot
+/// witness absence for it. Local keys are `local://...`.
+fn app_surface_target_is_remote_keyed(session_path: &str) -> bool {
+    session_path.starts_with("remote-") && session_path.contains("://")
+}
+
+/// The batch's local absence declaration reads WANTED halves only: an
+/// unwanted half is AbsentLocally by construction (never asked) and is not
+/// evidence of anything (sol s40 Q3).
+fn app_surface_wanted_half_decided_absent(
+    want: bool,
+    verdict: AppSurfaceBatchVerdict,
+) -> bool {
+    want && verdict == AppSurfaceBatchVerdict::AbsentLocally
+}
+
 #[derive(Debug, Default)]
 struct AppSurfaceRestoreBatch {
     by_session: HashMap<String, Vec<yggterm_server::app_declare::AppDeclareRecord>>,
@@ -40975,10 +41047,15 @@ impl AppSurfaceRestoreBatch {
                 Self::ask_single(target.want_web),
             );
         }
+        // A remote-keyed row's PTY authority lives on another machine: this
+        // daemon's empty app-declare ledger cannot witness absence for it (a
+        // proxy-spawned remote row carries no preserved-owner record, so it
+        // reaches this match with `owner_remote` false, or misses it whole).
+        let remote_keyed = app_surface_target_is_remote_keyed(&target.session_path);
         match self.by_session.get(&target.session_path) {
             None => (
-                Self::absent(target.want_rail),
-                Self::absent(target.want_web),
+                Self::verdict_wanted(target.want_rail, false, remote_keyed),
+                Self::verdict_wanted(target.want_web, false, remote_keyed),
             ),
             Some(records) => (
                 // ANY retained sidebar record is Rebuild-worthy, a close just
@@ -40987,13 +41064,15 @@ impl AppSurfaceRestoreBatch {
                 // probe — no ssh, no network. Mapping a close to "absent"
                 // here made the daemon-held retirement inexpressible through
                 // the batch, which is the one channel a hostless client has.
-                Self::verdict(
+                Self::verdict_wanted(
                     target.want_rail,
                     records.iter().any(|r| r.verb == "sidebar"),
+                    remote_keyed,
                 ),
-                Self::verdict(
+                Self::verdict_wanted(
                     target.want_web,
                     records.iter().any(|r| r.verb == "web-surface"),
+                    remote_keyed,
                 ),
             ),
         }
@@ -41018,14 +41097,23 @@ impl AppSurfaceRestoreBatch {
             AppSurfaceBatchVerdict::AbsentLocally
         }
     }
-    fn absent(want: bool) -> AppSurfaceBatchVerdict {
-        Self::verdict(want, false)
-    }
-    fn verdict(want: bool, present: bool) -> AppSurfaceBatchVerdict {
-        if !want {
-            AppSurfaceBatchVerdict::AbsentLocally
-        } else if present {
-            AppSurfaceBatchVerdict::Rebuild
+    /// The wanted-half verdict. An unwanted half NEVER asks (AbsentLocally
+    /// keeps the invariant the rebuild guard reads). A wanted half with no
+    /// positive record is locally-decided absent only when the row is not
+    /// remote-keyed — a remote row's local emptiness is not a witness.
+    fn verdict_wanted(
+        want: bool,
+        present: bool,
+        remote_keyed: bool,
+    ) -> AppSurfaceBatchVerdict {
+        if want {
+            if present {
+                AppSurfaceBatchVerdict::Rebuild
+            } else if remote_keyed {
+                AppSurfaceBatchVerdict::NoLocalAuthority
+            } else {
+                AppSurfaceBatchVerdict::AbsentLocally
+            }
         } else {
             AppSurfaceBatchVerdict::AbsentLocally
         }
@@ -41044,6 +41132,15 @@ enum AppSurfaceBatchVerdict {
     /// The batch deferred this row (a preserved owner elsewhere holds the
     /// PTY) — use the single, owner-proxying ask.
     AskSingle,
+    /// The batch holds no positive evidence for a WANTED half of a
+    /// remote-keyed row: the local daemon holds no PTY for it, so its empty
+    /// ledger is "I don't know", never "absent" (the F2 presence-gate law —
+    /// an unavailable witness must SUPPRESS the absence declaration, sol
+    /// s36 Q4; measured live 2026-10-14: the remote-agy harness row was
+    /// declared absent via:batch ~every backoff window while painted and
+    /// running:true on its owner). Nothing asks, nothing declares, nothing
+    /// retires; the backoff ledger bounds the re-inspection.
+    NoLocalAuthority,
 }
 
 /// Set the first time a daemon answers the batch ask with `Error` (a daemon
@@ -41267,15 +41364,39 @@ async fn restore_app_surfaces_tick(
         };
         // The locally-decided absence keeps its trace name — `via: "batch"`
         // says the ask never left the client, so an operator counting these
-        // still sees the poll working, at a fraction of the cost.
-        if rail_verdict == AppSurfaceBatchVerdict::AbsentLocally
-            || web_verdict == AppSurfaceBatchVerdict::AbsentLocally
+        // still sees the poll working, at a fraction of the cost. The
+        // declaration reads WANTED halves only: an unwanted half is
+        // AbsentLocally by construction (never asked) and is not evidence —
+        // counting it let a suppressed wanted half declare anyway (sol s40 Q3).
+        if app_surface_wanted_half_decided_absent(target.want_rail, rail_verdict)
+            || app_surface_wanted_half_decided_absent(target.want_web, web_verdict)
         {
             append_trace_event(
                 &trace_home,
                 "ui",
                 "app_declare",
                 "daemon_declare_absent",
+                json!({
+                    "session_path": target.session_path,
+                    "via": "batch",
+                }),
+            );
+        } else if (target.want_rail
+            && rail_verdict == AppSurfaceBatchVerdict::NoLocalAuthority)
+            || (target.want_web
+                && web_verdict == AppSurfaceBatchVerdict::NoLocalAuthority)
+        {
+            // [F2] The presence-gate law (sol s36 Q4): an unavailable witness
+            // must SUPPRESS the absence declaration. A remote-keyed row's PTY
+            // authority lives on another machine — the local daemon's empty
+            // ledger is "I don't know", never "absent" — so the batch
+            // declares nothing and traces the suppression instead (the
+            // backoff ledger bounds the cadence).
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "app_declare",
+                "daemon_declare_suppressed_no_local_authority",
                 json!({
                     "session_path": target.session_path,
                     "via": "batch",
@@ -41340,6 +41461,7 @@ async fn restore_app_surfaces_tick(
                 }
             }
             AppSurfaceBatchVerdict::AbsentLocally => false,
+            AppSurfaceBatchVerdict::NoLocalAuthority => false,
         };
         // The web half. Independent of the rail: ychrome declares a
         // `web-surface` and no sidebar pane, yedit the reverse. Its own
@@ -41404,6 +41526,11 @@ async fn restore_app_surfaces_tick(
                     // `already_up`.
                     Some(DeclareRebuild::NoDeclare)
                 }
+                // [F2] No positive evidence for a remote-keyed row: nothing
+                // declares and nothing climbs the corpse ladder — a
+                // suppressed unknown must never retire a possibly-painted
+                // surface (the 06:43 drop class).
+                AppSurfaceBatchVerdict::NoLocalAuthority => Some(DeclareRebuild::NoDeclare),
             }
         } else {
             match web_verdict {
@@ -41427,6 +41554,9 @@ async fn restore_app_surfaces_tick(
                     Some(DeclareRebuild::NoDeclare)
                 }
                 AppSurfaceBatchVerdict::AbsentLocally => None,
+                // [F2] No positive evidence for a remote-keyed row: honest
+                // `no_declare`, never an absence, never a rebuild.
+                AppSurfaceBatchVerdict::NoLocalAuthority => Some(DeclareRebuild::NoDeclare),
             }
         };
         if rail || web.as_ref().is_some_and(DeclareRebuild::rebuilt) {
