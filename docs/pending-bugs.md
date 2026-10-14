@@ -1265,18 +1265,30 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   client's remote-key rehydrate asks the OWNING machine
   (agent-screen-snapshot verb, three-valued) instead of trusting a local
   daemon's ("",0) — [11.32]'s entry carries the full record + falsifier.
-  REMAINDERS: presence/liveness gate (sol s36 Q4 DEFER — the declare_absent
-  witness inspection; unavailable must SUPPRESS an absence declaration —
-  REPRODUCED LIVE s38 on the harness: after a daemon restart the fresh
-  daemon declares the LIVE remote-agy row absent every ~5s,
-  `daemon_declare_absent via:batch` 6+ times in 45s while the row is painted
-  and running:true on oc — the absence declaration is a lie exactly as the
-  witness inspection predicted), the [11.229] absent-declaration sub-item,
-  the live rig (the dev-local GUI harness is BUILT — `tools/e2e/
-  gui-harness.sh`, s38; [11.32]'s live proof delivered on it), and the
-  enum-variant upgrade
-  (additive fields → the full Absent/Unavailable/valid-empty vocabulary)
-  when a second consumer needs it. MEMBERS: [11.32], the [11.229]
+  REMAINDERS: presence/liveness gate — THE BATCH ARM LANDED 2026-10-14
+  (sitting 40, lane/f2/declare-absent-suppression): a remote-keyed row
+  (`remote-<kind>://` — its PTY authority lives on another machine) with no
+  positive evidence in the app-surface restore batch is NoLocalAuthority,
+  never AbsentLocally — the batch declares nothing, traces
+  `daemon_declare_suppressed_no_local_authority via:batch` (cadence bounded
+  by the standing backoff ledger), climbs no corpse ladder, rebuilds
+  nothing; the absence declaration now reads WANTED halves only (sol s40
+  Q3: an unwanted half is AbsentLocally by construction — counting it let
+  a suppressed wanted half declare anyway). RED (measured live s38+s40):
+  the harness daemon declared the painted, running:true remote-agy row
+  absent 7× in 138s (backoff gaps 2.5→5→10→20→40→60s — s38's "~5s storm"
+  DECAYS to a persistent ~60s lie on a GUI-only restart). sol s40 round:
+  Q1 accept (suppression only), Q2 defer (the wire upgrade is its own
+  lane), Q3 rebut folded (the wanted-half gate). OWED: the harness GREEN
+  re-run post-deploy (zero declares + the suppression trace on a boot-2).
+  STILL OPEN: the SINGLE-ASK arm's authority gap — a proxy-spawned remote
+  row with no preserved-owner record self-answers empty and
+  `daemon_declare_absent` (no via:batch) can still fire from the rebuild
+  path — whose fix is the enum-variant upgrade (additive fields → the full
+  Absent/Unavailable/valid-empty vocabulary); its second consumer now
+  EXISTS. The [11.229] absent-declaration sub-item stands. The live rig
+  (the dev-local GUI harness is BUILT — `tools/e2e/gui-harness.sh`, s38;
+  [11.32]'s live proof delivered on it). MEMBERS: [11.32], the [11.229]
   absent-declaration sub-item.
 - **F3 — HOST-LIFECYCLE IMMORTALITY**: a bad host must be replaced, never
   revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71);
