@@ -1608,6 +1608,37 @@ CLIENT halves that still recur on healthy rows.
   following = the old shape on an un-upgraded peer. Shape locked by
   a_deadline_expired_cover_with_no_buffered_bytes_rearms_the_screen_
   reconcile; cover-rig lands as the boot-2 reveal-health bar.
+- LIVE PROOF DELIVERED 2026-10-14 (sitting 40, zcode jojo
+  sess_a7a7e9c7; board plan ACK-1cbaa571d2): the dev-local GUI harness
+  made the shape CONSTRUCTIBLE — its active row is a REAL remote-agy
+  (remote-agy://oc/ecdfd72b…, session_source:LiveSsh — the arming gate's
+  exact conjunction). Construct: SIGSTOP the agy TUI on oc (the
+  post-attach SIGWINCH nudge can never produce a TUI frame; the daemon's
+  vt100 keeps the last frame) → boot-2 the harness GUI only → re-attach
+  arms reveal_cover_held source:post_attach_redraw_nudge gen 2 at
+  +4839ms → reveal_cover_released reason:deadline bytes:0 at +5841ms
+  (THE TRIGGER, live) → reveal_cover_deadline_reconcile_armed the SAME
+  millisecond → reveal_screen_reconcile bytes:419 at +5843ms (defer
+  chain + retry budget reset — the fix's fresh-budget clause).
+  EFFECT BAR MET AT PIXELS: the Xvfb :78 screenshot shows the agy
+  trust-dialog frame FULLY PAINTED in the client viewport while the TUI
+  is still T (stopped) — those 419 bytes can only be the reconcile's
+  daemon-frame paint; the pre-fix shape leaves this viewport blank.
+  Then SIGCONT → the row resumes (state S). RIG LAWS BANKED: (1) boot-2
+  = kill the GUI pid (environ-matched, daemon kept) + launch the
+  dbus-run-session GUI block BY HAND — `gui-harness.sh start` counts the
+  daemon in alive_pids and reports "already up" without booting a GUI;
+  (2) SIGSTOP-the-TUI is the honest cover-starvation construct — the
+  nudge answer cannot exist, no fake clock needed; (3) ytrace slice keys
+  are ts_ms/name/component (NOT timestamp/event). BOUNDARY (honest): the
+  pre-fix differential (old binary → viewport stays blank) remains a
+  code-read + the owner's 2026-10-05 field recurrence; the queue's named
+  bar (live proof by detector + the effect) is MET, no pre-fix RED was
+  built. F2 BONUS DATUM: during this boot-2 the harness daemon declared
+  the live row absent 7× in 138s (daemon_declare_absent via:batch,
+  backoff gaps 2.5→5→10→20→40→60s) — s38's "~5s storm" DECAYS to a
+  ~60s persistent lie on a GUI-only restart; the declaration is never
+  suppressed while the row stays painted + running:true.
 - UPDATE 2026-10-05 ~08:2x IST (recurrence, owner-reported live; board
 ACK-d3e73eac18): a FRESH agy row (remote-agy://dev/4314d6ee…, born
 08:19:59 on dev, cwd /home/user) sat BLANK in the owner's active viewport
