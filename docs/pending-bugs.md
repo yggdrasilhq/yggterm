@@ -1410,58 +1410,26 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   knowledge/creativity only). SLICE 2 LANDED 2026-10-06 (sitting 11, lane lane/memory/dream-verb): the `dream` verb (--prepare/--apply/--run/--status: journal-delta collector with dreamer ingestion isolation + per-ns dream watermark + input budget, machine-parsed composer contract, MANDATORY adversarial-critic verdicts, per-claim [as-of; proof] stamps over a closed vocabulary, append-section/propose-tombstone ops whitelist, ns-level NOW.md + _global owner-now.md landed through journaled origin=dreamer publishes, per-dream OPLOG) + the `search` verb (regex across hub doors, provenance per hit) + tests/test_memory_dream_verb.py (green: isolation, budget, refusals x10, watermark, ops, owner-now, search). FIRST REAL DREAM applied live on -home-pi-gh-yggterm via the seat-composer path (sol transport built but juju-capped to Oct 10 3:54 AM): NOW.md 2309B/9 claims/0 contested AFTER the critic pass contested three generator claims (a stale 33KB figure copied from the door, an unsourced watcher count, an unevidenced 'sittings 1-10') — the adversarial gate measured working on its first live run. owner-now.md live in _global and pinned into every zcode project. Remaining for F8: slices 3-4 (H_vocab phase telemetry, Hebbian decay/canaries) + the [11.236] byte-source probe + the per-host ns-index gap (a peer host never learns a new door's hub-ns MEMORY.md line — the index is per-host publish-time state; NOW.md is read by `get`, so orientation works, but the index drift is a dream-grade gap).
 
 - **F9 — DISK-PLANE SELF-MAINTENANCE (unbounded local growth)**: the
-  fleet's own verbs grow append-only local state with ZERO retention, and
-  the muse-lab host's SSD pays. OWNER-PRIORITIZED 2026-10-14 ("important
-  fixes the yggterm agent should prioritize on multiple layers" — the
-  layers: host-dies-when-disk-full, inode exhaustion ALREADY HAPPENED on
-  /tmp, and every sweep so far has been per-sitting heroics). MEMBERS
-  (all measured 2026-10-11→14, the muse lab host): [11.239] the family entry — (a)
-  ynpm scratchpad extraction staging (22G under ~/.yggterm, 138G + a
-  100%-inode event under /tmp, sitting 36), (b) ynpm generations
-  (every-version-forever, 21G), (c) ynpm/npm download caches (15G),
-  (d) ygg-memory sync-harness memory-backups (a full backup run per
-  invocation, ~2,000 runs per namespace). Root mechanism is ONE shape:
-  retention was never a verb's concern, so each verb assumes someone
-  else sweeps. ATTACK: none landed — [11.239] carries the member table,
-  fix directions (retention at write time + a sweep verb per tool) and
-  falsifiers. Manual sweeps 2026-10-14 reclaimed ~105G logical; without
-  the verbs it regrows at the next CLI-update cadence.
-
-## ⛔ [11.239] THE DISK-BALLOONING FAMILY — FOUR UNBOUNDED GROWTH PATHS IN THE FLEET'S OWN TOOLING (ynpm scratchpad, ynpm generations, ynpm/npm caches, ygg-memory memory-backups) FILLED THE MUSE-LAB HOST'S SSD TO 84% POOL AND /tmp TO 100% INODES (measured 2026-10-11→14, the muse lab host zcode sess_cf046eec; the /tmp arm cross-measured by sitting 36, infra/meta ACK-e26171ca6c)
-
-**Status:** OPEN
-
-OWNER PRIORITY (2026-10-14, in-session): "these are important fixes that the
-yggterm agent should prioritize on multiple layers." The layers, named: (1) a
-full SSD takes down the PRIMARY GUI host for every seat and campaign at once;
-(2) the inode half ALREADY FIRED — sitting 36 found /tmp's inode table at 100%
-and the host refusing writes; (3) every cleanup so far has been manual heroics
-inside a sitting, which is exactly the class the verb-first doctrine exists to
-kill; (4) the growth is SELF-INFLICTED — our own verbs (ynpm install, sync
-harness) write the files, so the retention fix belongs IN the verbs.
-
-Root mechanism (one shape, four surfaces): each tool treats its local state as
-append-only and retention as someone else's job. Nothing sweeps, nothing caps,
-nothing prunes at write time.
-
-| id | member | measured on the muse lab host 2026-10-11→14 | fix direction | falsifier |
-|---|---|---|---|---|
-| 11.239-a | ynpm scratchpad — per-update extraction dirs (`npm-<pkg>-<ver>-<rand>/`) never swept, in BOTH locations | `~/.yggterm/scratchpad/ynpm` 22G (claude-code 2.1.267→2.1.272 one dir per update); `/tmp/.yggterm/scratchpad/ynpm` 138G, 455 dirs, same versions re-downloaded per install (opencode 2.0.26 ×5 at 803M each) — sitting 36 swept it after the inode event | sweep-on-install (keep newest N extractions per package, N≈2, never the dir a live process runs from — verify via /proc cmdline before deleting) + a `ynpm sweep [--dry-run]` verb with a default cap | after 30 days incl. ≥3 CLI update cycles, both scratchpad roots stay under ~3G and ≤2 extractions per package |
-| 11.239-b | ynpm generations — every downloaded version kept forever | 21G: claude-code 25 versions (5.3G), opencode 9G, codex 2.2G; the ACTIVE generation is wired by absolute path (ychrome runs FROM `generations/ychrome/0.2.2/`) | `ynpm gc` = keep active-wired + newest N per package (N≈2), refuse to remove any version referenced by a running process or a registered path | a gc run followed by every fleet CLI launching clean (ychrome, claude, codex, opencode all exec) and generations du ≤ ~8G steady-state |
-| 11.239-c | ynpm cache + npm-cache `_cacache` — download caches never pruned | 13G + 1.9G on the muse lab host (2026-10-14, swept by hand) | cap + LRU prune inside ynpm's cache path (npm-style `--cache min=…` or post-install prune) | cache dir stays under its cap across a month of installs; hit-rate unchanged (re-downloads only for pruned entries) |
-| 11.239-d | ygg-memory sync-harness memory-backups — a FULL backup run per invocation, zero retention | `~/.yggterm/memory-backups/<ns>/<ts>/`: ~1,950-2,000 timestamped runs PER namespace × ~20 namespaces (~40k dirs, 14G; runs as small as 0.5MB) — the harness runs at every session end per fleet law, so this is the fastest-growing of the four | retention AT WRITE TIME: keep newest N runs per namespace (N≈5), prune older in the same pass; never prune the run being written | a namespace that syncs daily for a month holds ≤ N+1 run dirs and memory-backups du stays flat |
-
-Manual sweep state 2026-10-14 (the muse lab host, this seat): scratchpad roots emptied
-(nothing ran from them — /proc-verified), caches deleted, backups pruned to
-newest-2, generations pruned to newest-2 + wired versions → `~/.yggterm`
-83G→9.1G logical. Without members a-d landing, the next CLI-update cadence
-regrows (a)+(c) and every session-end regrows (d).
-
-Cross-refs: sitting 36's sweep post (infra/meta ACK-e26171ca6c) measured the
-/tmp arm and filed the ynpm-sweeper dream; this entry is the PRIORITIZED
-parent. F8 owns the memory plane's consolidation; (d) is its backup-side
-sibling and deliberately homed here because the leak is a disk-plane one.
-
+  fleet's own verbs grew append-only local state with ZERO retention, and
+  the muse-lab host's SSD paid. OWNER-PRIORITIZED 2026-10-14. MEMBERS
+  (a)-(d): ALL LANDED 2026-10-14 (sitting 39, zcode sess_ab07a759) — the
+  member entry [11.239] is CLOSED AND ARCHIVED
+  (docs/archive/pending-bugs-closed-2026-10-14.md). ynpm: staging retire on
+  success + stateless generation reuse + `ynpm sweep` verb (guarded
+  scratch/generations/cache, capacity admission in bytes AND inodes,
+  throttled auto-pass) — lane/f9/ynpm-retention cdf15344 in main
+  210d9bfc0e38, crate tests 53/53, falsifier rig 6/6. ygg-memory: retention
+  at write (newest-5 digest copies per bucket, atomic publish,
+  collision-free buckets) + `prune-backups [--legacy]` — runner dfe71ead
+  hand-pinned on all 3 hosts × 2 paths, read back, stable across mesh
+  ticks. LIVE PROOF: dev sweep reclaimed 125.2 GB / 513k files
+  (scratchpad 19G→25K, generations 23G→3.3G, cache 14G→2.0G under cap) and
+  every fleet CLI execs clean; jojo reclaimed 8.0 GB (CLIs exec clean);
+  memory-backups 24M→1.9M with digest copies FLAT under a 59-door churn
+  sync. REMAINder: the installed manager is the exe-proofed lane build
+  (81940aff) until the release train ships a release-built binary; the
+  30-day falsifier windows (scratchpad ≤~3G, cache under cap, digests
+  flat) are standing observations.
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
