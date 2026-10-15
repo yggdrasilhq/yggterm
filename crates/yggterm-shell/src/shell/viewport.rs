@@ -6896,7 +6896,9 @@ fn TerminalCanvas(
                 format!(
                     "{}{}",
                     terminal_mount_grid_prefix(pinned_grid, initial_grid),
-                    terminal_mount_warm_eval_script(&terminal_mount_params_json(
+                    terminal_mount_warm_eval_script(
+                        &host_id,
+                        &terminal_mount_params_json(
                         &host_id,
                         &theme,
                         initial_input_focus,
