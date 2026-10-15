@@ -487,7 +487,8 @@ pub(crate) fn terminal_applied_content_probe_script(host_id: &str) -> String {
 const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
 const __r = __e && __e.appliedContent ? __e.appliedContent : null;
 const __entryLive = __e ? (window.__yggtermXtermHosts[__h] === __e) : false;
-return JSON.stringify({{ present: Boolean(__r), receipt: __r, entry_live: __entryLive }});"#
+const __husk = __e ? (__e.lastVisiblePaintWasHusk === undefined ? null : Boolean(__e.lastVisiblePaintWasHusk)) : null;
+return JSON.stringify({{ present: Boolean(__r), receipt: __r, entry_live: __entryLive, was_husk: __husk }});"#
     )
 }
 

@@ -7960,8 +7960,10 @@ fn TerminalCanvas(
                 // poll deadline fires even when idle — and staging only
                 // constructs a pinned future, so the body stays await-free
                 // (the (i-r1) law). Gates kept: js_ready (a page must
-                // exist to read), one probe in flight, the 2s cooldown, a
-                // parked claim for THIS session. Gates dropped:
+                // exist to read), one probe in flight, the 2s cooldown.
+                // [i-r2 L2 sol s47 Q1] the parked-claim gate WIDENED to the
+                // organic want — evidence/witness missing OR a claim parked —
+                // for the loop's whole life. Gates dropped:
                 // js_ready_synthesized, bridge-read policy, flush_due —
                 // real mounts publish receipts through the live-write
                 // issuer and the probe script is entryLive-guarded.
@@ -7969,10 +7971,22 @@ fn TerminalCanvas(
                     && applied_content_probe_future.is_none()
                     && current_millis() >= applied_content_probe_next_ms
                 {
-                    let parked = state.with(|shell| {
+                    // [i-r2 L2 sol s47 Q1] CLAIM-INDEPENDENT organic
+                    // recovery: probe while the receipt/witness is still
+                    // missing OR a claim is parked — for the loop's whole
+                    // life, no mount-age or attempt-state boundary (the
+                    // measured starve had neither a parked claim nor a
+                    // delivered Paint event). Once the receipt qualifies AND
+                    // the witness is earned the probe has nothing left to
+                    // discover and stops arming; a parked claim always
+                    // re-attests (sol s23 R2).
+                    let wants_probe = state.with(|shell| {
                         shell.terminal_pending_content_claims.contains_key(&session_path)
+                            || !shell
+                                .terminal_session_applied_receipt_qualifies(&session_path)
+                            || !shell.terminal_session_host_has_painted(&session_path)
                     });
-                    if parked {
+                    if wants_probe {
                         applied_content_probe_next_ms = current_millis() + 2000;
                         applied_content_probe_future = Some(stage_applied_content_probe(
                             state,
@@ -22779,6 +22793,16 @@ fn stage_applied_content_probe(
         };
         let Some(verdict) = verdict else { return };
         if !verdict.get("entry_live").and_then(Value::as_bool).unwrap_or(false) {
+            return;
+        }
+        // [i-r2 L2 sol s47 Q1] THE ISSUER'S OWNERSHIP CHECK: a receipt read
+        // from a HUSK entry (visible-but-detached — the ln-646 measured
+        // class: entry_live:true + was_husk:true + a gen-3 receipt coexist
+        // through teardown transients) is not content evidence. Require
+        // was_husk === false; an absent field skips this sample too — the
+        // 2s cadence re-probes the settled entry, so strictness costs one
+        // round, never liveness.
+        if verdict.get("was_husk").and_then(Value::as_bool) != Some(false) {
             return;
         }
         let Some(record) = decode_applied_content_probe_receipt(&verdict) else {

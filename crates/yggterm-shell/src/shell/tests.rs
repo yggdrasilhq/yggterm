@@ -60582,6 +60582,241 @@ fn the_ack_arrival_promotion_completes_a_parked_claim_and_pending_paint() {
     assert!(shell.terminal_sessions_paint_pending.is_empty());
 }
 
+// ============================================================================
+// [i-r2 s47] THE ORGANIC-EARN BEHAVIORAL LOCKS (sol s47 Q2 map): the paint
+// witness earns on a VALIDATED receipt with NO Paint event ever delivered;
+// the locks pin what earns nothing and what survives churn. The rig
+// (tools/uxspeed/i2prov-rig.sh) measures the live shape; these pin the law.
+// ============================================================================
+
+#[test]
+fn a_validated_receipt_earns_the_paint_witness_without_any_paint_event() {
+    // lock (a) paint-suppressed organic earn: no Paint event reached the
+    // witness site, paint_pending was NEVER armed — the validated receipt
+    // alone earns the witness and reports the promotion (the measured s47
+    // starve: sends attempted, zero delivered, receipt in the entry).
+    let session_path = "local://organic-earn";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-oe", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+    let promoted = shell
+        .record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 0,
+                wrote: 349,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 1,
+                source: "reattest_probe",
+            },
+        )
+        .promoted;
+    assert!(promoted, "the organic earn IS a promotion");
+    assert!(shell.terminal_session_host_has_painted(session_path));
+    assert!(shell.terminal_sessions_paint_pending.is_empty());
+}
+
+#[test]
+fn a_foreign_or_replaced_epoch_receipt_earns_no_witness() {
+    // lock (b) state half: a foreign runtime (named expectation 7, receipt
+    // 9) and a replaced epoch (receipt 1001 vs current 1) are rejected at
+    // the door and earn NOTHING — no witness, no promotion.
+    let session_path = "local://organic-foreign";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let _attempt = shell.begin_terminal_open_attempt(session_path, "req-of", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 7);
+    let promoted = shell
+        .record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 9,
+                wrote: 64,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 1,
+                source: "reattest_probe",
+            },
+        )
+        .promoted;
+    assert!(!promoted, "a foreign runtime must not earn");
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+    let promoted = shell
+        .record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1001,
+                runtime_spawn_id: 7,
+                wrote: 64,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 1,
+                source: "reattest_probe",
+            },
+        )
+        .promoted;
+    assert!(!promoted, "a replaced epoch must not earn");
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+}
+
+#[test]
+fn receipt_first_and_claim_first_orders_converge_on_the_same_completion() {
+    // lock (c): receipt-first (the record lands, THEN the Content claim
+    // completes immediately — already-qualifying evidence earns the latch)
+    // and claim-first (the claim parks, THEN the receipt promotes through
+    // the ack-arrival door) end identically: attempt Ready, witness earned.
+    let session_path = "local://converge-receipt-first";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-cf", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 349,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 1,
+            source: "reattest_probe",
+        },
+    );
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "organic_earn" },
+        Some(attempt_id.as_str()),
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::ContentCompleted));
+    let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+    assert!(attempt.ready_at_ms.is_some());
+    assert!(shell.terminal_session_host_has_painted(session_path));
+
+    // claim-first: a fresh session parks, then the receipt promotes.
+    let session_path = "local://converge-claim-first";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-cl", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "organic_earn" },
+        Some(attempt_id.as_str()),
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
+    let promoted = shell
+        .record_terminal_applied_content(
+            session_path,
+            TerminalAppliedContentRecord {
+                mount_epoch: 1,
+                runtime_spawn_id: 0,
+                wrote: 349,
+                blank: false,
+                ts: current_millis(),
+                page_gen: 1,
+                source: "reattest_probe",
+            },
+        )
+        .promoted;
+    assert!(promoted);
+    let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+    assert!(attempt.ready_at_ms.is_some(), "the parked claim completed");
+    assert!(shell.terminal_session_host_has_painted(session_path));
+}
+
+#[test]
+fn a_parked_claim_with_no_receipt_stays_pending_and_earns_no_witness() {
+    // lock (d): a legitimately silent live loop stays Pending — the claim
+    // parks and NOTHING earns until a validated receipt arrives; silence
+    // never fabricates content (distinct from a fault: no latch, no veto).
+    let session_path = "local://legit-silent";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-ls", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    let outcome = shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "organic_earn" },
+        Some(attempt_id.as_str()),
+    );
+    assert!(matches!(outcome, TerminalReadyOutcome::ContentPending));
+    assert!(shell.terminal_pending_content_claims.contains_key(session_path));
+    assert!(!shell.terminal_session_host_has_painted(session_path));
+    let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+    assert!(attempt.ready_at_ms.is_none());
+    assert!(attempt.latched_failure_reason.is_none(), "silence is not a fault");
+}
+
+#[test]
+fn earned_witness_and_sticky_ready_survive_attempt_churn() {
+    // lock (e): the witness and the sticky ready history survive attempt
+    // churn at the SAME epoch (the s46 pin: cleared only on epoch bump or
+    // render-state drop); a genuine later fault still vetoes through the
+    // raise-safety trio — here the survival half is pinned.
+    let session_path = "local://churn-sticky";
+    let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+    let mut shell = ShellState::new(bootstrap);
+    let attempt_a = shell.begin_terminal_open_attempt(session_path, "req-ca", 1, "open_row");
+    shell.terminal_mount_epochs.insert(session_path.to_string(), 1);
+    shell.arm_terminal_applied_content(session_path, 1, 0);
+    shell.record_terminal_applied_content(
+        session_path,
+        TerminalAppliedContentRecord {
+            mount_epoch: 1,
+            runtime_spawn_id: 0,
+            wrote: 349,
+            blank: false,
+            ts: current_millis(),
+            page_gen: 1,
+            source: "reattest_probe",
+        },
+    );
+    shell.complete_terminal_open_attempt_ready(
+        session_path,
+        TerminalReadyClaim::Content { reason: "organic_earn" },
+        Some(attempt_a.as_str()),
+    );
+    let _attempt_b = shell.begin_terminal_open_attempt(session_path, "req-cb", 1, "open_row");
+    assert!(shell.terminal_session_host_has_painted(session_path));
+    assert!(shell.terminal_session_was_ever_ready(session_path));
+}
+
+#[test]
+fn the_applied_content_probe_refuses_a_husk_entry() {
+    // lock (b) ingress half (sol s47 Q1: the ln-646 measured class —
+    // entry_live:true + was_husk:true + a receipt coexist through teardown
+    // transients). The probe verdict must carry was_husk and the stage gate
+    // must require was_husk === false BEFORE the receipt reaches the door.
+    let script = terminal_applied_content_probe_script("host-m1");
+    assert!(script.contains("lastVisiblePaintWasHusk"));
+    assert!(script.contains("was_husk"));
+    let source = include_str!("viewport.rs");
+    let gate = source
+        .find("THE ISSUER'S OWNERSHIP CHECK")
+        .expect("the husk gate exists in stage_applied_content_probe");
+    let window = &source[gate..];
+    let check = window
+        .find("!= Some(false)")
+        .expect("the strict non-husk check");
+    let door = window
+        .find("record_terminal_applied_content")
+        .expect("the door call");
+    assert!(
+        check < door,
+        "the husk check must run BEFORE the receipt reaches the door",
+    );
+}
+
 #[test]
 fn a_foreign_epoch_or_runtime_receipt_never_promotes() {
     // sol R6: the tuple arms — one mismatch must not be masked by another.
@@ -61232,8 +61467,11 @@ fn an_arm_after_an_epoch_bump_retires_the_dead_tuples_parked_state() {
         },
     );
     assert!(outcome.accepted);
-    assert!(!outcome.promoted, "no dead state left to promote");
-    assert!(!shell.terminal_session_host_has_painted(session_path));
+    // [i-r2 L2 sol s47 Q1] the retirement cleared the DEAD tuple's state;
+    // the fresh epoch-2 receipt itself QUALIFIES, so the organic earn fires
+    // and the witness advances — retirement and earning are independent.
+    assert!(outcome.promoted, "the fresh receipt earns the witness");
+    assert!(shell.terminal_session_host_has_painted(session_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -61362,7 +61600,11 @@ fn attempt_churn_voids_the_dead_attempt_s_parked_claim() {
         },
     );
     assert!(outcome.accepted);
-    assert!(!outcome.promoted, "A's retired claim must not promote B");
+    // [i-r2 L2 sol s47 Q1] A's retired claim still never completes B — but
+    // the receipt is genuine content for the CURRENT mount, so the WITNESS
+    // earns (attempt-independent by design). B stays unready until B
+    // claims on its own — the assertion below is the churn-void guarantee.
+    assert!(outcome.promoted, "the witness earns; attempts are not promoted");
     assert!(!shell.terminal_session_has_ready_attempt(session_path));
     // B's own claim completes against the SAME stored receipt:
     let b = shell.complete_terminal_open_attempt_ready(
@@ -61529,7 +61771,10 @@ fn the_promotion_drops_a_claim_that_names_a_dead_attempt() {
         },
     );
     assert!(outcome.accepted, "the receipt itself stays valid");
-    assert!(!outcome.promoted, "a dead-attempt claim never promotes");
+    // [i-r2 L2 sol s47 Q1] the dead-attempt claim never completes an
+    // ATTEMPT — but the valid receipt earns the witness (the earn is
+    // attempt-independent; only the claim's completion was refused).
+    assert!(outcome.promoted, "the witness earns; the dead claim does not");
     assert!(!shell.terminal_session_has_ready_attempt(session_path));
     assert!(!shell.terminal_resume_ready_paths.contains(session_path));
     assert!(!shell.terminal_pending_content_claims.contains_key(session_path));
@@ -61682,9 +61927,11 @@ fn a_runtime_replacement_with_a_stable_epoch_retires_the_old_expectations_state(
 
 #[test]
 fn an_accepted_receipt_with_nothing_parked_promotes_nothing() {
-    // sol s28 Q3: `promoted == false` is LEGAL for an accepted receipt with
-    // nothing parked — the old single bool could not serve as an acceptance
-    // flag, which is exactly why the seed paint gate now reads `accepted`.
+    // sol s28 Q3, as reshaped by [i-r2 L2 sol s47 Q1]: `accepted` remains
+    // the acceptance flag the seed paint gate reads — but a QUALIFYING
+    // receipt with nothing parked now EARNS THE WITNESS (the organic earn),
+    // so `promoted == true` here. What nothing-parked still never does is
+    // complete an ATTEMPT: no claim, no ready mark.
     let session_path = "remote-session://dev/accepted-unpromoted";
     let bootstrap = test_shell_bootstrap_with_active_session(session_path);
     let mut shell = ShellState::new(bootstrap);
@@ -61704,9 +61951,18 @@ fn an_accepted_receipt_with_nothing_parked_promotes_nothing() {
         },
     );
     assert!(outcome.accepted, "the tuple matches: the receipt is stored");
-    assert!(!outcome.promoted, "nothing was parked — nothing promotes");
+    assert!(
+        outcome.promoted,
+        "the organic earn fires: the witness advances with nothing parked",
+    );
     assert!(shell.terminal_session_applied_receipt_qualifies(session_path));
-    assert!(!shell.terminal_session_host_has_painted(session_path));
+    assert!(shell.terminal_session_host_has_painted(session_path));
+    assert!(
+        shell
+            .latest_terminal_open_attempt_for_path(session_path)
+            .is_some_and(|attempt| attempt.ready_at_ms.is_none()),
+        "no claim means no ATTEMPT promotion — the earn is witness-only",
+    );
 }
 
 

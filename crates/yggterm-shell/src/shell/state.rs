@@ -29836,7 +29836,7 @@ impl ShellState {
         self.terminal_sessions_painted.insert(session_path.to_string());
         true
     }
-    fn terminal_session_host_has_painted(&self, session_path: &str) -> bool {
+    pub(crate) fn terminal_session_host_has_painted(&self, session_path: &str) -> bool {
         self.terminal_sessions_painted.contains(session_path)
     }
 
@@ -29965,7 +29965,7 @@ impl ShellState {
     /// was earned under; the expected tuple's runtime — when named — must
     /// match. An unknown expected runtime is unresolved, not a wildcard:
     /// the epoch binds.)
-    fn terminal_session_applied_receipt_qualifies(&self, session_path: &str) -> bool {
+    pub(crate) fn terminal_session_applied_receipt_qualifies(&self, session_path: &str) -> bool {
         let Some(current_epoch) = self.terminal_mount_epochs.get(session_path) else {
             return false;
         };
@@ -30126,12 +30126,28 @@ impl ShellState {
                 }
             }
         }
-        if self.terminal_sessions_paint_pending.remove(session_path) {
-            self.note_terminal_session_painted_for_mount_epoch(
-                session_path,
-                current_epoch,
-            );
-            promoted = true;
+        // [i-r2 L2 sol s47 Q1] THE ORGANIC EARN: the witness advances on a
+        // VALIDATED receipt even when no Paint event ever armed
+        // paint_pending — the measured s47 starve (paint sends attempted
+        // page-side, ZERO delivered to Rust, a qualified receipt sitting in
+        // the page entry observable only over the eval-return leg). The
+        // husk exclusion lives at the INGRESS (the probe refuses a husk
+        // entry; the pushed receipt's issuer is the write callback of a
+        // connected term; the seed proof constructs one); here the
+        // epoch/tuple validation above IS the qualification. Idempotent: an
+        // already-earned witness re-earns nothing and no duplicate
+        // acceptance can re-promote; the pending marker is cleared as
+        // cleanup in every qualified arm.
+        if self.terminal_session_applied_receipt_qualifies(session_path) {
+            let was_pending = self.terminal_sessions_paint_pending.remove(session_path);
+            if !self.terminal_session_host_has_painted(session_path) {
+                self.note_terminal_session_painted_for_mount_epoch(
+                    session_path,
+                    current_epoch,
+                );
+                promoted = true;
+            }
+            let _ = was_pending;
         }
         TerminalAppliedContentOutcome {
             accepted: true,
