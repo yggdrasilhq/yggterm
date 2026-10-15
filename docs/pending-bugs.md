@@ -39,18 +39,42 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   half-handshake site, the [11.229](c) blank shape, the first-spawn-blank
   readings beside [11.226]. ((a) left this family 2026-10-07 — measured
   as the [11.228] grid-divergence reuse arm, closed in F3.) THE WARM-GATE
-  VANISH INTERMITTENT (measured s47, OPEN): warm_eval_vanish_redo_cold
-  {decision: pipeline_alive_eval_lost, waited_ms: 1204, probe_count: 1}
-  fires on HEALTHY fresh mounts under load — measured 2/3 fence-order
-  runs on DEPLOYED MAIN 1d018bf8f875 and 6/6 on the s47 lane
-  (build-independent; the s45/s46 single green rolls were luck). The redo
-  mid-stall merges the stall-window chunks (one 186B batch vs 131+50),
-  raises the seed's output_seq over the retained batch, and routes
-  delivery through the (e-r1) covered-drop instead of a flush —
-  fence-order's evidence bar now accounts both routes (s47 revision; the
-  exactly-once ordering bar itself held 7/7). The alive-record-ABSENT
-  read on a live mount is the next F1 attack surface (the s32/33
-  transport ledger instruments apply directly). ATTACK: LANDED 2026-10-05 (3042a0d6, lane
+  VANISH INTERMITTENT — ROOT-CAUSED + FIXED 2026-10-15 (s50,
+  lane/f1/alive-match-keying 14d260af): the conviction was a KEYING BUG,
+  not a shed eval — the s47 "alive-record-ABSENT read" framing is dead.
+  The [11.178]-c2 liveness poll matched the mount record's attempt
+  against the PAGE-WIDE __yggtermMountDispatchedAttempt mirror, and any
+  second mount's dispatch bump convicted every other concurrently-alive
+  mount (build-independent 2/3 main + 6/6 s47 lane because concurrent
+  dispatches are the precondition). The surviving s47 trace held the
+  decisive rows (A attempt=1/dispatched=2/stage=posted convicted; B
+  attempt=2/dispatched=2 matched — last-dispatched wins) and the s50 arms
+  upgraded sol's who-bumped attribution caveat to per-row proof (the
+  convicted host's own record carried ITS attempt while the mirror
+  carried the other mount's). sol s50 HIGH
+  (lores/chain-of-thought/2026-10-15-yggterm-s50-alive-match-sol.md):
+  Q1/Q2/Q4/Q5 accept, Q3 defer. FIX: both dispatch shapes (warm invoke +
+  cold tail) also write __yggtermMountDispatchedByHost[host]=attempt
+  (one attempt value, no intervening await); the poll matches within the
+  HOST's scope — a missing entry is unverified liveness (the
+  record-absent recovery path) and the page-wide mirror is never a
+  fallback; the fn body is untouched (no TERMINAL_MOUNT_FN_VERSION bump,
+  no forced cold reinstalls); the entry supersede guard stays page-wide
+  (sol Q3 DEFER — this fixes false liveness convictions, not all
+  concurrent-mount supersession; a cross-host entry abort remains
+  observable and unmeasured). DIFFERENTIAL (fence-order ×3 per binary,
+  rig rc 0 all six): main absent=3/false=3/redo_lost=3/shed=3 — every
+  run convicted exactly one healthy posted mount; lane
+  absent=0/false=0/redo=0/shed=5 — every poll matched, ZERO redos, the
+  s47 redo side effects (stall-window chunk merges, seed output_seq
+  raise, covered-drop routing) disappear with the convictions, and the
+  [11.217] synthesis arm (the lost-first-ready control sol Q5 asked
+  for) kept delivering (VERDICT FENCE-ORDERING 3/3 on the lane). Locks:
+  both shapes stamp the per-host map (count==2, source form), the poll
+  reads it and must NEVER reference the page-wide mirror, the warm
+  invoke keys by its dispatch host. The s47 fence-order evidence-bar
+  revision stands (the covered-drop route remains legal for real
+  recovery). ATTACK: LANDED 2026-10-05 (3042a0d6, lane
   lane/f1/synthesize-full-contract) — on matched-stage-posted the FULL
   contract now rides the ONE transport measured alive through the shed
   window (fresh document::eval + return): off-loop daemon screen snapshot
@@ -1518,10 +1542,13 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   disarmed; the claim-independent arm is lock-proven + measured in the
   s47 starve trace). fences order/dup/swap rc 0 (order's evidence bar
   revised to account the covered-drop route — see the F1 vanish
-  intermittent above; the ordering bar itself held 7/7). STILL OPEN IN
-  THIS FAMILY: the F1(c) Paint loss site; the warm-gate vanish
-  intermittent. ((e-r2) CLOSED 2026-10-15 measured-safe — premise
-  falsified; see its record.)
+  intermittent above; the ordering bar itself held 7/7). NO LONGER OPEN
+  IN THIS FAMILY: the F1(c) Paint loss site CLOSED s49 measured-safe
+  (premise falsified — the witness guard's initialization, not the
+  transport); the warm-gate vanish intermittent CLOSED s50 root-caused
+  + fixed (cross-host mirror bumps — see the F1 families entry).
+  ((e-r2) CLOSED 2026-10-15 measured-safe — premise falsified; see its
+  record.)
 - **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
