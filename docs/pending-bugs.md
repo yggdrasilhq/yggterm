@@ -3431,6 +3431,44 @@ uxprobe `switch` on the rotated build reports
 activation→first_frame p50 ≤150 ms net (first_frame_ms − activation_ms),
 settle complete ≥7/8, zero accuracy failures.
 
+S51 DECOMPOSITION + THE HEAL-DUPE FIX (2026-10-15 ~23:0x-00:5x IST, zcode
+seat): paint_reveal_ms decomposed into TWO legs, both measured (s50 report
+re-read + fresh s51 re-run on deployed b07f3c79, same harness): Leg A
+activation->reveal_served p50 ~160ms (EMPTY trace windows — the dioxus
+render pass reaching the raise decision; component_window root_renders=16
+at the boundary) and Leg B reveal_served->paint_reveal p50 ~320ms (NOT
+eval transport: the +1ms page cascade is repaintActiveEntry(:now, heavy)
+-> redrawTerminal — atlas clear + full refresh + canvas ink sampling —
+whose own requestVisiblePaint(true) arms the visible-paint funnel, which
+re-runs clearTerminalTextureAtlas + term.refresh ~1ms later; the
+ui.block family itself reads gap_ms=215/219 inside the silent stretch;
+frame_window carries 4-5 full_canvas_frames for ONE staleness event; the
+scheduled :120ms pass is a THIRD full heal). THE STAMP IS
+MEASUREMENT-ONLY: rows_painted=48 lands at the ~+215-330ms resume
+cluster — content is truly visible there; the 577ms stamp p50 overcounts
+felt latency. LANDED (lane/f7/reveal-heal-dedupe d8dc6db6, merged main
+bb8b0173): the shared lastAtlasHealAtMs clock + the funnel-side 50ms
+just_healed dedupe (the demand is CONSUMED via the named skip, not
+re-armed; the partial glyph-gap heal deliberately never stamps);
+TERMINAL_MOUNT_FN_VERSION 4->5 (the fn-body law); heal_dedupe_age_ms on
+both perf events; lock
+the_visible_paint_funnel_dedupes_a_just_completed_atlas_heal + the
+throttle-lock needle extended. Suites shell 2308/0 + server 1685/0
+no-fail-fast. RIG LAW DISCOVERED THE HARD WAY: a lane GUI run from a
+non-install path (/tmp target) SELF-HEALS to the registry install — the
+GUI spawns the DEPLOYED build's daemon AND a second GUI from the deployed
+build; three "lane" runs measured the deployed binary (fn length
+identical, fnV=4 after the bump to 5 gave it away). A GUI-class lane
+differential goes through ygg-ci deploy (this lane) or an install-layout
+dir. OWED HERE: the post-deploy differential (forced_refresh per warm
+switch should drop to the redraw's own pass; ui.block gap and
+paint_reveal_ms should shrink by the removed pass) + the sol consult
+(staged, juju-capped: lores/chain-of-thought/
+2026-10-15-yggterm-s51-reveal-stamp-sol.md) on Leg A (earlier raise
+decision vs render cost), the :120ms pass design, and the probe's
+paint-end pairing predicate (the first frame_gap's rows_painted=1 makes
+first-frame pairing gameable).
+
 PROGRESS 2026-09-27 ~04:20 IST (switch-raise lane, leg 1 LANDED, fix
 direction corrected by event-resolution measurement): the dominant leg is
 NOT the construction — it is the ~513 ms main-thread PARSE of the
