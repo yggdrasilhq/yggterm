@@ -1289,15 +1289,63 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   the_exhaustion_park_break_arms_its_own_remount,
   the_budget_exhausted_degrade_posts_the_honest_stopped_surface + the
   LEG C bound 3..=5. Suites: shell 2293/0 (2291 + 2) no-fail-fast;
-  fence order/dup/swap on the lane build. STILL OPEN IN THIS FAMILY:
-  (1) the creation-churn SURVIVAL arm (sol Q4: punch+bootstrap recovery
-  is measured working, but the s15 BackgroundTrickle guarantee — buffers
-  current BEFORE reveal — dies with the loop; survival is still owed
-  unless the owner re-cuts the guarantee; fix the lifetime boundary
-  that cancels the retained row's task, stable component identity is
-  the smaller design, NOT a detached tokio task); (2) the alive-loop
-  evidence-less claim bound (above); (3) (e-r2) repaint cursor
-  restoration (untouched).
+  fence order/dup/swap on the lane build.
+  (i-r2) SURVIVAL ARM CLOSED 2026-10-15 (sitting 46, lane
+  lane/i2/churn-identity 6875bc33; sol round node
+  lores/chain-of-thought/2026-10-15-yggterm-s46-churn-identity-sol.md,
+  gpt-6.1-sol HIGH 220k): THE ROOT CAUSE IS STRUCTURAL, NOT LIFETIME
+  POLICY — MainSurface's retained-terminal for-loop wrapped its rsx in
+  an extra expression block (`for { { locals; rsx!{...} } }`), so every
+  list child was an UNKEYED wrapper (dioxus-rsx 0.7.10's template root
+  is the raw block; the key inside the nested rsx is invisible to the
+  list diff). A sibling row's CREATION prepends to the live order
+  ([a] -> [b,a]); dioxus diffs the unkeyed children POSITIONALLY —
+  grows a fresh tail instance (bootstrap_reset on the demoted row at
+  the SAME epoch 1 + bootstrap_spawn_skipped_inactive_retained_host),
+  then diffs index 0 and destroys the old instance
+  (terminal_mount_task_dropped remount_armed:false exit_hint:pre_select)
+  — cancelling the render-spawned mount loop. The trace ordering
+  (fresh a -> fresh b -> old a dropped, NO epoch bump, NO retention
+  eviction) is the fingerprint sol s46 Q1 predicted (rebut: c2 the
+  unkeyed wrapper, NOT the sync-sweep eviction the seat's recon
+  hypothesized — the epoch staying 1 killed that hypothesis). THE FIX
+  (sol Q3 f4): the iteration root IS the keyed div —
+  `.iter().cloned().map(|session| { locals; rsx!{ div { key } } })` —
+  at the retained-terminal loop AND the pinned-web-pane loop (same
+  shape, same mechanism; the split-divider loop left as the noted
+  same-shape residue). No retention/sweep/lifetime changes; the KDE
+  limit-to-active policy, the s15 punch, the fences and LEG C
+  untouched. RIG tools/uxspeed/i2c-rig.sh (hermetic, exe-proofed):
+  RED rc6 on deployed main 1296a65b (drops=1 pre_select + the pair,
+  refused raise loop_live:false); GREEN rc0 x2 on the lane (drops=0
+  resets=0, BAR-T trickle-to-demoted-row green, BAR-P typing green);
+  fences order/dup/swap rc 0; shell suite 2293/0 no-fail-fast. RIG
+  HONESTY (sol Q4, applied): SPLIT markers (printf-concatenated — the
+  typed echo can never satisfy the contiguous-marker bar) + asserted
+  absent before the churn; BAR-D asserts the INSTANCE claim only;
+  BAR-T carries its non-discriminating caveat IN THE RIG (a remount
+  re-seeds from the daemon screen too); BAR-R is INFORMATIONAL (see
+  the residual below). RESIDUAL FILED (separate stacked defect,
+  measured + root-caused this sitting, NOT fixed): the re-select fast
+  raise still refuses after a churn — three layers: (a) the birth
+  open-attempt of an app-control-created row sits Pending forever (no
+  ready observation reaches background rows — describe_state polls
+  only); (b) the churn's bootstrap-skip cancel
+  (cancel_terminal_open_attempt_for_inactive_session) legally converts
+  that Pending attempt to LATCHED FAILURE — its ready-latch
+  (ready_on_inactive_cancel_host_already_live) cannot fire because the
+  organic PAINT WITNESS never advances (zero Paint JsEvents reach the
+  witness site on organic cold mounts — the witness only advances
+  through the Q7 applied-content paths, and the promotion at
+  applied_content_promoted{promoted:false} leaves paint_pending
+  unarmed); (c) the raise predicate reads the latched failure as the
+  retained-fault lane owning the row -> refuse -> full bootstrap that
+  supersedes the now-surviving loop
+  (bootstrap_owner_superseded_during_loop). Fix layer TBD (attempt
+  observation for background rows vs the witness's organic advance vs
+  the raise's veto) — sol first. STILL OPEN IN THIS FAMILY: (1) the
+  residual above; (2) (e-r2) repaint cursor restoration (untouched);
+  the alive-loop evidence-less claim bound CLOSED s45 unit 2.
   (i-r3) LONG-TERM: sol's owner-backed attach transaction (ContentReady
   only on a JS ack of applied cursor+buffer; one bounded reconstruction
   then an explicit failure surface). RIG LAWS (measured this sitting):
