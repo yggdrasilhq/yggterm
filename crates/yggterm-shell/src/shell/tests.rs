@@ -17750,10 +17750,11 @@ console.log('ok');
         );
         let armed = viewport.matches("mount_task_guard.arm_remount.set(true)").count();
         assert!(
-            armed >= 3 && armed <= 4,
-            "the bridge-death breaks plus the [F1-(h2)] env-gated test hook \
-             arm the remount — supersede and ensure-error exits must NOT (a \
-             successor exists / the host is genuinely unreachable)"
+            armed >= 3 && armed <= 5,
+            "the bridge-death breaks, the [F1-(h2)] env-gated test hook, and \
+             the (i-r2 s45) exhaustion park-break arm the remount — supersede \
+             and ensure-error exits must NOT (a successor exists / the host is \
+             genuinely unreachable)"
         );
         // [F1-(h2)] The surface-remount test hook: one-shot per process,
         // fired only on a quiesced drain (zero new chunks after applied
@@ -42977,6 +42978,49 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             attempt.rearm_count, 1,
             "the remount budget is consumed by genuinely stuck attempts"
+        );
+    }
+
+    /// (i-r2 s45) The remote exhaustion park-break is a NAMED death that WANTS
+    /// a restart: the break arms its own remount on the drop guard instead of
+    /// leaving the row to a witnessed-death watchdog tick. Wiring lock — the
+    /// set must sit inside the exhaustion arm, immediately before its break.
+    #[test]
+    fn the_exhaustion_park_break_arms_its_own_remount() {
+        const NEEDLE: &str = "(i-r2 s45) This break is a NAMED death that WANTS a";
+        assert!(
+            SHELL_SOURCE.contains(NEEDLE),
+            "the exhaustion park-break lost its keep-alive arm"
+        );
+        let arm = SHELL_SOURCE
+            .find(NEEDLE)
+            .map(|at| &SHELL_SOURCE[at..])
+            .unwrap_or("");
+        let set_at = arm.find("mount_task_guard.arm_remount.set(true);");
+        let break_at = arm.find("terminal read failed after attach");
+        assert!(
+            set_at.is_some() && break_at.is_some() && set_at.unwrap() < break_at.unwrap(),
+            "the arm must be set inside the exhaustion arm, before the break"
+        );
+    }
+
+    /// (i-r2 s45) At remount-budget exhaustion the ladder's stale "Retrying"
+    /// Warning is a lying surface — NOTHING retries until the spend window
+    /// rolls, and the measured s45 shape froze the row under that stale
+    /// Warning for the whole window. The degraded arm must post the honest
+    /// stopped-state notification.
+    #[test]
+    fn the_budget_exhausted_degrade_posts_the_honest_stopped_surface() {
+        const NEEDLE: &str = "terminal_mount_loop_stale_degraded";
+        let at = SHELL_SOURCE
+            .find(NEEDLE)
+            .expect("the degrade trace exists");
+        let arm = &SHELL_SOURCE[at..];
+        assert!(
+            arm.contains("Terminal Restore Stopped")
+                && arm.contains("could not restore this row's live view automatically")
+                && arm.contains("NotificationTone::Error"),
+            "the exhausted arm must post the honest RecoveryStopped surface"
         );
     }
 

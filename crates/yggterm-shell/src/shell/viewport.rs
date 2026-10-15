@@ -17811,6 +17811,16 @@ fn TerminalCanvas(
                                     });
                                     maybe_spawn_missing_remote_machine_refreshes(state);
                                     maybe_spawn_missing_managed_cli_refreshes(state);
+                                    // (i-r2 s45) This break is a NAMED death that WANTS a
+                                    // restart: the read stream died after attach, the
+                                    // content claim is parked, and the row's keep-alive
+                                    // IS the remount. Arm it here so the drop guard
+                                    // restarts immediately under the same budget check,
+                                    // instead of leaving the row to a witnessed-death
+                                    // watchdog tick (measured s45 on main: ~4s; this
+                                    // makes the restart by-design rather than witnessed,
+                                    // and independent of the attempt-entry gate).
+                                    mount_task_guard.arm_remount.set(true);
                                     warn!(session=%session_path, error=%error, "terminal read failed after attach");
                                     break;
                                 }
@@ -21014,6 +21024,22 @@ fn ensure_terminal_loop_watchdog(mut state: Signal<ShellState>) {
                             "budget": TERMINAL_LOOP_REMOUNT_BUDGET,
                             "window_ms": TERMINAL_LOOP_REMOUNT_WINDOW_MS,
                         }),
+                    );
+                    // (i-r2 s45) The honest end state: the ladder's Warning
+                    // says "retrying the restore", and with the budget spent
+                    // NOTHING retries until the spend window rolls — leaving
+                    // that notification up is the lying surface (measured s45:
+                    // the row freezes under a stale "Retrying" for the whole
+                    // window). Say what happened and what to do. A later
+                    // remount overwrites this with its own notification; a
+                    // successful attach clears it (the standing upsert/clear
+                    // machinery).
+                    upsert_terminal_resume_notification(
+                        state,
+                        &session_path,
+                        NotificationTone::Error,
+                        "Terminal Restore Stopped",
+                        "Yggterm could not restore this row's live view automatically. Select the row to retry.",
                     );
                 }
             }
