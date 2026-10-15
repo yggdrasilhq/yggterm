@@ -821,14 +821,18 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   a_qualifying_stored_receipt_releases_the_latch_instead_of_parking,
   the_reattest_shape_promotes_a_parked_claim_from_re_read_evidence,
   the_probe_decoder_abstains_on_a_null_receipt_and_keeps_blank_
-  evidence. LOOP-DEAD ARM FILED OPEN (sol s35 Q3 option b): the
-  exhaustion park (attach_complete_latch, viewport.rs ~17522) parks
-  then BREAKS the mount loop — its re-attest depends on a future
-  remount arming the probe; ownership boundary per sol: THIS wedge
-  owns scheduling reads of existing evidence + validation routing,
-  (i-r2) owns loop survival/restart. The sitting's claim is exactly:
-  alive-loop idle re-attestation fixed; loop-dead re-attestation
-  remains open.
+  evidence. LOOP-DEAD ARM CLOSED BY MEASUREMENT 2026-10-15 (sitting 45,
+  lane lane/i2/loop-survival): the exhaustion park+break's loop
+  survival/restart is (i-r2)'s and is now MEASURED LIVE end to end — see
+  the (i-r2) attack state below: the break drops the task, the
+  witnessed-death watchdog remounts within one 5s tick (measured 3.4-3.8s),
+  the successor re-attaches and re-earns its own readiness (a new attempt
+  RETIRES the parked claim by the [e-r8] begin-retires design — no pending
+  claim exists on the natural path anyway: a painted row's stored receipt
+  qualifies at its current epoch, so the park is a latch-release). The
+  break now also ARMS ITS OWN REMOUNT (the (i-r2) lane): the restart is
+  by-design, instant, still budget-checked. sol s45 round node:
+  lores/chain-of-thought/2026-10-15-yggterm-s45-i2-loop-survival-sol.md.
   (e-r10) PAGE_GEN — RESOLVED AS TELEMETRY BY MEASUREMENT 2026-10-11
   (sitting 35 unit 2, lane lane/e10/page-gen-comparison; sol round
   node lores/chain-of-thought/2026-10-11-yggterm-s35b-page-gen-sol.md):
@@ -883,15 +887,16 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   "fetch failed / old daemon" alone; the daemon boundary now names
   the conflation + the safety contract; the test comment follows) —
   sol's standing "correct the misleading comment" instruction from
-  s23 R5. RESIDUE RE-FILED under (i-r2)'s family: sol's remaining
-  demand ("missing/failed evidence needs bounded retry/recovery or
-  an explicit failure resolution") reduces to the attempt-level
-  bound for a parked claim with NO evidence source and NO output
-  ever — the same policy family as (e-r9)'s loop-dead arm and
-  (i-r2)'s keep-alive (a claim parked on an evidence-less mount
-  waits today until a real write, the probe abstaining correctly —
-  whether the ATTEMPT needs its own bounded failure resolution is
-  the open question, owned with (i-r2)).
+  s23 R5. RESIDUE NARROWED BY THE S45 MEASUREMENT (sitting 45): the
+  DEATH-side bound is closed — a parked claim never survives a death
+  (begin retires it; the successor re-earns), and the budget-exhausted
+  end state now posts the honest RecoveryStopped notification (the s45
+  lane) instead of the stale "Retrying" lie. The ALIVE-loop bound stays
+  OPEN with (i-r2): a claim parked on an evidence-less mount on a LIVING
+  loop waits until a real write (the probe abstains correctly) — whether
+  that attempt needs its own bounded failure resolution is still the open
+  question (sol s45 Q3: the deadline must cover this case; the remount
+  budget cannot, because no further deaths need occur).
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
@@ -1243,6 +1248,46 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   creation-churn window only (a row demoted by a sibling's creation
   loses its loop's read trickle + pays the bootstrap on re-select —
   the BackgroundTrickle intent is violated exactly there);
+  (i-r2) ATTACK STATE 2026-10-15 (sitting 45, lane lane/i2/loop-survival;
+  sol round node lores/chain-of-thought/2026-10-15-yggterm-s45-i2-loop-
+  survival-sol.md, gpt-6.1-sol HIGH 67.6k): THE MEASUREMENT (i2-rig on a
+  real remote-agy row, oc PTY, deployed main f20d21b9): injected read
+  errors post-attach → the recovery ladder (2 sweeps, ~30s per attempt) →
+  the remote exhaustion arm parks (attach_complete_latch; NO pending
+  claim on the natural path — the painted row's receipt qualifies, the
+  park is a latch-release; sol s45's flagged trap confirmed) → break →
+  drop (exit_hint read_poll_apply, remount_armed false) → the
+  witnessed-death watchdog detects in 3.4-3.8s (one 5s tick; the arm has
+  no death-age threshold, it is the TICK that sets the floor) → remount
+  armed (budget 1/3 spent per cycle) → successor re-attaches ~30s later;
+  a fault clearing MID-LADDER heals the same loop in place (attempt
+  counter resets on the next successful read — measured, zero further
+  events). THE CHAIN SELF-HEALS WITHOUT USER ACTION: there is NO
+  missing-restart defect (sol Q1's rebut CONFIRMED; the s44-class
+  manufacturing of a RED for a latency change avoided). THE TWO REAL
+  DEFECTS, FIXED IN THE LANE: (a) the break now arms its own remount
+  (drop guard, budget-checked) — the restart is by-design, not
+  witnessed; the [11.187] LEG C law lock extended to the third
+  legitimate class (deliberate park-break: no successor exists, host
+  not unreachable). (b) THE SURFACE LIE at budget exhaustion: the
+  ladder's Warning ("retrying the restore") stays up through the whole
+  spend window while NOTHING retries — the degraded arm now posts the
+  honest Error notification ("Terminal Restore Stopped — could not
+  restore this row's live view automatically. Select the row to
+  retry."), overwritten by a later remount's own notification, cleared
+  by a successful attach (the standing upsert/clear machinery). LOCKS:
+  the_exhaustion_park_break_arms_its_own_remount,
+  the_budget_exhausted_degrade_posts_the_honest_stopped_surface + the
+  LEG C bound 3..=5. Suites: shell 2293/0 (2291 + 2) no-fail-fast;
+  fence order/dup/swap on the lane build. STILL OPEN IN THIS FAMILY:
+  (1) the creation-churn SURVIVAL arm (sol Q4: punch+bootstrap recovery
+  is measured working, but the s15 BackgroundTrickle guarantee — buffers
+  current BEFORE reveal — dies with the loop; survival is still owed
+  unless the owner re-cuts the guarantee; fix the lifetime boundary
+  that cancels the retained row's task, stable component identity is
+  the smaller design, NOT a detached tokio task); (2) the alive-loop
+  evidence-less claim bound (above); (3) (e-r2) repaint cursor
+  restoration (untouched).
   (i-r3) LONG-TERM: sol's owner-backed attach transaction (ContentReady
   only on a JS ack of applied cursor+buffer; one bounded reconstruction
   then an explicit failure surface). RIG LAWS (measured this sitting):
@@ -1689,6 +1734,11 @@ CLIENT halves that still recur on healthy rows.
   bounded ladder; the REMOTE established branch stays
   unconstructible locally — the s20 rig v5b remote-row pattern pointed
   at a live remote target is the OWED construction bar, named).
+  DELIVERED 2026-10-15 (sitting 45): tools/uxspeed/i2-rig.sh — the remote
+  established branch constructed on a REAL remote-agy row (oc owns the
+  PTY; fresh scratch home + machine graft + Xvfb :80; the
+  READ_ERROR_FILE hook armed-absent at boot, created mid-flight): the
+  full chain measured (see the (i-r2) attack state).
   Shape-locked by established_frame_read_error_hold_is_bounded_and_
   escalates (predicate edges + the fall-through wiring + the streak
   resets). PROOF LEVEL (the (c)/(f2)/(h2) precedent): landed in code +
