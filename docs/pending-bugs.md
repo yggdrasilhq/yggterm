@@ -1745,10 +1745,13 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   bar, [11.172] switch remount cost (the RAISE PROVEN 6/6 on deployed
   53b2db5f 2026-10-15 — see its record; the residual is the reveal-stamp
   delivery leg, paint_reveal_ms p50 ≈ 577 ms), the close/teardown
-  family. RE-DERIVATION STARTED 2026-10-15 (s50): the first wedge-free
-  switch baselines are in ([11.172]'s record); [11.215]'s appear-over
-  bar and the close/teardown family still need fresh runs on the
-  dev-local harness.
+  family. S52 (2026-10-16): the light-pass dedupe + warm-switch ink bypass
+  LANDED (clears/switch 4->1 counter-proven on the dev harness, dwell
+  switch garble-free at pixels; ui.block <150ms NOT met — the one-heal
+  cost remains, see [11.172]'s record) and the paint metric's
+  quiet-switch gap is filed (frame_full event = the next unit);
+  [11.215]'s appear-over bar and the close/teardown family still need
+  fresh runs on the dev-local harness.
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
@@ -3491,6 +3494,61 @@ reveal_served (stamp demotes to accuracy-only). NEXT SESSION: the
 light-pass dedupe unit (Q2's shape, falsifier: forced clears per warm
 switch 4->1, ui.block max < 150ms, zero garble on the
 switch-after-idle-dwell bar) + the probe pairing predicate.
+
+S52 LIGHT-PASS DEDUPE + WARM-SWITCH INK BYPASS + Q4 PAIRING (2026-10-16
+~01:3x-03:4x IST, zcode jojo seat): the s51 residual (felt p50 567 vs 577)
+was the CHURN TRAIN the standby consult named — repaintActiveEntry's light
+:raf/:120/:360 passes each cleared + re-refreshed the whole viewport right
+behind the heavy :now heal (four full-viewport clears per warm switch),
+and redrawTerminal sampled canvas ink before AND after every redraw (up to
+~384 one-pixel getImageData calls = a synchronous GPU pipeline sync inside
+the churn). LANDED (lane/f7/light-pass-dedupe 1a691ffe, merged main
+8967dca5, deployed 03:05:48): the light passes dedupe behind an
+ENTRY-LEVEL mirror of the heal clock (entry.lastFullHealAtMs, window
+ACTIVATION_LIGHT_HEAL_DEDUPE_MS=400 — covers the 360ms schedule + timer
+slop) stamped by every full-heal site (redrawTerminal, the forced-refresh
+funnel, the stale-atlas rAF-gap heal) and by a light heal that runs; the
+cold reveal's late-content heal (pendingRevealDaemonRepaint) rides
+redrawTerminal and is NOT suppressible by the window. The activation-class
+redraws (active_session_switch|window_foreground) skip BOTH ink samples;
+a skipped sample reports 'ink_skipped_activation', never an ink verdict.
+uxprobe pairs the raise's paint truth with the FIRST full-coverage
+xterm_render frame at/after reveal_served (frame_gap point ts primary;
+frame_window flush fallback, source-labeled paint_source; the stamp
+demotes to ACCURACY-ONLY — no proven frame means NO timestamp + an acc
+note, never the stamp's lie). TERMINAL_MOUNT_FN_VERSION 5->6; locks
+the_activation_light_passes_dedupe_behind_the_entry_heal_mirror +
+the_full_heal_sites_mirror_the_heal_clock_onto_the_host_entry +
+redraw_terminal_skips_ink_sampling_on_activation_reasons (the s51
+count-of-2 closure-clock law preserved). Suites shell 2311/0 + server
+1685/0 no-fail-fast. THE POST-DEPLOY DIFFERENTIAL (deployed 8967dca5, dev
+harness restarted onto it, page fnV=6 dom-eval-verified; control = the
+fnV=5 deploy on the SAME harness; instrument
+tools/uxspeed/lightpass-rig.sh): BAR (a) clears/switch MET — the dwell
+warm switch counted fullHeal +1, activationLightHealSkip +3, forced flat:
+ONE full heal, the three light passes provably deduped (the s51 4-clear
+shape is gone). BAR (c) garble-free 30s-idle-dwell switch MET —
+pixel-legible screenshot + stamp visible=true content_rows=48 + 48/48
+full frames in the trace. BAR (b) ui.block <150ms NOT MET, honestly: the
+single remaining :now heal itself blocks ~570ms on Xvfb/llvmpipe (control
+524ms — parity; on jojo hardware the same heal measured 386ms in s51).
+The residual felt budget = the ONE-heal cost (the accepted shape) + Leg A
+render cost (Q3's rank-1, next). THE PAINT METRIC'S OWN GAP (filed as the
+next F7 unit): on the lane's QUIET warm switch the Q4 predicate honestly
+REFUSED — no full-coverage frame event within the probe window (the churn
+shrank so much the first full frame's inter-frame gap fell under the 250ms
+YGG_XTERM_FRAME_GAP_FLOOR_MS, then the host went silent — nothing
+re-renders, no frame_window flush rolls); the stamp stayed accuracy-only
+(visible=true, content_rows=48) and paint_reveal_ms is null, not
+fabricated. Fix shape: a rate-guarded frame_full point event (per
+full-coverage frame, throttled to the floor's cadence) so fast quiet
+switches become measurable. The dwell leg (content present) paired fine:
+697ms lane vs 685ms control — parity, no regression claimed. RIG LAWS:
+the probe's bare `yggterm` name needs PATH=$HOME/.local/bin under
+non-login ssh (gotcha 2 again); a fnV<6 page CANNOT report the new
+counters (the fields are new) — the control side of a counter-bar
+differential is trace+code-read, the lane side is dom-eval counters.
+
 
 PROGRESS 2026-09-27 ~04:20 IST (switch-raise lane, leg 1 LANDED, fix
 direction corrected by event-resolution measurement): the dominant leg is
