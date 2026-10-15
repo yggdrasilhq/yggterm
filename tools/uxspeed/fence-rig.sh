@@ -61,7 +61,7 @@ MODE=${4:-order}
 # dup-mode defaults sized for the probe-type verb's ~1.2s round trip:
 # marker must land in (arm, capture); seed delivery at capture+STALL.
 CAPTURE_STALL=${CAPTURE_STALL:-2000}
-if [ "$MODE" != order ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ] && [ "$MODE" != swap ] && [ "$MODE" != reattest ]; then echo "MODE must be order|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming|swap|reattest"; exit 2; fi
+if [ "$MODE" != order ] && [ "$MODE" != cursor ] && [ "$MODE" != dup ] && [ "$MODE" != loss ] && [ "$MODE" != flushshed ] && [ "$MODE" != lateflush ] && [ "$MODE" != latecontrol ] && [ "$MODE" != blank ] && [ "$MODE" != negative ] && [ "$MODE" != provenance ] && [ "$MODE" != naming ] && [ "$MODE" != swap ] && [ "$MODE" != reattest ]; then echo "MODE must be order|cursor|dup|loss|flushshed|lateflush|latecontrol|blank|negative|provenance|naming|swap|reattest"; exit 2; fi
 if ! [ -x "$BIN" ]; then echo "NO BINARY at $BIN — build first"; exit 2; fi
 export BIN STALL MODE CAPTURE_STALL
 
@@ -70,8 +70,16 @@ run_boot() {  # $1=scratch $2=synthesized-envs(1|0) -> boots GUI, echoes wrap pi
   mkdir -p "$SCRATCH"
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME=$SCRATCH XDG_DATA_HOME=$SCRATCH/xdg-share
   CAPT_EXPORT=""
-  if [ "$MODE" = dup ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ] || [ "$MODE" = blank ] || [ "$MODE" = negative ]; then
+  if [ "$MODE" = dup ] || [ "$MODE" = cursor ] || [ "$MODE" = loss ] || [ "$MODE" = flushshed ] || [ "$MODE" = lateflush ] || [ "$MODE" = latecontrol ] || [ "$MODE" = blank ] || [ "$MODE" = negative ]; then
     CAPT_EXPORT="export YGGTERM_TEST_STALL_SNAPSHOT_CAPTURE_MS=$CAPTURE_STALL;"
+  fi
+  if [ "$MODE" = cursor ]; then
+    # [F1-(e-r2) s48] THE PARK, injected daemon-side inside the capture
+    # hook (measured 2026-10-15: probe-type's acceptance can carry ZERO
+    # PTY delivery — gotcha 20 — and its ~2s round trip lost the capture
+    # race twice). L1/L2/L3 then an absolute CUP to 0-based (1,8): the
+    # daemon's captured frame carries both the text and the parked caret.
+    CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SNAPSHOT_CAPTURE_INJECT=\$'L1\\r\\nL2\\r\\nL3\\r\\n\\033[2;9H';"
   fi
   if [ "$MODE" = blank ]; then
     CAPT_EXPORT="$CAPT_EXPORT export YGGTERM_TEST_SNAPSHOT_CAPTURE_RING_ONLY=1;"
@@ -832,6 +840,14 @@ if MODE == "order":
     out = verb("server", "app", "terminal", "probe-type", s, "--data", repaint_cmd, "--enter", "--mode", "xterm")
     print("probe-type -> %s" % (out.stdout or out.stderr)[:120].replace("\n", " "))
 
+if MODE == "cursor":
+    # [F1-(e-r2) s48] No verb drive: the park is injected DAEMON-SIDE
+    # inside the capture hook (YGGTERM_TEST_SNAPSHOT_CAPTURE_INJECT) with
+    # the dup bar's by-construction guarantee. Measured 2026-10-15: the
+    # probe-type drive lost the capture race twice (2s and 8s stalls) and
+    # its acceptance can carry zero PTY delivery (gotcha 20).
+    pass
+
 ok, proof = wait_for(
     lambda ev: session_events(ev, s, "synthesized_mount_open"), 30, "synthesized_mount_open proof")
 ok_stall = bool(wait_for(
@@ -840,6 +856,39 @@ print("stall_hook_traced=%s proof_seen=%s" % (ok_stall, ok))
 if not ok_stall:
     print("PRE-FLIGHT FAIL: the stall hook never traced — rig invalid (hook missing from build?)")
     raise SystemExit(2)
+
+if MODE == "cursor":
+    # [F1-(e-r2) s48] THE MEASURED BAR: the fenced repaint must land the
+    # PAGE caret exactly on the daemon's parked cell. The proof reads
+    # cursorY/cursorX AFTER the seed write's callback resolved and rides
+    # the eval-return leg into the synthesized_mount_open trace. Guards:
+    # fenced mode + a real write + the capture hook traced + the seed
+    # text actually installed (L3 visible on the page).
+    p = proof[-1][1]
+    seed_mode = p.get("seed_mode")
+    wrote = int(p.get("wrote_seed") or 0)
+    cr = int(p.get("cursor_row", -1))
+    cc = int(p.get("cursor_col", -1))
+    page_l3 = page_screen_count(s, "L3")[0]
+    capt_traced = bool(wait_for(
+        lambda ev: [x for x in ev if x[1] == "test_hook_snapshot_capture_stalled"],
+        10, "capture stall hook")[0])
+    if seed_mode != "fenced_repaint" or wrote <= 0 or not capt_traced:
+        print("VACUOUS: seed_mode=%s wrote_seed=%d capture_hook_traced=%s"
+              % (seed_mode, wrote, capt_traced))
+        raise SystemExit(4)
+    if page_l3 < 1:
+        print("VACUOUS: the seed text never installed (page L3 count=%d)" % page_l3)
+        raise SystemExit(5)
+    if (cr, cc) != (1, 8):
+        print("VERDICT RED CONFIRMED: page caret (%d,%d) != daemon park (1,8) "
+              "(seed_mode=%s wrote_seed=%d) — the cursor state was lost or "
+              "never restored" % (cr, cc, seed_mode, wrote))
+        raise SystemExit(7)
+    print("VERDICT GREEN: fenced repaint restored the daemon cursor exactly "
+          "(page caret (%d,%d) == parked (1,8); seed_mode=%s wrote_seed=%d)"
+          % (cr, cc, seed_mode, wrote))
+    raise SystemExit(0)
 
 if MODE == "blank":
     # [Q7] BAR 7 — THE VALID-BLANK FALSIFIER (sitting 23, sol round 1 R5):

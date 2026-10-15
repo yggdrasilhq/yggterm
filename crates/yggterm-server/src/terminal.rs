@@ -6461,6 +6461,31 @@ mod tests {
     }
 
     #[test]
+    fn the_formatted_state_carries_the_daemon_cursor_position() {
+        // [F1-(e-r2) MEASURED 2026-10-15] The mount/recovery seed is the
+        // vt100 FORMATTED state and the serializer restores the CURSOR
+        // inside it (the grid walk ends with the cursor MoveTo; only
+        // attribute/mode diffs follow, and those cannot move the caret).
+        // A screen parked mid-cell therefore repaints with the caret
+        // exactly there. The old (e-r2) framing ("the daemon's cursor
+        // position is not in the answer") was written from the seed-write
+        // sites without reading the serializer; the s48 sol round
+        // falsified it (117k-token consult, vendored-xterm probes). This
+        // lock pins the contract the fence and the replay sanitizers
+        // must never break.
+        let mut parser = Vt100Parser::new(6, 40, 0);
+        parser.process(b"L1\r\nL2\r\nL3\r\n");
+        parser.process(b"\x1b[2;9H");
+        let formatted =
+            String::from_utf8_lossy(&parser.screen().state_formatted()).into_owned();
+        assert!(
+            formatted.contains("\x1b[2;9H"),
+            "the formatted state must carry the daemon cursor restore (row 2, col 9); tail: {:?}",
+            &formatted[formatted.len().saturating_sub(64)..]
+        );
+    }
+
+    #[test]
     fn the_injected_ring_floor_keeps_the_lowest_seq() {
         let floor = AtomicU64::new(0);
         cap_injected_ring_floor(&floor, 30);
