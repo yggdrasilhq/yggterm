@@ -1742,9 +1742,13 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   the entry.
 - **F7 — FELT-LATENCY BUDGET RESIDUE** (the ux-speed residue; probe
   baselines in the uxprobe reports): [11.215] split-create appear over
-  bar, [11.172] switch remount cost (FIXED in code — proof owed), the
-  close/teardown family. Re-derive this family's shape after F1 lands
-  (the wedge contaminated spawn-latency baselines).
+  bar, [11.172] switch remount cost (the RAISE PROVEN 6/6 on deployed
+  53b2db5f 2026-10-15 — see its record; the residual is the reveal-stamp
+  delivery leg, paint_reveal_ms p50 ≈ 577 ms), the close/teardown
+  family. RE-DERIVATION STARTED 2026-10-15 (s50): the first wedge-free
+  switch baselines are in ([11.172]'s record); [11.215]'s appear-over
+  bar and the close/teardown family still need fresh runs on the
+  dev-local harness.
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
@@ -3408,7 +3412,22 @@ ui/block spans) is a SECOND cost this fix removes for the raise path by not
 dispatching the mount eval at all; whatever delivery latency remains on the
 tiny stamp eval will show up honestly in paint_reveal_ms.
 
-FALSIFIER: uxprobe `switch` on the rotated build reports
+LIVE PROOF RUN 2026-10-15 (s50, the DEPLOYED main 53b2db5f7338 on the
+dev-local Xvfb harness, n=8 clicks on a scratch pair): THE RAISE SERVES —
+6/6 warm switch-backs raised (`reveal_served`, the mount family never
+fired, ui_block 0 / merge_events 0 in every window) and the only 2
+remounts were the 2 cold first-activations (correctly refused,
+was_ever_ready=false — the gate's first arm is honest on cold rows).
+paint_end_rate 8/8, zero accuracy failures, activation p50 119.5 ms.
+THE HONEST RESIDUAL (the fix note's own prediction): the raise's
+paint-truth stamp costs paint_reveal_ms 400/1000/502/442/653/662
+(p50 ≈ 577 ms) — the tiny reveal-stamp eval's delivery leg, not a
+remount. ms-class felt latency is NOT yet demonstrated by the stamp
+proxy; whether retained pixels are visible at activation (the real felt
+question) needs a canvas-truth read cheaper than the stamp. THE FALSIFIER
+below stays the bar for the remount family; the raise family's bar is a
+fast paint-truth stamp (the next F7 surface). Original falsifier text:
+uxprobe `switch` on the rotated build reports
 activation→first_frame p50 ≤150 ms net (first_frame_ms − activation_ms),
 settle complete ≥7/8, zero accuracy failures.
 
