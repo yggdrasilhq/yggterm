@@ -492,6 +492,33 @@ return JSON.stringify({{ present: Boolean(__r), receipt: __r, entry_live: __entr
 }
 
 
+/// [s47 MEASUREMENT] The paint-provenance probe (sol s46b spec): reads the
+/// mount's paint counters back over the eval-return leg. paintCount alone
+/// proves emitPaint RAN (it advances BEFORE the nextPaintKey gate), so the
+/// send-side truth is paintSendAttemptCount + lastPaintKey, published at the
+/// sendTerminalEvent site. READ-ONLY: no emitPaint, no redraw, no write, no
+/// park, no completion. An absent field answers null — the Rust side traces
+/// that as UNKNOWN, never zero (the unknown-is-not-zero law).
+pub(crate) fn terminal_paint_provenance_probe_script(host_id: &str) -> String {
+    let host = serde_json::to_string(host_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"const __h = {host};
+const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
+const __entryLive = __e ? (window.__yggtermXtermHosts[__h] === __e) : false;
+const __r = __e && __e.appliedContent ? __e.appliedContent : null;
+return JSON.stringify({{
+    present: Boolean(__e),
+    entry_live: __entryLive,
+    paint_count: __e ? (__e.paintCount === undefined ? null : Number(__e.paintCount)) : null,
+    send_attempts: __e ? (__e.paintSendAttemptCount === undefined ? null : Number(__e.paintSendAttemptCount)) : null,
+    last_paint_key: __e ? (__e.lastPaintKey === undefined ? null : String(__e.lastPaintKey)) : null,
+    last_visible_paint: __e ? (__e.lastVisiblePaint === undefined ? null : Boolean(__e.lastVisiblePaint)) : null,
+    was_husk: __e ? (__e.lastVisiblePaintWasHusk === undefined ? null : Boolean(__e.lastVisiblePaintWasHusk)) : null,
+    applied_receipt: __r ? {{ wrote: Number(__r.wrote || 0), ts: Number(__r.ts || 0), gen: Number(__r.gen || 0), blank: Boolean(__r.blank) }} : null
+}});"#
+    )
+}
+
 /// [F1-(e) Q2] The synthesized mount's frame-hash probe over a FRESH
 /// eval: pair the daemon's authoritative-grid hash (same `fnv32:%08x`
 /// canonical form both sides — frame_hash_probe.js and the daemon twin
@@ -6879,6 +6906,11 @@ fn terminal_eval_script_with_canvas_renderer(
         applySoftwareCanvasLayerOptimization('initial_mount');
         let paintCount = 0;
         let lastPaintKey = '';
+        // [s47 MEASUREMENT] the send-side truth: paintCount advances BEFORE
+        // the nextPaintKey gate, so it proves emitPaint RAN, never that the
+        // kind:"paint" event was ATTEMPTED. This counter moves exactly at the
+        // send site and is published to the host entry beside it.
+        let paintSendAttemptCount = 0;
         // Daemon-handover paint suspension (user-settled call #7). Set by the
         // `set_handover_paint_suspended` command; while true this host does no
         // render-health sampling, no recovery redraw and no visible paint, and
@@ -7116,6 +7148,11 @@ fn terminal_eval_script_with_canvas_renderer(
             ]);
             if (nextPaintKey !== lastPaintKey) {{
                 lastPaintKey = nextPaintKey;
+                paintSendAttemptCount += 1;
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].paintSendAttemptCount = paintSendAttemptCount;
+                    window.__yggtermXtermHosts[hostId].lastPaintKey = lastPaintKey;
+                }}
                 sendTerminalEvent({{
                     kind: "paint",
                     child_count: host.childElementCount,

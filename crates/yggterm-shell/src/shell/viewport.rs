@@ -7574,6 +7574,19 @@ fn TerminalCanvas(
                 std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
             > = None;
             let mut applied_content_probe_next_ms: u64 = 0;
+            // [s47 MEASUREMENT] the paint-provenance sampler (sol s46b spec):
+            // 250ms READ-ONLY samples of the page's paint counters through
+            // the churn demotion + skip-cancel grace. Gated on the test env —
+            // production never arms it, the loop body stays await-free (the
+            // (i-r1) law), and the future's only effect is its trace event.
+            // Absent answers are traced UNKNOWN (null), never zero.
+            let paint_provenance_enabled =
+                std::env::var("YGGTERM_TEST_PAINT_PROVENANCE").as_deref() == Ok("1");
+            let mut paint_provenance_future: Option<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+            > = None;
+            let mut paint_provenance_next_ms: u64 = 0;
+            let mut paint_provenance_samples: u64 = 0;
             // [e9 RIG HOOK] one-shot latch for the re-attest park marker
             // (YGGTERM_TEST_PARK_CLAIM_FILE — absent = inert).
             let reattest_park_hook = std::env::var("YGGTERM_TEST_PARK_CLAIM_FILE").is_ok();
@@ -7968,6 +7981,26 @@ fn TerminalCanvas(
                             trace_home.clone(),
                         ));
                     }
+                }
+                // [s47 MEASUREMENT] the provenance sampler: armed on every
+                // loop wake while the test gate is on — INDEPENDENT of parked
+                // claims (that independence is the point: the re-attest
+                // probe's parked-claim gate is one of the two observation
+                // gaps under study). 480 samples cap (2 min) so a leaked env
+                // cannot trace forever.
+                if paint_provenance_enabled
+                    && paint_provenance_samples < 480
+                    && paint_provenance_future.is_none()
+                    && current_millis() >= paint_provenance_next_ms
+                {
+                    paint_provenance_next_ms = current_millis() + 250;
+                    paint_provenance_samples += 1;
+                    paint_provenance_future = Some(stage_paint_provenance_probe(
+                        host_id.clone(),
+                        session_path.clone(),
+                        trace_home.clone(),
+                        paint_provenance_samples,
+                    ));
                 }
                 // [e9 RIG HOOK] the re-attest bar's park constructor — the
                 // marker file is absent in production, making this inert.
@@ -13676,6 +13709,23 @@ fn TerminalCanvas(
                             &session_path,
                         );
                         applied_content_probe_future = None;
+                    },
+                    // [s47 MEASUREMENT] the provenance probe completes —
+                    // READ-ONLY: it never mutates shell state, the trace
+                    // event inside the future is its whole effect.
+                    paint_provenance_done = async {
+                        paint_provenance_future
+                            .as_mut()
+                            .expect("paint provenance probe armed")
+                            .await
+                    },
+                        if paint_provenance_future.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "paint_provenance_probe",
+                            &session_path,
+                        );
+                        paint_provenance_future = None;
                     },
                     synth_hash_probe_answer = async {
                         synth_hash_probe_eval
@@ -22778,6 +22828,55 @@ fn decode_applied_content_probe_receipt(verdict: &Value) -> Option<TerminalAppli
         ts: receipt.get("ts").and_then(Value::as_u64).unwrap_or(0),
         page_gen: receipt.get("gen").and_then(Value::as_u64).unwrap_or(0),
         source: "reattest_probe",
+    })
+}
+
+/// [s47 MEASUREMENT] one 250ms provenance sample: read the page's paint
+/// counters over the eval-return leg and trace them. Trace-only — never
+/// mutates shell state, never parks, never completes an attempt.
+fn stage_paint_provenance_probe(
+    host_id: String,
+    session_path: String,
+    trace_home: std::path::PathBuf,
+    sample: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    Box::pin(async move {
+        let script = terminal_paint_provenance_probe_script(&host_id);
+        let answer = document::eval(&script).await;
+        let verdict = match answer {
+            Ok(value) => value
+                .as_str()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok()),
+            Err(_error) => None,
+        };
+        let payload = match verdict {
+            Some(v) => serde_json::json!({
+                "session_path": session_path,
+                "host_id": host_id,
+                "sample": sample,
+                "present": v.get("present").and_then(serde_json::Value::as_bool),
+                "entry_live": v.get("entry_live").and_then(serde_json::Value::as_bool),
+                "paint_count": v.get("paint_count").cloned().unwrap_or(serde_json::Value::Null),
+                "send_attempts": v.get("send_attempts").cloned().unwrap_or(serde_json::Value::Null),
+                "last_paint_key": v.get("last_paint_key").cloned().unwrap_or(serde_json::Value::Null),
+                "last_visible_paint": v.get("last_visible_paint").cloned().unwrap_or(serde_json::Value::Null),
+                "was_husk": v.get("was_husk").cloned().unwrap_or(serde_json::Value::Null),
+                "applied_receipt": v.get("applied_receipt").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+            None => serde_json::json!({
+                "session_path": session_path,
+                "host_id": host_id,
+                "sample": sample,
+                "unknown": true,
+            }),
+        };
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "terminal_paint_provenance",
+            payload,
+        );
     })
 }
 

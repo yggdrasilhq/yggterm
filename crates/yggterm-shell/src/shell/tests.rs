@@ -72281,6 +72281,53 @@ fn frame_hash_sync_script_pairs_the_daemon_hash_with_the_page_probe() {
     assert!(script.contains("return JSON.stringify"));
 }
 
+// [s47 MEASUREMENT] the provenance probe's shape locks: the probe is
+// READ-ONLY (the unknown-is-not-zero law — an absent answer is null, never
+// 0) and the send-side truth is published at the sendTerminalEvent site
+// BEFORE the send, so paintCount can never be mistaken for send evidence
+// (sol's correction: paintCount proves emitPaint RAN, not that the event
+// was attempted through the nextPaintKey gate).
+#[test]
+fn the_paint_provenance_probe_is_read_only_and_unknown_is_null() {
+    let script = terminal_paint_provenance_probe_script("host-m1");
+    assert!(script.contains("return JSON.stringify"));
+    // the counters it reads — send-side truth, not just emitPaint runs
+    assert!(script.contains("paintSendAttemptCount"));
+    assert!(script.contains("lastPaintKey"));
+    assert!(script.contains("paintCount"));
+    // UNKNOWN is null, never zero (an absent field answers null)
+    assert!(script.contains("=== undefined ? null :"));
+    // READ-ONLY: no mutation verbs anywhere in the probe
+    assert!(!script.contains(".appliedContent ="));
+    assert!(!script.contains("emitPaint("));
+    assert!(!script.contains("sendTerminalEvent("));
+    // entry-identity guard (a replaced entry is not this mount's evidence)
+    assert!(script.contains("entry_live"));
+}
+
+#[test]
+fn the_mount_script_publishes_send_attempts_at_the_send_site() {
+    let source = include_str!("terminal_scripts.rs");
+    // the publish must sit BEFORE the sendTerminalEvent call and bump the
+    // dedicated counter — the nextPaintKey gate is the only send arm.
+    let gate = source
+        .find("if (nextPaintKey !== lastPaintKey) {{")
+        .expect("the paint send gate exists");
+    let window = &source[gate..];
+    let publish = window
+        .find("paintSendAttemptCount += 1")
+        .expect("the send-attempt counter bumps at the gate");
+    let send_call = window
+        .find("sendTerminalEvent({{")
+        .expect("the paint send call");
+    assert!(
+        publish < send_call,
+        "the send-attempt counter must move BEFORE the send, never after",
+    );
+    assert!(window.contains("__yggtermXtermHosts[hostId].paintSendAttemptCount"));
+    assert!(window.contains("__yggtermXtermHosts[hostId].lastPaintKey"));
+}
+
 
 // ============================================================================
 // [F1-(e-r1)] THE SEED'S STREAM-CURSOR STAMP — unit locks for the fence's
