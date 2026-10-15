@@ -3460,14 +3460,27 @@ GUI spawns the DEPLOYED build's daemon AND a second GUI from the deployed
 build; three "lane" runs measured the deployed binary (fn length
 identical, fnV=4 after the bump to 5 gave it away). A GUI-class lane
 differential goes through ygg-ci deploy (this lane) or an install-layout
-dir. OWED HERE: the post-deploy differential (forced_refresh per warm
-switch should drop to the redraw's own pass; ui.block gap and
-paint_reveal_ms should shrink by the removed pass) + the sol consult
-(staged, juju-capped: lores/chain-of-thought/
-2026-10-15-yggterm-s51-reveal-stamp-sol.md) on Leg A (earlier raise
-decision vs render cost), the :120ms pass design, and the probe's
-paint-end pairing predicate (the first frame_gap's rows_painted=1 makes
-first-frame pairing gameable).
+dir. THE POST-DEPLOY DIFFERENTIAL (deployed c9f4f007 on the dev-local Xvfb
+harness; the page VERIFIED running the merged fn via dom-eval — fnV=5,
+lastAtlasHealAtMs present, the install-self-heal trap caught three fake
+"lane" runs before this): the intermediate 50ms dedupe alone was NOT
+enough — the heal's own main-thread block delays the armed funnel to
++139..+344ms (5/6 switches), past the window; the true fix is
+redrawTerminal presents via requestVisiblePaint(false) (115f34cc
+rebuilt as 985325b6 on main after the amend-vs-merged conflict).
+MECHANISM PROVEN: per warm switch, xterm_forced_refresh after the first
+terminal_repaint = 0/6 (control b07f3c79: 1 per switch at +0..+344ms,
+6/6). FELT NUMBERS UNMOVED WITHIN NOISE (anti-lying): paint_reveal p50
+567 vs 577 control, legB p50 297 vs 343, biggest ui.block 386ms vs
+223ms — the dominant block was never only the funnel duplicate. The
+remaining felt budget: the light :raf/:120/:360 passes (the
+input-policy design), Leg A's render pass, and the stamp proxy's own
+overcount. Board outcome ACK-c8f8bdfd44. OWED + sol consult (staged,
+juju-capped: lores/chain-of-thought/
+2026-10-15-yggterm-s51-reveal-stamp-sol.md): Leg A (earlier raise
+decision vs render cost), the light-pass design on warm raises, the
+probe's paint-end pairing predicate (the first frame_gap's
+rows_painted=1 makes first-frame pairing gameable).
 
 PROGRESS 2026-09-27 ~04:20 IST (switch-raise lane, leg 1 LANDED, fix
 direction corrected by event-resolution measurement): the dominant leg is
