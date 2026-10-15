@@ -296,14 +296,21 @@ fn terminal_mount_params_json(
 /// The ~1 KB warm eval: fresh params + invoke of the already-installed (and
 /// version-probed) mount function. Parsing this is what a felt switch pays
 /// where it used to parse the whole body.
-fn terminal_mount_warm_eval_script(mount_params_json: &str) -> String {
+fn terminal_mount_warm_eval_script(host_id: &str, mount_params_json: &str) -> String {
     // [11.178] The invoke stamps its attempt AT INVOKE TIME and passes it as
     // an argument: a stalled instance that resumes after the redo-cold bumped
     // the counter still carries its OWN stamp and aborts at the body's entry
     // guard instead of registering over the fresh mount (the stale closure
     // used to win the host last-writer-wins via its ownerToken).
+    // [F1 s50] The dispatched attempt is keyed PER HOST for the liveness
+    // match: the page-wide DISPATCHED mirror is bumped by every mount's
+    // dispatch, so matching against it convicted every other concurrently-
+    // alive mount the moment a second dispatch landed (the s47
+    // pipeline_alive_eval_lost false convictions). One attempt value feeds
+    // both mirrors, read with no intervening await.
+    let host = serde_json::json!(host_id);
     format!(
-        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== \"undefined\" ? dioxus : null));"
+        "window.__yggtermMountParams = {mount_params_json};\n        window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;\n        window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;\n        (window.__yggtermMountDispatchedByHost = window.__yggtermMountDispatchedByHost || {{}})[{host}] = window.__yggtermMountAttempt;\n        await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== \"undefined\" ? dioxus : null));"
     )
 }
 
@@ -344,7 +351,10 @@ pub(crate) fn terminal_mount_pipeline_probe_script() -> String {
 /// dispatched attempt proves the warm mount fn is RUNNING: its bridge
 /// events were shed, not the mount lost, so the poll re-triggers the
 /// page-side ready re-post and the gate keeps the warm mount. An absent or
-/// stale record means the mount eval never executed — redo cold.
+/// stale record means the mount eval never executed — redo cold. The
+/// attempt comparison is scoped to THIS host's dispatch ([F1 s50]): the
+/// page-wide mirror is bumped by every mount on the page, so matching
+/// against it convicted healthy mounts whenever a second dispatch ran.
 pub(crate) fn terminal_mount_liveness_poll_script(host_id: &str) -> String {
     // ⛔ [11.173] shape law: the eval bridge wraps every script in a
     // function body — a value crosses ONLY via a top-level `return`.
@@ -352,7 +362,11 @@ pub(crate) fn terminal_mount_liveness_poll_script(host_id: &str) -> String {
     format!(
         r#"const __h = {host};
 const __r = (window.__yggtermMountAlive || {{}})[__h] || null;
-const __d = window.__yggtermMountDispatchedAttempt;
+// [F1 s50] match within THIS host's dispatch scope. A missing map entry is
+// unverified liveness (the record-absent recovery path); the page-wide
+// DISPATCHED mirror is never a fallback — another mount's dispatch bumping
+// it is exactly the s47 false conviction.
+const __d = (window.__yggtermMountDispatchedByHost || {{}})[__h];
 const __m = Boolean(__r && __d !== undefined && __r.attempt === __d);
 if (__m && __r.stage === "posted" && typeof window.__yggtermMountResend === "function") {{
     try {{ window.__yggtermMountResend(__h); }} catch (_error) {{}}
@@ -14471,6 +14485,9 @@ fn terminal_eval_script_with_canvas_renderer(
         // guard instead of fighting this one for the host.
         window.__yggtermMountAttempt = (window.__yggtermMountAttempt || 0) + 1;
         window.__yggtermMountDispatchedAttempt = window.__yggtermMountAttempt;
+        // [F1 s50] the liveness match keys on THIS host's dispatched attempt;
+        // the page-wide mirror stays for attempt uniqueness + the entry guard.
+        (window.__yggtermMountDispatchedByHost = window.__yggtermMountDispatchedByHost || {{}})[hostId] = window.__yggtermMountAttempt;
         await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus !== "undefined" ? dioxus : null));
         "#,
         trace_emitter_js = TRACE_EMITTER_JS,

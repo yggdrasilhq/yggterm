@@ -22954,13 +22954,17 @@ console.log('ok');
         );
         assert!(params.contains("\"hostId\":\"yggterm-terminal-test\""));
 
-        let warm = terminal_mount_warm_eval_script(&params);
+        let warm = terminal_mount_warm_eval_script("yggterm-terminal-test", &params);
         assert!(
             warm.len() < 4_096,
             "the warm eval must stay tiny, got {} bytes",
             warm.len()
         );
         assert!(warm.contains("__yggtermMountParams ="));
+        assert!(
+            warm.contains("[\"yggterm-terminal-test\"] = window.__yggtermMountAttempt;"),
+            "the warm invoke keys the per-host dispatched map by its host"
+        );
         assert!(warm.contains("await window.__yggtermMountFn(window.__yggtermMountAttempt, (typeof dioxus"));
         assert!(warm.contains("? dioxus : null));"));
 
@@ -23015,7 +23019,15 @@ console.log('ok');
         assert!(poll.contains("return JSON.stringify("));
         assert!(!poll.trim_start().starts_with("("), "an IIFE poll answers null on the live bridge");
         assert!(poll.contains("window.__yggtermMountAlive"));
-        assert!(poll.contains("__yggtermMountDispatchedAttempt"));
+        assert!(
+            poll.contains("(window.__yggtermMountDispatchedByHost || {})[__h]"),
+            "the poll matches within the HOST's dispatch scope"
+        );
+        assert!(
+            !poll.contains("window.__yggtermMountDispatchedAttempt"),
+            "the poll must never fall back to the page-wide mirror — another \
+             mount's dispatch bumping it is the s47 false conviction"
+        );
         assert!(poll.contains("window.__yggtermMountResend"));
         assert!(poll.contains("__r.stage === \"posted\""));
 
@@ -23050,8 +23062,24 @@ console.log('ok');
             ("\x1b[A", "\x1b[B", 0),
             None,
         );
-        let warm = terminal_mount_warm_eval_script(&params);
+        let host_stamp =
+            "(window.__yggtermMountDispatchedByHost = window.__yggtermMountDispatchedByHost || {})";
+        assert_eq!(
+            cold.matches(host_stamp).count(),
+            1,
+            "the cold tail keys the per-host dispatched map exactly once"
+        );
+        assert!(
+            cold.contains(")[hostId] = window.__yggtermMountAttempt;"),
+            "the cold tail keys the map by the body's hostId"
+        );
+        let warm = terminal_mount_warm_eval_script("yggterm-terminal-test", &params);
         assert_eq!(warm.matches(stamp).count(), 1);
+        assert_eq!(
+            warm.matches(host_stamp).count(),
+            1,
+            "the warm invoke keys the per-host dispatched map exactly once"
+        );
     }
 
     #[test]
@@ -74871,6 +74899,18 @@ mod web_surface_immersion_locks {
             2,
             "exactly the warm invoke and the cold installer tail stamp the \
              dispatched attempt"
+        );
+        assert_eq!(
+            scripts.matches("(window.__yggtermMountDispatchedByHost = window.__yggtermMountDispatchedByHost || {{}})").count(),
+            2,
+            "both dispatch shapes also key the dispatched attempt PER HOST — \
+             the liveness poll matches within the host's scope; the page-wide \
+             mirror alone convicted every other alive mount (s50, s47 trace)"
+        );
+        assert!(
+            !scripts.split("pub(crate) fn terminal_mount_liveness_poll_script").nth(1).unwrap_or("").is_empty()
+                && scripts.split("pub(crate) fn terminal_mount_liveness_poll_script").nth(1).unwrap_or("").split("pub(crate) fn").next().unwrap_or("").contains("(window.__yggtermMountDispatchedByHost || {{}})[__h]"),
+            "the liveness poll reads the per-host map"
         );
         assert_eq!(
             scripts.matches("await window.__yggtermMountFn(window.__yggtermMountAttempt,").count(),
