@@ -1343,7 +1343,50 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   supersedes the now-surviving loop
   (bootstrap_owner_superseded_during_loop). Fix layer TBD (attempt
   observation for background rows vs the witness's organic advance vs
-  the raise's veto) — sol first. STILL OPEN IN THIS FAMILY: (1) the
+  the raise veto). DESIGN DECIDED (sol s46b round, node
+  lores/chain-of-thought/2026-10-15-yggterm-s46b-residual-fix-layer-sol.md,
+  gpt-6.1-sol HIGH): land L2 FIRST — organic surface evidence independent
+  of the captured-send Paint event (the gap: record_terminal_applied_content
+  advances paint only when paint was ALREADY pending, state.rs:30063, and
+  the re-attest probe arms only when a content claim is parked,
+  viewport.rs:7955 — Missing Paint + no parked claim = no independent
+  observation path; neither paintCount nor receipt arrival alone may earn
+  the witness, the paint-zombie exclusion stays) — THEN L1: complete the
+  birth attempt at terminal_attach_local_ready (viewport.rs:16346 — it
+  retains + removes attach_in_flight but never completes) via a
+  captured-origin Content claim through complete_terminal_open_attempt_ready,
+  absent receipts park it; NOT via observe_terminal_open_attempt_from_
+  viewport (active-session scoped, mutates the resume latch). L3 (raise
+  veto) and broad L4 (skip-cancel exemption) REJECTED by sol. Q3 rebut:
+  the sticky-set idea ALREADY EXISTS (was_ever_ready =
+  reached_ready || ready history, state.rs:32659, and the pin already
+  calls it) — the activation-epoch mechanism stays; earn readiness and
+  the freeze-don't-zero pin does the rest. MEASUREMENT OWED BEFORE THE
+  NARROW L2 REPAIR: the gated provenance probe
+  (YGGTERM_TEST_PAINT_PROVENANCE=1; terminal_paint_provenance_probe_script
+  beside terminal_frame_hash_sync_script; CRITICAL sol correction —
+  paintCount proves emitPaint RAN, not that the event SENT: the counter
+  advances BEFORE the nextPaintKey gate, so the hook must also publish
+  paintSendAttemptCount + lastPaintKey; staged as one persistent future in
+  TerminalCanvas's pre-select region, 250ms samples through the demotion +
+  cancel grace; read-only — it must never emitPaint/redraw/write/park/
+  complete; timeout/replaced-entry = UNKNOWN never zero; also check the
+  AppliedContent page receipt — same sendTerminalEvent pipe). BARS (sol
+  Q4): i2c-rig BAR-R becomes a HARD gate WITH the viewport condition
+  (reveal_served fires after the Decision completion BEFORE effect proof,
+  viewport.rs:6111 — the re-selected viewport must already contain the
+  late marker, sampled immediately); BAR-D must include owner-supersessions
+  (the rig header claimed skips forbidden while ok_d checked only
+  drops+resets — mismatch fixed in the next rig revision); retain the
+  named incident locks (0829 positive, paint-zombie negative, witness
+  lifetime, the Q7 transaction trio, the provenance set, valid-blank pair,
+  raise-safety trio, pin-safety pair) + FIVE new behavioral locks
+  (paint-suppressed organic earn; husk/detached/withheld/foreign/
+  replacement earn nothing; receipt-before-observation and the reverse
+  converge; a live legitimately silent loop stays Pending — distinct from
+  the existing silent-loop raise test; attempt churn preserves earned
+  sticky readiness while genuine faults still veto). Ranked plan: measure
+  → land L2 → land L1 → gate. STILL OPEN IN THIS FAMILY: (1) the
   residual above; (2) (e-r2) repaint cursor restoration (untouched);
   the alive-loop evidence-less claim bound CLOSED s45 unit 2.
   (i-r3) LONG-TERM: sol's owner-backed attach transaction (ContentReady
