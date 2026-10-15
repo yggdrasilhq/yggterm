@@ -229,7 +229,7 @@ fn terminal_reused_host_grid_script(session_path: &str) -> String {
 // re-invocations re-bound the dead cold channel pair (s31 differential:
 // the warm invocation tag lives in the mailbox alone). Both invoke sites
 // pass their OWN eval binding; the version gate forces the reinstall.
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 5;
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 6;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -8287,8 +8287,19 @@ fn terminal_eval_script_with_canvas_renderer(
             }};
             const redrawShouldFollowPrompt =
                 redrawReasonForcesPromptFollow(reason) || scrollbackIntent !== 'UserScrollback';
+            // [F7 s52] Activation-path redraws (session switch, foreground
+            // regain) ride the churn train; the ink probe's up-to-~384
+            // one-pixel getImageData calls force a GPU pipeline sync on
+            // WebKitGTK exactly when the frame budget matters most. The
+            // switch path keeps its render-event evidence; the ink fields
+            // report the skip instead of pretending a sample happened.
+            const redrawSkipsInkSampling = /^(active_session_switch|window_foreground)/.test(
+                String(reason || "")
+            );
             let redrawInkBefore = null;
-            try {{ redrawInkBefore = sampleCanvasInk(); }} catch (_error) {{}}
+            if (!redrawSkipsInkSampling) {{
+                try {{ redrawInkBefore = sampleCanvasInk(); }} catch (_error) {{}}
+            }}
             try {{ hideLowPowerTuiOverlay(); }} catch (_error) {{}}
             try {{ rebindCurrentHost(String(reason || 'manual-redraw'), true); }} catch (_error) {{}}
             try {{ repairMissingRendererSurface(String(reason || 'manual-redraw')); }} catch (_error) {{}}
@@ -8297,6 +8308,18 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{ scrollLiveCursorIntoView(redrawShouldFollowPrompt, String(reason || 'manual-redraw')); }} catch (_error) {{}}
             clearTerminalTextureAtlas();
             lastAtlasHealAtMs = Date.now();
+            // [F7 s52] Entry-level mirror of the heal clock: the input-policy
+            // script's repaintActiveEntry lives in a separate IIFE and cannot
+            // read this closure, so its light passes dedupe against the entry
+            // copy (ACTIVATION_LIGHT_HEAL_DEDUPE_MS there).
+            try {{
+                const healEntry = window.__yggtermXtermHosts
+                    && window.__yggtermXtermHosts[hostId];
+                if (healEntry) {{
+                    healEntry.lastFullHealAtMs = lastAtlasHealAtMs;
+                    healEntry.fullHealCount = Number(healEntry.fullHealCount || 0) + 1;
+                }}
+            }} catch (_error) {{}}
             try {{
                 if (term.refresh) {{
                     term.refresh(0, Math.max(0, term.rows - 1));
@@ -8341,7 +8364,9 @@ fn terminal_eval_script_with_canvas_renderer(
                 const settledAtMs = Date.now();
                 const redrawRenderEventCountAfter = Number(renderEventCount || 0);
                 let redrawInkAfter = null;
-                try {{ redrawInkAfter = sampleCanvasInk(); }} catch (_error) {{}}
+                if (!redrawSkipsInkSampling) {{
+                    try {{ redrawInkAfter = sampleCanvasInk(); }} catch (_error) {{}}
+                }}
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     const entry = window.__yggtermXtermHosts[hostId];
                     const beforeInkPixels = redrawInkBefore
@@ -8357,7 +8382,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.lastManualRedrawInkAfter = redrawInkAfter;
                     entry.lastManualRedrawEffect = renderDelta > 0
                         ? 'rendered'
-                        : (beforeInkPixels !== afterInkPixels ? 'ink_changed' : 'repainted_no_text_change');
+                        : (redrawSkipsInkSampling
+                            ? 'ink_skipped_activation'
+                            : (beforeInkPixels !== afterInkPixels
+                                ? 'ink_changed'
+                                : 'repainted_no_text_change'));
                 }}
             }});
             sendTerminalEvent({{
@@ -9026,7 +9055,13 @@ fn terminal_eval_script_with_canvas_renderer(
                         syncVisiblePaintDemandToHostEntry();
                         forcedRefreshCount += 1;
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
-                            window.__yggtermXtermHosts[hostId].forcedRefreshCount = forcedRefreshCount;
+                            const healEntry = window.__yggtermXtermHosts[hostId];
+                            healEntry.forcedRefreshCount = forcedRefreshCount;
+                            // [F7 s52] entry mirror of the heal clock (see
+                            // redrawTerminal): the activation light passes
+                            // dedupe against it.
+                            healEntry.lastFullHealAtMs = now;
+                            healEntry.fullHealCount = Number(healEntry.fullHealCount || 0) + 1;
                         }}
                         // WebGL glyph-atlas heal: while the window is backgrounded
                         // the WebGL render loop (rAF) is throttled and the GPU glyph
@@ -13484,6 +13519,14 @@ fn terminal_eval_script_with_canvas_renderer(
                                 clearTerminalTextureAtlas();
                                 atlasCleared = true;
                                 lastAtlasHealAtMs = Date.now();
+                                // [F7 s52] entry mirror — see redrawTerminal.
+                                try {{
+                                    if (staleAtlasEntry) {{
+                                        staleAtlasEntry.lastFullHealAtMs = lastAtlasHealAtMs;
+                                        staleAtlasEntry.fullHealCount =
+                                            Number(staleAtlasEntry.fullHealCount || 0) + 1;
+                                    }}
+                                }} catch (_error) {{}}
                                 if (term.refresh) {{
                                     rowsRefreshed = Math.max(0, term.rows - 1);
                                     term.refresh(0, rowsRefreshed);
@@ -16515,6 +16558,10 @@ fn terminal_set_input_policy_script_for_active_session(
               host.setAttribute('data-active-session-host', isActiveHost ? 'true' : 'false');
             }} catch (_error) {{}}
           }}
+          // [F7 s52] Dedupe window for the light :raf/:120/:360 activation
+          // passes: all three must fall inside ONE full heal's shadow (the
+          // schedule's last leg is +360ms; 400 leaves timer-slop margin).
+          const ACTIVATION_LIGHT_HEAL_DEDUPE_MS = 400;
           const repaintActiveEntry = (entry, reason, heavy) => {{
             try {{
               if (!entry || !entry.term) {{
@@ -16534,12 +16581,40 @@ fn terminal_set_input_policy_script_for_active_session(
               if (heavy && typeof entry.redrawTerminal === "function") {{
                 entry.redrawTerminal(reason);
               }} else {{
-                if (typeof entry.term.clearTextureAtlas === "function") {{
-                  entry.term.clearTextureAtlas();
-                  entry.lastAtlasClearAtMs = Date.now();
-                }}
-                if (typeof entry.term.refresh === "function") {{
-                  entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+                // [F7 s52] ONE full heal at :now. The light :raf/:120/:360
+                // passes each re-cleared and re-refreshed the whole viewport
+                // right behind the heavy heal — the churn train that kept
+                // warm-switch paint_reveal p50 at ~577ms (s51 measured four
+                // forced clears per switch). Inside the dedupe window a
+                // full-heal site (redrawTerminal, the forced-refresh funnel,
+                // the stale-atlas heal — or a light pass that ran) already
+                // did this work: skip to the health emit only. Genuine
+                // staleness (an idle dwell long enough to evict textures)
+                // can never land within 400ms of a full heal. The cold
+                // reveal's late-content heal is NOT this path — it rides
+                // redrawTerminal (pendingRevealDaemonRepaint) and stamps the
+                // mirror itself.
+                const lastFullHealMs = Number(entry.lastFullHealAtMs || 0);
+                const nowMs = Date.now();
+                if (
+                  lastFullHealMs > 0
+                  && nowMs - lastFullHealMs < ACTIVATION_LIGHT_HEAL_DEDUPE_MS
+                ) {{
+                  entry.activationLightHealSkipCount =
+                    Number(entry.activationLightHealSkipCount || 0) + 1;
+                  entry.lastActivationLightSkipReason = String(reason || "");
+                }} else {{
+                  if (typeof entry.term.clearTextureAtlas === "function") {{
+                    entry.term.clearTextureAtlas();
+                    entry.lastAtlasClearAtMs = nowMs;
+                  }}
+                  if (typeof entry.term.refresh === "function") {{
+                    entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+                  }}
+                  entry.lastFullHealAtMs = nowMs;
+                  entry.fullHealCount = Number(entry.fullHealCount || 0) + 1;
+                  entry.activationLightHealCount =
+                    Number(entry.activationLightHealCount || 0) + 1;
                 }}
                 if (typeof entry.emitHostHealth === "function") {{
                   entry.emitHostHealth(reason);
