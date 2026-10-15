@@ -19112,12 +19112,12 @@ console.log('ok');
         // break". Throttling is still correct and still pinned; DROPPING is not.
         assert!(
             script.contains(
-                "requestedForceFullRefresh\n                        && term.refresh\n                        && !inputHot\n                        && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))"
+                "requestedForceFullRefresh\n                        && term.refresh\n                        && !inputHot\n                        && !justHealed\n                        && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))"
             )
                 && script.contains("recentFrameLikeWriteUntilMs = Date.now() + Math.max(600, writeFrameMs * 2);")
                 && script.contains("recentFrameLikeWrite ? 'frame_like' : 'rate_limited'")
                 && script.contains("xterm_forced_refresh_skipped"),
-            "a throttled full refresh must still be throttled, but never unconditionally"
+            "a throttled full refresh must still be throttled, but never unconditionally (the [F7 s51] just-healed dedupe is a veto on an already-served staleness, not a drop: the demand is consumed through the named just_healed skip)"
         );
         assert!(
             script.contains("const VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS = 1500;")
@@ -74975,6 +74975,70 @@ mod web_surface_immersion_locks {
         assert!(
             script.contains("local://stamp-test"),
             "the stamp must carry the session identity (the [11.171] join key)"
+        );
+    }
+
+    // [F7 s51] The visible-paint funnel must not repeat a texture-atlas heal
+    // that a full-heal site just completed: redrawTerminal's own
+    // requestVisiblePaint(true) arms the funnel's force-full demand, so every
+    // switch-in paid the heal TWICE back-to-back (measured 2026-10-15: the
+    // funnel's xterm_forced_refresh lands ~1ms after the redraw's
+    // terminal_repaint; ui.block reads a ~215ms stall across the pair). The
+    // shared lastAtlasHealAtMs clock + the 50ms dedupe window consume the
+    // duplicate; genuine staleness (a backgrounded period of missed frames)
+    // can never land inside the window.
+    #[test]
+    fn the_visible_paint_funnel_dedupes_a_just_completed_atlas_heal() {
+        let scripts = include_str!("terminal_scripts.rs");
+        for needle in [
+            // The shared heal clock + its window, declared once.
+            "let lastAtlasHealAtMs = 0;",
+            "const VISIBLE_PAINT_HEAL_DEDUPE_MS = 50;",
+            // The funnel consults it and stands down...
+            "const justHealed =",
+            "&& !justHealed",
+            // ...the funnel's own heal writes the clock,
+            "lastVisiblePaintFullRefreshAtMs = now;\n                        lastAtlasHealAtMs = now;",
+            // the demand is CONSUMED (not re-armed) through the named skip,
+            "recordVisiblePaintRefreshSkipped('just_healed', true);",
+            // and redrawTerminal's full heal stamps the same clock.
+            "lastAtlasHealAtMs = Date.now();",
+        ] {
+            assert!(
+                scripts.contains(needle),
+                "the heal-dedupe lost {needle:?}"
+            );
+        }
+        // The just_healed arm must PRECEDE the generic defer arm, and the
+        // generic defer must still re-arm (its latch-loss contract stands for
+        // input_hot/frame_like/rate_limited — only the dedupe consumes).
+        let healed_arm = scripts
+            .find("else if (requestedForceFullRefresh && justHealed)")
+            .expect("the just_healed consume arm is missing");
+        let generic_arm = scripts
+            .find("else if (requestedForceFullRefresh) {{")
+            .expect("the generic defer arm is missing");
+        assert!(
+            healed_arm < generic_arm,
+            "the just_healed arm must be matched before the generic defer arm"
+        );
+        let defer_body = &scripts[generic_arm..];
+        let defer_tail = defer_body
+            .find("pendingVisiblePaintForceFullRefresh = true;")
+            .expect("the generic defer must still re-arm the demand");
+        assert!(
+            defer_tail < defer_body.find("}} else if (").unwrap_or(defer_body.len()),
+            "the re-arm belongs to the generic defer arm, not a later arm"
+        );
+        // The partial glyph-gap heal must NOT stamp the shared clock: it
+        // clears the atlas but refreshes only the gap rows, so a following
+        // full heal is NOT the same work. Its setTimeout body must stay
+        // stamp-free (the two stamped Date.now() sites are redrawTerminal and
+        // the stale-atlas rAF-gap heal).
+        assert_eq!(
+            scripts.matches("lastAtlasHealAtMs = Date.now();").count(),
+            2,
+            "exactly the two FULL-heal sites may stamp the shared clock"
         );
     }
 
