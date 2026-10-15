@@ -3475,12 +3475,22 @@ terminal_repaint = 0/6 (control b07f3c79: 1 per switch at +0..+344ms,
 223ms — the dominant block was never only the funnel duplicate. The
 remaining felt budget: the light :raf/:120/:360 passes (the
 input-policy design), Leg A's render pass, and the stamp proxy's own
-overcount. Board outcome ACK-c8f8bdfd44. OWED + sol consult (staged,
-juju-capped: lores/chain-of-thought/
-2026-10-15-yggterm-s51-reveal-stamp-sol.md): Leg A (earlier raise
-decision vs render cost), the light-pass design on warm raises, the
-probe's paint-end pairing predicate (the first frame_gap's
-rows_painted=1 makes first-frame pairing gameable).
+overcount. Board outcome ACK-c8f8bdfd44. THE CONSULT RAN (sol juju-capped; the
+sanctioned STANDBY gemini-3.8-flash HIGH via agy — nodes
+lores/chain-of-thought/2026-10-15-yggterm-s51-reveal-stamp-{sol,gemini-standby}.md):
+Q1 rebut with 3 accepted corrections (the felt cluster is ~240-400ms
+post-activation once Leg A is counted; switch 0's first cluster carried
+rows_painted=1; the delay is a churn train), Q2 REBUT — the next unit
+is ONE-heal-at-:now: dedupe the light :raf/:120/:360 passes behind
+lastAtlasHealAtMs (repaintActiveEntry's light branch bypasses the clock
+today) + skip sampleCanvasInk on warm switch, Q3 REBUT — the
+earlier-decision idea is accounting fiction, rank render-cost reduction
+first, Q4 REBUT — the probe pairing predicate is the first
+frame_gap/frame_window with rows_painted >= term.rows at ts >=
+reveal_served (stamp demotes to accuracy-only). NEXT SESSION: the
+light-pass dedupe unit (Q2's shape, falsifier: forced clears per warm
+switch 4->1, ui.block max < 150ms, zero garble on the
+switch-after-idle-dwell bar) + the probe pairing predicate.
 
 PROGRESS 2026-09-27 ~04:20 IST (switch-raise lane, leg 1 LANDED, fix
 direction corrected by event-resolution measurement): the dominant leg is
