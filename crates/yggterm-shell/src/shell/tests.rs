@@ -60792,6 +60792,52 @@ fn earned_witness_and_sticky_ready_survive_attempt_churn() {
 }
 
 #[test]
+fn the_attach_ready_site_submits_the_birth_attempt_content_claim() {
+    // [i-r2 L1 sol s47 Q3] the PRIMARY attempt-completion fix, pinned at
+    // the source: attach is where the attempt submits its evidence demand —
+    // a qualifying receipt completes NOW; absent receipts PARK (the door's
+    // ContentPending); the origin is the mount's captured attempt, never
+    // the latest at callback time; the vetoed observe door stays out of
+    // this site (active-session scoped, mutates the resume latch).
+    let source = include_str!("viewport.rs");
+    let site = source
+        .find("\"terminal_attach_local_ready\"")
+        .expect("the attach-ready site exists");
+    let window = &source[site..];
+    let closure = window.find("|shell| {").expect("the shell closure");
+    let body = &window[closure..];
+    let bound = body
+        .find("fresh_remote_codex_start")
+        .unwrap_or(body.len());
+    let body = &body[..bound];
+    let origin = body
+        .find("mount_origin_attempt_id.as_deref()")
+        .expect("the captured origin rides the claim");
+    let finish = body
+        .find("maybe_finish_terminal_surface_request_for_session")
+        .expect("the surface-request finish");
+    assert!(
+        origin < finish,
+        "the claim submits before the surface-request finish",
+    );
+    assert!(
+        body.contains("TerminalReadyClaim::Content {"),
+        "the attach site submits a CONTENT claim (evidence-demand, not a bypass)",
+    );
+    // comment lines are stripped first — the site's own doc comment names
+    // the vetoed door; the lock judges the CODE (the s34 audit-lock law).
+    let code: String = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("observe_terminal_open_attempt_from_viewport"),
+        "the attach site must not route through the observe door",
+    );
+}
+
+#[test]
 fn the_applied_content_probe_refuses_a_husk_entry() {
     // lock (b) ingress half (sol s47 Q1: the ln-646 measured class —
     // entry_live:true + was_husk:true + a receipt coexist through teardown

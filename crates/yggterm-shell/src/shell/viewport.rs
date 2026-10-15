@@ -16410,6 +16410,31 @@ fn TerminalCanvas(
                                             |shell| {
                                                 shell.retain_terminal_session_path(&session_path);
                                                 shell.terminal_attach_in_flight.remove(&session_path);
+                                                // [i-r2 L1 sol s47 Q3] THE BIRTH-ATTEMPT
+                                                // COMPLETION: attach is where the attempt
+                                                // submits its evidence demand — a qualifying
+                                                // receipt completes it NOW; absent receipts
+                                                // PARK it (the door's ContentPending) for the
+                                                // ack-arrival / organic-probe promotion. The
+                                                // origin is the mount's captured attempt (the
+                                                // (e-r8) rule — never the latest at callback
+                                                // time). This is the PRIMARY attempt-completion
+                                                // fix: readiness must not depend on a later
+                                                // demotion's cancel latch (the measured s47
+                                                // starve: the Pending birth attempt latched
+                                                // FAILURE on the churn because the witness
+                                                // could not earn). NOT routed through
+                                                // observe_terminal_open_attempt_from_viewport
+                                                // (active-session scoped, mutates the resume
+                                                // latch). The cancel latch and its paint
+                                                // requirement stay as the fallback.
+                                                shell.complete_terminal_open_attempt_ready(
+                                                    &session_path,
+                                                    TerminalReadyClaim::Content {
+                                                        reason: "terminal_attach_local_ready",
+                                                    },
+                                                    mount_origin_attempt_id.as_deref(),
+                                                );
                                                 shell.maybe_finish_terminal_surface_request_for_session(
                                                     &session_path,
                                                 );

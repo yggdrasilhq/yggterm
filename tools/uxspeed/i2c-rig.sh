@@ -10,24 +10,29 @@
 #          (printf '%s%s' CHURN LATE_<nonce> — the typed line can never satisfy
 #          the contiguous-marker bar, sol s46 Q4); create row b — b's CREATION
 #          prepends b to the live order and demotes a inside b's churn window.
-#   BAR-D (survival): a must NOT churn during/after b's creation — no
-#          terminal_mount_task_dropped, no bootstrap_reset, no
-#          bootstrap_spawn_skipped_inactive_retained_host on a in the slice.
+#   BAR-D (survival, HARD, FULL slice — sol s47 Q4): a's component
+#          instance, loop AND owner survive b's creation THROUGH the
+#          re-select and the effect check — zero terminal_mount_task_dropped,
+#          zero bootstrap_reset, zero bootstrap_owner_superseded_during_loop
+#          (an owner switch = a replacement loop start; samples partition by
+#          incarnation at each supersession). spawn_skipped stays
+#          INFORMATIONAL (the residual cascade's fingerprint). Row b's
+#          legitimate initial bootstrap and a's pre-churn cold-mount
+#          refusal are outside this slice.
 #   BAR-T (trickle): the SPLIT marker must reach a's client buffer while a is
 #          demoted, absent before demotion. NON-DISCRIMINATING as instrumented
 #          (a remount re-seeds from the daemon screen too) — BAR-D/BAR-R carry
 #          the verdict; kept as the symptom bar.
-#   BAR-R (fast raise): MEASURED, INFORMATIONAL ONLY — the re-select raise
-#          currently refuses after a churn for a SEPARATE stacked defect
-#          (the birth attempt of an app-control row sits Pending — no ready
-#          observation while backgrounded; the churn's skip-cancel legally
-#          latches it as a failure because the organic paint witness never
-#          advanced; the latched failure vetoes the raise → full bootstrap).
-#          Filed in the queue; NOT this unit's claim. Never gate rc on it.
+#   BAR-R (fast raise, HARD — sol s47 Q4): the re-select takes the fast
+#          raise branch — the birth attempt EARNED readiness at attach (the
+#          in-slice 'ready' attempt event, the L1 fix), reveal_served fires
+#          with ZERO reveal_raise_refused. BAR-P below is the fresh-effect
+#          proof (a typed marker read back — no stale retained frame can
+#          satisfy it); no latency budget is asserted (none is declared).
 #   BAR-P (client typing): the SPLIT-typed echo lands in a's client buffer.
 #          Delivery-only (no latency claim).
 # RC: 0 all green · 2 setup · 4 pre-flight · 5 BAR-T · 6 BAR-D ·
-#     8 BAR-P · 9 exe-mismatch voids all verdicts.
+#     7 BAR-R · 8 BAR-P · 9 exe-mismatch voids all verdicts.
 # Usage: tools/uxspeed/i2c-rig.sh <binary>  (absolute path; full-workspace
 # release build per rig law L1).
 set -u
@@ -181,35 +186,28 @@ print("VERDICT BAR-T (trickle to demoted row, split marker %s): %s" % (ML, "GREE
 if not ok_t:
     fail = 5
 
-# BAR-D: a's component instance and loop survive b's creation.
-post = read_events()[slice_start:]
-drops_a = [(ln, p) for ln, p in session_events(post, a, "terminal_mount_task_dropped")]
-resets_a = session_events(post, a, "bootstrap_reset")
-skips_a = session_events(post, a, "bootstrap_spawn_skipped_inactive_retained_host")
-print("a post-churn slice: drops=%d bootstrap_reset=%d spawn_skipped=%d" % (
-    len(drops_a), len(resets_a), len(skips_a)))
-for _, p in drops_a:
-    print("   drop: remount_armed=%s exit_hint=%s" % (p.get("remount_armed"), p.get("exit_hint")))
-ok_d = not drops_a and not resets_a
-print("VERDICT BAR-D (instance survives the creation churn): %s%s" % (
-    "GREEN" if ok_d else "RED",
-    "" if ok_d else " (spawn_skipped=%d — the residual cascade's fingerprint, see queue)" % len(skips_a)))
-if not ok_d:
-    fail = fail or 6
-
-# BAR-R: re-select a — the fast raise, sliced from the re-select boundary.
+# BAR-R (HARD, sol s47 Q4): the fast raise raises. Precondition in-slice:
+# the birth attempt EARNED readiness at attach (the L1 'ready' attempt
+# event); the re-select takes the raise branch — reveal_served with ZERO
+# reveal_raise_refused. BAR-P below is the fresh-effect proof.
+post_pre = read_events()[slice_start:]
+ready_a = session_events(post_pre, a, "ready")
 reselect_start = len(read_events())
 verb("server", "app", "open", a, "--view", "terminal"); time.sleep(4)
 post2 = read_events()[reselect_start:]
 served_a = session_events(post2, a, "reveal_served")
 refused_a = session_events(post2, a, "reveal_raise_refused")
+print("a birth-attempt 'ready' events in slice: %d" % len(ready_a))
 print("a after re-select (slice %d..): served=%d refused=%d" % (reselect_start, len(served_a), len(refused_a)))
 for _, p in refused_a[-2:]:
     print("   refused: loop_live=%s was_ever_ready=%s" % (p.get("loop_live"), p.get("was_ever_ready")))
-ok_r = len(served_a) >= 1 and len(refused_a) == 0
-print("VERDICT BAR-R (fast raise on re-select; INFORMATIONAL — separate residual, not gated): %s" % ("GREEN" if ok_r else "RED (residual: see queue)"))
+ok_r = len(ready_a) >= 1 and len(served_a) >= 1 and len(refused_a) == 0
+print("VERDICT BAR-R (fast raise raises on re-select; HARD): %s" % ("GREEN" if ok_r else "RED"))
+if not ok_r:
+    fail = fail or 7
 
-# BAR-P: typing lands in the client buffer (delivery-only).
+# BAR-P (the fresh-effect proof): typing lands in the client buffer after
+# the raise — a stale retained frame cannot satisfy a typed-marker read.
 typed(a, typed_cmd_2)
 ok_p = False
 for _ in range(24):
@@ -219,6 +217,27 @@ for _ in range(24):
 print("VERDICT BAR-P (typing green after re-select, %s): %s" % (M2, "GREEN" if ok_p else "RED"))
 if not ok_p:
     fail = fail or 8
+
+# BAR-D (HARD, FULL slice — sol s47 Q4): zero drops, zero resets, zero
+# owner-supersessions for the retained target through re-select + effect +
+# settle. spawn_skipped stays INFORMATIONAL.
+post = read_events()[slice_start:]
+drops_a = [(ln, p) for ln, p in session_events(post, a, "terminal_mount_task_dropped")]
+resets_a = session_events(post, a, "bootstrap_reset")
+superseded_a = [(ln, p) for ln, p in session_events(post, a, "bootstrap_owner_superseded_during_loop")]
+skips_a = session_events(post, a, "bootstrap_spawn_skipped_inactive_retained_host")
+print("a full slice (churn->re-select->effect->settle): drops=%d bootstrap_reset=%d superseded=%d spawn_skipped=%d" % (
+    len(drops_a), len(resets_a), len(superseded_a), len(skips_a)))
+for ln, p in drops_a:
+    print("   drop ln=%d: remount_armed=%s exit_hint=%s" % (ln, p.get("remount_armed"), p.get("exit_hint")))
+for ln, _ in superseded_a:
+    print("   superseded ln=%d (owner switch — a replacement loop started; samples partition by incarnation)" % ln)
+ok_d = not drops_a and not resets_a and not superseded_a
+print("VERDICT BAR-D (instance+owner survive the churn through the re-select; HARD): %s%s" % (
+    "GREEN" if ok_d else "RED",
+    "" if ok_d else " (spawn_skipped=%d informational)" % len(skips_a)))
+if not ok_d:
+    fail = fail or 6
 
 if fail:
     raise SystemExit(fail)
