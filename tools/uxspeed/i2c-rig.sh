@@ -24,8 +24,9 @@
 #          (a remount re-seeds from the daemon screen too) — BAR-D/BAR-R carry
 #          the verdict; kept as the symptom bar.
 #   BAR-R (fast raise, HARD — sol s47 Q4): the re-select takes the fast
-#          raise branch — the birth attempt EARNED readiness at attach (the
-#          in-slice 'ready' attempt event, the L1 fix), reveal_served fires
+#          raise branch — the birth attempt EARNED readiness at attach + the
+#          organic promotion (the pre-re-select 'ready' attempt event, the
+#          L1 fix), reveal_served fires
 #          with ZERO reveal_raise_refused. BAR-P below is the fresh-effect
 #          proof (a typed marker read back — no stale retained frame can
 #          satisfy it); no latency budget is asserted (none is declared).
@@ -190,8 +191,11 @@ if not ok_t:
 # the birth attempt EARNED readiness at attach (the L1 'ready' attempt
 # event); the re-select takes the raise branch — reveal_served with ZERO
 # reveal_raise_refused. BAR-P below is the fresh-effect proof.
-post_pre = read_events()[slice_start:]
-ready_a = session_events(post_pre, a, "ready")
+# The 'ready' precondition scans the WHOLE pre-re-select trace: the birth
+# attempt earns readiness at attach + the organic promotion (~2s after
+# birth) — BEFORE the churn, not inside it.
+reselect_start = len(read_events())
+ready_a = session_events(read_events()[:reselect_start], a, "ready")
 reselect_start = len(read_events())
 verb("server", "app", "open", a, "--view", "terminal"); time.sleep(4)
 post2 = read_events()[reselect_start:]

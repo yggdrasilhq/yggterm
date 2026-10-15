@@ -38,7 +38,19 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   eval" framing is dead; the "vanish" was this shed window), the [11.217]
   half-handshake site, the [11.229](c) blank shape, the first-spawn-blank
   readings beside [11.226]. ((a) left this family 2026-10-07 — measured
-  as the [11.228] grid-divergence reuse arm, closed in F3.) ATTACK: LANDED 2026-10-05 (3042a0d6, lane
+  as the [11.228] grid-divergence reuse arm, closed in F3.) THE WARM-GATE
+  VANISH INTERMITTENT (measured s47, OPEN): warm_eval_vanish_redo_cold
+  {decision: pipeline_alive_eval_lost, waited_ms: 1204, probe_count: 1}
+  fires on HEALTHY fresh mounts under load — measured 2/3 fence-order
+  runs on DEPLOYED MAIN 1d018bf8f875 and 6/6 on the s47 lane
+  (build-independent; the s45/s46 single green rolls were luck). The redo
+  mid-stall merges the stall-window chunks (one 186B batch vs 131+50),
+  raises the seed's output_seq over the retained batch, and routes
+  delivery through the (e-r1) covered-drop instead of a flush —
+  fence-order's evidence bar now accounts both routes (s47 revision; the
+  exactly-once ordering bar itself held 7/7). The alive-record-ABSENT
+  read on a live mount is the next F1 attack surface (the s32/33
+  transport ledger instruments apply directly). ATTACK: LANDED 2026-10-05 (3042a0d6, lane
   lane/f1/synthesize-full-contract) — on matched-stage-posted the FULL
   contract now rides the ONE transport measured alive through the shed
   window (fresh document::eval + return): off-loop daemon screen snapshot
@@ -60,7 +72,19 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   warm_alive_posted mount (synthesized_input_drained 2/2 chunks, "echo
   F1LEG4 / F1LEG4" painted on screen); (c) the
   stale-receiver WHY (sol ranked-attack #3) — page-side send ring +
-  IPC-ingress stamps decide it; (d) the healthy row's page→Rust ytrace
+  IPC-ingress stamps decide it; MEASURED PAINT DELIVERY GAP — OPEN (s47,
+  sol s47 Q5 wording): on exe-proved 95339388, the organic mount attempts
+  Paint sends page-side (paintSendAttemptCount 3, key 3<->4), but no Rust
+  paint_ready/first-paint-witness event is observed; the page
+  independently holds an applied-write receipt before churn (gen 1, wrote
+  349). Receipt recovery was parked-claim-gated, leaving the paint
+  witness unearned; cancellation then latched failure and re-selection
+  superseded the surviving loop — the L1/L2 fix removed readiness's
+  dependency on Paint delivery. The precise loss site (send failure,
+  receiver lifetime, decoding, routing) remains unlocalized; after
+  L1/L2, verify readiness recovery separately from Paint-channel repair.
+  Call it cosmetic only after auditing the Paint arm's remaining
+  consumers. (d) the healthy row's page→Rust ytrace
   still rides the dead leg (cosmetic, trace-only); (e) THE OUTPUT FENCE — LANDED 2026-10-06 ([11.233], sitting 9, lane
   lane/f1/output-fence): the painted-guard could NOT order the
   synthesized seed against in-flight differentials, and the mechanism is
@@ -1399,6 +1423,50 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   BAR A "focus away+back retains the host" evidence was therefore
   vacuous (no switch happened); the retained-host claim itself is
   re-proven by d-rig's control arm.
+  (i-r2) RESIDUAL CLOSED 2026-10-15 (sitting 47, lane lane/i2/
+  paint-provenance 95339388+66e13e80+f9c1b2d7; sol round node
+  lores/chain-of-thought/2026-10-15-yggterm-s47-paint-provenance-sol.md,
+  gpt-6.1-sol HIGH 64,950 tokens, RAW staged data): THE MEASUREMENT FIRST
+  (tools/uxspeed/i2prov-rig.sh + the gated provenance probe
+  YGGTERM_TEST_PAINT_PROVENANCE=1 — paintCount + paintSendAttemptCount +
+  lastPaintKey sampled at 250ms through the churn): the s46b framing
+  FALSIFIED — the kind:"paint" send IS attempted page-side (3 attempts,
+  key 3<->4) but ZERO events reach Rust (the F1(c) gap above), while a
+  QUALIFIED receipt (wrote=349, blank=false, gen=1) sat in the page entry
+  from ~mount+2s, observable only over the eval-return leg — and the only
+  read-back instrument was gated on a parked claim the row never has.
+  THE FIXES (sol s47 Q1/Q3 verdicts): L2 — record_terminal_applied_content
+  earns the paint witness on a VALIDATED receipt WITHOUT paint_pending
+  pre-arm (idempotent; the pending marker cleared as cleanup; promoted
+  keeps its claim-promotion meaning — the earn is silent), and the
+  re-attest probe arms CLAIM-INDEPENDENTLY (evidence/witness missing OR a
+  claim parked, loop-whole-life) with the issuer's ownership check at the
+  ingress (was_husk === false required — the ln-646 measured class:
+  entry_live:true + was_husk:true + a receipt coexist through teardown
+  transients; lastVisiblePaint deliberately NOT required); L1 —
+  terminal_attach_local_ready submits the birth attempt's evidence demand
+  (complete_terminal_open_attempt_ready, Content claim, the mount's
+  CAPTURED origin per (e-r8), NOT via observe_terminal_open_attempt_);
+  absent receipts park it. The cancel latch + its paint requirement stay
+  as the fallback. THE FIVE BEHAVIORAL LOCKS pinned (sol s47 Q2 map) + the
+  husk-ingress source lock + four old-law pins updated (promoted now also
+  fires on the witness earn; the attempt-level guarantees unchanged).
+  PROOF: shell 2302/0 + server 1684/0(+25) no-fail-fast; i2c-rig HARD
+  bars (sol s47 Q4) — BAR-R hard (the pre-re-select 'ready' attempt event
+  + reveal_served with ZERO reveal_raise_refused; BAR-P the fresh-effect
+  proof) and BAR-D hard over the FULL slice with owner-supersessions —
+  lane rc 0 ALL GREEN vs deployed main rc 7 (BAR-R RED: no ready event,
+  raise refused was_ever_ready:false; BAR-D RED: drop pre_select +
+  supersession ln 597) — the exact differential; i2prov on the lane: the
+  chain RESOLVES (zero cancels, zero supersessions, ONE incarnation
+  through the re-select; the page-push delivered the receipt —
+  applied_content_promoted — so the probe's stop-optimization kept it
+  disarmed; the claim-independent arm is lock-proven + measured in the
+  s47 starve trace). fences order/dup/swap rc 0 (order's evidence bar
+  revised to account the covered-drop route — see the F1 vanish
+  intermittent above; the ordering bar itself held 7/7). STILL OPEN IN
+  THIS FAMILY: (e-r2) repaint cursor restoration; the F1(c) Paint loss
+  site; the warm-gate vanish intermittent.
 - **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
