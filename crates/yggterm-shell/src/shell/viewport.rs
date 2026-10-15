@@ -13533,6 +13533,19 @@ fn TerminalCanvas(
                                     "surface_painted": surface_painted,
                                     "receipt_qualifies": receipt_qualifies,
                                     "seed_applied": seed_applied,
+                                    // [F1-(e-r2)] The page caret the proof
+                                    // read AFTER the seed write's callback
+                                    // resolved — the fence's own evidence
+                                    // that the repaint restored (or lost)
+                                    // the daemon's cursor. -1 = unreadable.
+                                    "cursor_row": proof
+                                        .get("cursor_row")
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(-1),
+                                    "cursor_col": proof
+                                        .get("cursor_col")
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(-1),
                                     "blank": proof
                                         .get("blank")
                                         .and_then(Value::as_bool)

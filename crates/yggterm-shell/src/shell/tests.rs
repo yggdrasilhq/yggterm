@@ -57369,6 +57369,21 @@ Shared connection to 192.0.2.14 closed.\r\n";
     }
 
     #[test]
+    fn sanitize_terminal_replay_payload_keeps_a_daemon_cursor_restore() {
+        // [F1-(e-r2) MEASURED 2026-10-15] The seed's cursor restore is the
+        // vt100 serializer's own cursor MoveTo near the stream tail; the
+        // replay sanitizers cut transport-noise LINES and must never cut
+        // cursor-addressed state that is part of the authoritative frame.
+        // Pins the measured contract against line-classifier drift.
+        let raw = "\x1b[2J\x1b[HL1\r\nL2\r\nL3\r\n\x1b[2;9H";
+        let cleaned = sanitize_terminal_replay_payload(raw);
+        assert!(
+            cleaned.contains("\x1b[2;9H"),
+            "the replay payload must keep the daemon cursor restore, got: {cleaned:?}"
+        );
+    }
+
+    #[test]
     fn sanitize_terminal_replay_payload_strips_orphaned_shared_connection_close() {
         let raw = "ssh log\nShared connection to 192.0.2.14 closed.\n›";
 

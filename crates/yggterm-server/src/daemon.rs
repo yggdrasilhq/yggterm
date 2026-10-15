@@ -14793,9 +14793,15 @@ impl DaemonRuntime {
                     let ring_only = std::env::var("YGGTERM_TEST_SNAPSHOT_CAPTURE_RING_ONLY")
                         .map(|value| value == "1")
                         .unwrap_or(false);
+                    // [F1-(e-r2) s48] The payload is env-overridable so
+                    // the cursor bar can inject a CURSOR PARK (L1/L2/L3 +
+                    // an absolute CUP) with the dup bar's no-verb-timing
+                    // guarantee: the bytes are parsed into the vt100 screen
+                    // synchronously inside this hook, before the capture.
                     let injected_seq = self.terminals.debug_inject_ring_marker_once(
                         &runtime_path,
-                        "E1RMARK\r\n",
+                        &std::env::var("YGGTERM_TEST_SNAPSHOT_CAPTURE_INJECT")
+                            .unwrap_or_else(|_| "E1RMARK\r\n".to_string()),
                         ring_only,
                     );
                     if ring_only {
