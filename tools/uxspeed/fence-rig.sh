@@ -1327,6 +1327,10 @@ page_count, page_tail = page_screen_count(s, "F1EMARK")
 daemon_count = daemon_screen_count(s, "F1EMARK")
 proof_payload = (session_events(read_events(), s, "synthesized_mount_open") or [(0, {})])[-1][1]
 flush_events = session_events(read_events(), s, "synth_output_fence_flushed")
+covered_events = session_events(read_events(), s, "synth_output_fence_seed_covered_drop")
+retained_events = session_events(read_events(), s, "synth_output_fence_retained")
+covered_batches = sum(int(p.get("dropped_batches") or 0) for _, p in covered_events)
+retained_batches = len(retained_events)
 print("VERDICT FENCE-ORDERING: page F1EMARK=%d (daemon=%d) seed_mode=%s wrote_seed=%s" % (
     page_count, daemon_count, proof_payload.get("seed_mode"), proof_payload.get("wrote_seed")))
 print("   page tail: %r" % page_tail[-160:])
@@ -1343,15 +1347,30 @@ elif page_count != 1:
 # BAR 2: fence evidence (only meaningful once ordering holds).
 if fail_rc == 0:
     seed_mode = proof_payload.get("seed_mode")
-    if seed_mode != "fenced_repaint" or not flush_events:
-        print("VERDICT FENCE-EVIDENCE FAIL: seed_mode=%s flush_events=%d (want fenced_repaint + >=1)" % (
-            seed_mode, len(flush_events)))
+    # [s47] the retained bytes must provably reach the page: flushed after
+    # the seed (the classic proof) OR dropped as seed-covered (the (e-r1)
+    # proof — the seed's authoritative screen already contains them, the
+    # page holds exactly the seed's copy, and BAR 1 pinned exactly-once).
+    # The covered route is the measured outcome when the PRE-EXISTING
+    # warm-gate vanish intermittent (warm_eval_vanish_redo_cold
+    # pipeline_alive_eval_lost — measured on DEPLOYED MAIN 2/3 runs, the
+    # F1/[11.178] class) merges the stall-window chunks and raises the
+    # seed's output_seq over the retained batch. Retained batches neither
+    # flushed nor covered stay RED (silent loss).
+    if seed_mode != "fenced_repaint" or (
+        not flush_events and covered_batches < retained_batches
+    ):
+        print("VERDICT FENCE-EVIDENCE FAIL: seed_mode=%s flush_events=%d covered=%d/%d (want fenced_repaint + flush>=1 or covered==retained)" % (
+            seed_mode, len(flush_events), covered_batches, retained_batches))
         fail_rc = fail_rc or 6
     elif int(proof_payload.get("wrote_seed") or 0) <= 0:
         print("VERDICT FENCE-EVIDENCE FAIL: fenced seed wrote nothing (wrote_seed=%s)" % proof_payload.get("wrote_seed"))
         fail_rc = fail_rc or 6
     else:
-        print("VERDICT FENCE-EVIDENCE: OK (fenced_repaint + flush rode the proof)")
+        if flush_events:
+            print("VERDICT FENCE-EVIDENCE: OK (fenced_repaint + flush rode the proof)")
+        else:
+            print("VERDICT FENCE-EVIDENCE: OK (fenced_repaint + covered-drop exhausted the retained bytes — the seed's screen IS the delivery; warm-gate-vanish intermittent route)")
 
 # BAR 3 [e-r10]: the seed receipt carried a REAL page gen (telemetry
 # honesty — the page_gen: 0 convention is dead; RED on main records 0).

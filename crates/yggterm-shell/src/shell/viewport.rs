@@ -7574,6 +7574,19 @@ fn TerminalCanvas(
                 std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
             > = None;
             let mut applied_content_probe_next_ms: u64 = 0;
+            // [s47 MEASUREMENT] the paint-provenance sampler (sol s46b spec):
+            // 250ms READ-ONLY samples of the page's paint counters through
+            // the churn demotion + skip-cancel grace. Gated on the test env —
+            // production never arms it, the loop body stays await-free (the
+            // (i-r1) law), and the future's only effect is its trace event.
+            // Absent answers are traced UNKNOWN (null), never zero.
+            let paint_provenance_enabled =
+                std::env::var("YGGTERM_TEST_PAINT_PROVENANCE").as_deref() == Ok("1");
+            let mut paint_provenance_future: Option<
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+            > = None;
+            let mut paint_provenance_next_ms: u64 = 0;
+            let mut paint_provenance_samples: u64 = 0;
             // [e9 RIG HOOK] one-shot latch for the re-attest park marker
             // (YGGTERM_TEST_PARK_CLAIM_FILE — absent = inert).
             let reattest_park_hook = std::env::var("YGGTERM_TEST_PARK_CLAIM_FILE").is_ok();
@@ -7947,8 +7960,10 @@ fn TerminalCanvas(
                 // poll deadline fires even when idle — and staging only
                 // constructs a pinned future, so the body stays await-free
                 // (the (i-r1) law). Gates kept: js_ready (a page must
-                // exist to read), one probe in flight, the 2s cooldown, a
-                // parked claim for THIS session. Gates dropped:
+                // exist to read), one probe in flight, the 2s cooldown.
+                // [i-r2 L2 sol s47 Q1] the parked-claim gate WIDENED to the
+                // organic want — evidence/witness missing OR a claim parked —
+                // for the loop's whole life. Gates dropped:
                 // js_ready_synthesized, bridge-read policy, flush_due —
                 // real mounts publish receipts through the live-write
                 // issuer and the probe script is entryLive-guarded.
@@ -7956,10 +7971,22 @@ fn TerminalCanvas(
                     && applied_content_probe_future.is_none()
                     && current_millis() >= applied_content_probe_next_ms
                 {
-                    let parked = state.with(|shell| {
+                    // [i-r2 L2 sol s47 Q1] CLAIM-INDEPENDENT organic
+                    // recovery: probe while the receipt/witness is still
+                    // missing OR a claim is parked — for the loop's whole
+                    // life, no mount-age or attempt-state boundary (the
+                    // measured starve had neither a parked claim nor a
+                    // delivered Paint event). Once the receipt qualifies AND
+                    // the witness is earned the probe has nothing left to
+                    // discover and stops arming; a parked claim always
+                    // re-attests (sol s23 R2).
+                    let wants_probe = state.with(|shell| {
                         shell.terminal_pending_content_claims.contains_key(&session_path)
+                            || !shell
+                                .terminal_session_applied_receipt_qualifies(&session_path)
+                            || !shell.terminal_session_host_has_painted(&session_path)
                     });
-                    if parked {
+                    if wants_probe {
                         applied_content_probe_next_ms = current_millis() + 2000;
                         applied_content_probe_future = Some(stage_applied_content_probe(
                             state,
@@ -7968,6 +7995,26 @@ fn TerminalCanvas(
                             trace_home.clone(),
                         ));
                     }
+                }
+                // [s47 MEASUREMENT] the provenance sampler: armed on every
+                // loop wake while the test gate is on — INDEPENDENT of parked
+                // claims (that independence is the point: the re-attest
+                // probe's parked-claim gate is one of the two observation
+                // gaps under study). 480 samples cap (2 min) so a leaked env
+                // cannot trace forever.
+                if paint_provenance_enabled
+                    && paint_provenance_samples < 480
+                    && paint_provenance_future.is_none()
+                    && current_millis() >= paint_provenance_next_ms
+                {
+                    paint_provenance_next_ms = current_millis() + 250;
+                    paint_provenance_samples += 1;
+                    paint_provenance_future = Some(stage_paint_provenance_probe(
+                        host_id.clone(),
+                        session_path.clone(),
+                        trace_home.clone(),
+                        paint_provenance_samples,
+                    ));
                 }
                 // [e9 RIG HOOK] the re-attest bar's park constructor — the
                 // marker file is absent in production, making this inert.
@@ -13677,6 +13724,23 @@ fn TerminalCanvas(
                         );
                         applied_content_probe_future = None;
                     },
+                    // [s47 MEASUREMENT] the provenance probe completes —
+                    // READ-ONLY: it never mutates shell state, the trace
+                    // event inside the future is its whole effect.
+                    paint_provenance_done = async {
+                        paint_provenance_future
+                            .as_mut()
+                            .expect("paint provenance probe armed")
+                            .await
+                    },
+                        if paint_provenance_future.is_some() =>
+                    {
+                        let _loop_branch = TerminalLoopBranchGuard::new(
+                            "paint_provenance_probe",
+                            &session_path,
+                        );
+                        paint_provenance_future = None;
+                    },
                     synth_hash_probe_answer = async {
                         synth_hash_probe_eval
                             .as_mut()
@@ -16346,6 +16410,31 @@ fn TerminalCanvas(
                                             |shell| {
                                                 shell.retain_terminal_session_path(&session_path);
                                                 shell.terminal_attach_in_flight.remove(&session_path);
+                                                // [i-r2 L1 sol s47 Q3] THE BIRTH-ATTEMPT
+                                                // COMPLETION: attach is where the attempt
+                                                // submits its evidence demand — a qualifying
+                                                // receipt completes it NOW; absent receipts
+                                                // PARK it (the door's ContentPending) for the
+                                                // ack-arrival / organic-probe promotion. The
+                                                // origin is the mount's captured attempt (the
+                                                // (e-r8) rule — never the latest at callback
+                                                // time). This is the PRIMARY attempt-completion
+                                                // fix: readiness must not depend on a later
+                                                // demotion's cancel latch (the measured s47
+                                                // starve: the Pending birth attempt latched
+                                                // FAILURE on the churn because the witness
+                                                // could not earn). NOT routed through
+                                                // observe_terminal_open_attempt_from_viewport
+                                                // (active-session scoped, mutates the resume
+                                                // latch). The cancel latch and its paint
+                                                // requirement stay as the fallback.
+                                                shell.complete_terminal_open_attempt_ready(
+                                                    &session_path,
+                                                    TerminalReadyClaim::Content {
+                                                        reason: "terminal_attach_local_ready",
+                                                    },
+                                                    mount_origin_attempt_id.as_deref(),
+                                                );
                                                 shell.maybe_finish_terminal_surface_request_for_session(
                                                     &session_path,
                                                 );
@@ -22731,6 +22820,16 @@ fn stage_applied_content_probe(
         if !verdict.get("entry_live").and_then(Value::as_bool).unwrap_or(false) {
             return;
         }
+        // [i-r2 L2 sol s47 Q1] THE ISSUER'S OWNERSHIP CHECK: a receipt read
+        // from a HUSK entry (visible-but-detached — the ln-646 measured
+        // class: entry_live:true + was_husk:true + a gen-3 receipt coexist
+        // through teardown transients) is not content evidence. Require
+        // was_husk === false; an absent field skips this sample too — the
+        // 2s cadence re-probes the settled entry, so strictness costs one
+        // round, never liveness.
+        if verdict.get("was_husk").and_then(Value::as_bool) != Some(false) {
+            return;
+        }
         let Some(record) = decode_applied_content_probe_receipt(&verdict) else {
             return;
         };
@@ -22778,6 +22877,55 @@ fn decode_applied_content_probe_receipt(verdict: &Value) -> Option<TerminalAppli
         ts: receipt.get("ts").and_then(Value::as_u64).unwrap_or(0),
         page_gen: receipt.get("gen").and_then(Value::as_u64).unwrap_or(0),
         source: "reattest_probe",
+    })
+}
+
+/// [s47 MEASUREMENT] one 250ms provenance sample: read the page's paint
+/// counters over the eval-return leg and trace them. Trace-only — never
+/// mutates shell state, never parks, never completes an attempt.
+fn stage_paint_provenance_probe(
+    host_id: String,
+    session_path: String,
+    trace_home: std::path::PathBuf,
+    sample: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+    Box::pin(async move {
+        let script = terminal_paint_provenance_probe_script(&host_id);
+        let answer = document::eval(&script).await;
+        let verdict = match answer {
+            Ok(value) => value
+                .as_str()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok()),
+            Err(_error) => None,
+        };
+        let payload = match verdict {
+            Some(v) => serde_json::json!({
+                "session_path": session_path,
+                "host_id": host_id,
+                "sample": sample,
+                "present": v.get("present").and_then(serde_json::Value::as_bool),
+                "entry_live": v.get("entry_live").and_then(serde_json::Value::as_bool),
+                "paint_count": v.get("paint_count").cloned().unwrap_or(serde_json::Value::Null),
+                "send_attempts": v.get("send_attempts").cloned().unwrap_or(serde_json::Value::Null),
+                "last_paint_key": v.get("last_paint_key").cloned().unwrap_or(serde_json::Value::Null),
+                "last_visible_paint": v.get("last_visible_paint").cloned().unwrap_or(serde_json::Value::Null),
+                "was_husk": v.get("was_husk").cloned().unwrap_or(serde_json::Value::Null),
+                "applied_receipt": v.get("applied_receipt").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+            None => serde_json::json!({
+                "session_path": session_path,
+                "host_id": host_id,
+                "sample": sample,
+                "unknown": true,
+            }),
+        };
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "terminal_paint_provenance",
+            payload,
+        );
     })
 }
 
