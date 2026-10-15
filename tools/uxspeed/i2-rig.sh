@@ -299,7 +299,7 @@ print("fault removed at t=+%0.f (mode=%s)" % (time.time() - t0, MODE))
 rec_t0 = time.time()
 RECOVERY_WAIT = 120 if MODE == "early-recover" else 720
 recovered = False
-before = screen_bytes()
+last_write = 0.0
 while time.time() - rec_t0 < RECOVERY_WAIT:
     evs, off = events_since(off)
     for name, payload in evs:
@@ -310,19 +310,22 @@ while time.time() - rec_t0 < RECOVERY_WAIT:
             remounts.append(time.time())
             print("  ev %s (post-fault) %s" % (name, brief(payload)))
     body = screen_bytes()
-    if post_drop_ready >= 1 and body.strip() and body != before:
-        # LIVING-ROW BAR: a write round trip mutates the screen — input reaches
-        # the PTY and output returns through the recovered loop.
+    if body.strip() and time.time() - last_write > 12:
+        # LIVING-ROW BAR: write-drive unconditionally (resumed mounts never
+        # re-trace attach_ready, so a trace-gated bar never fires). A typed
+        # char rendered into the composer = input drained through a LIVING
+        # loop and echoed back — the round trip sol Q5 demanded. A dead loop
+        # leaves the keystroke in the ring and the screen unchanged.
+        last_write = time.time()
         subprocess.run([BIN, "server", "terminal", "write", ROW, "--stdin"],
-                       input="\n", capture_output=True, text=True, timeout=30)
-        for i in range(8):
-            time.sleep(2)
-            after = screen_bytes()
-            if after != body:
-                recovered = True
-                print("living-row proof: write mutated the screen (%d -> %d bytes)" % (len(body), len(after)))
-                break
-        break
+                       input="x", capture_output=True, text=True, timeout=30)
+        time.sleep(4)
+        after = screen_bytes()
+        if after != body:
+            recovered = True
+            print("living-row proof: write mutated the screen (%d -> %d bytes) at +%.0fs"
+                  % (len(body), len(after), time.time() - rec_t0))
+            break
     time.sleep(3)
 
 print("phase-recover: recovered=%s wait=%.0fs" % (recovered, time.time() - rec_t0))
