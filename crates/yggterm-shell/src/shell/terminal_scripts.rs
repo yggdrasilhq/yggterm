@@ -8303,7 +8303,16 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }} catch (_error) {{}}
             try {{ enforceHelperTextareaContract(); }} catch (_error) {{}}
-            requestVisiblePaint(true);
+            // [F7 s51] Present the redraw WITHOUT re-arming the force-full
+            // demand: this function IS the full heal (clearTerminalTextureAtlas
+            // + refresh above), so a (true) arm made the visible-paint funnel
+            // repeat it — measured 2026-10-15 at +139..+344ms after this
+            // redraw (the heal's own main-thread block delays the funnel's
+            // rAF past the 50ms lastAtlasHealAtMs dedupe window, 5 of 6 warm
+            // switches), a second full re-raster per switch-in. A plain
+            // request still presents the frame; every caller of this function
+            // wanted the heal, which already happened.
+            requestVisiblePaint(false);
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 const entry = window.__yggtermXtermHosts[hostId];
                 entry.manualRedrawCount = manualRedrawCount;

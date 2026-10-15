@@ -75040,6 +75040,19 @@ mod web_surface_immersion_locks {
             2,
             "exactly the two FULL-heal sites may stamp the shared clock"
         );
+        // And redrawTerminal must not RE-ARM the funnel's force-full demand:
+        // the measured duplicate ran +139..+344ms after the redraw (the
+        // heal's own main-thread block delays the funnel's rAF past the 50ms
+        // dedupe window), so the dedupe alone cannot catch it — the redraw
+        // must present without demanding a second heal.
+        let redraw_arm = scripts
+            .find("requestVisiblePaint(false);")
+            .expect("redrawTerminal must present without arming a second heal");
+        let arm_context = &scripts[redraw_arm.saturating_sub(950)..redraw_arm];
+        assert!(
+            arm_context.contains("enforceHelperTextareaContract"),
+            "the (false) arm must be the one INSIDE redrawTerminal"
+        );
     }
 
     // ======================================================================
