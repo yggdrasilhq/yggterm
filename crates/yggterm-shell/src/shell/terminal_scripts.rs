@@ -229,7 +229,7 @@ fn terminal_reused_host_grid_script(session_path: &str) -> String {
 // re-invocations re-bound the dead cold channel pair (s31 differential:
 // the warm invocation tag lives in the mailbox alone). Both invoke sites
 // pass their OWN eval binding; the version gate forces the reinstall.
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 4;
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 5;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -7084,6 +7084,25 @@ fn terminal_eval_script_with_canvas_renderer(
         let visiblePaintRecoveryTimer = null;
         let lastVisiblePaintRunAtMs = 0;
         let lastVisiblePaintFullRefreshAtMs = 0;
+        // [F7 s51] When a texture-atlas heal LAST completed on this host
+        // (clearTerminalTextureAtlas + full refresh) — written by BOTH full-heal
+        // sites (redrawTerminal, the visible-paint funnel below, and the
+        // stale-atlas rAF-gap heal). The funnel consults it before repeating the
+        // heal: redrawTerminal arms the funnel's own force-full demand as a side
+        // effect of requestVisiblePaint(true), so on every switch-in the funnel
+        // re-ran the exact heal the redraw had just finished one frame earlier
+        // (measured 2026-10-15: xterm_forced_refresh atlas_cleared lands ~1ms
+        // after the redraw's terminal_repaint, the ui.block family reads a
+        // ~215ms main-thread stall across the pair, and the switch window
+        // carries 4-5 full_canvas_frames for ONE staleness event).
+        let lastAtlasHealAtMs = 0;
+        // Same-frame-scale by design: the duplicate it kills is the demand the
+        // heal itself arms (served on the next rAF, 1-16ms). Genuine staleness
+        // accrues across a backgrounded period of missed frames, so a heal
+        // inside this window of a completed heal is by construction the second
+        // consumer of the SAME staleness — suppressing it cannot resurrect the
+        // garble the heal exists to prevent.
+        const VISIBLE_PAINT_HEAL_DEDUPE_MS = 50;
         let lastVisiblePaintRefreshSkipPerfAtMs = 0;
         let recentFrameLikeWriteUntilMs = 0;
         // See VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS at the refusal branch below.
@@ -8277,6 +8296,7 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{ applyTerminalRowFitGuard(String(reason || 'manual')); }} catch (_error) {{}}
             try {{ scrollLiveCursorIntoView(redrawShouldFollowPrompt, String(reason || 'manual-redraw')); }} catch (_error) {{}}
             clearTerminalTextureAtlas();
+            lastAtlasHealAtMs = Date.now();
             try {{
                 if (term.refresh) {{
                     term.refresh(0, Math.max(0, term.rows - 1));
@@ -8775,6 +8795,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 emitPerf("xterm_forced_refresh_skipped", {{
                     reason: skipReason,
                     force_full_refresh: Boolean(forceFullRefresh),
+                    heal_dedupe_age_ms: lastAtlasHealAtMs > 0 ? now - lastAtlasHealAtMs : -1,
                 }});
             }}
         }};
@@ -8975,13 +8996,22 @@ fn terminal_eval_script_with_canvas_renderer(
                         && pendingVisiblePaintForceFullRefreshSinceMs > 0
                         && now - pendingVisiblePaintForceFullRefreshSinceMs
                             >= VISIBLE_PAINT_FULL_REFRESH_DEADLINE_MS;
+                    // [F7 s51] A full heal inside the dedupe window consumes this
+                    // demand's staleness — see lastAtlasHealAtMs. The overdue arm
+                    // stays under the same veto: a heal that JUST ran already
+                    // served whatever the overdue demand was waiting for.
+                    const justHealed =
+                        lastAtlasHealAtMs > 0
+                        && now - lastAtlasHealAtMs < VISIBLE_PAINT_HEAL_DEDUPE_MS;
                     if (
                         requestedForceFullRefresh
                         && term.refresh
                         && !inputHot
+                        && !justHealed
                         && (fullRefreshOverdue || (!recentFrameLikeWrite && !fullRefreshRateLimited))
                     ) {{
                         lastVisiblePaintFullRefreshAtMs = now;
+                        lastAtlasHealAtMs = now;
                         pendingVisiblePaintForceFullRefreshSinceMs = 0;
                         visiblePaintDemandRescueStreak = 0;
                         syncVisiblePaintDemandToHostEntry();
@@ -9013,7 +9043,15 @@ fn terminal_eval_script_with_canvas_renderer(
                             reason: "visible_paint",
                             force_full_refresh: Boolean(requestedForceFullRefresh),
                             atlas_cleared: true,
+                            heal_dedupe_age_ms: lastAtlasHealAtMs > 0 ? now - lastAtlasHealAtMs : -1,
                         }});
+                    }} else if (requestedForceFullRefresh && justHealed) {{
+                        // [F7 s51] The heal ALREADY RAN (a full-heal site cleared +
+                        // rebuilt this atlas inside VISIBLE_PAINT_HEAL_DEDUPE_MS).
+                        // Consume the demand — do NOT re-arm: re-arming would drum
+                        // the funnel for a heal whose work is done. The skip is
+                        // recorded so the dedupe stays visible in telemetry.
+                        recordVisiblePaintRefreshSkipped('just_healed', true);
                     }} else if (requestedForceFullRefresh) {{
                         recordVisiblePaintRefreshSkipped(
                             inputHot ? 'input_hot' : (recentFrameLikeWrite ? 'frame_like' : 'rate_limited'),
@@ -13436,6 +13474,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             try {{
                                 clearTerminalTextureAtlas();
                                 atlasCleared = true;
+                                lastAtlasHealAtMs = Date.now();
                                 if (term.refresh) {{
                                     rowsRefreshed = Math.max(0, term.rows - 1);
                                     term.refresh(0, rowsRefreshed);
