@@ -72,19 +72,40 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   warm_alive_posted mount (synthesized_input_drained 2/2 chunks, "echo
   F1LEG4 / F1LEG4" painted on screen); (c) the
   stale-receiver WHY (sol ranked-attack #3) — page-side send ring +
-  IPC-ingress stamps decide it; MEASURED PAINT DELIVERY GAP — OPEN (s47,
-  sol s47 Q5 wording): on exe-proved 95339388, the organic mount attempts
-  Paint sends page-side (paintSendAttemptCount 3, key 3<->4), but no Rust
-  paint_ready/first-paint-witness event is observed; the page
-  independently holds an applied-write receipt before churn (gen 1, wrote
-  349). Receipt recovery was parked-claim-gated, leaving the paint
-  witness unearned; cancellation then latched failure and re-selection
-  superseded the surviving loop — the L1/L2 fix removed readiness's
-  dependency on Paint delivery. The precise loss site (send failure,
-  receiver lifetime, decoding, routing) remains unlocalized; after
-  L1/L2, verify readiness recovery separately from Paint-channel repair.
-  Call it cosmetic only after auditing the Paint arm's remaining
-  consumers. (d) the healthy row's page→Rust ytrace
+  IPC-ingress stamps decide it; (c) THE PAINT DELIVERY GAP — CLOSED
+  MEASURED-SAFE 2026-10-15 (sitting 49, PREMISE FALSIFIED — no fix
+  existed): the s47 "zero Paint events reach the witness site" was the
+  WITNESS GUARD's INITIALIZATION, not a transport loss. THE MEASUREMENT
+  (tools/uxspeed/i2send-rig.sh, the gated send ledger
+  YGGTERM_TEST_PAINT_SEND_LEDGER=1 + the unconditional
+  terminal_paint_receive trace; sol s49 HIGH
+  lores/chain-of-thought/2026-10-15-yggterm-s49-paint-loss-sol.md shaped
+  the experiment): every paint send traverses the WHOLE chain — ledger
+  stages attempt-recorded -> payload-built -> send-entered ->
+  returned-sync 6/6 (3 paint + 3 applied_content; ZERO no-send-api /
+  build-threw / threw; invocation identity per record), Rust received
+  3/3 paints (terminal_paint_receive, exactly the 3<->4 key oscillation),
+  zero js_event_ignored, and the receipt promoted (accepted+promoted,
+  both rows) — the Q7 receipt path owns local mounts' painted truth and
+  FIRED. THE MECHANISM NAMED: `terminal_paint_seen` initializes
+  `!is_remote_resume_session` (viewport.rs) — the paint_ready witness
+  trace is REMOTE-RESUME-ONLY tooling, so on LOCAL organic mounts every
+  arrival is silently skipped and paint_ready can NEVER fire (s47's
+  grep for it was blind BY INITIALIZATION; its zero-arrival read was the
+  guard, the transport was healthy all along). The organic-Paint-witness
+  framing is DEAD: Paint arm's remaining consumers on local mounts are
+  served by the Q7 receipt path (s47 L2 earn) + the geometry resize arm;
+  the readiness recovery stays decoupled (s47 L1/L2, verified firing
+  this sitting). LANDED: the staged send ledger (identity-preserving,
+  bounded ring, gated), the UNCONDITIONAL terminal_paint_receive arrival
+  trace (paint_ready's guard can no longer hide arrivals — the blindness
+  class is dead), and tools/uxspeed/i2send-rig.sh (the site-naming rig
+  with sol's outcome map). RIG LAWS BANKED: (1) a gated page instrument
+  must DIAGNOSE ITS OWN ARMING (the mount-fn branch field) — the ledger
+  was live while its summary read null through an IIFE that closed
+  without invocation (JSON.stringify drops functions SILENTLY — the
+  null was the bug, not the transport); (2) probe summary IIFEs get
+  `}})()` — `}});` compiles and reads as null forever. (d) the healthy row's page→Rust ytrace
   still rides the dead leg (cosmetic, trace-only); (e) THE OUTPUT FENCE — LANDED 2026-10-06 ([11.233], sitting 9, lane
   lane/f1/output-fence): the painted-guard could NOT order the
   synthesized seed against in-flight differentials, and the mechanism is

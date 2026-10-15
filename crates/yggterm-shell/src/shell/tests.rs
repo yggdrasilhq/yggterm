@@ -72646,6 +72646,97 @@ fn the_mount_script_publishes_send_attempts_at_the_send_site() {
 }
 
 
+
+// [s49 F1(c)] the send ledger + receive observation locks: the ledger is
+// STAGED (attempt-recorded before the payload literal — a construction throw
+// is its own stage), identity-preserving (attempt + page token + bridge
+// source per record), bounded with a visible eviction counter, and the Rust
+// receive observation precedes the witness guard (paint_ready is
+// first-arrival-only; sol s49 Q1/Q3).
+#[test]
+fn the_send_ledger_stages_are_ordered_and_identity_preserving() {
+    let source = include_str!("terminal_scripts.rs");
+    let attempt = source
+        .find("\"attempt-recorded\"")
+        .expect("the attempt-recorded stage exists");
+    let built = source
+        .find("\"payload-built\"")
+        .expect("the payload-built stage exists");
+    let entered = source
+        .find("\"send-entered\"")
+        .expect("the send-entered stage exists");
+    let returned = source
+        .find("\"returned-sync\"")
+        .expect("the returned-sync stage exists");
+    assert!(
+        attempt < built && built < entered && entered < returned,
+        "the ledger stages must be recorded in execution order",
+    );
+    // the pre-build stage is recorded BEFORE the payload literal is evaluated
+    let traced = source.find("__ygSendTraced = (kind").expect("traced send exists");
+    let traced_body = &source[traced..];
+    let builder_eval = traced_body
+        .find("payload = buildPayload()")
+        .expect("the builder runs inside the traced send");
+    let stage = traced_body.find("\"attempt-recorded\"").expect("stage");
+    assert!(
+        stage < builder_eval,
+        "attempt-recorded must precede the payload construction (sol Q2)",
+    );
+    // every record carries invocation identity (the Q5d confounder)
+    assert!(source.contains("attempt: Number(__yggAttempt || 0)"));
+    assert!(source.contains("page: __ygPageTok"));
+    assert!(source.contains("bridge: __ygBridgeSrc"));
+    // record-then-rethrow: the exception behavior is preserved
+    assert!(source.contains("\"build-threw\""));
+    assert!(source.contains("\"threw\""));
+    // no-send-api is its own stage (site A is nameable, not silent)
+    assert!(source.contains("\"no-send-api\""));
+}
+
+#[test]
+fn the_send_ledger_ring_is_bounded_and_reports_evictions() {
+    let source = include_str!("terminal_scripts.rs");
+    let ring = source.find("window.__ygSendLedger").expect("the ring exists");
+    let window = &source[ring..];
+    assert!(window.contains("records.length >= 256"));
+    assert!(window.contains("__ygLedger.dropped += 1"));
+}
+
+#[test]
+fn the_paint_and_applied_content_sends_route_through_the_ledger_when_gated() {
+    let source = include_str!("terminal_scripts.rs");
+    // the paint gate wraps the traced send BEFORE the send call site
+    let gate = source
+        .find("if (nextPaintKey !== lastPaintKey) {{")
+        .expect("the paint send gate exists");
+    let window = &source[gate..];
+    let traced = window.find("__ygSendTraced(\"paint\"").expect("gated paint send");
+    let ungated = window.find("sendTerminalEvent({{").expect("ungated paint send kept");
+    assert!(traced < ungated, "the traced arm precedes the fallback arm");
+    // the applied_content page push rides the same ledger (sol Q5 note 2:
+    // the receipt's lane claim needs per-record identity too)
+    assert!(window.contains("__ygSendTraced(\"applied_content\""));
+}
+
+#[test]
+fn the_paint_receive_observation_precedes_the_paint_witness_guard() {
+    let source = include_str!("viewport.rs");
+    let recv = source
+        .find("\"terminal_paint_receive\"")
+        .expect("the receive observation exists");
+    let witness = source
+        .find("terminal_first_paint_witness")
+        .expect("the witness site exists");
+    assert!(
+        recv < witness,
+        "every decoded Paint arrival must be recorded BEFORE the witness filter",
+    );
+    assert!(
+        source.contains("paint_seen_at_entry"),
+        "the receive record carries the guard state that hides paint_ready",
+    );
+}
 // ============================================================================
 // [F1-(e-r1)] THE SEED'S STREAM-CURSOR STAMP — unit locks for the fence's
 // covered-drop. The rig (tools/uxspeed/fence-rig.sh MODE=dup) proves the

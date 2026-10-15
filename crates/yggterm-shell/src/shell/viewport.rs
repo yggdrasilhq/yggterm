@@ -9148,6 +9148,33 @@ fn TerminalCanvas(
                                 cols,
                                 rows,
                             }) => {
+                                // [s49 F1(c)] THE PAINT RECEIVE OBSERVATION:
+                                // paint_ready is a guarded FIRST-ARRIVAL trace
+                                // (`terminal_paint_seen` latches and starts
+                                // TRUE on non-remote-resume mounts), so its
+                                // absence never proved absence of arrival —
+                                // the s47 zero-arrival read was blind on local
+                                // rows by initialization. Every decoded Paint
+                                // arrival is now recorded with the guard state
+                                // BEFORE any witness filter (sol s49 Q3).
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "terminal_paint_receive",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "child_count": child_count,
+                                        "xterm_present": xterm_present,
+                                        "screen_present": screen_present,
+                                        "viewport_present": viewport_present,
+                                        "rows_present": rows_present,
+                                        "cols": cols,
+                                        "rows": rows,
+                                        "paint_seen_at_entry": terminal_paint_seen,
+                                    }),
+                                );
                                 let painted =
                                     child_count > 0
                                         || xterm_present
@@ -22924,6 +22951,15 @@ fn stage_paint_provenance_probe(
                 "last_visible_paint": v.get("last_visible_paint").cloned().unwrap_or(serde_json::Value::Null),
                 "was_husk": v.get("was_husk").cloned().unwrap_or(serde_json::Value::Null),
                 "applied_receipt": v.get("applied_receipt").cloned().unwrap_or(serde_json::Value::Null),
+                // [s49 F1(c)] the send ledger summary (page-side, gated ring)
+                "send_ledger": v.get("send_ledger").cloned().unwrap_or(serde_json::Value::Null),
+                // [s49 diag] did the SERVED mount fn carry the ledger at all?
+                "mount_fn_has_ledger": v.get("mount_fn_has_ledger").cloned().unwrap_or(serde_json::Value::Null),
+                "mount_fn_ledger_branch": v.get("mount_fn_ledger_branch").cloned().unwrap_or(serde_json::Value::Null),
+                "mount_fn_v": v.get("mount_fn_v").cloned().unwrap_or(serde_json::Value::Null),
+                "yg_ledger_typeof": v.get("yg_ledger_typeof").cloned().unwrap_or(serde_json::Value::Null),
+                "yg_ledger_seq": v.get("yg_ledger_seq").cloned().unwrap_or(serde_json::Value::Null),
+                "fn_ledger_slice": v.get("fn_ledger_slice").cloned().unwrap_or(serde_json::Value::Null),
             }),
             None => serde_json::json!({
                 "session_path": session_path,
