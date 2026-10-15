@@ -380,8 +380,23 @@ fn MainSurface(
                     div {
                         "data-split-layer": if active_split_group.is_some() { "1" },
                         style: "{terminal_layer_style}",
-                        for terminal_session in retained_terminal_sessions.iter().cloned() {
-                            {
+                        // [i-r2] THE KEY MUST SIT ON THE ITERATION ROOT. A
+                        // `for { { locals; rsx!{...} } }` body renders each item
+                        // as an UNKEYED wrapper (the macro's template root is the
+                        // raw block — the key inside the nested rsx is invisible
+                        // to the list diff), so a prepend ([a] -> [b,a]) diffs
+                        // POSITIONALLY: dioxus grows a fresh tail instance and
+                        // destroys the old one. Measured (s46 rig + trace): the
+                        // sibling row's creation churn unmounted this row's
+                        // TerminalCanvas, its render-spawned mount loop was
+                        // cancelled at the select await (exit_hint=pre_select,
+                        // remount_armed:false), the fresh instance's bootstrap
+                        // spawn was skipped (inactive) and the row sat loop-less
+                        // until re-select paid a full bootstrap — the s15
+                        // BackgroundTrickle guarantee died with the loop. The
+                        // map's Element return preserves the keyed div as the
+                        // item root, so b prepends and a's instance survives.
+                        {retained_terminal_sessions.iter().cloned().map(|terminal_session| {
                                 let session_path_str = terminal_session.session_path.clone();
                                 let session_mount_epoch =
                                     snapshot_terminal_mount_epoch(
@@ -510,8 +525,7 @@ fn MainSurface(
                                         }
                                     }
                                 }
-                            }
-                        }
+                        })}
                         // Pinned WEB panes (split-tabs, [[campaign-libyggterm]]
                         // Phase 3): a Web{tab} member is a pane of its own —
                         // pure page, no strip/omnibox chrome (the session's
@@ -519,10 +533,10 @@ fn MainSurface(
                         // placeholder is the native-surface reconciler's
                         // geometry oracle for exactly this (session, tab), the
                         // pinned twin of `[data-ws-page]`.
-                        for (pinned_idx, pinned_session, pinned_tab) in
-                            pinned_web_panes.iter().cloned()
-                        {
-                            {
+                        // [i-r2] Same keyed-iteration-root law as the terminal
+                        // loop above: an unkeyed wrapper churns EVERY pinned web
+                        // pane's component when another prepends.
+                        {pinned_web_panes.iter().cloned().map(|(pinned_idx, pinned_session, pinned_tab)| {
                                 let (pane_axis, pane_ratio, pinned_group_id) = active_split_group
                                     .as_ref()
                                     .map(|group| {
@@ -574,8 +588,7 @@ fn MainSurface(
                                         }
                                     }
                                 }
-                            }
-                        }
+                        })}
                         if let Some(group) = active_split_group.clone() {
                             {
                                 let axis = group.axis;
