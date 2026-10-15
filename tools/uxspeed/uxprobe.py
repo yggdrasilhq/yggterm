@@ -2102,6 +2102,12 @@ dioxus.send(out);
             reveal_served = None
             reveal_refused = None
             paint_reveal = None
+            # [F7 s52 Q4] the raise's paint truth: the first full-coverage
+            # xterm_render frame at/after reveal_served. The stamp demotes to
+            # accuracy-only; no proven frame means NO paint timestamp.
+            full_frame = None
+            full_frame_gaps = []
+            full_frame_windows = []
             deadline = time.time() + self.timeout_s
             t_loop = time.time()
             while time.time() < deadline:
@@ -2154,6 +2160,9 @@ dioxus.send(out);
                         elif (reveal_served is None and c == "terminal_mount"
                                 and n == "reveal_served"):
                             reveal_served = e
+                            # raises have no mount_begin; join frames by the
+                            # raise's own host_id
+                            host_id = host_id or p.get("host_id")
                         elif (reveal_refused is None
                                 and c == "terminal_mount"
                                 and n == "reveal_raise_refused"):
@@ -2161,12 +2170,53 @@ dioxus.send(out);
                         elif (paint_reveal is None and c == "xterm_paint"
                                 and n == "reveal"):
                             paint_reveal = e
+                        elif (c == "xterm_render" and n == "frame_gap"
+                                and (p.get("rows") or 0) > 0
+                                and (p.get("rows_painted") or 0)
+                                >= (p.get("rows") or 0)):
+                            full_frame_gaps.append(e)
+                        elif (c == "xterm_render" and n == "frame_window"
+                                and (p.get("max_rows_painted") or 0) > 0):
+                            full_frame_windows.append(e)
+                # [F7 s52 Q4] pair the raise's paint truth: first
+                # full-coverage frame at/after reveal_served. Point frame_gap
+                # ts is primary; a frame_window flush is the fallback and its
+                # ts UPPER-BOUNDS the paint time (the window flushed after
+                # the frame painted). frame_window carries no rows field, so
+                # the coverage bar comes from the stamp's geometry.
+                if reveal_served is not None and full_frame is None:
+                    rs_ts = reveal_served.get("ts_ms", 0)
+                    for e in full_frame_gaps:
+                        if e.get("ts_ms", 0) >= rs_ts:
+                            full_frame = e
+                            break
+                    if full_frame is None:
+                        expected_rows = 0
+                        if paint_reveal is not None:
+                            expected_rows = (paint_reveal.get("payload") or {}).get(
+                                "reveal_rows") or 0
+                        if expected_rows > 0:
+                            for e in full_frame_windows:
+                                wp = e.get("payload") or {}
+                                if (e.get("ts_ms", 0) >= rs_ts
+                                        and (wp.get("max_rows_painted") or 0)
+                                        >= expected_rows):
+                                    full_frame = e
+                                    break
                 if activation is not None and (
                         first_frame is not None or forced is not None
                         or reveal is not None or paint_reveal is not None) and (
                         settle is not None or paint_reveal is not None
                         or time.time() - t_loop > 4.0):
-                    break
+                    # [F7 s52 Q4] the raise's end is the PROVEN full-viewport
+                    # frame, not the stamp: on the raise path (reveal_served,
+                    # no mount chain) keep scanning until the frame event
+                    # lands (hard cap 8s so a frame-less raise still reports).
+                    raise_awaiting_frame = (reveal_served is not None
+                                            and first_frame is None
+                                            and full_frame is None)
+                    if not raise_awaiting_frame or time.time() - t_loop > 8.0:
+                        break
                 time.sleep(0.05)
             window = evs
             names = [e.get("name") for e in window]
@@ -2210,12 +2260,27 @@ dioxus.send(out);
                     if not fp.get("rows_painted"):
                         acc.append("first_frame painted no rows — not paint "
                                    "truth (rows_painted=%r)" % fp.get("rows_painted"))
-                elif paint_reveal is not None:
-                    # [11.172] the raise's paint truth: the retained canvas
-                    # is visible and holds content WITHOUT any re-init.
-                    it["paint_reveal_ms"] = (paint_reveal.get("ts_ms", 0)
-                                             - t_release)
-                    rp = paint_reveal.get("payload") or {}
+                elif paint_reveal is not None or full_frame is not None:
+                    # [F7 s52 Q4] the stamp is ACCURACY-ONLY now: the paint
+                    # timestamp comes from the first full-coverage
+                    # xterm_render frame at/after reveal_served. No proven
+                    # frame -> no timestamp (null + note), never the stamp's —
+                    # the stamp can fire while rows are still painting (s51
+                    # switch 0: rows_painted=1 at the first cluster).
+                    rp = (paint_reveal.get("payload") or {}
+                          if paint_reveal is not None else {})
+                    if full_frame is not None:
+                        ffp = full_frame.get("payload") or {}
+                        it["paint_reveal_ms"] = (full_frame.get("ts_ms", 0)
+                                                 - t_release)
+                        it["paint_source"] = full_frame.get("name")
+                        it["paint_rows_painted"] = ffp.get(
+                            "rows_painted", ffp.get("max_rows_painted"))
+                    else:
+                        acc.append("no full-viewport xterm_render frame after "
+                                   "reveal_served within the window — paint "
+                                   "timestamp unproven (the 250ms frame-gap "
+                                   "floor can hide a fast quiet frame)")
                     it["reveal_visible"] = rp.get("visible")
                     it["reveal_content_rows"] = rp.get("content_rows")
                     it["reveal_rows"] = rp.get("rows")

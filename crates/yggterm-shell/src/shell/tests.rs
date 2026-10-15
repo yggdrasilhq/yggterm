@@ -74978,6 +74978,95 @@ mod web_surface_immersion_locks {
         );
     }
 
+    // [F7 s52] The activation repaint's light passes (:raf/:120/:360) must
+    // dedupe behind ONE full heal: repaintActiveEntry's light branch cleared
+    // + re-refreshed the whole viewport right behind the heavy :now heal —
+    // four forced clears per warm switch, the churn train that kept
+    // paint_reveal p50 ~577ms after s51's funnel dedupe. The entry-level
+    // mirror (lastFullHealAtMs) is the clock the light branch can see — it
+    // lives in a separate IIFE from redrawTerminal's closure clock.
+    #[test]
+    fn the_activation_light_passes_dedupe_behind_the_entry_heal_mirror() {
+        let scripts = include_str!("terminal_scripts.rs");
+        for needle in [
+            "const ACTIVATION_LIGHT_HEAL_DEDUPE_MS = 400;",
+            "const lastFullHealMs = Number(entry.lastFullHealAtMs || 0);",
+            "nowMs - lastFullHealMs < ACTIVATION_LIGHT_HEAL_DEDUPE_MS",
+            "entry.activationLightHealSkipCount =",
+            "entry.activationLightHealCount =",
+            // the light heal stamps the mirror too, so back-to-back lights
+            // dedupe each other
+            "entry.lastFullHealAtMs = nowMs;",
+        ] {
+            assert!(
+                scripts.contains(needle),
+                "the light-pass dedupe lost {needle:?}"
+            );
+        }
+        // The skip arm must PRECEDE the clear arm inside the light branch.
+        let skip = scripts
+            .find("entry.activationLightHealSkipCount =")
+            .expect("the light skip arm is missing");
+        let clear = scripts
+            .find("entry.lastAtlasClearAtMs = nowMs;")
+            .expect("the light clear arm is missing");
+        assert!(skip < clear, "the skip arm must be matched before the clear");
+    }
+
+    // [F7 s52] Every FULL-heal site must mirror the heal clock onto the host
+    // entry — the input-policy script's repaintActiveEntry (a separate IIFE)
+    // dedupes its light passes against the entry copy. The closure clock's
+    // own stamps stay exactly two (s51's law — the mirrors are assignments
+    // FROM the clock, never new Date.now() stamps).
+    #[test]
+    fn the_full_heal_sites_mirror_the_heal_clock_onto_the_host_entry() {
+        let scripts = include_str!("terminal_scripts.rs");
+        assert!(
+            scripts.contains("healEntry.lastFullHealAtMs = lastAtlasHealAtMs;"),
+            "redrawTerminal must mirror the heal clock onto the entry"
+        );
+        assert!(
+            scripts.contains("healEntry.lastFullHealAtMs = now;"),
+            "the forced-refresh funnel must mirror the heal clock onto the entry"
+        );
+        assert!(
+            scripts.contains("staleAtlasEntry.lastFullHealAtMs = lastAtlasHealAtMs;"),
+            "the stale-atlas heal must mirror the heal clock onto the entry"
+        );
+        // Exactly four mirror writes: redraw + funnel + stale-atlas + the
+        // light branch itself.
+        assert_eq!(
+            scripts.matches("lastFullHealAtMs = ").count(),
+            4,
+            "mirror write sites drifted — every full heal must stamp the entry clock"
+        );
+    }
+
+    // [F7 s52] Activation-path redraws skip the canvas ink probe: up to ~384
+    // one-pixel getImageData calls force a GPU pipeline sync inside the
+    // switch churn. Both samples (before + the rAF settle) gate on the
+    // reason class, and a skipped sample must not masquerade as an ink
+    // verdict.
+    #[test]
+    fn redraw_terminal_skips_ink_sampling_on_activation_reasons() {
+        let scripts = include_str!("terminal_scripts.rs");
+        assert!(
+            scripts.contains(
+                "const redrawSkipsInkSampling = /^(active_session_switch|window_foreground)/.test("
+            ),
+            "the activation ink gate is missing"
+        );
+        assert_eq!(
+            scripts.matches("if (!redrawSkipsInkSampling) {{").count(),
+            2,
+            "both ink samples (before + settle) must gate on the activation class"
+        );
+        assert!(
+            scripts.contains("'ink_skipped_activation'"),
+            "a skipped sample must report the skip, not an ink verdict"
+        );
+    }
+
     // [F7 s51] The visible-paint funnel must not repeat a texture-atlas heal
     // that a full-heal site just completed: redrawTerminal's own
     // requestVisiblePaint(true) arms the funnel's force-full demand, so every
