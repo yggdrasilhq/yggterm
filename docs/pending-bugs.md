@@ -931,8 +931,40 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   SESSION PATH and an EMPTY marker is INERT (the OPPOSITE of
   READ_ERROR_FILE's empty-matches-all) — three rig runs paid for that
   asymmetry.
-  (e-r2) repaint cursor restoration is end-of-content only
-  (the daemon's cursor position is not in the answer);
+  (e-r2) REPAINT CURSOR RESTORATION — PREMISE FALSIFIED, CLOSED AS
+  MEASURED-SAFE 2026-10-15 (sitting 48, lane lane/e2/repaint-cursor-restore
+  0c731da8; sol node lores/chain-of-thought/2026-10-15-yggterm-s48-repaint-
+  cursor-sol.md, gpt-6.1-sol HIGH 117,015 tokens — the consult's Q1/Q2/Q4/
+  Q5 rebuttals RESHAPED the unit from fix-first to measure-first): the old
+  framing ("the daemon's cursor position is not in the answer") was written
+  from the seed-write sites without reading the serializer. MEASURED: vt100
+  0.16.2's state_formatted() carries the cursor restore INSIDE the
+  formatted state (the grid walk ends with the cursor MoveTo; only SGR/mode
+  diffs follow, and those cannot move the caret); the replay sanitizers
+  keep it (line-classifier strippers cut noise LINES, not the cursor
+  escape); and the fenced repaint lands the page caret EXACTLY on the
+  daemon's captured cursor — live GREEN (fence-rig MODE=cursor: injected
+  park (1,8) -> proof caret (1,8), seed_mode=fenced_repaint, rc 0). The
+  CUP-tail fix the seat first designed was REBUTTED by sol (a CUP tail
+  destroys pending-wrap — the serializer re-draws the last cell instead;
+  DECOM offsets CUP; and the wire cursor fields were conditional on
+  demonstrated necessity, which never materialized — NO wire change, NO
+  stamp bump). GUARDS LANDED: the serializer-contract lock
+  (the_formatted_state_carries_the_daemon_cursor_position), the sanitizer
+  keep lock (sanitize_terminal_replay_payload_keeps_a_daemon_cursor_restore),
+  the page-caret evidence in the mount proof + the synthesized_mount_open
+  trace (cursor_row/cursor_col read AFTER the write callback, riding the
+  eval-return leg), the injectable capture-hook payload
+  (YGGTERM_TEST_SNAPSHOT_CAPTURE_INJECT — the dup bar's by-construction
+  mechanism; probe-type's acceptance carried ZERO PTY delivery twice,
+  gotcha 20 re-confirmed), and fence-rig MODE=cursor as the standing
+  regression bar. RIG LAW: the capture-stall hook event carries NO
+  session_path — a session-scoped event filter false-vacuums it (cost one
+  rc 4). NARROW RESIDUALS (sol-named, NOT defects today; reopen only with
+  a live failing frame): pending-wrap frames, DECOM/origin-mode rows,
+  alternate-buffer identity on repaint, and the OTHER repaint consumers
+  (active_recovery_pty_snapshot's retained-replay path, app-control
+  reconcile) — none observed broken.
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
   lane/f1/ring-watermark; sol correction round applied same sitting, node
   lores/chain-of-thought/2026-10-05-yggterm-f1-ring-rework-sol-review.md):
@@ -1411,7 +1443,8 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   the existing silent-loop raise test; attempt churn preserves earned
   sticky readiness while genuine faults still veto). Ranked plan: measure
   → land L2 → land L1 → gate. STILL OPEN IN THIS FAMILY: (1) the
-  residual above; (2) (e-r2) repaint cursor restoration (untouched);
+  residual above; (2) (e-r2) CLOSED 2026-10-15 measured-safe (premise
+  falsified — the cursor was always in the answer; see its record below);
   the alive-loop evidence-less claim bound CLOSED s45 unit 2.
   (i-r3) LONG-TERM: sol's owner-backed attach transaction (ContentReady
   only on a JS ack of applied cursor+buffer; one bounded reconstruction
@@ -1465,8 +1498,9 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   s47 starve trace). fences order/dup/swap rc 0 (order's evidence bar
   revised to account the covered-drop route — see the F1 vanish
   intermittent above; the ordering bar itself held 7/7). STILL OPEN IN
-  THIS FAMILY: (e-r2) repaint cursor restoration; the F1(c) Paint loss
-  site; the warm-gate vanish intermittent.
+  THIS FAMILY: the F1(c) Paint loss site; the warm-gate vanish
+  intermittent. ((e-r2) CLOSED 2026-10-15 measured-safe — premise
+  falsified; see its record.)
 - **F2 — REMOTE CONTENT-PLANE AUTHORITY STALENESS**: the GUI-side read /
   reveal / presence paths consult a CACHED remote scan and assorted
   authorities that disagree with the owning daemon ([11.32]'s empty reads,
