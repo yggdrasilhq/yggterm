@@ -887,16 +887,26 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   "fetch failed / old daemon" alone; the daemon boundary now names
   the conflation + the safety contract; the test comment follows) —
   sol's standing "correct the misleading comment" instruction from
-  s23 R5. RESIDUE NARROWED BY THE S45 MEASUREMENT (sitting 45): the
-  DEATH-side bound is closed — a parked claim never survives a death
-  (begin retires it; the successor re-earns), and the budget-exhausted
-  end state now posts the honest RecoveryStopped notification (the s45
-  lane) instead of the stale "Retrying" lie. The ALIVE-loop bound stays
-  OPEN with (i-r2): a claim parked on an evidence-less mount on a LIVING
-  loop waits until a real write (the probe abstains correctly) — whether
-  that attempt needs its own bounded failure resolution is still the open
-  question (sol s45 Q3: the deadline must cover this case; the remount
-  budget cannot, because no further deaths need occur).
+  s23 R5. RESIDUE CLOSED BY MEASUREMENT 2026-10-15 (sitting 45 unit 2,
+  tools/uxspeed/i2b-probe.sh, deployed main 71030ec0): the ALIVE-LOOP
+  evidence-less park (the s35 PARK_CLAIM hook parks + drops the Rust
+  receipt on a living loop) was constructed and the surface MEASURED
+  HONEST while it waits — the row stays painted, input works, nothing
+  claims readiness, no stuck overlay or notification (a park is not a
+  fault state; the attempt-Pending telemetry is TRUE). The wait RESOLVES
+  through the standing machinery: a real write mints fresh evidence and
+  the re-attest probe promotes the claim (measured: screen mutated +4s,
+  reattest accepted=true promoted=true); death and new-attempt fences
+  bound every other exit ([e-r8] begin-retires + the drop guard). sol
+  s45 Q3's demand ("the deadline must cover an alive loop with no
+  evidence source") is answered NOT OWED: a bounded failure would
+  FABRICATE a fault on a legitimately silent row, and the probe cannot
+  fabricate the promotion (the null-receipt abstain is suite-locked).
+  The attempt stays Pending honestly until evidence, death, or a
+  successor. RIG LAW BANKED: the PARK_CLAIM hook's marker matches the
+  SESSION PATH and an EMPTY marker is INERT (the OPPOSITE of
+  READ_ERROR_FILE's empty-matches-all) — three rig runs paid for that
+  asymmetry.
   (e-r2) repaint cursor restoration is end-of-content only
   (the daemon's cursor position is not in the answer);
   (f) THE RING WATERMARK REWORK (Q4+Q5) — LANDED 2026-10-05 (9217871e,
