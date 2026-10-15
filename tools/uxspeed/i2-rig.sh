@@ -271,8 +271,12 @@ while time.time() - t0 < INJECT_WINDOW:
                 print("exhaust screenshot failed: %s" % e)
         if drop_at is not None and "attach_ready" in name:
             post_drop_ready += 1
-    if MODE == "early-recover" and drops and remounts and post_drop_ready >= 1:
-        print("successor mounted (attach_ready after drop) — removing fault now")
+    if MODE == "early-recover" and drops and remounts:
+        # remove the fault at the FIRST witnessed arm — the instant remount
+        # then attaches with CLEAN reads and the recovery bar is honest
+        # (waiting for a successor attach trace can overrun the budget
+        # window and turn the scenario into an exhaust run)
+        print("first drop armed — removing fault now")
         break
     time.sleep(2)
 
