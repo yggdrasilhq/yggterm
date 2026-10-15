@@ -505,6 +505,19 @@ pub(crate) fn terminal_paint_provenance_probe_script(host_id: &str) -> String {
     format!(
         r#"const __h = {host};
 const __e = (window.__yggtermXtermHosts || {{}})[__h] || null;
+
+const __L = window.__ygSendLedger || null;
+const __Lsum = (() => {{
+    if (!__L) return null;
+    const byStage = {{}};
+    for (const rec of __L.records) {{
+        if (rec.kind !== "paint") continue;
+        const key = rec.stage + (rec.outcome ? (":" + rec.outcome) : "");
+        byStage[key] = (byStage[key] || 0) + 1;
+    }}
+    return {{ seq: __L.seq, dropped: __L.dropped, retained: __L.records.length,
+        paint_by_stage: byStage, tail: __L.records.slice(-8) }};
+}})();
 const __entryLive = __e ? (window.__yggtermXtermHosts[__h] === __e) : false;
 const __r = __e && __e.appliedContent ? __e.appliedContent : null;
 return JSON.stringify({{
@@ -515,7 +528,21 @@ return JSON.stringify({{
     last_paint_key: __e ? (__e.lastPaintKey === undefined ? null : String(__e.lastPaintKey)) : null,
     last_visible_paint: __e ? (__e.lastVisiblePaint === undefined ? null : Boolean(__e.lastVisiblePaint)) : null,
     was_husk: __e ? (__e.lastVisiblePaintWasHusk === undefined ? null : Boolean(__e.lastVisiblePaintWasHusk)) : null,
-    applied_receipt: __r ? {{ wrote: Number(__r.wrote || 0), ts: Number(__r.ts || 0), gen: Number(__r.gen || 0), blank: Boolean(__r.blank) }} : null
+    applied_receipt: __r ? {{ wrote: Number(__r.wrote || 0), ts: Number(__r.ts || 0), gen: Number(__r.gen || 0), blank: Boolean(__r.blank) }} : null,
+    send_ledger: __Lsum,
+    mount_fn_has_ledger: (typeof window.__yggtermMountFn === "function")
+        ? (String(window.__yggtermMountFn).indexOf("__ygSendLedger") >= 0) : null,
+    mount_fn_ledger_branch: (typeof window.__yggtermMountFn === "function")
+        ? (String(window.__yggtermMountFn).indexOf("__ygLedger = true") >= 0
+            ? "true" : (String(window.__yggtermMountFn).indexOf("__ygLedger = false") >= 0 ? "false" : "neither"))
+        : null,
+    mount_fn_v: (window.__yggtermMountFnV === undefined) ? null : Number(window.__yggtermMountFnV),
+    yg_ledger_typeof: (typeof window.__ygSendLedger),
+    yg_ledger_seq: (window.__ygSendLedger && window.__ygSendLedger.seq !== undefined) ? Number(window.__ygSendLedger.seq) : null,
+    fn_ledger_slice: (typeof window.__yggtermMountFn === "function")
+        ? (() => {{ const s = String(window.__yggtermMountFn); const i = s.indexOf("__ygLedger");
+            return i >= 0 ? s.substring(Math.max(0, i - 30), i + 200) : "absent"; }})()
+        : null
 }});"#
     )
 }
@@ -923,6 +950,17 @@ fn terminal_eval_script_with_canvas_renderer(
         std::env::var("YGGTERM_TEST_TRANSPORT_STALE_CAPTURE")
             .map(|value| value == "1")
             .unwrap_or(false);
+    // [s49 F1(c)] THE PAINT SEND LEDGER (sol s49 Q2: gated, staged,
+    // identity-preserving, bounded): when set, the mount fn instruments the
+    // paint + applied_content sends with per-stage outcome records
+    // (attempt-recorded BEFORE payload construction -> payload-built ->
+    // send-entered -> returned-sync | no-send-api | threw) on a window-global
+    // bounded ring read back over the eval-return leg by the provenance
+    // probe. Production never sets the env; the localization rig arms it.
+    let paint_send_ledger =
+        std::env::var("YGGTERM_TEST_PAINT_SEND_LEDGER")
+            .map(|value| value == "1")
+            .unwrap_or(false);
     // SSOT for "which chrome owns the keyboard" — see UI_FOCUS_OWNER_SELECTORS.
     let ui_focus_owners = ui_focus_owner_selectors_js();
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -1039,6 +1077,64 @@ fn terminal_eval_script_with_canvas_renderer(
             if (terminalDioxusSend) {{
                 terminalDioxusSend(payload);
             }}
+        }};
+        // [s49 F1(c)] THE SEND LEDGER (gated by YGGTERM_TEST_PAINT_SEND_LEDGER;
+        // sol s49 Q2 corrections applied): per-stage outcome records with
+        // INVOCATION IDENTITY (attempt + per-invocation page token + bridge
+        // source) — the two-invocation confounder (Q5d) is answered per
+        // record, never inferred. attempt-recorded precedes the payload
+        // literal (a construction throw is its own stage); record-then-
+        // rethrow preserves the caller's exception behavior; the ring is
+        // window-bounded (256 records) with a visible eviction counter.
+        // `returned-sync` is deliberately NOT "enqueued": send's promise
+        // semantics are unverified (sol Q2).
+        const __ygLedger = {paint_send_ledger}
+            ? (window.__ygSendLedger = window.__ygSendLedger || {{ seq: 0, dropped: 0, records: [] }})
+            : null;
+        const __ygPageTok = {paint_send_ledger} ? Math.random().toString(36).slice(2, 8) : "";
+        const __ygBridgeSrc = {paint_send_ledger}
+            ? (__ygInvocationApi ? "invocation" : (typeof dioxus !== "undefined" ? "lexical" : "none"))
+            : "";
+        const __ygLedgerPush = (kind, stage, outcome) => {{
+            if (!__ygLedger) {{ return; }}
+            try {{
+                const seq = __ygLedger.seq + 1;
+                __ygLedger.seq = seq;
+                if (__ygLedger.records.length >= 256) {{
+                    __ygLedger.records.shift();
+                    __ygLedger.dropped += 1;
+                }}
+                __ygLedger.records.push({{
+                    seq: seq, kind: kind, stage: stage, outcome: outcome || null,
+                    attempt: Number(__yggAttempt || 0), page: __ygPageTok, bridge: __ygBridgeSrc,
+                    ts: Date.now(),
+                }});
+            }} catch (_ledgerError) {{}}
+        }};
+        const __ygSendTraced = (kind, buildPayload, attemptRecorded) => {{
+            if (!attemptRecorded) {{
+                __ygLedgerPush(kind, "attempt-recorded", null);
+            }}
+            let payload = null;
+            try {{
+                payload = buildPayload();
+            }} catch (error) {{
+                __ygLedgerPush(kind, "build-threw", String((error && error.message) || error));
+                throw error;
+            }}
+            __ygLedgerPush(kind, "payload-built", null);
+            if (!terminalDioxusSend) {{
+                __ygLedgerPush(kind, "no-send-api", null);
+                return;
+            }}
+            __ygLedgerPush(kind, "send-entered", null);
+            try {{
+                terminalDioxusSend(payload);
+            }} catch (error) {{
+                __ygLedgerPush(kind, "threw", String((error && error.message) || error));
+                throw error;
+            }}
+            __ygLedgerPush(kind, "returned-sync", null);
         }};
         // [e-r6 RIG ARM] the differential transport probe: EVERY
         // invocation (cold install AND every warm re-invocation) records
@@ -7154,20 +7250,39 @@ fn terminal_eval_script_with_canvas_renderer(
             if (nextPaintKey !== lastPaintKey) {{
                 lastPaintKey = nextPaintKey;
                 paintSendAttemptCount += 1;
+                if ({paint_send_ledger}) {{
+                    __ygLedgerPush("paint", "attempt-recorded", null);
+                }}
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].paintSendAttemptCount = paintSendAttemptCount;
                     window.__yggtermXtermHosts[hostId].lastPaintKey = lastPaintKey;
                 }}
-                sendTerminalEvent({{
-                    kind: "paint",
-                    child_count: host.childElementCount,
-                    xterm_present: Boolean(xtermRoot),
-                    screen_present: Boolean(screen),
-                    viewport_present: Boolean(viewport),
-                    rows_present: Boolean(rowsLayer),
-                    cols: term.cols,
-                    rows: term.rows,
-                }});
+                if ({paint_send_ledger}) {{
+                    __ygSendTraced("paint", () => ({{
+                        kind: "paint",
+                        child_count: host.childElementCount,
+                        xterm_present: Boolean(xtermRoot),
+                        screen_present: Boolean(screen),
+                        viewport_present: Boolean(viewport),
+                        rows_present: Boolean(rowsLayer),
+                        cols: term.cols,
+                        rows: term.rows,
+                    }}), true);
+                }} else {{
+                    sendTerminalEvent({{
+                        kind: "paint",
+                        child_count: host.childElementCount,
+                        xterm_present: Boolean(xtermRoot),
+                        screen_present: Boolean(screen),
+                        viewport_present: Boolean(viewport),
+                        rows_present: Boolean(rowsLayer),
+                        cols: term.cols,
+                        rows: term.rows,
+                    }});
+                }}
+            }}
+            if ({paint_send_ledger}) {{
+                __ygLedgerPush("paint", "emit-completed", null);
             }}
             paintCount += 1;
             // Repaint-storm detection (the ~50Hz garbled-blink pathology). Count
@@ -12774,16 +12889,29 @@ fn terminal_eval_script_with_canvas_renderer(
                         gen: __acTuple.gen,
                         source: 'live_write',
                     }};
-                    sendTerminalEvent({{
-                        kind: 'applied_content',
-                        session: issueEntry.appliedContent.session,
-                        epoch: issueEntry.appliedContent.epoch,
-                        runtime: issueEntry.appliedContent.runtime,
-                        wrote: wroteLen,
-                        blank: false,
-                        ts: issueEntry.appliedContent.ts,
-                        page_gen: __acTuple.gen,
-                    }});
+                    if ({paint_send_ledger}) {{
+                        __ygSendTraced("applied_content", () => ({{
+                            kind: 'applied_content',
+                            session: issueEntry.appliedContent.session,
+                            epoch: issueEntry.appliedContent.epoch,
+                            runtime: issueEntry.appliedContent.runtime,
+                            wrote: wroteLen,
+                            blank: false,
+                            ts: issueEntry.appliedContent.ts,
+                            page_gen: __acTuple.gen,
+                        }}), false);
+                    }} else {{
+                        sendTerminalEvent({{
+                            kind: 'applied_content',
+                            session: issueEntry.appliedContent.session,
+                            epoch: issueEntry.appliedContent.epoch,
+                            runtime: issueEntry.appliedContent.runtime,
+                            wrote: wroteLen,
+                            blank: false,
+                            ts: issueEntry.appliedContent.ts,
+                            page_gen: __acTuple.gen,
+                        }});
+                    }}
                 }} catch (_appliedError) {{}}
             }};
             const flushPendingWrite = () => {{
