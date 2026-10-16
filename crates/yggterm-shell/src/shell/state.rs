@@ -22957,6 +22957,8 @@ impl ShellState {
         let __snap_t = std::time::Instant::now();
         let sidebar_hot_sessions =
             merge_hot_sidebar_sessions(&live_sessions, &retained_terminal_sessions);
+        crate::render_attribution::note_span_ms("snapshot.p.merge.hot", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let merged_expanded_paths = if search_active {
             search_expanded_paths(
                 &stored_rows,
@@ -22968,13 +22970,9 @@ impl ShellState {
         } else {
             expanded_paths.clone()
         };
-        let mut merged_rows = merged_sidebar_rows_traced(
-            &self.bootstrap.settings_path,
-            if search_active {
-                "snapshot_search"
-            } else {
-                "snapshot"
-            },
+        // [s56-enrich-memo] Merge + live-title enrich in one memoized step:
+        // on a memo hit the 13.6ms per-frame row walk does not run at all.
+        let merged_rows = merged_sidebar_rows_enriched(
             &stored_rows,
             &stored_projection_rows,
             // [s56-merge-key] The plain snapshot's stored rows are the
@@ -22997,14 +22995,16 @@ impl ShellState {
             // cannot change.
             &self.user_collapsed_synthetic_paths,
             &self.row_arrangement,
-        );
-        enrich_sidebar_rows_with_live_titles(
-            &mut merged_rows,
-            &sidebar_hot_sessions,
-            self.server.remote_machines(),
             &self.session_title_overrides,
             &self.generated_summaries,
+            if search_active {
+                "snapshot_search"
+            } else {
+                "snapshot"
+            },
         );
+        crate::render_attribution::note_span_ms("snapshot.p.merge.enrich", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         // The open row menu, resolved ONCE per frame against the rows that exist
         // now. Everything downstream — the keep-alive plan, the item list, the
         // snapshot field the mount site and the transient cover read — takes the
@@ -23022,6 +23022,8 @@ impl ShellState {
             })
         });
         let mut rows = sidebar_rows_for_render(&merged_rows, effective_search_query);
+        crate::render_attribution::note_span_ms("snapshot.p.merge.render_rows", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         // Mirror the split geometry in the sidebar: within Live Sessions, a
         // group's member rows collapse to one compound row
         // ([[campaign-split-view-groups]]). Skipped while searching so a query
@@ -23030,7 +23032,8 @@ impl ShellState {
         if !search_active {
             collapse_live_sessions_into_split_rows(&mut rows, &self.split_groups);
         }
-        crate::render_attribution::note_span_ms("snapshot.p.merge", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        crate::render_attribution::note_span_ms("snapshot.p.merge.collapse", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let __snap_t = std::time::Instant::now();
         let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let active_title = active_session
@@ -54387,6 +54390,114 @@ fn preview_run_cache() -> &'static Mutex<PreviewRunCache> {
 fn sidebar_merge_cache() -> &'static Mutex<SidebarMergeCache> {
     SIDEBAR_MERGE_CACHE.get_or_init(|| Mutex::new(SidebarMergeCache::default()))
 }
+
+/// [s56-enrich-memo] ONE entry: the post-enrich merged rows for the LAST
+/// (merge key, enrich-inputs fingerprint) pair. Enrich is a pure function
+/// of the merge result (content-keyed by the merge key), the title
+/// overrides and the generated summaries (both hashed into inputs_fp) —
+/// so a hit is exact, and the snapshot's per-frame 13.6ms row walk
+/// (measured 2026-10-16, the rank-3 reprofile: enrich was 90%+ of the
+/// residual merge on hit windows) collapses to an Arc clone. Single-entry:
+/// the only caller is the snapshot build, which is monotone per state.
+#[derive(Default)]
+struct SidebarEnrichMemo {
+    entry: Option<(u64, u64, std::sync::Arc<Vec<BrowserRow>>)>,
+}
+static SIDEBAR_ENRICH_MEMO: std::sync::OnceLock<Mutex<SidebarEnrichMemo>> =
+    std::sync::OnceLock::new();
+fn sidebar_enrich_memo() -> &'static Mutex<SidebarEnrichMemo> {
+    SIDEBAR_ENRICH_MEMO.get_or_init(|| Mutex::new(SidebarEnrichMemo::default()))
+}
+
+/// [s56-enrich-memo] The enrich inputs BEYOND the merge key: the title
+/// overrides and generated summaries. Both are plain maps read only by
+/// [`enrich_sidebar_rows_with_live_titles`]; their content hash joins the
+/// memo key. Small maps — the hash is a map walk, not a row walk.
+fn sidebar_enrich_inputs_fp(
+    session_title_overrides: &BTreeMap<String, String>,
+    generated_summaries: &BTreeMap<String, String>,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_title_overrides.len().hash(&mut hasher);
+    for (path, title) in session_title_overrides {
+        path.hash(&mut hasher);
+        title.hash(&mut hasher);
+    }
+    generated_summaries.len().hash(&mut hasher);
+    for (path, summary) in generated_summaries {
+        path.hash(&mut hasher);
+        summary.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The snapshot's merge + enrich in one memoized step: the merged rows
+/// (every row set drawn OPEN is NOT implied here — the caller's collapse
+/// set decides that as before) with live titles composed, shared as an
+/// Arc. A memo hit performs NO row work; a miss builds through the merge
+/// cache exactly as the traced path does and enriches once.
+#[allow(clippy::too_many_arguments)]
+fn merged_sidebar_rows_enriched(
+    stored_rows: &[BrowserRow],
+    stored_projection_rows: &[BrowserRow],
+    stored_rows_fingerprint: Option<u64>,
+    projection_rows_fingerprint: Option<u64>,
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+    collapsed_row_set_heads: &HashSet<String>,
+    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
+    session_title_overrides: &BTreeMap<String, String>,
+    generated_summaries: &BTreeMap<String, String>,
+    source: &str,
+) -> std::sync::Arc<Vec<BrowserRow>> {
+    let parts = sidebar_merge_cache_key_parts(
+        stored_rows,
+        stored_projection_rows,
+        stored_rows_fingerprint,
+        projection_rows_fingerprint,
+        remote_machines,
+        ssh_targets,
+        live_sessions,
+        expanded_paths,
+        collapsed_row_set_heads,
+        row_arrangement,
+    );
+    let inputs_fp = sidebar_enrich_inputs_fp(session_title_overrides, generated_summaries);
+    if let Ok(memo) = sidebar_enrich_memo().lock() {
+        if let Some((memo_key, memo_fp, rows)) = memo.entry.as_ref() {
+            if *memo_key == parts.key && *memo_fp == inputs_fp {
+                return std::sync::Arc::clone(rows);
+            }
+        }
+    }
+    let mut rows = merged_sidebar_rows_with_projection_rows(
+        stored_rows,
+        stored_projection_rows,
+        stored_rows_fingerprint,
+        projection_rows_fingerprint,
+        remote_machines,
+        ssh_targets,
+        live_sessions,
+        expanded_paths,
+        collapsed_row_set_heads,
+        row_arrangement,
+        source,
+    );
+    enrich_sidebar_rows_with_live_titles(
+        &mut rows,
+        live_sessions,
+        remote_machines,
+        session_title_overrides,
+        generated_summaries,
+    );
+    let rows = std::sync::Arc::new(rows);
+    if let Ok(mut memo) = sidebar_enrich_memo().lock() {
+        memo.entry = Some((parts.key, inputs_fp, std::sync::Arc::clone(&rows)));
+    }
+    rows
+}
 fn sidebar_search_cache() -> &'static Mutex<SidebarSearchCache> {
     SIDEBAR_SEARCH_CACHE.get_or_init(|| Mutex::new(SidebarSearchCache::default()))
 }
@@ -59254,9 +59365,17 @@ fn merged_sidebar_rows_with_projection_rows(
         "row_arrangement": format!("{:016x}", parts.input_keys[7]),
     });
     let key_ms = key_started_at.elapsed().as_secs_f64() * 1000.0;
+    crate::render_attribution::note_span_ms("snapshot.p.merge.key", key_ms);
+    let hit_clone_started_at = Instant::now();
     let cache_lookup_started_at = Instant::now();
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
         if let Some(hit) = cache.entries.get(&key).cloned() {
+            // [s56-reprofile] The cached Vec deep-clones here on every hit —
+            // this span names that cost separately from the lookup itself.
+            crate::render_attribution::note_span_ms(
+                "snapshot.p.merge.hit_clone",
+                hit_clone_started_at.elapsed().as_secs_f64() * 1000.0,
+            );
             if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
                 cache.order.remove(ix);
             }
@@ -59295,8 +59414,14 @@ fn merged_sidebar_rows_with_projection_rows(
         row_arrangement,
     );
     let uncached_ms = uncached_started_at.elapsed().as_secs_f64() * 1000.0;
+    crate::render_attribution::note_span_ms("snapshot.p.merge.uncached", uncached_ms);
+    let store_clone_started_at = Instant::now();
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
         cache.entries.insert(key, rows.clone());
+        crate::render_attribution::note_span_ms(
+            "snapshot.p.merge.store_clone",
+            store_clone_started_at.elapsed().as_secs_f64() * 1000.0,
+        );
         if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
             cache.order.remove(ix);
         }

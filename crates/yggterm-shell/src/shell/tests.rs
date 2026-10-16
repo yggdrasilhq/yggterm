@@ -69488,6 +69488,108 @@ mod menu_dismissal_locks {
     }
 
     #[test]
+    fn the_enrich_memo_shares_rows_until_an_input_moves() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+        ]));
+        let empty: HashSet<String> = HashSet::new();
+        let arrangement = yggterm_core::row_set_outline::RowArrangement::default();
+        let rows = shell.browser.rows().to_vec();
+        let projection = shell.browser.all_rows();
+        let args = (
+            &rows as &[BrowserRow],
+            projection.as_slice(),
+        );
+        let first = super::merged_sidebar_rows_enriched(
+            args.0,
+            args.1,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &empty,
+            &HashSet::new(),
+            &arrangement,
+            &shell.session_title_overrides,
+            &shell.generated_summaries,
+            "memo_test",
+        );
+        // Same inputs again: the memo shares the EXACT Arc (no row work).
+        let second = super::merged_sidebar_rows_enriched(
+            args.0,
+            args.1,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &empty,
+            &HashSet::new(),
+            &arrangement,
+            &shell.session_title_overrides,
+            &shell.generated_summaries,
+            "memo_test",
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "an unchanged (merge key, enrich inputs) pair must share the memoized rows"
+        );
+        // A title override moves the enrich-inputs fingerprint: new rows,
+        // and the override title must appear. Keyed by a REAL row path —
+        // overrides name session paths, and tree rows carry tree paths.
+        let target_path = first
+            .iter()
+            .find(|row| row.kind == BrowserRowKind::Session)
+            .map(|row| row.full_path.clone())
+            .expect("the fixture tree projects a session row");
+        shell
+            .session_title_overrides
+            .insert(target_path, "Renamed By Override".to_string());
+        let third = super::merged_sidebar_rows_enriched(
+            args.0,
+            args.1,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &empty,
+            &HashSet::new(),
+            &arrangement,
+            &shell.session_title_overrides,
+            &shell.generated_summaries,
+            "memo_test",
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "an override change must rebuild the enriched rows (the fingerprint moved)"
+        );
+        // And the memo now serves the REBUILT rows on the next identical call.
+        let fourth = super::merged_sidebar_rows_enriched(
+            args.0,
+            args.1,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &empty,
+            &HashSet::new(),
+            &arrangement,
+            &shell.session_title_overrides,
+            &shell.generated_summaries,
+            "memo_test",
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&third, &fourth),
+            "the memo must serve the rebuilt rows for the new input pair"
+        );
+    }
+
+    #[test]
     fn the_snapshot_cache_holds_until_the_wall_clock_deadline_not_the_old_tick() {
         let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
         let mut shell = ShellState::new(bootstrap);
