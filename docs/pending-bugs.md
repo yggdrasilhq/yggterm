@@ -1955,6 +1955,20 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (3) the falsifier is the mergekey rig (tools/uxspeed/mergekey-rig.sh)
   at the 20k world: unacked batches per trial -> 0, DOM reads frame-fresh
   (root_render_count advance before every read already in the rig).
+  BASELINE MEASURED 2026-10-16 ~23:5x on deployed main e63f0dadd774 (all
+  three s56 units in): the counters were ALREADY exposed in describe
+  (webview_edit_flush_timeouts / gate_bypasses / resync_requests,
+  state.rs ~66850 — prior sittings); the F10 probe (idle 20s / bounded
+  expand-churn / spawn-remove / idle, staged 20k world) read ZERO on
+  every counter in every leg, zero ack-timeout log lines. The
+  historical 85-100 timeouts/trial were measured on PRE-MEMO builds —
+  starvation correlates with the slow-render regime (13.6ms enrich +
+  10.8ms builds blocking the VirtualDom, batches piling behind it),
+  which s56 removed. A/B OPEN: rebuild eb08f3d73363 (post-TTL, pre-memo)
+  and run the identical probe — if timeouts reappear there, the
+  starvation is render-block DOWNSTREAM and the fix is proven to be the
+  s56 render-path work; if they persist, the renderer/IPC arc reopens
+  as the true root.
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
