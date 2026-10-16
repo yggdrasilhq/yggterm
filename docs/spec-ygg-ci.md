@@ -26,6 +26,7 @@ One entry per project; picked up on the next tick (≤300s) without restarting t
 | `gates` | space-separated scripts that must exit 0 before main is pushed |
 | `deploy` | optional deploy command (empty = build-and-gate only) |
 | `host` | which host builds it (all current recipes: `dev`) |
+**Docs-scope skip (dream ACK-a8a9eec7c3):** when every changed path between the last BUILT sha and the integrated HEAD is markdown, the tick skips the build AND the deploy — the binary cannot change — while the gates still run and main still pushes. The build record carries `build_skipped: "docs-scope"` + the changed paths; the ci.log line names the skip. Conservative: an empty diff, a failed diff, or any non-`.md` path builds as usual. This is what makes docs-only lanes cost seconds instead of a build+deploy cycle.
 | `interval` | seconds between ticks |
 
 ## 2. §Compile cache — the optimization techniques ⭐
