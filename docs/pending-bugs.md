@@ -2037,6 +2037,19 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   spawn legs need either a raise-able timeout flag on
   `server app terminal new` or a product answer for CLI launches under
   a non-real HOME).
+  UPDATE same sitting: the small-world rig mode (S56_SMALL_WORLD=1, now in
+  tools/uxspeed/mergekey-rig.sh) is a HIGH-REPRO F11 harness — the panic
+  fires ~2x per launch there AND the DOM never renders at all (zero
+  component_window events, empty sidebar, while the shell state itself
+  answers: init_count=1, describe works). So "the GUI recovers" is TRUE
+  only on the real-home runs (1 panic, renders continue); under the
+  redirected-home regime the first Root render dies and the sidebar never
+  draws. The redirected-HOME spawn latency note above is DOWNGRADED —
+  `--timeout-ms` already exists on the app-control CLI (default 15s); the
+  rig now passes it. The DOM-empty signature also means: whatever hook is
+  misordered, the sidebar subtree renders NOTHING after the panic —
+  F11's fix unblocks the sol Q4 paint matrix (the rig's spawn legs work
+  once the DOM draws).
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN

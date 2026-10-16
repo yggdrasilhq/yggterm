@@ -61,17 +61,47 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# [s56-paintmatrix] S56_SMALL_WORLD=1 stages the session store INSIDE the
+# scratch home and launches the GUI with HOME redirected there — the tree
+# scan walks dirs::home_dir, so this is the only way to measure a SMALL
+# hermetic world (the real store's 20k sessions otherwise dominate every
+# trial; the Q4 paint matrix needs a world where DOM reads are verifiable).
+SMALL_WORLD=${S56_SMALL_WORLD:-0}
+
 for t in $(seq 1 "$TRIALS"); do
   HOME_DIR="$SCRATCH/t$t"
   mkdir -p "$HOME_DIR"
+  if [ "$SMALL_WORLD" = "1" ]; then
+    STAGE_BASE="$HOME_DIR/.codex/sessions/2026/01/02/$STAGE_TAG"
+    mkdir -p "$STAGE_BASE"
+    python3 - "$STAGE_BASE" "$SESS" <<'PYSTAGE'
+import json, os, sys, uuid
+base, count = sys.argv[1], int(sys.argv[2])
+cwds = [f"/home/pi/proj-{tag}" for tag in "abcdefgh"]
+for ix in range(count):
+    sid = str(uuid.uuid4())
+    cwd = cwds[ix % len(cwds)]
+    body = (
+        json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd}}) + "\n"
+        + json.dumps({"type": "event_msg", "payload": {
+            "type": "user_message", "message": f"s56 staged session {ix} on {cwd}"}}) + "\n"
+    )
+    with open(os.path.join(base, f"rollout-{sid}.jsonl"), "w") as fh:
+        fh.write(body)
+print(f"staged {count} sessions (small-world) across {len(cwds)} cwds")
+PYSTAGE
+  fi
   pkill -f "Xvfb $DISP" 2>/dev/null; sleep 1
   Xvfb $DISP -screen 0 1600x1000x24 -ac > "$OUT/xvfb-t$t.log" 2>&1 &
   XPID=$!; sleep 1.5
   export PATH="$(dirname "$BIN"):$PATH" YGGTERM_HOME="$HOME_DIR" \
          XDG_DATA_HOME="$HOME_DIR/xdg-share"
+  HOME_REDIRECT=""
+  if [ "$SMALL_WORLD" = "1" ]; then HOME_REDIRECT="HOME=$HOME_DIR"; fi
   dbus-run-session -- bash -c "
     export DISPLAY=$DISP GDK_BACKEND=x11 YGGTERM_FORCE_X11_BACKEND=1 \
            RUST_BACKTRACE=1 YGGTERM_HOME=$HOME_DIR
+    export $HOME_REDIRECT
     $BIN > $OUT/gui-t$t.log 2>&1
   " > /dev/null 2>&1 </dev/null &
   GUIWRAP=$!
