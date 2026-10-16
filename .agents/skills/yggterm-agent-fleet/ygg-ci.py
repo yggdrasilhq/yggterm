@@ -424,6 +424,15 @@ def _cache_wire_probe(host=None):
     o = r.stdout or ""
     return {"wrapper": "W=1" in o, "binary": "B=1" in o}
 
+def _is_docs_scope(paths):
+    """Dream ACK-a8a9eec7c3 / F5: a tick whose changed paths are ALL markdown
+    cannot change the binary — the cargo build and the deploy are skipped
+    (gates still run, main still pushes). Conservative by construction: any
+    non-.md path, or an empty path list, builds."""
+    paths = [p.strip() for p in paths if p and p.strip()]
+    return bool(paths) and all(p.endswith(".md") for p in paths)
+
+
 def cmd_cache(a):
     """Per-host compile-cache health + the verdict digest of recent builds (§4)."""
     hosts = [h.strip() for h in (a.host.split(",") if a.host else _default_fleet_hosts())]
@@ -1307,11 +1316,24 @@ def _do_tick_project(project, dry=False):
     integ_sha = git_rev(repo, "HEAD")
     build_ok = True
     build_log = ""
+    # [docs-scope] diff the last BUILT sha (fallback: this tick's start) against
+    # the integrated HEAD — that is exactly what this build would compile. An
+    # all-markdown diff cannot change the binary; the diff failing builds (safe).
+    docs_scope = False
+    scope_paths = []
+    if build_cmd:
+        base = (last_attempt or {}).get("sha") or pre_tick
+        sd = _run(["git", "diff", "--name-only", f"{base}..HEAD"], cwd=str(repo), timeout=60)
+        if sd.returncode == 0:
+            scope_paths = [p for p in (sd.stdout or "").splitlines() if p.strip()]
+            docs_scope = _is_docs_scope(scope_paths)
     hb_secs = int(pcfg.get("step_heartbeat_secs", DEFAULT_STEP_HEARTBEAT_SECS))
     build_to = int(pcfg.get("build_timeout_secs", DEFAULT_BUILD_TIMEOUT_SECS))
     gate_to = int(pcfg.get("gate_timeout_secs", DEFAULT_GATE_TIMEOUT_SECS))
     cc = None
-    if build_cmd:
+    if build_cmd and docs_scope:
+        log(f"  docs-scope: {len(scope_paths)} changed paths, all markdown — build skipped (dream ACK-a8a9eec7c3; the binary cannot change)")
+    elif build_cmd:
         log(f"  building {project} IN {repo} ({main_branch}@{integ_sha[:12]}, budget {build_to}s): {build_cmd}")
         cc_pre = _sccache_stats()
         r = _run(build_cmd, cwd=str(repo), timeout=build_to, shell=True, label=f"build {project}", heartbeat_secs=hb_secs)
@@ -1416,7 +1438,9 @@ def _do_tick_project(project, dry=False):
             "id": f"{project}--{ts_stamp()}--{integ_sha[:12] if integ_sha else 'no-sha'}--failed",
             "project": project, "at": int(time.time()), "host": this_host(),
             "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts,
-            "build": build_cmd, "build_ok": build_ok, "status": "build-failed",
+            "build": build_cmd, "build_ok": build_ok,
+        "build_skipped": ("docs-scope" if docs_scope else None),
+        "docs_scope_paths": scope_paths[:24] if docs_scope else [], "status": "build-failed",
             "reset_to": pre_tick, "quarantined": failed_lanes, "sccache": cc,
         }
         BUILDS.mkdir(parents=True, exist_ok=True)
@@ -1428,7 +1452,9 @@ def _do_tick_project(project, dry=False):
     # guard spent 3.2.4x fighting). ──
     deploy_ok = None
     if pushed is not False:
-        if deploy_cmd:
+        if docs_scope:
+            log("  deploy skipped (docs-scope — binary unchanged; deployed sha stays where it was)")
+        if deploy_cmd and not docs_scope:
             log(f"  deploying {project}: {deploy_cmd}")
             r = _run(deploy_cmd, cwd=str(repo),
                      timeout=int(pcfg.get("deploy_timeout_secs", DEFAULT_DEPLOY_TIMEOUT_SECS)),
