@@ -1787,7 +1787,28 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   leaves the merge entirely; gate = first_switch_paint_matches_uncached_
   snapshot (Q2). Secondary findings for that unit: merge_rows_traced's
   key hashing costs ~7.6ms/window and the 500ms TTL converts idle-cadence
-  renders into full merges (miss_ttl_expired in most windows).
+  renders into full merges (miss_ttl_expired in most windows). S55
+  (2026-10-16): the projection cache LANDED + first falsifier run GREEN
+  (lane/f7/browser-projection-cache dae5e210 -> main 6c2b1120, deployed):
+  all_rows() built at most once per browser instance
+  (OnceLock<Arc<Vec<BrowserRow>>>, constructor-only root enforced by a
+  fail-closed source-scan gate with a demonstration arm per sol Q2),
+  callers borrow via as_slice()/iter(), the two fixtures off .into_iter(),
+  projection_init_count exposed in describe's browser/metrics. Shaped by
+  the sol s54 HIGH consult (all five accept-with-corrections; lore node
+  lores/chain-of-thought/2026-10-16-yggterm-s54-projection-cache-sol.md).
+  FALSIFIER (dev harness, rig s55, 54 windows): snapshot.p.browser FLAT
+  0.0ms for the whole run — the s54b 90-115ms step is GONE; the tree
+  replacement shows ONE cold re-init window (19.6ms) then 0.0 again;
+  projection_init_count=1 across 291 root renders; late-run app.snapshot
+  means 97-143ms -> 17.6-33.9ms; the dwell leg painted 48/48 rows with
+  the screenshot captured. OWED per sol Q4's protocol: the 3 matched
+  control/candidate trials, the >=100 first-switch-paint zero-mismatch
+  matrix (spot-checked only this sitting), per-call grain (window means
+  can hide spikes), and search-active separate reporting. NEXT per the
+  sol Q5 ranking: (1) merge-key fingerprint (the ~7.6ms content hashing),
+  (2) the 500ms TTL audit (busy-hint expiry depends on it), (3) reprofile
+  the residual ~20-30ms merge — now the dominant slice.
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
