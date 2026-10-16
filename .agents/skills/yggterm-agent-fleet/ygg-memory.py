@@ -3847,7 +3847,11 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
         return "auto-dream: no candidate (clean tick)"
     candidates.sort(reverse=True)
     _, ns = candidates[0]
-    base = [sys.executable, str(Path(__file__).resolve()), "--root", str(root), "--ns", ns]
+    # ⛔ `--ns <ns>` breaks when ns starts with a dash (every namespace does):
+    # argparse reads the value as another option ("expected one argument").
+    # The `=` form is the documented convention — the auto-dreamer died on
+    # this for 10 days (2026-10-06..16, backoff-stamped each tick).
+    base = [sys.executable, str(Path(__file__).resolve()), "--root", str(root), f"--ns={ns}"]
     try:
         run_ = subprocess.run(
             base
