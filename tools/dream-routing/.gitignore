@@ -1,0 +1,4 @@
+corpus/
+results/
+__pycache__/
+routing-config.json
