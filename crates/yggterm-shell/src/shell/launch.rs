@@ -2283,7 +2283,16 @@ fn app() -> Element {
     // Shared through the epoch cache: a root render with no state write in
     // front of it (the measured ~11% forced-wake amplification) reuses the
     // previous merge instead of rebuilding it.
-    let snapshot: SharedSnapshot = state.read().snapshot_shared();
+    // [s53 unit B] THE LEG A DECOMPOSITION: the app root render measured
+    // ~150ms/pass on the dev harness (3 renders = 455ms in one
+    // component_window) while every child component stayed sub-5ms — the
+    // cost is inside THIS fn. These section spans split it into
+    // snapshot-vs-rsx-vs-residual through the same component_window
+    // aggregate; no behavior change.
+    let snapshot: SharedSnapshot = {
+        let _section = crate::render_attribution::ComponentRenderSpan::start("app.snapshot");
+        state.read().snapshot_shared()
+    };
     // External search-value sync: the titlebar input is UNCONTROLLED (typing
     // never re-renders its value — the controlled rewrite raced the
     // per-keystroke tree rebuild and ate characters), so external writers
@@ -3180,6 +3189,7 @@ fn app() -> Element {
     // reason it is here and not in a rail body: one owner, every surface.
     let text_field_css = text_field_css(snapshot.palette);
     let context_menu_overlay = snapshot.context_menu_row.clone();
+    let _rsx_section = crate::render_attribution::ComponentRenderSpan::start("app.rsx");
     rsx! {
         div {
             id: "yggterm-shell-root",
