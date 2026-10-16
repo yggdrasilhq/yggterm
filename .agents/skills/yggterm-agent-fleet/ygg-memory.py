@@ -4524,6 +4524,273 @@ def owner_affect(root: Path, target: str) -> dict:
     return affect
 
 
+# ── [slice 5] CONNECTIONS — typed edges between resolvable objects ──────────
+# Sol round-4 Q1: connection TYPE describes meaning, never authority. Edges
+# wrap the native address systems (lobe://, [[hub links]], board ACK refs) —
+# no replacement grammar is invented. The index is DERIVED and rebuildable;
+# adapters are observation-only and never rewrite a source. Yin tightens
+# (resolve unambiguous refs, dedupe, strengthen, mark broken/expired); Yang
+# grows (hypothesis edges with a mandatory falsification test — "possibly
+# related" fails admission, and an untested hypothesis expires from ordinary
+# traversal after 7 days while staying visible as a hypothesis).
+CONNECTION_STATUSES = ("observed", "owner-asserted", "hypothesis", "supported", "rejected", "expired")
+CONNECTION_HYPOTHESIS_DAYS = 7
+CONNECTIONS_REBUILD_MAX = 5_000
+
+
+def connections_path(root: Path) -> Path:
+    return root / "dream" / "connections.json"
+
+
+def load_connections(root: Path) -> dict:
+    path = connections_path(root)
+    if not path.is_file():
+        return {"version": 1, "edges": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data.get("edges"), list):
+            data["edges"] = []
+        return data
+    except Exception:
+        return {"version": 1, "edges": []}
+
+
+def save_connections(root: Path, data: dict) -> None:
+    path = connections_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+
+
+def _connection_edge_id(from_addr: str, relation: str, to_addr: str) -> str:
+    return hashlib.sha256(f"{from_addr}|{relation}|{to_addr}".encode("utf-8")).hexdigest()[:16]
+
+
+def connection_view_status(edge: dict, today: str | None = None) -> str:
+    """Computed, never stored: an untested hypothesis past its review date
+    is EXPIRED in every view (history keeps the original status)."""
+    today = today or budget_today()
+    if edge.get("status") == "hypothesis" and not edge.get("tested_at"):
+        if str(edge.get("review_by", "9999")) < today:
+            return "expired"
+    return edge.get("status", "observed")
+
+
+def connection_observe(
+    root: Path, from_addr: str, relation: str, to_addr: str, *,
+    status: str = "observed", source_ref: str | None = None, created_by: str = "seat",
+    hypothesis: str | None = None, falsification_test: str | None = None, review_days: int | None = None,
+) -> dict:
+    """Yin admission for one edge. Identical (from, relation, to) triples
+    NEVER duplicate: a rerun strengthens the existing edge's evidence
+    instead — several summaries repeating one source stay one lineage."""
+    if status not in CONNECTION_STATUSES:
+        raise ValueError(f"connection: unknown status {status}")
+    if status == "hypothesis":
+        # Yang admission: a hypothesis with no concrete test is noise
+        if not hypothesis or not falsification_test:
+            raise ValueError("connection: a hypothesis needs BOTH a hypothesis and a falsification test ('possibly related' fails admission)")
+        if not review_days:
+            review_days = CONNECTION_HYPOTHESIS_DAYS
+    data = load_connections(root)
+    edges = data.setdefault("edges", [])
+    eid = _connection_edge_id(from_addr, relation, to_addr)
+    today = budget_today()
+    for edge in edges:
+        if edge.get("id") == eid:
+            if status in ("observed", "owner-asserted") and source_ref and source_ref not in edge.get("source_refs", []):
+                edge["source_refs"] = (edge.get("source_refs", []) + [source_ref])[-10:]
+                edge["strengthened_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                save_connections(root, data)
+                return {"action": "strengthened", "id": eid, "status": connection_view_status(edge, today)}
+            return {"action": "deduplicated", "id": eid, "status": connection_view_status(edge, today)}
+    entry = {
+        "id": eid, "from": from_addr, "relation": relation, "to": to_addr,
+        "status": status,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "created_by": created_by,
+        "source_refs": [source_ref] if source_ref else [],
+    }
+    if status == "hypothesis":
+        entry.update({
+            "hypothesis": hypothesis,
+            "falsification_test": falsification_test,
+            "review_by": (datetime.date.fromisoformat(today) + datetime.timedelta(days=review_days)).isoformat(),
+        })
+    edges.append(entry)
+    data["edges"] = edges[-CONNECTIONS_REBUILD_MAX:]
+    save_connections(root, data)
+    return {"action": "created", "id": eid, "status": connection_view_status(entry, today)}
+
+
+def connection_test(root: Path, edge_id: str, outcome: str, evidence: str | None = None) -> dict:
+    """Run the named falsification test: supported or rejected. A rejection
+    is history — never traversed again — and the edge records WHAT test ran."""
+    if outcome not in ("supported", "rejected"):
+        raise ValueError("connection: outcome is supported|rejected")
+    data = load_connections(root)
+    for edge in data.get("edges", []):
+        if edge.get("id") == edge_id:
+            edge["status"] = outcome
+            edge["tested_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            if evidence:
+                edge["source_refs"] = (edge.get("source_refs", []) + [evidence])[-10:]
+            save_connections(root, data)
+            return {"tested": True, "id": edge_id, "status": outcome}
+    return {"tested": False, "reason": f"unknown edge {edge_id}"}
+
+
+def connections_index(root: Path, *, explore: bool = False, today: str | None = None) -> dict:
+    """The derived view. Ordinary retrieval EXCLUDES hypothesis edges unless
+    exploration is requested; even then the hypothetical status survives."""
+    today = today or budget_today()
+    data = load_connections(root)
+    out = []
+    for edge in data.get("edges", []):
+        status = connection_view_status(edge, today)
+        if status == "rejected":
+            continue  # history only
+        if status in ("hypothesis", "expired") and not explore:
+            continue
+        row = {k: edge.get(k) for k in ("id", "from", "relation", "to", "status", "source_refs", "created_by")}
+        row["status"] = status
+        if status == "hypothesis":
+            row["hypothesis"] = edge.get("hypothesis")
+            row["falsification_test"] = edge.get("falsification_test")
+            row["review_by"] = edge.get("review_by")
+        out.append(row)
+    return {"edges": out, "explore": explore, "today": today}
+
+
+def scan_hub_links(root: Path, ns: str) -> dict:
+    """Hub adapter (observation-only): [[name]] links resolve WITHIN the
+    namespace against door stems. Ambiguous (2+ doors) and unresolved (0)
+    links are RECORDED as unresolved — never silently guessed to a target.
+    Unambiguous links become/strengthen derived edges. Sources untouched."""
+    ns_dir = get_namespace_dir(root, ns, create=False)
+    if not ns_dir.is_dir():
+        raise SystemExit(f"connections: no namespace {ns}")
+    stems: dict[str, list[str]] = {}
+    doors = sorted(ns_dir.rglob("*.md"))
+    for path in doors:
+        stems.setdefault(path.stem.lower(), []).append(path.stem)
+    created = strengthened = 0
+    unresolved = []
+    for path in doors:
+        rel = str(path.relative_to(ns_dir))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for name in re.findall(r"\[\[([^\]\[]+)\]\]", text):
+            matches = stems.get(name.strip().lower(), [])
+            if len(matches) == 1:
+                result = connection_observe(
+                    root, f"{ns}/{path.stem}", "links", f"{ns}/{matches[0]}",
+                    source_ref=f"hub:{ns}/{rel}", created_by="yin-hub-adapter",
+                )
+                if result["action"] == "created":
+                    created += 1
+                elif result["action"] == "strengthened":
+                    strengthened += 1
+            else:
+                unresolved.append({"from": f"{ns}/{path.stem}", "link": name, "why": "ambiguous" if len(matches) > 1 else "no door"})
+    return {"ns": ns, "created": created, "strengthened": strengthened, "unresolved": unresolved}
+
+
+def scan_board_references(root: Path, boards_root: Path, board: str) -> dict:
+    """Board adapter (observation-only): a post whose refs cite another
+    post's ACK token becomes an observed `replies-to` edge between the two
+    immutable posts. A board reply proves that someone replied — never
+    agreement, support, or completion (Q1). Foreign ref forms are skipped,
+    never guessed. Append-only boards replay identically (dedupe by design)."""
+    path = boards_root / board / "board.jsonl"
+    if not path.is_file():
+        raise SystemExit(f"connections: no board journal at {path}")
+    created = strengthened = deduplicated = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            post = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ack = post.get("ack_token")
+        if not ack:
+            continue
+        for ref in post.get("refs", []) or []:
+            if isinstance(ref, str) and ref.startswith("ACK-"):
+                result = connection_observe(
+                    root, f"board:{board}/{ack}", "replies-to", f"board:{board}/{ref}",
+                    source_ref=f"board:{board}", created_by="yin-board-adapter",
+                )
+                if result["action"] == "created":
+                    created += 1
+                elif result["action"] == "strengthened":
+                    strengthened += 1
+                else:
+                    deduplicated += 1
+    return {"board": board, "created": created, "strengthened": strengthened, "deduplicated": deduplicated}
+
+
+def scan_lobe_references(root: Path, lobes_dir: Path) -> dict:
+    """Lobe adapter (observation-only): `lobe://<lobe>/<path>#<anchor>`
+    references found INSIDE lobe records become observed edges between lobe
+    addresses. The native address is preserved verbatim — no re-grammar."""
+    if not lobes_dir.is_dir():
+        raise SystemExit(f"connections: no lobes dir at {lobes_dir}")
+    created = strengthened = deduplicated = 0
+    unresolved = []
+    for path in sorted(lobes_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.findall(r"lobe://[A-Za-z0-9_\-./]+(?:#[A-Za-z0-9_\-]+)?", text):
+            result = connection_observe(
+                root, f"lobe:{path.relative_to(lobes_dir)}", "references", match,
+                source_ref=f"lobe:{path.relative_to(lobes_dir)}", created_by="yin-lobe-adapter",
+            )
+            if result["action"] == "created":
+                created += 1
+            elif result["action"] == "strengthened":
+                strengthened += 1
+            else:
+                deduplicated += 1
+    return {"lobes_dir": str(lobes_dir), "created": created, "strengthened": strengthened, "deduplicated": deduplicated, "unresolved": unresolved}
+
+
+def cmd_connections(args):
+    """[slice 5] The connection plane: observe (Yin), propose (Yang), test,
+    index, and the observation-only adapters (hub links, board ACK refs,
+    lobe:// references). Sources are never rewritten; reruns never duplicate."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    if getattr(args, "index", False):
+        result = connections_index(root, explore=bool(getattr(args, "explore", False)))
+    elif getattr(args, "observe", False):
+        result = connection_observe(
+            root, args.from_addr, args.relation, args.to_addr,
+            status=args.status, source_ref=args.source_ref, created_by=args.created_by,
+        )
+    elif getattr(args, "propose", False):
+        result = connection_observe(
+            root, args.from_addr, args.relation, args.to_addr,
+            status="hypothesis", source_ref=args.source_ref, created_by=args.created_by,
+            hypothesis=args.hypothesis, falsification_test=args.falsification_test,
+            review_days=args.review_days,
+        )
+    elif getattr(args, "test", None):
+        result = connection_test(root, args.test, args.outcome, evidence=args.source_ref)
+    elif getattr(args, "scan_hub", None):
+        result = scan_hub_links(root, args.scan_hub)
+    elif getattr(args, "scan_board", None):
+        boards_root = Path(os.environ.get("MSGGRAPH_BOARDS", str(Path.home() / "data" / "msggraph" / "boards")))
+        result = scan_board_references(root, boards_root, args.scan_board)
+    elif getattr(args, "scan_lobes", None):
+        result = scan_lobe_references(root, Path(args.scan_lobes))
+    else:
+        raise SystemExit("connections: choose --index / --observe / --propose / --test ID / --scan-hub NS / --scan-board B / --scan-lobes DIR")
+    print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+
+
 def cmd_claims(args):
     """[slice 3] Bounded retrieval over the persistent claim store — the
     compaction-safety guarantee made reachable: after any amount of brief
@@ -6009,6 +6276,33 @@ def main():
     p_claims.add_argument("--limit", type=int, default=20)
     p_claims.set_defaults(fn=cmd_claims)
 
+    # [slice 5] the connection plane (Yin/Yang over native addresses)
+    p_conn = subparsers.add_parser(
+        "connections",
+        parents=[common_parser],
+        help="[slice 5] Typed edges between resolvable objects: --observe (Yin, deduping), --propose (Yang hypothesis + mandatory falsification test), --test, --index [--explore], --scan-hub/--scan-board/--scan-lobes (observation-only adapters)",
+    )
+    conn_actions = p_conn.add_mutually_exclusive_group(required=True)
+    conn_actions.add_argument("--index", action="store_true", help="the derived edge view (ordinary retrieval: hypotheses and expired edges excluded)")
+    conn_actions.add_argument("--explore", action="store_true", help="the exploratory view: hypothesis edges INCLUDED, hypothetical status preserved")
+    conn_actions.add_argument("--observe", action="store_true", help="Yin: record/strengthen one observed edge (identical triples dedupe, never duplicate)")
+    conn_actions.add_argument("--propose", action="store_true", help="Yang: propose a hypothesis edge — needs --hypothesis AND --falsification-test ('possibly related' fails admission)")
+    conn_actions.add_argument("--test", metavar="EDGE_ID", help="run a hypothesis's falsification test: --outcome supported|rejected")
+    conn_actions.add_argument("--scan-hub", metavar="NS", help="Yin hub adapter: resolve [[links]] within a namespace (ambiguous stays unresolved)")
+    conn_actions.add_argument("--scan-board", metavar="BOARD", help="Yin board adapter: ACK refs → replies-to edges (replies prove reply, not agreement)")
+    conn_actions.add_argument("--scan-lobes", metavar="DIR", help="Yin lobe adapter: lobe:// references inside lobe records → edges")
+    p_conn.add_argument("--from", dest="from_addr", default="", help="from address (ns/door, board:<b>/<ACK>, lobe://…, or any stable id)")
+    p_conn.add_argument("--relation", default="references", help="edge relation (links|references|replies-to|supports|corrects|fulfills|…)")
+    p_conn.add_argument("--to", dest="to_addr", default="", help="to address")
+    p_conn.add_argument("--status", default="observed", choices=CONNECTION_STATUSES, help="epistemic status for --observe")
+    p_conn.add_argument("--source", dest="source_ref", default=None, help="provenance reference (evidence the edge came from)")
+    p_conn.add_argument("--created-by", dest="created_by", default="seat")
+    p_conn.add_argument("--hypothesis", default=None, help="the concrete hypothesis (mandatory for --propose)")
+    p_conn.add_argument("--falsification-test", dest="falsification_test", default=None, help="the observable falsification test (mandatory for --propose)")
+    p_conn.add_argument("--review-days", type=int, default=None, help="hypothesis review window (default 7d; untested past it = expired from ordinary views)")
+    p_conn.add_argument("--outcome", default="supported", choices=["supported", "rejected"], help="test outcome for --test")
+    p_conn.set_defaults(fn=cmd_connections)
+
     # [slice 2] owner-declared work-class registry
     p_registry = subparsers.add_parser(
         "work-registry",
@@ -6082,6 +6376,8 @@ def main():
         cmd_work_registry(args)
     elif args.subcommand == "claims":
         cmd_claims(args)
+    elif args.subcommand == "connections":
+        cmd_connections(args)
     elif args.subcommand == "_budget-op":
         cmd_budget_op(args)
     else:
