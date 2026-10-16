@@ -22559,6 +22559,12 @@ impl ShellState {
             session.status_line = cursor_line.to_string();
         }
     }
+    /// [`Self::snapshot_shared_at`] with no call-site label — for tests and
+    /// any future caller that has not chosen a site name.
+    fn snapshot_shared(&self) -> SharedSnapshot {
+        self.snapshot_shared_at("unlabeled")
+    }
+
     /// [`Self::snapshot`], deduplicated across a stable data-write epoch.
     ///
     /// Returns the SAME `Arc` while `SHELLSTATE_SNAPSHOT_DATA_TOTAL` has not
@@ -22571,28 +22577,81 @@ impl ShellState {
     /// because a few snapshot inputs are wall-clock reads (the optimistic
     /// busy-hint filter): 500 ms bounds how stale those can be served when no
     /// data write happens.
-    fn snapshot_shared(&self) -> SharedSnapshot {
+    ///
+    /// [s54] Every call carries a site label, and the cache decision is
+    /// attributed: the lookup/build/store phases each get their own
+    /// component_window row PER SITE, and every outcome (hit by reason, miss
+    /// by reason) is counted into the same window. Without the split, a merge
+    /// that ran under an effect or an agent handler reads as a root-render
+    /// cost — the exact misattribution the [s53 unit B] numbers could not
+    /// rule out (sol s53 Q4/Q5).
+    fn snapshot_shared_at(&self, site: &'static str) -> SharedSnapshot {
         const RENDER_SNAPSHOT_CACHE_TTL_MS: u64 = 500;
         let epoch = SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(Ordering::Relaxed);
         let now = current_millis();
-        if let Some((cached_epoch, cached_at_ms, cached)) =
-            self.render_snapshot_cache.borrow().as_ref()
-            && *cached_epoch == epoch
-            && (now.saturating_sub(*cached_at_ms) < RENDER_SNAPSHOT_CACHE_TTL_MS
-                // A settings-modal toggle changes no data projection. Even if
-                // the user waited past the ordinary TTL before clicking, the
-                // modal must not wait for a cold fleet merge; the data will be
-                // refreshed by the next data epoch. This branch is restricted
-                // to the three fields whose click handlers use the modal-only
-                // write wrapper below.
-                || (*cached).launch_flags_open != self.launch_flags_open
-                || (*cached).cli_install_open != self.cli_install_open
-                || (*cached).keymap_editor_open != self.keymap_editor_open)
-        {
-            return cached.clone();
+        let (lookup_span, build_span, store_span) =
+            crate::render_attribution::snapshot_span_names(site);
+        enum CacheDecision {
+            Hit(&'static str, SharedSnapshot),
+            Miss(&'static str),
         }
-        let fresh: SharedSnapshot = std::sync::Arc::new(self.snapshot());
-        *self.render_snapshot_cache.borrow_mut() = Some((epoch, now, fresh.clone()));
+        let decision = {
+            let _lookup = crate::render_attribution::ComponentRenderSpan::start(lookup_span);
+            let cache = self.render_snapshot_cache.borrow();
+            match cache.as_ref() {
+                None => CacheDecision::Miss("miss_cache_empty"),
+                Some((cached_epoch, cached_at_ms, cached)) => {
+                    let ttl_fresh =
+                        now.saturating_sub(*cached_at_ms) < RENDER_SNAPSHOT_CACHE_TTL_MS;
+                    // A settings-modal toggle changes no data projection. Even
+                    // if the user waited past the ordinary TTL before clicking,
+                    // the modal must not wait for a cold fleet merge; the data
+                    // will be refreshed by the next data epoch. This branch is
+                    // restricted to the three fields whose click handlers use
+                    // the modal-only write wrapper below.
+                    let modal_open_bits_differ = (*cached).launch_flags_open
+                        != self.launch_flags_open
+                        || (*cached).cli_install_open != self.cli_install_open
+                        || (*cached).keymap_editor_open != self.keymap_editor_open;
+                    if *cached_epoch == epoch && (ttl_fresh || modal_open_bits_differ) {
+                        CacheDecision::Hit(
+                            if ttl_fresh {
+                                "hit_epoch"
+                            } else {
+                                "hit_modal_exception"
+                            },
+                            cached.clone(),
+                        )
+                    } else if *cached_epoch == epoch {
+                        CacheDecision::Miss("miss_ttl_expired")
+                    } else {
+                        CacheDecision::Miss("miss_epoch_moved")
+                    }
+                }
+            }
+        };
+        match decision {
+            CacheDecision::Hit(outcome, cached) => {
+                crate::render_attribution::note_snapshot_outcome(outcome);
+                return cached;
+            }
+            CacheDecision::Miss(outcome) => {
+                crate::render_attribution::note_snapshot_outcome(outcome);
+            }
+        }
+        let fresh: SharedSnapshot = {
+            let _build = crate::render_attribution::ComponentRenderSpan::start(build_span);
+            std::sync::Arc::new(self.snapshot())
+        };
+        {
+            // The store is measured SEPARATELY from the build on purpose: the
+            // assignment drops the replaced entry here, so this row carries
+            // the old snapshot's destructor cost — the sol s53 Q5 hypothesis
+            // that part of the "47 ms" was a call-boundary drop, not merge
+            // work.
+            let _store = crate::render_attribution::ComponentRenderSpan::start(store_span);
+            *self.render_snapshot_cache.borrow_mut() = Some((epoch, now, fresh.clone()));
+        }
         fresh
     }
 
@@ -66026,7 +66085,7 @@ fn describe_app_state_snapshot(
     // Shared, not rebuilt: agent probes arrive in bursts on a fleet host, and
     // every DescribeState used to pay its own full sidebar merge on the UI
     // thread (`app_control/request_begin` blocks, 2026-08-20).
-    let snapshot = shell.snapshot_shared();
+    let snapshot = shell.snapshot_shared_at("handler_describe_state");
     // The rail's rendered truth, resolved by the SAME call the component makes.
     let rail_view = rail_render_view(&snapshot);
     let rendered_app_pane = match &rail_view.rendered_mode {
@@ -67408,7 +67467,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     // Clone of the shared snapshot, not a rebuild: this verb annotates its
     // copy below, but the expensive half is the merge, and that is what the
     // epoch cache dedups across a probe burst.
-    let mut snapshot = (*shell.snapshot_shared()).clone();
+    let mut snapshot = (*shell.snapshot_shared_at("handler_describe_rows")).clone();
     // The rows the SCREEN is showing, so a row can still report whether the
     // user has it folded away.
     let rendered: std::collections::HashSet<String> = snapshot

@@ -2289,9 +2289,14 @@ fn app() -> Element {
     // cost is inside THIS fn. These section spans split it into
     // snapshot-vs-rsx-vs-residual through the same component_window
     // aggregate; no behavior change.
+    // [s54] The snapshot call is site-labeled: the shared-cache split records
+    // lookup/build/store per call site (and every hit/miss reason) into the
+    // same window record, so this outer span can be reconstructed from its
+    // parts exactly — and an effect-side merge can no longer read as a
+    // root-render cost.
     let snapshot: SharedSnapshot = {
         let _section = crate::render_attribution::ComponentRenderSpan::start("app.snapshot");
-        state.read().snapshot_shared()
+        state.read().snapshot_shared_at("root_render")
     };
     // External search-value sync: the titlebar input is UNCONTROLLED (typing
     // never re-renders its value — the controlled rewrite raced the
@@ -2331,7 +2336,7 @@ fn app() -> Element {
             // bypasses the shared cache, rebuilds the whole sidebar merge, and
             // delays a local modal behind remote/tree work. This effect only
             // needs the same immutable render facts as the root below.
-            let snapshot = shell.snapshot_shared();
+            let snapshot = shell.snapshot_shared_at("effect_sidebar_autoscroll");
             let selected_path = shell
                 .selection_anchor
                 .as_ref()
@@ -2396,7 +2401,7 @@ fn app() -> Element {
     });
     use_effect(move || {
         let target_dom_id = {
-            let snapshot = state.read().snapshot_shared();
+            let snapshot = state.read().snapshot_shared_at("effect_search_scroll");
             snapshot.search_content_hit_index.and_then(|ix| {
                 snapshot
                     .search_content_hits
@@ -2449,7 +2454,7 @@ fn app() -> Element {
     let dock_desktop = desktop.clone();
     use_effect(move || {
         let _ = *window_epoch.read();
-        let snapshot = state.read().snapshot_shared();
+        let snapshot = state.read().snapshot_shared_at("effect_dock_sync");
         let request = ghostty_dock_request(&dock_desktop, &snapshot);
         let (should_sync, window_to_hide) = {
             let shell = state.read();
