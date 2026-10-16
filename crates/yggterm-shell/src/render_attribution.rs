@@ -191,6 +191,20 @@ pub(crate) fn note_state_write(site: WriteSite) {
     *state.cumulative.entry(site).or_insert(0) += 1;
 }
 
+/// Add one measured duration straight to a span bucket — the manual form of
+/// [`ComponentRenderSpan`] for code that cannot take an RAII guard at the
+/// segment boundary (linear timers inside one long function). Same bucket,
+/// same window drain, same aggregation discipline.
+pub(crate) fn note_span_ms(name: &'static str, ms: f64) {
+    let mut state = lock_attribution();
+    let bucket = state.buckets.entry(name).or_default();
+    bucket.renders += 1;
+    bucket.total_ms += ms;
+    if ms > bucket.max_ms {
+        bucket.max_ms = ms;
+    }
+}
+
 /// Record one `snapshot_shared` cache outcome. Called on every cache
 /// decision — hits and misses alike, by reason — so a window record can
 /// answer "how many merges ran, and why" without a per-call trace point.
