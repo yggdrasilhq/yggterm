@@ -2109,6 +2109,17 @@ dioxus.send(out);
             full_frame_fulls = []
             full_frame_gaps = []
             full_frame_windows = []
+            # [F7 s53] the raise's host_id must SURVIVE the pass that first
+            # saw reveal_served: the pass-local derivation re-runs every poll,
+            # the assignment guards (`reveal_served is None`) do not — on a
+            # raise there is no mount_begin, so every poll AFTER the reveal
+            # re-derived host_id=None and the identity gate silently rejected
+            # every frame event (measured live: fulls=0 gaps=0 while the
+            # trace held two full-coverage frames from the raise's own host,
+            # 650ms after reveal_served). This also rewrites the s52 story:
+            # its quiet-switch refusal was THIS loss, not the frame-gap
+            # floor hiding fast frames.
+            reveal_host_id = None
             deadline = time.time() + self.timeout_s
             t_loop = time.time()
             while time.time() < deadline:
@@ -2134,7 +2145,8 @@ dioxus.send(out);
                     # one. terminal_mount/reveal_forced_incomplete is the
                     # honest incomplete end (the ui/reveal family only covers
                     # first-reveal-after-boot).
-                    host_id = (mount_begin or {}).get("payload", {}).get("host_id")
+                    host_id = ((mount_begin or {}).get("payload", {}).get(
+                        "host_id") or reveal_host_id)
                     act_ts = activation.get("ts_ms", 0)
                     for e in evs:
                         p = e.get("payload") or {}
@@ -2162,7 +2174,9 @@ dioxus.send(out);
                                 and n == "reveal_served"):
                             reveal_served = e
                             # raises have no mount_begin; join frames by the
-                            # raise's own host_id
+                            # raise's own host_id — and keep it for the NEXT
+                            # pass (the assignment guards above fire once)
+                            reveal_host_id = reveal_host_id or p.get("host_id")
                             host_id = host_id or p.get("host_id")
                         elif (reveal_refused is None
                                 and c == "terminal_mount"
