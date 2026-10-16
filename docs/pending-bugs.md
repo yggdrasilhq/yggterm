@@ -1764,7 +1764,30 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   FIX UNIT is the snapshot build (finer-grained sharing so a
   click-caused render stops recloning the whole shared snapshot), not
   the tree. [11.215]'s appear-over bar and the close/teardown family
-  still need fresh runs on the dev-local harness.
+  still need fresh runs on the dev-local harness. S54 (2026-10-16): the
+  app.snapshot span SPLIT + the construction profile LANDED (lane/
+  f7/snapshot-span-split dc4d1fa0+99254ab9 -> main c7ba7ba6, deployed):
+  site-labeled lookup/build/store sub-spans + hit/miss reason counters in
+  the same component_window record (no per-render emission). THE
+  ACCOUNTING VERIFIED — residual 0.00-0.07ms in every window, the outer
+  span IS the build. Sol s53 Q5's destructor theory is DEAD (store spans
+  0.0ms everywhere, max 4.3ms once). Effect/handler-side merges are REAL
+  but secondary (autoscroll 124ms, dock 117ms, search 132ms, agent
+  describe 40-56ms — each pays the same build on the UI thread; the
+  per-site labels make them visible now). H1 CONFIRMED: construction is
+  99.99% of the span and it GROWS during a run — the 7-phase profile
+  names the slice: `browser` is 0.0ms flat, then steps to 90-115ms at one
+  mid-run event and STAYS; sessions 0.1 / retained 0.1 / merge 15-40
+  stable / tail ~1. BrowserMetrics independently confirms the mechanism:
+  last_rebuild_ms=53.6 at row_count=7 — the cost is the WHOLE-TREE WALK
+  (unique_session_short_ids + collect_group_paths + flatten_rows inside
+  all_rows(), which snapshot() re-runs on EVERY cache-miss merge), not a
+  row clone. THE FIX TARGET (sol s53 Q1(a) projection cache) is now
+  NAMED: cache the browser projection by browser revision so the walk
+  leaves the merge entirely; gate = first_switch_paint_matches_uncached_
+  snapshot (Q2). Secondary findings for that unit: merge_rows_traced's
+  key hashing costs ~7.6ms/window and the 500ms TTL converts idle-cadence
+  renders into full merges (miss_ttl_expired in most windows).
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
