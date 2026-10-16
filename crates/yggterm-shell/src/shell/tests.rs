@@ -5155,6 +5155,12 @@ JSON.stringify({{
         );
     }
 
+    // [s55-projection] The cache contract, and the invariant that makes it
+    // sound. `all_rows()` used to re-run the whole-tree walk on EVERY call,
+    // and snapshot() calls it on every merge; the walk is a pure function of
+    // `root`, and `root` never mutates after construction, so the projection
+    // is built at most once per browser instance and shared as an Arc.
+
     /// A modal/open action must not pay for a second full sidebar merge merely
     /// because a neighbouring render effect needs the same immutable facts.
     /// `snapshot()` bypasses the epoch cache; these three effects used that
@@ -68662,8 +68668,9 @@ mod menu_dismissal_locks {
         let row = shell
             .browser
             .all_rows()
-            .into_iter()
+            .iter()
             .find(|row| row.kind == BrowserRowKind::Session && row.full_path.contains("doomed"))
+            .cloned()
             .expect("the fixture tree has one session row");
         assert!(
             !shell
@@ -69433,11 +69440,148 @@ mod menu_dismissal_locks {
         let row = shell
             .browser
             .all_rows()
-            .into_iter()
+            .iter()
             .find(|row| row.kind == BrowserRowKind::Session && row.full_path.contains("doomed"))
+            .cloned()
             .expect("the fixture tree has one session row");
         (shell, row)
     }
+
+    #[test]
+    fn the_all_rows_projection_is_built_once_and_shared() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+            "/home/user/.codex/sessions/beta.jsonl",
+        ]));
+        let first = shell.browser.all_rows();
+        assert!(
+            shell.browser.projection_init_count() == 1,
+            "the first all_rows call must initialize the projection exactly once"
+        );
+        assert!(!first.is_empty(), "the fixture tree projects at least one row");
+        let second = shell.browser.all_rows();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a repeat all_rows call must share the cached projection, not rebuild it"
+        );
+        assert_eq!(first.len(), second.len());
+        assert!(
+            shell.browser.projection_init_count() == 1,
+            "repeated calls must not add initializations"
+        );
+    }
+
+    #[test]
+    fn a_replaced_browser_tree_gets_a_fresh_projection() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+        ]));
+        let old = shell.browser.all_rows();
+        let old_len = old.len();
+        // Dropping `old` first is not required for correctness (the new
+        // instance builds its own Arc), but the ptr_eq check below must hold
+        // against the NEW instance's cache, not a lingering old allocation.
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+            "/home/user/.codex/sessions/beta.jsonl",
+        ]));
+        let fresh = shell.browser.all_rows();
+        assert!(
+            !std::sync::Arc::ptr_eq(&old, &fresh),
+            "a replaced tree is a new browser instance with its own projection"
+        );
+        assert!(
+            fresh.len() >= old_len,
+            "the two-session tree projects at least as many rows as the one-session tree"
+        );
+        assert_eq!(
+            shell.browser.projection_init_count(),
+            1,
+            "the new instance initialized exactly once for its own demanded call"
+        );
+    }
+
+    #[test]
+    fn search_rows_stays_uncached_and_all_rows_ignores_the_filter() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+            "/home/user/.codex/sessions/beta.jsonl",
+        ]));
+        let unfiltered_all = shell.browser.all_rows();
+        shell.browser.set_filter_query("beta");
+        let filtered_search = shell.browser.search_rows();
+        let after_filter_all = shell.browser.all_rows();
+        assert!(
+            filtered_search.len() < unfiltered_all.len() || filtered_search.is_empty(),
+            "search_rows must reflect the filter (the projection cache must not leak into it)"
+        );
+        assert_eq!(
+            unfiltered_all.len(),
+            after_filter_all.len(),
+            "all_rows is the unfiltered full projection regardless of the filter query"
+        );
+    }
+
+    /// The constructor-only root initialization gate. A cached projection is
+    /// only sound while `root` never mutates after `new()`; this scanner
+    /// fails closed on the representative mutation shapes. The demonstration
+    /// arm proves the scanner actually flags each shape; the real-file arm
+    /// proves the shipped source is clean. A future mutation form this
+    /// scanner does not recognize must extend it IN THE SAME CHANGE (fail
+    /// closed, never silently allowed).
+    fn root_mutation_violations(src: &str) -> Vec<String> {
+        const MUTATION_SUFFIXES: [&str; 11] = [
+            ".push(", ".insert(", ".remove(", ".retain(", ".clear(", ".sort",
+            ".replace(", ".truncate(", ".swap", ".pop(", ".append(",
+        ];
+        let mut hits = Vec::new();
+        for (ix, line) in src.lines().enumerate() {
+            let t = line.trim();
+            let flagged = t.starts_with("self.root = ")
+                || t.starts_with("&mut self.root")
+                || t.contains("&mut self.root")
+                || t.contains("mem::replace(&mut self.root")
+                || t.contains("take(&mut self.root")
+                || (t.starts_with("self.root.")
+                    && MUTATION_SUFFIXES.iter().any(|suffix| t.contains(suffix)));
+            if flagged {
+                hits.push(format!("browser.rs:{}: {}", ix + 1, t));
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn the_browser_root_never_mutates_after_construction() {
+        // Demonstration arm: every representative mutation shape is flagged.
+        for snippet in [
+            "self.root = next;",
+            "self.root.children.push(node);",
+            "let probe = &mut self.root;",
+            "let probe = mem::replace(&mut self.root, next);",
+            "self.root.children.retain(|child| keep(child));",
+            "self.root.children.clear();",
+        ] {
+            assert!(
+                !root_mutation_violations(snippet).is_empty(),
+                "the root-immutability scanner missed a representative: {snippet}"
+            );
+        }
+        // Real-file arm: the shipped browser.rs is clean.
+        let src = include_str!("../../../yggterm-core/src/browser.rs");
+        let violations = root_mutation_violations(src);
+        assert!(
+            violations.is_empty(),
+            "root mutation appeared in browser.rs — the projection cache contract is broken: {violations:?}"
+        );
+    }
+
 
     fn app_pane_menu_actions() -> Vec<AppPaneRowAction> {
         vec![AppPaneRowAction {

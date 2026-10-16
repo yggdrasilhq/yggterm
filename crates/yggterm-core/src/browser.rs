@@ -97,6 +97,18 @@ pub struct SessionBrowserState {
     // survives restarts — same guarantee synthetic groups already had.
     collapsed_paths: HashSet<String>,
     rows: Vec<BrowserRow>,
+    // [s55-projection] The all-rows projection (the expensive whole-tree walk
+    // behind `all_rows()`) built at most once per instance. `root` never
+    // mutates after construction — the constructor-only initialization is
+    // enforced by the source-scan gate in the shell suite — so the projection
+    // is immutable for the instance's life and sharing one Arc across callers
+    // is always fresh. NEVER hand-mutate the cached Vec; a caller that needs
+    // owned rows clones explicitly at its own site. The Cell counts
+    // initializations for the falsifier's exact-one bar (the state is only
+    // ever touched behind the shell's state lock, so Cell suffices; a Clone
+    // of the browser carries its own counter, matching its own fresh cache).
+    all_rows_projection: std::sync::OnceLock<std::sync::Arc<Vec<BrowserRow>>>,
+    projection_inits: std::cell::Cell<usize>,
     selected_path: Option<String>,
     metrics: BrowserMetrics,
 }
@@ -117,6 +129,8 @@ impl SessionBrowserState {
             expanded_paths,
             collapsed_paths: HashSet::new(),
             rows: Vec::new(),
+            all_rows_projection: std::sync::OnceLock::new(),
+            projection_inits: std::cell::Cell::new(0),
             selected_path: None,
             metrics: BrowserMetrics::default(),
         };
@@ -147,21 +161,45 @@ impl SessionBrowserState {
         rows
     }
 
-    pub fn all_rows(&self) -> Vec<BrowserRow> {
-        let short_ids = unique_session_short_ids(&self.root);
+    /// The tree's own rows with every group expanded and no filter — the
+    /// full projection, independent of expansion state and search query.
+    ///
+    /// [s55-projection] The walk behind this used to run fresh on EVERY call,
+    /// and `ShellState::snapshot()` calls it on every cache-miss merge — a
+    /// 50-115ms whole-tree traversal on the UI thread once the cwd tree
+    /// materializes (s54 phase profile). `root` is immutable per instance, so
+    /// the projection is built at most once and shared as an Arc. The cached
+    /// Vec is never mutated; callers borrow through the Arc (`as_slice()` /
+    /// `.iter()`) and clone explicitly only where they need owned rows.
+    pub fn all_rows(&self) -> std::sync::Arc<Vec<BrowserRow>> {
+        if let Some(cached) = self.all_rows_projection.get() {
+            return std::sync::Arc::clone(cached);
+        }
+        self.all_rows_projection
+            .get_or_init(|| {
+                self.projection_inits
+                    .set(self.projection_inits.get() + 1);
+                std::sync::Arc::new(Self::build_all_rows_projection(&self.root))
+            })
+            .clone()
+    }
+
+    /// The pure function of `root` behind [`Self::all_rows`]. Kept separate so
+    /// the cache wrapper stays auditable at a glance.
+    fn build_all_rows_projection(root: &SessionNode) -> Vec<BrowserRow> {
+        let short_ids = unique_session_short_ids(root);
         let mut expanded_paths = HashSet::new();
-        collect_group_paths(&self.root, &mut expanded_paths);
+        collect_group_paths(root, &mut expanded_paths);
         let mut rows = Vec::new();
-        flatten_rows(
-            &self.root,
-            0,
-            "",
-            &expanded_paths,
-            &short_ids,
-            &mut rows,
-            true,
-        );
+        flatten_rows(root, 0, "", &expanded_paths, &short_ids, &mut rows, true);
         rows
+    }
+
+    /// How many times this instance initialized the all-rows projection.
+    /// The falsifier's exact-one bar: any demanded instance reports at most
+    /// one, and only when some caller actually asked.
+    pub fn projection_init_count(&self) -> usize {
+        self.projection_inits.get()
     }
 
     pub fn root(&self) -> &SessionNode {

@@ -22768,6 +22768,7 @@ impl ShellState {
         // to render orphaned at child depth while their parent group was
         // collapsed (live bug reported 2026-05-26).
         let stored_projection_rows = self.browser.all_rows();
+        let stored_projection_rows = stored_projection_rows.as_slice();
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
                 || active.session_path.starts_with("remote-session://")
@@ -27040,6 +27041,7 @@ impl ShellState {
         let expanded_paths = self.browser.expanded_path_set();
         let stored_rows = self.browser.search_rows();
         let stored_projection_rows = self.browser.all_rows();
+        let stored_projection_rows = stored_projection_rows.as_slice();
         let live_sessions = self.server.live_sessions();
         let search_expanded = search_expanded_paths(
             &stored_rows,
@@ -48576,6 +48578,7 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
     }
     let stored_rows = shell.browser.search_rows();
     let stored_projection_rows = shell.browser.all_rows();
+    let stored_projection_rows = stored_projection_rows.as_slice();
     let expanded_paths = search_expanded_paths(
         &stored_rows,
         shell.server.remote_machines(),
@@ -66622,6 +66625,7 @@ fn describe_app_state_snapshot(
                 "row_count": browser_metrics.row_count,
                 "rebuild_count": browser_metrics.rebuild_count,
                 "last_rebuild_ms": browser_metrics.last_rebuild_ms,
+                "projection_init_count": shell.browser.projection_init_count(),
                 "root_render_count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
             },
         },
@@ -67380,6 +67384,7 @@ fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
     // verb means showing the rows a FOLD hides, not unfolding the whole tree.
     let stored_rows = shell.browser.search_rows();
     let stored_projection_rows = shell.browser.all_rows();
+    let stored_projection_rows = stored_projection_rows.as_slice();
     let mut rows = merged_sidebar_rows_traced(
         &shell.bootstrap.settings_path,
         "app_control_rows",
