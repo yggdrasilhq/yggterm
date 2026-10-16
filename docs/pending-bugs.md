@@ -2013,6 +2013,30 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   future rig/probe trial ticks on recurrence, with phase attribution
   built in. Status: MONITOR (not closed — one clean stochastic flip is
   not a mechanism claim).
+- **F11 — ROOT-COMPONENT STARTUP HOOK PANIC, SWALLOWED BY THE RENDER
+  ERROR HANDLER** (filed 2026-10-17 ~03:1x, sitting 56's paint-matrix
+  arc): "Panic while rendering component `Root`" — a dioxus
+  Scope::push_hook_value panic inside use_callback in
+  yggterm_shell::shell::app — fires INTERMITTENTLY at GUI startup
+  (1-2 per launch on recent builds: present in /tmp/s56-tick3,
+  /tmp/s56-underload, and both small-world runs; absent in /tmp/s56-memo,
+  /tmp/s56-candidate — so it arrived with something landed between the
+  enrich memo and the F10 sampler, or is timing-dependent). The render
+  error handler swallows it (`Encountered panic: Any { .. }` — the
+  payload type erases the message) and the VirtualDom keeps running, so
+  the GUI recovers — but a hook-order panic can leave that scope's hook
+  sequence SHIFTED for its lifetime, meaning some hook after the panic
+  point may read ANOTHER hook's state until restart. ATTACK: (1) surface
+  the panic payload (the Any is no use — downcast-ref to &str/String at
+  the handler and log it); (2) bisect which landed change introduced it
+  (between enrich-memo era 875ce073 and F10-sampler ca8bb398);
+  (3) audit the app component's hook order for a conditional hook.
+  Found BY the mergekey rig's small-world mode (S56_SMALL_WORLD=1,
+  HOME-redirected) — which also found the redirected-HOME app-control
+  spawn latency (>15s server-side request timeout; the small-world
+  spawn legs need either a raise-able timeout flag on
+  `server app terminal new` or a product answer for CLI launches under
+  a non-real HOME).
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
