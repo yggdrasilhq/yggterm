@@ -66,6 +66,17 @@ PUBLISH = HOME / ".claude" / "context-gauge"
 # transcript. Same publish/verdict plane; a different reader below.
 ZCODE_ROLLOUT = HOME / ".zcode" / "cli" / "rollout"
 
+# AutoClaw (z.ai desktop, pi-runtime; taught 2026-10-16): each agent run lands
+# under `<AutoClaw config>/accounts/<acct>/runtime/traces/<run-id>/` as
+# `transcript-<session>.jsonl`. The truth is already computed BY the harness:
+# every `assistant` entry carries `payload.data.usage.contextTokens` (exact
+# context used) and `usage.windowTokens` (the model's real window) plus
+# `payload.data.model.model` (e.g. "zai_glm-5.3-flash"). We read those
+# directly — no window table needed, no "ASSUMED" risk. Session ids are the
+# transcript's own uuid; the session marker `<!-- autoclaw-session:<id> -->`
+# is not needed because AutoClaw names the file after the session.
+AUTOCLAW_CONFIGS = tuple(sorted((HOME / ".config").glob("AutoClaw*")))
+
 NOTICE = int(os.environ.get("CTX_NOTICE", "55"))
 LAND = int(os.environ.get("CTX_LAND", "70"))
 CRITICAL = int(os.environ.get("CTX_CRITICAL", "85"))
@@ -204,6 +215,55 @@ def read_usage_zcode(path):
             model = str(m) or model
     return used, observed_max, dead, model
 
+def read_usage_autoclaw(path):
+    """(used, observed_max, dead, model, window) from an AutoClaw transcript.
+
+    Row shape (measured 2026-10-16): `entryType == "assistant"`,
+    `payload.data.usage` = {contextTokens, windowTokens, input, cacheRead,
+    cacheWrite, ...} — the harness has ALREADY computed the context total
+    (contextTokens) and the real model window (windowTokens). Using them
+    directly removes the two classic gauge failure modes: window-table
+    guessing and the inclusive/exclusive cache convention trap.
+    `compactAtTokens` in the row also explains drops: AutoClaw auto-compacts.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > TAIL_BYTES:
+                fh.seek(size - TAIL_BYTES)
+                fh.readline()
+            blob = fh.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return 0, 0, False, "", 0
+
+    used = 0
+    observed_max = 0
+    dead = False
+    model = ""
+    window = 0
+    for line in blob.splitlines():
+        if '"assistant"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("entryType") != "assistant":
+            continue
+        data = (row.get("payload") or {}).get("data") or {}
+        u = data.get("usage") or {}
+        total = u.get("contextTokens", 0)
+        if total <= 0:
+            continue
+        dead = dead or data.get("finishReason") == "length"
+        used = total
+        observed_max = max(observed_max, total)
+        m = data.get("model") or {}
+        model = (m.get("model") if isinstance(m, dict) else str(m)) or model
+        window = u.get("windowTokens", 0) or window
+    return used, observed_max, dead, model, window
+
+
 def read_usage(path):
     """(used, observed_max, dead) from the tail of a transcript.
 
@@ -267,7 +327,15 @@ def transcript_for(session_id):
     # 2026-09-04). Session ids are `sess_<uuid>`; the rollout file is the only
     # per-session transcript zcode keeps.
     zcode = ZCODE_ROLLOUT / f"model-io-{session_id}.jsonl"
-    return str(zcode) if zcode.exists() else None
+    if zcode.exists():
+        return str(zcode)
+    # AutoClaw: `/<config>/accounts/<acct>/runtime/traces/<run>/transcript-<session>.jsonl`
+    # A session may resume across runs, so the newest matching file wins.
+    for cfg in AUTOCLAW_CONFIGS:
+        hits = list(cfg.glob(f"accounts/*/runtime/traces/*/transcript-{session_id}.jsonl"))
+        if hits:
+            return str(max(hits, key=lambda f: f.stat().st_mtime))
+    return None
     hits = list(PROJECTS.glob(f"*/{session_id}.jsonl"))
     return str(hits[0]) if hits else None
 
@@ -580,6 +648,15 @@ def main():
             window_override = int(argv[argv.index("--window") + 1])
         except (IndexError, ValueError):
             pass
+    if cli == "autoclaw":
+        session_id = None
+        if "--session" in argv:
+            try:
+                session_id = argv[argv.index("--session") + 1]
+            except IndexError:
+                pass
+        session_id = session_id or os.environ.get("AUTOCLAW_SESSION_ID") or "unknown"
+        return run_autoclaw(session_id, report, used_override, window_override)
     if cli == "opencode":
         session_id = None
         if "--session" in argv:
@@ -666,6 +743,56 @@ def main():
         print(f"CONTEXT GAUGE — {pct}% of the {win_label} window used "
               f"({used:,} tokens) — model {model or '?'}, window "
               f"{'ASSUMED' if assumed else 'known'}. OK; relay at {LAND}%.")
+    return 0
+
+
+# ── AutoClaw support (2026-10-16) ─────────────────────────────────────────
+def run_autoclaw(session_id: str, report: bool, used_override=None, window_override=None):
+    """AutoClaw gauge: read the run's transcript, publish, report.
+
+    The window comes from the harness itself (usage.windowTokens) — never
+    assumed; fallback to window_override or 1M with assumed=True only when a
+    transcript has no window yet (fresh session, zero assistant rows)."""
+    path = transcript_for(session_id)
+    if not path:
+        if report:
+            print(f"CONTEXT GAUGE — no AutoClaw transcript found for session {session_id}. "
+                  "A missing gauge is NO INFORMATION, never 'healthy'. "
+                  "Pass --session <the transcript uuid> (traces/*/transcript-<id>.jsonl).")
+        return 0
+    used, observed_max, dead, model, window = read_usage_autoclaw(path)
+    if used_override:
+        used, dead = used_override, False
+    assumed = False
+    if window_override:
+        window, assumed = window_override, True
+    if not window:
+        window, assumed = 1_000_000, True
+    if used <= 0:
+        if report:
+            print(f"CONTEXT GAUGE — no token data yet for AutoClaw session {session_id} "
+                  f"({path}). NO INFORMATION, never 'healthy'.")
+        return 0
+    pct = round(100.0 * used / window)
+    v = verdict(pct)
+    win_label = (f"{window // 1_000_000}M"
+                 if window >= 1_000_000 and window % 1_000_000 == 0
+                 else f"{window // 1000}k")
+    publish(session_id, {
+        "session": session_id, "cli": "autoclaw", "pct": pct, "used": used,
+        "window": window, "window_assumed": assumed, "model": model,
+        "verdict": v, "dead": dead, "cwd": os.getcwd(),
+    })
+    if v != "OK":
+        msg = MESSAGES[v].format(pct=pct, win=win_label, used=used)
+        if assumed:
+            msg = ("⚠ WINDOW ASSUMED — the transcript carried no windowTokens; "
+                   "verify with the harness's own indicator.\n") + msg
+        print(msg + RITUAL)
+    elif report:
+        print(f"CONTEXT GAUGE — {pct}% of the {win_label} window used "
+              f"({used:,} tokens) — AutoClaw session {session_id}, model {model or '?'}, "
+              f"window {'ASSUMED' if assumed else 'harness-reported'}. {v}; relay at {LAND}%.")
     return 0
 
 
