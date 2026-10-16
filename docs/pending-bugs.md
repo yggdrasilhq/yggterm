@@ -34342,3 +34342,28 @@ remains OPEN is the standing observation only: hit rate across a day of
 real ticks (the resize must hold under the fleet's multi-path churn) and
 the first honest verdict readout on a live tick (the fixed watcher serves
 it on the next build). Status stays OPEN for that observation.
+
+
+## ⛔ [11.241] CONCURRENT SUBSCRIBES CAN DOUBLE-SPAWN THE CI WATCHER — THE ALIVE CHECK AND THE SPAWN WERE NOT ONE CRITICAL SECTION (the 2026-10-05 rogue-watcher incident was born exactly this way: pid 343080 born at a gate-overrun failure, pid 393738 spawned by a subscribe that read the staled heartbeat as "no watcher"; the /proc belt only saves the NEXT adopter, it cannot unspawn a twin)
+
+**Status:** FIXED IN CODE — LIVE PROOF OWED
+
+Filed 2026-10-17 ~00:4x IST by the zcode seat (sitting 57; F5 member — the
+same plane as the twin-watcher [11.227] incident). MECHANISM:
+ensure_watcher ran watcher_alive() + any_watcher_process_live() and then
+spawned, all unlocked — two concurrent subscribes (or a subscribe racing a
+dying watcher) both observed "no watcher" and both spawned a watch loop;
+both then tick, integrate, and deploy (the 2026-10-05 incident's orphaned
+merges + a deploy of dangling bits came from exactly this twin). THE FIX:
+check-and-spawn is ONE flock-held critical section on
+CI_STATE/spawn.lock — the lock holder spawns (and waits for the pidfile
+inside the lock), a loser re-checks inside the lock and adopts whatever
+now exists. The [11.227] adoption belt is unchanged and now races-free.
+Locked by tests/test_yggci_spawn_guard.py: 8 concurrent callers spawn
+EXACTLY ONE watcher; the rogue-adoption path and the alive short-circuit
+hold under the same lock. LIVE PROOF OWED: the race needs a no-watcher
+window to fire, and the dev plane now runs under systemd (ygg-ci-watch,
+sitting 57) — manufacturing the window means stopping the unit for a
+synthetic race; the honest live proof is the next organic concurrent-
+subscribe window (or a planned drill on a non-CI host), not a staged
+outage of the production train.
