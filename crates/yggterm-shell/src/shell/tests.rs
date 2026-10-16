@@ -26083,6 +26083,8 @@ console.log('ok');
         merged_sidebar_rows_with_projection_rows(
             &[],
             &[],
+            None,
+            None,
             &[],
             &[],
             &live_sessions,
@@ -28297,6 +28299,8 @@ console.log('ok');
         let ka = sidebar_merge_cache_key_parts(
             &[],
             &[],
+            None,
+            None,
             &[],
             &[],
             &[],
@@ -28307,6 +28311,8 @@ console.log('ok');
         let kb = sidebar_merge_cache_key_parts(
             &[],
             &[],
+            None,
+            None,
             &[],
             &[],
             &[],
@@ -28327,6 +28333,8 @@ console.log('ok');
         let kc = sidebar_merge_cache_key_parts(
             &[],
             &[],
+            None,
+            None,
             &[],
             &[],
             &[],
@@ -28349,6 +28357,8 @@ console.log('ok');
         let k12 = sidebar_merge_cache_key_parts(
             &[r1.clone(), r2.clone()],
             &[],
+            None,
+            None,
             &[],
             &[],
             &[],
@@ -28359,6 +28369,8 @@ console.log('ok');
         let k21 = sidebar_merge_cache_key_parts(
             &[r2, r1],
             &[],
+            None,
+            None,
             &[],
             &[],
             &[],
@@ -32651,6 +32663,8 @@ console.log('ok');
         let rows = merged_sidebar_rows_with_projection_rows(
             &visible_stored_rows,
             &projection_rows,
+            None,
+            None,
             &[RemoteMachineSnapshot {
                 cli_presence: Vec::new(),
                 apps: Vec::new(),
@@ -32725,6 +32739,8 @@ console.log('ok');
         let rows = merged_sidebar_rows_with_projection_rows(
             &[],
             &projection_rows,
+            None,
+            None,
             &[RemoteMachineSnapshot {
                 cli_presence: Vec::new(),
                 apps: Vec::new(),
@@ -69445,6 +69461,89 @@ mod menu_dismissal_locks {
             .cloned()
             .expect("the fixture tree has one session row");
         (shell, row)
+    }
+
+    #[test]
+    fn the_merge_fingerprints_equal_a_fresh_slice_hash() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+            "/home/user/.codex/sessions/beta.jsonl",
+        ]));
+        // The cached fingerprint and a fresh hash over the same rows MUST
+        // agree at every point, or the composite merge key changes meaning
+        // mid-flight (the fallback would re-hash, the cache would miss).
+        assert_eq!(
+            shell.browser.all_rows_merge_fingerprint(),
+            yggterm_core::projection_rows_merge_fingerprint(
+                shell.browser.all_rows().as_slice()
+            ),
+            "the projection fingerprint must equal a fresh slice-hash"
+        );
+        assert_eq!(
+            shell.browser.rows_merge_fingerprint(),
+            yggterm_core::stored_rows_merge_fingerprint(shell.browser.rows()),
+            "the rows fingerprint must equal a fresh slice-hash"
+        );
+        // Rebuilds re-derive the rows fingerprint; the projection is filter-
+        // independent, so its fingerprint is stable across them.
+        let projection_before = shell.browser.all_rows_merge_fingerprint();
+        shell.browser.set_filter_query("alpha");
+        assert_eq!(
+            shell.browser.rows_merge_fingerprint(),
+            yggterm_core::stored_rows_merge_fingerprint(shell.browser.rows()),
+            "the rows fingerprint must track a rebuild"
+        );
+        assert_eq!(
+            shell.browser.all_rows_merge_fingerprint(),
+            projection_before,
+            "the projection fingerprint must not move with the filter"
+        );
+        shell.browser.set_filter_query("");
+        assert_eq!(
+            shell.browser.rows_merge_fingerprint(),
+            yggterm_core::stored_rows_merge_fingerprint(shell.browser.rows()),
+        );
+    }
+
+    #[test]
+    fn the_merge_fingerprints_are_content_identity_not_pointer_identity() {
+        let bootstrap_a = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell_a = ShellState::new(bootstrap_a);
+        shell_a.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+            "/home/user/.codex/sessions/beta.jsonl",
+        ]));
+        let bootstrap_b = super::tests::test_shell_bootstrap_with_active_session("local://b");
+        let mut shell_b = ShellState::new(bootstrap_b);
+        shell_b.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+            "/home/user/.codex/sessions/beta.jsonl",
+        ]));
+        // sol Q5's law: NEVER a bare pointer as durable identity. Two equal
+        // trees in two instances carry EQUAL fingerprints; a different tree
+        // differs.
+        assert_eq!(
+            shell_a.browser.all_rows_merge_fingerprint(),
+            shell_b.browser.all_rows_merge_fingerprint(),
+            "equal trees must carry equal fingerprints"
+        );
+        assert_eq!(
+            shell_a.browser.rows_merge_fingerprint(),
+            shell_b.browser.rows_merge_fingerprint(),
+            "equal row sets must carry equal fingerprints"
+        );
+        let bootstrap_c = super::tests::test_shell_bootstrap_with_active_session("local://c");
+        let mut shell_c = ShellState::new(bootstrap_c);
+        shell_c.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/gamma.jsonl",
+        ]));
+        assert_ne!(
+            shell_a.browser.all_rows_merge_fingerprint(),
+            shell_c.browser.all_rows_merge_fingerprint(),
+            "a different tree must carry a different fingerprint"
+        );
     }
 
     #[test]

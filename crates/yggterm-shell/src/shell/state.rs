@@ -22937,6 +22937,17 @@ impl ShellState {
             },
             &stored_rows,
             &stored_projection_rows,
+            // [s56-merge-key] The plain snapshot's stored rows are the
+            // browser's own (fingerprint cached at rebuild); a search window
+            // builds a fresh Vec per call and stays fully re-hashed (sol Q4:
+            // search-active reported separately). The projection fingerprint
+            // is exact in both arms.
+            if search_active {
+                None
+            } else {
+                Some(self.browser.rows_merge_fingerprint())
+            },
+            Some(self.browser.all_rows_merge_fingerprint()),
             self.server.remote_machines(),
             self.server.ssh_targets(),
             &sidebar_hot_sessions,
@@ -27055,6 +27066,11 @@ impl ShellState {
             "current_search_sidebar_matches",
             &stored_rows,
             &stored_projection_rows,
+            // [s56-merge-key] A fresh search_rows() Vec per call: the stored
+            // input stays on the slice-hash fallback; the projection
+            // fingerprint is exact here.
+            None,
+            Some(self.browser.all_rows_merge_fingerprint()),
             self.server.remote_machines(),
             self.server.ssh_targets(),
             &live_sessions,
@@ -36555,6 +36571,8 @@ impl ShellState {
         let crawl_key = sidebar_merge_cache_key_parts(
             &stored_rows,
             &[],
+            None,
+            None,
             &remote_machines,
             &ssh_targets,
             &live_sessions,
@@ -48591,6 +48609,9 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         "resolve_app_control_row",
         &stored_rows,
         &stored_projection_rows,
+        // [s56-merge-key] Fresh search_rows() per call; projection exact.
+        None,
+        Some(shell.browser.all_rows_merge_fingerprint()),
         shell.server.remote_machines(),
         shell.server.ssh_targets(),
         &shell.server.live_sessions(),
@@ -54330,48 +54351,19 @@ fn hash_merge_input_stored_rows(
     hasher: &mut std::collections::hash_map::DefaultHasher,
     stored_rows: &[BrowserRow],
 ) {
-    for row in stored_rows {
-        match row.kind {
-            BrowserRowKind::Group => 1_u8,
-            BrowserRowKind::Separator => 2_u8,
-            BrowserRowKind::Session => 3_u8,
-            BrowserRowKind::Document => 4_u8,
-        }
-        .hash(hasher);
-        row.full_path.hash(hasher);
-        row.label.hash(hasher);
-        row.detail_label.hash(hasher);
-        row.document_kind.hash(hasher);
-        row.group_kind.hash(hasher);
-        row.session_title.hash(hasher);
-        row.depth.hash(hasher);
-        row.host_label.hash(hasher);
-        row.descendant_sessions.hash(hasher);
-        row.expanded.hash(hasher);
-        row.session_id.hash(hasher);
-        row.session_cwd.hash(hasher);
-        0xfe_u8.hash(hasher);
-    }
+    // [s56-merge-key] ONE definition lives in core (the per-instance
+    // fingerprints hash with it too), so the fallback and the cached value
+    // cannot drift apart.
+    yggterm_core::write_stored_rows_merge_hash(hasher, stored_rows);
 }
 
 fn hash_merge_input_projection_rows(
     hasher: &mut std::collections::hash_map::DefaultHasher,
     stored_projection_rows: &[BrowserRow],
 ) {
-    for row in stored_projection_rows {
-        match row.kind {
-            BrowserRowKind::Group => 1_u8,
-            BrowserRowKind::Separator => 2_u8,
-            BrowserRowKind::Session => 3_u8,
-            BrowserRowKind::Document => 4_u8,
-        }
-        .hash(hasher);
-        row.full_path.hash(hasher);
-        row.label.hash(hasher);
-        row.group_kind.hash(hasher);
-        row.session_cwd.hash(hasher);
-        0xef_u8.hash(hasher);
-    }
+    // [s56-merge-key] ONE definition lives in core (see the stored-rows
+    // delegate above).
+    yggterm_core::write_projection_rows_merge_hash(hasher, stored_projection_rows);
 }
 
 fn hash_merge_input_remote_machines(
@@ -54518,28 +54510,6 @@ fn hash_merge_input_row_arrangement(
     }
 }
 
-fn sidebar_merge_cache_key(
-    stored_rows: &[BrowserRow],
-    stored_projection_rows: &[BrowserRow],
-    remote_machines: &[RemoteMachineSnapshot],
-    ssh_targets: &[SshConnectTarget],
-    live_sessions: &[ManagedSessionView],
-    expanded_paths: &HashSet<String>,
-    collapsed_row_set_heads: &HashSet<String>,
-    row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
-) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_merge_input_stored_rows(&mut hasher, stored_rows);
-    0xf0_u8.hash(&mut hasher);
-    hash_merge_input_projection_rows(&mut hasher, stored_projection_rows);
-    hash_merge_input_remote_machines(&mut hasher, remote_machines);
-    hash_merge_input_ssh_targets(&mut hasher, ssh_targets);
-    hash_merge_input_live_sessions(&mut hasher, live_sessions);
-    hash_merge_input_expanded_paths(&mut hasher, expanded_paths);
-    hash_merge_input_collapsed_heads(&mut hasher, collapsed_row_set_heads);
-    hash_merge_input_row_arrangement(&mut hasher, row_arrangement);
-    hasher.finish()
-}
 
 /// The merge cache key split per input. `key` is the cache's lookup key; the
 /// `input_keys` ride the breakdown payload as the WHICH-INPUT-MOVED
@@ -54553,6 +54523,14 @@ struct SidebarMergeKeyParts {
 fn sidebar_merge_cache_key_parts(
     stored_rows: &[BrowserRow],
     stored_projection_rows: &[BrowserRow],
+    // [s56-merge-key] A caller holding the browser's cached fingerprints
+    // passes them; each MUST be the same per-input hash the fallback computes
+    // (one shared definition in core), so the composite key and the
+    // which-input-moved breakdown stay bit-identical to the pre-fingerprint
+    // values. None falls back to hashing the slice right here. They sit
+    // directly after the slices they fingerprint, everywhere.
+    stored_rows_fingerprint: Option<u64>,
+    projection_rows_fingerprint: Option<u64>,
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
@@ -54561,12 +54539,16 @@ fn sidebar_merge_cache_key_parts(
     row_arrangement: &yggterm_core::row_set_outline::RowArrangement,
 ) -> SidebarMergeKeyParts {
     let mut input_keys = [0_u64; SIDEBAR_MERGE_INPUT_COUNT];
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_merge_input_stored_rows(&mut hasher, stored_rows);
-    input_keys[0] = hasher.finish();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_merge_input_projection_rows(&mut hasher, stored_projection_rows);
-    input_keys[1] = hasher.finish();
+    input_keys[0] = stored_rows_fingerprint.unwrap_or_else(|| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_merge_input_stored_rows(&mut hasher, stored_rows);
+        hasher.finish()
+    });
+    input_keys[1] = projection_rows_fingerprint.unwrap_or_else(|| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_merge_input_projection_rows(&mut hasher, stored_projection_rows);
+        hasher.finish()
+    });
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hash_merge_input_remote_machines(&mut hasher, remote_machines);
     input_keys[2] = hasher.finish();
@@ -59132,6 +59114,11 @@ fn merged_sidebar_rows(
     merged_sidebar_rows_with_projection_rows(
         stored_rows,
         stored_rows,
+        // [s56-merge-key] The plain variant aliases stored_rows into the
+        // projection slot (telemetry/drag paths): no cached fingerprint to
+        // offer, the fallback hashes the slices.
+        None,
+        None,
         remote_machines,
         ssh_targets,
         live_sessions,
@@ -59144,6 +59131,8 @@ fn merged_sidebar_rows(
 fn merged_sidebar_rows_with_projection_rows(
     stored_rows: &[BrowserRow],
     stored_projection_rows: &[BrowserRow],
+    stored_rows_fingerprint: Option<u64>,
+    projection_rows_fingerprint: Option<u64>,
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
@@ -59161,6 +59150,8 @@ fn merged_sidebar_rows_with_projection_rows(
     let parts = sidebar_merge_cache_key_parts(
         stored_rows,
         stored_projection_rows,
+        stored_rows_fingerprint,
+        projection_rows_fingerprint,
         remote_machines,
         ssh_targets,
         live_sessions,
@@ -59345,6 +59336,8 @@ fn merged_sidebar_rows_traced(
     source: &str,
     stored_rows: &[BrowserRow],
     stored_projection_rows: &[BrowserRow],
+    stored_rows_fingerprint: Option<u64>,
+    projection_rows_fingerprint: Option<u64>,
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
@@ -59365,6 +59358,8 @@ fn merged_sidebar_rows_traced(
         return merged_sidebar_rows_with_projection_rows(
             stored_rows,
             stored_projection_rows,
+            stored_rows_fingerprint,
+            projection_rows_fingerprint,
             remote_machines,
             ssh_targets,
             live_sessions,
@@ -59379,6 +59374,8 @@ fn merged_sidebar_rows_traced(
     let rows = merged_sidebar_rows_with_projection_rows(
         stored_rows,
         stored_projection_rows,
+        stored_rows_fingerprint,
+        projection_rows_fingerprint,
         remote_machines,
         ssh_targets,
         live_sessions,
@@ -67390,6 +67387,9 @@ fn app_control_rows_with_every_set_open(shell: &ShellState) -> Vec<BrowserRow> {
         "app_control_rows",
         &stored_rows,
         &stored_projection_rows,
+        // [s56-merge-key] Fresh search_rows() per call; projection exact.
+        None,
+        Some(shell.browser.all_rows_merge_fingerprint()),
         shell.server.remote_machines(),
         shell.server.ssh_targets(),
         &shell.server.live_sessions(),

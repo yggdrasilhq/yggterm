@@ -1,6 +1,7 @@
 use crate::{SessionKind, SessionNode, SessionNodeKind, WorkspaceDocumentKind, WorkspaceGroupKind};
 use dirs::home_dir;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::Instant;
 
@@ -109,6 +110,13 @@ pub struct SessionBrowserState {
     // of the browser carries its own counter, matching its own fresh cache).
     all_rows_projection: std::sync::OnceLock<std::sync::Arc<Vec<BrowserRow>>>,
     projection_inits: std::cell::Cell<usize>,
+    // [s56-merge-key] Cached merge-key fingerprints for the two row-walk
+    // inputs. Both are CONTENT identity (the same field-by-field hash the
+    // key fn computes over a fresh hasher), never a pointer identity: equal
+    // trees carry equal fingerprints. The projection's is set inside the
+    // projection's own cold window; the rows' is recomputed by rebuild_rows.
+    all_rows_merge_fp: std::sync::OnceLock<u64>,
+    rows_merge_fp: std::cell::Cell<Option<u64>>,
     selected_path: Option<String>,
     metrics: BrowserMetrics,
 }
@@ -131,6 +139,8 @@ impl SessionBrowserState {
             rows: Vec::new(),
             all_rows_projection: std::sync::OnceLock::new(),
             projection_inits: std::cell::Cell::new(0),
+            all_rows_merge_fp: std::sync::OnceLock::new(),
+            rows_merge_fp: std::cell::Cell::new(None),
             selected_path: None,
             metrics: BrowserMetrics::default(),
         };
@@ -179,9 +189,44 @@ impl SessionBrowserState {
             .get_or_init(|| {
                 self.projection_inits
                     .set(self.projection_inits.get() + 1);
-                std::sync::Arc::new(Self::build_all_rows_projection(&self.root))
+                // [s56-merge-key] The fingerprint rides the same cold window
+                // that builds the projection: one instance, one walk, one
+                // hash — the per-window key computation borrows it instead of
+                // re-walking the whole tree every frame.
+                let rows = Self::build_all_rows_projection(&self.root);
+                self.all_rows_merge_fp
+                    .set(projection_rows_merge_fingerprint(&rows));
+                std::sync::Arc::new(rows)
             })
             .clone()
+    }
+
+    /// [s56-merge-key] The projection input's merge-key sub-hash. Computed
+    /// inside the projection's own cold window (see [`Self::all_rows`]); the
+    /// fallback only serves a caller that arrived before the build. It MUST
+    /// equal what [`projection_rows_merge_fingerprint`] computes over
+    /// [`Self::all_rows`] at any instant — one definition in this module
+    /// guarantees it.
+    pub fn all_rows_merge_fingerprint(&self) -> u64 {
+        if let Some(&fp) = self.all_rows_merge_fp.get() {
+            return fp;
+        }
+        let fp = projection_rows_merge_fingerprint(&self.all_rows());
+        self.all_rows_merge_fp.set(fp);
+        fp
+    }
+
+    /// [s56-merge-key] The visible-rows input's merge-key sub-hash. `rows` is
+    /// written only by [`Self::rebuild_rows`], which recomputes the
+    /// fingerprint there — so this value is always exactly the hash of
+    /// [`Self::rows`].
+    pub fn rows_merge_fingerprint(&self) -> u64 {
+        if let Some(fp) = self.rows_merge_fp.get() {
+            return fp;
+        }
+        let fp = stored_rows_merge_fingerprint(&self.rows);
+        self.rows_merge_fp.set(Some(fp));
+        fp
     }
 
     /// The pure function of `root` behind [`Self::all_rows`]. Kept separate so
@@ -424,6 +469,10 @@ impl SessionBrowserState {
         self.metrics.row_count = self.rows.len();
         self.metrics.rebuild_count += 1;
         self.metrics.last_rebuild_ms = started_at.elapsed().as_secs_f32() * 1000.0;
+        // [s56-merge-key] rows() is written only here, so the fingerprint is
+        // recomputed with the rows and never drifts from hash(rows()).
+        self.rows_merge_fp
+            .set(Some(stored_rows_merge_fingerprint(&self.rows)));
     }
 
     fn select_session_relative(&mut self, delta: isize) -> Option<usize> {
@@ -517,6 +566,77 @@ fn first_session_path(node: &SessionNode) -> Option<String> {
     }
 
     None
+}
+
+/// [s56-merge-key] The stored-rows input of the sidebar merge key, defined
+/// here ONCE so the shell's key fallback and the per-instance fingerprints
+/// can never drift apart. A cached fingerprint is only sound while it equals
+/// the slice-hash the fallback computes. The field order is the shell key's
+/// historical order — keep the two in lockstep by construction, not by luck.
+pub fn write_stored_rows_merge_hash(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    rows: &[BrowserRow],
+) {
+    for row in rows {
+        match row.kind {
+            BrowserRowKind::Group => 1_u8,
+            BrowserRowKind::Separator => 2_u8,
+            BrowserRowKind::Session => 3_u8,
+            BrowserRowKind::Document => 4_u8,
+        }
+        .hash(hasher);
+        row.full_path.hash(hasher);
+        row.label.hash(hasher);
+        row.detail_label.hash(hasher);
+        row.document_kind.hash(hasher);
+        row.group_kind.hash(hasher);
+        row.session_title.hash(hasher);
+        row.depth.hash(hasher);
+        row.host_label.hash(hasher);
+        row.descendant_sessions.hash(hasher);
+        row.expanded.hash(hasher);
+        row.session_id.hash(hasher);
+        row.session_cwd.hash(hasher);
+        0xfe_u8.hash(hasher);
+    }
+}
+
+/// [s56-merge-key] The projection-rows input of the sidebar merge key — the
+/// same one-definition law as [`write_stored_rows_merge_hash`].
+pub fn write_projection_rows_merge_hash(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    rows: &[BrowserRow],
+) {
+    for row in rows {
+        match row.kind {
+            BrowserRowKind::Group => 1_u8,
+            BrowserRowKind::Separator => 2_u8,
+            BrowserRowKind::Session => 3_u8,
+            BrowserRowKind::Document => 4_u8,
+        }
+        .hash(hasher);
+        row.full_path.hash(hasher);
+        row.label.hash(hasher);
+        row.group_kind.hash(hasher);
+        row.session_cwd.hash(hasher);
+        0xef_u8.hash(hasher);
+    }
+}
+
+/// The stored-rows fingerprint over a fresh hasher: the value the merge key's
+/// per-input slot carries.
+pub fn stored_rows_merge_fingerprint(rows: &[BrowserRow]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    write_stored_rows_merge_hash(&mut hasher, rows);
+    hasher.finish()
+}
+
+/// The projection-rows fingerprint over a fresh hasher: the value the merge
+/// key's per-input slot carries.
+pub fn projection_rows_merge_fingerprint(rows: &[BrowserRow]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    write_projection_rows_merge_hash(&mut hasher, rows);
+    hasher.finish()
 }
 
 fn collect_group_paths(node: &SessionNode, expanded_paths: &mut HashSet<String>) {

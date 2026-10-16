@@ -120,7 +120,11 @@ pub use app_registry::{
 };
 pub use browser::{
     BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState,
-    unique_session_short_ids_for_pairs,
+    // [s56-merge-key] The merge-key hash + fingerprint pair: ONE definition
+    // for the shell's key fallback and the browser's cached fingerprints.
+    projection_rows_merge_fingerprint, stored_rows_merge_fingerprint,
+    unique_session_short_ids_for_pairs, write_projection_rows_merge_hash,
+    write_stored_rows_merge_hash,
 };
 pub use cli_args::{
     cli_flag_value, cli_payload_arg, cli_positional_args, refuse_flag_shaped_payload,
