@@ -3387,6 +3387,56 @@ def collect_dream_deltas(root: Path, ns: str, after_seq: int) -> tuple[list[dict
     return deltas, captured
 
 
+DREAM_RETAINED_CLAIMS_BUDGET_BYTES = 20_000
+DREAM_CLAIM_REFS_MAX = 24
+DREAM_CLAIM_CONFIRMATIONS_MAX = 5
+
+
+def select_retained_claims(root: Path, ns: str, state: dict) -> tuple[list[str], list[str], int]:
+    """[slice 3] Ranked bounded retrieval over the persistent claim store.
+
+    Order: temporal work first (expired/due — the composer must see what it
+    must re-verify), then the rest served through a ROTATING window persisted
+    in the dream watermark, byte-budgeted. Returns (selected_ids, omitted_ids,
+    rotation_offset_for_next_dream). Nothing is dropped from the STORE — only
+    from this brief; the omitted ids travel with the brief as an index."""
+    claims = state.get("claims", {})
+    if not claims:
+        return [], [], 0
+    today = budget_today()
+
+    def rank(cid: str):
+        entry = claims[cid]
+        status = claim_status(entry, today)
+        return (0 if status in ("due", "expired") else 1, str(entry.get("last_seen", "")), cid)
+
+    ordered = sorted(claims.keys(), key=rank)
+    urgent = [cid for cid in ordered if rank(cid)[0] == 0]
+    tail = [cid for cid in ordered if rank(cid)[0] != 0]
+
+    watermark = load_dream_watermark(root, ns)
+    offset = int(watermark.get("claim_rotation", 0)) % len(tail) if tail else 0
+    rotated = tail[offset:] + tail[:offset]
+
+    selected: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    for cid in urgent + rotated:
+        size = len(json.dumps({cid: claims[cid]}).encode("utf-8"))
+        if used + size > DREAM_RETAINED_CLAIMS_BUDGET_BYTES and selected:
+            omitted.append(cid)
+            continue
+        selected.append(cid)
+        used += size
+    # keep the store order stable for the brief; the rotation advances past
+    # what THIS dream served so the next one starts where it ended
+    served_tail = len([cid for cid in selected if cid in set(tail)])
+    rotation = (offset + served_tail) % len(tail) if tail else 0
+    watermark["claim_rotation"] = rotation
+    save_dream_watermark(root, ns, watermark)
+    return selected, omitted, rotation
+
+
 def prepare_dream(
     root: Path,
     ns: str,
@@ -3446,8 +3496,15 @@ def prepare_dream(
     # [slice 4] RETAINED CLAIMS: the composer receives the persistent claim
     # state (evidence-linked) so it does not relearn the world from the newest
     # batch. Previous NOW prose is context, NOT evidence — claims carry dates.
+    # [slice 3] BOUNDED RETRIEVAL (gap-2 ruling): injecting every retained
+    # claim exhausts context at multi-year scale. Selection is ranked —
+    # due/expired temporal work first, then newest — and the remainder is
+    # served by a ROTATING window (state in the dream watermark) so every
+    # claim is eventually seen; what was omitted goes out as an id index,
+    # and `claims --query` reaches any rare early fact on demand.
     state = load_claim_state(root, ns)
-    retained = state.get("claims", {})
+    selected_claims, omitted_claims, rotation = select_retained_claims(root, ns, state)
+    retained = {cid: state["claims"][cid] for cid in selected_claims}
 
     lines = [
         f"# DREAM BRIEF — {ns} — phase {phase} — prepared {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
@@ -3459,6 +3516,14 @@ def prepare_dream(
         "## RETAINED CLAIMS (persistent, evidence-linked — reuse these; do not re-derive; superseded/expired ones are dead)",
         "",
         json.dumps(retained, indent=1) if retained else "(none yet)",
+        "",
+        (
+            f"(+{len(omitted_claims)} more claim(s) NOT staged this dream — retrieve by id with "
+            f"`ygg-memory claims --ns={ns} --query <text>` or --id: {', '.join(omitted_claims[:24])}"
+            f"{' …' if len(omitted_claims) > 24 else ''})"
+        )
+        if omitted_claims
+        else "",
         "",
         "## CURRENT ROLLUP (previous NOW.md — REPLACE semantics; prune contradicted claims)",
         "",
@@ -3507,6 +3572,9 @@ def prepare_dream(
         # [slice 4] coverage manifest: per-event disposition, recoverable
         "coverage": manifest_entries,
         "retained_claims_count": len(state.get("claims", {})),
+        "retained_selected": selected_claims,
+        "retained_omitted": len(omitted_claims),
+        "claim_rotation": rotation,
     }
     (pending / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return brief_path, manifest
@@ -3815,8 +3883,12 @@ def merge_claims(state: dict, claims: list, as_of: str) -> dict:
 
     Preserves supersession edges and evidence dates: a claim older in evidence
     is NEVER re-stamped by a newer dream just because it was restated.
-    Temporal fields are optional and validated; unknown values are dropped
-    rather than invented."""
+    [slice 3] restatement vs confirmation: the same text recurring with NO
+    new sources is a restatement (counted, never new corroboration — several
+    summaries repeating one source are ONE evidentiary lineage); genuinely
+    NEW source refs are recorded as dated confirmations while the original
+    evidence stays first-class. Temporal fields are optional and validated;
+    unknown values are dropped rather than invented."""
     store = state.setdefault("claims", {})
     for claim in claims:
         if not isinstance(claim, dict):
@@ -3826,13 +3898,15 @@ def merge_claims(state: dict, claims: list, as_of: str) -> dict:
         if not cid or not text:
             continue
         existing = store.get(cid, {})
+        new_refs = [str(r) for r in (claim.get("source_refs") or [])]
+        old_refs = [str(r) for r in (existing.get("source_refs") or [])]
         entry = {
             "text": text,
             "as_of": str(claim.get("as_of") or as_of),
             "proof": str(claim.get("proof") or "claimed"),
             # generation is separate from evidence
             "last_seen": as_of,
-            "source_refs": list(claim.get("source_refs") or existing.get("source_refs") or []),
+            "source_refs": (old_refs + [r for r in new_refs if r not in old_refs])[:DREAM_CLAIM_REFS_MAX],
         }
         for field in ("valid_from", "valid_until", "review_after"):
             value = claim.get(field) or existing.get(field)
@@ -3844,6 +3918,18 @@ def merge_claims(state: dict, claims: list, as_of: str) -> dict:
         # evidence date is sticky: a restatement does not re-date the evidence
         if existing.get("as_of"):
             entry["as_of"] = existing["as_of"]
+        if existing:
+            fresh_refs = [r for r in new_refs if r not in old_refs]
+            if fresh_refs:
+                # genuinely newer evidence confirming the old claim — the
+                # original lineage stays first-class, the confirmation is dated
+                confirmed = list(existing.get("confirmed") or [])
+                confirmed.append({"as_of": as_of, "refs": fresh_refs[:5]})
+                entry["confirmed"] = confirmed[-DREAM_CLAIM_CONFIRMATIONS_MAX:]
+            elif existing.get("text") == text:
+                # a restatement: same claim, no new evidence — counted, never
+                # promoted to corroboration
+                entry["restatements"] = int(existing.get("restatements", 0)) + 1
         store[cid] = entry
         # supersession edge: mark the superseded claim
         if supersedes and supersedes in store:
@@ -4058,20 +4144,42 @@ def dream_quiescence_violation(root: Path, ns: str) -> str:
     return ""
 
 
-def dream_fence_violation(root: Path, ns: str, captured_seq: int) -> str:
-    """Gate 4 (round-3 consult): read-version fencing — the composer thinks
-    for tens of seconds; if the journal moved past the prepare watermark in
-    that window, the dream's factual foundation is stale and the apply is
-    refused (re-prepare). Dream-origin records never fence a dream."""
+def dream_fence_violation(
+    root: Path, ns: str, captured_seq: int, composed_files: list[str] | None = None
+) -> str:
+    """Gate 4 (round-3 consult), made DEPENDENCY-SCOPED in [slice 3] per the
+    gap-1 ruling: the old stop-the-world fence let ANY journal advance
+    refuse a finished synthesis forever under sustained fleet writes. Now a
+    post-prepare event only fences the dream when it touches a door the
+    composed batch actually covered (the same lost-update surface); events
+    on unrelated doors stay PENDING for the next dream, and read-time
+    owner corrections still override everything. With no scope supplied the
+    conservative whole-namespace behavior stands. Dream-origin records
+    never fence a dream."""
     advanced = [
         rec
         for rec in dream_live_activity(root, ns)
         if rec.get("seq", 0) > captured_seq
     ]
-    if advanced:
+    if not advanced:
+        return ""
+    if composed_files is None:
         return (
             f"journal advanced since prepare ({len(advanced)} record(s) after "
             f"seq {captured_seq}) — re-prepare before apply"
+        )
+    scope = {str(f) for f in composed_files}
+    conflicting = [
+        rec
+        for rec in advanced
+        # a record with no file attribution could touch anything — refuse
+        if not rec.get("file") or str(rec.get("file")) in scope
+    ]
+    if conflicting:
+        return (
+            f"journal advanced on composed door(s) since prepare "
+            f"({len(conflicting)} record(s) after seq {captured_seq} touch "
+            f"the composed batch) — re-prepare before apply"
         )
     return ""
 
@@ -4209,17 +4317,30 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
     # [slice 2] FOCUS APPLIES TO RANKING ONLY — never to eligibility. The
     # quiescence/cooldown/pending filters above already ran; a boost cannot
     # resurrect a blocked namespace (focus reorders, it does not grant).
-    focused_candidates = []
+    ranked = []
     for score, delta_count, ns_name, summary in candidates:
         focus = focus_view(root, ns_name)
         if focus["exclusive"] and not focus["matched"]:
             continue  # exclusive mode: all DISCRETIONARY work goes to the scope
-        focused_candidates.append((score * focus["weight"], delta_count, ns_name, summary, focus["weight"]))
-    if not focused_candidates:
+        ranked.append(
+            (score * focus["weight"], delta_count, ns_name, summary, focus["weight"])
+        )
+    if not ranked:
         _dream_receipt(root, "deferred", "all candidates excluded by an exclusive focus")
         return "auto-dream: deferred (exclusive focus excludes every candidate)"
-    focused_candidates.sort(reverse=True)
-    _, _, ns, _, weight = focused_candidates[0]
+    # [slice 3] OVERDUE-SERVICE ROTATION (gap-1 ruling: the fairness formula
+    # had no service guarantee — a one-delta namespace could lose forever to
+    # continuously replenished ones scoring above the age cap). A namespace
+    # whose pending work has blown the progress deadline jumps the whole
+    # queue, oldest pending first; the fairness score decides WITHIN each
+    # class. Pending age derives from the journal, so attempts and blanket
+    # deferrals never reset it — service is eventual, not merely likely.
+    overdue = sorted(
+        (r for r in ranked if r[3]["overdue"]),
+        key=lambda r: -r[3]["oldest_pending_s"],
+    )
+    chosen = overdue[0] if overdue else max(ranked, key=lambda r: r[0])
+    _, _, ns, _, weight = chosen
     # ⛔ `--ns <ns>` breaks when ns starts with a dash (every namespace does):
     # argparse reads the value as another option ("expected one argument").
     # The `=` form is the documented convention — the auto-dreamer died on
@@ -4305,6 +4426,41 @@ def cmd_owner(args):
     entry = owner_correct(root, chosen, target, text, scope=getattr(args, "scope", "_global") or "_global")
     print(f"owner {chosen} recorded: {json.dumps(entry)[:200]}")
     print("(effective on the next memory read — no dream, no quiescence wait)")
+
+
+def cmd_claims(args):
+    """[slice 3] Bounded retrieval over the persistent claim store — the
+    compaction-safety guarantee made reachable: after any amount of brief
+    capping, a rare early fact, an exception, or a correction is one
+    evidence-linked query away."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    ns = detect_namespace(override=getattr(args, "ns", None))
+    if not ns:
+        raise SystemExit("claims: --ns is required")
+    today = budget_today()
+    state = load_claim_state(root, ns)
+    rows = []
+    query = (getattr(args, "query", "") or "").lower()
+    want_status = getattr(args, "status", "all") or "all"
+    for cid, entry in state.get("claims", {}).items():
+        status = claim_status(entry, today)
+        if want_status != "all" and status != want_status:
+            continue
+        if query and query not in str(entry.get("text", "")).lower():
+            continue
+        claim_id = getattr(args, "id", None)
+        if claim_id and cid != claim_id:
+            continue
+        rows.append(
+            {
+                "id": cid,
+                "status": status,
+                **{k: entry.get(k) for k in ("text", "as_of", "proof", "last_seen", "valid_until", "review_after", "superseded_by", "supersedes", "source_refs", "confirmed", "restatements")},
+            }
+        )
+    rows.sort(key=lambda r: str(r.get("last_seen", "")), reverse=True)
+    rows = rows[: max(1, int(getattr(args, "limit", 20)))]
+    print(json.dumps(rows, indent=None if getattr(args, "json", False) else 2))
 
 
 def cmd_budget(args):
@@ -5287,9 +5443,6 @@ def cmd_dream(args):
         if not manifest_path.is_file() or not response_path.is_file():
             raise SystemExit(f"dream: no pending dream in {pending} (run --prepare, compose RESPONSE.md first)")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        fence = dream_fence_violation(root, ns, manifest.get("captured_seq", 0))
-        if fence:
-            raise SystemExit(f"dream: REFUSED — {fence}")
         try:
             parsed = parse_dream_response(response_path.read_text(encoding="utf-8"))
             critic_path = pending / "CRITIC.md"
@@ -5297,6 +5450,14 @@ def cmd_dream(args):
         except ValueError as error:
             print(f"dream: REFUSED — {error}", file=sys.stderr)
             raise SystemExit(2)
+        # [slice 3] the fence scope is the composed batch itself plus the
+        # doors the ops write: an unrelated concurrent write stays pending
+        # for the next dream instead of refusing this one forever.
+        composed_scope = list(manifest.get("delta_files", []))
+        composed_scope += [op.get("file") for op in parsed["ops"] if op.get("file")]
+        fence = dream_fence_violation(root, ns, manifest.get("captured_seq", 0), composed_scope)
+        if fence:
+            raise SystemExit(f"dream: REFUSED — {fence}")
         ns_dir = get_namespace_dir(root, ns, create=False)
         errors = validate_dream_response(parsed, verdicts, ns_dir)
         if errors:
@@ -5723,6 +5884,18 @@ def main():
     p_budget.add_argument("--class", dest="work_class", default=None, help="[slice 2] work-class id — enforces the owner registry (unknown/disabled class refuses + forwards; over-ceiling estimate refuses + forwards)")
     p_budget.set_defaults(fn=cmd_budget)
 
+    # [slice 3] bounded claim retrieval
+    p_claims = subparsers.add_parser(
+        "claims",
+        parents=[common_parser],
+        help="[slice 3] Query the persistent claim store (evidence-linked; survives any amount of brief compaction)",
+    )
+    p_claims.add_argument("--query", default="", help="case-insensitive substring over claim text")
+    p_claims.add_argument("--id", default=None, help="exact claim id")
+    p_claims.add_argument("--status", default="all", choices=["all", "ok", "due", "expired", "superseded"], help="temporal filter")
+    p_claims.add_argument("--limit", type=int, default=20)
+    p_claims.set_defaults(fn=cmd_claims)
+
     # [slice 2] owner-declared work-class registry
     p_registry = subparsers.add_parser(
         "work-registry",
@@ -5794,6 +5967,8 @@ def main():
         cmd_budget(args)
     elif args.subcommand == "work-registry":
         cmd_work_registry(args)
+    elif args.subcommand == "claims":
+        cmd_claims(args)
     elif args.subcommand == "_budget-op":
         cmd_budget_op(args)
     else:
