@@ -106,6 +106,12 @@ struct AttributionState {
     /// driver event, about two full renders" half of the blink storm — and it
     /// is the number a coalescing fix has to move.
     renders_unattributed: u64,
+    /// Snapshot-cache outcome counters for the window, keyed by a small
+    /// static vocabulary (hits by reason, misses by reason). Drained with
+    /// the same window record — the aggregation discipline is shared, so a
+    /// hot cache can never reproduce the per-render flood this module
+    /// exists to prevent.
+    snapshot_outcomes: HashMap<&'static str, u64>,
 }
 
 /// ⛔ Recover from poisoning rather than bailing out, matching the trace
@@ -133,6 +139,7 @@ fn attribution() -> &'static Mutex<AttributionState> {
             cumulative: HashMap::new(),
             root_renders: 0,
             renders_unattributed: 0,
+            snapshot_outcomes: HashMap::new(),
         })
     })
 }
@@ -182,6 +189,61 @@ pub(crate) fn note_state_write(site: WriteSite) {
     let mut state = lock_attribution();
     *state.pending_writes.entry(site).or_insert(0) += 1;
     *state.cumulative.entry(site).or_insert(0) += 1;
+}
+
+/// Record one `snapshot_shared` cache outcome. Called on every cache
+/// decision — hits and misses alike, by reason — so a window record can
+/// answer "how many merges ran, and why" without a per-call trace point.
+pub(crate) fn note_snapshot_outcome(outcome: &'static str) {
+    let mut state = lock_attribution();
+    *state.snapshot_outcomes.entry(outcome).or_insert(0) += 1;
+}
+
+/// The static span names for one `snapshot_shared_at(site)` call, split per
+/// call site so the window record can reconstruct the outer `app.snapshot`
+/// span exactly (root render vs effects vs agent handlers) instead of
+/// averaging a mixed population — and so an effect-side merge can no
+/// longer be read as a root-render cost (the sol s53 Q4/Q5 rebuttal).
+pub(crate) fn snapshot_span_names(
+    site: &'static str,
+) -> (&'static str, &'static str, &'static str) {
+    match site {
+        "root_render" => (
+            "snapshot.lookup.root_render",
+            "snapshot.build.root_render",
+            "snapshot.store.root_render",
+        ),
+        "effect_sidebar_autoscroll" => (
+            "snapshot.lookup.effect_sidebar_autoscroll",
+            "snapshot.build.effect_sidebar_autoscroll",
+            "snapshot.store.effect_sidebar_autoscroll",
+        ),
+        "effect_search_scroll" => (
+            "snapshot.lookup.effect_search_scroll",
+            "snapshot.build.effect_search_scroll",
+            "snapshot.store.effect_search_scroll",
+        ),
+        "effect_dock_sync" => (
+            "snapshot.lookup.effect_dock_sync",
+            "snapshot.build.effect_dock_sync",
+            "snapshot.store.effect_dock_sync",
+        ),
+        "handler_describe_state" => (
+            "snapshot.lookup.handler_describe_state",
+            "snapshot.build.handler_describe_state",
+            "snapshot.store.handler_describe_state",
+        ),
+        "handler_describe_rows" => (
+            "snapshot.lookup.handler_describe_rows",
+            "snapshot.build.handler_describe_rows",
+            "snapshot.store.handler_describe_rows",
+        ),
+        _ => (
+            "snapshot.lookup.other_site",
+            "snapshot.build.other_site",
+            "snapshot.store.other_site",
+        ),
+    }
 }
 
 /// Close the causal gap between the last root render and this one.
@@ -244,6 +306,7 @@ pub(crate) fn flush_component_render_windows(trace_home: &Path) {
     let causes = std::mem::take(&mut state.causes);
     let root_renders = std::mem::replace(&mut state.root_renders, 0);
     let renders_unattributed = std::mem::replace(&mut state.renders_unattributed, 0);
+    let snapshot_outcomes = std::mem::take(&mut state.snapshot_outcomes);
     state.started_at = Instant::now();
     drop(state);
 
@@ -327,6 +390,14 @@ pub(crate) fn flush_component_render_windows(trace_home: &Path) {
             // `writes` is the churn count. A site with high writes and low
             // renders_preceded is chatty and harmless; the reverse is the storm.
             "causes": causes,
+            // The snapshot-cache decisions of this window, keyed by outcome
+            // reason. Together with the per-site `snapshot.build.*` rows
+            // this is what lets a reader reconstruct the outer
+            // `app.snapshot` span and tell a root-render merge from an
+            // effect-side one.
+            "snapshot_cache_outcomes": snapshot_outcomes
+                .into_iter()
+                .collect::<std::collections::BTreeMap<&str, u64>>(),
         }),
     );
 }
@@ -360,6 +431,21 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_outcome_accumulates_by_reason_and_clears_with_the_window() {
+        let _serial = serialized();
+        reset_for_test();
+
+        note_snapshot_outcome("hit_epoch");
+        note_snapshot_outcome("hit_epoch");
+        note_snapshot_outcome("miss_epoch_moved");
+
+        let state = lock_attribution();
+        assert_eq!(state.snapshot_outcomes.get("hit_epoch"), Some(&2));
+        assert_eq!(state.snapshot_outcomes.get("miss_epoch_moved"), Some(&1));
+        assert!(!state.snapshot_outcomes.contains_key("hit_modal_exception"));
+    }
+
+    #[test]
     fn a_window_that_has_not_elapsed_reports_nothing_and_keeps_its_bucket() {
         // The guard that keeps the cost of measuring independent of the render
         // rate. If this ever short-circuits, a storm emits per render and the
@@ -387,6 +473,7 @@ mod tests {
         state.pending_writes.clear();
         state.causes.clear();
         state.cumulative.clear();
+        state.snapshot_outcomes.clear();
         state.root_renders = 0;
         state.renders_unattributed = 0;
         state.started_at = Instant::now();

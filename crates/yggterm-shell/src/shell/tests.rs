@@ -5174,10 +5174,37 @@ JSON.stringify({{
             "a render effect bypasses snapshot_shared and rebuilds the sidebar merge"
         );
         assert_eq!(
-            launch.matches("snapshot_shared()").count(),
+            launch.matches("snapshot_shared_at(").count(),
             4,
             "the root render and its three effects must share the epoch-cached snapshot"
         );
+        for label in [
+            "root_render",
+            "effect_sidebar_autoscroll",
+            "effect_search_scroll",
+            "effect_dock_sync",
+        ] {
+            assert!(
+                launch.contains(&format!("snapshot_shared_at(\"{label}\")")),
+                "the site-labeled snapshot call {label:?} is missing from launch.rs"
+            );
+        }
+        // [s54] The outcome vocabulary is a closed set of five reasons; each
+        // must survive in snapshot_shared_at or a window record silently
+        // loses a reason it used to answer.
+        let state_src = include_str!("state.rs");
+        for outcome in [
+            "hit_epoch",
+            "hit_modal_exception",
+            "miss_ttl_expired",
+            "miss_epoch_moved",
+            "miss_cache_empty",
+        ] {
+            assert!(
+                state_src.contains(&format!("\"{outcome}\"")),
+                "the snapshot-cache outcome {outcome:?} vanished from snapshot_shared_at"
+            );
+        }
     }
 
     #[test]
