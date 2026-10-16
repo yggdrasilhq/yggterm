@@ -109,9 +109,12 @@ class Args:
 
 
 def cli_env() -> dict:
+    # the capacity-refusal falsifiers are HARD-CAPS-mode contracts (the
+    # owner-instantiated device); soft mode is tested separately below
     env = dict(os.environ)
     env["YGG_BUDGET_AUTHORITY"] = "local"
     env["YGG_BUDGET_POLICY_JSON"] = TINY_POLICY
+    env["YGG_BUDGET_CAPS"] = "hard"
     return env
 
 
@@ -321,8 +324,11 @@ def test_dream_run_gated_by_budget(module, failures):
     )
     saved_env = os.environ.get("YGG_BUDGET_POLICY_JSON")
     saved_authority = os.environ.get("YGG_BUDGET_AUTHORITY")
+    saved_caps = os.environ.get("YGG_BUDGET_CAPS")
     os.environ["YGG_BUDGET_POLICY_JSON"] = dream_policy
     os.environ["YGG_BUDGET_AUTHORITY"] = "local"
+    os.environ["YGG_BUDGET_CAPS"] = "hard"
+    os.environ["YGG_BUDGET_CAPS"] = "hard"
     try:
         _dream_run_gated_body(module, failures)
     finally:
@@ -334,6 +340,10 @@ def test_dream_run_gated_by_budget(module, failures):
             os.environ.pop("YGG_BUDGET_AUTHORITY", None)
         else:
             os.environ["YGG_BUDGET_AUTHORITY"] = saved_authority
+        if saved_caps is None:
+            os.environ.pop("YGG_BUDGET_CAPS", None)
+        else:
+            os.environ["YGG_BUDGET_CAPS"] = saved_caps
 
 
 def _dream_run_gated_body(module, failures):
@@ -402,10 +412,48 @@ def test_budget_op_verb_shape(module, failures):
             failures.append("transport: host echo should ride the op, not the result")
 
 
+def test_soft_caps_never_refuse_capacity(module, failures):
+    """[owner ruling 2026-10-16] SOFT is the standing caps mode: capacity
+    never refuses work — the ledger serializes, accounts, and flags
+    overborrow; per-item ceilings and bad estimates still refuse (waste
+    guards, not capacity guards); settle still books honestly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        today = module.budget_today()
+        seed_ledger(root, spent={today: {"_total": {"input": 100_000, "generated": 10_000, "cash_cents": 50},
+                                        "yin": {"input": 100_000, "generated": 10_000, "cash_cents": 50}}})
+        env = cli_env()
+        env["YGG_BUDGET_CAPS"] = "soft"
+        import subprocess as sp
+        def soft_cli(*args):
+            run_ = sp.run([sys.executable, str(MODULE_PATH), "--root", str(root), "dream-budget", *args],
+                          capture_output=True, text=True, env=env, timeout=60)
+            return json.loads(run_.stdout)
+        past_cap = soft_cli("--admit", "--bucket", "yin", "--input", "40_000",
+                            "--generated", "2_000", "--cash-cents", "5", "--purpose", "over-cap")
+        if not past_cap.get("admitted"):
+            failures.append(f"soft: capacity refused work (must admit + flag): {past_cap}")
+        if not past_cap.get("borrowed"):
+            failures.append(f"soft: over-cap admission not flagged borrowed: {past_cap}")
+        if soft_cli("--admit", "--bucket", "yin", "--input", "0").get("admitted"):
+            failures.append("soft: zero estimate admitted (waste guard must survive)")
+        ceiling = soft_cli("--admit", "--class", "infra-updates", "--input", "999_999", "--generated", "10")
+        if ceiling.get("admitted"):
+            failures.append("soft: per-item ceiling breached (waste guard must survive)")
+        settled = soft_cli("--settle", past_cap["id"], "--input", "39_000",
+                           "--generated", "1_800", "--cash-cents", "4", "--actual-source", "measured")
+        if not settled.get("settled"):
+            failures.append(f"soft: settle broke: {settled}")
+        ledger = json.loads((root / "dream" / "budget" / "ledger.json").read_text())
+        if spent_dims(ledger, today)["input"] != 139_000:
+            failures.append(f"soft: accounting drifted: {spent_dims(ledger, today)}")
+
+
 def main() -> int:
     module = load_module(Path(sys.argv[1]) if len(sys.argv) > 1 else MODULE_PATH)
     failures: list[str] = []
     test_race_last_allowance(module, failures)
+    test_soft_caps_never_refuse_capacity(module, failures)
     test_midnight_inflight_books_to_reservation_day(module, failures)
     test_ttl_crash_release(module, failures)
     test_bucket_borrow_and_verification_reserve(module, failures)

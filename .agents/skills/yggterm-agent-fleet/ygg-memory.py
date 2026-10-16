@@ -4844,6 +4844,8 @@ def cmd_budget(args):
     root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
     if getattr(args, "budget_status", False):
         op = {"action": "status"}
+    elif getattr(args, "caps", None):
+        op = {"action": "caps", "mode": args.caps, "for_days": args.for_days, "reason": args.purpose}
     elif getattr(args, "admit", False):
         op = {
             "action": "admit", "bucket": args.bucket,
@@ -5483,11 +5485,25 @@ def _budget_op(root: Path, op: dict) -> dict:
                     result = {"admitted": False, "reason": "zero-estimate"}
                 else:
                     holds_total = _budget_sum_holds(ledger["reservations"], None)
-                    # HARD fleet totals stop admission first (Q4: the first
-                    # exhausted resource stops admission).
+                    # [owner ruling 2026-10-16] CAPS MODE: quality of work
+                    # takes precedence over tokenomics; agents may empty
+                    # provider quotas but never WASTE tokens (per-item
+                    # ceilings, estimate discipline, and dedupe still guard
+                    # that). The hard totals are an owner-instantiated
+                    # device — set only when the owner says so for a period
+                    # (`dream-budget --caps hard`). Default is soft: the
+                    # ledger still serializes, accounts, and flags
+                    # overborrow, but capacity never refuses work; dreams
+                    # stall on PROVIDER quota hits (the designed backoff),
+                    # not on our arithmetic.
+                    caps_mode = ledger.get("caps_mode", "soft")
+                    if os.environ.get("YGG_BUDGET_CAPS"):  # test/sandbox override
+                        caps_mode = os.environ["YGG_BUDGET_CAPS"]
+                    if caps_mode == "hard" and ledger.get("caps_until") and day > ledger["caps_until"]:
+                        caps_mode = "soft"  # the owner-instantiated window elapsed; auto-restore
                     hard_room = {dim: totals[dim] - today_spent["_total"].get(dim, 0) - holds_total[dim] for dim in BUDGET_DIMS}
                     exhausted = [dim for dim in BUDGET_DIMS if est[dim] > hard_room[dim]]
-                    if exhausted:
+                    if exhausted and caps_mode == "hard":
                         result = {
                             "admitted": False,
                             "reason": "exhausted:" + ",".join(exhausted),
@@ -5497,14 +5513,15 @@ def _budget_op(root: Path, op: dict) -> dict:
                         bucket_spent = today_spent.setdefault(bucket, _budget_zero_dims())
                         holds_bucket = _budget_sum_holds(ledger["reservations"], None, bucket)
                         bucket_room = {dim: spec[dim] - bucket_spent.get(dim, 0) - holds_bucket[dim] for dim in BUDGET_DIMS}
-                        borrowed = any(est[dim] > bucket_room[dim] for dim in BUDGET_DIMS)
-                        if borrowed and not spec.get("borrowable", True):
+                        borrowed = caps_mode == "soft" or any(est[dim] > bucket_room[dim] for dim in BUDGET_DIMS)
+                        if borrowed and caps_mode == "hard" and not spec.get("borrowable", True):
                             result = {"admitted": False, "reason": f"bucket-exhausted:{bucket}", "bucket_room": bucket_room}
                         else:
                             res_id = uuid.uuid4().hex[:16]
                             ttl = max(1, int(op.get("ttl", BUDGET_RESERVATION_TTL_S)))
                             reservation = {
                                 "day": day, "bucket": bucket, "state": "reserved",
+                                "caps_mode": caps_mode,
                                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                 "expires_at": now_s + ttl, "host": op.get("host", ""), "pid": op.get("pid"),
                                 "purpose": str(op.get("purpose", ""))[:200], "borrowed": borrowed,
@@ -5566,6 +5583,22 @@ def _budget_op(root: Path, op: dict) -> dict:
             res["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             _budget_receipt(ledger, {"kind": "released", "id": res_id, "bucket": res["bucket"], "purpose": str(res.get("purpose", ""))[:120]})
             result = {"released": True, "id": res_id}
+    elif action == "caps":
+        # [owner ruling 2026-10-16] The owner (through a seat, on his spoken
+        # direction) instantiates or lifts a hard-cap window. Soft is the
+        # standing state: quality first, no waste, provider quotas may empty.
+        mode = op.get("mode")
+        if mode not in ("hard", "soft"):
+            result = {"set": False, "reason": "mode is hard|soft"}
+        else:
+            ledger["caps_mode"] = mode
+            for_days = int(op.get("for_days") or 0)
+            ledger["caps_until"] = (
+                (datetime.date.fromisoformat(day) + datetime.timedelta(days=for_days)).isoformat()
+                if mode == "hard" and for_days > 0 else None
+            )
+            _budget_receipt(ledger, {"kind": "caps-mode", "mode": mode, "until": ledger.get("caps_until"), "reason": str(op.get("reason", ""))[:160]})
+            result = {"set": True, "caps_mode": mode, "caps_until": ledger.get("caps_until"), "reason": op.get("reason", "")}
     elif action == "registry-update":
         # [slice 2] Registry mutations ride the SAME serialized plane as
         # admissions (a revoke must be visible to every host's next check).
@@ -5619,6 +5652,8 @@ def _budget_op(root: Path, op: dict) -> dict:
             }
         result = {
             "day": day,
+            "caps_mode": ledger.get("caps_mode", "soft"),
+            "caps_until": ledger.get("caps_until"),
             "totals": totals,
             "hard_room": hard_room,
             "holds_total": holds_total,
@@ -6249,7 +6284,8 @@ def main():
         help="[slice 1] Atomically reserve/settle dream token+cash against the ONE serialized fleet authority (refusal = deferred, exit 3)",
     )
     budget_actions = p_budget.add_mutually_exclusive_group(required=True)
-    budget_actions.add_argument("--admit", action="store_true", help="reserve an estimate (refused if the hard totals or a non-borrowable bucket are exhausted)")
+    budget_actions.add_argument("--admit", action="store_true", help="reserve an estimate (refused on per-item/registry gates always; on capacity only in hard-caps mode)")
+    budget_actions.add_argument("--caps", choices=["hard", "soft"], help="[owner ruling 2026-10-16] instantiate (hard) or lift (soft) a cap window — soft is the standing state: quality first, no waste, provider quotas may empty; dreams stall on quota hits, not on our arithmetic")
     budget_actions.add_argument("--settle", metavar="ID", help="book actual spend for a reservation (charged to its reservation day)")
     budget_actions.add_argument("--release", metavar="ID", help="release a hold unspent (abandoned work)")
     budget_actions.add_argument("--status", action="store_true", dest="budget_status", help="ledger view: caps, spend, holds, headroom, receipts")
@@ -6258,7 +6294,8 @@ def main():
     p_budget.add_argument("--generated", type=int, default=0, help="generated-token dimension")
     p_budget.add_argument("--cash-cents", type=int, default=0, dest="cash_cents", help="cash dimension in US cents")
     p_budget.add_argument("--ttl", type=int, default=BUDGET_RESERVATION_TTL_S, help=f"admission hold TTL seconds (default {BUDGET_RESERVATION_TTL_S}; crash safety)")
-    p_budget.add_argument("--purpose", default="", help="what this reservation is for (recorded in receipts)")
+    p_budget.add_argument("--for-days", type=int, default=None, help="with --caps hard: the window length (auto-restores soft after it)")
+    p_budget.add_argument("--purpose", default="", help="what this reservation is for / the reason for a caps change (recorded in receipts)")
     p_budget.add_argument("--actual-source", default="measured", help="how settle actuals were obtained (measured|byte-estimate)")
     p_budget.add_argument("--class", dest="work_class", default=None, help="[slice 2] work-class id — enforces the owner registry (unknown/disabled class refuses + forwards; over-ceiling estimate refuses + forwards)")
     p_budget.set_defaults(fn=cmd_budget)
