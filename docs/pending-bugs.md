@@ -34277,3 +34277,29 @@ CI verb; diff sccache --show-stats; SCCACHE_LOG names the hashed key
 inputs) for whatever miss rate survives (0)-(2). FALSIFIER: two
 consecutive same-shape builds report Rust hits>0 with rate >=50%; a
 no-op tick reports idle and never STALE.
+
+UPDATE 2026-10-16 ~23:4x IST (sitting 57, same seat): STEPS 0+1 LANDED and
+the FALSIFIER RAN. Step 0: /etc/environment SCCACHE_CACHE_SIZE 50G→200G
+(sudo; 3.5T free), server restarted at 200G, watcher env re-inherited.
+Step 1 (lane/ci/11240-verdict d58df0ed → main 94a8de3d, deployed): the
+STALE verdict split into bypassed / non-cacheable with the wire readout in
+the verdict, cache_bypassed/cache_noncacheable events, spec §4 updated,
+tests/test_yggci_cache_verdict.py. CONTROLLED FALSIFIER (scratch worktree
+~/gh/yggterm--s57-cacheprobe at main 94a8de3d, CARGO_TARGET_DIR=/tmp/zc-
+s57-cacheprobe-target, the EXACT CI verb, build1 cold 6m43s wall → wipe →
+build2 identical): build1 wrote 971 Rust misses (expected, cold); build2
+turned 970 of them into HITS with ZERO new misses — 100% hit rate on
+identical same-path inputs, requests executed 1750→3493, misses FROZEN at
+971. VERDICT: the cache is healthy end-to-end; the 0.13% lifetime rate was
+MULTI-PATH THRASH AT THE 50G CAP (the same crates cold-compiled from the
+main checkout + every seat's worktree + every lane /tmp target, evicted
+before their next read). Mechanism (d) confirmed-dominant, (a) confirmed
+as the inherent per-path cold cost, (b) fixed in code, (c) stands as the
+check-side residual (dev-profile incremental compiles stay non-cacheable
+CALLS — worth CARGO_INCREMENTAL=0 in the CI recipe only if check-side
+compiles ever dominate a tick again). The entry's bar — two consecutive
+same-shape builds report Rust hits>0 with rate >=50% — MET at 100%. What
+remains OPEN is the standing observation only: hit rate across a day of
+real ticks (the resize must hold under the fleet's multi-path churn) and
+the first honest verdict readout on a live tick (the fixed watcher serves
+it on the next build). Status stays OPEN for that observation.
