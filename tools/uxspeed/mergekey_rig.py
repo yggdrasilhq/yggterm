@@ -125,8 +125,17 @@ if (!btn) {{ dioxus.send({{clicked: false}}); }} else {{ btn.click(); dioxus.sen
 
     def spawn_row(self, title: str) -> dict:
         before = set(x.get("full_path", "") for x in self.live_rows())
+        # small-world mode (HOME redirected): agent-CLI kinds cannot find
+        # their store/auth under the scratch home — spawn a plain shell.
+        kind = ["--kind", "shell"] if os.environ.get("S56_SMALL_WORLD") == "1" else []
+        # small-world spawns land slow (the CLI launch re-scans the scratch
+        # home) — raise BOTH the CLI's own app-control request timeout
+        # (--timeout-ms, default 15s server-side) and the verb budget.
+        small = os.environ.get("S56_SMALL_WORLD") == "1"
         r = self.verb("terminal", "new", "--title", title, "--cwd", "/tmp",
-                      "--no-activate")
+                      *kind, *(["--timeout-ms", "60000"] if small else []),
+                      "--no-activate",
+                      timeout=70.0 if small else None)
         if not r["ok"]:
             return {"error": f"spawn failed: {r.get('error')}"}
         data = (r.get("json") or {}).get("data") or {}
@@ -278,6 +287,8 @@ def phase_main(home: str, out_path: str) -> int:
         if len(ok) >= 2:
             break
         time.sleep(6)
+    # small-world mode: HOME was redirected, so the ready bar is the staged
+    # count itself (S56_EXPECT_ROWS), not the real store's 20k.
     last_scan = (scans[-1].get("payload", {}).get("meta", {}) or {}) if scans else {}
     report["readiness_wait_s"] = round(time.time() - t_gate, 1)
     report["tree_scan_meta"] = last_scan
