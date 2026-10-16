@@ -1748,10 +1748,16 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   family. S52 (2026-10-16): the light-pass dedupe + warm-switch ink bypass
   LANDED (clears/switch 4->1 counter-proven on the dev harness, dwell
   switch garble-free at pixels; ui.block <150ms NOT met — the one-heal
-  cost remains, see [11.172]'s record) and the paint metric's
-  quiet-switch gap is filed (frame_full event = the next unit);
-  [11.215]'s appear-over bar and the close/teardown family still need
-  fresh runs on the dev-local harness.
+  cost remains, see [11.172]'s record). S53 (2026-10-16): the paint
+  metric's quiet-switch gap CLOSED — the rate-guarded frame_full point
+  event (fnV=7, main d4796b32) plus the probe pairing root fix (the
+  raise's host_id was per-pass state; every poll after the reveal
+  re-derived None and silently rejected every frame event — the s52
+  "250ms floor hides fast frames" story was THIS loss, not the floor);
+  raises now pair paint_source=frame_full deterministically (2/2 after
+  the fix, 1/2 before, on the dev harness). [11.215]'s appear-over bar
+  and the close/teardown family still need fresh runs on the dev-local
+  harness.
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
@@ -3533,16 +3539,22 @@ full frames in the trace. BAR (b) ui.block <150ms NOT MET, honestly: the
 single remaining :now heal itself blocks ~570ms on Xvfb/llvmpipe (control
 524ms — parity; on jojo hardware the same heal measured 386ms in s51).
 The residual felt budget = the ONE-heal cost (the accepted shape) + Leg A
-render cost (Q3's rank-1, next). THE PAINT METRIC'S OWN GAP (filed as the
-next F7 unit): on the lane's QUIET warm switch the Q4 predicate honestly
-REFUSED — no full-coverage frame event within the probe window (the churn
-shrank so much the first full frame's inter-frame gap fell under the 250ms
-YGG_XTERM_FRAME_GAP_FLOOR_MS, then the host went silent — nothing
-re-renders, no frame_window flush rolls); the stamp stayed accuracy-only
-(visible=true, content_rows=48) and paint_reveal_ms is null, not
-fabricated. Fix shape: a rate-guarded frame_full point event (per
-full-coverage frame, throttled to the floor's cadence) so fast quiet
-switches become measurable. The dwell leg (content present) paired fine:
+render cost (Q3's rank-1, next). THE PAINT METRIC'S OWN GAP (CLOSED s53): on the lane's QUIET warm
+switch the Q4 predicate honestly REFUSED — no full-coverage frame event
+within the probe window. TWO roots, both measured: (1) the page-side
+silence (the s52 code-read was right that nothing records the frame —
+frame_gap needs a >=250ms gap inside an OPEN window and the window closes
+lazily); fixed by the rate-guarded frame_full point event (per
+full-coverage frame, throttled to the floor's cadence by a clock OUTSIDE
+the window bucket; fnV=7); (2) the probe-side pairing loss the s52 story
+MISSED — the scan's host_id was per-pass state while the reveal_served
+assignment guard fires once, so on a raise every poll after the reveal
+re-derived host_id=None and the identity gate rejected every frame event
+(dbg fulls=0 gaps=0 beside two full-coverage frames from the raise's own
+host); fixed pass-invariant (reveal_host_id mirror). Measured: raises
+pair paint_source=frame_full 2/2 after vs 1/2 before (dev harness,
+d4796b32 build). The stamp stays accuracy-only; a refusal still reports
+null + note, never a fabricated timestamp. The dwell leg (content present) paired fine:
 697ms lane vs 685ms control — parity, no regression claimed. RIG LAWS:
 the probe's bare `yggterm` name needs PATH=$HOME/.local/bin under
 non-login ssh (gotcha 2 again); a fnV<6 page CANNOT report the new
