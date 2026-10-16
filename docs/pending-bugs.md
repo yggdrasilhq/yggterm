@@ -2000,6 +2000,19 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   batch bytes + ack latency histogram around it (vendor edits.rs
   counters) -> decide renderer-main-thread contention vs websocket
   backpressure.
+  RESOLUTION TO MONITOR (2026-10-17 ~00:5x, same sitting): the sampler
+  lane (lane/f10/ack-tick-sampler 84d089a4, main bb42570c044b) landed —
+  every ack-fault counter delta is now a ts'd ack_fault_tick record in
+  event-trace.jsonl, so ANY future starvation self-attributes to its
+  phase. And the starvation did not recur: FIVE consecutive full-rig
+  trials on builds bb42570c044b..69ef977326b4 (idle machine AND under a
+  concurrent release build) read ZERO timeouts and ZERO resyncs, against
+  52/8 on c8aa890856d8 and 74-119/6-20 on every pre-s56 build. Whether
+  the newest builds genuinely closed it or the 52-run caught a
+  once-only scheduling storm, the falsifier now runs for free: every
+  future rig/probe trial ticks on recurrence, with phase attribution
+  built in. Status: MONITOR (not closed — one clean stochastic flip is
+  not a mechanism claim).
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
