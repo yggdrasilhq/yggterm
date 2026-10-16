@@ -235,3 +235,27 @@ Keep eight slices. Build contracts early; enable live execution only after the r
 Evidence limit: home-memory synchronization remained locked after three attempts, so I used your accepted round-3 summary and inspected skill contracts. Exact `links-index.lisp` integration remains unverified. Stored Callgraph notes informed the proposed boundaries; live quotas, balances, and operational state were not revalidated.
 
 
+
+---
+
+## ADDENDUM (owner revision, same day, post-consult)
+
+The owner revised Q3s mechanism: **focus directives are MEMORY DOCS, not CLI.**
+
+---
+
+## ADDENDUM (owner revision, same day, post-consult)
+
+The owner revised Q3's mechanism: **focus directives are MEMORY DOCS, not CLI.**
+He will rarely (if ever) run the dream-focus verb; instead he opens a session in
+any harness and directs prioritization in natural language — the seat records it
+as the focus doc. SSOT: the hub door `_global/dream-focus.md` (seq #58609,
+owner-authored origin). Semantics from this consult (boost x4, 7d default
+expiry, 20 percent unfocused floor, exclusive <=24h, max-not-multiply) are
+UNCHANGED — only the issuance surface changed. `dream --prepare` reads the doc
+at staging; lobemanager scheduling records become a MIRROR for agenda
+visibility, never the authority. The focus CLI remains optional sugar.
+
+Campaign door minted: the hub door campaign-memory-work.md in _global
+(seq #58608) — the build continues in any harness via the entry phrase
+"continue the memory work campaign."
