@@ -1,0 +1,25 @@
+[Unit]
+Description=ygg-ci watcher — the fleet's single build plane (yggterm + every tuned project)
+Documentation=https://github.com/yggdrasilhq/yggterm docs/spec-ygg-ci.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/gh/yggterm/.agents/skills/yggterm-agent-fleet
+ExecStart=/usr/bin/python3 /home/pi/gh/yggterm/.agents/skills/yggterm-agent-fleet/ygg-ci.py watch --interval 300
+Restart=on-failure
+RestartSec=30
+Environment=HOME=/home/pi
+Environment=PATH=/home/pi/.local/bin:/home/pi/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SCCACHE_BASEDIR=/home/pi
+Environment=SCCACHE_CACHE_SIZE=200G
+# Single-instance is enforced by ygg-ci itself ([11.227]: pidfile + live /proc
+# belt — a subscribe that finds this unit's watcher alive adopts it, never
+# spawns a second). Before `systemctl start`, stop any hand-spawned watcher
+# (kill the pid in ~/.yggterm/relay/ci/ci.pid) so the guard adopts THIS one.
+
+[Install]
+WantedBy=multi-user.target
