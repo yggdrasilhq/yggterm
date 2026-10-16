@@ -9,7 +9,7 @@
 set -u
 
 cfg="$HOME/.config/ygg-fleet/memory-sync.conf"
-harnesses="claude,codex,antigravity,grok,muse,qwen,opencode,pi,kimi,gemini"
+harnesses="claude,codex,antigravity,grok,muse,qwen,opencode,pi,kimi,gemini,zcode,autoclaw"
 if [ -f "$cfg" ]; then
   configured="$(sed -n 's/^harnesses=//p' "$cfg" | tail -n 1)"
   [ -z "$configured" ] || harnesses="$configured"

@@ -136,7 +136,10 @@ def memory_bridge(harness: str) -> str:
         f"`ygg-memory sync --harness {canonical} --ns=<area>` first, then inspect status/diff and open only the relevant door "
         "with `ygg-memory get --file <name> --ns=<area>`. Publish durable findings through `ygg-memory publish`; "
         "never copy credentials, sessions, databases, indexes, or lock files between machines.\n\n"
-        f"This harness name is `{canonical}`. The current project namespace is derived from the cwd.\n"
+        "This harness name is `autoclaw` when you are running inside AutoClaw (the z.ai desktop agent "
+        "— its sessions snapshot this file as pi-user/AGENTS.md), or `pi` in the standalone pi CLI. "
+        "Use the name that matches where you are running right now; each keeps its own watermark. "
+        "The current project namespace is derived from the cwd.\n"
         f"{MANAGED_BLOCK_END}"
     )
 
@@ -1096,6 +1099,84 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
         return max(1, len(memory_dirs)), ingested + i2, delivered + o2, deleted + d2
 
 
+class AutoclawMemoryAdapter(HarnessMemoryAdapter):
+    """AutoClaw (z.ai desktop, pi-runtime) native memory per project workspace.
+
+    AutoClaw reads exactly one root steer file, ``~/.pi/agent/AGENTS.md``
+    (verified via its pi-resources manifest, 2026-10-16), and has no
+    auto-injected memory index — the steer law makes reading the workspace
+    index deliberate. Unlike zcode's opaque project slugs, an AutoClaw
+    workspace is a real path, so each project's ``memory/`` dir maps to its
+    cwd-derived namespace (claude-style per-project ns, not zcode's
+    forced-global). Native memories ingest through the standard
+    project-memory sync with the usual exclusions; ``MEMORY.md`` /
+    ``ARCHIVE-INDEX.md`` are rebuilt from the files, never synced. Every
+    sync touches the dream heartbeat so the dreamer's quiescence gate sees
+    AutoClaw activity.
+    """
+
+    name = "autoclaw"
+
+    HEARTBEAT_REL = Path(".yggterm/config/dream/autoclaw-heartbeat")
+
+    def __init__(self, home: Path):
+        self.home = home
+        self.instruction_path = home / ".pi" / "agent" / "AGENTS.md"
+
+    def workspaces(self) -> list:
+        """AutoClaw project workspaces on this host (discovery, no hardcode)."""
+        found = []
+        for proj_dir in sorted((self.home / ".config").glob("AutoClaw*/accounts/*/projects/*")):
+            if proj_dir.is_dir():
+                found.append(proj_dir)
+        return found
+
+    @staticmethod
+    def namespace_for(workspace: Path) -> str:
+        return detect_namespace(workspace)
+
+    def _touch_heartbeat(self) -> None:
+        # The heartbeat can never fail a sync.
+        try:
+            hb = self.home / self.HEARTBEAT_REL
+            hb.parent.mkdir(parents=True, exist_ok=True)
+            hb.touch()
+        except OSError:
+            pass
+
+    def local_dir(self, workspace: Path) -> Path:
+        return workspace / "memory"
+
+    def _project(self, root: Path, harness: str, workspace: Path) -> tuple:
+        self._touch_heartbeat()
+        ns = self.namespace_for(workspace)
+        ing, outc, delc = _sync_project_memory_namespace(root, harness, ns, self.local_dir(workspace))
+        i2, o2, d2 = sync_instruction_document(root, harness, self.instruction_path)
+        return ing + i2, outc + o2, delc + d2
+
+    def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple:
+        ing, outc, delc = sync_instruction_document(root, harness, self.instruction_path)
+        for workspace in self.workspaces():
+            if self.namespace_for(workspace) != namespace:
+                continue
+            i, o, d = self._project(root, harness, workspace)
+            ing += i
+            outc += o
+            delc += d
+        return ing, outc, delc
+
+    def sync_all(self, root: Path, harness: str) -> tuple:
+        workspaces = self.workspaces()
+        ing, outc, delc = 0, 0, 0
+        for workspace in workspaces:
+            i, o, d = self._project(root, harness, workspace)
+            ing += i
+            outc += o
+            delc += d
+        i2, o2, d2 = sync_instruction_document(root, harness, self.instruction_path)
+        return max(1, len(workspaces)), ing + i2, outc + o2, delc + d2
+
+
 class GrokMemoryAdapter(HarnessMemoryAdapter):
     """Grok 1.0.5 native MEMORY.md; SQLite/session state remains CLI-owned."""
 
@@ -1399,6 +1480,8 @@ def get_harness_adapter(harness: str, home: Path | None = None, cwd: Path | None
         return GeminiMemoryAdapter(home, cwd)
     if normalized == "zcode":
         return ZcodeMemoryAdapter(home)
+    if normalized == "autoclaw":
+        return AutoclawMemoryAdapter(home)
     raise ValueError(f"Unsupported harness memory backend: {normalized}")
 
 
@@ -1462,6 +1545,8 @@ def normalize_harness_name(name: str) -> str:
         return "pi"
     if n in ("zcode-cli", "zcode_cli", "zcode"):
         return "zcode"
+    if n in ("autoclaw", "autoclaw-cli", "autoclaw_cli", "autoclaw-desktop"):
+        return "autoclaw"
     return n
 
 
@@ -3640,9 +3725,28 @@ def dream_live_activity(root: Path, ns: str) -> list:
     return live
 
 
+DREAM_AUTOCLAW_HEARTBEAT = Path(".yggterm/config/dream/autoclaw-heartbeat")
+
+
+def dream_autoclaw_activity_age(home: Path | None = None) -> float | None:
+    """Age in seconds of the AutoClaw activity heartbeat, or None if absent.
+
+    AutoClaw sessions do not sit in yggterm rows, so the journal-based
+    quiescence signal cannot see them. The autoclaw adapter (and the steer
+    ritual) touches this heartbeat file on every sync/session start; the
+    gate treats a fresh heartbeat as live activity.
+    """
+    hb = (home or Path.home()) / DREAM_AUTOCLAW_HEARTBEAT
+    try:
+        return time.time() - hb.stat().st_mtime
+    except OSError:
+        return None
+
+
 def dream_quiescence_violation(root: Path, ns: str) -> str:
     """Gate 3 (round-3 consult): the dreamer never competes with an active
-    writer — a journal write inside the cooldown window defers the dream."""
+    writer — a journal write inside the cooldown window defers the dream.
+    AutoClaw activity (heartbeat) counts as live writer activity too."""
     live = dream_live_activity(root, ns)
     if not live:
         return ""
@@ -3650,6 +3754,12 @@ def dream_quiescence_violation(root: Path, ns: str) -> str:
     if age < DREAM_QUIESCENCE_SECONDS:
         return (
             f"ns {ns} is ACTIVE (last non-dream write {int(age)}s ago, "
+            f"< {DREAM_QUIESCENCE_SECONDS}s quiescence) — dream deferred"
+        )
+    hb_age = dream_autoclaw_activity_age(root.parent.parent if root.parent.name == "memory" else Path.home())
+    if hb_age is not None and hb_age < DREAM_QUIESCENCE_SECONDS:
+        return (
+            f"ns {ns} is ACTIVE (autoclaw heartbeat {int(hb_age)}s ago, "
             f"< {DREAM_QUIESCENCE_SECONDS}s quiescence) — dream deferred"
         )
     return ""
