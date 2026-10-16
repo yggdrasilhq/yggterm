@@ -229,7 +229,7 @@ fn terminal_reused_host_grid_script(session_path: &str) -> String {
 // re-invocations re-bound the dead cold channel pair (s31 differential:
 // the warm invocation tag lives in the mailbox alone). Both invoke sites
 // pass their OWN eval binding; the version gate forces the reinstall.
-pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 6;
+pub(crate) const TERMINAL_MOUNT_FN_VERSION: u64 = 7;
 
 /// The per-mount parameters the cached body reads through its `__mp`
 /// snapshot. Rendered once per mount into BOTH eval shapes (cold installer
@@ -1415,6 +1415,21 @@ fn terminal_eval_script_with_canvas_renderer(
             bucket.max_ms = Math.max(bucket.max_ms, duration);
             bucket.chars += Number((detail && detail.raw_payload_length) || 0);
         }};
+        // [F7 s53] The frame-gap point above only fires after a >=250ms gap
+        // INSIDE an open window, and the window closes LAZILY — so a switch
+        // whose churn is gone (the s52 light-pass dedupe) paints one fast
+        // full frame and goes silent, and neither the frame_gap point nor a
+        // frame_window flush ever records the frame the paint metric pairs
+        // against reveal_served. `frame_full` is that record: one point per
+        // FULL-COVERAGE frame, throttled to the same floor's cadence. The
+        // throttle clock deliberately lives OUTSIDE the window bucket: a
+        // bucket-held clock would reset on every lazy close and burst one
+        // event per second forever. Rate bound: ~4/s under continuous churn
+        // (the same order as frame_gap's own worst case), exactly one event
+        // on a quiet switch; the aggregate keeps the honest count and
+        // skipped_since_last keeps the throttle honest.
+        let lastFrameFullEmitAtMs = 0;
+        let frameFullSkipped = 0;
         const traceXtermRender = (rowStart, rowEnd, rows) => {{
             const now = Date.now();
             const bucket = xtermProbeWindow("xterm_render/frame_window", {{
@@ -1436,6 +1451,22 @@ fn terminal_eval_script_with_canvas_renderer(
             // reading every frame.
             if (rows > 0 && rowsPainted >= rows) {{
                 bucket.full_canvas_frames += 1;
+                if (now - lastFrameFullEmitAtMs >= YGG_XTERM_FRAME_GAP_FLOOR_MS) {{
+                    ytrace.emit({{
+                        category: "xterm_render",
+                        name: "frame_full",
+                        payload: {{
+                            host_id: hostId,
+                            rows_painted: rowsPainted,
+                            rows,
+                            skipped_since_last: frameFullSkipped,
+                        }},
+                    }});
+                    lastFrameFullEmitAtMs = now;
+                    frameFullSkipped = 0;
+                }} else {{
+                    frameFullSkipped += 1;
+                }}
             }}
             if (gapMs >= YGG_XTERM_FRAME_GAP_FLOOR_MS) {{
                 ytrace.emit({{

@@ -10798,6 +10798,7 @@ JSON.stringify({{
         );
     }
 
+    #[test]
     fn the_composed_terminal_script_is_valid_javascript() {
         // ⛔⛔ THE ONE FAILURE THAT TAKES EVERY TERMINAL AT ONCE. The script is
         // assembled from a `format!` template plus an `include_str!`'d emitter,
@@ -10816,8 +10817,21 @@ JSON.stringify({{
         // script never consumes a DECSET (pure observer), and the suppressed
         // variant consumes ONLY pure mouse DECSETs — the flag must be a
         // literal the client can read, not a behavior buried in a closure.
+        // [s53] The flag became a NAMED MOUNT PARAM (the script reads
+        // `__mp.suppressMouseTracking`; the hardcoded literal rotted away
+        // while this guard sat dead on main — re-armed this sitting, and
+        // the rot is exactly what it caught). The owner contract it guards
+        // (2026-09-02: the client can read which way the flag points) is
+        // unchanged, so the assertions follow the value into the params
+        // JSON and the param read.
         assert!(
-            script.contains("const suppressMouse = false;"),
+            script.contains(
+                "const suppressMouse = (Boolean(__mp.suppressMouseTracking));"
+            ),
+            "the script must read mouse suppression through the named mount param"
+        );
+        assert!(
+            script.contains("\"suppressMouseTracking\":false"),
             "default script must leave mouse tracking armed"
         );
         let suppressed = terminal_eval_script_with_canvas_renderer(
@@ -10831,7 +10845,7 @@ JSON.stringify({{
             None,
         );
         assert!(
-            suppressed.contains("const suppressMouse = true;"),
+            suppressed.contains("\"suppressMouseTracking\":true"),
             "suppressed script must carry the flag for the probe handler"
         );
         assert!(
@@ -10893,6 +10907,37 @@ JSON.stringify({{
             "YGG_XTERM_FLUSH_FLOOR_MS",
             "xterm_write/flush_window",
             "armXtermFlushDetail()",
+        ] {
+            assert!(
+                script.contains(marker),
+                "the composed script must carry `{marker}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_frame_full_point_event_keeps_the_quiet_switch_measurable() {
+        // [F7 s53] THE PAINT METRIC'S OWN GAP (the s52-filed next unit).
+        // After the s52 light-pass dedupe a quiet warm switch paints ONE
+        // fast full frame and the host goes silent: the frame_gap point
+        // needs a >=250ms gap inside an OPEN window and the window closes
+        // lazily, so neither source records the frame and the probe's
+        // reveal_served pairing honestly refused (paint_reveal_ms null +
+        // note). frame_full closes that hole — one throttled point per
+        // full-coverage frame — and the throttle clock must stay OUTSIDE
+        // the window bucket: a bucket-held clock resets on every lazy
+        // close and the point bursts one event per second forever.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        for marker in [
+            "name: \"frame_full\"",
+            "let lastFrameFullEmitAtMs = 0;",
+            "let frameFullSkipped = 0;",
+            "skipped_since_last: frameFullSkipped,",
+            "lastFrameFullEmitAtMs = now;",
+            // The throttle rides the SAME floor constant as frame_gap — one
+            // cadence, one honest rate story for a reader.
+            "now - lastFrameFullEmitAtMs >= YGG_XTERM_FRAME_GAP_FLOOR_MS",
         ] {
             assert!(
                 script.contains(marker),

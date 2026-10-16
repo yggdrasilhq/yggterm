@@ -2106,6 +2106,7 @@ dioxus.send(out);
             # xterm_render frame at/after reveal_served. The stamp demotes to
             # accuracy-only; no proven frame means NO paint timestamp.
             full_frame = None
+            full_frame_fulls = []
             full_frame_gaps = []
             full_frame_windows = []
             deadline = time.time() + self.timeout_s
@@ -2170,6 +2171,11 @@ dioxus.send(out);
                         elif (paint_reveal is None and c == "xterm_paint"
                                 and n == "reveal"):
                             paint_reveal = e
+                        elif (c == "xterm_render" and n == "frame_full"
+                                and (p.get("rows") or 0) > 0
+                                and (p.get("rows_painted") or 0)
+                                >= (p.get("rows") or 0)):
+                            full_frame_fulls.append(e)
                         elif (c == "xterm_render" and n == "frame_gap"
                                 and (p.get("rows") or 0) > 0
                                 and (p.get("rows_painted") or 0)
@@ -2178,18 +2184,28 @@ dioxus.send(out);
                         elif (c == "xterm_render" and n == "frame_window"
                                 and (p.get("max_rows_painted") or 0) > 0):
                             full_frame_windows.append(e)
-                # [F7 s52 Q4] pair the raise's paint truth: first
-                # full-coverage frame at/after reveal_served. Point frame_gap
-                # ts is primary; a frame_window flush is the fallback and its
-                # ts UPPER-BOUNDS the paint time (the window flushed after
-                # the frame painted). frame_window carries no rows field, so
-                # the coverage bar comes from the stamp's geometry.
+                # [F7 s53 Q4] pair the raise's paint truth: first
+                # full-coverage frame at/after reveal_served. The s52 primary
+                # (frame_gap) needs a >=250ms gap INSIDE an open window and
+                # the window closes lazily — a quiet switch paints one fast
+                # full frame and goes silent, recording nothing (the s52
+                # refusal). frame_full, the floor-throttled per-frame point,
+                # is primary now; frame_gap and the frame_window flush stay
+                # as older-build fallbacks, the flush's ts UPPER-BOUNDING the
+                # paint time (the window flushed after the frame painted).
+                # frame_window carries no rows field, so the coverage bar
+                # comes from the stamp's geometry.
                 if reveal_served is not None and full_frame is None:
                     rs_ts = reveal_served.get("ts_ms", 0)
-                    for e in full_frame_gaps:
+                    for e in full_frame_fulls:
                         if e.get("ts_ms", 0) >= rs_ts:
                             full_frame = e
                             break
+                    if full_frame is None:
+                        for e in full_frame_gaps:
+                            if e.get("ts_ms", 0) >= rs_ts:
+                                full_frame = e
+                                break
                     if full_frame is None:
                         expected_rows = 0
                         if paint_reveal is not None:
@@ -2279,8 +2295,9 @@ dioxus.send(out);
                     else:
                         acc.append("no full-viewport xterm_render frame after "
                                    "reveal_served within the window — paint "
-                                   "timestamp unproven (the 250ms frame-gap "
-                                   "floor can hide a fast quiet frame)")
+                                   "timestamp unproven (frame_full is "
+                                   "floor-throttled: a full frame <250ms after "
+                                   "a prior one is swallowed by design)")
                     it["reveal_visible"] = rp.get("visible")
                     it["reveal_content_rows"] = rp.get("content_rows")
                     it["reveal_rows"] = rp.get("rows")

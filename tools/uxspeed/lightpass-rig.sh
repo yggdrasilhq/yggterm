@@ -54,6 +54,7 @@ path, t0f, t1f = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 forced = skipped = blocks = 0
 bmax = -1
 frames = []
+fulls = []
 for line in open(path, errors="replace"):
     try:
         e = json.loads(line)
@@ -77,8 +78,11 @@ for line in open(path, errors="replace"):
             bmax = g
     elif n == "frame_gap":
         frames.append((ts, p.get("rows_painted"), p.get("rows")))
+    elif n == "frame_full":
+        fulls.append((ts, p.get("rows_painted"), p.get("rows"),
+                      p.get("skipped_since_last")))
 print(f"SUMMARY forced_refresh={forced} skipped={skipped} ui_block={blocks} "
-      f"ui_block_max_gap_ms={bmax} frame_gaps={frames}")
+      f"ui_block_max_gap_ms={bmax} frame_fulls={fulls} frame_gaps={frames}")
 PY
 cat "$OUT/window-trace.txt"
 
@@ -149,7 +153,8 @@ for line in open(path, errors="replace"):
     n = e.get("name", "")
     c = e.get("category", "")
     p = e.get("payload") or {}
-    if n in ("reveal_served", "reveal_raise_refused", "frame_gap", "block",
+    if n in ("reveal_served", "reveal_raise_refused", "frame_gap",
+             "frame_full", "block",
              "xterm_forced_refresh", "xterm_forced_refresh_skipped") or \
        (c == "xterm_paint" and n == "reveal"):
         keep = {k: p.get(k) for k in (
