@@ -3402,12 +3402,35 @@ def prepare_dream(
         shutil.rmtree(pending)
     pending.mkdir(parents=True)
 
+    # [slice 4] COVERAGE MANIFEST: every delta accounted for — represented,
+    # deferred (budget), or excluded (why). An acknowledged event need not
+    # appear in NOW, but its disposition must be recoverable. The watermark
+    # never advances past unaccounted work (sol: a byte-limited brief must
+    # never advance its watermark to an unprocessed journal head).
+    manifest_entries = [
+        {"seq": d["seq"], "file": d["file"], "action": d["action"], "disposition": "represented"}
+        for d in kept
+    ] + [
+        {"seq": d["seq"], "file": d["file"], "action": d["action"], "disposition": "deferred", "why": "input budget"}
+        for d in deltas[len(kept):]
+    ]
+
+    # [slice 4] RETAINED CLAIMS: the composer receives the persistent claim
+    # state (evidence-linked) so it does not relearn the world from the newest
+    # batch. Previous NOW prose is context, NOT evidence — claims carry dates.
+    state = load_claim_state(root, ns)
+    retained = state.get("claims", {})
+
     lines = [
         f"# DREAM BRIEF — {ns} — phase {phase} — prepared {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
         "",
         "## CONTRACT",
         "",
         DREAM_CONTRACT,
+        "",
+        "## RETAINED CLAIMS (persistent, evidence-linked — reuse these; do not re-derive; superseded/expired ones are dead)",
+        "",
+        json.dumps(retained, indent=1) if retained else "(none yet)",
         "",
         "## CURRENT ROLLUP (previous NOW.md — REPLACE semantics; prune contradicted claims)",
         "",
@@ -3449,6 +3472,9 @@ def prepare_dream(
         "extra_inputs": [e["path"] for e in extras],
         "budget": budget,
         "brief_bytes": brief_path.stat().st_size,
+        # [slice 4] coverage manifest: per-event disposition, recoverable
+        "coverage": manifest_entries,
+        "retained_claims_count": len(state.get("claims", {})),
     }
     (pending / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return brief_path, manifest
@@ -3623,6 +3649,241 @@ def _upsert_ns_index_line(ns_dir: Path, filename: str, hook: str) -> None:
         print(f"ygg-memory: index line not updated: {index_error}", file=sys.stderr)
 
 
+# ── [slice 3, sol 2026-10-16] CORRECTABLE OWNER CONTEXT ─────────────────────
+# Two logical layers (sol Q3), both selectable across namespaces through ONE
+# owner identity (_global):
+#   durable-owner.md  — preferences, constraints, recurring practices, important
+#                       background, surfacing instructions. Persists until
+#                       corrected or superseded (NOT fast-rotting).
+#   owner-now.md      — current commitments, temporary availability, travel,
+#                       explicit energy/mood. Short validity, evidence dates.
+# And an AUTHORITATIVE corrections record that takes effect on the NEXT memory
+# READ — without waiting for quiescence, cooldown, or composition, and immune
+# to an old archive resurrecting a dismissed claim.
+DURABLE_OWNER_FILENAME = "durable-owner.md"
+OWNER_CORRECTIONS_FILENAME = "owner-corrections.json"
+
+
+def _owner_corrections_path(root: Path) -> Path:
+    return root / "owner" / OWNER_CORRECTIONS_FILENAME
+
+
+def load_owner_corrections(root: Path) -> dict:
+    """The authoritative owner record: corrections, dismissals, surfacing
+    instructions. Owner-authored (never dreamer-generated) — a campaign dream
+    must never overwrite a newer owner update learned elsewhere."""
+    path = _owner_corrections_path(root)
+    if not path.is_file():
+        return {"corrections": [], "dismissals": [], "surfacing": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("corrections", "dismissals", "surfacing"):
+            if not isinstance(data.get(key), list):
+                data[key] = []
+        return data
+    except Exception:
+        return {"corrections": [], "dismissals": [], "surfacing": []}
+
+
+def owner_correct(root: Path, kind: str, target: str, text: str = "", *, scope: str = "_global") -> dict:
+    """Apply one authoritative owner correction/dismissal/surfacing instruction.
+
+    kind ∈ {correct, dismiss, surface}. Takes effect on the next READ.
+    Append-only journal of owner authority — never deleted, so a dismissed
+    claim can never be resurrected by replaying an old archive."""
+    data = load_owner_corrections(root)
+    entry = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "authority": "owner",
+        "kind": kind,
+        "target": target,
+        "text": text,
+        "scope": scope,
+    }
+    key = {"correct": "corrections", "dismiss": "dismissals", "surface": "surfacing"}.get(kind)
+    if key is None:
+        raise ValueError(f"unknown owner correction kind: {kind}")
+    data[key].append(entry)
+    path = _owner_corrections_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return entry
+
+
+def apply_owner_filters(root: Path, text: str) -> str:
+    """Read-time application (slice 3): strip dismissed content and append
+    owner surfacing instructions. Cheap, deterministic, composition-free."""
+    data = load_owner_corrections(root)
+    dismissed = [d.get("target", "") for d in data.get("dismissals", []) if d.get("target")]
+    out_lines = []
+    for line in text.splitlines():
+        if any(target and target in line for target in dismissed):
+            continue  # a dismissed claim never resurfaces
+        out_lines.append(line)
+    out = "\n".join(out_lines)
+    surf = data.get("surfacing", [])
+    if surf:
+        out += "\n\n## owner surfacing instructions\n"
+        for s in surf:
+            if s.get("text"):
+                out += f"- {s['text']} (as-of {str(s.get('ts', ''))[:10]})\n"
+    return out
+
+
+def durable_owner_context(root: Path) -> str:
+    """The durable owner layer, read at session start."""
+    path = get_namespace_dir(root, GLOBAL_NAMESPACE, create=False) / DURABLE_OWNER_FILENAME
+    if not path.is_file():
+        return ""
+    content = path.read_text(encoding="utf-8")
+    if content.startswith("---\n"):
+        end = content.find("\n---\n", 4)
+        if end != -1:
+            content = content[end + 5:]
+    return content.strip()
+
+
+# ── [slice 2, sol 2026-10-16] TIME-AWARE MEMORY DELIVERY ─────────────────────
+# Three DISTINCT dates per claim (never conflated): evidence time (when the
+# underlying observation was made), validity boundary (when it stops being
+# usable as current, if known), review deadline (when it needs checking; passing
+# it does not prove it false). Generation time stays separate — rewriting a
+# claim today must never make old evidence look newly observed.
+# Ages are computed AT READ, never stored (no composer tokens maintaining
+# changing age strings).
+CLAIMS_FILENAME = "claims.json"
+
+
+def _claims_path(root: Path, ns: str) -> Path:
+    return get_dream_dir(root, ns, create=False) / CLAIMS_FILENAME
+
+
+def load_claim_state(root: Path, ns: str) -> dict:
+    """Persistent, evidence-linked claim state for one namespace."""
+    path = _claims_path(root, ns)
+    if not path.is_file():
+        return {"ns": ns, "claims": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data.get("claims"), dict):
+            data["claims"] = {}
+        return data
+    except Exception:
+        return {"ns": ns, "claims": {}}
+
+
+def save_claim_state(root: Path, ns: str, state: dict) -> None:
+    path = _claims_path(root, ns)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def merge_claims(state: dict, claims: list, as_of: str) -> dict:
+    """Fold a dream's CLAIMS into persistent state (slice 2 + slice 4).
+
+    Preserves supersession edges and evidence dates: a claim older in evidence
+    is NEVER re-stamped by a newer dream just because it was restated.
+    Temporal fields are optional and validated; unknown values are dropped
+    rather than invented."""
+    store = state.setdefault("claims", {})
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        cid = str(claim.get("claim_id") or "").strip()
+        text = str(claim.get("text") or "").strip()
+        if not cid or not text:
+            continue
+        existing = store.get(cid, {})
+        entry = {
+            "text": text,
+            "as_of": str(claim.get("as_of") or as_of),
+            "proof": str(claim.get("proof") or "claimed"),
+            # generation is separate from evidence
+            "last_seen": as_of,
+            "source_refs": list(claim.get("source_refs") or existing.get("source_refs") or []),
+        }
+        for field in ("valid_from", "valid_until", "review_after"):
+            value = claim.get(field) or existing.get(field)
+            if value and re.match(r"^\d{4}-\d{2}-\d{2}$", str(value)):
+                entry[field] = str(value)
+        supersedes = claim.get("supersedes") or existing.get("supersedes")
+        if supersedes:
+            entry["supersedes"] = supersedes
+        # evidence date is sticky: a restatement does not re-date the evidence
+        if existing.get("as_of"):
+            entry["as_of"] = existing["as_of"]
+        store[cid] = entry
+        # supersession edge: mark the superseded claim
+        if supersedes and supersedes in store:
+            store[supersedes]["superseded_by"] = cid
+    return state
+
+
+def claim_status(entry: dict, today: str) -> str:
+    """ok | expired | due | superseded — computed at read, never stored."""
+    if entry.get("superseded_by"):
+        return "superseded"
+    valid_until = entry.get("valid_until")
+    if valid_until and str(valid_until) < today:
+        return "expired"
+    review_after = entry.get("review_after")
+    if review_after and str(review_after) <= today:
+        return "due"
+    return "ok"
+
+
+def temporal_envelope(root: Path, ns: str, *, today: str | None = None) -> str:
+    """The read-time temporal envelope (slice 2): today's date, synthesis age,
+    and per-claim ages/statuses. Returned WITHOUT spending composer tokens."""
+    today = today or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    lines = [f"Now: {today} (UTC)"]
+    watermark = load_dream_watermark(root, ns)
+    last_dream = watermark.get("last_dream_ts")
+    if last_dream:
+        try:
+            age_days = (
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.datetime.fromisoformat(str(last_dream))
+            ).days
+            lines.append(f"Synthesis: {age_days}d old (watermark seq {watermark.get('last_seq', 0)})")
+        except Exception:
+            pass
+    state = load_claim_state(root, ns)
+    claims = state.get("claims", {})
+    if claims:
+        expired = sorted(c for c, e in claims.items() if claim_status(e, today) == "expired")
+        due = sorted(c for c, e in claims.items() if claim_status(e, today) == "due")
+        dead = sorted(c for c, e in claims.items() if claim_status(e, today) == "superseded")
+        lines.append(
+            f"Claims: {len(claims)} tracked · {len(expired)} expired · {len(due)} due · {len(dead)} superseded"
+        )
+        for cid in expired[:5]:
+            entry = claims[cid]
+            lines.append(f"  [{cid}] EXPIRED {entry.get('valid_until')} — evidence {entry.get('as_of')}: {entry.get('text', '')[:90]}")
+        for cid in due[:5]:
+            entry = claims[cid]
+            lines.append(f"  [{cid}] REVIEW DUE {entry.get('review_after')} — {entry.get('text', '')[:90]}")
+        for cid in dead[:3]:
+            entry = claims[cid]
+            lines.append(f"  [{cid}] SUPERSEDED by {entry.get('superseded_by')}: {entry.get('text', '')[:80]}")
+    return "\n".join(lines)
+
+
+def temporal_work_due(root: Path, ns: str, *, today: str | None = None) -> bool:
+    """Slice 2 trigger: work_due = new_source_delta OR temporal_deadline_due.
+    Without the second term a plan never ages when conversations stop."""
+    today = today or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    state = load_claim_state(root, ns)
+    for entry in state.get("claims", {}).values():
+        if claim_status(entry, today) in ("expired", "due"):
+            return True
+        valid_until = entry.get("valid_until")
+        # a claim whose validity just ended within the last 2 days is fresh work
+        if valid_until and valid_until <= today:
+            return True
+    return False
+
+
 def _dream_publish_door(
     root: Path,
     ns: str,
@@ -3786,6 +4047,62 @@ def dream_fence_violation(root: Path, ns: str, captured_seq: int) -> str:
 DREAM_AUTO_COOLDOWN_S = 2 * 60 * 60
 DREAM_AUTO_BACKOFF_S = 60 * 60
 CANARY_MEMORY_MAX_LINES = 400
+# [slice 1, sol 2026-10-16] the progress contract: every auto-dream invocation
+# writes a bounded execution receipt; the canary (INDEPENDENT of the dreamer —
+# a dreamer cannot report its own absence) checks receipt liveness + synthesis
+# progress deadlines. Backoff is a FAILURE state with a retry time; it never
+# refreshes a healthy timestamp.
+DREAM_RECEIPT_MAX = 64          # bounded receipt log (drop oldest)
+DREAM_PROGRESS_DEADLINE_S = 6 * 3600   # pending deltas older than this = violation
+
+
+def _dream_receipt(root: Path, outcome: str, reason: str = "", ns: str = "") -> None:
+    """Append one bounded execution receipt (slice 1). Valid outcomes: idle,
+    deferred, running, failed, applied. Never raises."""
+    try:
+        stamp_dir = root / "dream"
+        stamp_dir.mkdir(parents=True, exist_ok=True)
+        path = stamp_dir / "receipts.jsonl"
+        records = []
+        if path.is_file():
+            records = [json.loads(l) for l in path.read_text().splitlines() if l.strip()][-DREAM_RECEIPT_MAX + 1:]
+        records.append({
+            "ts": time.time(),
+            "outcome": outcome,
+            "ns": ns,
+            "reason": reason[:200],
+        })
+        path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    except Exception:
+        pass  # the receipt can never fail the tick
+
+
+def _dream_backoff_remaining(root: Path) -> float:
+    """Seconds of backoff left, or 0."""
+    stamp = root / "dream" / "auto-backoff.json"
+    try:
+        data = json.loads(stamp.read_text(encoding="utf-8"))
+        return max(0.0, DREAM_AUTO_BACKOFF_S - (time.time() - float(data.get("ts", 0))))
+    except Exception:
+        return 0.0
+
+
+def _dream_pending_summary(root: Path, ns: str) -> dict:
+    """Per-namespace coverage state (slice 1): deltas pending, oldest pending
+    age, and whether the progress deadline is blown."""
+    try:
+        watermark = load_dream_watermark(root, ns)
+    except Exception:
+        watermark = {"last_seq": 0}
+    consumed = watermark.get("last_seq", 0)
+    live = [r for r in dream_live_activity(root, ns) if r.get("seq", 0) > consumed]
+    now = time.time()
+    oldest = min((now - float(r.get("ts", now)) for r in live), default=0.0)
+    return {
+        "pending": len(live),
+        "oldest_pending_s": int(oldest),
+        "overdue": bool(live) and oldest > DREAM_PROGRESS_DEADLINE_S,
+    }
 
 
 def _dream_auto_backoff(root: Path, reason: str) -> None:
@@ -3807,7 +4124,9 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
     if backoff.is_file():
         try:
             stamp = json.loads(backoff.read_text(encoding="utf-8"))
-            if time.time() - float(stamp.get("ts", 0)) < DREAM_AUTO_BACKOFF_S:
+            remaining = DREAM_AUTO_BACKOFF_S - (time.time() - float(stamp.get("ts", 0)))
+            if remaining > 0:
+                _dream_receipt(root, "deferred", f"backoff {int(remaining)}s: {str(stamp.get('reason', '?'))[:120]}")
                 return f"auto-dream: backing off ({str(stamp.get('reason', '?'))[:80]})"
         except Exception:
             pass
@@ -3840,13 +4159,23 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
             delta = sum(
                 1 for rec in dream_live_activity(root, ns) if rec.get("seq", 0) > consumed
             )
-            if delta <= 0:
+            # [slice 2 trigger] work_due = new_source_delta OR temporal_deadline_due:
+            # an expired/due claim with ZERO new deltas still deserves a dream.
+            if delta <= 0 and not temporal_work_due(root, ns):
                 continue
-            candidates.append((delta, ns))
+            if delta <= 0:
+                delta = 1  # deadline-driven dream (temporal work, no deltas)
+            # [slice 1 fairness] score = delta * age pressure so a starving
+            # small namespace (old pending, few deltas) can outrank a churny
+            # big one; the pure-delta sort starved smaller namespaces.
+            summary = _dream_pending_summary(root, ns)
+            age_hours = summary["oldest_pending_s"] / 3600.0
+            candidates.append((delta * (1.0 + min(age_hours, 24.0) / 6.0), delta, ns, summary))
     if not candidates:
+        _dream_receipt(root, "idle", "no candidate (clean tick)")
         return "auto-dream: no candidate (clean tick)"
     candidates.sort(reverse=True)
-    _, ns = candidates[0]
+    _, _, ns, _ = candidates[0]
     # ⛔ `--ns <ns>` breaks when ns starts with a dash (every namespace does):
     # argparse reads the value as another option ("expected one argument").
     # The `=` form is the documented convention — the auto-dreamer died on
@@ -3869,13 +4198,69 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
         )
     except subprocess.TimeoutExpired:
         _dream_auto_backoff(root, "composer timeout")
+        _dream_receipt(root, "failed", "composer timeout", ns)
         return "auto-dream: composer timed out; 1h backoff stamped"
     if run_.returncode != 0:
         detail = (run_.stderr or run_.stdout or "").strip().splitlines()
-        _dream_auto_backoff(root, detail[-1] if detail else "composer failed")
+        reason = detail[-1] if detail else "composer failed"
+        _dream_auto_backoff(root, reason)
+        _dream_receipt(root, "failed", reason, ns)
         return "auto-dream: composer failed; 1h backoff stamped"
     lines = (run_.stdout or "").strip().splitlines()
+    _dream_receipt(root, "applied", lines[-1] if lines else "dreamed", ns)
     return f"auto-dream[{ns}]: {lines[-1] if lines else 'dreamed'}"
+
+
+def cmd_now(args):
+    """[slice 2+3] The session-start orientation read: durable owner context +
+    NOW.md + the computed temporal envelope (claim ages, expiries,
+    supersessions), with owner dismissals/surfacing applied at READ time.
+    Ages are computed here, never stored — this is how a fresh session becomes
+    time-aware without spending composer tokens."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    ns = detect_namespace(override=getattr(args, "ns", None))
+    if not ns:
+        raise SystemExit("now: --ns is required")
+    durable = durable_owner_context(root)
+    if durable:
+        print("── durable owner context ──")
+        print(apply_owner_filters(root, durable))
+        print()
+    ns_dir = get_namespace_dir(root, ns, create=False)
+    now_path = ns_dir / "NOW.md"
+    if now_path.is_file():
+        content = now_path.read_text(encoding="utf-8")
+        if content.startswith("---\n"):
+            end = content.find("\n---\n", 4)
+            if end != -1:
+                content = content[end + 5:]
+        print(apply_owner_filters(root, content.rstrip()))
+    else:
+        print(f"(no NOW.md yet for {ns} — the dreamer has not synthesized this namespace)")
+    print()
+    print("── temporal envelope ──")
+    print(temporal_envelope(root, ns))
+
+
+def cmd_owner(args):
+    """[slice 3] The authoritative owner correction path: correct / dismiss /
+    surface. Takes effect on the next read, no dreamer needed."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    kind = {"--correct": "correct", "--dismiss": "dismiss", "--surface": "surface"}
+    chosen = None
+    for flag, name in kind.items():
+        if getattr(args, name, False):
+            chosen = name
+    if not chosen:
+        raise SystemExit("owner: choose one of --correct / --dismiss / --surface")
+    if getattr(args, "list", False):
+        print(json.dumps(load_owner_corrections(root), indent=2))
+        return
+    target = getattr(args, "target", "") or ""
+    text = getattr(args, "text", "") or ""
+    entry = owner_correct(root, chosen, target, text, scope=getattr(args, "scope", "_global") or "_global")
+    print(f"owner {chosen} recorded: {json.dumps(entry)[:200]}")
+    print("(effective on the next memory read — no dream, no quiescence wait)")
 
 
 def cmd_canary(args):
@@ -3924,6 +4309,53 @@ def cmd_canary(args):
             ]
             if any(later < earlier for earlier, later in zip(seqs, seqs[1:])):
                 violations.append(f"{ns_dir.name}: dream watermark seqs not monotonic")
+
+    # ── [slice 1, sol 2026-10-16] DREAM LIVENESS + PROGRESS CONTRACT ──────────
+    # The canary is the INDEPENDENT monitor (a dreamer cannot report its own
+    # absence — the 2026-10-06..16 silent death passed every prior probe).
+    # Two separate checks: (1) EXECUTION liveness — did the controller tick, or
+    # is it in a standing failure backoff? (2) SYNTHESIS progress — with work
+    # pending, is source coverage advancing within the declared service bound?
+    if dream_root.is_dir():
+        receipt_path = dream_root / "receipts.jsonl"
+        backoff_path = dream_root / "auto-backoff.json"
+        remaining = 0.0
+        try:
+            stamp = json.loads(backoff_path.read_text(encoding="utf-8"))
+            remaining = max(0.0, DREAM_AUTO_BACKOFF_S - (time.time() - float(stamp.get("ts", 0))))
+            if remaining > 0:
+                violations.append(
+                    f"dreamer: standing FAILURE backoff ({int(remaining)}s left: "
+                    f"{str(stamp.get('reason', '?'))[:120]}) — execution not healthy"
+                )
+        except Exception:
+            pass
+        last_receipt_ts = 0.0
+        try:
+            lines = [l for l in receipt_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if lines:
+                last_receipt_ts = float(json.loads(lines[-1]).get("ts", 0))
+        except Exception:
+            pass
+        # A live tick should leave receipts; absence over 2h with any pending
+        # namespace means the controller is not running at all.
+        for ns_dir in sorted(dream_root.glob("*/")):
+            summary = _dream_pending_summary(root, ns_dir.name)
+            if summary["pending"] <= 0:
+                continue
+            if summary["overdue"]:
+                violations.append(
+                    f"dreamer: ns {ns_dir.name} has {summary['pending']} pending deltas, "
+                    f"oldest {summary['oldest_pending_s']}s > {DREAM_PROGRESS_DEADLINE_S}s — "
+                    "synthesis progress deadline BLOWN (degraded freshness)"
+                )
+            if remaining <= 0 and last_receipt_ts and (
+                time.time() - last_receipt_ts > DREAM_PROGRESS_DEADLINE_S
+            ):
+                violations.append(
+                    f"dreamer: no execution receipt for {int(time.time() - last_receipt_ts)}s "
+                    f"while ns {ns_dir.name} has {summary['pending']} pending — controller not ticking"
+                )
     if violations:
         for violation in violations:
             print(f"canary: {violation}", file=sys.stderr)
@@ -4095,6 +4527,16 @@ def cmd_dream(args):
                     applied_ops.append({**op, "applied": False, "note": "proposal logged only"})
         finally:
             _flock_close(lock)
+
+        # [slice 2] fold CLAIMS into persistent claim state (supersession
+        # edges preserved; evidence dates sticky). Contested claims are NOT
+        # stored as ok — the critic's demotion is respected.
+        try:
+            state = load_claim_state(root, ns)
+            state = merge_claims(state, parsed["claims"], today)
+            save_claim_state(root, ns, state)
+        except Exception as state_error:
+            print(f"dream: claim-state persistence skipped: {state_error}", file=sys.stderr)
 
         watermark = load_dream_watermark(root, ns)
         dream_record = {
@@ -4396,6 +4838,21 @@ def main():
     )
     p_search.add_argument("pattern", help="regex to match")
     p_search.add_argument("--all", action="store_true", help="search every namespace (default when --ns is omitted)")
+
+    # [slice 2] the read-time temporal envelope verb
+    p_now = subparsers.add_parser("now", parents=[common_parser], help="Read NOW.md + the temporal envelope (claim ages, expiries, supersessions) — the session-start orientation read")
+    p_now.set_defaults(fn=cmd_now)
+
+    # [slice 3] authoritative owner corrections
+    p_owner = subparsers.add_parser("owner", parents=[common_parser], help="Authoritative owner corrections: --correct/--dismiss/--surface (effective on next read); --list shows the record")
+    p_owner.add_argument("--correct", action="store_true")
+    p_owner.add_argument("--dismiss", action="store_true")
+    p_owner.add_argument("--surface", action="store_true")
+    p_owner.add_argument("--target", default="", help="the claim id / text fragment the correction targets")
+    p_owner.add_argument("--text", default="", help="the corrected text or surfacing instruction")
+    p_owner.add_argument("--scope", default="_global")
+    p_owner.add_argument("--list", action="store_true")
+    p_owner.set_defaults(fn=cmd_owner)
     p_search.add_argument("-i", "--ignore-case", action="store_true")
     p_search.add_argument("--max-lines", type=int, default=50)
 
@@ -4437,6 +4894,10 @@ def main():
         cmd_dream(args)
     elif args.subcommand == "search":
         cmd_search(args)
+    elif args.subcommand == "now":
+        cmd_now(args)
+    elif args.subcommand == "owner":
+        cmd_owner(args)
     else:
         parser.print_help()
 
