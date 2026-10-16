@@ -1755,9 +1755,16 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   re-derived None and silently rejected every frame event — the s52
   "250ms floor hides fast frames" story was THIS loss, not the floor);
   raises now pair paint_source=frame_full deterministically (2/2 after
-  the fix, 1/2 before, on the dev harness). [11.215]'s appear-over bar
-  and the close/teardown family still need fresh runs on the dev-local
-  harness.
+  the fix, 1/2 before, on the dev harness). S53 unit B: Leg A
+  DECOMPOSED by the new app-render section spans (lane
+  lane/f7/app-render-sections 82e35573, main b4453b61) — the app root
+  render costs ~60ms/pass on the dev harness and ~80% of it is
+  `app.snapshot` (the `state.read().snapshot_shared()` row-clone pass,
+  ~47ms mean) while `app.rsx` is 0.2ms and children stay sub-5ms; THE
+  FIX UNIT is the snapshot build (finer-grained sharing so a
+  click-caused render stops recloning the whole shared snapshot), not
+  the tree. [11.215]'s appear-over bar and the close/teardown family
+  still need fresh runs on the dev-local harness.
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
