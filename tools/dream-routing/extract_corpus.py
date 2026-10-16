@@ -217,9 +217,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=os.path.join(here, "routing-config.json"))
     ap.add_argument("--out", default=os.path.join(here, "corpus", "corpus.jsonl"))
+    ap.add_argument("--seed", type=int, default=SEED,
+                    help="sampling seed (panel sample-variance testing; "
+                         "default keeps the canonical corpus reproducible)")
     a = ap.parse_args()
     cfg = json.load(open(a.config, encoding="utf-8"))
-    rng = random.Random(SEED)
+    rng = random.Random(a.seed)
     cases = []
     for fam, fcfg in cfg["families"].items():
         cases += EXTRACTORS[fcfg["kind"]](fcfg, rng)
