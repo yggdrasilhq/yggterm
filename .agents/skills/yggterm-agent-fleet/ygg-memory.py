@@ -3500,6 +3500,10 @@ def prepare_dream(
         "extra_inputs": [e["path"] for e in extras],
         "budget": budget,
         "brief_bytes": brief_path.stat().st_size,
+        # [slice 2] the owner's focus doc read AT STAGING (the doc is the
+        # SSOT; the CLI is optional sugar) — recorded so briefs/oplogs show
+        # WHY this namespace was prioritized.
+        "focus": focus_view(root, ns),
         # [slice 4] coverage manifest: per-event disposition, recoverable
         "coverage": manifest_entries,
         "retained_claims_count": len(state.get("claims", {})),
@@ -4202,8 +4206,20 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
     if not candidates:
         _dream_receipt(root, "idle", "no candidate (clean tick)")
         return "auto-dream: no candidate (clean tick)"
-    candidates.sort(reverse=True)
-    _, _, ns, _ = candidates[0]
+    # [slice 2] FOCUS APPLIES TO RANKING ONLY — never to eligibility. The
+    # quiescence/cooldown/pending filters above already ran; a boost cannot
+    # resurrect a blocked namespace (focus reorders, it does not grant).
+    focused_candidates = []
+    for score, delta_count, ns_name, summary in candidates:
+        focus = focus_view(root, ns_name)
+        if focus["exclusive"] and not focus["matched"]:
+            continue  # exclusive mode: all DISCRETIONARY work goes to the scope
+        focused_candidates.append((score * focus["weight"], delta_count, ns_name, summary, focus["weight"]))
+    if not focused_candidates:
+        _dream_receipt(root, "deferred", "all candidates excluded by an exclusive focus")
+        return "auto-dream: deferred (exclusive focus excludes every candidate)"
+    focused_candidates.sort(reverse=True)
+    _, _, ns, _, weight = focused_candidates[0]
     # ⛔ `--ns <ns>` breaks when ns starts with a dash (every namespace does):
     # argparse reads the value as another option ("expected one argument").
     # The `=` form is the documented convention — the auto-dreamer died on
@@ -4303,6 +4319,7 @@ def cmd_budget(args):
             "action": "admit", "bucket": args.bucket,
             "input": args.input, "generated": args.generated, "cash_cents": args.cash_cents,
             "ttl": args.ttl, "purpose": args.purpose,
+            "class": getattr(args, "work_class", None),
         }
     elif getattr(args, "settle", None):
         op = {
@@ -4334,6 +4351,39 @@ def cmd_budget_op(args):
     except json.JSONDecodeError as error:
         raise SystemExit(f"_budget-op: bad stdin JSON: {error}")
     print(json.dumps(budget_run_local(root, op)))
+
+
+def cmd_work_registry(args):
+    """[slice 2] The owner-declared work-class registry. Mutations ride the
+    budget authority plane (serialized with admissions) and can only TIGHTEN
+    the seed ceilings — raising a budget is always outside autonomous
+    authority (sol round-4 Q2)."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    if getattr(args, "list_registry", False):
+        result = budget_op(root, {"action": "registry-read"})
+        print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+        return
+    class_id = args.class_id
+    if not class_id:
+        raise SystemExit("work-registry: --class-id is required for mutations")
+    op = {"action": "registry-update", "class_id": class_id}
+    if args.enable:
+        op["enabled"] = True
+    elif args.disable:
+        op["enabled"] = False
+    if args.input is not None or args.generated is not None or args.cash_cents is not None:
+        seed = WORK_REGISTRY_CLASSES.get(class_id, {}).get("per_item", {})
+        op["per_item"] = {
+            "input": args.input if args.input is not None else seed.get("input", 0),
+            "generated": args.generated if args.generated is not None else seed.get("generated", 0),
+            "cash_cents": args.cash_cents if args.cash_cents is not None else seed.get("cash_cents", 0),
+        }
+    if "enabled" not in op and "per_item" not in op:
+        raise SystemExit("work-registry: choose --enable / --disable / --set-per-item dimensions")
+    result = budget_op(root, op)
+    print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+    if not result.get("updated"):
+        raise SystemExit(3)
 
 
 def cmd_canary(args):
@@ -4453,6 +4503,269 @@ def budget_authority_host() -> str:
 
 def budget_ledger_path(root: Path) -> Path:
     return root / "dream" / "budget" / "ledger.json"
+
+
+# ── [slice 2] WORK-CLASS REGISTRY — owner-declared, enforced in code ────────
+# Sol round-4 Q2: the registry grants only explicitly listed operations;
+# missing or contradictory authority produces a narrow forwarding item, never
+# self-interpreted permission. Seeds are the OWNER ceilings (Q2 table): a
+# mutation may tighten them, never raise them ("changing the registry's own
+# permissions, or raising its budgets" is always outside autonomous authority).
+WORK_REGISTRY_CLASSES = {
+    "callgraph": {
+        "per_item": {"input": 8_000, "generated": 600, "cash_cents": 4},
+        "bucket": "work:callgraph",
+        "forbidden": ["new-engine-purchase", "arbitrary-identity-merge"],
+        "owner_authorization_ref": "sol-round4 2026-10-16 (Q2 table)",
+    },
+    "dossiergraph": {
+        "per_item": {"input": 12_000, "generated": 1_200, "cash_cents": 8},
+        "bucket": "work:dossiergraph",
+        "forbidden": ["outward-action", "verified-bundle-without-hash-check"],
+        "owner_authorization_ref": "sol-round4 2026-10-16 (Q2 table)",
+    },
+    "infra-updates": {
+        "per_item": {"input": 4_000, "generated": 400, "cash_cents": 3},
+        "bucket": "work:infra",
+        "forbidden": ["jojo-reboot", "outside-target-allowlist"],
+        "owner_authorization_ref": "sol-round4 2026-10-16 (Q2 table)",
+    },
+    "legacy-notes-conversion": {
+        "per_item": {"input": 8_000, "generated": 800, "cash_cents": 5},
+        "bucket": "work:conversion",
+        "forbidden": ["semantic-rewrite", "invent-missing-material"],
+        "owner_authorization_ref": "sol-round4 2026-10-16 (Q2 table)",
+    },
+    "learning-linkages": {
+        "per_item": {"input": 4_000, "generated": 400, "cash_cents": 2},
+        "bucket": "work:learning",
+        "forbidden": ["alter-learner-achievements", "pattern-to-fit"],
+        "owner_authorization_ref": "sol-round4 2026-10-16 (Q2 table)",
+    },
+    "consult-docs": {
+        "per_item": {"input": 12_000, "generated": 1_200, "cash_cents": 8},
+        "bucket": "work:consult-docs",
+        "forbidden": ["amend-law", "self-authorize-implementation", "unattended-sol-high"],
+        "owner_authorization_ref": "sol-round4 2026-10-16 (Q2 table)",
+    },
+}
+
+
+def work_registry_path(root: Path) -> Path:
+    return root / "dream" / "budget" / "work-registry.json"
+
+
+def work_forward_path(root: Path) -> Path:
+    return root / "dream" / "budget" / "forwarded.jsonl"
+
+
+def load_work_registry(root: Path) -> dict:
+    """The effective registry: seed ceilings clamped with any persisted
+    (owner/seat-declared) TIGHTENINGS. A missing or corrupt file leaves the
+    seeds standing — enforcement never defaults to permissive."""
+    registry = {"version": 1, "classes": {}}
+    path = work_registry_path(root)
+    if path.is_file():
+        try:
+            registry = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass  # corrupt overrides fall back to seeds
+    classes = {}
+    for class_id, seed in WORK_REGISTRY_CLASSES.items():
+        stored = (registry.get("classes") or {}).get(class_id, {})
+        per_item = {
+            dim: min(int(stored.get("per_item", {}).get(dim, seed["per_item"][dim])), seed["per_item"][dim])
+            for dim in BUDGET_DIMS
+        }
+        classes[class_id] = {
+            "enabled": bool(stored.get("enabled", True)),
+            "per_item": per_item,
+            "bucket": seed["bucket"],
+            "forbidden": seed["forbidden"],
+            "owner_authorization_ref": seed["owner_authorization_ref"],
+            "updated_at": stored.get("updated_at"),
+        }
+    return {"version": registry.get("version", 1), "classes": classes}
+
+
+def _budget_forward_tail(root: Path, limit: int = 20) -> list[dict]:
+    """The bounded view of the owner-remainder queue (newest last)."""
+    path = work_forward_path(root)
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows[-limit:]
+
+
+def work_registry_forward(root: Path, item: dict) -> None:
+    """The narrow owner remainder (Q2: decision needed + evidence +
+    anticipated default + resume checkpoint). Deduped — the same blockage
+    appears ONCE in the queue, not once per refused attempt."""
+    key = f"{item.get('kind')}:{item.get('class_id', '')}:{item.get('reason', '')}"
+    seen = set()
+    path = work_forward_path(root)
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                seen.add(json.loads(line).get("key"))
+            except Exception:
+                continue
+    if key in seen:
+        return
+    item = {"key": key, "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(), **item}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(item) + "\n")
+
+
+# ── [slice 2] FOCUS DOCS — the owner's priority doc (memory doc, not CLI) ──
+# SSOT: hub door `_global/dream-focus.md` (owner-authored origin). Semantics
+# per sol round-4 Q3 + owner addendum: boost ×4, 7d default expiry (explicit
+# `expires:` honored), exclusive ≤24h, overlapping boosts take the MAX, and a
+# selector that resolves to nothing stays UNRESOLVED instead of silently
+# choosing a target. Focus reorders; it never grants authority.
+FOCUS_DOC_NAMESPACE = "_global"
+FOCUS_DOC_NAME = "dream-focus.md"
+FOCUS_BOOST_WEIGHT = 4
+FOCUS_STANDING_WEIGHT = 2
+FOCUS_DEFAULT_DAYS = 7
+FOCUS_EXCLUSIVE_MAX_S = 24 * 3600
+
+
+def parse_focus_doc(text: str, today: str | None = None) -> dict:
+    """Parse the owner's focus doc into active directives + standing
+    constraints. Expiry is COMPUTED here, never stored: entries past their
+    `expires:` (default today+7d) are pruned from the active set."""
+    today = today or budget_today()
+    today_d = datetime.date.fromisoformat(today)
+    section = None
+    directives: list[dict] = []
+    constraints: list[dict] = []
+    pending: dict | None = None
+
+    def _flush():
+        nonlocal pending
+        if pending is None:
+            return
+        target = directives if pending["_section"] == "active" else constraints
+        target.append({k: v for k, v in pending.items() if not k.startswith("_")})
+        pending = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("## "):
+            _flush()
+            heading = line[3:].strip().lower()
+            section = "active" if "active focus" in heading else ("standing" if "standing" in heading else None)
+            continue
+        if section is None or line.startswith("#") or not line.strip():
+            _flush()
+            continue
+        if "<!--" in line or line.strip().startswith("Owner:"):
+            continue
+        if line.lstrip().startswith("- "):
+            _flush()
+            pending = {
+                "_section": section,
+                "text": line.lstrip()[2:].strip(),
+                "as_of": None,
+                "expires": None,
+                "exclusive": False,
+                "scopes": [],
+                "namespaces": [],
+            }
+        elif pending is not None:
+            pending["text"] += " " + line.strip()
+        else:
+            continue
+        body = pending["text"]
+        stamp = re.search(r"\[as-of:\s*(\d{4}-\d{2}-\d{2})", body)
+        if stamp:
+            pending["as_of"] = stamp.group(1)
+        expiry = re.search(r"expires:\s*(\d{4}-\d{2}-\d{2})", body)
+        if expiry:
+            pending["expires"] = expiry.group(1)
+        scope_body = body
+        if re.search(r"\bexclusive\b", scope_body, re.IGNORECASE):
+            pending["exclusive"] = True
+            # the bare flag ends the scope list — but only AFTER the scope
+            # marker (a directive title may legitimately say "exclusive")
+            scope_marker = scope_body.lower().find("scope:")
+            excl_after = scope_body.lower().find("exclusive", scope_marker + 6) if scope_marker != -1 else -1
+            if excl_after != -1:
+                scope_body = scope_body[:excl_after]
+        for chunk in re.findall(
+            r"scope:\s*([a-zA-Z0-9_,\.\-]+(?:[\s,]+[a-zA-Z0-9_,\.\-]+)*)\s*(?=\]|\||;|$|\[)",
+            scope_body,
+        ):
+            pending["scopes"] += [tok for tok in re.split(r"[\s,]+", chunk) if tok]
+        pending["namespaces"] += re.findall(r"(-[a-z0-9][a-z0-9\-]{3,}|_global)", body)
+    _flush()
+
+    active = []
+    for directive in directives:
+        expires = directive.get("expires")
+        if not expires:
+            if directive.get("exclusive"):
+                # exclusive caps at ≤24h when the owner gives no duration
+                expires = (today_d + datetime.timedelta(days=1)).isoformat()
+            else:
+                expires = (today_d + datetime.timedelta(days=FOCUS_DEFAULT_DAYS)).isoformat()
+        directive = {**directive, "expires": expires}
+        if expires >= today:
+            active.append(directive)
+    return {"today": today, "directives": active, "constraints": constraints}
+
+
+def focus_scope_matches(selector: str, target: str) -> bool:
+    """A selector resolves against a namespace or work-class id by normalized
+    substring; anything else stays unresolved (never a silent guess)."""
+    def norm(value: str) -> str:
+        return re.sub(r"[\s_]+", "-", value.strip().lower()).strip("-")
+
+    sel, tgt = norm(selector), norm(target)
+    if not sel:
+        return False
+    return sel in tgt or tgt in sel
+
+
+def _read_ns_file(root: Path, ns: str, filename: str) -> str:
+    path = get_namespace_dir(root, ns, create=False) / filename
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def focus_view(root: Path, ns: str, today: str | None = None) -> dict:
+    """The resolved focus state for one namespace: weight (MAX across
+    matching directives — never multiplied), exclusive participation, and
+    exactly what resolved vs stayed unresolved."""
+    doc = parse_focus_doc(_read_ns_file(root, FOCUS_DOC_NAMESPACE, FOCUS_DOC_NAME), today=today)
+    matched, unresolved = [], []
+    weight = 1
+    exclusive = False
+    for directive in doc["directives"]:
+        selectors = directive.get("scopes") or []
+        if not selectors:
+            unresolved.append(directive["text"][:90])
+            continue
+        if any(focus_scope_matches(selector, ns) for selector in selectors):
+            matched.append(directive["text"][:90])
+            weight = max(weight, FOCUS_BOOST_WEIGHT)
+            if directive.get("exclusive"):
+                exclusive = True
+    if weight == 1:
+        for constraint in doc["constraints"]:
+            if any(focus_scope_matches(token, ns) for token in constraint.get("namespaces", [])):
+                weight = FOCUS_STANDING_WEIGHT
+                matched.append("(standing) " + constraint["text"][:80])
+                break
+    return {"ns": ns, "weight": weight, "exclusive": exclusive, "matched": matched, "unresolved": unresolved}
 
 
 def budget_today() -> str:
@@ -4583,51 +4896,98 @@ def _budget_op(root: Path, op: dict) -> dict:
 
     if action == "admit":
         bucket = str(op.get("bucket", ""))
-        spec = policy["buckets"].get(bucket)
-        if spec is None:
-            result = {"admitted": False, "reason": f"unknown-bucket:{bucket}"}
-        elif not _budget_dims_all_nonnegative(op):
-            result = {"admitted": False, "reason": "bad-estimate"}
-        else:
-            est = {dim: int(op.get(dim, 0)) for dim in BUDGET_DIMS}
-            if all(v == 0 for v in est.values()):
-                result = {"admitted": False, "reason": "zero-estimate"}
+        class_refusal = None
+        class_id = op.get("class")
+        if class_id:
+            # [slice 2] AUTHORITY GATE — enforced here in serialized code,
+            # never interpreted by the model. Missing/contradictory authority
+            # produces a narrow forward, not self-granted permission. Focus
+            # never reaches this plane: a boost cannot grant a class.
+            cls = load_work_registry(root)["classes"].get(str(class_id))
+            if cls is None:
+                work_registry_forward(root, {
+                    "kind": "unknown-class", "class_id": str(class_id),
+                    "reason": "class not in the owner registry",
+                    "decision_needed": f"declare work class '{class_id}' or stop attempting it",
+                    "evidence": ["sol round-4 Q2: registry grants only listed operations"],
+                    "anticipated_default": "work stays blocked; no admission",
+                    "resume": "after the owner declares the class",
+                })
+                class_refusal = f"unknown-class:{class_id}"
+            elif not cls["enabled"]:
+                work_registry_forward(root, {
+                    "kind": "class-disabled", "class_id": str(class_id),
+                    "reason": "class is disabled in the registry",
+                    "decision_needed": f"re-enable '{class_id}' or keep it blocked",
+                    "evidence": [f"registry updated_at {cls.get('updated_at')}"],
+                    "anticipated_default": "work stays blocked; no admission",
+                    "resume": "after the owner re-enables the class",
+                })
+                class_refusal = f"class-disabled:{class_id}"
             else:
-                holds_total = _budget_sum_holds(ledger["reservations"], None)
-                # HARD fleet totals stop admission first (Q4: the first
-                # exhausted resource stops admission).
-                hard_room = {dim: totals[dim] - today_spent["_total"].get(dim, 0) - holds_total[dim] for dim in BUDGET_DIMS}
-                exhausted = [dim for dim in BUDGET_DIMS if est[dim] > hard_room[dim]]
-                if exhausted:
-                    result = {
-                        "admitted": False,
-                        "reason": "exhausted:" + ",".join(exhausted),
-                        "headroom": hard_room,
-                    }
+                bucket = cls["bucket"]
+                per_item = cls["per_item"]
+                est_check = {dim: int(op.get(dim, 0)) for dim in BUDGET_DIMS}
+                over = [dim for dim in BUDGET_DIMS if est_check[dim] > per_item[dim]]
+                if over:
+                    work_registry_forward(root, {
+                        "kind": "over-item-ceiling", "class_id": str(class_id),
+                        "reason": f"estimate exceeds the per-item ceiling on {','.join(over)}",
+                        "decision_needed": "split the item, or raise the ceiling (owner only)",
+                        "evidence": [f"estimate {est_check} vs per-item {per_item}"],
+                        "anticipated_default": "forward to the owner's active session",
+                        "resume": "with a split estimate or an owner raise",
+                    })
+                    class_refusal = f"over-item-ceiling:{','.join(over)}"
+        if class_refusal:
+            result = {"admitted": False, "reason": class_refusal}
+        else:
+            spec = policy["buckets"].get(bucket)
+            if spec is None:
+                result = {"admitted": False, "reason": f"unknown-bucket:{bucket}"}
+            elif not _budget_dims_all_nonnegative(op):
+                result = {"admitted": False, "reason": "bad-estimate"}
+            else:
+                est = {dim: int(op.get(dim, 0)) for dim in BUDGET_DIMS}
+                if all(v == 0 for v in est.values()):
+                    result = {"admitted": False, "reason": "zero-estimate"}
                 else:
-                    bucket_spent = today_spent.setdefault(bucket, _budget_zero_dims())
-                    holds_bucket = _budget_sum_holds(ledger["reservations"], None, bucket)
-                    bucket_room = {dim: spec[dim] - bucket_spent.get(dim, 0) - holds_bucket[dim] for dim in BUDGET_DIMS}
-                    borrowed = any(est[dim] > bucket_room[dim] for dim in BUDGET_DIMS)
-                    if borrowed and not spec.get("borrowable", True):
-                        result = {"admitted": False, "reason": f"bucket-exhausted:{bucket}", "bucket_room": bucket_room}
-                    else:
-                        res_id = uuid.uuid4().hex[:16]
-                        ttl = max(1, int(op.get("ttl", BUDGET_RESERVATION_TTL_S)))
-                        reservation = {
-                            "day": day, "bucket": bucket, "state": "reserved",
-                            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                            "expires_at": now_s + ttl, "host": op.get("host", ""), "pid": op.get("pid"),
-                            "purpose": str(op.get("purpose", ""))[:200], "borrowed": borrowed,
-                            **est,
-                        }
-                        ledger["reservations"][res_id] = reservation
-                        _budget_receipt(ledger, {"kind": "admitted", "id": res_id, "bucket": bucket, **est, "borrowed": borrowed, "purpose": reservation["purpose"]})
+                    holds_total = _budget_sum_holds(ledger["reservations"], None)
+                    # HARD fleet totals stop admission first (Q4: the first
+                    # exhausted resource stops admission).
+                    hard_room = {dim: totals[dim] - today_spent["_total"].get(dim, 0) - holds_total[dim] for dim in BUDGET_DIMS}
+                    exhausted = [dim for dim in BUDGET_DIMS if est[dim] > hard_room[dim]]
+                    if exhausted:
                         result = {
-                            "admitted": True, "id": res_id, "bucket": bucket,
-                            "estimate": est, "borrowed": borrowed, "expires_at": reservation["expires_at"],
-                            "day": day,
+                            "admitted": False,
+                            "reason": "exhausted:" + ",".join(exhausted),
+                            "headroom": hard_room,
                         }
+                    else:
+                        bucket_spent = today_spent.setdefault(bucket, _budget_zero_dims())
+                        holds_bucket = _budget_sum_holds(ledger["reservations"], None, bucket)
+                        bucket_room = {dim: spec[dim] - bucket_spent.get(dim, 0) - holds_bucket[dim] for dim in BUDGET_DIMS}
+                        borrowed = any(est[dim] > bucket_room[dim] for dim in BUDGET_DIMS)
+                        if borrowed and not spec.get("borrowable", True):
+                            result = {"admitted": False, "reason": f"bucket-exhausted:{bucket}", "bucket_room": bucket_room}
+                        else:
+                            res_id = uuid.uuid4().hex[:16]
+                            ttl = max(1, int(op.get("ttl", BUDGET_RESERVATION_TTL_S)))
+                            reservation = {
+                                "day": day, "bucket": bucket, "state": "reserved",
+                                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "expires_at": now_s + ttl, "host": op.get("host", ""), "pid": op.get("pid"),
+                                "purpose": str(op.get("purpose", ""))[:200], "borrowed": borrowed,
+                                "class_id": str(class_id) if class_id else None,
+                                **est,
+                            }
+                            ledger["reservations"][res_id] = reservation
+                            _budget_receipt(ledger, {"kind": "admitted", "id": res_id, "bucket": bucket, **est, "borrowed": borrowed, "purpose": reservation["purpose"]})
+                            result = {
+                                "admitted": True, "id": res_id, "bucket": bucket,
+                                "estimate": est, "borrowed": borrowed, "expires_at": reservation["expires_at"],
+                                "day": day,
+                            }
     elif action == "settle":
         res_id = str(op.get("id", ""))
         res = ledger["reservations"].get(res_id)
@@ -4635,6 +4995,22 @@ def _budget_op(root: Path, op: dict) -> dict:
             result = {"settled": False, "reason": "unknown-id"}
         elif res["state"] not in ("reserved", "expired"):
             result = {"settled": False, "reason": f"already-{res['state']}"}
+        elif res.get("class_id") and not load_work_registry(root)["classes"].get(res["class_id"], {}).get("enabled"):
+            # [slice 2] THE PRE-COMMIT RECHECK (Q2 admission flow step 6):
+            # authority revoked between admit and settle invalidates the
+            # pending write — the class may not commit, the hold releases.
+            res["state"] = "settle-refused"
+            res["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _budget_receipt(ledger, {"kind": "settle-refused", "id": res_id, "bucket": res["bucket"], "why": "class-revoked", "class_id": res["class_id"]})
+            work_registry_forward(root, {
+                "kind": "settle-refused-class-revoked", "class_id": res["class_id"],
+                "reason": f"reservation {res_id} finished after its class was revoked",
+                "decision_needed": "keep the class disabled (work is void) or re-enable and redo",
+                "evidence": [f"reservation {res_id} admitted {res.get('created_at')}"],
+                "anticipated_default": "work product discarded, not committed",
+                "resume": "after an owner ruling on the class",
+            })
+            result = {"settled": False, "reason": "class-revoked", "id": res_id}
         else:
             actual = {dim: int(op.get(dim, 0)) for dim in BUDGET_DIMS}
             res_day_spent = spent.setdefault(res["day"], {"_total": _budget_zero_dims()})
@@ -4660,6 +5036,43 @@ def _budget_op(root: Path, op: dict) -> dict:
             res["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             _budget_receipt(ledger, {"kind": "released", "id": res_id, "bucket": res["bucket"], "purpose": str(res.get("purpose", ""))[:120]})
             result = {"released": True, "id": res_id}
+    elif action == "registry-update":
+        # [slice 2] Registry mutations ride the SAME serialized plane as
+        # admissions (a revoke must be visible to every host's next check).
+        # Stored deltas are TIGHTENINGS only: load_work_registry clamps
+        # against the owner seed ceilings on every read.
+        class_id = str(op.get("class_id", ""))
+        if class_id not in WORK_REGISTRY_CLASSES:
+            result = {"updated": False, "reason": f"unknown-class:{class_id}"}
+        else:
+            reg_path = work_registry_path(root)
+            stored = {"version": 1, "classes": {}}
+            if reg_path.is_file():
+                try:
+                    stored = json.loads(reg_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            entry = (stored.setdefault("classes", {}).setdefault(class_id, {}))
+            changes = {}
+            if op.get("enabled") is not None:
+                entry["enabled"] = bool(op["enabled"])
+                changes["enabled"] = bool(op["enabled"])
+            if op.get("per_item"):
+                seed = WORK_REGISTRY_CLASSES[class_id]["per_item"]
+                entry["per_item"] = {
+                    dim: min(int(op["per_item"].get(dim, entry.get("per_item", {}).get(dim, seed[dim]))), seed[dim])
+                    for dim in BUDGET_DIMS
+                }
+                changes["per_item"] = entry["per_item"]
+            entry["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            reg_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = reg_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(stored, indent=1), encoding="utf-8")
+            tmp.replace(reg_path)
+            _budget_receipt(ledger, {"kind": "registry-update", "class_id": class_id, **changes})
+            result = {"updated": True, "class_id": class_id, "changes": changes, "effective": load_work_registry(root)["classes"][class_id]}
+    elif action == "registry-read":
+        result = {"classes": load_work_registry(root)["classes"]}
     elif action == "status":
         holds_total = _budget_sum_holds(ledger["reservations"], None)
         hard_room = {dim: totals[dim] - today_spent["_total"].get(dim, 0) - holds_total[dim] for dim in BUDGET_DIMS}
@@ -4680,10 +5093,12 @@ def _budget_op(root: Path, op: dict) -> dict:
             "hard_room": hard_room,
             "holds_total": holds_total,
             "open_reservations": {
-                rid: {k: res.get(k) for k in ("day", "bucket", "created_at", "expires_at", "purpose", "borrowed", "input", "generated", "cash_cents", "host")}
+                rid: {k: res.get(k) for k in ("day", "bucket", "created_at", "expires_at", "purpose", "borrowed", "class_id", "input", "generated", "cash_cents", "host")}
                 for rid, res in ledger["reservations"].items() if res.get("state") == "reserved"
             },
             "buckets": buckets,
+            "work_registry": load_work_registry(root)["classes"],
+            "forwarded": _budget_forward_tail(root),
             "jev_envelope_cents": BUDGET_JEV_ENVELOPE_CENTS,
             "expired_released_now": [entry.get("id") for entry in expired],
             "rolled_from": rolled,
@@ -5305,7 +5720,24 @@ def main():
     p_budget.add_argument("--ttl", type=int, default=BUDGET_RESERVATION_TTL_S, help=f"admission hold TTL seconds (default {BUDGET_RESERVATION_TTL_S}; crash safety)")
     p_budget.add_argument("--purpose", default="", help="what this reservation is for (recorded in receipts)")
     p_budget.add_argument("--actual-source", default="measured", help="how settle actuals were obtained (measured|byte-estimate)")
+    p_budget.add_argument("--class", dest="work_class", default=None, help="[slice 2] work-class id — enforces the owner registry (unknown/disabled class refuses + forwards; over-ceiling estimate refuses + forwards)")
     p_budget.set_defaults(fn=cmd_budget)
+
+    # [slice 2] owner-declared work-class registry
+    p_registry = subparsers.add_parser(
+        "work-registry",
+        parents=[common_parser],
+        help="[slice 2] The owner work-class registry: --list, or tighten/enforce (--enable/--disable/--set-per-item; raising a seed ceiling is refused by design)",
+    )
+    registry_actions = p_registry.add_mutually_exclusive_group()
+    registry_actions.add_argument("--list", action="store_true", dest="list_registry", help="show the effective registry (seeds + tightenings)")
+    registry_actions.add_argument("--enable", action="store_true", help="enable a class")
+    registry_actions.add_argument("--disable", action="store_true", help="disable a class (admissions refuse + forward; in-flight settles REFUSE — authority revoked pre-commit)")
+    p_registry.add_argument("--class-id", default=None, help="the work class to mutate")
+    p_registry.add_argument("--input", type=int, default=None, help="per-item input ceiling (lowering only)")
+    p_registry.add_argument("--generated", type=int, default=None, help="per-item generated ceiling (lowering only)")
+    p_registry.add_argument("--cash-cents", type=int, default=None, dest="cash_cents", help="per-item cash ceiling in cents (lowering only)")
+    p_registry.set_defaults(fn=cmd_work_registry)
 
     # hidden plumbing: the authority host executes one op from stdin
     p_budget_op = subparsers.add_parser(
@@ -5360,6 +5792,8 @@ def main():
         cmd_owner(args)
     elif args.subcommand == "dream-budget":
         cmd_budget(args)
+    elif args.subcommand == "work-registry":
+        cmd_work_registry(args)
     elif args.subcommand == "_budget-op":
         cmd_budget_op(args)
     else:
