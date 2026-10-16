@@ -1641,13 +1641,20 @@ fn main() -> Result<()> {
         // "no declared web surface". Connect directly like the other read-only
         // diagnostics — no version gate, no daemon spawn.
         let endpoint = cli_server_endpoint(store.home_dir());
-        let (records, running, _declare_authority) =
+        let (records, running, declare_authority) =
             yggterm_server::terminal_app_declares(&endpoint, &args[3])?;
+        // [F2 residue (iv)] the authority verdict IS the answer's meaning: an
+        // empty `declares` under `authoritative` is a real absence (the row
+        // hosts no app), but under `no_local_authority` it is "I don't know"
+        // — the row is remote-keyed and the OWNING machine must be asked
+        // (the F2 presence-gate law). A diagnostic that hides the verdict
+        // reproduces the empty-ledger lie this vocabulary exists to end.
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "session_path": args[3],
                 "running": running,
+                "declare_authority": declare_authority,
                 "declare_count": records.len(),
                 "declares": records,
             }))?

@@ -1678,9 +1678,15 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   batch consumed a declare, so a transport-path natural fire needs the
   declaring row to predate the GUI boot (declare → flush → full harness
   reboot → the kills).
-  (iv) The CLI `terminal app declares` verb ignores the authority verdict
-  in its printed output (cosmetic; the daemon+client fixes carry the
-  substance).
+  (iv) RESOLVED 2026-10-17 (sitting 57 continuation, lane
+  lane/f2/declare-authority-print): both dispatcher copies (the
+  ⛔-both-binaries pair in yggterm-headless.rs + main.rs) now print
+  `declare_authority` in the verb's JSON — an empty `declares` under
+  `authoritative` is a real absence, under `no_local_authority` it is
+  "I don't know; ask the owning machine" — the diagnostic stopped
+  reproducing the empty-ledger lie. Effect proof: the verb's live output
+  on the deployed build carries the verdict (Option None = a legacy
+  pre-field answer, printed as null per the compat law).
 - **F3 — HOST-LIFECYCLE IMMORTALITY**: a bad host must be replaced, never
   revealed forever. FIXED: ready-by-cancel paint witness (main 5499fa71);
   THE RELAUNCH/RE-BIND ARM ROOT-FIXED (sitting 13, 2026-10-06, main
