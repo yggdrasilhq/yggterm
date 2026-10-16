@@ -1,13 +1,11 @@
 [Unit]
 Description=ygg-ci watcher — the fleet's single build plane (yggterm + every tuned project)
-Documentation=https://github.com/yggdrasilhq/yggterm docs/spec-ygg-ci.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=pi
-Group=pi
 WorkingDirectory=/home/pi/gh/yggterm/.agents/skills/yggterm-agent-fleet
 ExecStart=/usr/bin/python3 /home/pi/gh/yggterm/.agents/skills/yggterm-agent-fleet/ygg-ci.py watch --interval 300
 Restart=on-failure
