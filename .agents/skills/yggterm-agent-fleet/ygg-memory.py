@@ -4223,12 +4223,26 @@ def dream_fence_violation(
             f"seq {captured_seq}) — re-prepare before apply"
         )
     scope = {str(f) for f in composed_files}
-    conflicting = [
-        rec
-        for rec in advanced
-        # a record with no file attribution could touch anything — refuse
-        if not rec.get("file") or str(rec.get("file")) in scope
-    ]
+    # [fence fix 2026-10-16] dream_live_activity folds in ALL _global records
+    # (the dreamer writes owner-now.md there for every ns dream), so a bare
+    # filename match fences cross-namespace: one _global/advisors-doctrine.md
+    # mirror record blocked a -home-pi-data-msggraph dream composing
+    # msggraph/advisors-doctrine.md FOREVER (measured 2026-10-16 live, seq
+    # 33180 vs watermark 33143). Namespace-qualify the match: a record in the
+    # dreamed ns matches by filename; a _global record only matches when the
+    # dreamed ns IS _global. Records with no file OR no ns attribution still
+    # refuse (conservative).
+    def _touches_composed_batch(rec) -> bool:
+        if not rec.get("file"):
+            return True
+        if str(rec.get("file")) not in scope:
+            return False
+        rec_ns = rec.get("ns")
+        if rec_ns is None:
+            return True
+        return rec_ns == ns or (rec_ns == "_global" and ns == "_global")
+
+    conflicting = [rec for rec in advanced if _touches_composed_batch(rec)]
     if conflicting:
         return (
             f"journal advanced on composed door(s) since prepare "

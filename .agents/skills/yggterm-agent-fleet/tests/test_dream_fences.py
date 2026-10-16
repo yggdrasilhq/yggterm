@@ -81,6 +81,34 @@ def main() -> int:
         fence = module.dream_fence_violation(root, "ns-x", 10)
         check(bool(fence) and "re-prepare" in fence, "a live write during the composer window refuses the apply")
 
+
+    print("[3] namespace-qualified scope matching (fence fix 2026-10-16)")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_journal(root, [{"seq": 10, "ts": time.time() - 3600, "ns": "ns-x", "file": "a.md", "summary": "prepare-era write"}])
+        write_journal(root, [{"seq": 11, "ts": time.time() - 3500, "ns": "_global", "file": "advisors-doctrine.md", "summary": "native mirror sync touches the _global namesake"}])
+        fence = module.dream_fence_violation(root, "ns-x", 10, ["advisors-doctrine.md"])
+        check(fence == "", "a _global record with the same bare filename never fences another ns's scoped dream (the 33180 false-block class)")
+        write_journal(root, [{"seq": 12, "ts": time.time() - 60, "ns": "ns-x", "file": "advisors-doctrine.md", "summary": "same-ns concurrent write to a composed door"}])
+        fence = module.dream_fence_violation(root, "ns-x", 10, ["advisors-doctrine.md"])
+        check(bool(fence) and "composed" in fence, "a same-ns write to a composed door still fences")
+        write_journal(root, [{"seq": 13, "ts": time.time() - 30, "ns": "ns-x", "summary": "record with no file attribution"}])
+        fence = module.dream_fence_violation(root, "ns-x", 12, ["advisors-doctrine.md"])
+        check(bool(fence), "an unattributed-file record still refuses (conservative)")
+        write_journal(root, [{"seq": 14, "ts": time.time() - 20, "ns": "ns-x", "file": "a.md", "summary": "record with no ns attribution"}])
+        fence = module.dream_fence_violation(root, "ns-x", 12, ["a.md"])
+        # strip the ns on a copy to simulate a legacy unattributed record
+        import json as _json
+        jr = root / "journal.jsonl"
+        rows = [_json.loads(l) for l in open(jr)]
+        rows[-1].pop("ns", None)
+        jr.write_text("".join(_json.dumps(r) + "\n" for r in rows))
+        fence = module.dream_fence_violation(root, "ns-x", 12, ["a.md"])
+        check(bool(fence), "an unattributed-ns record with a matching filename still refuses (conservative)")
+        write_journal(root, [{"seq": 15, "ts": time.time() - 10, "ns": "_global", "file": "owner-now.md", "summary": "concurrent owner-now write"}])
+        fence = module.dream_fence_violation(root, "_global", 14, ["owner-now.md"])
+        check(bool(fence) and "composed" in fence, "a _global dream still fences on _global composed doors")
+
     if failures:
         print(f"\n{len(failures)} FAILURES")
         return 1
