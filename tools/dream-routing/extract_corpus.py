@@ -108,7 +108,7 @@ def extract_notes(cfg, rng):
     notes = []
     for section in sorted(os.listdir(main)):
         sdir = os.path.join(main, section)
-        if not os.path.isdir(sdir) or section in ("trash",):
+        if not os.path.isdir(sdir) or section.lower() in ("trash", ".trash") or section.startswith("."):
             continue
         for dirpath, _dirs, files in os.walk(sdir):
             rel = os.path.relpath(dirpath, main)
