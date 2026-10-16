@@ -22699,6 +22699,11 @@ impl ShellState {
     }
 
     fn snapshot(&self) -> RenderSnapshot {
+        // [s54] Phase profile: which slice of the merge grows. Linear timers,
+        // one note per boundary — no restructuring. The phases ride the same
+        // component_window rows as the site spans (they sum to
+        // snapshot.build.<site>).
+        let __snap_t = std::time::Instant::now();
         let active_theme_spec = if self.theme_editor_open {
             clamp_theme_spec(&self.theme_editor_draft)
         } else {
@@ -22712,6 +22717,8 @@ impl ShellState {
             self.search_query.as_str()
         };
         let search_active = !effective_search_query.trim().is_empty();
+        crate::render_attribution::note_span_ms("snapshot.p.base", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let live_session_views = self.server.live_session_views();
         let mut live_runtime_sessions = live_session_views
             .iter()
@@ -22720,6 +22727,8 @@ impl ShellState {
         for session in live_runtime_sessions.iter_mut() {
             self.overlay_live_terminal_sidebar_sample(session);
         }
+        crate::render_attribution::note_span_ms("snapshot.p.sessions", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let live_sessions = live_runtime_sessions
             .iter()
             .filter(|session| is_promoted_live_session(session))
@@ -22730,6 +22739,8 @@ impl ShellState {
             &live_runtime_sessions,
             &self.generated_summaries,
         );
+        crate::render_attribution::note_span_ms("snapshot.p.live_filter", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let optimistic_busy_paths = self
             .terminal_busy_hint_until_ms
             .iter()
@@ -22792,6 +22803,8 @@ impl ShellState {
             self.closing_app && linux_close_requires_terminal_detach();
         let render_active_view_mode =
             render_active_view_mode_for_snapshot(active_view_mode, detach_terminal_before_close);
+        crate::render_attribution::note_span_ms("snapshot.p.browser", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let active_live_session = active_session_path.as_deref().and_then(|path| {
             live_runtime_sessions
                 .iter()
@@ -22899,6 +22912,8 @@ impl ShellState {
                 }
             }
         }
+        crate::render_attribution::note_span_ms("snapshot.p.retained", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let sidebar_hot_sessions =
             merge_hot_sidebar_sessions(&live_sessions, &retained_terminal_sessions);
         let merged_expanded_paths = if search_active {
@@ -22963,6 +22978,8 @@ impl ShellState {
         if !search_active {
             collapse_live_sessions_into_split_rows(&mut rows, &self.split_groups);
         }
+        crate::render_attribution::note_span_ms("snapshot.p.merge", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let active_title = active_session
             .as_ref()
@@ -23145,6 +23162,8 @@ impl ShellState {
         // The WebTabs rail's row menu, resolved against THIS frame's tab tree so
         // "Close 12 other tabs" is a promise the frame can keep.
         let (web_tab_menu_items, web_tab_menu_title) = self.web_tab_menu_view();
+        crate::render_attribution::note_span_ms("snapshot.p.tail", __snap_t.elapsed().as_secs_f64() * 1000.0);
+        let __snap_t = std::time::Instant::now();
         RenderSnapshot {
             palette: palette,
             // Kind from the ROW the sidebar already resolved — available in the
