@@ -1808,7 +1808,30 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   can hide spikes), and search-active separate reporting. NEXT per the
   sol Q5 ranking: (1) merge-key fingerprint (the ~7.6ms content hashing),
   (2) the 500ms TTL audit (busy-hint expiry depends on it), (3) reprofile
-  the residual ~20-30ms merge — now the dominant slice.
+  the residual ~20-30ms merge — now the dominant slice. S56 (2026-10-16):
+  Q5 rank 1 LANDED + the Q4 matrix RUN (lane/f7/merge-key-fingerprint
+  5dbcfd82 -> main 2f741bb39f7a, deployed): the two row-walk key inputs
+  hash ONCE at their build point (projection fingerprint inside the
+  OnceLock cold window, rows fingerprint inside rebuild_rows — self.rows
+  is written only there), one hash definition in core serves fingerprints
+  + fallback (bit-identical keys), content identity tested, dead
+  sidebar_merge_cache_key removed. Q4 MATRIX (control 6c2b112024ce~1 vs
+  candidate, dev Xvfb, ~20.3k-session real store; rig
+  tools/uxspeed/mergekey-rig.sh + mergekey_rig.py, exe-proofed per trial):
+  control browser median 211.4ms / candidate 1.27ms = 99.4% below (bar
+  >=95% PASS); key hashing 15.6ms -> 0.025ms per recorded breakdown;
+  projection_init_count=1 all three candidate trials; per-call grain
+  clean (1 spiky window). every-window<=2.0ms FAILED AS STATED (768/896;
+  the 3 >30ms windows coincide with webview edit-ack starvation, a
+  separate render-plane family — 85-100 ack-failure lines per trial log);
+  the >=100-paint DOM matrix NOT CLAIMED (DOM-read fragility at this
+  world size on BOTH builds — rig-limited, honestly recorded). NEXT per
+  sol Q5: (2) the 500ms TTL audit, (3) reprofile the residual merge
+  (control 24.4 -> candidate 10.6ms median — the cached-Vec return clone
+  + enrich pass are the named next slices); NEW finding for the queue:
+  the webview edit-ack starvation under large-tree renders (the flush
+  gate releases and the DOM silently lags — the paint-metric instrument
+  reads stale frames; candidate for its own F-family entry).
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
