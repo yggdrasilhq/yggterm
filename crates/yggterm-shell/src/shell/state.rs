@@ -425,7 +425,11 @@ static SHELLSTATE_MUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 // expensive data projection consumed by the main shell. Keeping a second epoch
 // lets the settings overlays reuse the last rendered data snapshot while their
 // own current open bit is read directly by the modal layer.
-static SHELLSTATE_SNAPSHOT_DATA_TOTAL: AtomicU64 = AtomicU64::new(0);
+// pub(crate) for the snapshot-cache timing test: the epoch is a PROCESS
+// global, so parallel tests' counted writes bump it under a test that is
+// trying to observe hold/expiry timing — the test re-anchors around
+// foreign bumps by reading it. Production has one ShellState per process.
+pub(crate) static SHELLSTATE_SNAPSHOT_DATA_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// ⭐ THE PER-SITE HISTOGRAM MOVED TO [`crate::render_attribution`] AND IS NOW
 /// ALWAYS ON (2026-08-20). It used to live here keyed on `String`, formatting a
 /// `file:line` per write, and that cost is why it sat behind an env flag or a
@@ -20159,6 +20163,18 @@ struct RenderSnapshot {
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_sessions: Vec<ManagedSessionView>,
     optimistic_busy_paths: HashSet<String>,
+    /// [s56-ttl] The earliest wall-clock deadline ANY snapshot projection
+    /// depends on: the min over the active busy hints' deadlines, a pending
+    /// preview-failure surfacing flip, and the kept sidebar-pane
+    /// contributions' liveness expiry. All three are step functions of
+    /// `now` vs deadlines — between crossings NOTHING in the snapshot can
+    /// change without a state write (which moves the data epoch), so the
+    /// shared-snapshot cache holds until this instant instead of sampling
+    /// blindly every 500ms. u64::MAX when no deadline is pending. The
+    /// cache caps this with RENDER_SNAPSHOT_MAX_IDLE_FRESH_MS as the drift
+    /// bound for any future wall-clock read that forgets to file its
+    /// deadline here.
+    wall_clock_fresh_until_ms: u64,
     total_leaf_sessions: usize,
     last_action: String,
     ghostty_embedded_surface_supported: bool,
@@ -22586,7 +22602,18 @@ impl ShellState {
     /// cost — the exact misattribution the [s53 unit B] numbers could not
     /// rule out (sol s53 Q4/Q5).
     fn snapshot_shared_at(&self, site: &'static str) -> SharedSnapshot {
-        const RENDER_SNAPSHOT_CACHE_TTL_MS: u64 = 500;
+        // [s56-ttl] The wall-clock bits are step functions of `now` vs
+        // deadlines (busy-hint expiry, preview-failure surfacing, sidebar-pane
+        // liveness — every one files its deadline in
+        // RenderSnapshot::wall_clock_fresh_until_ms), so the cache holds
+        // until the EARLIEST pending deadline instead of sampling every
+        // 500ms. This constant is only the DRIFT BOUND for a future
+        // wall-clock read that forgets to file its deadline — generous
+        // because a forgotten read is a bug to fix, not a bound to lean on.
+        // Idle-cadence renders stopped paying full merges for this: the Q4
+        // candidate runs measured 650 TTL-expiry rebuilds at ~10.6ms each
+        // for microsecond-scale wall-clock work.
+        const RENDER_SNAPSHOT_MAX_IDLE_FRESH_MS: u64 = 30_000;
         let epoch = SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(Ordering::Relaxed);
         let now = current_millis();
         let (lookup_span, build_span, store_span) =
@@ -22601,8 +22628,7 @@ impl ShellState {
             match cache.as_ref() {
                 None => CacheDecision::Miss("miss_cache_empty"),
                 Some((cached_epoch, cached_at_ms, cached)) => {
-                    let ttl_fresh =
-                        now.saturating_sub(*cached_at_ms) < RENDER_SNAPSHOT_CACHE_TTL_MS;
+                    let ttl_fresh = now < *cached_at_ms;
                     // A settings-modal toggle changes no data projection. Even
                     // if the user waited past the ordinary TTL before clicking,
                     // the modal must not wait for a cold fleet merge; the data
@@ -22650,7 +22676,15 @@ impl ShellState {
             // that part of the "47 ms" was a call-boundary drop, not merge
             // work.
             let _store = crate::render_attribution::ComponentRenderSpan::start(store_span);
-            *self.render_snapshot_cache.borrow_mut() = Some((epoch, now, fresh.clone()));
+            // [s56-ttl] The stored second element is now the FRESH-UNTIL
+            // instant, not the build time: min(drift bound, the snapshot's
+            // own earliest wall-clock deadline).
+            *self.render_snapshot_cache.borrow_mut() = Some((
+                epoch,
+                now.saturating_add(RENDER_SNAPSHOT_MAX_IDLE_FRESH_MS)
+                    .min(fresh.wall_clock_fresh_until_ms),
+                fresh.clone(),
+            ));
         }
         fresh
     }
@@ -22741,19 +22775,25 @@ impl ShellState {
         );
         crate::render_attribution::note_span_ms("snapshot.p.live_filter", __snap_t.elapsed().as_secs_f64() * 1000.0);
         let __snap_t = std::time::Instant::now();
+        // [s56-ttl] One clock read for the whole filter (the per-entry
+        // re-read bought nothing), and the KEPT entries' min deadline rides
+        // along: the earliest instant this projection can change without a
+        // state write.
+        let busy_now_ms = current_millis();
+        let mut optimistic_busy_deadline = u64::MAX;
         let optimistic_busy_paths = self
             .terminal_busy_hint_until_ms
             .iter()
-            .filter(|(_session_path, deadline_ms)| {
-                if current_millis() > **deadline_ms {
-                    return false;
+            .filter_map(|(session_path, deadline_ms)| {
+                if busy_now_ms > *deadline_ms {
+                    return None;
                 }
                 // This hint is set immediately after terminal input. The live
                 // session snapshot may still contain the pre-command prompt, so
                 // do not let stale idle text cancel the short optimistic state.
-                true
+                optimistic_busy_deadline = optimistic_busy_deadline.min(*deadline_ms);
+                Some(session_path.clone())
             })
-            .map(|(session_path, _)| session_path.clone())
             .collect::<HashSet<_>>();
         let expanded_paths = self.browser.expanded_path_set();
         let stored_rows = if search_active {
@@ -23057,6 +23097,16 @@ impl ShellState {
             should_surface_preview_failure(failure, now_ms).then(|| failure.message.clone())
         });
         let preview_failure_pending = preview_failure_entry.is_some() && preview_failure.is_none();
+        // [s56-ttl] A pending failure flips to surfaced at first_failed+6s
+        // (should_surface_preview_failure's only time term) — the exact
+        // instant this projection can change without a state write.
+        let preview_flip_deadline = if preview_failure_pending {
+            preview_failure_entry
+                .map(|failure| failure.first_failed_at_ms.saturating_add(6_000))
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
         let preview_has_readable_fallback_context =
             active_session.as_ref().is_some_and(|session| {
                 preview_has_readable_resume_context(
@@ -23088,6 +23138,13 @@ impl ShellState {
             .as_deref()
             .map(|path| self.active_sidebar_panes(path, current_millis()))
             .unwrap_or_default();
+        // [s56-ttl] When the pane liveness filter can next flip (a kept
+        // contribution aging past the stale window) — same one-clock-read
+        // law as the busy filter above.
+        let sidebar_panes_fresh_until = active_session_path
+            .as_deref()
+            .map(|path| self.sidebar_panes_fresh_until(path, current_millis()))
+            .unwrap_or(u64::MAX);
         // The ROW MENU, built ONCE per frame: `ContextMenuOverlay` draws this list
         // and the KeyTip tree's `rowmenu` scope declares it, so the mouse menu and
         // the ALT layer cannot disagree about what the menu holds.
@@ -23360,6 +23417,9 @@ impl ShellState {
             remote_machines: self.server.remote_machines().to_vec(),
             live_sessions,
             optimistic_busy_paths,
+            wall_clock_fresh_until_ms: optimistic_busy_deadline
+                .min(preview_flip_deadline)
+                .min(sidebar_panes_fresh_until),
             total_leaf_sessions: self.browser.total_sessions(),
             last_action: self.last_action.clone(),
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
@@ -25039,6 +25099,26 @@ impl ShellState {
     /// excluded — they render in the main viewport (the document surface),
     /// and offering them as rail buttons painted the whole document into a
     /// 300px rail twice (live-caught 2026-07-17, the yedit duplication).
+    /// [s56-ttl] The earliest instant [`Self::active_sidebar_panes`]'s
+    /// liveness filter can next flip for this session without a state
+    /// write: the kept contributions' `liveness + WEB_SURFACE_STALE_AFTER_MS`
+    /// minimum. u64::MAX when nothing is kept (an empty projection cannot
+    /// change on the clock).
+    fn sidebar_panes_fresh_until(&self, session_path: &str, now_ms: u64) -> u64 {
+        let reads_since = self.session_reads_since(session_path, now_ms);
+        self.sidebar_contributions
+            .get(session_path)
+            .and_then(|contribution| {
+                let liveness = contribution
+                    .last_seen_ms
+                    .max(sidebar_ping_liveness_ms(session_path))
+                    .max(reads_since);
+                (now_ms.saturating_sub(liveness) <= WEB_SURFACE_STALE_AFTER_MS)
+                    .then(|| liveness.saturating_add(WEB_SURFACE_STALE_AFTER_MS) + 1)
+            })
+            .unwrap_or(u64::MAX)
+    }
+
     fn active_sidebar_panes(&self, session_path: &str, now_ms: u64) -> Vec<SidebarPaneDeclaration> {
         // reads-since grace, same as the surface overlay: the rail must not
         // blink out for the first post-switch tick while the contribution's

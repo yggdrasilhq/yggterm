@@ -49257,6 +49257,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -50562,6 +50564,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -50775,6 +50779,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -50988,6 +50994,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -51204,6 +51212,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -51424,6 +51434,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -51636,6 +51648,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -51848,6 +51862,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -52103,6 +52119,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -52318,6 +52336,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -52574,6 +52594,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -53319,6 +53341,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
+            // [s56-ttl] fixtures carry no wall-clock deadlines.
+            wall_clock_fresh_until_ms: u64::MAX,
             preview_history_expanding: None,
             agent_cursors: Vec::new(),
             daemon: None,
@@ -69461,6 +69485,126 @@ mod menu_dismissal_locks {
             .cloned()
             .expect("the fixture tree has one session row");
         (shell, row)
+    }
+
+    #[test]
+    fn the_snapshot_cache_holds_until_the_wall_clock_deadline_not_the_old_tick() {
+        let bootstrap = super::tests::test_shell_bootstrap_with_active_session("local://a");
+        let mut shell = ShellState::new(bootstrap);
+        shell.replace_browser_tree(tree_with_sessions(&[
+            "/home/user/.codex/sessions/alpha.jsonl",
+        ]));
+        // The snapshot epoch is a PROCESS global and parallel tests bump it
+        // with every counted write — a foreign bump looks exactly like a
+        // data write (a legitimate rebuild trigger). Each phase therefore
+        // verifies NO foreign bump crossed its timing window and retries
+        // otherwise, so the asserts below test THIS unit's timing, not the
+        // suite's scheduling.
+        let mut hold_proven = false;
+        let mut expiry_proven = false;
+        for _attempt in 0..10 {
+            // Warm the cache first: every timing anchor sits on fast warm
+            // builds (a cold build under load can take seconds).
+            let _warmup = shell.snapshot_shared_at("ttl_test");
+            let now = current_millis();
+            shell.terminal_busy_hint_until_ms.insert(
+                "local://alpha".to_string(),
+                now.saturating_add(5_000),
+            );
+            shell.render_snapshot_cache.borrow_mut().take();
+            let first = shell.snapshot_shared_at("ttl_test");
+            let epoch0 = super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // ~700ms in: past the old 500ms tick, well before the 5s
+            // deadline.
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            if super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(
+                std::sync::atomic::Ordering::Relaxed,
+            ) != epoch0
+            {
+                continue; // foreign data write — re-anchor
+            }
+            let third = shell.snapshot_shared_at("ttl_test");
+            if super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(
+                std::sync::atomic::Ordering::Relaxed,
+            ) != epoch0
+            {
+                continue; // a bump raced the call itself — re-anchor
+            }
+            if !std::sync::Arc::ptr_eq(&first, &third) {
+                eprintln!(
+                    "s56-ttl DEBUG: rebuilt at hold-check; epoch0={epoch0} epoch_now={epoch_now} hint_deadline={} now={}",
+                    shell.terminal_busy_hint_until_ms.get("local://alpha").copied().unwrap_or(0),
+                    current_millis(),
+                    epoch0 = epoch0,
+                    epoch_now = super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                continue;
+            }
+            assert!(
+                std::sync::Arc::ptr_eq(&first, &third),
+                "the cache must HOLD past the old 500ms tick while the deadline is live"
+            );
+            assert!(
+                third
+                    .optimistic_busy_paths
+                    .contains("local://alpha"),
+                "the busy hint must still be projected while its deadline is live"
+            );
+            hold_proven = true;
+            // A SHORT deadline (300ms), written into the map directly —
+            // hint EXPIRY is a clock fact, not a state write, which is
+            // exactly the case the old TTL sampled for.
+            let now2 = current_millis();
+            shell.terminal_busy_hint_until_ms.insert(
+                "local://alpha".to_string(),
+                now2.saturating_add(300),
+            );
+            shell.render_snapshot_cache.borrow_mut().take();
+            let rebuilt = shell.snapshot_shared_at("ttl_test");
+            assert!(
+                rebuilt
+                    .optimistic_busy_paths
+                    .contains("local://alpha"),
+                "the rebuilt snapshot must still project the live hint"
+            );
+            let epoch1 = super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // ~600ms: past the 300ms deadline.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            if super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(
+                std::sync::atomic::Ordering::Relaxed,
+            ) != epoch1
+            {
+                continue; // foreign data write — re-anchor
+            }
+            let fourth = shell.snapshot_shared_at("ttl_test");
+            if super::SHELLSTATE_SNAPSHOT_DATA_TOTAL.load(
+                std::sync::atomic::Ordering::Relaxed,
+            ) != epoch1
+            {
+                continue; // a bump raced the call itself — re-anchor
+            }
+            assert!(
+                !std::sync::Arc::ptr_eq(&rebuilt, &fourth),
+                "crossing the wall-clock deadline must rebuild"
+            );
+            assert!(
+                !fourth
+                    .optimistic_busy_paths
+                    .contains("local://alpha"),
+                "the expired hint must leave the projection after the rebuild"
+            );
+            expiry_proven = true;
+            break;
+        }
+        assert!(
+            hold_proven && expiry_proven,
+            "the global snapshot epoch kept moving under parallel load — the \
+             timing window never closed; that is suite scheduling, not this unit"
+        );
     }
 
     #[test]
