@@ -1731,9 +1731,12 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   monotonic main); the owed re-disperse is MOOT, verified 2026-10-14:
   the running watcher (pid 49892, started 2026-10-10 05:39 IST) executes
   ygg-ci.py bytes IDENTICAL to main (md5-compared) — the stale-note
-  correction landed with the s36 sitting; [11.230] the
-  sub-file wedge (below; ONE callgraph sub remains, skipped-as-merged
-  each tick — the callgraph campaign's lane to retire);
+  correction landed with the s36 sitting; [11.230] CLOSED 2026-10-16
+  (sitting 57 — every branch-deleted sub shape consumed or EXPIRED,
+  falsified two rounds; archived:
+  docs/archive/pending-bugs-closed-2026-10-16.md);
+  [11.240] NEW: the Rust compile cache is a no-op on dev (0.13% hit
+  rate; the STALE verdict fires with a false premise; entry below);
   the docs-gate 16-30 min cost (dream
   ACK-a8a9eec7c3 — wants a path-scoped gate skip).
 - **F6 — MANAGED-CLI REFRESH CONVERGENCE**: [11.224] escalation LIVE
@@ -1939,27 +1942,6 @@ state is visible, silently, with the same UX and the same trace schema.
 Symptom signature to remember: patched-code trace events stay at ZERO
 while known-main events fire — before suspecting the patch, read the
 register event's executable_path.
-
-## ⛔ [11.230] DELETING A MERGED LANE'S REMOTE BRANCH WEDGES ITS CI SUBSCRIPTION FOREVER — THE WATCHER COUNTS A SUB WHOSE BRANCH IS GONE AS A CONFLICT AND EVERY TICK REPORTS merged=0 (measured live 2026-10-05 11:20-11:45 IST, five stale subs, conflicts=5 × six ticks)
-
-**Status:** OPEN
-
-Filed 2026-10-05 ~12:5x IST by the zcode seat (board ACK-9b24b841bf).
-The mechanism: the worktree law deletes a lane's remote branch after its
-merge; the watcher's merge step then cannot resolve the branch (git
-ls-remote answers nothing), the failure is booked as a hunk conflict, and
-the sub file is never consumed — every subsequent tick reports
-merged=0 conflicts=N while REAL lanes (the [11.227] guard among them) sit
-stuck behind the wedge. The auto-unsubscribe's "already in main" check
-also needs the branch to exist to compare, so it never fires. Repaired by
-hand this sitting (five sub files removed after verifying each
-tip_at_enlist's content was in main). FIX SHAPE: when the sub's branch is
-absent from origin, fall back to checking tip_at_enlist ancestry against
-origin/main — ancestor ⇒ auto-unsubscribe ("merged under a rebase"),
-non-ancestor ⇒ drop the sub with an EXPIRED notice (a deleted unmerged
-branch is an abandoned lane, not a retryable merge). FALSIFIER: merge a
-lane, delete its remote branch, watch the next tick consume the sub
-instead of reporting conflicts.
 
 ## ⛔ [11.229] THE CLIENT-SIDE REMAINDERS OF THE VIEWPORT FAMILY — THE REVEAL DEADLINE EXPIRES TO A PERMANENT BLANK (reason:deadline bytes:0), session-remove's ConfirmedGone RACES THE KEEP-ALIVE RESURRECTION, the replaced-runtime NO-REWIND freeze arms, and the absent-declaration sub-item; the reuse-grid arm (a) and (b)'s relaunch/live-GUI arms are closed in the body (measured 2026-10-04, the owner's row cc-runtime://bb64eba2 across squish→blank→squish→blank)
 
@@ -34197,3 +34179,71 @@ code-side read of the landed lock sites is owed; (c) the escalation arm
 ([11.224]: two PPID-1 mimo orphans, one 5 d 20 h old, ops-cleared). Status
 stays OPEN on [11.224]'s convergence + the lock-span code read.
 
+
+## ⛔ [11.240] THE RUST COMPILE CACHE IS A NO-OP ON DEV — 0.13% HIT RATE (2376 Rust misses vs 3 hits) AND THE STALE VERDICT FIRES WITH A FALSE PREMISE (cache_stale on ticks where crates compiled without any executed cache request; measured 2026-10-16 22:3x-22:4x IST while landing [11.230]'s closure lane)
+
+**Status:** OPEN
+
+Filed 2026-10-16 ~22:5x IST by the zcode seat (sitting 57; F5 member).
+MEASURED (sccache 0.18.0 on dev, server at ~/.cache/sccache): the wire
+is PRESENT (~/.cargo/config.toml rustc-wrapper = /usr/local/bin/sccache,
+binary live, server healthy) but Rust compilation almost never hits:
+Cache hits (Rust) 3 vs Cache misses (Rust) 2376 — while C/C++ sits at
+1564 hits and a 100% rate on the SAME server. The cache verb's digest
+shows the recent-build pattern: alternating ok (req=1-3, rate=0.0 —
+every executed request a MISS) and STALE (req=0 while "Compiling "
+appears in build output — compilation that never became an executed
+cache request at all). sccache's own non-cacheable ledger: crate-type
+469, incremental 107, missing input 19, -o 9, -E 3; 620 non-cacheable
+calls total; Average compiler 1.619s over 2376 compilations ≈ 64 min
+of raw rustc time the cache absorbed nothing of. THE COUNTERS ARE A
+1.5-HOUR WINDOW (the sccache server restarted 21:39:49 IST — 2376
+compiles in one evening). AND THE CACHE IS FULL: 51G on disk against
+the configured 50G cap (63,605 files) — the working set exceeds the
+cap, so LRU evicts entries between their write and their next read.
+
+WHY IT MATTERS: every integration tick pays real compile minutes; the
+cache that should absorb them absorbs almost nothing, and the STALE
+verdict's "(bypassed or broken wire)" text asserts ONE cause where at
+least three distinct mechanisms are live.
+
+THREE NAMED MECHANISM CANDIDATES (predeclared for the attack):
+(a) PATH-KEY THRASH — Rust cache keys hash absolute paths; the fleet's
+    worktree law builds the same crates from MANY directories (main
+    checkout + ~/gh/yggterm--* worktrees + lane targets), so every
+    path permutation is a fresh miss (the main checkout's own rebuilds
+    should still hit, so this alone cannot explain 0.13%).
+(b) THE STALE-VERDICT BLIND SPOT — _cache_verdict treats d_req==0 +
+    "Compiling " as "bypassed wire", but sccache's non-cacheable
+    ledger (crate-type/incremental) shows rustc calls that reach
+    sccache and compile RAW without counting as requests — the
+    verdict text overclaims one cause; the cache_stale event
+    misleads the next debugger.
+(c) INCREMENTAL/PROFILE LEAKAGE — 107 incremental non-cacheable
+    calls: cargo check runs the dev profile with incremental ON by
+    default, and sccache cannot serve incremental compiles — every
+    check-side compile is a non-cacheable CALL, never a request
+    (this is ALSO the STALE verdict's real mechanism on check-only
+    ticks: "Compiling " appears, d_req stays 0, and the verdict
+    claims a broken wire).
+(d) CACHE-SIZE THRASH — 51G on disk at a 50G cap: the fleet's CI +
+    worktree + lane builds share ONE server and ONE disk cache; their
+    combined working set exceeds the cap, so eviction eats entries
+    before their next read (dev has 3.5T free — the cap is a config
+    choice, not a constraint).
+
+ATTACK SHAPE (cheapest first): (0) SIZE THE CAP — raise
+SCCACHE_CACHE_SIZE above the measured working set (dev has 3.5T free;
+200G is still rounding error) and observe the hit rate over a day of
+ticks before touching anything else; (1) fix the verdict (cheap,
+unblocks honest readouts): STALE requires the wire probe to agree
+(_cache_wire_probe wrapper+binary both true) AND its text must name
+the non-cacheable ledger as an alternative cause — a check-only tick
+is "non-cacheable", not "bypassed"; (2) CARGO_INCREMENTAL=0 in the CI
+build env so check-side compiles become cacheable requests; (3) only
+then the controlled-miss capture (touch one leaf crate in a SCRATCH
+worktree, CARGO_TARGET_DIR=/tmp/<lane>-target, gotcha 4; run the exact
+CI verb; diff sccache --show-stats; SCCACHE_LOG names the hashed key
+inputs) for whatever miss rate survives (0)-(2). FALSIFIER: two
+consecutive same-shape builds report Rust hits>0 with rate >=50%; a
+no-op tick reports idle and never STALE.
