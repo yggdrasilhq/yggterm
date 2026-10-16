@@ -383,8 +383,13 @@ def _cache_verdict(pre, post, build_out):
     """Delta verdict across one build — spec-ygg-ci.md §4.
 
     idle: nothing compiled (docs-only tick) · ok: the cache served the
-    compiles · STALE: rustc compiled but the cache saw zero requests
-    (bypassed or broken wire) · absent: no readable sccache on the host."""
+    compiles · bypassed: rustc compiled with the wrapper/binary wire
+    absent · non-cacheable: compiles ran but every call was one sccache
+    refuses (crate-type, incremental — the ledger counts those as
+    non-cacheable CALLS, never requests) · absent: no readable sccache
+    on the host. [11.240]: the old single-cause STALE claimed a broken
+    wire for BOTH shapes; the no-request compile is usually the cache
+    refusing the call shape, not a broken wire."""
     if pre is None or post is None:
         return {"verdict": "absent"}
     d_req = (post.get("requests_executed") or 0) - (pre.get("requests_executed") or 0)
@@ -395,7 +400,12 @@ def _cache_verdict(pre, post, build_out):
     if d_req > 0:
         v["verdict"] = "ok"
     elif "Compiling " in (build_out or ""):
-        v["verdict"] = "STALE"
+        wire = _cache_wire_probe()
+        v["wire"] = wire
+        if wire.get("wrapper") and wire.get("binary"):
+            v["verdict"] = "non-cacheable"
+        else:
+            v["verdict"] = "bypassed"
     else:
         v["verdict"] = "idle"
     return v
@@ -1306,10 +1316,15 @@ def _do_tick_project(project, dry=False):
         cc_pre = _sccache_stats()
         r = _run(build_cmd, cwd=str(repo), timeout=build_to, shell=True, label=f"build {project}", heartbeat_secs=hb_secs)
         cc = _cache_verdict(cc_pre, _sccache_stats(), (r.stdout or "") + (r.stderr or ""))
-        if cc.get("verdict") == "STALE":
-            _emit_event(project, "cache_stale", sha=integ_sha,
+        if cc.get("verdict") == "bypassed":
+            _emit_event(project, "cache_bypassed", sha=integ_sha,
+                        requests=cc.get("requests"), hits=cc.get("hits"), misses=cc.get("misses"),
+                        wire=cc.get("wire"))
+            log("  ⚠ sccache BYPASSED — rustc compiled with the wrapper/binary wire absent (docs/spec-ygg-ci.md §4; [11.240])")
+        elif cc.get("verdict") == "non-cacheable":
+            _emit_event(project, "cache_noncacheable", sha=integ_sha,
                         requests=cc.get("requests"), hits=cc.get("hits"), misses=cc.get("misses"))
-            log("  ⚠ sccache STALE — rustc compiled but the cache saw zero requests (bypassed or broken wire; docs/spec-ygg-ci.md §4)")
+            log("  ◦ sccache non-cacheable — compiles ran but none were cacheable calls (crate-type/incremental ledger; docs/spec-ygg-ci.md §4; [11.240])")
         if getattr(r, "overrun", None):
             _emit_event(project, "build_step_overrun", sha=integ_sha, budget_secs=r.overrun["budget"], pid=r.overrun["pid"])
         build_log = (r.stdout or "")[-4000:] + (r.stderr or "")[-4000:]
