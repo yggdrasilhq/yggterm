@@ -966,6 +966,54 @@ fn app() -> Element {
     let ui_heartbeat_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     if !ui_heartbeat_started.swap(true, Ordering::SeqCst) {
         yggterm_core::ui_block::spawn_watchdog(trace_home.clone());
+        // [F10] The edit-ack sampler: the recovery ladder's counters
+        // (dioxus_desktop::edit_flush_timeouts / gate_bypasses /
+        // resync_requests) are exposed in describe but CUMULATIVE, and the
+        // tracing log lines carry no timestamps — so a starvation streak
+        // could never be attributed to the render phase that caused it.
+        // This 500ms sampler turns every counter DELTA into a timestamped
+        // event-trace record; the mergekey rig's leg bounds then name the
+        // starving phase directly (measured 2026-10-16: the full-rig
+        // sequence starves the ack plane on every build — 52 timeouts +
+        // 8 dead-page resyncs per trial on current main — while dense
+        // expander churn alone never does).
+        let edit_ack_sampler_started =
+            use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+        if !edit_ack_sampler_started.swap(true, Ordering::SeqCst) {
+            let ack_trace_home = trace_home.clone();
+            let _ = std::thread::Builder::new()
+                .name("yggterm-edit-ack-sampler".to_string())
+                .spawn(move || {
+                    let mut last_timeouts = dioxus_desktop::edit_flush_timeouts();
+                    let mut last_bypasses = dioxus_desktop::edit_flush_gate_bypasses();
+                    let mut last_resyncs = dioxus_desktop::edit_webview_resync_requests();
+                    loop {
+                        std::thread::sleep(Duration::from_millis(500));
+                        let timeouts = dioxus_desktop::edit_flush_timeouts();
+                        let bypasses = dioxus_desktop::edit_flush_gate_bypasses();
+                        let resyncs = dioxus_desktop::edit_webview_resync_requests();
+                        if timeouts != last_timeouts
+                            || bypasses != last_bypasses
+                            || resyncs != last_resyncs
+                        {
+                            yggterm_core::append_trace_event(
+                                &ack_trace_home,
+                                "webview",
+                                "edit_ack",
+                                "ack_fault_tick",
+                                json!({
+                                    "flush_timeouts": timeouts,
+                                    "gate_bypasses": bypasses,
+                                    "resync_requests": resyncs,
+                                }),
+                            );
+                            last_timeouts = timeouts;
+                            last_bypasses = bypasses;
+                            last_resyncs = resyncs;
+                        }
+                    }
+                });
+        }
         spawn_forever(async move {
             loop {
                 yggterm_core::ui_block::stamp();
