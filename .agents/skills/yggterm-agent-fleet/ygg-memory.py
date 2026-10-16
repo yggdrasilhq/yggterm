@@ -2115,6 +2115,9 @@ def cmd_get(args):
             print(f"Error: bad --grep pattern: {exc}", file=sys.stderr)
             sys.exit(1)
         shown = [line for line in shown if pat.search(line)]
+    # [slice 4] corrections on EVERY read path: a dismissed line never
+    # leaves through the direct door read either.
+    shown = [line for line in shown if not owner_filter_line(root, line)]
     if args.lines is not None:
         shown = shown[: max(args.lines, 0)]
     if len(shown) != total:
@@ -3404,6 +3407,12 @@ def select_retained_claims(root: Path, ns: str, state: dict) -> tuple[list[str],
     if not claims:
         return [], [], 0
     today = budget_today()
+    # [slice 4] owner-dismissed claims are never staged for revival — they
+    # are counted separately so the manifest shows the correction took hold
+    dismissed = [cid for cid in claims if claim_is_dismissed(root, cid, claims[cid])]
+    claims = {cid: e for cid, e in claims.items() if cid not in set(dismissed)}
+    if not claims:
+        return [], [], 0
 
     def rank(cid: str):
         entry = claims[cid]
@@ -3474,6 +3483,10 @@ def prepare_dream(
 
     now_path = get_namespace_dir(root, ns, create=False) / "NOW.md"
     current_now = now_path.read_text(encoding="utf-8", errors="replace") if now_path.is_file() else "(none — first dream)"
+    # [slice 4] corrections on EVERY read path: the previous rollup and the
+    # raw deltas enter the brief already owner-qualified — the composer can
+    # never revive through its inputs what the owner dismissed on its outputs.
+    current_now = apply_owner_filters(root, current_now)
 
     pending = get_dream_dir(root, ns) / "pending"
     if pending.exists():
@@ -3534,7 +3547,7 @@ def prepare_dream(
     ]
     for delta in kept:
         lines.append(f"### [seq #{delta['seq']} | {delta['file']} | {delta['action']} | {delta['iso']}]")
-        lines.append(delta["content"])
+        lines.append(apply_owner_filters(root, delta["content"]))
         lines.append("")
     if dropped:
         lines.append(f"(input budget: {dropped} oldest delta(s) DROPPED for budget — the rollup may miss them)")
@@ -3574,6 +3587,9 @@ def prepare_dream(
         "retained_claims_count": len(state.get("claims", {})),
         "retained_selected": selected_claims,
         "retained_omitted": len(omitted_claims),
+        # [slice 4] the review surface: how many stored claims the owner's
+        # dismissals kept OUT of this brief
+        "retained_dismissed": sum(1 for cid, e in state.get("claims", {}).items() if claim_is_dismissed(root, cid, e)),
         "claim_rotation": rotation,
     }
     (pending / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -3810,18 +3826,51 @@ def owner_correct(root: Path, kind: str, target: str, text: str = "", *, scope: 
     return entry
 
 
+def owner_dismissed_targets(root: Path) -> list[str]:
+    """[slice 4] The dismiss targets in force — exact claim ids, `claim:<id>`
+    forms, and text fragments, all of which must die on EVERY read path."""
+    return [d.get("target", "") for d in load_owner_corrections(root).get("dismissals", []) if d.get("target")]
+
+
+def owner_filter_line(root: Path, line: str) -> bool:
+    """True when ONE line is dismissed (shared by every line-oriented read
+    path, so paraphrase copies and merged bullets die identically)."""
+    for target in owner_dismissed_targets(root):
+        if target and target in line:
+            return True
+    return False
+
+
+def claim_is_dismissed(root: Path, cid: str, entry: dict) -> bool:
+    """[slice 4] A claim is dismissed when the owner targeted its id, its
+    `claim:<id>` form, or any text fragment it carries."""
+    text = str(entry.get("text", ""))
+    for target in owner_dismissed_targets(root):
+        if not target:
+            continue
+        if target == cid or target == f"claim:{cid}" or target in text:
+            return True
+    return False
+
+
+def claim_owner_correction(root: Path, cid: str, entry: dict) -> str | None:
+    """[slice 4] The authoritative replacement text for a corrected claim,
+    or None — 'false' is corrected, 'stop surfacing' is dismissal, 'surface
+    under these circumstances' is surfacing; the three never conflate."""
+    text = str(entry.get("text", ""))
+    for c in load_owner_corrections(root).get("corrections", []):
+        target = c.get("target", "")
+        if target and (target == cid or target == f"claim:{cid}" or target in text):
+            return c.get("text") or ""
+    return None
+
+
 def apply_owner_filters(root: Path, text: str) -> str:
     """Read-time application (slice 3): strip dismissed content and append
     owner surfacing instructions. Cheap, deterministic, composition-free."""
-    data = load_owner_corrections(root)
-    dismissed = [d.get("target", "") for d in data.get("dismissals", []) if d.get("target")]
-    out_lines = []
-    for line in text.splitlines():
-        if any(target and target in line for target in dismissed):
-            continue  # a dismissed claim never resurfaces
-        out_lines.append(line)
+    out_lines = [line for line in text.splitlines() if not owner_filter_line(root, line)]
     out = "\n".join(out_lines)
-    surf = data.get("surfacing", [])
+    surf = load_owner_corrections(root).get("surfacing", [])
     if surf:
         out += "\n\n## owner surfacing instructions\n"
         for s in surf:
@@ -3967,7 +4016,12 @@ def temporal_envelope(root: Path, ns: str, *, today: str | None = None) -> str:
         except Exception:
             pass
     state = load_claim_state(root, ns)
-    claims = state.get("claims", {})
+    claims = {
+        cid: e
+        for cid, e in state.get("claims", {}).items()
+        # [slice 4] dismissed claims are dead on this read path too
+        if not claim_is_dismissed(root, cid, e)
+    }
     if claims:
         expired = sorted(c for c, e in claims.items() if claim_status(e, today) == "expired")
         due = sorted(c for c, e in claims.items() if claim_status(e, today) == "due")
@@ -4409,8 +4463,13 @@ def cmd_now(args):
 
 def cmd_owner(args):
     """[slice 3] The authoritative owner correction path: correct / dismiss /
-    surface. Takes effect on the next read, no dreamer needed."""
+    surface. Takes effect on the next read, no dreamer needed. [slice 4]
+    `--affect TARGET` is the review surface: what is remembered, from which
+    evidence, and what this correction currently touches."""
     root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    if getattr(args, "affect", None):
+        print(json.dumps(owner_affect(root, args.affect), indent=None if getattr(args, "json", False) else 2))
+        return
     kind = {"--correct": "correct", "--dismiss": "dismiss", "--surface": "surface"}
     chosen = None
     for flag, name in kind.items():
@@ -4428,6 +4487,43 @@ def cmd_owner(args):
     print("(effective on the next memory read — no dream, no quiescence wait)")
 
 
+def owner_affect(root: Path, target: str) -> dict:
+    """[slice 4] The correction review surface: WHICH claims (with their
+    evidence) and WHICH door lines the target currently matches — what the
+    owner is dismissing/correcting, before it takes effect everywhere."""
+    affect = {"target": target, "claims": [], "doors": [], "correction_in_force": None}
+    data = load_owner_corrections(root)
+    for kind in ("corrections", "dismissals", "surfacing"):
+        for entry in data.get(kind, []):
+            if entry.get("target") == target:
+                affect["correction_in_force"] = {"kind": kind[:-1], **entry}
+                break
+        if affect["correction_in_force"]:
+            break
+    namespaces_root = root / "namespaces"
+    if namespaces_root.is_dir():
+        for ns_dir in sorted(p for p in namespaces_root.iterdir() if p.is_dir()):
+            ns = ns_dir.name
+            state = load_claim_state(root, ns)
+            for cid, claim in state.get("claims", {}).items():
+                if target == cid or target == f"claim:{cid}" or target in str(claim.get("text", "")):
+                    affect["claims"].append({
+                        "ns": ns, "id": cid, "text": str(claim.get("text", ""))[:140],
+                        "as_of": claim.get("as_of"), "proof": claim.get("proof"),
+                        "source_refs": (claim.get("source_refs") or [])[:3],
+                    })
+            for md in sorted(ns_dir.rglob("*.md")):
+                try:
+                    matches = sum(1 for line in md.read_text(encoding="utf-8", errors="replace").splitlines() if target in line)
+                except OSError:
+                    continue
+                if matches:
+                    affect["doors"].append({"ns": ns, "file": str(md.relative_to(ns_dir)), "lines": matches})
+                    if len(affect["doors"]) >= 20:
+                        return affect
+    return affect
+
+
 def cmd_claims(args):
     """[slice 3] Bounded retrieval over the persistent claim store — the
     compaction-safety guarantee made reachable: after any amount of brief
@@ -4442,7 +4538,15 @@ def cmd_claims(args):
     rows = []
     query = (getattr(args, "query", "") or "").lower()
     want_status = getattr(args, "status", "all") or "all"
+    include_dismissed = bool(getattr(args, "dismissed", False))
     for cid, entry in state.get("claims", {}).items():
+        dismissed = claim_is_dismissed(root, cid, entry)
+        if dismissed and not include_dismissed:
+            # [slice 4] a dismissed claim does not resurface unqualified —
+            # `--dismissed` is the review surface, never the default
+            continue
+        if include_dismissed and not dismissed:
+            continue
         status = claim_status(entry, today)
         if want_status != "all" and status != want_status:
             continue
@@ -4451,10 +4555,13 @@ def cmd_claims(args):
         claim_id = getattr(args, "id", None)
         if claim_id and cid != claim_id:
             continue
+        correction = claim_owner_correction(root, cid, entry)
         rows.append(
             {
                 "id": cid,
                 "status": status,
+                "owner_dismissed": dismissed,
+                **({"owner_correction": correction} if correction is not None else {}),
                 **{k: entry.get(k) for k in ("text", "as_of", "proof", "last_seen", "valid_until", "review_after", "superseded_by", "supersedes", "source_refs", "confirmed", "restatements")},
             }
         )
@@ -5626,6 +5733,10 @@ def cmd_search(args):
                 continue
             for lineno, line in enumerate(text_lines, 1):
                 if pattern.search(line):
+                    # [slice 4] a dismissed line is not a search hit either —
+                    # no read path revives owner-dismissed content
+                    if owner_filter_line(root, line):
+                        continue
                     print(f"{ns}/{rel}:{lineno}{marker}: {line.strip()[:200]}")
                     hits += 1
                     if hits >= args.max_lines:
@@ -5861,6 +5972,7 @@ def main():
     p_owner.add_argument("--text", default="", help="the corrected text or surfacing instruction")
     p_owner.add_argument("--scope", default="_global")
     p_owner.add_argument("--list", action="store_true")
+    p_owner.add_argument("--affect", metavar="TARGET", default=None, help="[slice 4] review surface: which claims (with evidence) and door lines this target currently touches")
     p_owner.set_defaults(fn=cmd_owner)
 
     # [slice 1] fleet budget admission
@@ -5893,6 +6005,7 @@ def main():
     p_claims.add_argument("--query", default="", help="case-insensitive substring over claim text")
     p_claims.add_argument("--id", default=None, help="exact claim id")
     p_claims.add_argument("--status", default="all", choices=["all", "ok", "due", "expired", "superseded"], help="temporal filter")
+    p_claims.add_argument("--dismissed", action="store_true", help="[slice 4] show ONLY owner-dismissed claims (the review view; the default read never revives them)")
     p_claims.add_argument("--limit", type=int, default=20)
     p_claims.set_defaults(fn=cmd_claims)
 
