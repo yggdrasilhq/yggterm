@@ -43,6 +43,7 @@ Usage:
   ygg-ci.py hold [--until 2h|--forever|--clear] [--reason why]  # red main / toolchain hold
 """
 import argparse
+import fcntl
 import json
 import os
 import pathlib
@@ -546,6 +547,22 @@ def any_watcher_process_live():
     return None
 
 def ensure_watcher(interval=DEFAULT_INTERVAL, project=None):
+    # [11.241] the spawn guard: the alive check and the spawn are ONE
+    # critical section under an flock. Two concurrent subscribes both saw
+    # "no watcher" and both spawned (the 2026-10-05 rogue-watcher incident
+    # was born exactly this way — the /proc belt only saves the NEXT
+    # adopter, it cannot unspawn a twin). The lock holder spawns; a loser
+    # re-checks inside the lock and adopts whatever now exists.
+    CI_STATE.mkdir(parents=True, exist_ok=True)
+    lockf = open(CI_STATE / "spawn.lock", "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        return _ensure_watcher_locked(interval, project)
+    finally:
+        lockf.close()
+
+
+def _ensure_watcher_locked(interval=DEFAULT_INTERVAL, project=None):
     if watcher_alive():
         return True
     # [11.227] the belt: a live watcher WITHOUT the pidfile (rogue born
@@ -560,7 +577,6 @@ def ensure_watcher(interval=DEFAULT_INTERVAL, project=None):
             pass
         return True
     # spawn detached watcher
-    CI_STATE.mkdir(parents=True, exist_ok=True)
     logf = open(LOGPATH, "a")
     cmd = [sys.executable, str(HERE / "ygg-ci.py"), "watch", "--interval", str(interval)]
     if project:
