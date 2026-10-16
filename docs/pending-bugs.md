@@ -1834,7 +1834,19 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   + enrich pass are the named next slices); NEW finding for the queue:
   the webview edit-ack starvation under large-tree renders (the flush
   gate releases and the DOM silently lags — the paint-metric instrument
-  reads stale frames; candidate for its own F-family entry).
+  reads stale frames; candidate for its own F-family entry). S56 unit 3 (same day): the residual merge DECOMPOSED by new sub-spans
+  (snapshot.p.merge.{key,hit_clone,store_clone,uncached,hot,enrich,
+  render_rows,collapse} — they stay in the tree as the standing
+  decomposition) and its king FIXED: enrich was 13.64ms median per
+  window (90%+ of the residual; it re-walked every merged row on every
+  snapshot build); the enrich memo (pure function of merge key + title
+  overrides + generated summaries, single-entry Arc) took it to
+  0.05ms median and the whole app.snapshot build 10.80 -> 3.33ms
+  median (lane/f7/merge-reprofile fae7a2a4, main 875ce073, deployed;
+  board ACK-3a7075e4a0). The sol Q5 ranking is fully disposed:
+  fingerprint 15.6->0.025ms, idle TTL rebuilds ~8/40s->1/40s,
+  interactive build 10.80->3.33ms. Remaining honest work (not
+  residue): render_rows 1.39ms, real rebuilds on epoch moves.
 - **F8 — MEMORY-PLANE SELF-CONSOLIDATION (the dream build; owner GO
   2026-10-06)**: capture is law-complete but NOTHING consolidates — the
   zcode index rebuilt from every *.md (906 lines/176.7KB, past the
@@ -1925,6 +1937,24 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   (81940aff) until the release train ships a release-built binary; the
   30-day falsifier windows (scratchpad ≤~3G, cache under cap, digests
   flat) are standing observations.
+- **F10 — WEBVIEW EDIT-ACK STARVATION UNDER LARGE DOMS** (filed 2026-10-16,
+  sitting 56, measured twice on the dev Xvfb rig): under a large tree world
+  (~20k sessions staged + dev's real store), the webview's edit-ack plane
+  starves — the GUI logs dozens of "webview never acknowledged an edit
+  batch; releasing the flush gate" lines per rig trial (85-100 in the Q4
+  candidate runs), the VirtualDom keeps running by design, and the DOM
+  SILENTLY LAGS the state: DOM-level falsifier reads (sidebar row
+  queries) return stale frames that read as product bugs. Symptom class:
+  non-fatal degradation + untruthful instruments, worst exactly at big
+  worlds. ALSO the likely felt-latency face of large worlds (frames
+  released stale). ATTACK: (1) instrument — per-webview unacked-batch
+  counter + age in describe's webview section (the release log line
+  already exists; make it countable); (2) root-cause the ack starvation —
+  is it the ack plane's own queue, the renderer's main-thread contention
+  with the big DOM diff, or IPC backpressure (the F1 family's neighbor)?
+  (3) the falsifier is the mergekey rig (tools/uxspeed/mergekey-rig.sh)
+  at the 20k world: unacked batches per trial -> 0, DOM reads frame-fresh
+  (root_render_count advance before every read already in the rig).
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
