@@ -1972,6 +1972,28 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   starvation is render-block DOWNSTREAM and the fix is proven to be the
   s56 render-path work; if they persist, the renderer/IPC arc reopens
   as the true root.
+  ⛔ CORRECTED same sitting (append-only; supersedes the hypothesis
+  above): the A/B ran and REFUTED the downstream story — the pre-memo
+  control (eb08f3d73363) is ALSO clean under bounded legs, AND the FULL
+  mergekey rig on CURRENT main (c8aa890856d8, all s56 units) still
+  starves: 52 flush timeouts + 8 webview resyncs (dead-page reload
+  requests) per trial, vs 119/11 pre-TTL-pre-memo and 74-83/7-11 on the
+  intermediate builds. So: (a) the arc is LIVE on main, not downstream
+  of the s56 render work; (b) it is SEQUENCE-dependent, not
+  interaction-class-dependent — a dense expander probe (155 clicks/30s,
+  169 root renders) on main is perfectly clean, while the full rig
+  sequence (warm expand rounds + paint matrix + search leg over the 20k
+  world) starves the ack plane on EVERY build tested; (c) the s56 work
+  softened it (119 -> 52 timeouts) but did not close it. NEXT
+  INSTRUMENT (precise, small): per-leg correlation is blocked because
+  the tracing lines carry no timestamps — emit a ts'd trace event (the
+  app's event-trace.jsonl) on every flush-timeout delta (a 500ms
+  sampler over dioxus_desktop::edit_flush_timeouts() in the GUI), then
+  the mergekey rig's leg bounds name the starving phase directly.
+  Attack order after that: identify the starving phase -> dump the
+  batch bytes + ack latency histogram around it (vendor edits.rs
+  counters) -> decide renderer-main-thread contention vs websocket
+  backpressure.
 ## ⛔ [11.231] A RIG THAT LAUNCHES A WORKTREE BINARY WITHOUT OVERRIDING XDG_DATA_HOME MEASURES THE INSTALLED BUILD — THE WORKTREE BINARY RE-EXECS THE DIRECT-BUILD HANDOFF AND THE FALSIFIER REPORTS VERDICTS ABOUT CODE IT NEVER RAN (measured 2026-10-05: two VOID falsifier runs on the F1 patch, exposed only by the trace's own register event)
 
 **Status:** OPEN
