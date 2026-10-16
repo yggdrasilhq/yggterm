@@ -614,6 +614,51 @@ def git_is_ancestor(repo_path, a, b):
     r = _run(["git", "merge-base", "--is-ancestor", a, b], cwd=str(repo_path), timeout=30)
     return r.returncode == 0
 
+
+def _drop_sub_file(project, lane):
+    """Remove one subscription file if it exists; absent is fine."""
+    pth = _sub_path(project, lane)
+    if pth.exists():
+        pth.unlink(missing_ok=True)
+
+
+def _sweep_branch_deleted_subs(project, pcfg, subs, repo, local_main):
+    """[11.230] consume subs whose lane branch is gone from origin — the
+    worktree law's post-merge cleanup deletes merged branches, and a deleted
+    branch is not a retryable merge, so no shape of it may sit as a conflict
+    forever. An enlist tip that IS in main is a consumed lane (merged,
+    possibly under a rebase); anything else — a tip that never landed, or no
+    tip recorded at all — is an EXPIRED sub with a visible notice. Returns
+    the sweep's dispositions for the tick record."""
+    swept = []
+    for s in list(subs):
+        lane = s["lane"]
+        remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
+        if git_rev(repo, remote_ref):
+            continue
+        enlist = (s.get("tip_at_enlist") or "").strip()
+        if enlist and git_is_ancestor(repo, enlist, local_main):
+            log(f"  sweep {lane}: branch deleted, enlist tip {enlist[:12]} in main — consuming the sub")
+            swept.append({"lane": lane, "disposition": "consumed-merged"})
+        else:
+            why = ("enlist tip NOT in main" if enlist else "no enlist tip recorded")
+            log(f"  sweep {lane}: branch deleted, {why} — EXPIRED sub consumed (an abandoned lane is not a retryable merge)")
+            _emit_event(project, "sub_expired_abandoned", lane=lane,
+                        tip=enlist[:12] if enlist else None)
+            swept.append({"lane": lane, "disposition": "expired-abandoned"})
+        _drop_sub_file(project, lane)
+        subs.remove(s)
+    return swept
+
+
+def _consume_expired_conflicts(project, conflicts):
+    """[11.230] a conflict carrying drop_sub=True declares its sub EXPIRED
+    (an abandoned lane): unlink the sub so the next tick does not re-report
+    the same lane forever. The conflict stays in this tick's record."""
+    for c in [c for c in conflicts if c.get("drop_sub")]:
+        _drop_sub_file(project, c["lane"])
+        log(f"  dropped sub {c['lane']} (EXPIRED: {c.get('reason')})")
+
 # ─── subscribe / unsubscribe ─────────────────────────────────────────────────
 
 def cmd_subscribe(a):
@@ -1139,27 +1184,10 @@ def _do_tick_project(project, dry=False):
     # branch-deleted sub sits unconsumed forever while every tick reports
     # "none dirty" (measured live 2026-10-05 13:03-13:08 after the arm above
     # landed — the sub survived its own fix's first ticks).
-    for s in list(subs):
-        lane = s["lane"]
-        remote_ref = f"{pcfg.get('remote','origin')}/{lane}"
-        if git_rev(repo, remote_ref):
-            continue
-        enlist = (s.get("tip_at_enlist") or "").strip()
-        if enlist and git_is_ancestor(repo, enlist, local_main):
-            log(f"  sweep {lane}: branch deleted, enlist tip {enlist[:12]} in main — consuming the sub")
-            pth = _sub_path(project, lane)
-            if pth.exists():
-                pth.unlink(missing_ok=True)
-            subs.remove(s)
-        elif enlist:
-            log(f"  sweep {lane}: branch deleted, enlist tip {enlist[:12]} NOT in main — abandoned lane, consuming the sub as consumed-abandoned")
-            pth = _sub_path(project, lane)
-            if pth.exists():
-                pth.unlink(missing_ok=True)
-            subs.remove(s)
+    swept = _sweep_branch_deleted_subs(project, pcfg, subs, repo, local_main)
     if not subs:
         log(f"tick {project}: all subs consumed by the [11.230] sweep — nothing to do")
-        return {"status": "clean", "last": (last_attempt or {}).get("id")}
+        return {"status": "clean", "swept": swept, "last": (last_attempt or {}).get("id")}
     dirty, last = _dirty_subs(project, pcfg, subs)
     if not dirty and last and upstream_main == local_main and not main_moved:
         log(f"tick {project}: {len(subs)} subs but none dirty since {last.get('id')} — skipping")
@@ -1254,6 +1282,8 @@ def _do_tick_project(project, dry=False):
             log(f"  ⛔ conflict merging {lane} — excluded: {r.stderr[:400]}")
             conflicts.append({"lane": lane, "tip": tip, "reason": "conflict", "stderr": r.stderr[:600]})
             _emit_event(project, "merge_refused", lane=lane, tip=tip, stderr=r.stderr[:500])
+    _consume_expired_conflicts(project, conflicts)
+
     if quar_changed:
         q = _quarantine_load(); q[project] = quar; _quarantine_save(q)
 
@@ -1431,7 +1461,7 @@ def _do_tick_project(project, dry=False):
     rec = {
         "id": f"{project}--{ts_stamp()}--{integ_sha[:12] if integ_sha else 'no-sha'}",
         "project": project, "at": int(time.time()), "host": this_host(),
-        "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts,
+        "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts, "swept": swept,
         "subs": len(subs), "build": build_cmd, "build_ok": build_ok,
         "gates": gates, "deploy": deploy_cmd, "deploy_ok": deploy_ok,
         "pushed": pushed, "upstream": upstream, "status": status, "sccache": cc,
