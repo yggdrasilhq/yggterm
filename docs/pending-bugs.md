@@ -2203,6 +2203,21 @@ it live (rows_order position 0) — the batch liveness check consults a
 witness that contradicts both daemons; wants its own sub-item under (a).
 Workaround that heals (handed to the owner): epoch-bumping refocus —
 switch to another row and back.
+  SUB-ITEM RESOLVED BY F2 (pointer written 2026-10-17; the stale
+  "wants its own sub-item" stood while the mechanism closed two sittings
+  after this block was filed): the contradicting witness was the
+  answering daemon's transport-held EMPTY ledger speaking absence for a
+  REMOTE-KEYED row it merely represents — the F2 presence-gate law
+  suppresses exactly that. The batch arm landed 2026-10-14 (sitting 40,
+  lane/f2/declare-absent-suppression): a remote-keyed row is
+  NoLocalAuthority, never AbsentLocally — declares 0, 8 suppressions
+  via:batch, viewport painted whole over the 240 s observe; the
+  single-ask arm closed the same day (sitting 42, the
+  TerminalAppDeclareAuthority vocabulary; the natural-fire run that
+  shaped it is recorded at daemon.rs's TerminalAppDeclareAuthority).
+  The declare is dead by mechanism, not by workaround; the paint-zombie
+  half of the same recurrence was root-fixed the same morning (the
+  ~08:5x block above).
 
 UPDATE 2026-10-05 ~08:5x IST (root-cause fix; zcode on guihost, board plan
 ACK-83e4dc7e04): THE OWNER'S RECURRENCE EXPOSED THE FAMILY'S IMMORTALITY
