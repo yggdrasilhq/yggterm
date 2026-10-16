@@ -1737,8 +1737,11 @@ campaign's living map, maintained by the zcode+sol loop (consult node
   docs/archive/pending-bugs-closed-2026-10-16.md);
   [11.240] NEW: the Rust compile cache is a no-op on dev (0.13% hit
   rate; the STALE verdict fires with a false premise; entry below);
-  the docs-gate 16-30 min cost (dream
-  ACK-a8a9eec7c3 — wants a path-scoped gate skip).
+  the docs-gate 16-30 min cost LANDED 2026-10-16
+  (sitting 57, lane/ci/docs-scope-skip — a tick whose changed paths are
+  all markdown skips the build AND the deploy; gates still run, main
+  still pushes, build_skipped rides the record; this lane is its own
+  live falsifier — it merged build-free).
 - **F6 — MANAGED-CLI REFRESH CONVERGENCE**: [11.224] escalation LIVE
   (streak doubling measured; final falsifier = a day of walks without mimo
   kills, ≤1 retry/day); devin 130 cosmetic; owner shapes (a)/(b)/(c) in
