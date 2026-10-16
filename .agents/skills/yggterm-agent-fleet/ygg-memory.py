@@ -3199,6 +3199,34 @@ NOW_REQUIRED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS", "
 NOW_STAMPED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS")
 DREAM_PROOF_VOCAB = ("deployed", "suite", "measured-live", "claimed")
 
+# ── [slice 1] FLEET BUDGET POLICY — sol round-4 Q4, owner-ratified ──────────
+# Soft bucket allocations under HARD fleet-wide totals. One authoritative day
+# boundary (UTC); unused allocations are borrowable by eligible work; no daily
+# debt or carryover. The verification reserve is NOT borrowable — recovery is
+# reserved before execution, never raided for ordinary admissions.
+BUDGET_DIMS = ("input", "generated", "cash_cents")
+BUDGET_TOTALS = {"input": 100_000, "generated": 10_000, "cash_cents": 50}
+BUDGET_BUCKETS = {
+    "yin": {"input": 20_000, "generated": 2_000, "cash_cents": 10, "borrowable": True},
+    "yang": {"input": 15_000, "generated": 1_500, "cash_cents": 8, "borrowable": True},
+    "work:callgraph": {"input": 12_000, "generated": 1_200, "cash_cents": 6, "borrowable": True},
+    "work:dossiergraph": {"input": 10_000, "generated": 1_000, "cash_cents": 5, "borrowable": True},
+    "work:infra": {"input": 7_000, "generated": 700, "cash_cents": 4, "borrowable": True},
+    "work:conversion": {"input": 16_000, "generated": 1_600, "cash_cents": 8, "borrowable": True},
+    "work:consult-docs": {"input": 10_000, "generated": 1_000, "cash_cents": 5, "borrowable": True},
+    "reserve:verification": {"input": 10_000, "generated": 1_000, "cash_cents": 5, "borrowable": False},
+}
+# Jev keeps its OWN routing envelope (Q4) — tracked here so status can show it,
+# never a budget bypass: routing through Jev still enters a generative ledger.
+BUDGET_JEV_ENVELOPE_CENTS = 15
+BUDGET_RESERVATION_TTL_S = 7200  # crash safety: an orphaned hold self-releases
+BUDGET_ARCHIVE_DAYS = 8
+BUDGET_RECEIPTS_MAX = 400
+BUDGET_DREAM_BUCKET = "yin"  # a dream compose TIGHTENS memory (Yin)
+BUDGET_DREAM_GEN_ESTIMATE = 2_000  # tokens: composer + critic generated ceiling
+BUDGET_DREAM_CASH_CENTS = 4  # round-5 measured scale for a compose-sized pass
+BUDGET_TOKENS_PER_BYTE = 4  # the standard chars/token text estimate
+
 DREAM_CONTRACT = """You are the DREAM COMPOSER for this namespace. Produce a
 response in EXACTLY this machine-parsed marker format (plain markers, no code
 fences around the NOW.MD block):
@@ -4263,6 +4291,51 @@ def cmd_owner(args):
     print("(effective on the next memory read — no dream, no quiescence wait)")
 
 
+def cmd_budget(args):
+    """[slice 1] Fleet budget admission: atomically reserve token/cash against
+    the ONE serialized authority. Exit 0 = admitted/settled; exit 3 = refused
+    (a DEFER, the designed quota-cap sleep — never an error to retry later)."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    if getattr(args, "budget_status", False):
+        op = {"action": "status"}
+    elif getattr(args, "admit", False):
+        op = {
+            "action": "admit", "bucket": args.bucket,
+            "input": args.input, "generated": args.generated, "cash_cents": args.cash_cents,
+            "ttl": args.ttl, "purpose": args.purpose,
+        }
+    elif getattr(args, "settle", None):
+        op = {
+            "action": "settle", "id": args.settle,
+            "input": args.input, "generated": args.generated, "cash_cents": args.cash_cents,
+            "actual_source": args.actual_source,
+        }
+    elif getattr(args, "release", None):
+        op = {"action": "release", "id": args.release}
+    else:
+        raise SystemExit("dream-budget: choose --admit / --settle ID / --release ID / --status")
+    result = budget_op(root, op)
+    print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+    refused = (
+        (op["action"] == "admit" and not result.get("admitted"))
+        or (op["action"] in ("settle", "release") and not (result.get("settled") or result.get("released")))
+    )
+    if refused:
+        raise SystemExit(3)
+
+
+def cmd_budget_op(args):
+    """Hidden plumbing verb: the authority host executes one op from stdin
+    under its local ledger flock. Always LOCAL — the router already decided
+    this host is the authority when it ssh'd here."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    try:
+        op = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"_budget-op: bad stdin JSON: {error}")
+    print(json.dumps(budget_run_local(root, op)))
+
+
 def cmd_canary(args):
     """[mem-dream 3/4] Deterministic health probes, zero LLM: the index
     line budget (a client regenerator re-bloating MEMORY.md cannot recur
@@ -4363,6 +4436,336 @@ def cmd_canary(args):
     print("canary: all green" if not getattr(args, "json", False) else json.dumps({"status": "ok"}))
 
 
+# ── [slice 1] FLEET BUDGET ADMISSION — one serialized authority ─────────────
+# The race falsifier (two requests against the last allowance: both admitted
+# = fail) requires a SINGLE serialized check-and-reserve point. The ledger
+# lives on the authority host (dev — the same plane ygg-ci/deploy leases use)
+# under flock; every other host reaches it through ssh. Authority-unreachable
+# means DEFERRED, never a local-only guess: a hub-side journal merge is
+# eventually consistent and cannot serialize admissions.
+
+BUDGET_AUTHORITIES = {"dev", "oc", "jojo"}  # hosts that hold the ledger locally
+
+
+def budget_authority_host() -> str:
+    return os.environ.get("YGG_BUDGET_AUTHORITY", "dev").strip().lower()
+
+
+def budget_ledger_path(root: Path) -> Path:
+    return root / "dream" / "budget" / "ledger.json"
+
+
+def budget_today() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _budget_policy() -> dict:
+    """A ledger may carry a SMALLER sandbox policy (tests); it can never
+    exceed the ratified fleet policy — a hand-edited bigger cap silently
+    re-opening the spend floodgates is exactly what this overlay exists
+    to prevent."""
+    def _min_dim(policy: dict, ratified: dict) -> dict:
+        return {dim: min(int(policy.get(dim, ratified[dim])), ratified[dim]) for dim in BUDGET_DIMS}
+
+    policy = {
+        "totals": dict(BUDGET_TOTALS),
+        "buckets": {name: {**spec, "borrowable": bool(spec.get("borrowable", True))} for name, spec in BUDGET_BUCKETS.items()},
+    }
+    ledger_policy = os.environ.get("YGG_BUDGET_POLICY_JSON")
+    if not ledger_policy:
+        return policy
+    try:
+        supplied = json.loads(ledger_policy)
+        policy["totals"] = _min_dim(supplied.get("totals", {}), BUDGET_TOTALS)
+        buckets = {}
+        for name, spec in supplied.get("buckets", {}).items():
+            ratified = policy["buckets"].get(name)
+            if ratified is None:
+                buckets[name] = {**_min_dim(spec, BUDGET_TOTALS), "borrowable": bool(spec.get("borrowable", True))}
+            else:
+                buckets[name] = {**_min_dim(spec, ratified), "borrowable": bool(spec.get("borrowable", ratified["borrowable"]))}
+        policy["buckets"] = buckets
+    except Exception:
+        pass  # a malformed override leaves the ratified policy standing
+    return policy
+
+
+def _budget_zero_dims() -> dict:
+    return {dim: 0 for dim in BUDGET_DIMS}
+
+
+def _budget_dims_all_nonnegative(dims: dict) -> bool:
+    return all(isinstance(dims.get(dim, 0), int) and dims.get(dim, 0) >= 0 for dim in BUDGET_DIMS)
+
+
+def _budget_sum_holds(reservations: dict, day: str, bucket: str | None = None) -> dict:
+    """Open (state=reserved) holds, keyed to their RESERVATION day: a hold
+    made at 23:59 stays charged across midnight while in flight (Q4)."""
+    total = _budget_zero_dims()
+    for res in reservations.values():
+        if res.get("state") != "reserved":
+            continue
+        if day is not None and res.get("day") != day:
+            continue
+        if bucket is not None and res.get("bucket") != bucket:
+            continue
+        for dim in BUDGET_DIMS:
+            total[dim] += int(res.get(dim, 0))
+    return total
+
+
+def _budget_sweep_expired(ledger: dict, now_s: float) -> list[dict]:
+    released = []
+    for res_id, res in list(ledger.get("reservations", {}).items()):
+        if res.get("state") == "reserved" and float(res.get("expires_at", 0)) < now_s:
+            res["state"] = "expired"
+            res["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            released.append(
+                {
+                    "kind": "expired", "id": res_id, "bucket": res.get("bucket"),
+                    "day": res.get("day"), "purpose": str(res.get("purpose", ""))[:120],
+                }
+            )
+    return released
+
+
+def _budget_roll_day(ledger: dict) -> str | None:
+    today = budget_today()
+    if ledger.get("day") == today:
+        return None
+    previous = ledger.get("day")
+    ledger["day"] = today
+    spent = ledger.setdefault("spent", {})
+    spent.setdefault(today, {"_total": _budget_zero_dims()})
+    # bound the archive: the receipts carry the durable history
+    for day in sorted(list(spent.keys()))[: max(0, len(spent) - BUDGET_ARCHIVE_DAYS)]:
+        spent.pop(day, None)
+    return previous
+
+
+def _budget_receipt(ledger: dict, entry: dict) -> None:
+    entry["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    receipts = ledger.setdefault("receipts", [])
+    receipts.append(entry)
+    ledger["receipts"] = receipts[-BUDGET_RECEIPTS_MAX:]
+
+
+def _budget_op(root: Path, op: dict) -> dict:
+    """THE serialized budget core. Runs under the ledger flock (locally or on
+    the authority host via _budget-op). Sweeps expired holds, rolls the day,
+    then executes admit/settle/release/status."""
+    ledger_path = budget_ledger_path(root)
+    now_s = time.time()
+    if ledger_path.is_file():
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except Exception:
+            ledger = {}
+    else:
+        ledger = {}
+    ledger.setdefault("version", 1)
+    ledger["policy"] = _budget_policy()
+    ledger.setdefault("spent", {}).setdefault(budget_today(), {"_total": _budget_zero_dims()})
+    ledger.setdefault("reservations", {})
+    expired = _budget_sweep_expired(ledger, now_s)
+    for entry in expired:
+        _budget_receipt(ledger, entry)
+    rolled = _budget_roll_day(ledger)
+    if rolled:
+        _budget_receipt(ledger, {"kind": "day-roll", "from": rolled, "to": ledger["day"]})
+
+    action = op.get("action")
+    policy = ledger["policy"]
+    totals = policy["totals"]
+    spent = ledger["spent"]
+    day = ledger["day"]
+    today_spent = spent.setdefault(day, {"_total": _budget_zero_dims()})
+
+    if action == "admit":
+        bucket = str(op.get("bucket", ""))
+        spec = policy["buckets"].get(bucket)
+        if spec is None:
+            result = {"admitted": False, "reason": f"unknown-bucket:{bucket}"}
+        elif not _budget_dims_all_nonnegative(op):
+            result = {"admitted": False, "reason": "bad-estimate"}
+        else:
+            est = {dim: int(op.get(dim, 0)) for dim in BUDGET_DIMS}
+            if all(v == 0 for v in est.values()):
+                result = {"admitted": False, "reason": "zero-estimate"}
+            else:
+                holds_total = _budget_sum_holds(ledger["reservations"], None)
+                # HARD fleet totals stop admission first (Q4: the first
+                # exhausted resource stops admission).
+                hard_room = {dim: totals[dim] - today_spent["_total"].get(dim, 0) - holds_total[dim] for dim in BUDGET_DIMS}
+                exhausted = [dim for dim in BUDGET_DIMS if est[dim] > hard_room[dim]]
+                if exhausted:
+                    result = {
+                        "admitted": False,
+                        "reason": "exhausted:" + ",".join(exhausted),
+                        "headroom": hard_room,
+                    }
+                else:
+                    bucket_spent = today_spent.setdefault(bucket, _budget_zero_dims())
+                    holds_bucket = _budget_sum_holds(ledger["reservations"], None, bucket)
+                    bucket_room = {dim: spec[dim] - bucket_spent.get(dim, 0) - holds_bucket[dim] for dim in BUDGET_DIMS}
+                    borrowed = any(est[dim] > bucket_room[dim] for dim in BUDGET_DIMS)
+                    if borrowed and not spec.get("borrowable", True):
+                        result = {"admitted": False, "reason": f"bucket-exhausted:{bucket}", "bucket_room": bucket_room}
+                    else:
+                        res_id = uuid.uuid4().hex[:16]
+                        ttl = max(1, int(op.get("ttl", BUDGET_RESERVATION_TTL_S)))
+                        reservation = {
+                            "day": day, "bucket": bucket, "state": "reserved",
+                            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            "expires_at": now_s + ttl, "host": op.get("host", ""), "pid": op.get("pid"),
+                            "purpose": str(op.get("purpose", ""))[:200], "borrowed": borrowed,
+                            **est,
+                        }
+                        ledger["reservations"][res_id] = reservation
+                        _budget_receipt(ledger, {"kind": "admitted", "id": res_id, "bucket": bucket, **est, "borrowed": borrowed, "purpose": reservation["purpose"]})
+                        result = {
+                            "admitted": True, "id": res_id, "bucket": bucket,
+                            "estimate": est, "borrowed": borrowed, "expires_at": reservation["expires_at"],
+                            "day": day,
+                        }
+    elif action == "settle":
+        res_id = str(op.get("id", ""))
+        res = ledger["reservations"].get(res_id)
+        if res is None:
+            result = {"settled": False, "reason": "unknown-id"}
+        elif res["state"] not in ("reserved", "expired"):
+            result = {"settled": False, "reason": f"already-{res['state']}"}
+        else:
+            actual = {dim: int(op.get(dim, 0)) for dim in BUDGET_DIMS}
+            res_day_spent = spent.setdefault(res["day"], {"_total": _budget_zero_dims()})
+            res_day_spent["_total"] = {dim: res_day_spent["_total"].get(dim, 0) + actual[dim] for dim in BUDGET_DIMS}
+            bucket_spent = res_day_spent.setdefault(res["bucket"], _budget_zero_dims())
+            bucket_spent.update({dim: bucket_spent.get(dim, 0) + actual[dim] for dim in BUDGET_DIMS})
+            late = res["state"] == "expired" or res["day"] != day
+            res["state"] = "settled-late" if late else "settled"
+            res["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            res["actual"] = actual
+            res["actual_source"] = str(op.get("actual_source", "measured"))
+            _budget_receipt(ledger, {"kind": "settled", "id": res_id, "bucket": res["bucket"], "day": res["day"], **actual, "late": late})
+            result = {"settled": True, "id": res_id, "booked_day": res["day"], "actual": actual, "late": late}
+    elif action == "release":
+        res_id = str(op.get("id", ""))
+        res = ledger["reservations"].get(res_id)
+        if res is None:
+            result = {"released": False, "reason": "unknown-id"}
+        elif res["state"] != "reserved":
+            result = {"released": False, "reason": f"already-{res['state']}"}
+        else:
+            res["state"] = "released"
+            res["settled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _budget_receipt(ledger, {"kind": "released", "id": res_id, "bucket": res["bucket"], "purpose": str(res.get("purpose", ""))[:120]})
+            result = {"released": True, "id": res_id}
+    elif action == "status":
+        holds_total = _budget_sum_holds(ledger["reservations"], None)
+        hard_room = {dim: totals[dim] - today_spent["_total"].get(dim, 0) - holds_total[dim] for dim in BUDGET_DIMS}
+        buckets = {}
+        for name, spec in policy["buckets"].items():
+            bucket_spent = today_spent.get(name, _budget_zero_dims())
+            holds_bucket = _budget_sum_holds(ledger["reservations"], None, name)
+            buckets[name] = {
+                "cap": {dim: spec[dim] for dim in BUDGET_DIMS},
+                "spent": {dim: bucket_spent.get(dim, 0) for dim in BUDGET_DIMS},
+                "holds": holds_bucket,
+                "room": {dim: spec[dim] - bucket_spent.get(dim, 0) - holds_bucket[dim] for dim in BUDGET_DIMS},
+                "borrowable": bool(spec.get("borrowable", True)),
+            }
+        result = {
+            "day": day,
+            "totals": totals,
+            "hard_room": hard_room,
+            "holds_total": holds_total,
+            "open_reservations": {
+                rid: {k: res.get(k) for k in ("day", "bucket", "created_at", "expires_at", "purpose", "borrowed", "input", "generated", "cash_cents", "host")}
+                for rid, res in ledger["reservations"].items() if res.get("state") == "reserved"
+            },
+            "buckets": buckets,
+            "jev_envelope_cents": BUDGET_JEV_ENVELOPE_CENTS,
+            "expired_released_now": [entry.get("id") for entry in expired],
+            "rolled_from": rolled,
+            "recent_receipts": ledger.get("receipts", [])[-12:],
+        }
+    else:
+        result = {"error": f"unknown action {action}"}
+
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ledger_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(ledger, indent=1), encoding="utf-8")
+    tmp.replace(ledger_path)
+    return result
+
+
+def budget_run_local(root: Path, op: dict) -> dict:
+    lock = _flock_open(root / ".ygg-budget.lock", timeout_seconds=30)
+    try:
+        return _budget_op(root, op)
+    finally:
+        _flock_close(lock)
+
+
+def budget_run_remote(host: str, op: dict) -> dict:
+    module = os.environ.get("YGG_BUDGET_REMOTE_MODULE", "~/.local/bin/ygg-memory.py")
+    command = _fleet_ssh_command(10) + [
+        host,
+        f"python3 {module} _budget-op",
+    ]
+    run_ = subprocess.run(command, input=json.dumps(op), capture_output=True, text=True, timeout=60)
+    if run_.returncode != 0:
+        return {"admitted": False, "error": "authority-unreachable", "detail": (run_.stderr or "")[-300:]}
+    return json.loads(run_.stdout)
+
+
+def budget_op(root: Path, op: dict) -> dict:
+    """Route one budget op to the serialized authority: locally when this IS
+    the authority host, over ssh otherwise. op["host"] records the requester."""
+    op = {**op, "host": socket.gethostname()}
+    authority = budget_authority_host()
+    hostname = socket.gethostname().lower()
+    is_authority = authority == "local" or (hostname in BUDGET_AUTHORITIES and authority == hostname)
+    if is_authority:
+        return budget_run_local(root, op)
+    return budget_run_remote(authority, op)
+
+
+def budget_estimate_tokens(text_bytes: int) -> int:
+    return max(1, text_bytes // BUDGET_TOKENS_PER_BYTE)
+
+
+def dream_budget_admission(root: Path, input_bytes: int) -> dict:
+    """[slice 1] The dream compose admission: estimate the composer+critic
+    passes, atomically reserve against the fleet ledger. Refusal means DEFER
+    (the designed quota-cap sleep), never a local guess."""
+    return budget_op(
+        root,
+        {
+            "action": "admit",
+            "bucket": BUDGET_DREAM_BUCKET,
+            "input": budget_estimate_tokens(input_bytes),
+            "generated": BUDGET_DREAM_GEN_ESTIMATE,
+            "cash_cents": BUDGET_DREAM_CASH_CENTS,
+            "purpose": f"dream compose {input_bytes}B",
+        },
+    )
+
+
+def dream_budget_settle(root: Path, reservation: dict, input_bytes: int, output_bytes: int) -> dict:
+    return budget_op(
+        root,
+        {
+            "action": "settle",
+            "id": reservation["id"],
+            "input": budget_estimate_tokens(input_bytes),
+            "generated": budget_estimate_tokens(output_bytes),
+            "cash_cents": reservation["estimate"]["cash_cents"],
+            "actual_source": "byte-estimate",
+        },
+    )
+
+
 def cmd_dream(args):
     root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
     harness = detect_harness(args.harness)
@@ -4415,20 +4818,50 @@ def cmd_dream(args):
     if args.run:
         pending = get_dream_dir(root, ns) / "pending"
         brief = (pending / "BRIEF.md").read_text(encoding="utf-8")
-        codex_bin = _resolve_codex_bin(args.codex_bin)
-        print(f"dream: composer pass ({args.model}, effort {args.effort})…")
-        response = _codex_exec(codex_bin, args.model, args.effort, brief + "\n\nProduce the response now.")
-        (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
-        print("dream: critic pass…")
-        critic_prompt = (
-            brief
-            + "\n\n===== COMPOSER OUTPUT =====\n"
-            + response
-            + "\n\n"
-            + CRITIC_INSTRUCTIONS
+        # [slice 1] BUDGET ADMISSION before any composer call — no compose
+        # without a fleet-wide atomic reserve. Refusal is the designed
+        # quota-cap sleep (round-3 sol Q-D: the red canary exposes it; the
+        # tick backs off).
+        admission = dream_budget_admission(root, len(brief.encode("utf-8")))
+        if not admission.get("admitted"):
+            headroom = json.dumps(admission.get("headroom", {}))
+            raise SystemExit(
+                f"dream: DEFERRED — budget admission refused "
+                f"({admission.get('reason', 'unknown')}; hard room {headroom}; "
+                f"retry after spend/settle or the next day boundary)"
+            )
+        try:
+            manifest_path = pending / "MANIFEST.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["budget_reservation"] = admission["id"]
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            codex_bin = _resolve_codex_bin(args.codex_bin)
+            print(f"dream: composer pass ({args.model}, effort {args.effort})… [budget {admission['id']}{', borrowed' if admission.get('borrowed') else ''}]")
+            response = _codex_exec(codex_bin, args.model, args.effort, brief + "\n\nProduce the response now.")
+            (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
+            print("dream: critic pass…")
+            critic_prompt = (
+                brief
+                + "\n\n===== COMPOSER OUTPUT =====\n"
+                + response
+                + "\n\n"
+                + CRITIC_INSTRUCTIONS
+            )
+            critic = _codex_exec(codex_bin, args.model, args.effort, critic_prompt)
+            (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
+        except BaseException:
+            budget_op(root, {"action": "release", "id": admission["id"]})
+            raise
+        # Both passes ran: the tokens are burned whether or not apply
+        # succeeds — settle now, charged to the admission's day (survives
+        # midnight: an in-flight reservation books to its own day).
+        settle = dream_budget_settle(
+            root, admission,
+            len((brief + "\n\nProduce the response now." + critic_prompt).encode("utf-8")),
+            len((response + critic).encode("utf-8")),
         )
-        critic = _codex_exec(codex_bin, args.model, args.effort, critic_prompt)
-        (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
+        if not settle.get("settled"):
+            print(f"dream: budget settle skipped ({settle.get('reason')}) — hold expires by TTL", file=sys.stderr)
         args.apply = True
 
     if args.apply:
@@ -4853,6 +5286,33 @@ def main():
     p_owner.add_argument("--scope", default="_global")
     p_owner.add_argument("--list", action="store_true")
     p_owner.set_defaults(fn=cmd_owner)
+
+    # [slice 1] fleet budget admission
+    p_budget = subparsers.add_parser(
+        "dream-budget",
+        parents=[common_parser],
+        help="[slice 1] Atomically reserve/settle dream token+cash against the ONE serialized fleet authority (refusal = deferred, exit 3)",
+    )
+    budget_actions = p_budget.add_mutually_exclusive_group(required=True)
+    budget_actions.add_argument("--admit", action="store_true", help="reserve an estimate (refused if the hard totals or a non-borrowable bucket are exhausted)")
+    budget_actions.add_argument("--settle", metavar="ID", help="book actual spend for a reservation (charged to its reservation day)")
+    budget_actions.add_argument("--release", metavar="ID", help="release a hold unspent (abandoned work)")
+    budget_actions.add_argument("--status", action="store_true", dest="budget_status", help="ledger view: caps, spend, holds, headroom, receipts")
+    p_budget.add_argument("--bucket", default=BUDGET_DREAM_BUCKET, help=f"policy bucket (default {BUDGET_DREAM_BUCKET})")
+    p_budget.add_argument("--input", type=int, default=0, help="input-token dimension (estimate or actual)")
+    p_budget.add_argument("--generated", type=int, default=0, help="generated-token dimension")
+    p_budget.add_argument("--cash-cents", type=int, default=0, dest="cash_cents", help="cash dimension in US cents")
+    p_budget.add_argument("--ttl", type=int, default=BUDGET_RESERVATION_TTL_S, help=f"admission hold TTL seconds (default {BUDGET_RESERVATION_TTL_S}; crash safety)")
+    p_budget.add_argument("--purpose", default="", help="what this reservation is for (recorded in receipts)")
+    p_budget.add_argument("--actual-source", default="measured", help="how settle actuals were obtained (measured|byte-estimate)")
+    p_budget.set_defaults(fn=cmd_budget)
+
+    # hidden plumbing: the authority host executes one op from stdin
+    p_budget_op = subparsers.add_parser(
+        "_budget-op", parents=[common_parser], help=argparse.SUPPRESS,
+    )
+    p_budget_op.set_defaults(fn=cmd_budget_op)
+
     p_search.add_argument("-i", "--ignore-case", action="store_true")
     p_search.add_argument("--max-lines", type=int, default=50)
 
@@ -4898,6 +5358,10 @@ def main():
         cmd_now(args)
     elif args.subcommand == "owner":
         cmd_owner(args)
+    elif args.subcommand == "dream-budget":
+        cmd_budget(args)
+    elif args.subcommand == "_budget-op":
+        cmd_budget_op(args)
     else:
         parser.print_help()
 
