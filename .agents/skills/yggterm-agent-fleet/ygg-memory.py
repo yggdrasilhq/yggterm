@@ -4133,6 +4133,107 @@ def _codex_limit_auth_failure(text: str) -> bool:
     return any(marker in lowered for marker in CODEX_LIMIT_AUTH_MARKERS)
 
 
+# [free-first composer chain 2026-10-17, owner law: "before allowing codex to
+# dream, use and exhaust the free quota of opencode GLM-5.3-Flash and DeepSeek
+# 4.1 Flash — up to 200k context free on opencode with a hidden daily limit;
+# use them before even touching codex on dreaming and small tasks"] The chain
+# runs the FREE opencode transports first and falls to codex (with its account
+# rotation) only when the free quota is exhausted for the day. Failures
+# classified as limit/auth (the opencode free tier's hidden daily cap, 402/429
+# wording, quota/limit language) advance the chain; ordinary failures raise.
+# The 200k-context ceiling is a STEER law (harness/opencode.md): composer
+# briefs must stay within it — the dream budget (default 160KB) already does.
+OPENCODE_LIMIT_MARKERS = (
+    "rate limit", "usage limit", "limit reached", "quota", "429",
+    "402", "payment required", "exceeded", "daily limit", "free tier",
+    "insufficient", "unauthorized", "please sign in", "credit",
+)
+DEFAULT_COMPOSER_CHAIN = (
+    "opencode:opencode/glm-5.3-flash-free,"
+    "opencode:opencode/deepseek-v4.1-flash-free,"
+    "codex"
+)
+
+
+def _composer_chain() -> list:
+    raw = os.environ.get("YGG_DREAM_COMPOSERS", DEFAULT_COMPOSER_CHAIN)
+    chain = []
+    for spec in raw.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        if ":" in spec:
+            kind, model = spec.split(":", 1)
+            chain.append((kind.strip(), model.strip()))
+        else:
+            chain.append((spec, ""))
+    return chain or [("codex", "")]
+
+
+def _opencode_limit_failure(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in OPENCODE_LIMIT_MARKERS)
+
+
+def _opencode_bin() -> str:
+    override = os.environ.get("YGG_OPENCODE_BIN")
+    if override:
+        return override
+    found = shutil.which("opencode")
+    if found:
+        return found
+    candidate = os.path.expanduser("~/.yggterm/ynpm/bin/opencode")
+    if os.path.exists(candidate):
+        return candidate
+    raise SystemExit("dream: no opencode binary found (pass YGG_OPENCODE_BIN)")
+
+
+def _opencode_exec(model: str, prompt: str, timeout: int = 900) -> str:
+    cmd = [_opencode_bin(), "run", "-m", model, prompt]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, cwd="/tmp"
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"dream: opencode composer timed out after {timeout}s")
+    if result.returncode != 0:
+        tail = (result.stdout or "")[-400:] + (result.stderr or "")[-400:]
+        raise SystemExit(
+            f"dream: opencode composer exited {result.returncode}: …{tail}"
+        )
+    out = result.stdout or ""
+    # opencode echoes UI chrome around the answer; the tail carries the reply
+    return out[-8000:] if len(out) > 8000 else out
+
+
+def _composer_exec(prompt: str, effort: str, codex_bin: str, codex_model: str,
+                   timeout: int = 900) -> str:
+    """Run the composer prompt through the free-first transport chain.
+
+    Returns (output, transport_description). Each limit/auth-classified
+    failure advances to the next transport; codex (last) keeps its account
+    rotation. YGG_DREAM_COMPOSERS=codex restores the codex-only chain."""
+    last_error = None
+    for kind, model in _composer_chain():
+        try:
+            if kind == "opencode":
+                return _opencode_exec(model, prompt, timeout), f"opencode/{model}"
+            return (_codex_exec(codex_bin, codex_model, effort, prompt, timeout),
+                    f"codex/{codex_model}")
+        except SystemExit as err:
+            msg = str(err)
+            if kind == "opencode" and _opencode_limit_failure(msg):
+                last_error = msg
+                print(f"dream: opencode free quota hit ({model}); "
+                      "falling to the next composer", file=sys.stderr)
+                continue
+            raise
+    raise SystemExit(
+        f"dream: every composer transport exhausted (free quotas + codex); "
+        f"the designed backoff is the wait. last error: {last_error}"
+    )
+
+
 def _ygg_auth_runner() -> str | None:
     override = os.environ.get("YGG_AUTH_RUNNER")
     if override:
@@ -5913,7 +6014,9 @@ def cmd_dream(args):
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             codex_bin = _resolve_codex_bin(args.codex_bin)
             print(f"dream: composer pass ({args.model}, effort {args.effort})… [budget {admission['id']}{', borrowed' if admission.get('borrowed') else ''}]")
-            response = _codex_exec(codex_bin, args.model, args.effort, brief + "\n\nProduce the response now.")
+            response, composer_used = _composer_exec(
+                brief + "\n\nProduce the response now.", args.effort,
+                codex_bin, args.model)
             (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
             print("dream: critic pass…")
             critic_prompt = (
@@ -5923,7 +6026,8 @@ def cmd_dream(args):
                 + "\n\n"
                 + CRITIC_INSTRUCTIONS
             )
-            critic = _codex_exec(codex_bin, args.model, args.effort, critic_prompt)
+            critic, _ = _composer_exec(
+                critic_prompt, args.effort, codex_bin, args.model)
             (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
         except BaseException:
             budget_op(root, {"action": "release", "id": admission["id"]})

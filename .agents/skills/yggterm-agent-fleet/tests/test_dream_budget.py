@@ -352,12 +352,13 @@ def _dream_run_gated_body(module, failures):
         journal_one_delta(module, root)
         composer_calls = []
 
-        def fake_codex(codex_bin, model, effort, prompt):
+        def fake_composer(prompt, effort, codex_bin, model):
             composer_calls.append(prompt)
-            return GOOD_RESPONSE if "COMPOSER OUTPUT" not in prompt else GOOD_CRITIC
+            return (GOOD_RESPONSE if "COMPOSER OUTPUT" not in prompt
+                    else GOOD_CRITIC), "test-stub"
 
-        original_codex = module._codex_exec
-        module._codex_exec = fake_codex
+        original_composer = module._composer_exec
+        module._composer_exec = fake_composer
         try:
             # (a) refusal path: pre-exhaust the hard input total (the
             # dream-sized policy — a 100-token seed would just admit).
@@ -387,7 +388,7 @@ def _dream_run_gated_body(module, failures):
             if spent_dims(ledger, today)["input"] <= 0 or spent_dims(ledger, today)["generated"] <= 0:
                 failures.append(f"gate: settle booked nothing: {spent_dims(ledger, today)}")
         finally:
-            module._codex_exec = original_codex
+            module._composer_exec = original_composer
 
 
 def test_budget_op_verb_shape(module, failures):
