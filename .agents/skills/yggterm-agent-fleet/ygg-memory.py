@@ -4110,18 +4110,100 @@ def _resolve_codex_bin(explicit: str | None) -> str:
     raise SystemExit("dream: no codex binary found (pass --codex-bin)")
 
 
+# [auth rotation 2026-10-17, owner law: "codex dreaming must be fault-tolerant
+# of auth and limits — rotate between the three codex accounts when limits are
+# hit; when all limits are hit there is nothing to do but wait"] The composer
+# transport classifies auth/limit failures and rotates the active codex
+# account via the fleet auth plane (ygg-auth rotate = switch to the freshest
+# profile), retrying ONCE. A failure that persists after rotation means all
+# accounts are limited — the caller's designed backoff IS the wait, and the
+# next tick's rotate lands on whichever account reset first. Kill switch:
+# YGG_DREAM_AUTH_ROTATE=0 restores the raw single-account behavior (tests,
+# deliberate single-account runs). YGG_AUTH_RUNNER overrides the runner path.
+CODEX_LIMIT_AUTH_MARKERS = (
+    "rate limit", "usage limit", "ratelimit", "429", "quota",
+    "hit your", "you've reached", "you have reached", "session expired",
+    "token expired", "unauthorized", "forbidden", "authentication",
+    "auth.json", "please log in", "please sign in", "walled",
+)
+
+
+def _codex_limit_auth_failure(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in CODEX_LIMIT_AUTH_MARKERS)
+
+
+def _ygg_auth_runner() -> str | None:
+    override = os.environ.get("YGG_AUTH_RUNNER")
+    if override:
+        return override
+    candidates = (
+        shutil.which("ygg-auth"),
+        os.path.expanduser("~/.local/bin/ygg-auth"),
+        str(Path(__file__).resolve().parent / "ygg-auth.py"),
+        os.path.expanduser(
+            "~/gh/yggterm/.agents/skills/yggterm-agent-fleet/ygg-auth.py"),
+    )
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _codex_exec(codex_bin: str, model: str, effort: str, prompt: str, timeout: int = 900) -> str:
     cmd = [
         codex_bin, "exec", "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
         "-m", model, "-c", f'model_reasoning_effort="{effort}"', prompt,
     ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd="/tmp")
-    except subprocess.TimeoutExpired:
-        raise SystemExit(f"dream: composer timed out after {timeout}s")
+
+    def run_once():
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, cwd="/tmp"
+            ), None
+        except subprocess.TimeoutExpired:
+            return None, f"dream: composer timed out after {timeout}s"
+
+    result, timed_out = run_once()
+    if timed_out:
+        raise SystemExit(timed_out)
     if result.returncode != 0:
         tail = (result.stdout or "")[-400:] + (result.stderr or "")[-400:]
+        rotation_enabled = (
+            _codex_limit_auth_failure(tail)
+            and os.environ.get("YGG_DREAM_AUTH_ROTATE", "1") != "0"
+        )
+        if rotation_enabled:
+            runner = _ygg_auth_runner()
+            if runner:
+                rotate_cmd = (
+                    [sys.executable, runner, "rotate"]
+                    if runner.endswith(".py") else [runner, "rotate"]
+                )
+                try:
+                    rot = subprocess.run(
+                        rotate_cmd, capture_output=True, text=True, timeout=120
+                    )
+                    rot_lines = (rot.stdout or rot.stderr or "").strip().splitlines()
+                    rot_note = rot_lines[-1] if rot_lines else "rotate ran"
+                except (subprocess.TimeoutExpired, OSError) as rot_err:
+                    rot_note = f"rotate unavailable ({rot_err})"
+                print(
+                    f"dream: composer auth/limit failure; ygg-auth rotate → {rot_note}",
+                    file=sys.stderr,
+                )
+                retried, timed_out2 = run_once()
+                if timed_out2:
+                    raise SystemExit(timed_out2)
+                if retried.returncode == 0:
+                    return retried.stdout or ""
+                tail2 = (retried.stdout or "")[-400:] + (retried.stderr or "")[-400:]
+                raise SystemExit(
+                    f"dream: composer limit/auth failure PERSISTED after account "
+                    f"rotation ({rot_note}) — all codex accounts likely limited; "
+                    f"the designed backoff is the wait. exited {retried.returncode}: …{tail2}"
+                )
         raise SystemExit(f"dream: composer exited {result.returncode}: …{tail}")
     return result.stdout or ""
 
