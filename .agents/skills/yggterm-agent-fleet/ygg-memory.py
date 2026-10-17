@@ -26,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -3196,11 +3197,45 @@ DREAM_OWNER_NOW_MAX_BYTES = 1100
 DREAM_INPUT_BUDGET_BYTES = 160_000
 DREAM_PER_FILE_BYTES = 22_000
 DREAM_EXTRA_INPUT_BYTES = 32_000
+DREAM_SWEEP_CONTEXT_BYTES = 4_500  # [T-002 m3] total cap across sweep-ns excerpts
 DREAM_MAX_OPS = 3
 DREAM_OP_ENTRY_MAX = 400
 NOW_REQUIRED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS", "§POINTERS")
 NOW_STAMPED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS")
 DREAM_PROOF_VOCAB = ("deployed", "suite", "measured-live", "claimed")
+
+# ── [T-002 m1] MoE COMPRESSION ROUTING (charter amendment, owner 2026-10-17)
+# ─ Consolidation routes each knowledge type to its EXPERT treatment. The
+# composer never hand-does work another expert owns cheaper or better.
+MOE_ROUTE_VOCAB = ("code", "jev", "composer", "legal")
+MOE_ROUTING_BRIEF = """## EXPERT ROUTING (MoE compression — charter amendment 2026-10-17)
+
+Route each knowledge item to its expert; the route rides the claim's optional
+`route` field. A route NEVER changes evidence rules: proof stamps still come
+only from the deltas.
+
+- **route "code"** — deterministic/derivable facts (ages, counts, expiries,
+  sizes, anything recomputable at read time). Do NOT spend rollup prose on
+  them; the temporal envelope is derived in code. If such a fact must exist as
+  a claim, keep it minimal and mark route "code".
+- **route "jev"** — System-1 semantic decisions (routing/tagging/triage/
+  classification of recurring items). Do NOT hand-label a recurring decision
+  pattern; emit it as a claim describing the DECISION SHAPE so it can become a
+  Jev rubric (shadow first, falsifier, abstention discipline).
+- **route "composer"** (default) — deep synthesis/cross-layer patterns: the
+  NOW.md rollup itself, contradiction detection, carry-forward judgment.
+- **route "legal"** — legal/IP/evidentiary content. NEVER synthesize a legal
+  conclusion: a legal-route claim MUST carry proof "claimed" (the fact as
+  stated in the deltas) — the legal consultant (GLM-legal-Flash when live,
+  sol-high until then) and the owner interpret. Owner-gated rungs are never
+  autonomous.
+- **Cross-layer pattern recognition**: when the SAME pattern appears across
+  two or more namespaces (the SWEEP CONTEXT section below, when present),
+  mint it as a claim with `"scope": "cross-layer"` and `"layers":
+  ["<ns1>", "<ns2>", ...]` — hypotheses from sweep-wide observations, not
+  just per-namespace. Untested cross-layer hypotheses expire in 7 days; the
+  bounded Yang budgets (slice 7) govern volume, never invent a connection
+  the deltas do not evidence."""
 
 # ── [slice 1] FLEET BUDGET POLICY — sol round-4 Q4, owner-ratified ──────────
 # Soft bucket allocations under HARD fleet-wide totals. One authoritative day
@@ -3259,7 +3294,12 @@ touch indexes, never delete.>
 <JSON array with one entry per stamped bullet in NOW.MD:
   {"claim_id": "c1", "text": "<the bullet without its stamp>", "as_of":
    "YYYY-MM-DD", "proof": "<vocab word>", "source_refs": ["seq#N/<file>", ...]}.
-source_refs must cite deltas that exist below.>
+source_refs must cite deltas that exist below. Each entry MAY carry an optional
+"route": "<code|jev|composer|legal>" (expert routing, see the EXPERT ROUTING
+section; default "composer"; route "legal" forces proof "claimed") and, for a
+pattern observed across namespaces, "scope": "cross-layer" with "layers":
+["<ns1>", "<ns2>", ...] (>= 2 layers, only when the SWEEP CONTEXT section is
+present and the pattern is evidenced in both).>
 === OWNER-NOW ===
 <JSON object {"body": "<markdown, at most 1100 bytes, the owner's fast-rotting
 context: mood/energy, location/travel, active commitments, working hours,
@@ -3519,12 +3559,21 @@ def prepare_dream(
     selected_claims, omitted_claims, rotation = select_retained_claims(root, ns, state)
     retained = {cid: state["claims"][cid] for cid in selected_claims}
 
+    # [T-002 m3] SWEEP CONTEXT: other recently-dreamed namespaces' rollup
+    # excerpts ride the brief (bounded) so the composer can mint CROSS-LAYER
+    # pattern claims — Yang hypotheses from sweep-wide observations, not just
+    # per-namespace. Deterministic selection (most recently dreamed, this host
+    # and journal floor), never a model call.
+    sweep_ns, sweep_sections = _sweep_context(root, ns)
+
     lines = [
         f"# DREAM BRIEF — {ns} — phase {phase} — prepared {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
         "",
         "## CONTRACT",
         "",
         DREAM_CONTRACT,
+        "",
+        MOE_ROUTING_BRIEF,
         "",
         "## RETAINED CLAIMS (persistent, evidence-linked — reuse these; do not re-derive; superseded/expired ones are dead)",
         "",
@@ -3542,6 +3591,17 @@ def prepare_dream(
         "",
         current_now,
         "",
+    ]
+    if sweep_sections:
+        lines += [
+            "## SWEEP CONTEXT (cross-layer — other namespaces' §CURRENT_STATUS, for pattern recognition)",
+            "",
+        ]
+        for sweep_ns_name, excerpt in sweep_sections:
+            lines.append(f"### [{sweep_ns_name}]")
+            lines.append(excerpt)
+            lines.append("")
+    lines += [
         "## RAW DELTAS (newest first; provenance = journal seq / door / action / ts)",
         "",
     ]
@@ -3591,9 +3651,58 @@ def prepare_dream(
         # dismissals kept OUT of this brief
         "retained_dismissed": sum(1 for cid, e in state.get("claims", {}).items() if claim_is_dismissed(root, cid, e)),
         "claim_rotation": rotation,
+        # [T-002 m1] the MoE doctrine rode the brief (recorded so briefs/oplogs
+        # show the routing contract was in force for this compose)
+        "moe_routing": {"doctrine": True, "vocab": list(MOE_ROUTE_VOCAB)},
+        # [T-002 m3] which namespaces' rollups informed cross-layer pattern work
+        "sweep_context": {"namespaces": sweep_ns},
     }
     (pending / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return brief_path, manifest
+
+
+def _sweep_context(
+    root: Path, ns: str, window_hours: float = 48.0, max_namespaces: int = 3
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """[T-002 m3] Other namespaces dreamed within the window, most recent
+    first, with a bounded §CURRENT_STATUS excerpt each. Deterministic: the
+    watermark's last_dream_ts orders candidates; no model call. Returns
+    (namespace list, [(namespace, excerpt), ...])."""
+    dream_root = root / "dream"
+    if not dream_root.is_dir():
+        return [], []
+    now = time.time()
+    candidates: list[tuple[float, str]] = []
+    for ns_dir in dream_root.iterdir():
+        other = ns_dir.name
+        if other == ns or not ns_dir.is_dir():
+            continue
+        wm_path = ns_dir / "watermark.json"
+        if not wm_path.is_file():
+            continue
+        try:
+            stamp = datetime.datetime.fromisoformat(
+                str(json.loads(wm_path.read_text(encoding="utf-8")).get("last_dream_ts"))
+            ).timestamp()
+        except Exception:
+            continue
+        age_h = (now - stamp) / 3600.0
+        if 0 <= age_h <= window_hours:
+            candidates.append((stamp, other))
+    candidates.sort(reverse=True)
+    sections: list[tuple[str, str]] = []
+    per_ns_bytes = DREAM_SWEEP_CONTEXT_BYTES // max(max_namespaces, 1)
+    for _, other in candidates[:max_namespaces]:
+        now_path = get_namespace_dir(root, other, create=False) / "NOW.md"
+        if not now_path.is_file():
+            continue
+        body = now_path.read_text(encoding="utf-8", errors="replace")
+        match = re.search(r"## §CURRENT_STATUS\n(.*?)(?=\n## §|\Z)", body, re.DOTALL)
+        excerpt = match.group(1).strip() if match else ""
+        if not excerpt:
+            continue
+        sections.append((other, _dream_slice(excerpt, per_ns_bytes)))
+    return [name for name, _ in sections], sections
 
 
 def _dream_json_block(raw: str) -> str:
@@ -3679,6 +3788,32 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
             errors.append(f"claim {cid} has empty text")
         if not claim.get("source_refs"):
             errors.append(f"claim {cid} cites no source_refs")
+        # [T-002 m1] MoE expert routing: optional, vocabulary-locked. A
+        # legal-routed claim is NEVER a synthesized conclusion — the legal
+        # consultant (owner-gated) interprets, so the fact must stay
+        # proof=claimed.
+        route = claim.get("route")
+        if route is not None and route not in MOE_ROUTE_VOCAB:
+            errors.append(f"claim {cid} route not in vocabulary: {route!r}")
+        if route == "legal" and claim.get("proof") != "claimed":
+            errors.append(
+                f"claim {cid} route=legal requires proof 'claimed' — never a synthesized legal conclusion"
+            )
+        # [T-002 m3] cross-layer claims: scope + >= 2 layers, each a
+        # bounded namespace name; the sweep context rode the brief.
+        if claim.get("scope") is not None:
+            if claim.get("scope") != "cross-layer":
+                errors.append(f"claim {cid} scope must be 'cross-layer': {claim.get('scope')!r}")
+            else:
+                layers = claim.get("layers")
+                if (
+                    not isinstance(layers, list)
+                    or len(layers) < 2
+                    or not all(isinstance(x, str) and 0 < len(x) <= 80 for x in layers)
+                ):
+                    errors.append(f"claim {cid} cross-layer needs layers: [ns1, ns2, ...] with >= 2 layers")
+                elif not claim.get("source_refs"):
+                    errors.append(f"claim {cid} cross-layer must cite sweep evidence")
 
     if parsed["claims"] and not verdicts:
         errors.append("CRITIC.md verdicts missing — the adversarial critic gate is mandatory when claims exist")
@@ -3961,6 +4096,15 @@ def merge_claims(state: dict, claims: list, as_of: str) -> dict:
             value = claim.get(field) or existing.get(field)
             if value and re.match(r"^\d{4}-\d{2}-\d{2}$", str(value)):
                 entry[field] = str(value)
+        # [T-002 m1/m3] MoE expert routing + cross-layer scope persist with
+        # the claim (shape validated upstream in validate_dream_response)
+        if claim.get("route") in MOE_ROUTE_VOCAB or existing.get("route") in MOE_ROUTE_VOCAB:
+            entry["route"] = claim.get("route") or existing.get("route")
+        if claim.get("scope") == "cross-layer" or existing.get("scope") == "cross-layer":
+            entry["scope"] = "cross-layer"
+            layers = [str(x) for x in (claim.get("layers") or existing.get("layers") or [])][:8]
+            if len(layers) >= 2:
+                entry["layers"] = layers
         supersedes = claim.get("supersedes") or existing.get("supersedes")
         if supersedes:
             entry["supersedes"] = supersedes
@@ -4630,8 +4774,20 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
         _dream_receipt(root, "failed", reason, ns)
         return "auto-dream: composer failed; 1h backoff stamped"
     lines = (run_.stdout or "").strip().splitlines()
-    _dream_receipt(root, "applied", lines[-1] if lines else "dreamed", ns)
-    return f"auto-dream[{ns}]: {lines[-1] if lines else 'dreamed'}"
+    receipt = lines[-1] if lines else "dreamed"
+    # [T-002 m2] POST-DREAM TASK PICKUP — after a clean applied tick the
+    # dreamer may take the top tokenomics-ranked fleet-task-ledger task
+    # (auto-finish, charter 2026-10-17). Env-gated: the owner's 3-task GLM
+    # idle allowance is HIS quota — a tick never claims a task silently. A
+    # pickup failure never fails the tick (it degrades to a receipt note).
+    pickup = ""
+    if os.environ.get("YGG_DREAM_TASK_PICKUP", "") == "1":
+        try:
+            pickup = _dream_auto_task_pickup(root)
+        except Exception as exc:
+            pickup = f"task-pickup skipped ({str(exc)[:140]})"
+    _dream_receipt(root, "applied", receipt + (f"; {pickup}" if pickup else ""), ns)
+    return f"auto-dream[{ns}]: {receipt}" + (f"; {pickup}" if pickup else "")
 
 
 def cmd_now(args):
@@ -5120,6 +5276,175 @@ def cmd_work_registry(args):
     print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
     if not result.get("updated"):
         raise SystemExit(3)
+
+
+# ── [T-002 m2] FLEET TASK LEDGER PICKUP — the dreamer tick's auto-finish ────
+# plan.py (tools/task-ledger/) is the tokenomics SPEC; this is the same
+# ranking in-process: score = value/weight (big 4 / moderate 2 / small 1),
+# deps-not-ready held out, OWNER-GATED never auto, and codex takes
+# moderate-to-SMALL only (owner correction 2026-10-17). The tick's pickup is
+# env-gated (YGG_DREAM_TASK_PICKUP=1): the owner's 3-task GLM idle allowance
+# is HIS quota — a dream tick never claims a task silently. The claim books
+# through the publish-safe path (hub doors are never edited in place; the
+# last-writer window is the same one plan.py --done accepts).
+
+LEDGER_NS = "_global"
+LEDGER_DOOR = "fleet-task-ledger.md"
+LEDGER_WEIGHTS = {"big": 4.0, "moderate": 2.0, "small": 1.0}
+LEDGER_BLOCK_RE = re.compile(r"^### \[(T-\d+)\] (.+)$", re.M)
+
+
+def ledger_read(root: Path) -> str:
+    path = get_namespace_dir(root, LEDGER_NS, create=False) / LEDGER_DOOR
+    if not path.is_file():
+        raise SystemExit(f"task-pickup: ledger door missing: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def ledger_tasks(text: str) -> list:
+    tasks = []
+    heads = list(LEDGER_BLOCK_RE.finditer(text))
+    for i, m in enumerate(heads):
+        body_end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        task = {"id": m.group(1), "title": m.group(2).strip()}
+        for line in text[m.end():body_end].splitlines():
+            line = line.strip()
+            if not (line.startswith("- ") and ":" in line):
+                continue
+            for seg in line[2:].split(" ; "):
+                if ":" in seg:
+                    k, v = seg.split(":", 1)
+                    task[k.strip()] = v.strip()
+        tasks.append(task)
+    return tasks
+
+
+def ledger_task_score(task: dict) -> tuple:
+    size = "big" if "big" in task.get("size", "") else (
+        "moderate" if "moderate" in task.get("size", "") else "small")
+    m = re.search(r"(\d)", task.get("value", "0"))
+    value = int(m.group(1)) if m else 0
+    return value / LEDGER_WEIGHTS[size], size
+
+
+def ledger_pick(tasks: list, harness: str) -> dict | None:
+    """The top-scoring ledger task THIS harness may take: status open (never
+    claimed/done/blocked/gated), deps starting 'none' ready, route compatible
+    (codex = moderate/small ONLY; GLM-family takes any size)."""
+    is_codex = "codex" in (harness or "").lower()
+    best, best_score = None, -1.0
+    for t in tasks:
+        status = t.get("status", "open")
+        if not status.startswith("open") or "gated" in status:
+            continue
+        if "OWNER-GATED" in t.get("route", "").upper():
+            continue
+        if not t.get("deps", "none").strip().lower().startswith("none"):
+            continue
+        score, size = ledger_task_score(t)
+        route = t.get("route", "").lower()
+        wants_glm = "glm" in route or route.startswith("any") or route == ""
+        wants_codex = "codex" in route or route.startswith("any") or route == ""
+        if is_codex:
+            if not (wants_codex and size in ("moderate", "small")):
+                continue
+        elif not wants_glm:
+            continue
+        if score > best_score:
+            best, best_score = t, score
+    return best
+
+
+def ledger_claim_text(text: str, tid: str, harness: str, date: str) -> str:
+    """Pure transform: task status -> claimed(harness, date). Refuses a task
+    whose status line is no longer 'open' in the text being claimed."""
+    m = re.search(r"^### \[" + re.escape(tid) + r"\]", text, re.M)
+    if not m:
+        raise SystemExit(f"task-pickup: task {tid} not found in the ledger")
+    nxt = re.search(r"^### \[T-", text[m.end():], re.M)
+    block_end = m.end() + nxt.start() if nxt else len(text)
+    block = text[m.end():block_end]
+    if not re.search(r"^- status: open", block, re.M):
+        raise SystemExit(f"task-pickup: {tid} is no longer open — another seat took it first")
+    new_block, n = re.subn(
+        r"^- status: .*$",
+        f"- status: claimed({harness}, {date}) — taken by the dreamer pickup; execution in flight",
+        block, count=1, flags=re.M,
+    )
+    if n != 1:
+        raise SystemExit(f"task-pickup: {tid} has no status line to claim")
+    return text[:m.end()] + new_block + text[block_end:]
+
+
+def _ledger_publish(root: Path, content: str) -> None:
+    """Publish the transformed ledger through the ygg-memory publish verb
+    (subprocess, publish-safe; --root rides through so a test root stays
+    isolated from the real hub)."""
+    tmp = tempfile.NamedTemporaryFile(
+        "w", suffix=".md", delete=False, encoding="utf-8", prefix=f"ledger-pickup-{os.getpid()}-"
+    )
+    tmp.write(content)
+    tmp.close()
+    try:
+        runner = shutil.which("ygg-memory") or os.path.expanduser("~/.local/bin/ygg-memory.py")
+        proc = subprocess.run(
+            [sys.executable, runner, "publish", "--root", str(root), "--ns", LEDGER_NS,
+             "--file", tmp.name, "--as", LEDGER_DOOR],
+            capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        os.unlink(tmp.name)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "ledger publish failed: " + (proc.stderr or proc.stdout).strip()[-300:]
+        )
+
+
+def _dream_auto_task_pickup(root: Path) -> str:
+    """The tick's post-dream pickup (env-gated caller): take the top
+    tokenomics task for THIS harness and book the claim. Returns a receipt
+    line; raises only on real failures (the caller degrades gracefully)."""
+    harness = detect_harness(None)
+    text = ledger_read(root)
+    picked = ledger_pick(ledger_tasks(text), harness)
+    if not picked:
+        return "no ledger task ready for pickup"
+    score, size = ledger_task_score(picked)
+    date = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    _ledger_publish(root, ledger_claim_text(text, picked["id"], harness, date))
+    return f"claimed {picked['id']} ({size}, score {score:.2f}): {picked.get('title', '')[:70]}"
+
+
+def cmd_task_pickup(args):
+    """[T-002 m2] Take the top tokenomics-ranked fleet-task-ledger task for
+    this harness and book the claim publish-safely. --dry-run shows the pick
+    without publishing. The brief: the ledger door itself is self-contained
+    (§LAW routing + §TODAY-style entry + §QUEUE chunks)."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    harness = detect_harness(getattr(args, "harness", None))
+    text = ledger_read(root)
+    picked = ledger_pick(ledger_tasks(text), harness)
+    result = {"harness": harness, "picked": None}
+    if picked:
+        score, size = ledger_task_score(picked)
+        result["picked"] = picked.get("id")
+        result["title"] = picked.get("title")
+        result["score"] = round(score, 2)
+        result["size"] = size
+        result["route"] = picked.get("route", "")
+        result["source"] = picked.get("source", "")
+    if not picked:
+        print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+        return
+    date = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    if getattr(args, "dry_run", False):
+        result["dry_run"] = True
+        result["preview"] = ledger_claim_text(text, picked["id"], harness, date)
+        print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+        return
+    _ledger_publish(root, ledger_claim_text(text, picked["id"], harness, date))
+    result["claimed"] = True
+    print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
 
 
 def cmd_canary(args):
@@ -6082,6 +6407,17 @@ def cmd_dream(args):
                 print(f"  - {error}", file=sys.stderr)
             raise SystemExit(2)
 
+        # [T-002 m1] record the compose's actual MoE routing into the
+        # pending manifest — the brief carries the doctrine, the manifest
+        # proves which expert each claim was routed to (recoverable surface).
+        manifest["moe_routes"] = {
+            r: sum(1 for c in parsed["claims"] if c.get("route") == r)
+            for r in MOE_ROUTE_VOCAB
+        }
+        manifest["moe_routes"]["(unset)"] = sum(1 for c in parsed["claims"] if not c.get("route"))
+        manifest["cross_layer_claims"] = sum(1 for c in parsed["claims"] if c.get("scope") == "cross-layer")
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
         contested = sum(1 for v in verdicts if v.get("verdict") == "contested")
         if getattr(args, "dry_run", False):
             plan = {
@@ -6563,6 +6899,16 @@ def main():
     p_registry.add_argument("--cash-cents", type=int, default=None, dest="cash_cents", help="per-item cash ceiling in cents (lowering only)")
     p_registry.set_defaults(fn=cmd_work_registry)
 
+    # [T-002 m2] the dreamer tick's ledger task pickup (auto-finish, charter
+    # 2026-10-17); standalone verb always available, env-gated in the tick.
+    p_pickup = subparsers.add_parser(
+        "task-pickup",
+        parents=[common_parser],
+        help="[T-002 m2] take the top tokenomics fleet-task-ledger task for this harness (plan.py ranking; codex = moderate/small only; publish-safe claim; --dry-run previews)",
+    )
+    p_pickup.add_argument("--dry-run", action="store_true", help="show the pick + claim transform without publishing")
+    p_pickup.set_defaults(fn=cmd_task_pickup)
+
     # hidden plumbing: the authority host executes one op from stdin
     p_budget_op = subparsers.add_parser(
         "_budget-op", parents=[common_parser], help=argparse.SUPPRESS,
@@ -6622,6 +6968,8 @@ def main():
         cmd_claims(args)
     elif args.subcommand == "connections":
         cmd_connections(args)
+    elif args.subcommand == "task-pickup":
+        cmd_task_pickup(args)
     elif args.subcommand == "_budget-op":
         cmd_budget_op(args)
     else:
