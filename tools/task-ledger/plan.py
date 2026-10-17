@@ -250,26 +250,42 @@ def main():
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+
+    def publish_ledger(new_text, ok_line):
+        """Publish via the ygg-memory runner. The PATH may carry a bash
+        wrapper (ygg-memory, no .py — measured 2026-10-17: running it under
+        sys.executable is a SyntaxError) — prefer the .py and exec wrappers
+        directly. The ok_line prints ONLY on success: a booking that did not
+        publish is a failure, never a confirmation."""
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                          encoding="utf-8")
+        tmp.write(new_text)
+        tmp.close()
+        try:
+            runner = shutil.which("ygg-memory.py") or shutil.which(
+                "ygg-memory") or os.path.expanduser("~/.local/bin/ygg-memory.py")
+            prefix = [sys.executable] if runner.endswith(".py") else []
+            r = subprocess.run(prefix + [runner, "publish", "--file", tmp.name,
+                                         "--ns=_global", "--as",
+                                         "fleet-task-ledger.md"],
+                               capture_output=True, text=True, timeout=120)
+        finally:
+            os.unlink(tmp.name)
+        print(r.stdout.strip() or r.stderr.strip())
+        if r.returncode != 0:
+            print("ledger publish FAILED — the booking did NOT land")
+            return r.returncode
+        print(ok_line)
+        return 0
+
     if a.claim:
         text = open(a.ledger, encoding="utf-8").read()
         new = mark_claimed(text, a.claim, a.by, a.day, a.note)
         if a.dry_run:
             print(new)
             return 0
-        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
-                                          encoding="utf-8")
-        tmp.write(new)
-        tmp.close()
-        runner = shutil.which("ygg-memory") or os.path.expanduser(
-            "~/.local/bin/ygg-memory.py")
-        r = subprocess.run([sys.executable, runner, "publish", "--file", tmp.name,
-                            "--ns=_global", "--as", "fleet-task-ledger.md"],
-                           capture_output=True, text=True)
-        os.unlink(tmp.name)
-        print(r.stdout.strip() or r.stderr.strip())
-        print(f"booked {a.claim} claimed({a.by}) — the task is taken; "
-              "execution in flight")
-        return r.returncode
+        return publish_ledger(
+            new, f"booked {a.claim} claimed({a.by}) — the task is taken; execution in flight")
     if a.done:
         if not a.proof:
             print("--done needs --proof \"<ref>\"")
@@ -279,20 +295,10 @@ def main():
         if a.dry_run:
             print(new)
             return 0
-        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
-                                          encoding="utf-8")
-        tmp.write(new)
-        tmp.close()
-        runner = shutil.which("ygg-memory") or os.path.expanduser(
-            "~/.local/bin/ygg-memory.py")
-        r = subprocess.run([sys.executable, runner, "publish", "--file", tmp.name,
-                            "--ns=_global", "--as", "fleet-task-ledger.md"],
-                           capture_output=True, text=True)
-        os.unlink(tmp.name)
-        print(r.stdout.strip() or r.stderr.strip())
-        print(f"booked {a.done} done({a.proof}) [by {a.by}] — §BOOK line added; "
-              "if the day's batch is exhausted, refresh §TODAY with a fresh plan run")
-        return r.returncode
+        return publish_ledger(
+            new,
+            f"booked {a.done} done({a.proof}) [by {a.by}] — §BOOK line added; "
+            "if the day's batch is exhausted, refresh §TODAY with a fresh plan run")
     if not os.path.exists(a.ledger):
         print(json.dumps({"error": f"ledger not found: {a.ledger}"}))
         return 2
