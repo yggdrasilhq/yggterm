@@ -26,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -3202,6 +3203,28 @@ NOW_REQUIRED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS", "
 NOW_STAMPED_SECTIONS = ("§CURRENT_STATUS", "§NEXT_UNITS", "§ACTIVE_TRAPS")
 DREAM_PROOF_VOCAB = ("deployed", "suite", "measured-live", "claimed")
 
+# ── [moe routing 2026-10-17] the charter amendment: consolidation routes
+# each knowledge type to its EXPERT treatment — deterministic/derivable →
+# code; System-1 semantic (routing/tagging/triage/classification) → Jev;
+# deep synthesis → the composer itself (the default, usually not emitted);
+# legal/IP/evidentiary → GLM-legal-Flash when live, sol-high until then,
+# NEVER executed autonomously. The composer's job is to NOTICE items that
+# belong to another expert and route them out, not to grind them into prose.
+DREAM_ROUTING_CLASS_TO_ROUTE = {
+    "deterministic": "code",
+    "system1": "jev",
+    "synthesis": "composer",
+    "legal": "legal-flash",
+}
+DREAM_MAX_ROUTING = 8
+DREAM_ROUTING_JSONL_MAX = 200
+# [m3 cross-layer patterns 2026-10-17] Yang hypotheses are minted from
+# sweep-wide observations, not just per-ns: every emitted pattern is a
+# cross-layer hypothesis with a falsifier and a bounded untested expiry
+# (bounded-Yang law, §NEXT_UNIT 7). Stored fleet-wide, not per-ns.
+DREAM_MAX_PATTERNS = 3
+DREAM_PATTERN_TTL_DAYS = 7
+
 # ── [slice 1] FLEET BUDGET POLICY — sol round-4 Q4, owner-ratified ──────────
 # Soft bucket allocations under HARD fleet-wide totals. One authoritative day
 # boundary (UTC); unused allocations are borrowable by eligible work; no daily
@@ -3265,7 +3288,31 @@ source_refs must cite deltas that exist below.>
 context: mood/energy, location/travel, active commitments, working hours,
 communication shape — each line stamped [as-of: YYYY-MM-DD]; include only what
 the deltas EVIDENCE>", "evidence": ["seq#N/<file>", ...]} — or the single word
-null when the deltas contain no owner-state evidence.>"""
+null when the deltas contain no owner-state evidence.>
+=== ROUTING ===
+<JSON array, possibly [] — the MoE compression routing. Items in the deltas
+whose EXPERT treatment is NOT the composer's prose are ROUTED, not ground
+into NOW.md: {"item": "<what was seen, one line>", "class":
+"deterministic|system1|synthesis|legal", "route": "<code|jev|composer|
+legal-flash — must match the class>", "why": "<one line>", "source_refs":
+["seq#N/<file>", ...]}. Class meanings: deterministic = mechanically
+derivable fact (belongs in code/computed, never stored as model prose);
+system1 = repeated routing/tagging/triage/classification decision (belongs
+in Jev, with the rubric + falsifier discipline); synthesis = deep
+cross-layer synthesis that must be REMEMBERED as a routing instruction
+(the composer's own job — emit only the instruction, not the synthesis);
+legal = legal/IP/evidentiary matter (routes to GLM-legal-Flash when live,
+sol-high until then — never executed by the dreamer). At most 8 entries.
+Omit items that are neither deterministic, nor System-1, nor a synthesis
+instruction, nor legal.>
+=== PATTERNS ===
+<JSON array, possibly [] — at most 3 CROSS-LAYER pattern hypotheses (Yang
+seeds minted from sweep-wide observations): {"pattern": "<the observed
+repetition across layers>", "layers": ["<layer/ns id>", ...] (at least 2),
+"hypothesis": "<the connection it suggests>", "falsifier": "<the specific
+observation that would kill it>", "source_refs": ["seq#N/<file>", ...]}.
+A hypothesis without a falsifier is not a hypothesis — omit it.>
+"""
 
 
 def get_dream_dir(root: Path, ns: str, create: bool = True) -> Path:
@@ -3332,6 +3379,23 @@ def save_dream_watermark(root: Path, ns: str, watermark: dict) -> None:
     with open(temp, "w", encoding="utf-8") as f:
         json.dump(watermark, f, indent=2)
     temp.replace(p)
+
+
+def _append_bounded_jsonl(path: Path, records: list, cap: int) -> None:
+    """[moe routing] Append records to a JSONL journal, keeping at most the
+    newest ``cap`` lines — a bounded journal, not an archive."""
+    lines: list[str] = []
+    if path.is_file():
+        lines = [
+            line
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+    for record in records:
+        lines.append(json.dumps(record, ensure_ascii=False))
+    lines = lines[-cap:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def _dream_slice(text: str, cap: int) -> str:
@@ -3608,15 +3672,26 @@ def parse_dream_response(text: str) -> dict:
             raise ValueError(f"response is missing the {start} marker block")
         return match.group(1).strip()
 
+    def optional(start: str) -> str:
+        # [moe routing] the MoE blocks (ROUTING/PATTERNS) are OPTIONAL — a
+        # weaker composer may omit them and an older-format response still
+        # parses; absence is an empty list, never an error.
+        match = re.search(re.escape(start) + r"\s*\n(.*?)(?=\n=== |\Z)", text, re.DOTALL)
+        return _dream_json_block(match.group(1)) if match else ""
+
     now_md = between("=== NOW.MD ===", "=== OPS ===")
     ops_raw = _dream_json_block(between("=== OPS ===", "=== CLAIMS ==="))
     claims_raw = _dream_json_block(between("=== CLAIMS ===", "=== OWNER-NOW ==="))
     owner_raw = _dream_json_block(between("=== OWNER-NOW ===", None))
+    routing_raw = optional("=== ROUTING ===")
+    patterns_raw = optional("=== PATTERNS ===")
     return {
         "now_md": now_md,
         "ops": json.loads(ops_raw) if ops_raw else [],
         "claims": json.loads(claims_raw) if claims_raw else [],
         "owner_now": json.loads(owner_raw) if owner_raw else None,
+        "routing": json.loads(routing_raw) if routing_raw else [],
+        "patterns": json.loads(patterns_raw) if patterns_raw else [],
     }
 
 
@@ -3732,6 +3807,53 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
             errors.append(f"owner-now body > {DREAM_OWNER_NOW_MAX_BYTES} bytes")
         if not owner_now.get("evidence"):
             errors.append("owner-now carries no evidence refs")
+
+    # [moe routing] every routing entry must name a known class, carry the
+    # class's expert route, cite evidence, and stay under the bounded cap.
+    routing = parsed.get("routing") or []
+    if not isinstance(routing, list):
+        errors.append("ROUTING block is not a JSON array")
+        routing = []
+    if len(routing) > DREAM_MAX_ROUTING:
+        errors.append(f"{len(routing)} routing entries > {DREAM_MAX_ROUTING}")
+    for i, entry in enumerate(routing):
+        if not isinstance(entry, dict):
+            errors.append(f"routing entry #{i} is not an object")
+            continue
+        klass = entry.get("class")
+        if klass not in DREAM_ROUTING_CLASS_TO_ROUTE:
+            errors.append(f"routing entry #{i} class {klass!r} not in vocabulary {tuple(DREAM_ROUTING_CLASS_TO_ROUTE)}")
+        elif entry.get("route") != DREAM_ROUTING_CLASS_TO_ROUTE[klass]:
+            errors.append(
+                f"routing entry #{i} route {entry.get('route')!r} does not match class "
+                f"{klass!r} (expected {DREAM_ROUTING_CLASS_TO_ROUTE[klass]!r})"
+            )
+        if not entry.get("item") or not entry.get("why"):
+            errors.append(f"routing entry #{i} missing item or why")
+        if not entry.get("source_refs"):
+            errors.append(f"routing entry #{i} cites no source_refs")
+
+    # [m3 patterns] a Yang seed without a falsifier or with fewer than two
+    # layers is not cross-layer — refuse it rather than launder a hunch.
+    patterns = parsed.get("patterns") or []
+    if not isinstance(patterns, list):
+        errors.append("PATTERNS block is not a JSON array")
+        patterns = []
+    if len(patterns) > DREAM_MAX_PATTERNS:
+        errors.append(f"{len(patterns)} patterns > {DREAM_MAX_PATTERNS}")
+    for i, pat in enumerate(patterns):
+        if not isinstance(pat, dict):
+            errors.append(f"pattern #{i} is not an object")
+            continue
+        if not pat.get("pattern") or not pat.get("hypothesis"):
+            errors.append(f"pattern #{i} missing pattern or hypothesis")
+        if not pat.get("falsifier"):
+            errors.append(f"pattern #{i} carries no falsifier — not a hypothesis")
+        layers = pat.get("layers")
+        if not isinstance(layers, list) or len(layers) < 2:
+            errors.append(f"pattern #{i} names fewer than 2 layers — not cross-layer")
+        if not pat.get("source_refs"):
+            errors.append(f"pattern #{i} cites no source_refs")
     return errors
 
 
@@ -4504,6 +4626,253 @@ def _dream_auto_backoff(root: Path, reason: str) -> None:
     )
 
 
+# ── [task-ledger pickup 2026-10-17, §LAW 6] dreaming agents auto-finish
+# pending tasks ranked by tokenomics within routing rules. After a CLEAN
+# dream tick (nothing to consolidate) the tick takes the top-scoring OPEN
+# ledger task inside its harness's routing rule, claims it on the ledger
+# door (publish-safe), and emits the work brief for the calling session.
+# codex = moderate-to-small ONLY (owner correction); GLM seats = the
+# 1-big-2-moderate daily allowance; every other harness: no auto-pickup.
+# Cross-agent coordination IS the ledger: only `open` tasks are taken, and
+# the claim status line stops every other seat from double-taking. Parse/
+# sort semantics mirror tools/task-ledger/plan.py — keep the two aligned.
+LEDGER_TASK_RE = re.compile(r"^### \[(T-\d+)\] (.+)$", re.M)
+LEDGER_PICKUP_WEIGHT = {"big": 4.0, "moderate": 2.0, "small": 1.0}
+LEDGER_PICKUP_STATE = "ledger-pickups.json"
+LEDGER_PICKUP_DEFAULT_CAPS = {
+    "glm": {"big": 1, "moderate": 2},   # the owner's 1 BIG + 2 MODERATE/day
+    "codex": {"moderate": 2, "small": 2},  # moderate-to-small ONLY; count cap is this CLI's conservative default
+}
+PICKUP_HARNESS_CLASS = {"codex": "codex", "zcode": "glm", "autoclaw": "glm"}
+
+
+def _ledger_pickup_caps() -> dict:
+    raw = os.environ.get("YGG_DREAM_PICKUP_CAPS")
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                return loaded
+        except ValueError:
+            pass
+    return LEDGER_PICKUP_DEFAULT_CAPS
+
+
+def _ledger_task_size(task: dict) -> str:
+    size = str(task.get("size", ""))
+    if "big" in size:
+        return "big"
+    if "moderate" in size:
+        return "moderate"
+    return "small"
+
+
+def _ledger_task_score(task: dict) -> float:
+    value = 0
+    m = re.search(r"(\d)", str(task.get("value", "0")))
+    if m:
+        value = int(m.group(1))
+    return value / LEDGER_PICKUP_WEIGHT[_ledger_task_size(task)]
+
+
+def parse_ledger_tasks(text: str) -> list[dict]:
+    """Parse the ledger door into task dicts. Field parse mirrors
+    tools/task-ledger/plan.py: `- key: value` bullets, ` ; `-split fields."""
+    heads = list(LEDGER_TASK_RE.finditer(text))
+    tasks = []
+    for i, m in enumerate(heads):
+        body_end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        task = {"id": m.group(1), "title": m.group(2).strip()}
+        for line in text[m.end():body_end].splitlines():
+            line = line.strip()
+            if not (line.startswith("- ") and ":" in line):
+                continue
+            for seg in line[2:].split(" ; "):
+                if ":" in seg:
+                    k, v = seg.split(":", 1)
+                    task[k.strip()] = v.strip()
+        tasks.append(task)
+    return tasks
+
+
+def ledger_claim_task(text: str, tid: str, by: str, date: str, note: str) -> str:
+    """Pure transform: the task's `status:` line → `claimed(...)`. Refuses
+    any task that is not open — never steals a claimed/blocked/done entry."""
+    m = re.search(r"^### \[" + re.escape(tid) + r"\] ", text, re.M)
+    if not m:
+        raise ValueError(f"task {tid} not found in the ledger")
+    nxt = re.search(r"^### \[T-", text[m.end():], re.M)
+    block_end = m.end() + nxt.start() if nxt else len(text)
+    block = text[m.end():block_end]
+    status_m = re.search(r"^- status: (.*)$", block, re.M)
+    if not status_m:
+        raise ValueError(f"task {tid} has no status line")
+    status = status_m.group(1).strip()
+    if not status.startswith("open"):
+        raise ValueError(f"task {tid} is not open (status: {status[:60]})")
+    new_block, _ = re.subn(
+        r"^- status: .*$",
+        f"- status: claimed({by}, {date}) — {note}",
+        block,
+        count=1,
+        flags=re.M,
+    )
+    return text[:m.end()] + new_block + text[block_end:]
+
+
+def _load_pickup_state(root: Path) -> dict:
+    path = root / "dream" / LEDGER_PICKUP_STATE
+    state: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except Exception:
+            state = {}
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    if state.get("day") != today:
+        state = {"day": today, "pickups": []}
+    pickups = [p for p in state.get("pickups", []) if isinstance(p, dict)]
+    state["pickups"] = pickups[-64:]
+    return state
+
+
+def _save_pickup_state(root: Path, state: dict) -> None:
+    path = root / "dream" / LEDGER_PICKUP_STATE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+
+def _dream_task_pickup(root: Path) -> str | None:
+    """Clean tick: claim the top tokenomics-ranked ledger task within this
+    harness's routing rule and emit its work brief. None = no eligible task,
+    pickup disabled, or the claim publish failed (nothing counted)."""
+    if os.environ.get("YGG_DREAM_TASK_PICKUP", "1") == "0":
+        return None
+    route_class = os.environ.get("YGG_DREAM_TASK_ROUTE") or PICKUP_HARNESS_CLASS.get(
+        detect_harness()
+    )
+    if not route_class:
+        return None
+    caps = _ledger_pickup_caps().get(route_class)
+    if not caps:
+        return None
+    door = root / "namespaces" / "_global" / "fleet-task-ledger.md"
+    if not door.is_file():
+        return None
+    text = door.read_text(encoding="utf-8", errors="replace")
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    state = _load_pickup_state(root)
+    taken = [p for p in state["pickups"] if p.get("route_class") == route_class]
+
+    def eligible(task: dict) -> bool:
+        status = str(task.get("status", "open"))
+        if not status.startswith("open"):
+            return False
+        route = str(task.get("route", "")).lower()
+        if "owner-gated" in route or "gated" in status:
+            return False
+        if not str(task.get("deps", "none")).strip().lower().startswith("none"):
+            return False
+        wants_glm = "glm" in route or route.startswith("any") or route == ""
+        wants_codex = "codex" in route or route.startswith("any") or route == ""
+        if route_class == "glm":
+            if not wants_glm:
+                return False
+        else:
+            if not wants_codex:
+                return False
+        size = _ledger_task_size(task)
+        if size not in caps:
+            return False
+        used = sum(1 for p in taken if p.get("size") == size)
+        return used < int(caps[size])
+
+    chosen = next(
+        (
+            t
+            for t in sorted(
+                (t for t in parse_ledger_tasks(text) if eligible(t)),
+                key=_ledger_task_score,
+                reverse=True,
+            )
+        ),
+        None,
+    )
+    if chosen is None:
+        return None
+    try:
+        new_text = ledger_claim_task(
+            text, chosen["id"], route_class, today,
+            f"auto-pickup by the {route_class} dreamer tick",
+        )
+    except ValueError as err:
+        print(f"dream: ledger pickup skipped: {err}", file=sys.stderr)
+        return None
+    tmp = tempfile.NamedTemporaryFile(
+        "w", suffix=".md", delete=False, encoding="utf-8"
+    )
+    tmp.write(new_text)
+    tmp.close()
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                # ⛔ --root must ride along: without it the claim read from a
+                # sandboxed/overridden root would publish to the REAL hub.
+                "--root",
+                str(root),
+                "publish",
+                "--file",
+                tmp.name,
+                "--ns=_global",
+                "--as",
+                "fleet-task-ledger.md",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        os.unlink(tmp.name)
+    if proc.returncode != 0:
+        print(
+            "dream: ledger pickup publish failed: "
+            f"{(proc.stderr or proc.stdout or '')[-200:]}",
+            file=sys.stderr,
+        )
+        return None
+    state["pickups"].append(
+        {
+            "id": chosen["id"],
+            "route_class": route_class,
+            "size": _ledger_task_size(chosen),
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+    )
+    _save_pickup_state(root, state)
+    tid = chosen["id"]
+    lines = [
+        f"dream: TASK PICKUP {tid} [{_ledger_task_size(chosen)}] "
+        f"(score {_ledger_task_score(chosen):.2f}) — {chosen['title']}",
+        f"  claimed on the ledger for this session ({route_class} class, {today}). Work it NOW.",
+    ]
+    source = str(chosen.get("source", "")).strip()
+    if source:
+        lines.append(f"  source: {source[:220]}")
+    lines += [
+        "  LAST STEP — MANDATORY (§LAW 7): book the ledger when done"
+        f" (tools/task-ledger/plan.py --done {tid} --proof '<ref>', or"
+        " get→edit→publish --as fleet-task-ledger.md),",
+        "  post the outcome on the relevant board, then ygg-memory sync-harness --harness <me> --all.",
+    ]
+    return "\n".join(lines)
+
+
 def _dream_auto(root: Path, ns_filter: str, args) -> str:
     """The auto-dreamer (round-4 design): activity-driven, ONE namespace per
     invocation, cooldown + quiescence + pending-manifest filters, a 1h
@@ -4563,8 +4932,17 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
             age_hours = summary["oldest_pending_s"] / 3600.0
             candidates.append((delta * (1.0 + min(age_hours, 24.0) / 6.0), delta, ns, summary))
     if not candidates:
+        message = "auto-dream: no candidate (clean tick)"
+        # [task-ledger pickup] a clean consolidation tick is spare capacity:
+        # take the top tokenomics-ranked open ledger task within the routing
+        # rule and hand the work brief to the calling session. Only the
+        # clean-tick branch picks up — a deferred/dreamed tick did its work.
+        pickup = _dream_task_pickup(root)
+        if pickup:
+            _dream_receipt(root, "task-pickup", pickup.splitlines()[0][:120])
+            return message + "\n" + pickup
         _dream_receipt(root, "idle", "no candidate (clean tick)")
-        return "auto-dream: no candidate (clean tick)"
+        return message
     # [slice 2] FOCUS APPLIES TO RANKING ONLY — never to eligibility. The
     # quiescence/cooldown/pending filters above already ran; a boost cannot
     # resurrect a blocked namespace (focus reorders, it does not grant).
@@ -6165,8 +6543,52 @@ def cmd_dream(args):
             "claims": len(parsed["claims"]),
             "contested": contested,
             "ops": len(parsed["ops"]),
+            "routing": len(parsed.get("routing") or []),
+            "patterns": len(parsed.get("patterns") or []),
             "journal_seq": record["seq"],
         }
+        # [moe routing] the composer's expert-routing decisions persist as a
+        # bounded per-ns journal — the Jev/work-registry consumers read this
+        # plane; the dream itself never executes a routed item.
+        routing = parsed.get("routing") or []
+        if routing:
+            _append_bounded_jsonl(
+                get_dream_dir(root, ns) / "routing.jsonl",
+                [
+                    {
+                        **entry,
+                        "ns": ns,
+                        "journal_seq": record["seq"],
+                        "captured_seq": manifest["captured_seq"],
+                        "applied_at": dream_record["applied_at"],
+                    }
+                    for entry in routing
+                ],
+                DREAM_ROUTING_JSONL_MAX,
+            )
+        # [m3 patterns] Yang seeds go to the FLEET-WIDE pattern journal (not
+        # per-ns): each carries its falsifier, its minting dream, and a 7d
+        # untested expiry stamped at mint time.
+        patterns = parsed.get("patterns") or []
+        if patterns:
+            _append_bounded_jsonl(
+                root / "dream" / "patterns.jsonl",
+                [
+                    {
+                        **pat,
+                        "minted_by_ns": ns,
+                        "journal_seq": record["seq"],
+                        "opened_at": today,
+                        "expires_at": (
+                            datetime.datetime.now(datetime.timezone.utc).date()
+                            + datetime.timedelta(days=DREAM_PATTERN_TTL_DAYS)
+                        ).isoformat(),
+                        "status": "open",
+                    }
+                    for pat in patterns
+                ],
+                DREAM_ROUTING_JSONL_MAX,
+            )
         watermark["last_seq"] = manifest["captured_seq"]
         watermark["last_dream_ts"] = dream_record["applied_at"]
         watermark.setdefault("dreams", []).append(dream_record)
@@ -6185,6 +6607,8 @@ def cmd_dream(args):
             f"critic sha256: {file_sha256(critic_path)}" if critic_path.is_file() else "critic: (none — zero claims)",
             f"verdicts: {json.dumps(verdicts)}",
             f"ops: {json.dumps(applied_ops, indent=2)}",
+            f"routing: {json.dumps(parsed.get('routing') or [])}",
+            f"patterns: {json.dumps(parsed.get('patterns') or [])}",
             f"dream record: {json.dumps(dream_record)}",
         ]
         (done / "OPLOG.md").write_text("\n".join(oplog) + "\n", encoding="utf-8")
