@@ -23,6 +23,8 @@ import datetime
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -115,6 +117,33 @@ def plan(tasks):
     }
 
 
+
+
+def mark_done(text, tid, proof, by, date):
+    """Transform the ledger markdown: task status -> done, §BOOK one-liner.
+    Pure text transform (no writes) — the caller publishes via ygg-memory."""
+    m = re.search(r"^### \[" + re.escape(tid) + r"\] (.+)$", text, re.M)
+    if not m:
+        raise SystemExit(f"task {tid} not found in the ledger")
+    title = m.group(1).strip()
+    nxt = re.search(r"^### \[T-", text[m.end():], re.M)
+    block_end = m.end() + nxt.start() if nxt else len(text)
+    block = text[m.end():block_end]
+    if re.search(r"^- status: done", block, re.M):
+        raise SystemExit(f"task {tid} is already done")
+    new_block, n = re.subn(r"^- status: .*$",
+                           f"- status: done({proof}) [by {by}, {date}]",
+                           block, count=1, flags=re.M)
+    if n != 1:
+        raise SystemExit(f"task {tid} has no status line to book")
+    text = text[:m.end()] + new_block + text[block_end:]
+    book_hdr = "## §BOOK — one-liners of finished work"
+    if book_hdr in text:
+        line = f"- {date} {tid} done({proof}) [by {by}] — {title}"
+        text = text.replace(book_hdr, book_hdr + "\n" + line, 1)
+    return text
+
+
 def selftest():
     synthetic = """
 ### [T-101] low value small
@@ -146,6 +175,8 @@ def selftest():
 - size: moderate ; value: 4 ; est: x
 - route: any ; deps: none
 - status: open
+
+## §BOOK — one-liners of finished work
 """
     p = plan(parse_ledger(synthetic))
     ids = [t["id"] for t in p["glm_idle_batch"]["tasks"]]
@@ -154,7 +185,10 @@ def selftest():
     assert p["owner_gated"] and p["owner_gated"][0]["id"] == "T-104"
     assert p["held_for_deps"][0]["id"] == "T-105"
     assert p["codex_queue"]["tasks"][0]["id"] == "T-101"
-    print("selftest green")
+    booked = mark_done(synthetic, "T-101", "main abc123", "glm-idle", "2026-10-17")
+    assert "- status: done(main abc123) [by glm-idle, 2026-10-17]" in booked
+    assert "- 2026-10-17 T-101 done(main abc123) [by glm-idle]" in booked
+    print("selftest green (plan + mark_done)")
     return 0
 
 
@@ -164,9 +198,41 @@ def main():
     ap.add_argument("--day", default=datetime.date.today().isoformat())
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--done", metavar="TASK_ID",
+                    help="book a task done: rewrites the ledger door via "
+                         "ygg-memory publish (hub doors are never edited "
+                         "in place) + adds the §BOOK one-liner")
+    ap.add_argument("--proof", help="proof ref for --done (lane/main sha, board ACK, door seq)")
+    ap.add_argument("--by", default="glm-idle-session",
+                    help="who completed it (default: glm-idle-session)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --done: print the transform, do not publish")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+    if a.done:
+        if not a.proof:
+            print("--done needs --proof \"<ref>\"")
+            return 2
+        text = open(a.ledger, encoding="utf-8").read()
+        new = mark_done(text, a.done, a.proof, a.by, a.day)
+        if a.dry_run:
+            print(new)
+            return 0
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                          encoding="utf-8")
+        tmp.write(new)
+        tmp.close()
+        runner = shutil.which("ygg-memory") or os.path.expanduser(
+            "~/.local/bin/ygg-memory.py")
+        r = subprocess.run([sys.executable, runner, "publish", "--file", tmp.name,
+                            "--ns=_global", "--as", "fleet-task-ledger.md"],
+                           capture_output=True, text=True)
+        os.unlink(tmp.name)
+        print(r.stdout.strip() or r.stderr.strip())
+        print(f"booked {a.done} done({a.proof}) [by {a.by}] — §BOOK line added; "
+              "if the day's batch is exhausted, refresh §TODAY with a fresh plan run")
+        return r.returncode
     if not os.path.exists(a.ledger):
         print(json.dumps({"error": f"ledger not found: {a.ledger}"}))
         return 2
