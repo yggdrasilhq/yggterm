@@ -144,6 +144,31 @@ def mark_done(text, tid, proof, by, date):
     return text
 
 
+def mark_claimed(text, tid, by, date, note=""):
+    """Transform the ledger markdown: task status -> claimed(by, date).
+    Pure text transform — the caller publishes via ygg-memory. The claim is
+    ID-KEYED (same discipline as mark_done): the seat hands the task id and
+    this matches the exact block — hand regex over the door text has the
+    mis-target hazard measured 2026-10-17 (a claim edit skipped past a
+    just-claimed T-002 and landed on T-003). Refuses when the task is no
+    longer open in the text being claimed."""
+    m = re.search(r"^### \[" + re.escape(tid) + r"\] (.+)$", text, re.M)
+    if not m:
+        raise SystemExit(f"task {tid} not found in the ledger")
+    nxt = re.search(r"^### \[T-", text[m.end():], re.M)
+    block_end = m.end() + nxt.start() if nxt else len(text)
+    block = text[m.end():block_end]
+    if not re.search(r"^- status: open", block, re.M):
+        raise SystemExit(f"task {tid} is no longer open — another seat took it first")
+    suffix = f" — {note}" if note else ""
+    new_block, n = re.subn(r"^- status: .*$",
+                           f"- status: claimed({by}, {date}){suffix}",
+                           block, count=1, flags=re.M)
+    if n != 1:
+        raise SystemExit(f"task {tid} has no status line to claim")
+    return text[:m.end()] + new_block + text[block_end:]
+
+
 def selftest():
     synthetic = """
 ### [T-101] low value small
@@ -188,7 +213,16 @@ def selftest():
     booked = mark_done(synthetic, "T-101", "main abc123", "glm-idle", "2026-10-17")
     assert "- status: done(main abc123) [by glm-idle, 2026-10-17]" in booked
     assert "- 2026-10-17 T-101 done(main abc123) [by glm-idle]" in booked
-    print("selftest green (plan + mark_done)")
+    claimed = mark_claimed(synthetic, "T-102", "zcode", "2026-10-17", "on a lane")
+    assert "- status: claimed(zcode, 2026-10-17) — on a lane" in claimed
+    assert claimed.count("- status: open") == synthetic.count("- status: open") - 1
+    for bad_text, bad_id in ((claimed, "T-102"), (synthetic, "T-999")):
+        try:
+            mark_claimed(bad_text, bad_id, "zcode", "2026-10-17")
+            raise AssertionError(f"claim {bad_id} should refuse")
+        except SystemExit:
+            pass
+    print("selftest green (plan + mark_done + mark_claimed)")
     return 0
 
 
@@ -202,14 +236,40 @@ def main():
                     help="book a task done: rewrites the ledger door via "
                          "ygg-memory publish (hub doors are never edited "
                          "in place) + adds the §BOOK one-liner")
+    ap.add_argument("--claim", metavar="TASK_ID",
+                    help="book a claim (id-keyed, refuses a no-longer-open "
+                         "task): rewrites the ledger door via ygg-memory "
+                         "publish; the safe way to mark a task taken")
+    ap.add_argument("--note", default="",
+                    help="with --claim: the claim note (what/where)")
     ap.add_argument("--proof", help="proof ref for --done (lane/main sha, board ACK, door seq)")
     ap.add_argument("--by", default="glm-idle-session",
                     help="who completed it (default: glm-idle-session)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="with --done: print the transform, do not publish")
+                    help="with --done/--claim: print the transform, do not publish")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+    if a.claim:
+        text = open(a.ledger, encoding="utf-8").read()
+        new = mark_claimed(text, a.claim, a.by, a.day, a.note)
+        if a.dry_run:
+            print(new)
+            return 0
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                          encoding="utf-8")
+        tmp.write(new)
+        tmp.close()
+        runner = shutil.which("ygg-memory") or os.path.expanduser(
+            "~/.local/bin/ygg-memory.py")
+        r = subprocess.run([sys.executable, runner, "publish", "--file", tmp.name,
+                            "--ns=_global", "--as", "fleet-task-ledger.md"],
+                           capture_output=True, text=True)
+        os.unlink(tmp.name)
+        print(r.stdout.strip() or r.stderr.strip())
+        print(f"booked {a.claim} claimed({a.by}) — the task is taken; "
+              "execution in flight")
+        return r.returncode
     if a.done:
         if not a.proof:
             print("--done needs --proof \"<ref>\"")
