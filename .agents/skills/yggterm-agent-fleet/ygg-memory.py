@@ -4201,6 +4201,119 @@ def _door_existed(root: Path, ns: str, filename: str) -> bool:
     return any(r.get("file") == filename for r in read_journal_entries(root, namespace=ns))
 
 
+# ── [fleet-now 2026-10-17, T-006: structure dream ACK-15c236ca5a] the 26-NOW
+# rollup surface. A seat ROUTING reads every namespace's NOW.md (~14k tokens);
+# this derived view serves the first §CURRENT_STATUS line + the §ACTIVE_TRAPS
+# of each (~3k for the whole fleet). A VIEW, not a store: the doors stay SSOT;
+# the materialized file regenerates WHOLE on every dream apply and journals
+# with dreamer origin, so it never re-enters any dream's input set.
+FLEET_NOW_DOOR = "FLEET-NOW.md"
+FLEET_NOW_STATUS_MAX_BYTES = 300
+FLEET_NOW_TRAPS_MAX = 6
+
+
+def _now_body(content: str) -> str:
+    if content.startswith("---\n"):
+        end = content.find("\n---\n", 4)
+        if end != -1:
+            content = content[end + 5:]
+    return content
+
+
+def _now_section_bullets(body: str, section: str) -> list[str]:
+    bullets, inside = [], False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith("§"):
+            inside = section in stripped
+            continue
+        if inside and re.match(r"^(-|\*|\d+\.)\s", stripped):
+            # the marker is presentation — the view re-bullets its own way
+            bullets.append(re.sub(r"^(-|\*|\d+\.)\s+", "", stripped))
+    return bullets
+
+
+def build_fleet_now(root: Path) -> dict:
+    """Assemble the fleet-now view from every namespace's NOW.md. Namespaces
+    without a rollup are simply absent — absence is visible in the count."""
+    entries = []
+    ns_root = root / "namespaces"
+    if ns_root.is_dir():
+        for ns_dir in sorted(p for p in ns_root.iterdir() if p.is_dir()):
+            now_path = ns_dir / "NOW.md"
+            if not now_path.is_file():
+                continue
+            body = _now_body(now_path.read_text(encoding="utf-8", errors="replace"))
+            status = _now_section_bullets(body, "§CURRENT_STATUS")[:1]
+            status_line = status[0] if status else ""
+            if len(status_line.encode("utf-8")) > FLEET_NOW_STATUS_MAX_BYTES:
+                status_line = status_line[:FLEET_NOW_STATUS_MAX_BYTES] + "…"
+            traps = _now_section_bullets(body, "§ACTIVE_TRAPS")[:FLEET_NOW_TRAPS_MAX]
+            if not status_line and not traps:
+                continue  # a legacy/sectionless rollup is noise in the view
+            entries.append(
+                {
+                    "ns": ns_dir.name,
+                    "status": status_line,
+                    "traps": traps,
+                }
+            )
+    return {
+        "entries": entries,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def render_fleet_now(view: dict) -> str:
+    lines = [
+        "# FLEET-NOW — the whole-network rollup surface",
+        "",
+        f"Derived VIEW (doors are the SSOT) — {len(view['entries'])} namespace rollup(s), generated {view['generated_at']}.",
+        "",
+    ]
+    for entry in view["entries"]:
+        lines.append(f"## {entry['ns']}")
+        if entry["status"]:
+            lines.append(f"- {entry['status']}")
+        for trap in entry["traps"]:
+            lines.append(f"- ⚠ {trap}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _regenerate_fleet_now(root: Path, harness: str) -> dict:
+    view = build_fleet_now(root)
+    content = (
+        "---\n"
+        "name: FLEET-NOW\n"
+        "description: THE whole-network NOW rollup surface (derived view — regenerated on every dream apply)\n"
+        "metadata:\n"
+        "  type: now\n"
+        f"  origin: {DREAM_ORIGIN}\n"
+        f"  as_of: {datetime.datetime.now(datetime.timezone.utc).date().isoformat()}\n"
+        "---\n\n"
+        + render_fleet_now(view)
+    )
+    _dream_publish_door(
+        root, "_global", FLEET_NOW_DOOR, content, harness, "now",
+        f"fleet-now regen ({len(view['entries'])} ns)",
+    )
+    _upsert_ns_index_line(
+        get_namespace_dir(root, "_global"), FLEET_NOW_DOOR,
+        "THE whole-network NOW rollup surface (derived view)",
+    )
+    return view
+
+
+def cmd_fleet_now(args):
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    view = build_fleet_now(root)
+    if getattr(args, "json", False):
+        print(json.dumps(view, indent=2))
+        return
+    print(render_fleet_now(view).rstrip())
+
+
 def _dream_append_section(door_path: Path, section: str, entry: str) -> None:
     lines = door_path.read_text(encoding="utf-8", errors="replace").splitlines()
     header_idx = next((i for i, line in enumerate(lines) if section in line), None)
@@ -6489,6 +6602,14 @@ def cmd_dream(args):
             )
             _upsert_ns_index_line(ns_dir, "NOW.md", description)
 
+            # [fleet-now] the derived fleet surface regenerates whole on every
+            # dream apply — a VIEW, not a store; dreamer origin keeps it out
+            # of every dream's input set. A regen failure never kills the apply.
+            try:
+                _regenerate_fleet_now(root, harness)
+            except Exception as fleet_now_error:
+                print(f"dream: fleet-now regen skipped: {fleet_now_error}", file=sys.stderr)
+
             if parsed["owner_now"]:
                 owner = parsed["owner_now"]
                 owner_content = (
@@ -6889,6 +7010,11 @@ def main():
     p_now = subparsers.add_parser("now", parents=[common_parser], help="Read NOW.md + the temporal envelope (claim ages, expiries, supersessions) — the session-start orientation read")
     p_now.set_defaults(fn=cmd_now)
 
+    # [fleet-now] the 26-NOW rollup surface (structure dream ACK-15c236ca5a):
+    # first §CURRENT_STATUS line + §ACTIVE_TRAPS of every namespace in one read.
+    p_fleet_now = subparsers.add_parser("fleet-now", parents=[common_parser], help="The whole-network rollup surface: first §CURRENT_STATUS line + §ACTIVE_TRAPS of every namespace's NOW.md (~3k tokens for the fleet) — a derived view, regenerated on dream apply")
+    p_fleet_now.set_defaults(fn=cmd_fleet_now)
+
     # [slice 3] authoritative owner corrections
     p_owner = subparsers.add_parser("owner", parents=[common_parser], help="Authoritative owner corrections: --correct/--dismiss/--surface (effective on next read); --list shows the record")
     p_owner.add_argument("--correct", action="store_true")
@@ -7029,6 +7155,8 @@ def main():
         cmd_search(args)
     elif args.subcommand == "now":
         cmd_now(args)
+    elif args.subcommand == "fleet-now":
+        cmd_fleet_now(args)
     elif args.subcommand == "owner":
         cmd_owner(args)
     elif args.subcommand == "dream-budget":

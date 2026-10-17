@@ -383,6 +383,64 @@ def main() -> int:
                 failures.append("non-open: pickup stole a claimed task")
             else:
                 print("  ok: fully-claimed ledger → no pickup")
+
+        print("[9] the fleet-now view (T-006, dream ACK-15c236ca5a)")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_store(module, Path(tmp))
+            for ns, status, trap in (
+                ("-ns-a", "- Alpha landed [as-of: 2026-10-17; proof: deployed]", "- heredoc eats shells"),
+                ("-ns-b", "- Beta measured [as-of: 2026-10-17; proof: measured-live]", ""),
+            ):
+                ns_dir = module.get_namespace_dir(root, ns)
+                (ns_dir / "NOW.md").write_text(
+                    f"## §CURRENT_STATUS\n{status}\n\n## §NEXT_UNITS\n- next [as-of: 2026-10-17; proof: claimed]\n\n## §ACTIVE_TRAPS\n{trap}\n\n## §POINTERS\n- door\n",
+                    encoding="utf-8",
+                )
+            view = module.build_fleet_now(root)
+            by_ns = {e["ns"]: e for e in view["entries"]}
+            if "-ns-a" not in by_ns or "-ns-b" not in by_ns:
+                failures.append(f"fleet-now: rollups missing from the view: {sorted(by_ns)}")
+            elif not by_ns["-ns-a"]["status"].startswith("Alpha landed"):
+                failures.append(f"fleet-now: status line wrong: {by_ns['-ns-a']}")
+            elif by_ns["-ns-a"]["traps"] != ["heredoc eats shells"]:
+                failures.append(f"fleet-now: traps wrong: {by_ns['-ns-a']}")
+            elif by_ns["-ns-b"]["traps"]:
+                failures.append("fleet-now: trapless ns carries traps")
+            elif "-t-dream" in by_ns:
+                failures.append("fleet-now: sectionless legacy rollup not skipped")
+            else:
+                print("  ok: view = first status line + traps; sectionless rollups skipped")
+            rendered = module.render_fleet_now(view)
+            if "## -ns-a" not in rendered or "⚠ heredoc eats shells" not in rendered:
+                failures.append("fleet-now: render missing ns or trap marker")
+            else:
+                print("  ok: render carries ns heads + ⚠ traps")
+
+            # regeneration on dream apply, with dreamer-origin isolation
+            journal_door(module, root, "-ns-a", "door-alpha.md", "# alpha\n\nalpha content\n")
+            module.prepare_dream(root, "-ns-a", "synthesis", [], 10 ** 9)
+            pending = module.get_dream_dir(root, "-ns-a") / "pending"
+            (pending / "RESPONSE.md").write_text(BASE_RESPONSE, encoding="utf-8")
+            (pending / "CRITIC.md").write_text(GOOD_CRITIC, encoding="utf-8")
+            module.cmd_dream(Args(apply=True, ns="-ns-a", root=str(root)))
+            fleet_path = module.get_namespace_dir(root, "_global") / "FLEET-NOW.md"
+            if not fleet_path.is_file():
+                failures.append("fleet-now: not regenerated on dream apply")
+            else:
+                text = fleet_path.read_text()
+                if "-ns-a" not in text or "-ns-b" not in text:
+                    failures.append("fleet-now: regenerated file missing namespaces")
+                else:
+                    print("  ok: FLEET-NOW.md regenerated on dream apply")
+            origin = [
+                r.get("origin")
+                for r in module.read_journal_entries(root, namespace="_global")
+                if r.get("file") == "FLEET-NOW.md"
+            ]
+            if not origin or origin[-1] != module.DREAM_ORIGIN:
+                failures.append(f"fleet-now: journal origin not dreamer: {origin}")
+            else:
+                print("  ok: fleet-now journals with dreamer origin (never a dream input)")
     finally:
         for key, value in env_backup.items():
             if value is None:
