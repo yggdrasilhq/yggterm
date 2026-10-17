@@ -4189,7 +4189,14 @@ def _opencode_bin() -> str:
 
 
 def _opencode_exec(model: str, prompt: str, timeout: int = 900) -> str:
-    cmd = [_opencode_bin(), "run", "-m", model, prompt]
+    # Owner law 2026-10-17: dream agents run with FULL permissions — opencode
+    # gets `--auto` (approve every permission not explicitly denied), the
+    # codex counterpart being --dangerously-bypass-approvals-and-sandbox.
+    # YGG_OPENCODE_AUTO=0 restores approval-gated runs.
+    cmd = [_opencode_bin(), "run"]
+    if os.environ.get("YGG_OPENCODE_AUTO", "1") != "0":
+        cmd.append("--auto")
+    cmd += ["-m", model, prompt]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, cwd="/tmp"
