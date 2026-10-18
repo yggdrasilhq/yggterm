@@ -149,10 +149,27 @@ if [ -f "$SCRIPT_DIR/ygg-memory" ]; then
   chmod +x "$HOME/.local/bin/ygg-memory" "$HOME/.local/bin/ygg-memory-tick" 2>/dev/null || true
   if [ -d "$SCRIPT_DIR/systemd" ] && command -v systemctl >/dev/null 2>&1; then
     mkdir -p "$HOME/.config/systemd/user"
+    units_refreshed=0
     for unit in "$SCRIPT_DIR/systemd"/*; do
       name="$(basename "$unit")"
-      [ -f "$HOME/.config/systemd/user/$name" ] || cp "$unit" "$HOME/.config/systemd/user/$name"
+      # ⛔ Refresh skill-homed units when the checkout copy changed — unit
+      # text is tooling, and "install only when absent" stranded fixes on
+      # every host that ever installed the broken version (one seat's memory
+      # timer ran dead 2026-08-22..2026-10-18 on a stale installed copy; the
+      # fix never reached it). Owner hand-tuning is preserved: add the line
+      # `# YGGTERM_UNIT_TUNED` anywhere in the INSTALLED unit to pin it —
+      # the SSOT never carries that marker, so fresh installs always refresh.
+      if [ -f "$HOME/.config/systemd/user/$name" ] && grep -q "YGGTERM_UNIT_TUNED" "$HOME/.config/systemd/user/$name" 2>/dev/null; then
+        continue
+      fi
+      if [ ! -f "$HOME/.config/systemd/user/$name" ] || ! cmp -s "$unit" "$HOME/.config/systemd/user/$name"; then
+        cp "$unit" "$HOME/.config/systemd/user/$name"
+        units_refreshed=1
+      fi
     done
+    if [ "$units_refreshed" = 1 ]; then
+      note "refreshed systemd user units from skill SSOT (tuned units pinned by YGGTERM_UNIT_TUNED marker)"
+    fi
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     systemctl --user enable --now ygg-memory-sync.timer >/dev/null 2>&1 || true
   fi
