@@ -159,6 +159,24 @@ if [ -f "$SCRIPT_DIR/ygg-memory" ]; then
   note "installed/refreshed ygg-memory + tick to ~/.local/bin"
 fi
 
+# --- [onboarding] bare essentials for a solo user (owner directive 2026-10-18)
+# No permission gate for scaffolding; nothing hard-coded; dreaming stays
+# opt-in (the config DIR is created, the dreamer is NOT armed — arming is a
+# `touch ~/.yggterm/config/dream/enabled` on exactly ONE host, a decision
+# with a compute cost that belongs to the user).
+mkdir -p "$HOME/.yggterm/config/dream"
+if [ -x "$HOME/.local/bin/ygg-memory" ] && [ -f "$HOME/.local/bin/ygg-memory.py" ]; then
+  "$HOME/.local/bin/ygg-memory.py" asks seed >/dev/null 2>&1 \
+    || note "(asks door not seeded yet — run: ygg-memory asks seed)"
+fi
+if command -v systemctl >/dev/null 2>&1 && [ -f "$HOME/.config/systemd/user/ygg-memory-doctor.timer" ]; then
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user enable --now ygg-memory-doctor.timer >/dev/null 2>&1 || true
+  note "doctor timer enabled (hourly health probes, independent of the tick)"
+fi
+note "bare essentials ready — mold points: ~/.yggterm/config/, systemd --user units,"
+note "env (YGG_DREAM_COMPOSERS, YGG_COMPOSER_*), and the yggterm-onboarding skill."
+
 # Backfill Muse/Gemini/Codex from unified if they are empty (new user with only Claude)
 if [ "$WITH_TIMERS" = true ] || [ "$created" -gt 0 ]; then
   if command -v ygg-memory >/dev/null 2>&1 || [ -x "$HOME/.local/bin/ygg-memory" ]; then

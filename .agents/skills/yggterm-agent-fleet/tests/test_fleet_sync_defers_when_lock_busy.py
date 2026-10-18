@@ -57,6 +57,16 @@ def run():
     mod = load_module(script)
     tmp_root = Path(tempfile.mkdtemp(prefix="ygg-mem-defer-test-"))
 
+    # ⛔ Hermeticity (found 2026-10-18): Args(mesh=[]) is FALSY, so
+    # resolve_fleet_mesh falls through env/mesh-file and Case 3 can perform a
+    # REAL fleet sync — inheriting whatever divergence the peers hold (a live
+    # mesh with preserved conflicts raised 'failed=8-preserved-conflict(s)'
+    # out of a supposedly-quiet test and failed it). Pin the resolver to an
+    # empty mesh for the whole test; restore after. (An env sentinel does not
+    # work: ' ' strips to empty and falls through to the mesh file.)
+    saved_resolver = mod.resolve_fleet_mesh
+    mod.resolve_fleet_mesh = lambda explicit=None: []
+
     # Case 1 — lock genuinely held on another file descriptor: cmd_sync_fleet
     # must RETURN (no raise), print the deferral, and leave exit code 0 to its
     # caller. Real flock contention, not a mock.
@@ -149,6 +159,7 @@ def run():
     finally:
         mod._flock_close(holder)
 
+    mod.resolve_fleet_mesh = saved_resolver
     print()
     if FAILURES:
         print(f"{len(FAILURES)} failure(s)")

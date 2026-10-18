@@ -1,0 +1,15 @@
+[Unit]
+Description=Yggterm memory health doctor (independent of the memory tick)
+
+[Service]
+Type=oneshot
+# ⛔ Runs the REPO-HOMED verb (ygg-panic convention): the doctor needs the
+#   skill SSOT next to it for unit-drift probes, and an installed copy in
+#   ~/.local/bin has no systemd/ dir beside it. Adjust the checkout path if
+#   yours differs.
+ExecStart=python3 %h/gh/yggterm/.agents/skills/yggterm-agent-fleet/ygg-memory.py doctor --fix
+# Exit 1 = unresolved issues found — a successful doctor run (ygg-panic
+# convention). Without this, every real finding looks like a crash.
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle
