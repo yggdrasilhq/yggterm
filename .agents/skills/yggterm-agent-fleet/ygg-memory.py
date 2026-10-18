@@ -7514,6 +7514,9 @@ def main():
     p_asks.add_argument("--until")
     p_asks.add_argument("--verified", action="store_true")
     p_asks.set_defaults(fn=cmd_asks)
+    p_doctor = subparsers.add_parser("doctor", parents=[common_parser], help="deterministic health probes + bounded self-repair (exit 1 = unresolved issues)")
+    p_doctor.add_argument("--fix", action="store_true", help="apply bounded repairs to installation-owned parts")
+    p_doctor.set_defaults(fn=cmd_doctor)
     p_owner = subparsers.add_parser("owner", parents=[common_parser], help="Authoritative owner corrections: --correct/--dismiss/--surface (effective on next read); --list shows the record")
     p_owner.add_argument("--correct", action="store_true")
     p_owner.add_argument("--dismiss", action="store_true")
@@ -7663,6 +7666,10 @@ def main():
         cmd_search(args)
     elif args.subcommand == "now":
         cmd_now(args)
+    elif args.subcommand == "asks":
+        cmd_asks(args)
+    elif args.subcommand == "doctor":
+        cmd_doctor(args)
     elif args.subcommand == "owner":
         cmd_owner(args)
     elif args.subcommand == "dream-budget":
