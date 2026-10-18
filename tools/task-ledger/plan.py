@@ -31,7 +31,7 @@ import tempfile
 LEDGER = os.path.expanduser(
     "~/.yggterm/memory/namespaces/_global/fleet-task-ledger.md")
 WEIGHT = {"big": 4.0, "moderate": 2.0, "small": 1.0}
-BLOCK_RE = re.compile(r"^### \[(T-\d+)\] (.+)$", re.M)
+BLOCK_RE = re.compile(r"^### \[(T-\d+(?:-[A-Z])?)\] (.+)$", re.M)  # -C suffix ids legal (T-024-C class)
 # §BATCH daily-brief form: "- **T-022 [BIG] (open) — Title.** body" — the
 # status lives inline in the parens (may nest one level, e.g.
 # "(claimed(x, y) — note)"). Parsing it killed the claim-race class measured
@@ -84,7 +84,7 @@ def score(task):
 
 
 def plan(tasks):
-    ready, held, gated, blocked, done = [], [], [], [], []
+    ready, held, gated, blocked, done, claimed = [], [], [], [], [], []
     batch = []
     for t in tasks:
         if t.get("batch"):
@@ -95,6 +95,10 @@ def plan(tasks):
             done.append(t)
         elif status.startswith("blocked"):
             blocked.append(t)
+        elif status.startswith("claimed"):
+            # TAKEN — must never re-enter a daily batch (measured 2026-10-18:
+            # claimed rows fell through to ready and T-022 took the big slot)
+            claimed.append(t)
         elif "OWNER-GATED" in t.get("route", "").upper() or "gated" in status:
             gated.append(t)
         elif not t.get("deps", "none").strip().lower().startswith("none"):
@@ -138,6 +142,8 @@ def plan(tasks):
         "owner_gated": [{"id": t["id"], "title": t["title"]} for t in gated],
         "blocked": [{"id": t["id"], "title": t["title"],
                      "status": t.get("status", "")} for t in blocked],
+        "claimed": [{"id": t["id"], "title": t["title"],
+                     "status": t.get("status", "")} for t in claimed],
         "done": [{"id": t["id"], "title": t["title"]} for t in done],
     }
 
@@ -252,6 +258,16 @@ def selftest():
 - route: OWNER-GATED ; deps: none
 - status: open (gated)
 
+### [T-110] claimed elsewhere
+- size: moderate ; value: 5 ; est: x
+- route: glm-idle ; deps: none
+- status: claimed(zcode, 2026-10-17) — taken
+
+### [T-111-C] suffix-id formal row
+- size: moderate ; value: 4 ; est: x
+- route: glm-idle ; deps: none
+- status: open
+
 ### [T-105] held for deps
 - size: moderate ; value: 5 ; est: x
 - route: glm-idle ; deps: mail mechanics verified
@@ -266,11 +282,17 @@ def selftest():
 """
     p = plan(parse_ledger(synthetic))
     ids = [t["id"] for t in p["glm_idle_batch"]["tasks"]]
-    assert ids == ["T-102", "T-103", "T-106"], ids  # big slot first
+    # T-111-C (suffix id, value 4) ties T-106 at 2.0 and sits earlier in
+    # the file — stable sort keeps it in the moderate slot
+    assert ids == ["T-102", "T-103", "T-111-C"], ids
     assert all(t["id"] != "T-105" for t in p["glm_idle_batch"]["tasks"])
     assert p["owner_gated"] and p["owner_gated"][0]["id"] == "T-104"
+    assert {t["id"] for t in p["claimed"]} == {"T-110"}, p["claimed"]
+    assert all(t["id"] != "T-110" for t in p["glm_idle_batch"]["tasks"])
+    assert any(t["id"] == "T-111-C" for t in p["glm_idle_batch"]["tasks"])
     assert p["held_for_deps"][0]["id"] == "T-105"
-    assert p["codex_queue"]["tasks"][0]["id"] == "T-101"
+    # T-106 (route any) lost its glm moderate slot to T-111-C -> codex queue
+    assert [x["id"] for x in p["codex_queue"]["tasks"]] == ["T-106", "T-101"]
     booked = mark_done(synthetic, "T-101", "main abc123", "glm-idle", "2026-10-17")
     assert "- status: done(main abc123) [by glm-idle, 2026-10-17]" in booked
     assert "- 2026-10-17 T-101 done(main abc123) [by glm-idle]" in booked
