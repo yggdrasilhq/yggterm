@@ -5366,11 +5366,24 @@ def _doctor_timer_probe() -> dict:
         enabled = props.get("UnitFileState") in ("enabled", "enabled-runtime", "static")
         active = props.get("ActiveState") == "active"
         infinite = props.get("NextElapseUSecMonotonic", "").strip() == "infinity"
-        dead_shape = enabled and active and infinite
+        # RemainAfterElapse=no semantics (2026-10-18): an elapse consumed while
+        # the oneshot runs re-fires the moment the service exits, so a
+        # running/activating service legitimately shows no next elapse. That
+        # is the healthy transient — only an INACTIVE service with no next
+        # elapse is the dead shape.
+        svc = subprocess.run(
+            ["systemctl", "--user", "show", "ygg-memory-sync.service", "-p", "ActiveState"],
+            capture_output=True, text=True, timeout=15, env=env)
+        svc_state = (svc.stdout.strip().split("=", 1) + [""])[1]
+        running = svc_state in ("activating", "active")
+        dead_shape = enabled and active and infinite and not running
+        detail = (f"unit={props.get('UnitFileState')} active={props.get('ActiveState')} "
+                  f"next={props.get('NextElapseUSecMonotonic')} svc={svc_state or '?'}")
+        if running and infinite:
+            detail += " (run in progress; elapse re-fires on exit)"
         return {"name": "memory-sync-timer",
                 "ok": (not dead_shape) if enabled else None,
-                "detail": f"unit={props.get('UnitFileState')} active={props.get('ActiveState')} "
-                          f"next={props.get('NextElapseUSecMonotonic')}",
+                "detail": detail,
                 "dead_shape": dead_shape, "enabled": enabled}
     except ( FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return {"name": "memory-sync-timer", "ok": None, "detail": f"unprobeable: {exc}"}
