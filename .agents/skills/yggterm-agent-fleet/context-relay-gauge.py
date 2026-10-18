@@ -241,6 +241,7 @@ def read_usage_autoclaw(path):
     dead = False
     model = ""
     window = 0
+    ctx_series = []
     for line in blob.splitlines():
         if '"assistant"' not in line:
             continue
@@ -257,11 +258,43 @@ def read_usage_autoclaw(path):
             continue
         dead = dead or data.get("finishReason") == "length"
         used = total
+        ctx_series.append(total)
         observed_max = max(observed_max, total)
         m = data.get("model") or {}
         model = (m.get("model") if isinstance(m, dict) else str(m)) or model
         window = u.get("windowTokens", 0) or window
-    return used, observed_max, dead, model, window
+    projected = project_next_request(ctx_series)
+    return used, observed_max, dead, model, window, projected
+
+
+def project_next_request(rows):
+    """Projected contextTokens of the NEXT request, from observed growth.
+
+    Measured 2026-10-18 on a live GLM-5.3-Flash session: contextTokens is the
+    PROMPT weight of that request, and the assistant's output does NOT carry
+    into the next request's prompt (AutoClaw strips thinking; only persisted
+    content + tool results + injections grow the prompt, ~0.2-3k/turn even
+    when output is 6-12k). So next = last + median(recent growth). The old
+    code reported the LAST COMPLETED request and lagged every decision by one
+    turn. Compaction boundaries (big negative deltas) are excluded from the
+    median so a post-compact read is not dragged backward.
+    """
+    deltas = []
+    prev = None
+    for total in rows:
+        if total <= 0:
+            continue
+        if prev is not None and total >= prev:
+            deltas.append(total - prev)
+        prev = total
+    if not rows:
+        return 0
+    last = rows[-1]
+    if not deltas:
+        return last
+    recent = sorted(deltas[-3:])
+    median = recent[len(recent) // 2]
+    return last + median
 
 
 def read_usage(path):
@@ -760,9 +793,10 @@ def run_autoclaw(session_id: str, report: bool, used_override=None, window_overr
                   "A missing gauge is NO INFORMATION, never 'healthy'. "
                   "Pass --session <the transcript uuid> (traces/*/transcript-<id>.jsonl).")
         return 0
-    used, observed_max, dead, model, window = read_usage_autoclaw(path)
+    used, observed_max, dead, model, window, projected = read_usage_autoclaw(path)
     if used_override:
         used, dead = used_override, False
+        projected = used
     assumed = False
     if window_override:
         window, assumed = window_override, True
@@ -773,13 +807,21 @@ def run_autoclaw(session_id: str, report: bool, used_override=None, window_overr
             print(f"CONTEXT GAUGE — no token data yet for AutoClaw session {session_id} "
                   f"({path}). NO INFORMATION, never 'healthy'.")
         return 0
-    pct = round(100.0 * used / window)
+    # ⛔ Gauge the NEXT request, not the last completed one (2026-10-18): the
+    # transcript's last contextTokens is the PROMPT weight of the request that
+    # already finished; the owner's next decision (relay? compact? stop?) weighs
+    # what the next request will carry. Projection is self-calibrating from
+    # observed growth — never output tokens, which AutoClaw strips from the
+    # next prompt (measured: ~0.2-3k/turn growth on 6-12k outputs).
+    effective = max(used, projected or 0)
+    pct = round(100.0 * effective / window)
     v = verdict(pct)
     win_label = (f"{window // 1_000_000}M"
                  if window >= 1_000_000 and window % 1_000_000 == 0
                  else f"{window // 1000}k")
     publish(session_id, {
         "session": session_id, "cli": "autoclaw", "pct": pct, "used": used,
+        "projected_next": projected,
         "window": window, "window_assumed": assumed, "model": model,
         "verdict": v, "dead": dead, "cwd": os.getcwd(),
     })
@@ -790,9 +832,12 @@ def run_autoclaw(session_id: str, report: bool, used_override=None, window_overr
                    "verify with the harness's own indicator.\n") + msg
         print(msg + RITUAL)
     elif report:
+        proj_note = (f", {projected:,} projected next"
+                     if projected and projected != used else "")
         print(f"CONTEXT GAUGE — {pct}% of the {win_label} window used "
-              f"({used:,} tokens) — AutoClaw session {session_id}, model {model or '?'}, "
-              f"window {'ASSUMED' if assumed else 'harness-reported'}. {v}; relay at {LAND}%.")
+              f"({used:,} tokens last request{proj_note}) — AutoClaw session {session_id}, "
+              f"model {model or '?'}, window {'ASSUMED' if assumed else 'harness-reported'}. "
+              f"{v}; relay at {LAND}%.")
     return 0
 
 
