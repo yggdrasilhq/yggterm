@@ -2,21 +2,26 @@
 Description=Yggterm memory recovery catch-up (managed CLI startup is immediate)
 
 [Timer]
-# ⛔ OnStartupSec, NOT OnBootSec. Boot-relative elapses are measured from the
-# KERNEL boot, but the user manager (and this timer with it) arms tens of
-# seconds AFTER boot — ~40s here vs OnBootSec=15s. systemd skips an elapse
-# already in the past, and with no prior service run OnUnitActiveSec has
-# nothing to anchor to: the timer sits 'active (elapsed)' with
-# NextElapseUSecMonotonic=infinity FOREVER while reporting healthy. A fleet
-# seat's tick died exactly this way 2026-08-22..2026-10-18 (heartbeat stale,
-# the single-host dreamer blind to that harness's quiescence); a second host
-# died the same way 2026-09-26.
-# OnStartupSec is manager-relative, so it is always in the future when the
-# timer arms.
-OnStartupSec=15s
-OnUnitActiveSec=60s
+# ⛔ OnCalendar + RemainAfterElapse=no — the THIRD and final form of this
+# timer (owner 2026-10-18, three deaths in one day):
+#   1. OnBootSec=15s boot-skip: user manager arms after boot+15s, the elapse
+#      is skipped, no anchor ever -> dead 8 weeks while reporting healthy.
+#   2. OnStartupSec/OnUnitActiveSec monotonic decay: failed oneshot runs +
+#      daemon-reload elapse re-computation -> NextElapse=infinity within hours.
+#   3. Per-minute OnCalendar with a 4-7 MIN oneshot: the run spans several
+#      boundaries; under default RemainAfterElapse=yes the timer holds
+#      'elapsed' until the service exits -> effectively continuous
+#      back-to-back syncing (369MB peaks, no idle), still no visible next
+#      elapse while running.
+# Wall-clock schedule ALWAYS yields a next elapse; RemainAfterElapse=no
+# makes an overlapped elapse re-fire as soon as the service exits instead
+# of waiting for another boundary; every-5-minutes matches the real sync
+# duration so runs pace instead of stacking. :30 offset, off the
+# :00/:17/:43 jobs.
+OnCalendar=*-*-* *:0/5:30
+RemainAfterElapse=no
 AccuracySec=5s
-RandomizedDelaySec=10s
+RandomizedDelaySec=5s
 Persistent=true
 
 [Install]
