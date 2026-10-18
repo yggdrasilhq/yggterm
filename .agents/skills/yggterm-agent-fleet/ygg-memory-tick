@@ -36,10 +36,18 @@ sync_native
 # on exactly one host (multi-host arming = redundant composer spend; the
 # per-namespace watermarks keep even that correct). The verb's own gates
 # (quiescence, cooldown, delta, read-version fence) are the safety envelope.
-if [ -f "$HOME/.yggterm/config/dream/enabled" ] && [ -x "$HOME/.local/bin/ygg-memory" ]; then
+# Dream leg: the PRIMARY dreamer needs the `enabled` gate (exactly-one-primary
+# law); scoped secondary dreamers (dreamers.d/*.json) run on their own — a
+# dreamers-only host must not need primary arming, and must never run the
+# primary loop (YGG_DREAM_AUTO_MODE=dreamers-only enforces that in the verb).
+if [ -x "$HOME/.local/bin/ygg-memory" ] && { [ -f "$HOME/.yggterm/config/dream/enabled" ] || ls "$HOME/.yggterm/config/dream/dreamers.d/"*.json >/dev/null 2>&1; }; then
   exec 8>"$HOME/.yggterm/config/dream/.lock"
   if flock -n 8 2>/dev/null; then
-    timeout 960 "$HOME/.local/bin/ygg-memory" dream --auto --quiet >/dev/null 2>&1 || true
+    if [ -f "$HOME/.yggterm/config/dream/enabled" ]; then
+      timeout 960 "$HOME/.local/bin/ygg-memory" dream --auto --quiet >/dev/null 2>&1 || true
+    else
+      YGG_DREAM_AUTO_MODE=dreamers-only timeout 960 "$HOME/.local/bin/ygg-memory" dream --auto --quiet >/dev/null 2>&1 || true
+    fi
     flock -u 8 2>/dev/null
   fi
 fi
