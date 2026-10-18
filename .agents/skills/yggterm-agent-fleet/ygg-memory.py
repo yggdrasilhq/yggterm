@@ -2981,7 +2981,10 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
 
     # Network calls never occur while this lock is held. Two hosts can sync at
     # once without each waiting on the other's local lock.
-    local_lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
+    local_lock = _flock_open(
+        root / ".ygg-memory.lock",
+        timeout_seconds=float(os.environ.get("YGG_MEMORY_FLEET_LOCK_WAIT", "60")),
+    )
     try:
         for incoming in incoming_journals:
             _merge_journals(journal_file, incoming)
@@ -3020,15 +3023,25 @@ def _run_fleet_sync(root: Path, mesh: list[str], quick: bool = False) -> dict:
                 deferrals.append(f"{peer}:import-busy")
             else:
                 failures.append(f"{peer}:import-journal")
+    # ⛔ Preserved conflicts and missing objects are NOT convergence failures.
+    # They are divergent-door / object-store facts: the exchange itself landed,
+    # evidence is preserved under conflicts/, and the tick re-runs this every
+    # minute — so raising here turned every catch-up run exit-1 and, worse,
+    # made a REAL infra failure (unreachable peer, failed import) look
+    # identical to a routine semantic conflict. Strictness stays where it
+    # belongs: `ygg-memory sync` (the recall gate) still fails closed, and
+    # `resolve` is the door. Reported as warnings so they cannot rot silently.
+    warnings = []
     if materialized.get("conflicts"):
-        failures.append(f"{materialized['conflicts']}-preserved-conflict(s)")
+        warnings.append(f"{materialized['conflicts']}-preserved-conflict(s)")
     if materialized.get("missing_objects"):
-        failures.append(f"{materialized['missing_objects']}-missing-object(s)")
+        warnings.append(f"{materialized['missing_objects']}-missing-object(s)")
     detail = _fleet_outcome(unreachable, failures)
     if detail:
         raise RuntimeError("fleet memory did not converge: " + detail)
     return {
         "peers": live_peers,
+        **({"warnings": warnings} if warnings else {}),
         **({"deferred": deferrals} if deferrals else {}),
         "pulled_objects": pulled_objects,
         "pushed_objects": pushed_objects,
@@ -3063,10 +3076,13 @@ def cmd_sync_fleet(args):
         print(json.dumps(report))
     elif not getattr(args, "quiet", False):
         peers = ", ".join(report["peers"]) or "none reachable"
-        print(
+        line = (
             f"Fleet memory sync: {peers}; {report['pulled_objects']} objects pulled, "
             f"{report['pushed_objects']} pushed, {report['conflicts']} conflicts."
         )
+        if report.get("warnings"):
+            line += " ⚠ " + "; ".join(report["warnings"]) + " — ygg-memory resolve <door>"
+        print(line)
 
 
 def cmd_import_journal(args):
