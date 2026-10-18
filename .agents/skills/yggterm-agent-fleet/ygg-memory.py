@@ -6980,7 +6980,13 @@ def cmd_dream(args):
         raise SystemExit("dream: --ns is required")
 
     if getattr(args, "auto", False):
-        message = _dream_auto(root, getattr(args, "ns", None), args)
+        dreamers_only = os.environ.get("YGG_DREAM_AUTO_MODE", "") == "dreamers-only"
+        if dreamers_only:
+            # [exactly-one-primary] a host without the `enabled` gate runs
+            # ONLY its scoped dreamers — never the primary loop.
+            message = "auto-dream: primary not armed on this host (exactly-one-primary law); scoped dreamers only"
+        else:
+            message = _dream_auto(root, getattr(args, "ns", None), args)
         if getattr(args, "json", False):
             print(json.dumps({"status": message}))
         elif not getattr(args, "quiet", False):
