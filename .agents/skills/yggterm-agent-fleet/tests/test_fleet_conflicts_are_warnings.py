@@ -127,9 +127,14 @@ def run():
     if unit.is_file():
         text = unit.read_text(encoding="utf-8")
         directives = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        check("timer uses OnStartupSec", any(d.startswith("OnStartupSec=15s") for d in directives))
-        check("timer no longer uses OnBootSec", not any(d.startswith("OnBootSec") for d in directives))
-        check("timer keeps the periodic leg", any(d.startswith("OnUnitActiveSec=60s") for d in directives))
+        # ⛔ OnCalendar only: boot/manager-relative elapses (OnBootSec) get
+        # skipped by slow boot, and the monotonic OnUnitActiveSec leg decays
+        # to no-next-elapse on long-lived managers (both died silently). A
+        # wall-clock schedule always yields a next elapse.
+        check("timer uses OnCalendar (wall-clock, always a next elapse)",
+              any(d.startswith("OnCalendar=*-*-* *:*:30") for d in directives))
+        check("timer uses no relative elapse directives",
+              not any(d.startswith(("OnBootSec", "OnStartupSec", "OnUnitActiveSec")) for d in directives))
     else:
         check("timer unit exists in skill systemd/", False, str(unit))
 
