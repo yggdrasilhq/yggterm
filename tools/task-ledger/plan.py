@@ -32,6 +32,15 @@ LEDGER = os.path.expanduser(
     "~/.yggterm/memory/namespaces/_global/fleet-task-ledger.md")
 WEIGHT = {"big": 4.0, "moderate": 2.0, "small": 1.0}
 BLOCK_RE = re.compile(r"^### \[(T-\d+)\] (.+)$", re.M)
+# §BATCH daily-brief form: "- **T-022 [BIG] (open) — Title.** body" — the
+# status lives inline in the parens (may nest one level, e.g.
+# "(claimed(x, y) — note)"). Parsing it killed the claim-race class measured
+# 2026-10-18: §BATCH ids were invisible to --claim, so seats hand-edited the
+# door and a stale snapshot overwrite hit T-022 (infra/meta ACK-d0d108a714).
+BATCH_ITEM_RE = re.compile(
+    r"^- \*\*(?P<id>T-\d+(?:-[A-Za-z]+)?) \[(?P<size>[A-Za-z-]+)\] "
+    r"\((?P<status>(?:[^()]|\([^()]*\))*)\) — (?P<title>.+?)\.\*\*",
+    re.M)
 
 
 def parse_ledger(text):
@@ -53,6 +62,14 @@ def parse_ledger(text):
                     k, v = seg.split(":", 1)
                     task[k.strip()] = v.strip()
         tasks.append(task)
+    # §BATCH daily briefs: same task plane, inline-status form. They are the
+    # already-prepared batch, so plan() reports them as-is (no re-ranking).
+    for m in BATCH_ITEM_RE.finditer(text):
+        if any(t["id"] == m.group("id") for t in tasks):
+            continue
+        tasks.append({"id": m.group("id"), "title": m.group("title").strip(),
+                      "size": m.group("size").lower(), "status": m.group("status").strip(),
+                      "batch": "true"})
     return tasks
 
 
@@ -68,7 +85,11 @@ def score(task):
 
 def plan(tasks):
     ready, held, gated, blocked, done = [], [], [], [], []
+    batch = []
     for t in tasks:
+        if t.get("batch"):
+            batch.append(t)  # the already-prepared daily batch — reported as-is
+            continue
         status = t.get("status", "open")
         if status.startswith("done"):
             done.append(t)
@@ -104,6 +125,10 @@ def plan(tasks):
     return {
         "glm_idle_batch": {"law": "exactly 1 BIG + 2 MODERATE (owner 3/day)",
                            "tasks": glm},
+        "daily_batch": {"law": "§BATCH prepared briefs (reported as-is, not re-ranked)",
+                        "tasks": [{"id": t["id"], "title": t["title"],
+                                   "size": t.get("size", ""),
+                                   "status": t.get("status", "")} for t in batch]},
         "codex_queue": {"law": "moderate-to-small only (owner correction)",
                         "tasks": codex},
         "glm_waitlist": glm_wait,
@@ -119,12 +144,38 @@ def plan(tasks):
 
 
 
+def _batch_item(text, tid):
+    """Locate a §BATCH list-item entry by exact task id (or None)."""
+    return re.compile(
+        r"^- \*\*" + re.escape(tid) + r" \[[A-Za-z-]+\] "
+        r"\((?P<status>(?:[^()]|\([^()]*\))*)\) — (?P<title>.+?)\.\*\*",
+        re.M).search(text)
+
+
+def _splice_batch_status(text, m, new_blob):
+    """Replace only the inline status blob inside the matched parens."""
+    return text[:m.start("status")] + new_blob + text[m.end("status"):]
+
+
 def mark_done(text, tid, proof, by, date):
     """Transform the ledger markdown: task status -> done, §BOOK one-liner.
-    Pure text transform (no writes) — the caller publishes via ygg-memory."""
+    Pure text transform (no writes) — the caller publishes via ygg-memory.
+    Understands both entry forms: §QUEUE `### [T-xxx]` headers and §BATCH
+    `- **T-xxx [SIZE] (status) — Title.**` briefs."""
     m = re.search(r"^### \[" + re.escape(tid) + r"\] (.+)$", text, re.M)
     if not m:
-        raise SystemExit(f"task {tid} not found in the ledger")
+        bm = _batch_item(text, tid)
+        if bm is None:
+            raise SystemExit(f"task {tid} not found in the ledger (neither "
+                             "§QUEUE header nor §BATCH item)")
+        if bm.group("status").startswith("done"):
+            raise SystemExit(f"task {tid} is already done")
+        text = _splice_batch_status(text, bm, f"done({proof}) [by {by}, {date}]")
+        book_hdr = "## §BOOK — one-liners of finished work"
+        if book_hdr in text:
+            line = f"- {date} {tid} done({proof}) [by {by}] — {bm.group('title').strip()}"
+            text = text.replace(book_hdr, book_hdr + "\n" + line, 1)
+        return text
     title = m.group(1).strip()
     nxt = re.search(r"^### \[T-", text[m.end():], re.M)
     block_end = m.end() + nxt.start() if nxt else len(text)
@@ -151,10 +202,20 @@ def mark_claimed(text, tid, by, date, note=""):
     this matches the exact block — hand regex over the door text has the
     mis-target hazard measured 2026-10-17 (a claim edit skipped past a
     just-claimed T-002 and landed on T-003). Refuses when the task is no
-    longer open in the text being claimed."""
+    longer open in the text being claimed. Understands both entry forms:
+    §QUEUE `### [T-xxx]` headers and §BATCH `- **T-xxx [SIZE] (status) —
+    Title.**` briefs (the 2026-10-18 T-022 claim race happened because the
+    §BATCH form was hand-edited)."""
     m = re.search(r"^### \[" + re.escape(tid) + r"\] (.+)$", text, re.M)
     if not m:
-        raise SystemExit(f"task {tid} not found in the ledger")
+        bm = _batch_item(text, tid)
+        if bm is None:
+            raise SystemExit(f"task {tid} not found in the ledger (neither "
+                             "§QUEUE header nor §BATCH item)")
+        if not bm.group("status").startswith("open"):
+            raise SystemExit(f"task {tid} is no longer open — another seat took it first")
+        suffix = f" — {note}" if note else ""
+        return _splice_batch_status(text, bm, f"claimed({by}, {date}){suffix}")
     nxt = re.search(r"^### \[T-", text[m.end():], re.M)
     block_end = m.end() + nxt.start() if nxt else len(text)
     block = text[m.end():block_end]
@@ -222,7 +283,46 @@ def selftest():
             raise AssertionError(f"claim {bad_id} should refuse")
         except SystemExit:
             pass
-    print("selftest green (plan + mark_done + mark_claimed)")
+    # §BATCH form: claim/done on list-item briefs, refusal when not open
+    batch = synthetic + """
+## §BATCH — three ready-to-fire briefs
+
+- **T-201 [BIG] (open) — batch big task.** Body here.
+- **T-202 [MODERATE] (open) — batch moderate.** Body.
+- **T-203 [MODERATE] (claimed(zcode, 2026-10-17) — in flight) — batch claimed.** Body.
+"""
+    pb = plan(parse_ledger(batch))
+    assert [t["id"] for t in pb["daily_batch"]["tasks"]] == ["T-201", "T-202", "T-203"]
+    assert all(t["id"] not in {x["id"] for x in pb["glm_idle_batch"]["tasks"]}
+               for t in pb["daily_batch"]["tasks"])
+    bc = mark_claimed(batch, "T-201", "zcode", "2026-10-18", "race-free now")
+    assert "(claimed(zcode, 2026-10-18) — race-free now) — batch big task.**" in bc
+    assert "(claimed(zcode, 2026-10-17) — in flight) — batch claimed.**" in bc  # nested blob untouched
+    # nested-paren status must parse as ONE blob (a greedy [^)]* matched the
+    # inner paren and mis-split status/title — regression caught 2026-10-18)
+    bm203 = _batch_item(batch, "T-203")
+    assert bm203.group("status") == "claimed(zcode, 2026-10-17) — in flight"
+    assert bm203.group("title") == "batch claimed"
+    for bad_batch, bad_id in ((bc, "T-201"), (bc, "T-203")):
+        try:
+            mark_claimed(bad_batch, bad_id, "zcode", "2026-10-18")
+            raise AssertionError(f"batch claim {bad_id} should refuse")
+        except SystemExit:
+            pass
+    bd = mark_done(batch, "T-202", "results.json", "zcode", "2026-10-18")
+    assert "(done(results.json) [by zcode, 2026-10-18]) — batch moderate.**" in bd
+    assert "- 2026-10-18 T-202 done(results.json) [by zcode] — batch moderate" in bd
+    try:
+        mark_done(bd, "T-202", "x", "zcode", "2026-10-18")
+        raise AssertionError("batch done should refuse already-done")
+    except SystemExit:
+        pass
+    try:
+        mark_claimed(batch, "T-999", "zcode", "2026-10-18")
+        raise AssertionError("unknown batch id should refuse")
+    except SystemExit:
+        pass
+    print("selftest green (plan + mark_done + mark_claimed, §QUEUE + §BATCH forms)")
     return 0
 
 
@@ -311,6 +411,13 @@ def main():
     print(f"\n## GLM idle batch (1 big + 2 moderate — the 3/day allowance)")
     for t in p["glm_idle_batch"]["tasks"]:
         print(f"  {t['id']} [{t['size']}] (score {t['score']}) {t['title']}")
+    if p["daily_batch"]["tasks"]:
+        print("\n## daily batch (§BATCH prepared briefs, as-is — claim by id)")
+        for t in p["daily_batch"]["tasks"]:
+            st = t.get("status", "open")
+            mark = "TAKEN" if not st.startswith("open") else "open"
+            print(f"  {t['id']} [{t['size']}] ({mark}) {t['title']}"
+                  + ("" if mark == "open" else f" — {st[:70]}"))
     print("\n## codex queue (moderate-to-small only)")
     for t in p["codex_queue"]["tasks"]:
         print(f"  {t['id']} [{t['size']}] (score {t['score']}) {t['title']}")
