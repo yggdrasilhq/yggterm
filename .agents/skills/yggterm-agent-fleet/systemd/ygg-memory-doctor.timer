@@ -1,0 +1,14 @@
+[Unit]
+Description=Yggterm memory health doctor, hourly
+
+[Timer]
+# ⛔ OnCalendar, not OnUnitActiveSec (ygg-panic lesson: the monotonic form
+#   yields no next elapse after a missed run — the worst watchdog shape).
+#   Off the hour deliberately, minute 43, to avoid piling onto :00 jobs and
+#   away from the panic watch at :17.
+OnCalendar=*-*-* *:43:00
+AccuracySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

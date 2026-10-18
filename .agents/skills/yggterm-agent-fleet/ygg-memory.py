@@ -4335,6 +4335,97 @@ def _opencode_limit_failure(text: str) -> bool:
     return any(marker in lowered for marker in OPENCODE_LIMIT_MARKERS)
 
 
+# --- [model-limit monitor] deterministic free-transport health ----------------
+# Owner directive 2026-10-18: a free model that fails on limits must never
+# fail eternally unnoticed. Every composer outcome is accounted in
+# <root>/dream/composer-health.json: consecutive limit/auth-class failures
+# trip a SKIP WINDOW (the transport is skipped, not silently retried), and a
+# sustained failure streak escalates into the ask-user ledger (visible, not
+# buried in stderr). All deterministic — no model calls, no spend.
+COMPOSER_FAILURE_LIMIT = int(os.environ.get("YGG_COMPOSER_FAILURE_LIMIT", "3"))
+COMPOSER_SKIP_WINDOW_S = int(os.environ.get("YGG_COMPOSER_SKIP_WINDOW_S", "3600"))
+COMPOSER_ESCALATE_AFTER = int(os.environ.get("YGG_COMPOSER_ESCALATE_AFTER", "8"))
+
+
+def _composer_key(kind: str, model: str) -> str:
+    return f"{kind}:{model}" if model else kind
+
+
+def _composer_health_path(root: Path) -> Path:
+    return Path(root) / "dream" / "composer-health.json"
+
+
+def _composer_health_load(root: Path) -> dict:
+    try:
+        return json.loads(_composer_health_path(root).read_text(encoding="utf-8"))
+    except Exception:
+        return {"transports": {}}
+
+
+def _composer_health_save(root: Path, health: dict) -> None:
+    path = _composer_health_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(health, indent=1), encoding="utf-8")
+
+
+def _composer_error_class(msg: str) -> str:
+    lowered = (msg or "").lower()
+    if any(m in lowered for m in ("unauthorized", "please sign in", "401", "api key")):
+        return "auth"
+    if _opencode_limit_failure(msg):
+        return "limit"
+    return "other"
+
+
+def _composer_unhealthy(root: Path, kind: str, model: str) -> bool:
+    """True while the transport is inside its skip window (or disabled)."""
+    health = _composer_health_load(root)
+    entry = health.get("transports", {}).get(_composer_key(kind, model)) or {}
+    if entry.get("disabled"):
+        return True
+    skip_until = entry.get("skip_until", 0)
+    return skip_until > time.time()
+
+
+def _composer_record_failure(root: Path, kind: str, model: str, msg: str) -> dict:
+    """Account one limit/auth-class failure; trip the skip window at the limit.
+
+    Returns the entry so callers can report/escalate. A non-limit error class
+    is recorded but does NOT advance the skip counter (only deterministic
+    limit/auth exhaustion proves the free quota is gone; transient 'other'
+    failures keep the chain's normal failover)."""
+    key = _composer_key(kind, model)
+    err_class = _composer_error_class(msg)
+    health = _composer_health_load(root)
+    transports = health.setdefault("transports", {})
+    entry = transports.setdefault(key, {"consecutive": 0})
+    if err_class in ("limit", "auth"):
+        entry["consecutive"] = int(entry.get("consecutive", 0)) + 1
+    entry["last_error_class"] = err_class
+    entry["last_error_at"] = time.time()
+    entry["last_error"] = (msg or "")[:200]
+    if entry["consecutive"] >= COMPOSER_FAILURE_LIMIT:
+        entry["skip_until"] = time.time() + COMPOSER_SKIP_WINDOW_S
+        _dream_receipt(
+            root, "deferred",
+            f"composer {key} unhealthy: {entry['consecutive']}x {err_class}; "
+            f"skipping {COMPOSER_SKIP_WINDOW_S}s", "",
+        )
+    _composer_health_save(root, health)
+    return entry
+
+
+def _composer_record_success(root: Path, kind: str, model: str) -> None:
+    key = _composer_key(kind, model)
+    health = _composer_health_load(root)
+    entry = (health.get("transports", {}).get(key) or {})
+    if entry.get("consecutive") or entry.get("skip_until"):
+        health.setdefault("transports", {})[key] = {
+            "consecutive": 0, "recovered_at": time.time(),
+        }
+        _composer_health_save(root, health)
+
+
 def _opencode_bin() -> str:
     override = os.environ.get("YGG_OPENCODE_BIN")
     if override:
@@ -4374,27 +4465,63 @@ def _opencode_exec(model: str, prompt: str, timeout: int = 900) -> str:
 
 
 def _composer_exec(prompt: str, effort: str, codex_bin: str, codex_model: str,
-                   timeout: int = 900) -> str:
+                   timeout: int = 900, root: Path | None = None) -> str:
     """Run the composer prompt through the free-first transport chain.
 
     Returns (output, transport_description). Each limit/auth-classified
     failure advances to the next transport; codex (last) keeps its account
-    rotation. YGG_DREAM_COMPOSERS=codex restores the codex-only chain."""
+    rotation. YGG_DREAM_COMPOSERS=codex restores the codex-only chain.
+
+    [model-limit monitor] With a root, outcomes are accounted in
+    dream/composer-health.json: consecutive limit/auth failures trip a skip
+    window (the transport is SKIPPED, never silently retried forever), and a
+    sustained streak is flagged escalated for the doctor to surface as an
+    ask. Reaching the bottom of the chain with everything skipped is itself
+    a reportable event."""
     last_error = None
+    all_skipped = True
     for kind, model in _composer_chain():
+        if root is not None and _composer_unhealthy(root, kind, model):
+            print(f"dream: composer {kind}:{model} inside limit-failure skip "
+                  "window — skipping", file=sys.stderr)
+            continue
+        all_skipped = False
         try:
             if kind == "opencode":
-                return _opencode_exec(model, prompt, timeout), f"opencode/{model}"
-            return (_codex_exec(codex_bin, codex_model, effort, prompt, timeout),
-                    f"codex/{codex_model}")
+                out = _opencode_exec(model, prompt, timeout)
+                if root is not None:
+                    _composer_record_success(root, kind, model)
+                return out, f"opencode/{model}"
+            out = (_codex_exec(codex_bin, codex_model, effort, prompt, timeout),
+                   f"codex/{codex_model}")
+            if root is not None:
+                _composer_record_success(root, kind, model)
+            return out
         except SystemExit as err:
             msg = str(err)
             if kind == "opencode" and _opencode_limit_failure(msg):
                 last_error = msg
-                print(f"dream: opencode free quota hit ({model}); "
-                      "falling to the next composer", file=sys.stderr)
+                if root is not None:
+                    entry = _composer_record_failure(root, kind, model, msg)
+                    if entry.get("consecutive", 0) >= COMPOSER_ESCALATE_AFTER:
+                        entry["escalated"] = True
+                        _composer_health_save(root, _composer_health_load(root))
+                    note = (f" ({entry['consecutive']} consecutive)"
+                            if entry.get("consecutive") else "")
+                    print(f"dream: opencode free quota hit{note} ({model}); "
+                          "falling to the next composer", file=sys.stderr)
+                else:
+                    print(f"dream: opencode free quota hit ({model}); "
+                          "falling to the next composer", file=sys.stderr)
                 continue
             raise
+    if all_skipped and last_error is None:
+        raise SystemExit(
+            "dream: every composer transport is inside a limit-failure skip "
+            "window (see dream/composer-health.json); the dream is deferred, "
+            "not failed — the window expires and the doctor escalates if the "
+            "streak persists"
+        )
     raise SystemExit(
         f"dream: every composer transport exhausted (free quotas + codex); "
         f"the designed backoff is the wait. last error: {last_error}"
@@ -4671,7 +4798,37 @@ def _dream_auto_backoff(root: Path, reason: str) -> None:
     )
 
 
-def _dream_auto(root: Path, ns_filter: str, args) -> str:
+def _dreamers_load() -> list:
+    """Scoped secondary dreamers: ~/.yggterm/config/dream/dreamers.d/*.json.
+
+    Host-local by design (a dreamer is a compute decision on THIS host):
+    {"name", "ns_scope": ["-home-...-docs-graph"], "composers":
+    "opencode:opencode/deepseek-v4.1-flash-free,codex", "model", "effort",
+    "expires_at": "YYYY-MM-DD", "enabled": true}. Past expires_at the
+    dreamer is skipped (auto-disarm); it never extends another dreamer's
+    scope, and the shared global backoff + budget admission still gate every
+    child run — more dreamers never bypass spend protection."""
+    import glob as _glob
+    out = []
+    today = datetime.date.today().isoformat()
+    for path in sorted(_glob.glob(str(Path.home() / ".yggterm/config/dream/dreamers.d/*.json"))):
+        try:
+            cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not cfg.get("enabled", True):
+            continue
+        expires = str(cfg.get("expires_at", "")).strip()
+        if expires and expires < today:
+            continue
+        if not cfg.get("ns_scope"):
+            continue
+        cfg["_path"] = path
+        out.append(cfg)
+    return out
+
+
+def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -> str:
     """The auto-dreamer (round-4 design): activity-driven, ONE namespace per
     invocation, cooldown + quiescence + pending-manifest filters, a 1h
     backoff stamp on any composer/apply failure, and it NEVER raises — the
@@ -4695,7 +4852,10 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
             if not ns_dir.is_dir():
                 continue
             ns = ns_dir.name
-            if ns_filter and ns_filter != "_global" and ns != ns_filter:
+            if dreamer is not None:
+                if ns not in dreamer.get("ns_scope", []):
+                    continue
+            elif ns_filter and ns_filter != "_global" and ns != ns_filter:
                 continue
             watermark = load_dream_watermark(root, ns)
             last_ts = watermark.get("last_dream_ts")
@@ -4764,6 +4924,11 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
     # The `=` form is the documented convention — the auto-dreamer died on
     # this for 10 days (2026-10-06..16, backoff-stamped each tick).
     base = [sys.executable, str(Path(__file__).resolve()), "--root", str(root), f"--ns={ns}"]
+    child_model = (dreamer or {}).get("model") or getattr(args, "model", "gpt-6.1-sol")
+    child_effort = (dreamer or {}).get("effort") or getattr(args, "effort", "high")
+    child_env = dict(os.environ)
+    if dreamer and dreamer.get("composers"):
+        child_env["YGG_DREAM_COMPOSERS"] = str(dreamer["composers"])
     try:
         run_ = subprocess.run(
             base
@@ -4771,13 +4936,14 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
                 "dream",
                 "--run",
                 "--model",
-                getattr(args, "model", "gpt-6.1-sol"),
+                child_model,
                 "--effort",
-                getattr(args, "effort", "high"),
+                child_effort,
             ],
             capture_output=True,
             text=True,
             timeout=900,
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         _dream_auto_backoff(root, "composer timeout")
@@ -4803,7 +4969,513 @@ def _dream_auto(root: Path, ns_filter: str, args) -> str:
         except Exception as exc:
             pickup = f"task-pickup skipped ({str(exc)[:140]})"
     _dream_receipt(root, "applied", receipt + (f"; {pickup}" if pickup else ""), ns)
-    return f"auto-dream[{ns}]: {receipt}" + (f"; {pickup}" if pickup else "")
+    label = f"{dreamer['name']}:{ns}" if dreamer else ns
+    return f"auto-dream[{label}]: {receipt}" + (f"; {pickup}" if pickup else "")
+
+
+# --- [ask-user ledger] owner-blocked actions, sol build slice 2+3 -----------
+# The portable home for owner asks that no domain mechanism already owns.
+# Where lobemanager (decision debts) or a campaign door owns the obligation,
+# the ask carries a REFERENCE, never a copy. Schema (task-ledger pattern:
+# human-editable Markdown door, thin deterministic readers):
+#   id / kind (decision|missing-input|physical-action) / status
+#   (open|invited|answered|snoozed|closed) / since / source_ref / request /
+#   why_now / answer_shape / snooze_until / last_invited_at / provenance
+#   / optional: decision_debt_ref, owner_correction
+ASKS_NS = "_global"
+ASKS_FILENAME = "ask-user-ledger.md"
+ASK_KINDS = ("decision", "missing-input", "physical-action")
+ASK_FIELDS = ("id", "kind", "status", "since", "source_ref", "request",
+              "why_now", "answer_shape", "snooze_until", "last_invited_at",
+              "decision_debt_ref", "owner_correction", "provenance")
+
+
+def _asks_door_path(root: Path) -> Path:
+    return Path(root) / "namespaces" / ASKS_NS / ASKS_FILENAME
+
+
+def _asks_parse(root: Path) -> list:
+    """Parse <!-- asks:begin --> ... <!-- asks:end --> blocks from the door."""
+    path = _asks_door_path(root)
+    if not path.is_file():
+        return []
+    asks = []
+    in_block = False
+    current = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped == "<!-- asks:begin -->":
+            in_block, current = True, {}
+            continue
+        if stripped == "<!-- asks:end -->":
+            if in_block and current.get("id"):
+                asks.append(current)
+            in_block = False
+            continue
+        if in_block and ":" in stripped:
+            key, _, value = stripped.partition(":")
+            key = key.strip().replace("-", "_")
+            if key in ASK_FIELDS:
+                current[key] = value.strip()
+    return asks
+
+
+def _asks_render(ask: dict) -> str:
+    lines = ["<!-- asks:begin -->"]
+    for field in ASK_FIELDS:
+        if ask.get(field):
+            lines.append(f"{field.replace('_', '-')}: {ask[field]}")
+    lines.append("<!-- asks:end -->")
+    return "\n".join(lines)
+
+
+def _asks_save(root: Path, asks: list) -> None:
+    """Rewrite ONLY the ask blocks; everything outside them (the header, the
+    last-invite-day cooldown stamp, and the append-only ANSWER receipts) is
+    preserved verbatim — receipts are history, and the cooldown stamp is the
+    cross-harness invite state. Rewriting the whole file would clobber both."""
+    path = _asks_door_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old_text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    head, rest = "", old_text
+    begin = old_text.find("<!-- asks:begin -->")
+    if begin != -1:
+        head, rest = old_text[:begin], old_text[begin:]
+    blocks = "\n\n".join(_asks_render(a) for a in asks)
+    new_text = head + blocks
+    if blocks:
+        new_text += "\n"
+    # preserve anything after the final ask block (receipts etc.)
+    tail = ""
+    marker = "<!-- asks:end -->"
+    last_end = rest.rfind(marker)
+    if last_end != -1:
+        tail = rest[last_end + len(marker):]
+        if tail and not new_text.endswith("\n"):
+            new_text += "\n"
+    new_text += tail.lstrip("\n") if tail else ""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _asks_answer_receipt(root: Path, ask: dict, ruling: str, verified: bool) -> None:
+    path = _asks_door_path(root)
+    stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    receipt = (f"\n- ANSWER {ask['id']} @ {stamp} harness={detect_harness(None)} "
+               f"verified={'yes' if verified else 'no'} :: {ruling}")
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(receipt)
+
+
+def _asks_eligible(asks: list) -> list:
+    """Deterministic eligibility for surfacing: open/invited, not snoozed."""
+    today = datetime.date.today().isoformat()
+    out = []
+    for ask in asks:
+        if ask.get("status") not in ("open", "invited"):
+            continue
+        snooze = ask.get("snooze_until") or ""
+        if snooze and snooze > today:
+            continue
+        out.append(ask)
+    return out
+
+
+def cmd_asks(args):
+    """[slice 2+3] The ask-user ledger: add/list/close/snooze/invite/seed.
+
+    Recording an answer is a pure file operation — zero model spend. close()
+    write-through: a ruling on an ask that references a lobemanager decision
+    debt is forwarded to that debt; a physical action without --verified
+    stays pending-verification."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    action = args.asks_action
+    asks = _asks_parse(root)
+
+    if action == "seed":
+        if _asks_door_path(root).is_file():
+            print(f"asks: door already exists: {_asks_door_path(root)}")
+            return
+        _asks_save(root, [])
+        print(f"asks: seeded {_asks_door_path(root)}")
+        return
+
+    if action == "list":
+        eligible = _asks_eligible(asks)
+        if getattr(args, "json", False):
+            print(json.dumps({"eligible": eligible, "all": asks}, indent=1))
+            return
+        if not eligible:
+            print("asks: nothing awaiting the owner")
+            return
+        for ask in eligible:
+            age = ask.get("since") or "?"
+            print(f"  {ask['id']}  [{ask.get('kind')}|{ask.get('status')}] since {age}")
+            print(f"    {ask.get('request')}")
+            if ask.get("answer_shape"):
+                print(f"    answer shape: {ask['answer_shape']}")
+        return
+
+    if action == "add":
+        ask_id = getattr(args, "ask_id", None) or (
+            f"ask-{datetime.date.today().strftime('%Y%m%d')}-{len(asks) + 1:02d}")
+        if any(a["id"] == ask_id for a in asks):
+            raise SystemExit(f"asks: id already exists: {ask_id}")
+        kind = getattr(args, "kind", None) or "decision"
+        if kind not in ASK_KINDS:
+            raise SystemExit(f"asks: kind must be one of {ASK_KINDS}")
+        if not getattr(args, "request", None):
+            raise SystemExit("asks: --request is required")
+        ask = {
+            "id": ask_id, "kind": kind, "status": "open",
+            "since": datetime.date.today().isoformat(),
+            "source_ref": getattr(args, "source_ref", None) or "",
+            "request": args.request,
+            "why_now": getattr(args, "why_now", None) or "",
+            "answer_shape": getattr(args, "answer_shape", None) or "",
+            "snooze_until": "", "last_invited_at": "",
+            "decision_debt_ref": getattr(args, "decision_debt_ref", None) or "",
+            "owner_correction": "yes" if getattr(args, "owner_correction", False) else "",
+            "provenance": f"added by {detect_harness(None)} {datetime.date.today().isoformat()}",
+        }
+        asks.append(ask)
+        _asks_save(root, asks)
+        print(f"asks: added {ask_id}")
+        return
+
+    target = next((a for a in asks if a["id"] == args.ask_id), None)
+    if target is None:
+        raise SystemExit(f"asks: no such ask: {args.ask_id}")
+
+    if action == "snooze":
+        if not getattr(args, "until", None):
+            raise SystemExit("asks: snooze needs --until YYYY-MM-DD")
+        target["status"] = "snoozed"
+        target["snooze_until"] = args.until
+        _asks_save(root, asks)
+        print(f"asks: snoozed {args.ask_id} until {args.until}")
+        return
+
+    if action == "invite":
+        # [slice 4] ONE review invitation per owner per day ACROSS harnesses:
+        # the door is memory-synced, so a header day-stamp + the door lock is
+        # the shared cooldown — parallel sessions on any host converge on the
+        # same file and the second invite is refused, not stacked.
+        path = _asks_door_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        today = datetime.date.today().isoformat()
+        lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=30)
+        try:
+            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            m = re.search(r"^last-invite-day:\s*(\S+)\s*$", text, re.M)
+            if m and m.group(1) == today:
+                print("asks: a review invitation was already offered today "
+                      "(cross-harness cooldown); not stacking another")
+                return
+            target["status"] = "invited"
+            target["last_invited_at"] = today
+            _asks_save(root, asks)
+            if m:
+                text = re.sub(r"^last-invite-day:\s*\S+\s*$",
+                              f"last-invite-day: {today}", text, count=1, flags=re.M)
+            elif text:
+                text = f"last-invite-day: {today}\n" + text
+            else:
+                text = f"# ask-user ledger\n\nlast-invite-day: {today}\n"
+            path.write_text(text, encoding="utf-8")
+        finally:
+            _flock_close(lock)
+        print(f"asks: invited {args.ask_id}")
+        return
+
+    if action == "close":
+        ruling = getattr(args, "ruling", None) or ""
+        verified = bool(getattr(args, "verified", False))
+        target["status"] = "closed"
+        # [slice 3] write-through: a referenced lobemanager decision debt gets
+        # the ruling; the answer receipt is immutable regardless.
+        debt_ref = target.get("decision_debt_ref") or ""
+        forwarded = ""
+        if debt_ref and ruling:
+            lb = shutil.which("lobemanager") or ""
+            if not lb:
+                candidate = Path.home() / "data/msggraph/lobemanager/lobemanager.lisp"
+                lb = f"sbcl --script {candidate}" if candidate.exists() else ""
+            if lb:
+                try:
+                    proc = subprocess.run(
+                        lb.split() + ["decisions", "rule", debt_ref, ruling],
+                        capture_output=True, text=True, timeout=60)
+                    forwarded = "debt-updated" if proc.returncode == 0 else "debt-forward-FAILED"
+                except Exception as exc:
+                    forwarded = f"debt-forward-error({str(exc)[:60]})"
+            else:
+                forwarded = "debt-forward-unavailable(lobemanager not on this host)"
+        _asks_answer_receipt(root, target, ruling, verified)
+        if target.get("kind") == "physical-action" and not verified:
+            # A promise is not a completion: the ask closes as answered but a
+            # verification follow-up stays open until the handoff is confirmed.
+            target["status"] = "answered"
+            print("asks: physical action recorded as PENDING VERIFICATION "
+                  "(close again with --verified once the handoff is confirmed)")
+        _asks_save(root, asks)
+        note = f"; {forwarded}" if forwarded else ""
+        print(f"asks: closed {args.ask_id}{note}")
+        return
+
+    if action == "harvest":
+        # [slice 5] Deterministic harvest of owner-blocked work: task-ledger
+        # blocked entries whose blocker names the OWNER, plus lobemanager
+        # decision debts where that tool exists. Dedup by source_ref — an ask
+        # already carrying the reference is never duplicated. Harvesting adds
+        # asks; it never touches routing/quota state, and answering an ask
+        # never authorizes downstream execution.
+        added = 0
+        existing_refs = {a.get("source_ref") for a in asks if a.get("source_ref")}
+        ledger_path = Path(root) / "namespaces" / ASKS_NS / "fleet-task-ledger.md"
+        if not ledger_path.is_file():
+            print("asks: harvest — no fleet-task-ledger door visible on this host")
+            return
+        text = ledger_path.read_text(encoding="utf-8")
+        chunks = re.split(r"^###\s+", text, flags=re.M)[1:]
+        owner_markers = ("owner-gated", "owner scan", "owner-scan",
+                         "owner decision", "owner directive", "⛔ owner")
+        for chunk in chunks:
+            m = re.match(r"\[([T-\w]+)\]\s*(.+)", chunk.splitlines()[0] if chunk else "")
+            if not m:
+                continue
+            task_id, title = m.group(1), m.group(2).strip()
+            status_m = re.search(r"^\s*-\s*status:\s*blocked\((.+?)\)", chunk, re.M | re.I)
+            if not status_m:
+                continue
+            reason = status_m.group(1)
+            if not any(marker in reason.lower() for marker in owner_markers):
+                continue
+            source_ref = f"fleet-task-ledger:{task_id}"
+            if source_ref in existing_refs:
+                continue
+            lower = reason.lower()
+            kind = ("physical-action"
+                    if any(w in lower for w in ("scan", "upload", "mail", "sign", "pay"))
+                    else "decision")
+            ask_id = f"ask-harvest-{task_id.lower()}"
+            if any(a["id"] == ask_id for a in asks):
+                continue
+            asks.append({
+                "id": ask_id, "kind": kind, "status": "open",
+                "since": datetime.date.today().isoformat(),
+                "source_ref": source_ref,
+                "request": f"{title} — blocked on you: {reason[:160]}",
+                "why_now": "harvested from fleet-task-ledger blocked state",
+                "answer_shape": "ruling or the missing input",
+                "snooze_until": "", "last_invited_at": "",
+                "decision_debt_ref": "", "owner_correction": "",
+                "provenance": f"harvest by {detect_harness(None)} {datetime.date.today().isoformat()}",
+            })
+            added += 1
+        # lobemanager decision debts (best-effort, host-dependent)
+        lb_note = ""
+        lb_script = Path.home() / "data/msggraph/lobemanager/lobemanager.lisp"
+        if lb_script.exists():
+            try:
+                proc = subprocess.run(
+                    ["sbcl", "--script", str(lb_script), "decisions", "list"],
+                    capture_output=True, text=True, timeout=120)
+                for line in (proc.stdout or "").splitlines():
+                    dm = re.match(r"\s*\[?(DEB-\S+)\]?\s+(.*)", line)
+                    if not dm or "open" not in line.lower():
+                        continue
+                    debt_id, desc = dm.group(1), dm.group(2)[:160]
+                    source_ref = f"lobemanager:{debt_id}"
+                    if source_ref in existing_refs:
+                        continue
+                    ask_id = f"ask-debt-{debt_id.lower()}"
+                    if any(a["id"] == ask_id for a in asks):
+                        continue
+                    asks.append({
+                        "id": ask_id, "kind": "decision", "status": "open",
+                        "since": datetime.date.today().isoformat(),
+                        "source_ref": source_ref,
+                        "request": desc,
+                        "why_now": "open decision debt (lobemanager)",
+                        "answer_shape": "a ruling (the anticipated default is in the debt)",
+                        "snooze_until": "", "last_invited_at": "",
+                        "decision_debt_ref": debt_id, "owner_correction": "",
+                        "provenance": f"harvest by {detect_harness(None)} {datetime.date.today().isoformat()}",
+                    })
+                    added += 1
+            except Exception as exc:
+                lb_note = f"; lobemanager harvest skipped ({str(exc)[:60]})"
+        else:
+            lb_note = "; lobemanager not present on this host (task-ledger only)"
+        if added:
+            _asks_save(root, asks)
+        print(f"asks: harvest added {added} ask(s){lb_note}")
+        return
+
+    raise SystemExit(f"asks: unknown action: {action}")
+
+
+# --- [slice 6] doctor: deterministic probes + bounded self-repair -----------
+# The dead-timer shape from 2026-10-18 (enabled + active + NextElapse=infinity
+# reports healthy and fires never) must be DETECTED independently of the tick
+# it broke — a dead tick cannot heal itself through its own dream leg. The
+# doctor runs from its own systemd timer + bootstrap/startup, repairs ONLY
+# installation-owned parts (never a deliberately disabled unit — that is
+# intent), and escalates everything beyond that as ask-ledger entries.
+DOCTOR_HEARTBEAT_MAX_AGE_S = int(os.environ.get("YGG_DOCTOR_HEARTBEAT_MAX_AGE_S", "7200"))
+
+
+def _doctor_probes(root: Path) -> list:
+    probes = []
+    heartbeat = Path.home() / ".yggterm/config/dream/autoclaw-heartbeat"
+    if heartbeat.is_file():
+        age = time.time() - heartbeat.stat().st_mtime
+        probes.append({
+            "name": "autoclaw-heartbeat", "ok": age <= DOCTOR_HEARTBEAT_MAX_AGE_S,
+            "detail": f"age {int(age)}s (max {DOCTOR_HEARTBEAT_MAX_AGE_S}s)",
+        })
+    else:
+        probes.append({"name": "autoclaw-heartbeat", "ok": None,
+                       "detail": "absent (harness never synced here)"})
+    health = _composer_health_load(root)
+    for key, entry in (health.get("transports") or {}).items():
+        if entry.get("escalated") or int(entry.get("consecutive", 0)) >= COMPOSER_ESCALATE_AFTER:
+            probes.append({
+                "name": f"composer-{key}", "ok": False,
+                "detail": f"{entry.get('consecutive')}x {entry.get('last_error_class')} "
+                          f"failures; last: {entry.get('last_error', '')[:100]}",
+            })
+    return probes
+
+
+def _doctor_timer_probe() -> dict:
+    """The dead-timer shape: enabled+active but NextElapse=infinity."""
+    try:
+        env = dict(os.environ)
+        uid = os.getuid()
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={env['XDG_RUNTIME_DIR']}/bus")
+        proc = subprocess.run(
+            ["systemctl", "--user", "show", "ygg-memory-sync.timer", "-p",
+             "UnitFileState", "-p", "ActiveState", "-p", "NextElapseUSecMonotonic"],
+            capture_output=True, text=True, timeout=15, env=env)
+        props = dict(
+            line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+        enabled = props.get("UnitFileState") in ("enabled", "enabled-runtime", "static")
+        active = props.get("ActiveState") == "active"
+        infinite = props.get("NextElapseUSecMonotonic", "").strip() == "infinity"
+        dead_shape = enabled and active and infinite
+        return {"name": "memory-sync-timer",
+                "ok": (not dead_shape) if enabled else None,
+                "detail": f"unit={props.get('UnitFileState')} active={props.get('ActiveState')} "
+                          f"next={props.get('NextElapseUSecMonotonic')}",
+                "dead_shape": dead_shape, "enabled": enabled}
+    except ( FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {"name": "memory-sync-timer", "ok": None, "detail": f"unprobeable: {exc}"}
+
+
+def _doctor_unit_drift() -> dict:
+    skill_dir = Path(__file__).resolve().parent / "systemd"
+    installed = Path.home() / ".config/systemd/user"
+    if not skill_dir.is_dir():
+        # Running from an installed copy (~/.local/bin) — no SSOT here.
+        # That is UNKNOWN, never "healthy": report it so the doctor unit
+        # execs the repo-homed file (the ygg-panic convention).
+        return {"name": "unit-drift", "ok": None,
+                "detail": f"no unit SSOT next to this script ({skill_dir}); "
+                          "run the doctor from the repo-homed skill"}
+    drifted = []
+    if installed.is_dir():
+        for unit in skill_dir.glob("*"):
+            target = installed / unit.name
+            if target.is_file() and "YGGTERM_UNIT_TUNED" not in target.read_text(encoding="utf-8"):
+                if unit.read_bytes() != target.read_bytes():
+                    drifted.append(unit.name)
+    return {"name": "unit-drift", "ok": not drifted,
+            "detail": f"drifted: {', '.join(drifted)}" if drifted else "units match SSOT"}
+
+
+def cmd_doctor(args):
+    """[slice 6] Deterministic health checks + bounded self-repair.
+
+    Repairs ONLY installation-owned parts: the dead-timer anchor (start the
+    service once), unit drift (copy SSOT over unless YGGTERM_UNIT_TUNED),
+    stale verb copies. A disabled timer is intent and is left alone. Exit 1
+    = issues found (the ygg-panic convention; systemd units set
+    SuccessExitStatus=1) — exit 0 = healthy or fully repaired."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    fix = bool(getattr(args, "fix", False))
+    probes = [_doctor_timer_probe(), _doctor_unit_drift(), *_doctor_probes(root)]
+    repairs = []
+    for probe in probes:
+        if probe.get("ok") is False and fix:
+            if probe["name"] == "memory-sync-timer" and probe.get("dead_shape"):
+                env = dict(os.environ)
+                env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+                env.setdefault("DBUS_SESSION_BUS_ADDRESS",
+                               f"unix:path={env['XDG_RUNTIME_DIR']}/bus")
+                proc = subprocess.run(
+                    ["systemctl", "--user", "start", "--no-block",
+                     "ygg-memory-sync.service"],
+                    capture_output=True, text=True, timeout=15, env=env)
+                if proc.returncode == 0:
+                    probe["ok"] = None
+                    probe["detail"] += " -> anchored (repair issued)"
+                    repairs.append("timer-anchor")
+            elif probe["name"] == "unit-drift":
+                skill_dir = Path(__file__).resolve().parent / "systemd"
+                installed = Path.home() / ".config/systemd/user"
+                for name in probe["detail"].replace("drifted: ", "").split(", "):
+                    src_unit = skill_dir / name
+                    dst_unit = installed / name
+                    if src_unit.is_file() and dst_unit.is_file()                             and "YGGTERM_UNIT_TUNED" not in dst_unit.read_text(encoding="utf-8"):
+                        shutil.copyfile(src_unit, dst_unit)
+                        repairs.append(f"unit:{name}")
+                subprocess.run(["systemctl", "--user", "daemon-reload"],
+                               capture_output=True, timeout=15)
+                probe["ok"] = None
+                probe["detail"] += " -> refreshed from SSOT"
+    unresolved = [p for p in probes if p.get("ok") is False]
+    if getattr(args, "json", False):
+        print(json.dumps({"probes": probes, "repairs": repairs,
+                          "healthy": not unresolved}, indent=1))
+    else:
+        for probe in probes:
+            state = "ok" if probe.get("ok") else ("?" if probe.get("ok") is None else "BREACH")
+            print(f"  [{state:>6}] {probe['name']}: {probe['detail']}")
+        if repairs:
+            print(f"  repairs applied: {', '.join(repairs)}")
+        print(f"doctor: {'healthy' if not unresolved else f'{len(unresolved)} unresolved issue(s)'}")
+    # Escalation: unresolved issues become ask-ledger entries (visible, not
+    # buried) — best-effort, never fails the doctor.
+    if unresolved:
+        try:
+            asks = _asks_parse(root)
+            existing = {a.get("source_ref") for a in asks}
+            today = datetime.date.today().isoformat()
+            changed = False
+            for probe in unresolved:
+                ref = f"doctor:{probe['name']}"
+                if ref in existing:
+                    continue
+                asks.append({
+                    "id": f"ask-doctor-{probe['name']}", "kind": "decision",
+                    "status": "open", "since": today, "source_ref": ref,
+                    "request": f"infra issue needs you: {probe['detail'][:160]}",
+                    "why_now": "doctor probe unresolved after bounded self-repair",
+                    "answer_shape": "ruling (investigate / leave / reconfigure)",
+                    "snooze_until": "", "last_invited_at": "",
+                    "decision_debt_ref": "", "owner_correction": "",
+                    "provenance": f"doctor {today}",
+                })
+                changed = True
+            if changed:
+                _asks_save(root, asks)
+        except Exception:
+            pass
+    return 0 if not unresolved else 1
 
 
 def cmd_now(args):
@@ -4833,6 +5505,15 @@ def cmd_now(args):
     else:
         print(f"(no NOW.md yet for {ns} — the dreamer has not synthesized this namespace)")
     print()
+    # [slice 2+4] deterministic ask surfacing — zero model spend. The seat
+    # decides HOW to offer the daily review; this only decides WHAT is
+    # eligible (status + snooze). Cooldown is the invite path's job.
+    eligible = _asks_eligible(_asks_parse(root))
+    if eligible:
+        print("── asks awaiting you (offer ONE review invitation today) ──")
+        for ask in eligible[:5]:
+            print(f"  {ask['id']}  [{ask.get('kind')}] {ask.get('request')}")
+        print()
     print("── temporal envelope ──")
     print(temporal_envelope(root, ns))
 
@@ -6304,6 +6985,16 @@ def cmd_dream(args):
             print(json.dumps({"status": message}))
         elif not getattr(args, "quiet", False):
             print(message)
+        # [multi-dreamer] secondary scoped dreamers run after the primary in
+        # the same tick, each strictly limited to its ns_scope (disjoint from
+        # whatever the primary chose this tick; overlap trips the fence, it
+        # never doubles-spend) and to its own composer chain.
+        for dreamer in _dreamers_load():
+            try:
+                dmsg = _dream_auto(root, None, args, dreamer=dreamer)
+                print(f"dreamer[{dreamer.get('name', '?')}]: {dmsg}")
+            except Exception as exc:
+                print(f"dreamer[{dreamer.get('name', '?')}]: skipped ({str(exc)[:120]})")
         return
 
     if args.status:
@@ -6364,7 +7055,7 @@ def cmd_dream(args):
             print(f"dream: composer pass ({args.model}, effort {args.effort})… [budget {admission['id']}{', borrowed' if admission.get('borrowed') else ''}]")
             response, composer_used = _composer_exec(
                 brief + "\n\nProduce the response now.", args.effort,
-                codex_bin, args.model)
+                codex_bin, args.model, root=root)
             (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
             print("dream: critic pass…")
             critic_prompt = (
@@ -6375,7 +7066,7 @@ def cmd_dream(args):
                 + CRITIC_INSTRUCTIONS
             )
             critic, _ = _composer_exec(
-                critic_prompt, args.effort, codex_bin, args.model)
+                critic_prompt, args.effort, codex_bin, args.model, root=root)
             (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
         except BaseException:
             budget_op(root, {"action": "release", "id": admission["id"]})
@@ -6825,6 +7516,20 @@ def main():
     p_now.set_defaults(fn=cmd_now)
 
     # [slice 3] authoritative owner corrections
+    p_asks = subparsers.add_parser("asks", parents=[common_parser], help="ask-user ledger: seed/list/add/close/snooze/invite")
+    p_asks.add_argument("asks_action", choices=["seed", "list", "add", "close", "snooze", "invite", "harvest"])
+    p_asks.add_argument("ask_id", nargs="?")
+    p_asks.add_argument("--kind", choices=ASK_KINDS)
+    p_asks.add_argument("--request")
+    p_asks.add_argument("--why-now", dest="why_now")
+    p_asks.add_argument("--answer-shape", dest="answer_shape")
+    p_asks.add_argument("--source-ref", dest="source_ref")
+    p_asks.add_argument("--decision-debt-ref", dest="decision_debt_ref")
+    p_asks.add_argument("--owner-correction", action="store_true")
+    p_asks.add_argument("--ruling")
+    p_asks.add_argument("--until")
+    p_asks.add_argument("--verified", action="store_true")
+    p_asks.set_defaults(fn=cmd_asks)
     p_owner = subparsers.add_parser("owner", parents=[common_parser], help="Authoritative owner corrections: --correct/--dismiss/--surface (effective on next read); --list shows the record")
     p_owner.add_argument("--correct", action="store_true")
     p_owner.add_argument("--dismiss", action="store_true")
