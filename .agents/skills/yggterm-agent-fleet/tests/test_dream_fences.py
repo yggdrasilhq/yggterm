@@ -39,6 +39,10 @@ def write_journal(root: Path, records: list) -> None:
 def main() -> int:
     default = Path(__file__).resolve().parent.parent / "ygg-memory.py"
     module = load_module(Path(sys.argv[1]) if len(sys.argv) > 1 else default)
+    # hermetic: the autoclaw heartbeat is host state — a live seat on the
+    # running host would defer every dream in these cases. The heartbeat is
+    # never created here, so the lookup returns None.
+    module.DREAM_AUTOCLAW_HEARTBEAT = Path(tempfile.gettempdir()) / "dreamtests-no-heartbeat"
     failures = []
 
     def check(condition, message):
