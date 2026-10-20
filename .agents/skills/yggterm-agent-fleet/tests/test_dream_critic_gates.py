@@ -179,6 +179,54 @@ def main() -> int:
     if "TRIAGE" not in module.CRITIC_INSTRUCTIONS or "never a verdict" not in module.CRITIC_INSTRUCTIONS:
         failures.append("critic: lexical/citation triage rule missing from instructions")
 
+    # --- [T-027 harvest] pairing law: hallucination-prone never self-critiques
+    if module.critic_pairing_violation(
+        "opencode/deepseek-v4.1-flash-free", "opencode/deepseek-v4.1-flash-free"
+    ) is None:
+        failures.append("pairing: deepseek self-critique not refused")
+    if module.critic_pairing_violation("gemini-3.8-flash", "gemini-3.8-flash") is None:
+        failures.append("pairing: gemini self-critique not refused")
+    if module.critic_pairing_violation(
+        "opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free"
+    ) is not None:
+        failures.append("pairing: deepseek + cautious glm critic wrongly refused")
+    if module.critic_pairing_violation(
+        "opencode/glm-5.3-flash-free", "opencode/glm-5.3-flash-free"
+    ) is not None:
+        failures.append("pairing: sanctioned cautious glm pair wrongly refused")
+
+    # --- [T-027 harvest] overlap-as-triage ENFORCED: a contested verdict
+    # without a concrete counter_example never falsifies
+    with tempfile.TemporaryDirectory() as tmp:
+        _, ns_dir = build_ns(module, Path(tmp))
+        vs = verdicts(("c3", "contested"))
+        for v in vs:
+            if v["claim_id"] == "c3":
+                v["counter_example"] = None
+                v["overlap"] = 0.8
+        errs = module.validate_dream_response(parsed_response(), vs, ns_dir, strict=True)
+        if not any("overlap alone never contests" in e for e in errs):
+            failures.append(f"overlap: contested-without-counter_example accepted: {errs}")
+
+    # --- [T-027 harvest] roster entries auto-disarm past expires_at ---------
+    saved = probe.read_text(encoding="utf-8") if probe.is_file() else None
+    try:
+        cfg.mkdir(parents=True, exist_ok=True)
+        probe.write_text(json.dumps({
+            "example-ns-expired": {"critic_model": "old-critic", "expires_at": "2020-01-01"},
+            "example-ns-live": {"critic_model": "live-critic", "expires_at": "2099-01-01"},
+        }), encoding="utf-8")
+        roster = module.load_critic_roster()
+        if "example-ns-expired" in roster:
+            failures.append("roster: expired entry not auto-disarmed")
+        if roster.get("example-ns-live", {}).get("critic_model") != "live-critic":
+            failures.append("roster: live unexpired entry lost")
+    finally:
+        if saved is None:
+            probe.unlink(missing_ok=True)
+        else:
+            probe.write_text(saved, encoding="utf-8")
+
     if failures:
         print("dream-critic-gates tests: FAILURES")
         for f in failures:

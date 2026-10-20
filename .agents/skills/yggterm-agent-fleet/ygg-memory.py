@@ -3870,6 +3870,13 @@ def validate_dream_response(
                 for line in now_md.splitlines():
                     if fragment in line and "[CONTESTED" not in line and "[FALSIFIED" not in line:
                         errors.append(f"contested claim left undemoted: {fragment}")
+            # [T-027 harvest] overlap-as-triage is ENFORCED, not just prose:
+            # a contested verdict without a concrete counter_example never
+            # falsifies anything (lexical/citation similarity is triage).
+            if not (verdict.get("counter_example") or "").strip():
+                errors.append(
+                    f"claim {cid} contested without a counter_example — overlap alone never contests"
+                )
         # [T-027 sol] with claim-IDs on rollup statements the demotion check
         # keys on the id too — a bullet citing a contested claim id must be
         # visibly demoted even when the wording drifted.
@@ -4683,7 +4690,40 @@ def load_critic_roster() -> dict:
         return dict(DEFAULT_CRITIC_ROSTER)
     if not isinstance(roster, dict):
         return dict(DEFAULT_CRITIC_ROSTER)
-    return {k: v for k, v in roster.items() if v is not None}
+    today = datetime.date.today().isoformat()
+    out = {}
+    for k, v in roster.items():
+        if v is None:
+            continue
+        # [T-027 harvest] an entry may carry expires_at (YYYY-MM-DD) — past
+        # it the entry auto-disarms and the ns falls back (roster rot guard).
+        expires = ""
+        if isinstance(v, dict):
+            expires = str(v.get("expires_at", "")).strip()
+        if expires and expires < today:
+            continue
+        out[k] = v
+    return out
+
+
+# [T-027 harvest] the pairing law, deterministic: a hallucination-prone
+# composer family (AA-Omniscience pillar, _global/llm-model-trust-table.md)
+# may NEVER have its own model as its falsifier. Same-model cautious pairs
+# (glm-5.3-flash both legs — the sanctioned priority-ns pairing) are fine.
+DREAM_HALLUCINATION_PRONE_MARKERS = ("deepseek", "gemini")
+
+
+def critic_pairing_violation(composer_model: str, critic_model: str) -> str | None:
+    composer = (composer_model or "").lower()
+    critic = (critic_model or "").lower()
+    for marker in DREAM_HALLUCINATION_PRONE_MARKERS:
+        if marker in composer and marker in critic:
+            return (
+                f"model-trust law: composer {composer_model!r} is hallucination-prone "
+                f"({marker}) and the critic is the SAME model — pair a cautious "
+                "falsifier (glm-5.3-flash, gpt-6.1-sol; see _global/llm-model-trust-table.md)"
+            )
+    return None
 
 
 def dream_critic_binding(response_text: str, critic_model: str, critic_effort: str) -> str:
@@ -7176,14 +7216,29 @@ def cmd_dream(args):
                 critic_effort = str(roster_entry.get("critic_effort") or args.effort).strip()
                 if critic_model != args.model:
                     print(f"dream: critic roster — ns {ns} falsifier is {critic_model} (cross-model)")
+            # [T-027 harvest] the pairing law is ENFORCED, not just recorded:
+            # a hallucination-prone composer never critiques itself, refused
+            # deterministically BEFORE any tokens burn.
+            violation = critic_pairing_violation(args.model, critic_model)
+            if violation:
+                raise SystemExit(f"dream: REFUSED — {violation}")
             manifest["composer_model"] = args.model
             manifest["critic_model"] = critic_model
             manifest["critic_effort"] = critic_effort
+            manifest["critic_policy"] = DREAM_CRITIC_POLICY
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             print(f"dream: composer pass ({args.model}, effort {args.effort})… [budget {admission['id']}{', borrowed' if admission.get('borrowed') else ''}]")
             response, composer_used = _composer_exec(
                 brief + "\n\nProduce the response now.", args.effort,
                 codex_bin, args.model, root=root)
+            # [T-027 harvest] the transport chain may substitute a leg
+            # (free-first): the manifest records the ACTUAL identities so the
+            # pairing law and the binding evaluate reality, not the request.
+            manifest["composer_transport"] = composer_used
+            manifest["composer_model"] = (
+                composer_used.split("/", 1)[1] if "/" in composer_used else args.model
+            )
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
             print("dream: critic pass…")
             critic_prompt = (
@@ -7193,12 +7248,19 @@ def cmd_dream(args):
                 + "\n\n"
                 + CRITIC_INSTRUCTIONS
             )
-            critic, _ = _composer_exec(
+            critic, critic_used = _composer_exec(
                 critic_prompt, critic_effort, codex_bin, critic_model, root=root)
+            actual_critic = (
+                critic_used.split("/", 1)[1] if "/" in critic_used else critic_model
+            )
+            manifest["critic_model"] = actual_critic
+            manifest["critic_transport"] = critic_used
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             # [T-027 sol pre-gate] the RUNNER stamps the binding (candidate
             # bytes + critic identity + policy) onto the critic output —
-            # apply re-verifies it and fails closed on any mismatch.
-            binding = dream_critic_binding(response, critic_model, critic_effort)
+            # apply re-verifies it and fails closed on any mismatch. The
+            # stamp binds the ACTUAL falsifier identity, never the request.
+            binding = dream_critic_binding(response, actual_critic, critic_effort)
             (pending / "CRITIC.md").write_text(
                 f"<!-- dream-critic-binding: {binding} -->\n" + critic, encoding="utf-8")
         except BaseException:
