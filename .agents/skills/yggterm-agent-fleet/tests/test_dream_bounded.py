@@ -168,6 +168,11 @@ def test_overdue_service_rotation(module, failures):
                     {"seq": seq, "ts": time.time() - 4000, "ns": "ns-hot",
                      "file": "d.md", "origin": "host-a", "summary": "write"}) + "\n")
 
+        # hermetic: a live autoclaw seat on the running host leaves a fresh
+        # host heartbeat, which would defer every candidate and pick nothing.
+        # The heartbeat below is never created, so the lookup returns None.
+        module.DREAM_AUTOCLAW_HEARTBEAT = root / "never-created-heartbeat"
+
         captured = []
         original_receipt, original_run = module._dream_receipt, module.subprocess.run
 
