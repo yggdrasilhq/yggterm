@@ -8,6 +8,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::os::unix::fs::MetadataExt;
+
 use crate::trace_contract::{
     ForeignRecordFault, ForeignTraceRecord, MAX_FOREIGN_BATCH_RECORDS, validate_foreign_record,
 };
@@ -169,7 +171,20 @@ pub fn event_trace_path(home: &Path) -> PathBuf {
 struct TraceWriter {
     file: File,
     bytes_written: u64,
+    /// dev+ino of the inode this handle holds, captured at open. A foreign
+    /// writer's rotation renames our inode away while the handle keeps it —
+    /// the probe compares these against the live path's metadata.
+    inode: (u64, u64),
+    /// Bytes threshold for the next foreign-rotation probe (bounded stat).
+    next_probe_at: u64,
 }
+
+/// [T-013] Foreign-rotation probe interval: one `metadata` stat per this many
+/// traced bytes. The counter exists precisely to avoid a stat per call (the
+/// hot path used to pay one on every event under flood), so the probe rides
+/// the same counter — bounded cost, and a stale handle stops appending to a
+/// rotated-out generation within one interval instead of for hours.
+const FOREIGN_ROTATION_CHECK_BYTES: u64 = 256 * 1024;
 
 fn open_trace_writer(path: &Path) -> Option<TraceWriter> {
     let file = OpenOptions::new()
@@ -177,10 +192,14 @@ fn open_trace_writer(path: &Path) -> Option<TraceWriter> {
         .append(true)
         .open(path)
         .ok()?;
-    let bytes_written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let meta = file.metadata().ok()?;
+    let bytes_written = meta.len();
+    let inode = (meta.dev(), meta.ino());
     Some(TraceWriter {
         file,
         bytes_written,
+        inode,
+        next_probe_at: bytes_written + FOREIGN_ROTATION_CHECK_BYTES,
     })
 }
 
@@ -302,6 +321,25 @@ fn write_trace_line(home: &Path, line: &[u8]) {
     let mut writers = trace_writers()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // [T-013] Follow foreign rotations at a bounded interval: another writer
+    // (this code used to be the only rotator, but retention-aware tools and
+    // older builds rotate too) renames our inode away while this handle keeps
+    // appending to the rotated-out generation — the two-writers
+    // overlapping-generations defect (dream 2026-09-12: half a day's events
+    // silently split across files). A stat per call would defeat the
+    // counter, so the probe rides it: past the interval, one metadata stat
+    // decides whether the live path is still the inode we hold.
+    if let Some(writer) = writers.get_mut(&path) {
+        if writer.bytes_written >= writer.next_probe_at {
+            writer.next_probe_at = writer.bytes_written + FOREIGN_ROTATION_CHECK_BYTES;
+            if let Ok(live) = fs::metadata(&path) {
+                if (live.dev(), live.ino()) != writer.inode {
+                    writers.remove(&path);
+                }
+            }
+        }
+    }
 
     if !writers.contains_key(&path) {
         let _ = fs::create_dir_all(home);
@@ -846,6 +884,61 @@ mod tests {
         assert_eq!(lines.len(), 1, "fresh file should hold one record");
         let rec: EventTraceRecord = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(rec.name, "after-cap");
+
+        trace_writers().lock().unwrap().remove(&path);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn foreign_rotation_is_followed() {
+        // [T-013] The two-writers defect (dream 2026-09-12): a foreign
+        // writer rotates the live file out while this process's cached
+        // handle keeps appending to the rotated-out generation for hours.
+        // The probe must drop the stale handle within one interval so the
+        // post-rotation records land in the FRESH live file.
+        let home = unique_home("foreign-rotate");
+        let path = event_trace_path(&home);
+        let _ = fs::create_dir_all(&home);
+        trace_writers().lock().unwrap().remove(&path);
+
+        // Open the cached handle on the original inode.
+        append_trace_event(&home, "test", "unit", "before-foreign", json!({}));
+
+        // A foreign writer rotates the live file out and starts a fresh one.
+        let foreign_gen = home.join("event-trace.g-foreign.jsonl");
+        fs::rename(&path, &foreign_gen).unwrap();
+        fs::write(&path, b"").unwrap();
+
+        // Enough traced bytes to cross the probe interval (256 KiB).
+        let pad = "p".repeat(300);
+        for i in 0..2000u64 {
+            append_trace_event(&home, "test", "unit", "post-foreign", json!({ "i": i, "pad": pad }));
+        }
+
+        let gen_text = fs::read_to_string(&foreign_gen).unwrap();
+        let live_text = fs::read_to_string(&path).unwrap();
+        assert!(
+            gen_text.contains("before-foreign"),
+            "the pre-rotation record stays in the rotated-out generation"
+        );
+        assert!(
+            !live_text.contains("before-foreign"),
+            "the pre-rotation record must not reappear in the live file"
+        );
+        assert!(
+            live_text.contains("\"i\":1999"),
+            "the final records must follow the fresh live file — a stale handle may not outlive the probe"
+        );
+        // The overlap is BOUNDED by one probe interval: only about the
+        // interval's worth of post-rotation records may straddle into the
+        // rotated-out generation (the dream's defect was half a day of
+        // unbounded straddle).
+        let straddle = gen_text.matches("post-foreign").count();
+        let bounded = (FOREIGN_ROTATION_CHECK_BYTES as usize / 300) + 16;
+        assert!(
+            straddle <= bounded,
+            "the straddle must be bounded by one probe interval: {straddle} > {bounded}"
+        );
 
         trace_writers().lock().unwrap().remove(&path);
         let _ = fs::remove_dir_all(&home);
