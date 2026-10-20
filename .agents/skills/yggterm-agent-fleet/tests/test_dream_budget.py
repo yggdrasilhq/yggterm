@@ -42,13 +42,13 @@ TINY_POLICY = json.dumps(
 )
 
 GOOD_NOW = """## §CURRENT_STATUS
-- budget slice landed [as-of: 2026-10-16; proof: deployed]
+- budget slice landed [claim: c1] [as-of: 2026-10-16; proof: deployed]
 
 ## §NEXT_UNITS
-- next slice queued [as-of: 2026-10-16; proof: claimed]
+- next slice queued [claim: c2] [as-of: 2026-10-16; proof: claimed]
 
 ## §ACTIVE_TRAPS
-- watch the race [as-of: 2026-10-16; proof: measured-live]
+- watch the race [claim: c3] [as-of: 2026-10-16; proof: measured-live]
 
 ## §POINTERS
 - campaign door
@@ -101,6 +101,7 @@ class Args:
         self.dry_run = False
         self.composer = "sol"
         self.model = "gpt-6.1-sol"
+        self.critic_model = None
         self.effort = "high"
         self.codex_bin = None
         self.force = False
@@ -352,7 +353,7 @@ def _dream_run_gated_body(module, failures):
         journal_one_delta(module, root)
         composer_calls = []
 
-        def fake_composer(prompt, effort, codex_bin, model):
+        def fake_composer(prompt, effort, codex_bin, model, root=None):
             composer_calls.append(prompt)
             return (GOOD_RESPONSE if "COMPOSER OUTPUT" not in prompt
                     else GOOD_CRITIC), "test-stub"

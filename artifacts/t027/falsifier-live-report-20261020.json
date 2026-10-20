@@ -1,0 +1,13 @@
+{
+  "same_model": "opencode/glm-5.3-flash-free",
+  "cross_model": "gpt-6.1-sol",
+  "same": {
+    "c-true": "upheld",
+    "c-hallucinated": "contested"
+  },
+  "cross": {
+    "c-true": "upheld",
+    "c-hallucinated": "contested"
+  },
+  "verdict": "PASS"
+}

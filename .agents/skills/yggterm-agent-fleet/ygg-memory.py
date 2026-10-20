@@ -3289,8 +3289,10 @@ fences around the NOW.MD block):
 <markdown body ONLY — no frontmatter, at most 2600 bytes, exactly these four
 section headings: `## §CURRENT_STATUS`, `## §NEXT_UNITS`, `## §ACTIVE_TRAPS`,
 `## §POINTERS`. EVERY bullet line under the first three sections ends with an
-inline stamp `[as-of: YYYY-MM-DD; proof: <deployed|suite|measured-live|claimed>]`
-taken from the raw deltas — never invent a stamp or a date. Proof vocabulary:
+inline claim id and stamp `[claim: <claim_id>] [as-of: YYYY-MM-DD; proof:
+<deployed|suite|measured-live|claimed>]` — the claim id must equal the
+claim_id of that bullet's entry in the CLAIMS array — taken from the raw
+deltas — never invent a stamp or a date. Proof vocabulary:
 deployed = landed + deployed + read-back verified; suite = tests green only;
 measured-live = instrumented live evidence in the deltas; claimed = stated by
 a seat but unproven. NOW.md wholly REPLACES the previous rollup: carry forward
@@ -3755,7 +3757,12 @@ def parse_critic_verdicts(text: str) -> list[dict]:
     return verdicts
 
 
-def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) -> list[str]:
+def validate_dream_response(
+    parsed: dict, verdicts: list[dict], ns_dir: Path, strict: bool = False
+) -> list[str]:
+    """[T-027 sol pre-gates] strict=True (binding-verified, post-model-trust
+    pendings) additionally enforces: claim-ID on every rollup statement, and
+    apply ops blocked when they depend on a contested claim."""
     errors: list[str] = []
     now_md = parsed["now_md"]
     if now_md.startswith("---"):
@@ -3765,6 +3772,9 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
     for section in NOW_REQUIRED_SECTIONS:
         if section not in now_md:
             errors.append(f"NOW.MD is missing section {section}")
+
+    verdict_map = {v.get("claim_id"): v for v in verdicts if isinstance(v, dict)}
+    claimed_ids = {c.get("claim_id") for c in parsed["claims"] if c.get("claim_id")}
 
     current_section = None
     stamped_bullets = 0
@@ -3785,6 +3795,15 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
                     elif stamp.group(2).strip() not in DREAM_PROOF_VOCAB:
                         errors.append(
                             f"proof '{stamp.group(2).strip()}' not in vocabulary {DREAM_PROOF_VOCAB}: {stripped[:70]}"
+                        )
+                    # [T-027 sol] claim-ID on every rollup statement — the
+                    # bullet is traceable to its critic verdict.
+                    claim_ref = re.search(r"\[claim:\s*([A-Za-z0-9._:\x2d]+)\]", stripped)
+                    if strict and not claim_ref:
+                        errors.append(f"rollup bullet missing [claim: id]: {stripped[:70]}")
+                    elif claim_ref and claim_ref.group(1) not in claimed_ids:
+                        errors.append(
+                            f"rollup bullet cites unknown claim {claim_ref.group(1)!r}: {stripped[:70]}"
                         )
     if stamped_bullets == 0:
         errors.append("NOW.MD carries no stamped claim bullets — a rollup with no claims is not a rollup")
@@ -3833,7 +3852,6 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
 
     if parsed["claims"] and not verdicts:
         errors.append("CRITIC.md verdicts missing — the adversarial critic gate is mandatory when claims exist")
-    verdict_map = {v.get("claim_id"): v for v in verdicts if isinstance(v, dict)}
     for cid in claim_ids:
         verdict = verdict_map.get(cid)
         if verdict is None:
@@ -3841,14 +3859,31 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
         elif verdict.get("verdict") not in ("upheld", "contested"):
             errors.append(f"claim {cid} verdict not upheld|contested: {verdict.get('verdict')!r}")
     # A contested claim may survive ONLY visibly demoted in the rollup.
+    contested_claims: dict[str, str] = {}
     for claim in parsed["claims"]:
+        cid = str(claim.get("claim_id") or "")
         verdict = verdict_map.get(claim.get("claim_id"))
         if verdict and verdict.get("verdict") == "contested":
+            contested_claims[cid] = str(claim.get("text") or "")
             fragment = (claim.get("text") or "")[:40]
             if fragment:
                 for line in now_md.splitlines():
                     if fragment in line and "[CONTESTED" not in line and "[FALSIFIED" not in line:
                         errors.append(f"contested claim left undemoted: {fragment}")
+            # [T-027 harvest] overlap-as-triage is ENFORCED, not just prose:
+            # a contested verdict without a concrete counter_example never
+            # falsifies anything (lexical/citation similarity is triage).
+            if not (verdict.get("counter_example") or "").strip():
+                errors.append(
+                    f"claim {cid} contested without a counter_example — overlap alone never contests"
+                )
+        # [T-027 sol] with claim-IDs on rollup statements the demotion check
+        # keys on the id too — a bullet citing a contested claim id must be
+        # visibly demoted even when the wording drifted.
+        if strict and cid and cid in contested_claims:
+            for line in now_md.splitlines():
+                if f"[claim: {cid}]" in line and "[CONTESTED" not in line and "[FALSIFIED" not in line:
+                    errors.append(f"contested claim {cid} cited without demotion: {line.strip()[:70]}")
 
     ops = parsed["ops"]
     if len(ops) > DREAM_MAX_OPS:
@@ -3858,6 +3893,18 @@ def validate_dream_response(parsed: dict, verdicts: list[dict], ns_dir: Path) ->
         door = ns_dir / str(op.get("file", ""))
         if not op.get("reason"):
             errors.append(f"op {kind} on {op.get('file')!r} has no reason")
+        # [T-027 sol] contested blocks dependent ops: an apply op whose reason
+        # or entry rests on a contested claim cannot ride this apply — the
+        # seat resolves the contest (new deltas or claim drop) first.
+        if strict:
+            blob = f"{op.get('reason', '')} {op.get('entry', '')}"
+            for c_id, c_text in contested_claims.items():
+                fragment = c_text[:32]
+                if c_id and c_id in blob or (len(fragment) >= 24 and fragment in blob):
+                    errors.append(
+                        f"op {kind} on {op.get('file')!r} depends on contested claim {c_id} "
+                        f"— resolve the contest before this op"
+                    )
         if kind == "append-section":
             if not door.is_file():
                 errors.append(f"append-section target door does not exist: {op.get('file')!r}")
@@ -4612,7 +4659,90 @@ support the text. Respond in EXACTLY this format (no code fences):
 
 === VERDICTS ===
 [{"claim_id": "<id>", "verdict": "upheld|contested", "counter_example":
- "<direct quote from the raw deltas, or null>"}]"""
+ "<direct quote from the raw deltas, or null>"}]
+
+Lexical or citation overlap between a claim and its sources is a TRIAGE
+signal, never a verdict: uphold or contest on semantic support against the
+raw deltas, never because the words match."""
+
+
+# [T-027 sol pre-gate] the critic-gate policy version — bump when the
+# pre-gate rules change so every binding names the rules it was verified
+# under. Old pendings without this binding fail closed at apply.
+DREAM_CRITIC_POLICY = "t027-gates-1"
+
+# [T-027] priority namespaces get a cross-model falsifier: the critic must
+# NOT share the composer's model (owner model-trust law 2026-10-19 — cautious
+# models falsify). The per-namespace roster names PRIVATE namespaces, so it
+# lives ONLY in the local config file
+# ~/.yggterm/config/dream/critic-roster.json ({"<ns>": {"critic_model":
+# "...", "critic_effort": "..."}, "<ns>": null to remove}) — never in this
+# public repo. An empty/absent roster means every ns falls back to the
+# composer model (the pre-T-027 pairing).
+DEFAULT_CRITIC_ROSTER: dict = {}
+
+
+def load_critic_roster() -> dict:
+    path = Path.home() / ".yggterm" / "config" / "dream" / "critic-roster.json"
+    try:
+        roster = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return dict(DEFAULT_CRITIC_ROSTER)
+    if not isinstance(roster, dict):
+        return dict(DEFAULT_CRITIC_ROSTER)
+    today = datetime.date.today().isoformat()
+    out = {}
+    for k, v in roster.items():
+        if v is None:
+            continue
+        # [T-027 harvest] an entry may carry expires_at (YYYY-MM-DD) — past
+        # it the entry auto-disarms and the ns falls back (roster rot guard).
+        expires = ""
+        if isinstance(v, dict):
+            expires = str(v.get("expires_at", "")).strip()
+        if expires and expires < today:
+            continue
+        out[k] = v
+    return out
+
+
+# [T-027 harvest] the pairing law, deterministic: a hallucination-prone
+# composer family (AA-Omniscience pillar, _global/llm-model-trust-table.md)
+# may NEVER have its own model as its falsifier. Same-model cautious pairs
+# (glm-5.3-flash both legs — the sanctioned priority-ns pairing) are fine.
+DREAM_HALLUCINATION_PRONE_MARKERS = ("deepseek", "gemini")
+
+
+def critic_pairing_violation(composer_model: str, critic_model: str) -> str | None:
+    composer = (composer_model or "").lower()
+    critic = (critic_model or "").lower()
+    for marker in DREAM_HALLUCINATION_PRONE_MARKERS:
+        if marker in composer and marker in critic:
+            return (
+                f"model-trust law: composer {composer_model!r} is hallucination-prone "
+                f"({marker}) and the critic is the SAME model — pair a cautious "
+                "falsifier (glm-5.3-flash, gpt-6.1-sol; see _global/llm-model-trust-table.md)"
+            )
+    return None
+
+
+def dream_critic_binding(response_text: str, critic_model: str, critic_effort: str) -> str:
+    """[T-027 sol pre-gate] sha256 binding a critic verdict set to the exact
+    candidate bytes + critic identity + policy version. Stamped by the RUNNER
+    into CRITIC.md (never model-echoed) and re-verified at apply, so a stale
+    or foreign CRITIC.md fails closed instead of validating claims it never
+    saw."""
+    payload = json.dumps(
+        {
+            "response_sha256": hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
+            "critic_model": critic_model,
+            "critic_effort": critic_effort,
+            "policy": DREAM_CRITIC_POLICY,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 DREAM_SUMMARY_PREFIXES = ("dream ", "owner-now update")
@@ -7074,15 +7204,41 @@ def cmd_dream(args):
             # [model-trust law 2026-10-19] the critic may be a DIFFERENT
             # model than the composer; the resolved pairing is recorded in
             # the manifest so every verdict carries its falsifier identity.
-            critic_model = (args.critic_model or args.model).strip()
+            # [T-027] priority namespaces pull their falsifier from the
+            # critic roster (cautious cross-model) unless --critic-model
+            # explicitly overrides it.
+            explicit_critic = (args.critic_model or "").strip()
+            critic_model = explicit_critic
+            critic_effort = args.effort
+            if not explicit_critic:
+                roster_entry = load_critic_roster().get(ns) or {}
+                critic_model = str(roster_entry.get("critic_model") or args.model).strip()
+                critic_effort = str(roster_entry.get("critic_effort") or args.effort).strip()
+                if critic_model != args.model:
+                    print(f"dream: critic roster — ns {ns} falsifier is {critic_model} (cross-model)")
+            # [T-027 harvest] the pairing law is ENFORCED, not just recorded:
+            # a hallucination-prone composer never critiques itself, refused
+            # deterministically BEFORE any tokens burn.
+            violation = critic_pairing_violation(args.model, critic_model)
+            if violation:
+                raise SystemExit(f"dream: REFUSED — {violation}")
             manifest["composer_model"] = args.model
             manifest["critic_model"] = critic_model
-            manifest["critic_effort"] = args.effort
+            manifest["critic_effort"] = critic_effort
+            manifest["critic_policy"] = DREAM_CRITIC_POLICY
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             print(f"dream: composer pass ({args.model}, effort {args.effort})… [budget {admission['id']}{', borrowed' if admission.get('borrowed') else ''}]")
             response, composer_used = _composer_exec(
                 brief + "\n\nProduce the response now.", args.effort,
                 codex_bin, args.model, root=root)
+            # [T-027 harvest] the transport chain may substitute a leg
+            # (free-first): the manifest records the ACTUAL identities so the
+            # pairing law and the binding evaluate reality, not the request.
+            manifest["composer_transport"] = composer_used
+            manifest["composer_model"] = (
+                composer_used.split("/", 1)[1] if "/" in composer_used else args.model
+            )
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             (pending / "RESPONSE.md").write_text(response, encoding="utf-8")
             print("dream: critic pass…")
             critic_prompt = (
@@ -7092,9 +7248,21 @@ def cmd_dream(args):
                 + "\n\n"
                 + CRITIC_INSTRUCTIONS
             )
-            critic, _ = _composer_exec(
-                critic_prompt, args.effort, codex_bin, critic_model, root=root)
-            (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
+            critic, critic_used = _composer_exec(
+                critic_prompt, critic_effort, codex_bin, critic_model, root=root)
+            actual_critic = (
+                critic_used.split("/", 1)[1] if "/" in critic_used else critic_model
+            )
+            manifest["critic_model"] = actual_critic
+            manifest["critic_transport"] = critic_used
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            # [T-027 sol pre-gate] the RUNNER stamps the binding (candidate
+            # bytes + critic identity + policy) onto the critic output —
+            # apply re-verifies it and fails closed on any mismatch. The
+            # stamp binds the ACTUAL falsifier identity, never the request.
+            binding = dream_critic_binding(response, actual_critic, critic_effort)
+            (pending / "CRITIC.md").write_text(
+                f"<!-- dream-critic-binding: {binding} -->\n" + critic, encoding="utf-8")
         except BaseException:
             budget_op(root, {"action": "release", "id": admission["id"]})
             raise
@@ -7118,10 +7286,39 @@ def cmd_dream(args):
         if not manifest_path.is_file() or not response_path.is_file():
             raise SystemExit(f"dream: no pending dream in {pending} (run --prepare, compose RESPONSE.md first)")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # [T-027 sol pre-gate] verify the critic binding BEFORE anything
+        # consumes the verdicts: the verdict set must belong to THIS
+        # candidate bytes + critic identity + policy version. Legacy
+        # pendings (no critic_model provenance) stay on the warn path.
+        binding_verified = False
+        critic_text = ""
+        critic_path = pending / "CRITIC.md"
+        if critic_path.is_file():
+            critic_raw = critic_path.read_text(encoding="utf-8")
+            stamp = re.match(r"<!-- dream-critic-binding: ([0-9a-f]{64}) -->", critic_raw)
+            if stamp:
+                expected = dream_critic_binding(
+                    response_path.read_text(encoding="utf-8"),
+                    str(manifest.get("critic_model") or ""),
+                    str(manifest.get("critic_effort") or ""),
+                )
+                if stamp.group(1) != expected:
+                    raise SystemExit(
+                        "dream: REFUSED — critic binding mismatch: CRITIC.md is not the "
+                        "verdict set for this candidate/model/policy (re-run the critic pass)"
+                    )
+                binding_verified = True
+                critic_text = critic_raw[critic_raw.index("-->") + 3 :]
+            elif manifest.get("critic_model"):
+                raise SystemExit(
+                    "dream: REFUSED — critic provenance present but no binding stamp "
+                    "(pre-T-027 pending): re-run the critic pass to bind the verdicts"
+                )
+            else:
+                critic_text = critic_raw
         try:
             parsed = parse_dream_response(response_path.read_text(encoding="utf-8"))
-            critic_path = pending / "CRITIC.md"
-            verdicts = parse_critic_verdicts(critic_path.read_text(encoding="utf-8")) if critic_path.is_file() else []
+            verdicts = parse_critic_verdicts(critic_text) if critic_text.strip() else []
             if critic_path.is_file() and verdicts and not manifest.get("critic_model"):
                 print("dream: WARNING - pending dream has no critic_model provenance (pre model-trust law); verdict binding is unverified", file=sys.stderr)
         except ValueError as error:
@@ -7136,7 +7333,7 @@ def cmd_dream(args):
         if fence:
             raise SystemExit(f"dream: REFUSED — {fence}")
         ns_dir = get_namespace_dir(root, ns, create=False)
-        errors = validate_dream_response(parsed, verdicts, ns_dir)
+        errors = validate_dream_response(parsed, verdicts, ns_dir, strict=binding_verified)
         if errors:
             print(f"dream: REFUSED — {len(errors)} validation error(s):", file=sys.stderr)
             for error in errors:
