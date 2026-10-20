@@ -289,12 +289,17 @@ def _sync_native_document(
     target_harness: str,
     managed_block: str | None,
     native_path: str | None = None,
+    state_scope: str | None = None,
 ) -> tuple[int, int, int]:
     """Three-way synchronize one sanctioned native Markdown document.
 
     ``managed_block=None`` means a pure semantic document: restore the exact
     payload without injecting a bridge. Instruction/MEMORY files pass a block
     that remains adapter-owned and is stripped before change detection.
+
+    ``state_scope`` (tree-synced documents) keys the three-way watermark
+    state per native directory, so two project stores of one harness cannot
+    mutate each other's base, and enables the delete liveness gate below.
     """
     hub = get_namespace_dir(root, namespace) / filename
     local_exists = path.is_file()
@@ -322,11 +327,21 @@ def _sync_native_document(
     candidate_hub_digest = text_sha256(candidate_hub) if candidate_hub is not None else None
 
     watermark = load_watermark(root, harness)
-    state_key = f"{namespace}/{filename}"
-    state = watermark.setdefault("native_documents", {}).setdefault(state_key, {})
+    state_key = f"{namespace}/{filename}" + (f"::{state_scope}" if state_scope else "")
+    documents = watermark.setdefault("native_documents", {})
+    if state_scope is not None:
+        # The pre-scope shared key was the churn vector (one project's base
+        # mutated by another's pass); drop it once the scoped key takes over.
+        documents.pop(f"{namespace}/{filename}", None)
+    state = documents.setdefault(state_key, {})
     base_digest = state.get("delivered_payload_digest", state.get("delivered_digest"))
     base_version = state.get("delivered_version")
     ingested = delivered = deleted = 0
+    # Source liveness (dream ACK-5295df6877): the file being present in THIS
+    # directory's tree is the only proof this store ever held it. Recorded
+    # every tick while it exists; its later absence is then a real deletion.
+    if semantic_local_exists:
+        state["held_local"] = True
 
     def publish_local(causal_base: str | None) -> None:
         nonlocal ingested, deleted
@@ -343,6 +358,14 @@ def _sync_native_document(
             action = "upsert"
             ingested += 1
         else:
+            # Delete liveness gate (dream ACK-5295df6877): a directory whose
+            # scoped state never recorded holding the source at the native
+            # path must not delete-propagate. Its copy lives elsewhere (the
+            # zcode pinned bridge), so "local missing" is not a user
+            # deletion — propagating one made holder stores and empty stores
+            # fight forever (6.5k journal rows on one door).
+            if state_scope is not None and not state.get("held_local"):
+                return
             if hub.exists():
                 hub.unlink()
             action = "delete"
@@ -392,6 +415,7 @@ def _sync_native_document(
             temp.write_text(rendered, encoding="utf-8")
             temp.replace(path)
             delivered += 1
+            state["held_local"] = True
         elif not hub_exists and path.exists():
             # A retired door must not eat the native source: when the causal
             # store retired this door and the content is unchanged, the
@@ -402,6 +426,7 @@ def _sync_native_document(
                 backup_native_file(root, harness, namespace, path)
                 path.unlink()
                 delivered += 1
+                state["held_local"] = False
     else:
         before = path.read_text(encoding="utf-8") if path.is_file() else None
         write_managed_block(path, harness, hub_payload if hub_exists else "", managed_block)
@@ -492,6 +517,7 @@ def _sync_native_tree(
             target_harness=target_harness,
             managed_block=None,
             native_path=relative,
+            state_scope=str(directory),
         )
         ingested += inc
         delivered += outc
