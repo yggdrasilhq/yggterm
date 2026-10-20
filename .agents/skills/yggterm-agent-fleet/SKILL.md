@@ -48,6 +48,15 @@ agents are testing (see §3c).
 
 ---
 
+### Optional semantic memory search
+
+`ygg-memory search 'orchard irrigation' --semantic` reranks the same regex
+hits only when `~/.yggterm/config/system1.json` explicitly enables it.
+`ygg-memory system1 status` reports config and today's spend. Plain search
+keeps its deterministic path. Missing privacy coverage, weak judgments and
+exhausted budgets preserve the base hits. Setup, counter sharing and the
+falsifier: `docs/system1-search.md` in the repository.
+
 ## 0.5 The row registry (`ygg_row.py`) and the bridge (`ygg_bridge.py`) — production
 
 **The registry is the accountability plane.** It replaces the old alpha
