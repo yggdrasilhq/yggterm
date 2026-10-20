@@ -609,9 +609,120 @@ def run_dream_tests():
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+def run_mirror_liveness_tests():
+    """T-007 (dream ACK-5295df6877): native-mirror delete-vs-upsert races.
+
+    Two project stores of one harness share the harness watermark. The
+    pre-fix code keyed the three-way state per door only, so an empty
+    project interpreted a delivered door's absence in ITS tree as a user
+    deletion and delete-propagated it, while the holder's base kept getting
+    wiped (state.clear on the deleted door) and re-upserting — 6.5k journal
+    rows ping-ponging on one door. The fix: per-directory state scope plus
+    a delete liveness gate (only a store that held the source may
+    propagate its deletion).
+    """
+    mod = load_module(YGG_MEMORY_SCRIPT)
+    tmp_root = Path(tempfile.mkdtemp(prefix="yggmem-mirror-liveness-"))
+    try:
+        root = tmp_root / "memory"
+        holder = tmp_root / "proj-holder" / "memory"
+        empty = tmp_root / "proj-empty" / "memory"
+        holder.mkdir(parents=True)
+        empty.mkdir(parents=True)
+        source = holder / "bookshelf-note.md"
+        source.write_text(
+            "# bookshelf note\n\nthe only surviving research note.\n", encoding="utf-8"
+        )
+
+        mod._native_door_causal_cache.clear()
+        inc, _outc, delc = mod._sync_native_tree(
+            root, "zcode", mod.GLOBAL_NAMESPACE, holder, "memory", target_harness="all"
+        )
+        glob_dir = mod.get_namespace_dir(root, mod.GLOBAL_NAMESPACE)
+        mirrors = sorted(glob_dir.glob("native-zcode-memory-*-bookshelf-note.md"))
+        check(
+            "holder upserted the mirror door",
+            len(mirrors) == 1 and inc == 1 and delc == 0,
+        )
+        door = mirrors[0]
+
+        def journal_actions():
+            mod._native_door_causal_cache.clear()
+            return [
+                (e.get("action"), e.get("harness"))
+                for e in mod.read_journal_entries(root, namespace=mod.GLOBAL_NAMESPACE)
+                if e.get("file") == door.name
+            ]
+
+        # Seed the poisoned pre-fix shared watermark state exactly as live
+        # hosts carry it (delivered base, no directory scope).
+        payload = mod.native_document_payload(door.read_text(encoding="utf-8")).rstrip()
+        wm = mod.load_watermark(root, "zcode")
+        wm.setdefault("native_documents", {})[
+            f"{mod.GLOBAL_NAMESPACE}/{door.name}"
+        ] = {"delivered_payload_digest": mod.text_sha256(payload)}
+        mod.save_watermark(root, wm)
+
+        # The store that never held the file runs three ticks: it must
+        # deliver the door into its tree, never delete-propagate it.
+        for _ in range(3):
+            mod._native_door_causal_cache.clear()
+            mod._sync_native_tree(
+                root, "zcode", mod.GLOBAL_NAMESPACE, empty, "memory", target_harness="all"
+            )
+        check("non-holder's ticks kept the door alive", door.exists())
+        deletes = [a for a in journal_actions() if a[0] == "delete"]
+        check("non-holder never delete-propagated", not deletes, str(deletes))
+        check("non-holder converged by delivery", (empty / "bookshelf-note.md").is_file())
+
+        wm = mod.load_watermark(root, "zcode")
+        nd = wm.get("native_documents", {})
+        check(
+            "poisoned shared key retired by the scoped sync",
+            f"{mod.GLOBAL_NAMESPACE}/{door.name}" not in nd,
+        )
+        scoped = [k for k in nd if door.name in k and "::" in k]
+        check("scoped state exists per directory", len(scoped) == 2, str(sorted(nd))[:200])
+
+        before = len(journal_actions())
+        mod._native_door_causal_cache.clear()
+        mod._sync_native_tree(
+            root, "zcode", mod.GLOBAL_NAMESPACE, holder, "memory", target_harness="all"
+        )
+        check(
+            "holder's repeat tick is idle and its source survives",
+            len(journal_actions()) == before and source.exists(),
+        )
+
+        # A store that HELD the file (delivered into its tree) may still
+        # propagate a real deletion of it.
+        delivered_copy = empty / "bookshelf-note.md"
+        if delivered_copy.is_file():
+            delivered_copy.unlink()
+            mod._native_door_causal_cache.clear()
+            mod._sync_native_tree(
+                root, "zcode", mod.GLOBAL_NAMESPACE, empty, "memory", target_harness="all"
+            )
+            check("held store's real deletion propagates", not door.exists())
+        else:
+            check("held store's real deletion propagates", False, "delivery never landed")
+
+        # The retirement must not eat the holder's surviving source, and the
+        # unchanged source must not resurrect the retired door (churn guard).
+        mod._native_door_causal_cache.clear()
+        mod._sync_native_tree(
+            root, "zcode", mod.GLOBAL_NAMESPACE, holder, "memory", target_harness="all"
+        )
+        check("holder's source survived the retirement", source.exists())
+        check("unchanged source did not resurrect the retired door", not door.exists())
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     run_tests()
     run_dream_tests()
+    run_mirror_liveness_tests()
     if FAILURES:
         print(f"\n{len(FAILURES)} checks failed: {', '.join(FAILURES)}")
         sys.exit(1)
