@@ -7071,6 +7071,14 @@ def cmd_dream(args):
             manifest["budget_reservation"] = admission["id"]
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             codex_bin = _resolve_codex_bin(args.codex_bin)
+            # [model-trust law 2026-10-19] the critic may be a DIFFERENT
+            # model than the composer; the resolved pairing is recorded in
+            # the manifest so every verdict carries its falsifier identity.
+            critic_model = (args.critic_model or args.model).strip()
+            manifest["composer_model"] = args.model
+            manifest["critic_model"] = critic_model
+            manifest["critic_effort"] = args.effort
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             print(f"dream: composer pass ({args.model}, effort {args.effort})… [budget {admission['id']}{', borrowed' if admission.get('borrowed') else ''}]")
             response, composer_used = _composer_exec(
                 brief + "\n\nProduce the response now.", args.effort,
@@ -7085,7 +7093,7 @@ def cmd_dream(args):
                 + CRITIC_INSTRUCTIONS
             )
             critic, _ = _composer_exec(
-                critic_prompt, args.effort, codex_bin, args.model, root=root)
+                critic_prompt, args.effort, codex_bin, critic_model, root=root)
             (pending / "CRITIC.md").write_text(critic, encoding="utf-8")
         except BaseException:
             budget_op(root, {"action": "release", "id": admission["id"]})
@@ -7114,6 +7122,8 @@ def cmd_dream(args):
             parsed = parse_dream_response(response_path.read_text(encoding="utf-8"))
             critic_path = pending / "CRITIC.md"
             verdicts = parse_critic_verdicts(critic_path.read_text(encoding="utf-8")) if critic_path.is_file() else []
+            if critic_path.is_file() and verdicts and not manifest.get("critic_model"):
+                print("dream: WARNING - pending dream has no critic_model provenance (pre model-trust law); verdict binding is unverified", file=sys.stderr)
         except ValueError as error:
             print(f"dream: REFUSED — {error}", file=sys.stderr)
             raise SystemExit(2)
@@ -7507,6 +7517,7 @@ def main():
     p_dream.add_argument("--dry-run", action="store_true", help="with --apply: validate and print the plan without writing")
     p_dream.add_argument("--composer", default="sol", help="composer transport for --run (sol; the seat-composer path is prepare/apply by hand)")
     p_dream.add_argument("--model", default="gpt-6.1-sol", help="composer model for --run")
+    p_dream.add_argument("--critic-model", default=None, help="separate critic model for --run (default: the composer model). Owner model-trust law 2026-10-19: the falsifier must not share the composer model when the composer is hallucination-prone (deepseek, gemini; see _global/llm-model-trust-table.md) - pair a cautious model (glm-5.3-flash, gpt-6.1-sol). Priority namespaces always set this.")
     p_dream.add_argument("--effort", default="high", help="composer reasoning effort for --run")
     p_dream.add_argument("--codex-bin", default=None, help="explicit codex binary path for --run")
     p_dream.add_argument(
