@@ -72,3 +72,43 @@ python3 run_shadow.py --family hub --split dev # baseline + shadow
 
 Cache `~/.cache/dream-routing/jev-cache.jsonl` (sha-keyed, includes option
 order); any failure = `unknown`, never a guess.
+
+## Slice 8 — pattern learning (T-010, holdout-gated)
+
+`pattern_miner.py` mines evidence-linked routing PATTERNS from the DEV split
+only (heldout is never read at mining time — asserted in `--selftest`).
+Output: `corpus/patterns-candidates.json` in the slice-8 pattern-store
+schema (statement, scope, authority=observed-practice, episodes with
+content-hash eids, counterexample search, uncertainty). 65 rows (seed state
+2026-10-21); 9 rule-grade rows (support ≥4) carry `promotion-eligible` on
+their OWN measured holdout run.
+
+`pattern_router.py` reuses the incumbent scorer and ADDS mined mass; same
+2-token unknown floor, calls family untouched (no patterns admitted there —
+abstention is the designed behavior; a confident calls route is reported as
+an invented authority, never taken).
+
+`pattern_falsifier.py` is the gate: baseline vs pattern-augmented on
+HELDOUT, paired exact-binomial, no-harm, zero-invented. Measured
+2026-10-21 (extraction seed state 2026-10-16, heldout n=92/75 routed):
+
+| run | set | baseline acc | augmented | wins/losses | p |
+|---|---|---|---|---|---|
+| 071133 | full 69 (first mine, incl. shadow tokens) | 9.8% | 26.1% | 17/2 | 0.00036 |
+| 071644 | full 65 (composer-pass pruning) | 9.8% | 26.1% | 17/2 | 0.00036 |
+| 071719 | rule-grade 9 (support ≥4) | 9.8% | 19.6% | 10/1 | 0.0059 |
+
+All three: zero invented, calls intact (17/17 abstain). Promotion ceiling
+is `promotion-eligible` — the panel (owner) owns actual promotion; per
+family: hub 26.7→46.7%, notes 4.4→31.1% (pruned run 22.2%), cases flat
+20% (its routing evidence is name-shape, not content tokens — extraction
+artifacts remain the known corpus-hygiene gap). The Jev shadow is still the
+ceiling performance for the axis (T-008 heldout 97.3%); pattern learning is
+the DETERMINISTIC floor improvement and the durable evidence-linked layer
+`ygg-memory patterns --ns=_global` keeps (65 rows, status stamped).
+
+Composer-pass note (one `opencode/glm-5.3-flash-free` call, aliased labels,
+privacy-gate PASS e905777e): flagged support-2 function-word shadows and
+tokenizer fragments (`mone`, `mport`). STOPWORDS extended accordingly
+(second run proves the pruning is no-harm). Composer output is descriptive
+analysis, never a write authority.
