@@ -293,6 +293,13 @@ def test_focus_ranking_in_auto(module, failures):
             model = "gpt-6.1-sol"
             effort = "high"
 
+        # The autoclaw heartbeat is a host-global signal read through
+        # Path.home(); a live autoclaw seat on this host (heartbeat < 900s)
+        # made every _dream_auto tick defer as ACTIVE and the test went red
+        # whenever such a seat was working — isolate the home like
+        # test_memory_dream_auto does.
+        original_home = Path.home
+        module.Path.home = staticmethod(lambda: tmp)
         try:
             # Equal raw scores (1 pending delta each): the focus doc is the
             # ONLY thing that can decide — ns-small is boosted ×4.
@@ -333,6 +340,7 @@ def test_focus_ranking_in_auto(module, failures):
             if "ns-small" in message:
                 failures.append(f"eligibility: focus resurrected a cooled-down namespace: {message}")
         finally:
+            module.Path.home = original_home
             module._dream_receipt, module.subprocess.run = original_receipt, original_run
 
 
